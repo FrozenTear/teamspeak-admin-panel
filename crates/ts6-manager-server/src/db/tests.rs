@@ -2,7 +2,7 @@
 //!
 //! These run on every `cargo test` and need no external services. They cover
 //! the migration runner's idempotency property (re-running it does not
-//! re-apply any migration) and confirm the priority-slice tables exist.
+//! re-apply any migration) and confirm every Chapter-4 table exists.
 
 use super::{connect_in_memory, migrations};
 
@@ -17,6 +17,7 @@ async fn migrations_apply_priority_slice_on_fresh_db() {
             "0001_baseline".to_string(),
             "0002_query_bot_nickname".to_string(),
             "0003_ssh_bot_nickname".to_string(),
+            "0004_chapter4_remaining_entities".to_string(),
         ],
         "first run should apply every migration"
     );
@@ -36,18 +37,40 @@ async fn migrations_runner_is_idempotent() {
     );
     assert_eq!(
         second.skipped.len(),
-        3,
-        "second run should skip the three priority-slice migrations"
+        4,
+        "second run should skip every migration applied on the first run"
     );
 }
 
 #[tokio::test]
-async fn priority_slice_tables_exist_after_migrations() {
+async fn chapter4_tables_exist_after_migrations() {
     let db = connect_in_memory().await.expect("in-memory connect");
     migrations::run(&db).await.expect("migrations run");
 
-    // Each table should be defined and SELECT-able even when empty.
-    for table in ["user", "refresh_token", "server_connection", "server_user_grant"] {
+    // Every Chapter-4 table from spec §4.2.1–§4.2.17 must be defined and
+    // SELECT-able even when empty. Slice 1 plus slice 2.
+    let tables: &[&str] = &[
+        // §4.2.1–§4.2.4 priority slice
+        "user",
+        "refresh_token",
+        "server_connection",
+        "server_user_grant",
+        // §4.2.5–§4.2.17 slice 2
+        "bot_flow",
+        "bot_variable",
+        "bot_execution",
+        "bot_execution_log",
+        "app_setting",
+        "music_bot",
+        "song",
+        "playlist",
+        "playlist_song",
+        "radio_station",
+        "widget",
+        "music_request",
+        "stream_session",
+    ];
+    for table in tables {
         let q = format!("SELECT count() FROM {table} GROUP ALL");
         let mut response = db.query(&q).await.expect("count query");
         let _: Vec<serde_json::Value> = response.take(0).expect("count rows deserialise");

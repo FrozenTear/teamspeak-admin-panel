@@ -29,6 +29,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0003_ssh_bot_nickname",
         include_str!("../../migrations/0003_ssh_bot_nickname.surql"),
     ),
+    (
+        "0004_chapter4_remaining_entities",
+        include_str!("../../migrations/0004_chapter4_remaining_entities.surql"),
+    ),
 ];
 
 #[derive(Debug, Deserialize, SurrealValue)]

@@ -13,13 +13,28 @@
 use anyhow::{Result, bail};
 use surrealdb::types::{RecordId, RecordIdKey};
 
+pub mod app_settings;
+pub mod bot_execution_logs;
+pub mod bot_executions;
+pub mod bot_flows;
+pub mod bot_variables;
+pub mod music_bots;
+pub mod music_requests;
+pub mod playlist_songs;
+pub mod playlists;
+pub mod radio_stations;
 pub mod refresh_tokens;
 pub mod server_connections;
 pub mod server_user_grants;
+pub mod songs;
+pub mod stream_sessions;
 pub mod users;
+pub mod widgets;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_chapter4;
 
 /// Pull the integer portion out of a SurrealDB record id (e.g. the `1` in
 /// `user:1`). Spec §4.1 mandates `int` primary keys; the migrations pin each
