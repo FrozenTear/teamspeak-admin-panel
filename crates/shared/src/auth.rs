@@ -48,7 +48,7 @@ pub struct ChangePasswordRequest {
 }
 
 /// `GET /api/auth/me` response body — the current user's public profile.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserInfo {
     pub id: i64,
     pub username: String,
@@ -73,9 +73,12 @@ impl ErrorResponse {
 
 /// Spec-verbatim error strings for the auth surface.
 ///
-/// Constants here are the ground truth; `auth::extractors` and `auth::routes`
-/// MUST use them directly so the wire shape is identical across call sites.
+/// Constants here are the ground truth; `auth::extractors`, `auth::routes`,
+/// and the Dioxus login route ([PURA-14](/PURA/issues/PURA-14)) MUST use
+/// them directly so the same byte sequence reaches the wire and the
+/// rendered UI without copy duplication.
 pub mod auth_error_strings {
+    // Server-side wire strings (spec §6.4).
     pub const NO_TOKEN: &str = "No token provided";
     pub const INVALID_TOKEN: &str = "Invalid or expired token";
     pub const USER_DISABLED: &str = "User account disabled or deleted";
@@ -84,6 +87,17 @@ pub mod auth_error_strings {
     pub const NO_SERVER_ACCESS: &str = "No access to this server";
     pub const RATE_LIMIT_AUTH: &str = "Too many attempts, please try again later";
     pub const RATE_LIMIT_WEBHOOK: &str = "Too many webhook requests";
+
+    // UI-side copy used by the Dioxus login route. These are not server
+    // wire strings — the server returns its own bodies (e.g., "Invalid
+    // credentials") and the login page re-maps to user-facing copy.
+    /// Shown for any 401 / generic 4xx during login. Spec §28.2 example
+    /// uses "Invalid credentials"; the [PURA-14](/PURA/issues/PURA-14)
+    /// issue tightened the copy to match the design-system tone.
+    pub const INVALID_CREDENTIALS: &str = "Invalid username or password";
+    /// Shown for transport / 5xx failures during login. Spec is silent
+    /// on this branch; we intentionally avoid blaming the user.
+    pub const SIGN_IN_UNAVAILABLE: &str = "Sign-in is temporarily unavailable, please try again";
 }
 
 #[cfg(test)]

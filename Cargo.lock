@@ -1180,6 +1180,7 @@ dependencies = [
  "dioxus-hooks",
  "dioxus-html",
  "dioxus-logger",
+ "dioxus-router",
  "dioxus-server",
  "dioxus-signals",
  "dioxus-stores",
@@ -6144,9 +6145,12 @@ dependencies = [
  "chrono",
  "dioxus",
  "dioxus-server",
+ "futures",
+ "gloo-net",
  "hex",
  "hickory-resolver",
  "http-body-util",
+ "js-sys",
  "jsonwebtoken 9.3.1",
  "rand 0.8.6",
  "scrypt",
@@ -6161,6 +6165,9 @@ dependencies = [
  "tracing-subscriber",
  "ts6-manager-shared",
  "url",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

@@ -1,5 +1,6 @@
 mod app_state;
 mod auth;
+mod client;
 mod config;
 mod crypto;
 mod db;

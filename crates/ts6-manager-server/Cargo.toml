@@ -40,6 +40,16 @@ url = { workspace = true }
 chrono = { workspace = true }
 surrealdb = { workspace = true }
 
+# PURA-14 — auth client slice. WASM-only at runtime (gated by
+# `cfg(target_arch = "wasm32")` in source); on native targets these crates
+# compile but the request/storage code paths are unreachable.
+futures = { workspace = true }
+gloo-net = { workspace = true }
+js-sys = { workspace = true }
+wasm-bindgen = { workspace = true }
+wasm-bindgen-futures = { workspace = true }
+web-sys = { workspace = true }
+
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
 http-body-util = "0.1"
