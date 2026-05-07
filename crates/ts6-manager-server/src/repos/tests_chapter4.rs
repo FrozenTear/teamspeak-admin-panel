@@ -1,4 +1,4 @@
-//! End-to-end repo tests for the slice-2 entities (PURA-11).
+//! End-to-end repo tests for the slice-2 entities (PURA-12).
 //!
 //! Mirrors the spec §4.5 verification list at the repo layer:
 //!   - schema-roundtrip — insert one row of every entity, read it back.
@@ -577,7 +577,9 @@ async fn deleting_playlist_cascades_to_playlist_song() {
     .await
     .unwrap();
 
-    playlists::delete(&db, pl.id).await.expect("delete playlist");
+    playlists::delete(&db, pl.id)
+        .await
+        .expect("delete playlist");
     assert!(
         playlist_songs::list_for_playlist(&db, pl.id)
             .await
@@ -606,7 +608,9 @@ async fn radio_station_roundtrip_and_list_for_server() {
     .unwrap();
     assert_eq!(rs.url, "https://stream.example/radio.mp3");
 
-    let list = radio_stations::list_for_server(&db, server_id).await.unwrap();
+    let list = radio_stations::list_for_server(&db, server_id)
+        .await
+        .unwrap();
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].id, rs.id);
 }
@@ -689,7 +693,9 @@ async fn music_request_dedup_via_record() {
 
     assert_eq!(first.id, second.id, "second record() must reuse the row");
 
-    let listed = music_requests::list_for_server(&db, server_id).await.unwrap();
+    let listed = music_requests::list_for_server(&db, server_id)
+        .await
+        .unwrap();
     assert_eq!(listed.len(), 1);
 
     // Direct insert must still surface the index violation.
@@ -842,7 +848,10 @@ async fn deleting_server_cascades_chapter4_entities_except_logs() {
         "music_bot must cascade"
     );
     assert!(
-        songs::list_for_server(&db, server_id).await.unwrap().is_empty(),
+        songs::list_for_server(&db, server_id)
+            .await
+            .unwrap()
+            .is_empty(),
         "song must cascade"
     );
     assert!(
@@ -867,7 +876,9 @@ async fn deleting_server_cascades_chapter4_entities_except_logs() {
         "music_request must cascade"
     );
 
-    let logs = bot_execution_logs::list_for_flow(&db, flow.id).await.unwrap();
+    let logs = bot_execution_logs::list_for_flow(&db, flow.id)
+        .await
+        .unwrap();
     assert_eq!(
         logs.len(),
         1,
@@ -923,9 +934,7 @@ async fn stream_session_finish_stamps_ended_at_and_peak() {
     // §4.2.17: musicBotId is informational; deleting the bot does NOT
     // touch stream_session rows.
     music_bots::delete(&db, bot.id).await.unwrap();
-    let still_there = stream_sessions::find_by_id(&db, session.id)
-        .await
-        .unwrap();
+    let still_there = stream_sessions::find_by_id(&db, session.id).await.unwrap();
     assert!(
         still_there.is_some(),
         "stream_session survives MusicBot delete (informational FK)"
@@ -943,7 +952,10 @@ async fn migrate_run_is_idempotent_on_repeat() {
     let report = migrations::run(&db).await.expect("second run");
     assert!(report.applied.is_empty(), "second run must apply nothing");
     assert!(
-        report.skipped.iter().any(|s| s == "0004_chapter4_remaining_entities"),
+        report
+            .skipped
+            .iter()
+            .any(|s| s == "0004_chapter4_remaining_entities"),
         "0004 must appear in the skipped set"
     );
 
@@ -1115,21 +1127,66 @@ async fn schema_roundtrip_one_row_per_entity() {
 
     // Read every entity back via list/find and confirm identity.
     assert_eq!(bot_flows::list(&db).await.unwrap().len(), 1);
-    assert_eq!(bot_variables::list_for_flow(&db, flow.id).await.unwrap().len(), 1);
-    assert_eq!(bot_executions::list_for_flow(&db, flow.id).await.unwrap().len(), 1);
     assert_eq!(
-        bot_execution_logs::list_for_execution(&db, exec.id).await.unwrap().len(),
+        bot_variables::list_for_flow(&db, flow.id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        bot_executions::list_for_flow(&db, flow.id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        bot_execution_logs::list_for_execution(&db, exec.id)
+            .await
+            .unwrap()
+            .len(),
         1
     );
     assert!(app_settings::get(&db, "k").await.unwrap().is_some());
     assert_eq!(music_bots::list(&db).await.unwrap().len(), 1);
     assert_eq!(songs::list(&db).await.unwrap().len(), 1);
     assert_eq!(playlists::list(&db).await.unwrap().len(), 1);
-    assert_eq!(playlist_songs::list_for_playlist(&db, pl.id).await.unwrap().len(), 1);
-    assert_eq!(radio_stations::list_for_server(&db, server_id).await.unwrap().len(), 1);
-    assert_eq!(widgets::list_for_server(&db, server_id).await.unwrap().len(), 1);
-    assert_eq!(music_requests::list_for_server(&db, server_id).await.unwrap().len(), 1);
-    assert_eq!(stream_sessions::list_for_music_bot(&db, bot.id).await.unwrap().len(), 1);
+    assert_eq!(
+        playlist_songs::list_for_playlist(&db, pl.id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        radio_stations::list_for_server(&db, server_id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        widgets::list_for_server(&db, server_id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        music_requests::list_for_server(&db, server_id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        stream_sessions::list_for_music_bot(&db, bot.id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
 
     // Suppress unused-variable warnings on `_` bindings — explicitly drop.
     let _ = (flow, exec, song, pl, bot);
