@@ -1,5 +1,5 @@
 -- =====================================================================
--- TS6 Manager — Phase 1 DATA slice 2 (PURA-11)
+-- TS6 Manager — Phase 1 DATA slice 2 (PURA-13)
 --
 -- Spec: study-documents/ts6-manager-spec.md Chapter 4
 --   §4.2.5  BotFlow             §4.2.12 Playlist
