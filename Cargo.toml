@@ -1,0 +1,29 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/shared",
+    "crates/ts6-manager-server",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1.0"
+axum = "0.8"
+dioxus = { version = "0.7", features = ["fullstack"] }
+dioxus-server = "0.7"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+ts6-manager-shared = { path = "crates/shared" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

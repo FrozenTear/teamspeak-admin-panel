@@ -1,0 +1,26 @@
+# Minimal dev compose for the Dioxus fullstack server.
+# Production deployments use Quadlet units / `podman kube play` (added in a later OPS ticket).
+
+services:
+  fullstack:
+    container_name: ts6-manager-fullstack
+    image: localhost/ts6-manager-fullstack:dev
+    build:
+      context: .
+      dockerfile: Containerfile.fullstack
+    ports:
+      - "3001:3001"
+    environment:
+      NODE_ENV: production
+      PORT: "3001"
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      LOG_PRETTY: ${LOG_PRETTY:-}
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env or your shell before podman-compose up}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
+      DATABASE_URL: file:/var/lib/ts6-manager/db/ts6webui.db
+      MUSIC_DIR: /var/lib/ts6-manager/music
+    volumes:
+      - ./data/db:/var/lib/ts6-manager/db:Z
+      - ./data/music:/var/lib/ts6-manager/music:Z
+    restart: unless-stopped

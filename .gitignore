@@ -1,0 +1,6 @@
+/target
+/data
+**/*.rs.bk
+.env
+.env.local
+*.swp

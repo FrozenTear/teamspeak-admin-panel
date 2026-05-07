@@ -1,0 +1,54 @@
+# TS6 Manager — Dioxus fullstack server
+# Multi-stage OCI Containerfile (Podman-native; works with any OCI runtime).
+
+# -----------------------------------------------------------------------------
+# Stage 1 — build
+# -----------------------------------------------------------------------------
+FROM docker.io/rust:1.95-slim-bookworm AS builder
+
+WORKDIR /build
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        pkg-config \
+        libssl-dev \
+        ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY Cargo.toml ./
+COPY rust-toolchain.toml ./
+COPY crates ./crates
+
+# Cargo.lock may not exist on a fresh checkout; tolerate either case.
+COPY Cargo.loc[k] ./
+
+RUN cargo build --release --bin ts6-manager-server
+
+# -----------------------------------------------------------------------------
+# Stage 2 — runtime (non-root, slim)
+# -----------------------------------------------------------------------------
+FROM docker.io/debian:bookworm-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libssl3 \
+ && rm -rf /var/lib/apt/lists/* \
+ && groupadd --system --gid 10001 ts6 \
+ && useradd --system --uid 10001 --gid ts6 --shell /usr/sbin/nologin --home-dir /var/lib/ts6-manager ts6 \
+ && mkdir -p /var/lib/ts6-manager/db /var/lib/ts6-manager/music \
+ && chown -R ts6:ts6 /var/lib/ts6-manager
+
+COPY --from=builder /build/target/release/ts6-manager-server /usr/local/bin/ts6-manager-server
+
+USER ts6:ts6
+WORKDIR /var/lib/ts6-manager
+
+ENV PORT=3001 \
+    NODE_ENV=production \
+    DATABASE_URL=file:/var/lib/ts6-manager/db/ts6webui.db \
+    MUSIC_DIR=/var/lib/ts6-manager/music
+
+EXPOSE 3001
+
+ENTRYPOINT ["/usr/local/bin/ts6-manager-server"]
