@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "WebSearch",
-      "WebFetch(domain:community.teamspeak.com)",
-      "Bash(echo \"---exit: $?\")"
-    ]
-  }
-}
