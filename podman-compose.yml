@@ -18,7 +18,7 @@ services:
       JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env or your shell before podman-compose up}
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:-}
       FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
-      DATABASE_URL: file:/var/lib/ts6-manager/db/ts6webui.db
+      DATABASE_URL: surrealkv:///var/lib/ts6-manager/db
       MUSIC_DIR: /var/lib/ts6-manager/music
     volumes:
       - ./data/db:/var/lib/ts6-manager/db:Z

@@ -46,7 +46,7 @@ WORKDIR /var/lib/ts6-manager
 
 ENV PORT=3001 \
     NODE_ENV=production \
-    DATABASE_URL=file:/var/lib/ts6-manager/db/ts6webui.db \
+    DATABASE_URL=surrealkv:///var/lib/ts6-manager/db \
     MUSIC_DIR=/var/lib/ts6-manager/music
 
 EXPOSE 3001

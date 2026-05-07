@@ -7,7 +7,14 @@ use anyhow::{Context, Result, anyhow, bail};
 const DEV_JWT_PLACEHOLDER: &str = "dev-secret-change-me-in-production";
 const DEFAULT_LOG_LEVEL: &str = "info";
 const DEFAULT_PORT: u16 = 3001;
-const DEFAULT_DATABASE_URL: &str = "file:./data/ts6webui.db";
+// PURA-10 / D8 deviation: SurrealDB v3 embedded with the SurrealKV backend.
+// `surrealkv://./data/db` resolves relative to the process working directory;
+// operators can override with `surrealkv:///var/lib/...` for absolute paths or
+// `ws://host:8000` to point at an external `surreal start` server.
+// `memory` is accepted for tests / ephemeral runs.
+const DEFAULT_DATABASE_URL: &str = "surrealkv://./data/db";
+pub const DEFAULT_DB_NAMESPACE: &str = "ts6";
+pub const DEFAULT_DB_NAME: &str = "ts6_manager";
 const DEFAULT_MUSIC_DIR: &str = "/data/music";
 const DEFAULT_FRONTEND_URL_DEV: &str = "http://localhost:5173";
 const DEFAULT_FRONTEND_URL_PROD: &str = "http://localhost:3000";

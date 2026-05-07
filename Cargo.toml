@@ -38,6 +38,13 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "set-header"] }
 url = "2"
 
+# Phase 1 DATA (PURA-10) — SurrealDB v3 embedded (D8 ratified deviation 2026-05-07).
+# `kv-surrealkv` is the production embedded backend; `kv-mem` powers unit tests
+# without spinning up a server. The `protocol-*` features stay off so the binary
+# does not pull in networking client code we are not yet using.
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+surrealdb = { version = "3", default-features = false, features = ["kv-surrealkv", "kv-mem"] }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
