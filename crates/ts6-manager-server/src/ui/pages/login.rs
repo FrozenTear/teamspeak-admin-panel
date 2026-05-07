@@ -110,7 +110,7 @@ pub fn LoginPage(next: Option<String>) -> Element {
 
     rsx! {
         div { class: "app-root login-page",
-            section { class: "stack-md",
+            section { class: "stack-md login-card",
                 h1 { "Sign in" }
                 p { "Enter your operator credentials to manage your TeamSpeak servers." }
 

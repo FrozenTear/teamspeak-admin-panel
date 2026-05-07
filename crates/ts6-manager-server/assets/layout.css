@@ -1,0 +1,60 @@
+/* TS6 Manager — Page-layout utilities (PURA-16)
+ *
+ * Token-only — never hard-code spacing, colour, or radius here.
+ * Pair with tokens.css and components.css; this file owns page-level
+ * scaffolding (canvas wrapper, vertical-rhythm stacks, centred auth card)
+ * that primitives in components.css deliberately do not provide.
+ */
+
+/* ─── App canvas ─────────────────────────────────────── */
+/* Page-level wrapper. Sets the canvas surface, base text colour, and
+ * base font so any standalone route (login, error, setup) renders on the
+ * design-system canvas without inheriting from a parent shell. */
+.app-root {
+  min-height: 100vh;
+  background: var(--bg-canvas);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+}
+
+/* ─── Vertical rhythm stacks ─────────────────────────── */
+/* Flex columns whose `gap` is the only vertical-rhythm knob. Sized in
+ * 4-up steps off the spacing scale so a page can step up rhythm without
+ * inventing one-off margins. */
+.stack-xs { display: flex; flex-direction: column; gap: var(--space-4); }
+.stack-sm { display: flex; flex-direction: column; gap: var(--space-5); }
+.stack-md { display: flex; flex-direction: column; gap: var(--space-6); }
+.stack-lg { display: flex; flex-direction: column; gap: var(--space-7); }
+
+/* ─── Auth-route card (.login-page + .login-card) ─────── */
+/* Centred single-column auth surface. `.login-page` is the viewport-
+ * filling outer that vertically + horizontally centres the card.
+ * `.login-card` is the bounded card itself; pair it on the inner stack
+ * (e.g. `<section class="stack-md login-card">`) so the utility surface
+ * stays flat and predictable instead of using descendant selectors. */
+.login-page {
+  display: grid;
+  place-items: center;
+  padding: var(--space-7) var(--space-5);
+  min-height: 100vh;
+}
+
+.login-card {
+  width: min(420px, 100%);
+  padding: var(--space-7);
+  background: var(--bg-surface-raised);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-md);
+}
+
+/* Heading + helper paragraph tone for auth routes. Keeps the form copy
+ * legible without forcing every page to import a typography primitive. */
+.login-page h1 {
+  margin: 0;
+  font: var(--weight-semibold) var(--text-xl) / var(--lh-lg) var(--font-sans);
+}
+.login-page p {
+  margin: 0;
+  color: var(--text-secondary);
+}

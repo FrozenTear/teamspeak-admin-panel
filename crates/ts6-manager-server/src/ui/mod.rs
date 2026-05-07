@@ -29,6 +29,7 @@ use crate::ui::routes::Route;
 
 const TOKENS_CSS: Asset = asset!("/assets/tokens.css");
 const COMPONENTS_CSS: Asset = asset!("/assets/components.css");
+const LAYOUT_CSS: Asset = asset!("/assets/layout.css");
 
 #[allow(non_snake_case)]
 pub fn App() -> Element {
@@ -36,6 +37,7 @@ pub fn App() -> Element {
     rsx! {
         document::Stylesheet { href: TOKENS_CSS }
         document::Stylesheet { href: COMPONENTS_CSS }
+        document::Stylesheet { href: LAYOUT_CSS }
         theme::ThemeProvider {
             Router::<Route> {}
         }

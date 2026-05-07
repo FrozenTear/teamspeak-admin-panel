@@ -631,7 +631,80 @@ Used in the `/setup` wizard (3 steps) and reusable for any future ≤5-step line
 
 ---
 
-## 16. Component naming for DioxusLead
+## 16. Layout / Spacing utilities
+
+Token-backed page-level helpers. Live in `assets/layout.css`, loaded from `ui::App` alongside `tokens.css` and `components.css`. **Token-only — never invent pixel values; if a token doesn't exist, propose it as a system change rather than hard-coding.**
+
+### 16.1 `.app-root`
+
+Page-level wrapper that establishes the canvas surface, base text colour, and base font for any standalone route (login, error, setup wizard) that isn't mounted inside the §11 chrome.
+
+| Prop | Value |
+|---|---|
+| `min-height` | `100vh` |
+| `background` | `--bg-canvas` |
+| `color` | `--text-primary` |
+| `font-family` | `--font-sans` |
+
+### 16.2 `.stack-{xs,sm,md,lg}` — vertical-rhythm stacks
+
+Flex columns whose `gap` is the *only* vertical-rhythm knob. Use these instead of margin-stacks on siblings so rhythm stays a single source of truth.
+
+| Class | `gap` token | Pixel value | Typical use |
+|---|---|---|---|
+| `.stack-xs` | `--space-4` | 12px | Dense list rows, label → control inside a tight field |
+| `.stack-sm` | `--space-5` | 16px | Form rows inside a field group, list items in a card |
+| `.stack-md` | `--space-6` | 24px | Section content inside a card (heading → paragraph → form) |
+| `.stack-lg` | `--space-7` | 32px | Top-level page sections (hero → body → footer) |
+
+All four classes share the same display contract: `display: flex; flex-direction: column;`. Compose with any other utility — `.stack-md` does not assume a parent.
+
+### 16.3 `.login-page` + `.login-card`
+
+Centred single-column auth surface. `.login-page` is the viewport-filling outer that vertically and horizontally centres its child; `.login-card` is the bounded card itself. Pair the card class on the inner stack so the utility surface stays flat:
+
+```html
+<div class="app-root login-page">
+  <section class="stack-md login-card">
+    <h1>Sign in</h1>
+    <p>…</p>
+    <!-- form -->
+  </section>
+</div>
+```
+
+| `.login-page` | Value |
+|---|---|
+| `display` | `grid` |
+| `place-items` | `center` |
+| `padding` | `--space-7 --space-5` |
+| `min-height` | `100vh` |
+
+| `.login-card` | Value |
+|---|---|
+| `width` | `min(420px, 100%)` |
+| `padding` | `--space-7` |
+| `background` | `--bg-surface-raised` |
+| `border` | `1px solid --border-subtle` |
+| `border-radius` | `--radius-lg` |
+| `box-shadow` | `--shadow-md` |
+
+`.login-page h1` and `.login-page p` get a single typography rule each so the heading + helper paragraph have correct tone (semibold `--text-xl`/`--lh-lg` for the heading, `--text-secondary` colour for the paragraph) without any inline styles.
+
+### 16.4 Layout targets
+
+- **Desktop 1440x900** — card centred horizontally and vertically, max width 420px, comfortable space below for future "Forgot password?" links.
+- **Mobile 390x844** — card is effectively full-bleed minus `--space-5` side padding, vertical centring preserved, no horizontal scroll.
+- **Reduced motion** — these utilities ship no animations; rely on the `prefers-reduced-motion` block in `tokens.css`.
+
+### 16.5 When NOT to use these
+
+- Inside the §11 chrome (`.app .main`). The chrome already owns the canvas/font/colour for the dashboard surfaces. Stacks remain useful for vertical rhythm there, but `.app-root` and `.login-page` are only for routes that opt out of the chrome.
+- For horizontal layouts. Stacks are flex-column only by design — pair with `--space-*` tokens directly when you need a row.
+
+---
+
+## 17. Component naming for DioxusLead
 
 Suggested Rust component names, for handoff:
 
