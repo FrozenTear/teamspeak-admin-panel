@@ -1,12 +1,11 @@
+mod auth;
 mod config;
+mod crypto;
 mod logging;
+mod ssrf;
 mod ui;
 
-use axum::{
-    response::Html,
-    routing::get,
-    Json, Router,
-};
+use axum::{Json, Router, response::Html, routing::get};
 use dioxus_server::{DioxusRouterExt, ServeConfig};
 use std::net::SocketAddr;
 use ts6_manager_shared::health::{Health, HealthStatus};
@@ -30,6 +29,10 @@ async fn main() -> anyhow::Result<()> {
     let cfg = Config::load()?;
     logging::init(&cfg);
     cfg.log_hardening_summary();
+
+    // Phase 1 SECURITY: derive the AES-256-GCM key once at boot. Subsequent
+    // crypto::seal / crypto::unseal calls reuse this cached key.
+    crypto::init(&cfg.encryption_key);
 
     let serve_cfg = ServeConfig::new();
     // Phase 0: serve_api_application registers Dioxus server-functions without scanning a

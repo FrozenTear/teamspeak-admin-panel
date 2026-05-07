@@ -2,7 +2,7 @@ use std::env;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 
 const DEV_JWT_PLACEHOLDER: &str = "dev-secret-change-me-in-production";
 const DEFAULT_LOG_LEVEL: &str = "info";
@@ -73,9 +73,7 @@ impl Config {
         let (jwt_secret, jwt_secret_is_placeholder) = match (raw_jwt_secret, node_env) {
             (Some(s), _) if !s.is_empty() && s != DEV_JWT_PLACEHOLDER => (s, false),
             (_, NodeEnv::Production) => {
-                bail!(
-                    "JWT_SECRET must be set to a non-placeholder value when NODE_ENV=production"
-                );
+                bail!("JWT_SECRET must be set to a non-placeholder value when NODE_ENV=production");
             }
             (Some(s), NodeEnv::Development) if s == DEV_JWT_PLACEHOLDER => (s, true),
             (_, NodeEnv::Development) => (DEV_JWT_PLACEHOLDER.to_string(), true),
@@ -91,9 +89,8 @@ impl Config {
         let database_url =
             env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_DATABASE_URL.to_string());
 
-        let jwt_access_expiry =
-            parse_duration(&env_or("JWT_ACCESS_EXPIRY", DEFAULT_ACCESS_EXPIRY))
-                .context("invalid JWT_ACCESS_EXPIRY")?;
+        let jwt_access_expiry = parse_duration(&env_or("JWT_ACCESS_EXPIRY", DEFAULT_ACCESS_EXPIRY))
+            .context("invalid JWT_ACCESS_EXPIRY")?;
         let jwt_refresh_expiry =
             parse_duration(&env_or("JWT_REFRESH_EXPIRY", DEFAULT_REFRESH_EXPIRY))
                 .context("invalid JWT_REFRESH_EXPIRY")?;
@@ -167,7 +164,9 @@ impl Config {
             tracing::warn!("ENCRYPTION_KEY unset; derived from JWT_SECRET (spec §5.1 fallback)");
         }
         if !self.encryption_key_fell_back && self.encryption_key == self.jwt_secret {
-            tracing::warn!("ENCRYPTION_KEY equals JWT_SECRET; use separate values for better security");
+            tracing::warn!(
+                "ENCRYPTION_KEY equals JWT_SECRET; use separate values for better security"
+            );
         }
     }
 }
