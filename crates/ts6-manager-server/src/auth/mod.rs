@@ -11,4 +11,5 @@
 #![allow(dead_code)] // consumed by REST handlers (PURA-4 follow-up commit)
 
 pub mod complexity;
+pub mod jwt;
 pub mod password;

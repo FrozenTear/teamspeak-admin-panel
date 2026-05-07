@@ -4,6 +4,7 @@ mod crypto;
 mod logging;
 mod ssrf;
 mod ui;
+mod web;
 
 use axum::{Json, Router, response::Html, routing::get};
 use dioxus_server::{DioxusRouterExt, ServeConfig};
@@ -42,7 +43,12 @@ async fn main() -> anyhow::Result<()> {
     let router: Router = Router::new()
         .serve_api_application(serve_cfg, ui::App)
         .route("/", get(placeholder_page))
-        .route("/health", get(health));
+        .route("/health", get(health))
+        // Phase 1 SECURITY (slice 1.5): CORS allowlist + security headers
+        // applied globally. Per-route auth/rate-limit middleware will wrap
+        // specific paths in slice 2.
+        .layer(web::cors_layer(&cfg.frontend_url));
+    let router = web::security_headers_stack(cfg.node_env).apply(router);
 
     let addr: SocketAddr = format!("0.0.0.0:{}", cfg.port).parse()?;
     tracing::info!(%addr, "ts6-manager-server listening");

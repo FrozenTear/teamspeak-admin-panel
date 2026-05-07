@@ -9,7 +9,12 @@
 //! truth via `serde`.
 
 #![deny(missing_debug_implementations)]
+// Wire-shape JSON keys (e.g., `accessToken`, `passwordHash`) are camelCase per
+// spec; matching them in Rust struct fields keeps `#[derive(Serialize)]` direct
+// without per-field rename attributes.
+#![allow(non_snake_case)]
 
+pub mod auth;
 pub mod health;
 
 pub use health::Health;
