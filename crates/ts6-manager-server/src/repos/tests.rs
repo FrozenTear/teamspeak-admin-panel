@@ -31,10 +31,10 @@ async fn user_insert_and_find_by_username_roundtrip() {
     .await
     .expect("insert");
 
-    // SurrealDB `sequence::nextval` returns the *current* value before
-    // advancing — the very first row therefore lands at id 0. Repos and
-    // wire-shape consumers MUST treat 0 as a valid id; the spec only
-    // requires "auto-assigned 32-bit integer", not a 1-based sequence.
+    // 0001_baseline.surql defines sequences with `START 1`, so first row
+    // gets id 1. Spec §4.1 only requires "auto-assigned 32-bit integer",
+    // not a specific starting value — assert the id is non-negative so
+    // the test survives a future sequence-config tweak.
     assert!(inserted.id >= 0);
     assert_eq!(inserted.username, "alice");
     assert_eq!(inserted.role, "admin");

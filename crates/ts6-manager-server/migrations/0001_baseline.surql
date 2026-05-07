@@ -22,10 +22,14 @@
 -- =====================================================================
 
 -- ---- Sequences --------------------------------------------------------
-DEFINE SEQUENCE user_id;
-DEFINE SEQUENCE refresh_token_id;
-DEFINE SEQUENCE server_connection_id;
-DEFINE SEQUENCE server_user_grant_id;
+-- BATCH 1 keeps the per-batch allocation small (we generate one id per insert
+-- in the priority slice; nothing to gain by pre-allocating). START 1 matches
+-- the conventional "auto-increment from 1" the spec implies in §4.1 and keeps
+-- 0 free as a sentinel for "no id" callers might reach for later.
+DEFINE SEQUENCE user_id              BATCH 1 START 1;
+DEFINE SEQUENCE refresh_token_id     BATCH 1 START 1;
+DEFINE SEQUENCE server_connection_id BATCH 1 START 1;
+DEFINE SEQUENCE server_user_grant_id BATCH 1 START 1;
 
 -- ---- User (§4.2.1) ----------------------------------------------------
 DEFINE TABLE user SCHEMAFULL;
