@@ -1,3 +1,4 @@
+mod app_state;
 mod auth;
 mod config;
 mod crypto;
@@ -85,6 +86,13 @@ async fn run_serve(cfg: Config) -> anyhow::Result<()> {
     );
 
     let serve_cfg = ServeConfig::new();
+    let state = app_state::AppState::from_config(&cfg, database.clone());
+
+    // Phase 1 SECURITY (slice 3): /api/auth REST surface — login, refresh,
+    // logout, me, password. Building the sub-router with state baked in so
+    // it composes as a `Router<()>` with the rest of the app.
+    let auth_router = auth::routes::router().with_state(state);
+
     // Phase 0: serve_api_application registers Dioxus server-functions without scanning a
     // dx-CLI public/ bundle. The placeholder root page is a static HTML asset so the Phase 0
     // gate ("placeholder page renders") passes without the WASM build pipeline. The Dioxus
@@ -93,9 +101,9 @@ async fn run_serve(cfg: Config) -> anyhow::Result<()> {
         .serve_api_application(serve_cfg, ui::App)
         .route("/", get(placeholder_page))
         .route("/health", get(health))
-        // Phase 1 SECURITY (slice 1.5): CORS allowlist + security headers
-        // applied globally. Per-route auth/rate-limit middleware will wrap
-        // specific paths in slice 2.
+        .nest("/api/auth", auth_router)
+        // CORS + security headers apply globally. Per-route rate-limit
+        // middleware will wrap login/refresh paths in the next slice.
         .layer(web::cors_layer(&cfg.frontend_url));
     let router = web::security_headers_stack(cfg.node_env).apply(router);
 
