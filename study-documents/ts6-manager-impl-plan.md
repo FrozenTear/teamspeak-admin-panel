@@ -397,3 +397,33 @@ Rootless Podman is the default. Volumes use host paths owned by the operator's u
 - Generate Quadlet units via `podman generate systemd` once a known-good `podman pod create` recipe is locked.
 - For the Kubernetes YAML, prefer hand-written manifests over `podman generate kube` — the generated YAML drifts and is hard to review.
 - CI publishes images to a registry (`ghcr.io/<org>/ts6-manager-fullstack`, `…-sidecar`); the OD2 decision (CI host) determines exactly where.
+
+---
+
+## 10. Local dev loop (PURA-17)
+
+The fullstack app compiles to two flavours from the single `crates/ts6-manager-server` crate, gated by Cargo features:
+
+- `--features server` (default) → native binary; axum + SurrealDB + `/api/auth/*`.
+- `--features web` → `wasm32-unknown-unknown`; `dioxus::launch(App)` for browser hydration.
+
+`dx-CLI` toggles those automatically. Pin `dx` to the dioxus-runtime version in `Cargo.toml` (currently `0.7.7`) — a mismatch leaves placeholder text in `<link rel="stylesheet">` URLs.
+
+```bash
+# one-time
+rustup target add wasm32-unknown-unknown
+cargo install dioxus-cli --version 0.7.7 --locked
+
+# from `crates/ts6-manager-server/`:
+dx serve                                    # full dev loop with hot reload
+# or:
+dx build --web && dx serve --release        # one-shot prod-style bundle
+
+# raw cargo also works for the server-side build (tests, type-check, CI):
+cargo build -p ts6-manager-server
+cargo test  -p ts6-manager-server
+```
+
+`dx serve` is the canonical loop because it patches asset URLs in the binary at link time. Running `cargo run` directly produces a server that *answers* every route but renders unsubstituted placeholder text in the stylesheet hrefs — fine for API smoke tests, not for visual review.
+
+The dx-built artifacts live under `target/dx/ts6-manager-server/debug/web/` (`public/` for the WASM bundle + assets, `server` for the patched native binary). Production bundling/minification is a Phase-5 concern; Phase 1 only needs the dev loop to render `/login` in a browser.

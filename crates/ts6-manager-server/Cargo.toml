@@ -9,46 +9,87 @@ publish.workspace = true
 name = "ts6-manager-server"
 path = "src/main.rs"
 
+# PURA-17 — dx-CLI bundles a fullstack app from a single crate that has two
+# build flavours, selected by feature:
+#
+# - `server` (default): native binary; axum router + SurrealDB + auth surface.
+# - `web`: `wasm32-unknown-unknown`; dioxus-web hydration of `ui::App`.
+#
+# `dx-CLI` toggles these automatically:
+#   - `dx serve --web`        → `--features web --target wasm32-unknown-unknown`
+#   - native server build     → `--features server`
+#   - `cargo run` / `cargo test` keep working because `default = ["server"]`.
+#
+# All server-only deps are `optional = true` so the WASM build does not pull
+# in axum/tokio/surrealdb (which fail to compile on `wasm32-unknown-unknown`).
+[features]
+default = ["server"]
+server = [
+    "dioxus/server",
+    "dep:anyhow",
+    "dep:axum",
+    "dep:dioxus-server",
+    "dep:tokio",
+    "dep:tracing-subscriber",
+    "dep:aes-gcm",
+    "dep:argon2",
+    "dep:async-trait",
+    "dep:bcrypt",
+    "dep:hex",
+    "dep:hickory-resolver",
+    "dep:jsonwebtoken",
+    "dep:rand",
+    "dep:scrypt",
+    "dep:thiserror",
+    "dep:tower",
+    "dep:tower-http",
+    "dep:url",
+    "dep:surrealdb",
+]
+web = ["dioxus/web"]
+
 [dependencies]
-anyhow = { workspace = true }
-axum = { workspace = true }
+# Compiles on both server and wasm targets.
 dioxus = { workspace = true }
-dioxus-server = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 ts6-manager-shared = { workspace = true }
-
-# Phase 1 SECURITY (PURA-4)
-aes-gcm = { workspace = true }
-argon2 = { workspace = true }
-async-trait = { workspace = true }
-bcrypt = { workspace = true }
-hex = { workspace = true }
-hickory-resolver = { workspace = true }
-jsonwebtoken = { workspace = true }
-rand = { workspace = true }
-scrypt = { workspace = true }
-thiserror = { workspace = true }
-tower = { workspace = true }
-tower-http = { workspace = true }
-url = { workspace = true }
-
-# Phase 1 DATA (PURA-10)
 chrono = { workspace = true }
-surrealdb = { workspace = true }
-
-# PURA-14 — auth client slice. WASM-only at runtime (gated by
-# `cfg(target_arch = "wasm32")` in source); on native targets these crates
-# compile but the request/storage code paths are unreachable.
 futures = { workspace = true }
+
+# PURA-14 — auth client slice. Source code is `cfg(target_arch = "wasm32")`
+# gated, so these compile cheaply on native (no network calls reachable).
 gloo-net = { workspace = true }
 js-sys = { workspace = true }
 wasm-bindgen = { workspace = true }
 wasm-bindgen-futures = { workspace = true }
 web-sys = { workspace = true }
+
+# Server-only — gated by the `server` feature so the wasm32 build skips them.
+anyhow = { workspace = true, optional = true }
+axum = { workspace = true, optional = true }
+dioxus-server = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+
+# Phase 1 SECURITY (PURA-4) — server-only.
+aes-gcm = { workspace = true, optional = true }
+argon2 = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+bcrypt = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
+hickory-resolver = { workspace = true, optional = true }
+jsonwebtoken = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
+scrypt = { workspace = true, optional = true }
+thiserror = { workspace = true, optional = true }
+tower = { workspace = true, optional = true }
+tower-http = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
+
+# Phase 1 DATA (PURA-10) — server-only.
+surrealdb = { workspace = true, optional = true }
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }

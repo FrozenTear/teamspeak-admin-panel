@@ -202,14 +202,15 @@ async fn send<Req: Serialize>(
     bearer: Option<&str>,
     body: Option<&Req>,
 ) -> Result<gloo_net::http::Response, AuthError> {
+    use gloo_net::http::Request;
     let url = format!("{}{}", base.trim_end_matches('/'), path);
-    let mut builder = gloo_net::http::Request::new(&url).method(match method {
-        "GET" => gloo_net::http::Method::GET,
-        "POST" => gloo_net::http::Method::POST,
-        "PUT" => gloo_net::http::Method::PUT,
-        "DELETE" => gloo_net::http::Method::DELETE,
+    let mut builder = match method {
+        "GET" => Request::get(&url),
+        "POST" => Request::post(&url),
+        "PUT" => Request::put(&url),
+        "DELETE" => Request::delete(&url),
         other => panic!("unsupported HTTP method `{other}`"),
-    });
+    };
     if let Some(token) = bearer {
         builder = builder.header("authorization", &format!("Bearer {token}"));
     }

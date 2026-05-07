@@ -4,7 +4,7 @@
 //! call returns 401 with the spec body [`auth_error_strings::INVALID_TOKEN`],
 //! the interceptor:
 //!
-//! 1. Acquires a process-wide [`tokio::sync::Mutex`] so only one refresh
+//! 1. Acquires a process-wide [`futures::lock::Mutex`] so only one refresh
 //!    fires regardless of how many callers raced into the gate.
 //! 2. Re-checks the access token — another caller may have rotated it
 //!    while we were waiting. If so, replays the original call with the
@@ -16,23 +16,41 @@
 //!
 //! The refresh transport is injected via [`RefreshFn`] so unit tests can
 //! exercise the locking + replay logic without touching the network.
+//!
+//! `futures::lock::Mutex` is runtime-agnostic: the same lock works under
+//! tokio (server-side / native tests) and under wasm-bindgen-futures
+//! (browser). We avoid `tokio::sync::Mutex` so this module compiles on the
+//! `wasm32-unknown-unknown` target the dx-CLI builds for the SPA bundle.
 
 use std::future::Future;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use futures::lock::Mutex;
 
 use ts6_manager_shared::auth::{RefreshRequest, TokenPairResponse, UserInfo};
 
 use crate::client::auth::AuthError;
 use crate::client::store::AuthState;
 
+/// `BoxFuture` that the gate's trait objects return. On the browser
+/// `JsFuture` is `!Send`, so the wasm build uses the non-Send variant; on
+/// native, the `Send`-bearing variant flows through `tokio::spawn` correctly.
+#[cfg(target_arch = "wasm32")]
+type GateFuture<T> = futures::future::LocalBoxFuture<'static, Result<T, AuthError>>;
+#[cfg(not(target_arch = "wasm32"))]
+type GateFuture<T> = futures::future::BoxFuture<'static, Result<T, AuthError>>;
+
 /// Pluggable refresh transport. The default impl built on top of [`crate::client::auth::refresh`]
 /// hits the real endpoint; tests inject a counting fake.
+///
+/// `Send + Sync` is required only on native — wasm is single-threaded and
+/// `JsFuture` cannot satisfy the bound. The trait is identical otherwise.
+#[cfg(target_arch = "wasm32")]
+pub trait RefreshFn {
+    fn refresh(&self, token: String) -> GateFuture<TokenPairResponse>;
+}
+#[cfg(not(target_arch = "wasm32"))]
 pub trait RefreshFn: Send + Sync {
-    fn refresh(
-        &self,
-        token: String,
-    ) -> futures::future::BoxFuture<'static, Result<TokenPairResponse, AuthError>>;
+    fn refresh(&self, token: String) -> GateFuture<TokenPairResponse>;
 }
 
 /// Refresh transport that calls [`crate::client::auth::refresh`] against a
@@ -50,10 +68,7 @@ impl HttpRefresh {
 }
 
 impl RefreshFn for HttpRefresh {
-    fn refresh(
-        &self,
-        token: String,
-    ) -> futures::future::BoxFuture<'static, Result<TokenPairResponse, AuthError>> {
+    fn refresh(&self, token: String) -> GateFuture<TokenPairResponse> {
         let base = self.base_url.clone();
         Box::pin(async move {
             crate::client::auth::refresh(

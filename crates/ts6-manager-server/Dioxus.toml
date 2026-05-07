@@ -1,0 +1,46 @@
+# PURA-17 — dx-CLI configuration for the ts6-manager-server fullstack app.
+#
+# Run from this crate's directory (or the workspace root with
+# `dx serve -p ts6-manager-server`):
+#
+#   dx serve                     # fullstack: launches `cargo run --features server`
+#                                #            and rebuilds the wasm client on save.
+#   dx build --web               # one-shot wasm bundle into `dist/public/`.
+#
+# The `asset!()` macro in `src/ui/mod.rs` already pulls
+# `assets/{tokens,components,layout}.css` into the bundle with hashed names —
+# `asset_dir` below is the *additional* unprocessed static-file directory
+# (favicons, robots.txt, …). Empty for now.
+
+[application]
+name = "ts6-manager-server"
+# Where dx writes its build output. `dist/public/` is the WASM bundle
+# (index.html + .wasm + hashed assets); `dist/server/` is the native
+# server binary when `dx serve --fullstack` is used.
+out_dir = "dist"
+# Static-file directory copied verbatim to the bundle. Optional; left
+# pointing at an empty folder so the schema is satisfied.
+asset_dir = "public"
+
+[web.app]
+title = "TS6 Manager"
+# Served from the apex; no subdir prefix.
+base_path = ""
+
+[web.watcher]
+# Rebuild on changes under `src/` and our static assets so editing CSS
+# triggers a hot-reload. `index_on_404 = true` is required so the SPA
+# router can handle deep links like `/login` on first request.
+reload_html = true
+watch_path = ["src", "assets"]
+index_on_404 = true
+
+[web.resource]
+# Stylesheets live in `asset!()` macro calls in source, so leave these
+# empty — dx pulls them in automatically.
+style = []
+script = []
+
+[web.resource.dev]
+style = []
+script = []
