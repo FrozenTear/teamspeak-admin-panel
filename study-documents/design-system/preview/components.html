@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TS6 Manager — Component primitives</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="components.css">
+<style>
+  body { padding: var(--space-8); }
+  .grid { display: grid; gap: var(--space-7); max-width: 1200px; margin: 0 auto; }
+  section { background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: var(--space-7); }
+  section h2 { margin: 0 0 var(--space-3); font: var(--weight-semibold) var(--text-lg) / var(--lh-lg) var(--font-sans); }
+  section .desc { margin: 0 0 var(--space-6); color: var(--text-secondary); font-size: var(--text-sm); }
+  .row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-4); }
+  .col { display: grid; gap: var(--space-4); }
+  .swatch-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: var(--space-4); }
+  .swatch {
+    height: 64px; border-radius: var(--radius-md);
+    display: flex; align-items: flex-end; justify-content: space-between;
+    padding: var(--space-3) var(--space-4);
+    font: var(--weight-medium) var(--text-xs) / 1 var(--font-mono);
+    border: 1px solid var(--border-subtle);
+  }
+  h1 { font: var(--weight-bold) var(--text-2xl) / var(--lh-2xl) var(--font-sans); margin-bottom: var(--space-3); }
+  .label-line { color: var(--text-muted); font: var(--weight-regular) var(--text-xs) / 1 var(--font-mono); margin-bottom: var(--space-3); }
+</style>
+</head>
+<body>
+<div class="grid">
+
+<header style="text-align:center; padding-bottom: var(--space-3)">
+  <h1>TS6 Manager — Design System</h1>
+  <p style="color: var(--text-secondary); margin: 0">Component primitives @ desktop · dark theme</p>
+</header>
+
+<section>
+  <h2>Buttons</h2>
+  <p class="desc">Variants × sizes. <code>primary</code>, <code>secondary</code>, <code>ghost</code>, <code>danger</code>, <code>link</code>.</p>
+  <div class="col">
+    <div class="row">
+      <button class="btn btn-primary btn-sm">Save</button>
+      <button class="btn btn-primary">Save changes</button>
+      <button class="btn btn-primary btn-lg">Add server</button>
+    </div>
+    <div class="row">
+      <button class="btn btn-secondary btn-sm">Cancel</button>
+      <button class="btn btn-secondary">Test connection</button>
+      <button class="btn btn-secondary btn-lg">Skip step</button>
+    </div>
+    <div class="row">
+      <button class="btn btn-ghost btn-sm">Help</button>
+      <button class="btn btn-ghost">Discard</button>
+      <button class="btn btn-danger">Delete server</button>
+      <a class="btn btn-link" href="#">Forgot password?</a>
+      <button class="btn btn-primary" disabled>Disabled</button>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>Inputs &amp; fields</h2>
+  <p class="desc">Text, password (with reveal affix), number, with required / optional / error states.</p>
+  <div class="col">
+    <div class="field" style="max-width: 380px">
+      <label class="field-label">Username <span class="field-required">*</span></label>
+      <input class="input" type="text" value="robert">
+      <span class="field-help">Letters, numbers, underscore. 3–32 characters.</span>
+    </div>
+    <div class="field" style="max-width: 380px">
+      <label class="field-label">WebQuery API key <span class="field-required">*</span></label>
+      <div class="input-group">
+        <input class="input is-focus" type="password" value="•••••••••••••••••••••••••">
+        <button class="affix" type="button">⊘</button>
+      </div>
+      <span class="field-help">Find this in the TS6 server admin → API Keys.</span>
+    </div>
+    <div class="field" style="max-width: 380px">
+      <label class="field-label">Display name <span class="field-optional">(optional)</span></label>
+      <input class="input" type="text" placeholder="e.g. My Community">
+    </div>
+    <div class="field" style="max-width: 380px">
+      <label class="field-label">Cron expression <span class="field-required">*</span></label>
+      <input class="input is-error" type="text" value="* /5 * * **">
+      <span class="field-error">⚠ Not a valid cron expression. Try <code>*/5 * * * *</code> for every 5 minutes.</span>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>Tags / status pills</h2>
+  <p class="desc">Status communicated via dot + label, never color alone.</p>
+  <div class="row">
+    <span class="tag tag-success"><span class="dot"></span>online</span>
+    <span class="tag tag-info"><span class="dot"></span>connecting</span>
+    <span class="tag tag-neutral"><span class="dot"></span>idle</span>
+    <span class="tag tag-warning"><span class="dot"></span>degraded</span>
+    <span class="tag tag-danger"><span class="dot"></span>offline</span>
+  </div>
+</section>
+
+<section>
+  <h2>Toasts</h2>
+  <p class="desc">Bottom-right anchored, color-bar discriminator, 3 variants shown.</p>
+  <div class="col" style="max-width: 420px">
+    <div class="toast toast-success">
+      <span class="accent-bar"></span>
+      <span class="icon">✓</span>
+      <div>
+        <div class="title">Server connected</div>
+        <div class="detail">My Community is healthy.</div>
+      </div>
+      <button class="close">✕</button>
+    </div>
+    <div class="toast toast-warning">
+      <span class="accent-bar"></span>
+      <span class="icon">⚠</span>
+      <div>
+        <div class="title">Connection degraded</div>
+        <div class="detail">SSH bridge reconnecting (3/5 attempts).</div>
+      </div>
+      <button class="close">✕</button>
+    </div>
+    <div class="toast toast-danger">
+      <span class="accent-bar"></span>
+      <span class="icon">✕</span>
+      <div>
+        <div class="title">Couldn't save flow</div>
+        <div class="detail">Cron trigger has an invalid expression.</div>
+      </div>
+      <button class="close">✕</button>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>Empty state</h2>
+  <div class="empty" style="background:var(--bg-canvas); border:1px dashed var(--border-subtle); border-radius:var(--radius-md);">
+    <div class="icon">＋</div>
+    <h3>No flows yet.</h3>
+    <p>Build automation that reacts to TeamSpeak events, cron schedules, webhooks, or in-channel commands.</p>
+    <div class="actions">
+      <button class="btn btn-primary">＋ Create flow</button>
+      <button class="btn btn-secondary">Browse templates</button>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>Table row</h2>
+  <table class="table">
+    <thead>
+      <tr><th>Name</th><th>Trigger</th><th>Status</th><th class="num">Runs</th><th></th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Welcome message</td><td>event · enterview</td><td><span class="tag tag-success"><span class="dot"></span>enabled</span></td><td class="num">214</td><td>⋯</td></tr>
+      <tr class="is-selected"><td>AFK mover</td><td>event · client_idle</td><td><span class="tag tag-success"><span class="dot"></span>enabled</span></td><td class="num">71</td><td>⋯</td></tr>
+      <tr><td>Server stats channel</td><td>cron · */5 * * * *</td><td><span class="tag tag-warning"><span class="dot"></span>paused</span></td><td class="num">8 405</td><td>⋯</td></tr>
+      <tr><td>Anti-VPN</td><td>event · enterview</td><td><span class="tag tag-neutral"><span class="dot"></span>disabled</span></td><td class="num">0</td><td>⋯</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section>
+  <h2>Modal — confirm destructive</h2>
+  <div style="position:relative; min-height: 380px; border-radius: var(--radius-md); overflow: hidden; background: rgba(11,14,19,0.6)">
+    <div style="position:absolute; inset:0; backdrop-filter: blur(4px);"></div>
+    <div class="modal" style="position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); width:480px;">
+      <div class="modal-header">
+        <h2>Delete <em style="font-style:normal;color:var(--accent-fg)">My Community</em>?</h2>
+      </div>
+      <div class="modal-body">
+        <p style="margin:0 0 var(--space-5); color: var(--text-secondary)">
+          This will permanently delete the server connection and everything bound to it:
+        </p>
+        <ul style="margin:0 0 var(--space-5); padding-left: var(--space-7); color: var(--text-secondary)">
+          <li>3 flows</li>
+          <li>1 music bot</li>
+          <li>2 widgets</li>
+        </ul>
+        <p style="margin:0; color: var(--text-secondary)">Type <code style="background:var(--bg-surface-sunken); padding:2px 6px; border-radius:var(--radius-sm); color: var(--accent-fg)">My Community</code> to confirm.</p>
+        <input class="input is-error" type="text" placeholder="Type the server name…" style="margin-top: var(--space-4)">
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-ghost">Cancel</button>
+        <button class="btn btn-danger" disabled>Delete server</button>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>Skeleton (loading)</h2>
+  <div class="col" style="max-width: 480px">
+    <div class="skeleton" style="height: 28px; width: 60%"></div>
+    <div class="skeleton"></div>
+    <div class="skeleton" style="width: 80%"></div>
+    <div class="skeleton" style="width: 65%"></div>
+  </div>
+</section>
+
+</div>
+</body>
+</html>

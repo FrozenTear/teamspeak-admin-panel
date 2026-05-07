@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TS6 Manager — Dashboard</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="components.css">
+<style>
+  .kpi-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: var(--space-5);
+    margin-bottom: var(--space-7);
+  }
+  .kpi {
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    padding: var(--space-6);
+    display: grid;
+    gap: var(--space-3);
+  }
+  .kpi .label {
+    font: var(--weight-semibold) var(--text-2xs) / 1 var(--font-sans);
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .kpi .row {
+    display: flex; align-items: baseline; gap: var(--space-4); justify-content: space-between;
+  }
+  .kpi .value {
+    font: var(--weight-bold) var(--text-2xl) / 1 var(--font-sans);
+    color: var(--text-primary);
+    font-variant-numeric: tabular-nums;
+  }
+  .kpi .secondary {
+    font: var(--weight-medium) var(--text-sm) / 1 var(--font-sans);
+    color: var(--text-secondary);
+  }
+  .charts {
+    display: grid;
+    grid-template-columns: 1.6fr 1fr;
+    gap: var(--space-5);
+    margin-bottom: var(--space-7);
+  }
+  .panel {
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    padding: var(--space-6);
+  }
+  .panel .title {
+    font: var(--weight-semibold) var(--text-base) / 1 var(--font-sans);
+    color: var(--text-primary);
+    margin-bottom: var(--space-5);
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .panel .legend {
+    display: inline-flex; gap: var(--space-5);
+    font: var(--weight-regular) var(--text-xs) / 1 var(--font-sans);
+    color: var(--text-secondary);
+  }
+  .panel .legend .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
+
+  .conn-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    row-gap: var(--space-3);
+    column-gap: var(--space-5);
+    font: var(--weight-regular) var(--text-sm) / var(--lh-sm) var(--font-sans);
+  }
+  .conn-grid .lbl { color: var(--text-secondary); }
+  .conn-grid .val { color: var(--text-primary); text-align: right; font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+  .conn-grid .val.ok { color: var(--success-fg); }
+  .conn-grid .val.txt { font-family: var(--font-sans); }
+
+  .activity {
+    list-style: none; padding: 0; margin: 0;
+    display: grid; gap: var(--space-4);
+  }
+  .activity li {
+    display: grid;
+    grid-template-columns: 16px 1fr auto;
+    gap: var(--space-4);
+    align-items: center;
+    font: var(--weight-regular) var(--text-sm) / var(--lh-sm) var(--font-sans);
+    color: var(--text-primary);
+  }
+  .activity li .ts { font-size: var(--text-xs); color: var(--text-muted); font-variant-numeric: tabular-nums; }
+  .activity li .ic { color: var(--accent-fg); font-size: 14px; line-height: 1; text-align: center; }
+  .activity li.is-join .ic { color: var(--success-fg); }
+  .activity li.is-leave .ic { color: var(--text-muted); }
+  .activity li.is-bot .ic { color: var(--info-fg); }
+  .activity li.is-flow .ic { color: var(--warning-fg); }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <aside class="sidebar">
+    <div class="brand"><span class="mark"></span> TS6 Manager</div>
+
+    <div class="nav-group">
+      <div class="nav-group-label">Server</div>
+      <a class="nav-item is-active" href="#"><span class="icn">▦</span> Dashboard</a>
+      <a class="nav-item" href="#"><span class="icn">#</span> Channels</a>
+      <a class="nav-item" href="#"><span class="icn">◆</span> Clients</a>
+      <a class="nav-item" href="#"><span class="icn">▤</span> Files</a>
+    </div>
+
+    <div class="nav-group">
+      <div class="nav-group-label">Moderation</div>
+      <a class="nav-item" href="#"><span class="icn">⚐</span> Server groups</a>
+      <a class="nav-item" href="#"><span class="icn">⚑</span> Channel groups</a>
+      <a class="nav-item" href="#"><span class="icn">⚒</span> Permissions</a>
+      <a class="nav-item" href="#"><span class="icn">⊘</span> Bans</a>
+      <a class="nav-item" href="#"><span class="icn">∘</span> Tokens</a>
+      <a class="nav-item" href="#"><span class="icn">!</span> Complaints</a>
+      <a class="nav-item" href="#"><span class="icn">✉</span> Messages</a>
+    </div>
+
+    <div class="nav-group">
+      <div class="nav-group-label">Automation</div>
+      <a class="nav-item" href="#"><span class="icn">⊕</span> Bots</a>
+      <a class="nav-item" href="#"><span class="icn">♪</span> Music bots</a>
+      <a class="nav-item" href="#"><span class="icn">▣</span> Widgets</a>
+    </div>
+
+    <div class="nav-group">
+      <div class="nav-group-label">Admin</div>
+      <a class="nav-item" href="#"><span class="icn">≡</span> Logs</a>
+      <a class="nav-item" href="#"><span class="icn">◯</span> Instance</a>
+      <a class="nav-item" href="#"><span class="icn">⚙</span> Settings</a>
+    </div>
+  </aside>
+
+  <header class="header">
+    <button class="btn btn-ghost btn-sm hamburger" style="display:none" aria-label="Open navigation">☰</button>
+    <button class="selector desktop-selector"><span class="mark">⬢</span> My Community <span style="opacity:.7;margin-left:6px">▾</span></button>
+    <span class="ws-dot" title="WebSocket connected"></span>
+    <span class="spacer"></span>
+    <button class="btn btn-ghost btn-sm" title="Toggle theme">☾</button>
+    <span class="user"><span class="avatar">RS</span> Robert <span style="opacity:.7">▾</span></span>
+    <button class="btn btn-secondary btn-sm logout-btn">Logout</button>
+  </header>
+
+  <div class="mobile-selector-bar" style="display:none">
+    <button class="selector" style="width:100%; justify-content:flex-start"><span class="mark">⬢</span> My Community <span style="margin-left:auto;opacity:.7">▾</span></button>
+  </div>
+
+  <style>
+    @media (max-width: 768px) {
+      .hamburger { display: inline-flex !important; }
+      .header .desktop-selector { display: none !important; }
+      .header .logout-btn { display: none !important; }
+      .header .user span:not(.avatar) { display: none; }
+      .mobile-selector-bar {
+        display: block !important;
+        grid-column: 1;
+        padding: var(--space-3) var(--space-5);
+        background: var(--bg-canvas);
+        border-bottom: 1px solid var(--border-subtle);
+      }
+      .kpi-grid { grid-template-columns: 1fr !important; }
+      .charts { grid-template-columns: 1fr !important; }
+    }
+  </style>
+
+  <main class="main">
+    <div class="crumb">My Community / Dashboard</div>
+    <h1>Dashboard</h1>
+
+    <div class="kpi-grid">
+      <div class="kpi">
+        <div class="label">Online</div>
+        <div class="row">
+          <span class="value">47<span style="color:var(--text-muted); font-weight:var(--weight-medium); font-size: var(--text-base); margin-left: 6px">/ 512</span></span>
+          <span class="tag tag-success"><span class="dot"></span>active</span>
+        </div>
+      </div>
+      <div class="kpi">
+        <div class="label">Channels</div>
+        <div class="row">
+          <span class="value">124</span>
+          <span class="secondary">12 spacers</span>
+        </div>
+      </div>
+      <div class="kpi">
+        <div class="label">Uptime</div>
+        <div class="row">
+          <span class="value" style="font-size: var(--text-xl)">12d 03h</span>
+          <span class="secondary">since 2026-04-25</span>
+        </div>
+      </div>
+      <div class="kpi">
+        <div class="label">Status</div>
+        <div class="row">
+          <span class="value" style="font-size: var(--text-xl); color: var(--success-fg)">Live</span>
+          <span class="tag tag-success"><span class="dot"></span>healthy</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="charts">
+      <div class="panel">
+        <div class="title">
+          Bandwidth <span style="color:var(--text-muted); font-weight: var(--weight-regular)">(last 60 s)</span>
+          <span class="legend">
+            <span><span class="swatch" style="background:var(--accent-fg)"></span>incoming</span>
+            <span><span class="swatch" style="background:var(--success-fg)"></span>outgoing</span>
+          </span>
+        </div>
+        <svg viewBox="0 0 600 140" width="100%" height="140" preserveAspectRatio="none">
+          <defs>
+            <linearGradient id="gIn" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stop-color="#3CBEEF" stop-opacity="0.35"/>
+              <stop offset="100%" stop-color="#3CBEEF" stop-opacity="0"/>
+            </linearGradient>
+            <linearGradient id="gOut" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stop-color="#5DD299" stop-opacity="0.30"/>
+              <stop offset="100%" stop-color="#5DD299" stop-opacity="0"/>
+            </linearGradient>
+          </defs>
+          <!-- baseline grid -->
+          <line x1="0" y1="35"  x2="600" y2="35"  stroke="#2A3344" stroke-dasharray="2,4" />
+          <line x1="0" y1="70"  x2="600" y2="70"  stroke="#2A3344" stroke-dasharray="2,4" />
+          <line x1="0" y1="105" x2="600" y2="105" stroke="#2A3344" stroke-dasharray="2,4" />
+          <!-- incoming area + line -->
+          <path fill="url(#gIn)"
+                d="M0,90 L20,82 L40,72 L60,80 L80,68 L100,55 L120,48 L140,52 L160,40 L180,35 L200,42 L220,55 L240,62 L260,55 L280,48 L300,40 L320,35 L340,30 L360,42 L380,55 L400,68 L420,75 L440,72 L460,60 L480,52 L500,48 L520,42 L540,38 L560,45 L580,52 L600,58 L600,140 L0,140 Z" />
+          <path fill="none" stroke="#3CBEEF" stroke-width="2"
+                d="M0,90 L20,82 L40,72 L60,80 L80,68 L100,55 L120,48 L140,52 L160,40 L180,35 L200,42 L220,55 L240,62 L260,55 L280,48 L300,40 L320,35 L340,30 L360,42 L380,55 L400,68 L420,75 L440,72 L460,60 L480,52 L500,48 L520,42 L540,38 L560,45 L580,52 L600,58" />
+          <!-- outgoing area + line -->
+          <path fill="url(#gOut)"
+                d="M0,108 L20,105 L40,100 L60,102 L80,98 L100,92 L120,88 L140,90 L160,86 L180,84 L200,86 L220,92 L240,95 L260,90 L280,86 L300,80 L320,76 L340,74 L360,80 L380,86 L400,92 L420,95 L440,92 L460,86 L480,82 L500,80 L520,76 L540,74 L560,78 L580,82 L600,86 L600,140 L0,140 Z" />
+          <path fill="none" stroke="#5DD299" stroke-width="2"
+                d="M0,108 L20,105 L40,100 L60,102 L80,98 L100,92 L120,88 L140,90 L160,86 L180,84 L200,86 L220,92 L240,95 L260,90 L280,86 L300,80 L320,76 L340,74 L360,80 L380,86 L400,92 L420,95 L440,92 L460,86 L480,82 L500,80 L520,76 L540,74 L560,78 L580,82 L600,86" />
+        </svg>
+        <div style="display:flex; justify-content:space-between; margin-top:var(--space-3); font-size:var(--text-xs); color:var(--text-muted); font-variant-numeric: tabular-nums;">
+          <span style="color: var(--accent-fg)">↑ 1.42 MB/s in</span>
+          <span style="color: var(--success-fg)">↓ 0.87 MB/s out</span>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="title">Connection</div>
+        <div class="conn-grid">
+          <span class="lbl">Ping</span><span class="val ok">42 ms</span>
+          <span class="lbl">Packet loss</span><span class="val ok">0.0 %</span>
+          <span class="lbl">Platform</span><span class="val txt">Linux</span>
+          <span class="lbl">Version</span><span class="val txt">6.1.4 (build 2026-03)</span>
+          <span class="lbl">SSH bridge</span><span class="val txt" style="color:var(--success-fg)">connected</span>
+          <span class="lbl">WebQuery</span><span class="val txt" style="color:var(--success-fg)">healthy</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="title">Recent activity <span style="color:var(--text-muted); font-weight:var(--weight-regular); font-size: var(--text-xs)">last hour</span></div>
+      <ul class="activity">
+        <li class="is-join"><span class="ic">+</span> <span><strong>Alice</strong> joined #Lobby</span> <span class="ts">2m ago</span></li>
+        <li class="is-leave"><span class="ic">−</span> <span><strong>Bob</strong> left #Project Alpha</span> <span class="ts">3m ago</span></li>
+        <li class="is-flow"><span class="ic">⚡</span> <span>Flow <strong>Welcome message</strong> triggered for new client</span> <span class="ts">3m ago</span></li>
+        <li class="is-bot"><span class="ic">♪</span> <span>Music bot <strong>radio-1</strong> started — "Lo-fi beats / chill"</span> <span class="ts">12m ago</span></li>
+        <li class="is-flow"><span class="ic">⚡</span> <span>Flow <strong>AFK mover</strong> moved 2 clients to #AFK</span> <span class="ts">21m ago</span></li>
+        <li class="is-join"><span class="ic">+</span> <span><strong>charlie</strong> joined #Music Lounge</span> <span class="ts">38m ago</span></li>
+      </ul>
+    </div>
+  </main>
+</div>
+</body>
+</html>

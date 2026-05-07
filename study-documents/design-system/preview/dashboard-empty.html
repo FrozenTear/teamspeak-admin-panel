@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TS6 Manager — Dashboard (empty / no servers)</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="components.css">
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand"><span class="mark"></span> TS6 Manager</div>
+    <div class="nav-group">
+      <div class="nav-group-label">Server</div>
+      <a class="nav-item is-active" href="#"><span class="icn">▦</span> Dashboard</a>
+      <a class="nav-item" href="#" style="opacity:.5"><span class="icn">#</span> Channels</a>
+      <a class="nav-item" href="#" style="opacity:.5"><span class="icn">◆</span> Clients</a>
+    </div>
+    <div class="nav-group">
+      <div class="nav-group-label">Admin</div>
+      <a class="nav-item" href="#"><span class="icn">⚙</span> Settings</a>
+    </div>
+  </aside>
+
+  <header class="header">
+    <button class="btn btn-ghost btn-sm hamburger" style="display:none" aria-label="Open navigation">☰</button>
+    <button class="selector desktop-selector" disabled style="opacity:.7"><span class="mark">⬢</span> No servers <span style="opacity:.7;margin-left:6px">▾</span></button>
+    <span class="ws-dot" title="WebSocket connected"></span>
+    <span class="spacer"></span>
+    <button class="btn btn-ghost btn-sm" title="Toggle theme">☾</button>
+    <span class="user"><span class="avatar">RS</span> Robert <span style="opacity:.7">▾</span></span>
+    <button class="btn btn-secondary btn-sm logout-btn">Logout</button>
+  </header>
+  <style>
+    @media (max-width: 768px) {
+      .hamburger { display: inline-flex !important; }
+      .header .desktop-selector { display: none !important; }
+      .header .logout-btn { display: none !important; }
+      .header .user span:not(.avatar) { display: none; }
+    }
+  </style>
+
+  <main class="main">
+    <div class="empty">
+      <div class="icon">＋</div>
+      <h3>No TeamSpeak servers connected.</h3>
+      <p>Add your first server connection to start managing channels, clients, and automation.</p>
+      <div class="actions">
+        <button class="btn btn-primary btn-lg">＋ Add server</button>
+        <button class="btn btn-secondary btn-lg">Re-run setup</button>
+      </div>
+    </div>
+  </main>
+</div>
+</body>
+</html>

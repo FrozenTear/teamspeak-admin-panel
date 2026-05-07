@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TS6 Manager — Servers</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="components.css">
+<style>
+  .server-list {
+    display: grid;
+    gap: var(--space-5);
+    margin-bottom: var(--space-7);
+  }
+  .server-row {
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    padding: var(--space-6);
+    display: flex;
+    align-items: center;
+    gap: var(--space-5);
+  }
+  .server-row:hover { border-color: var(--border-strong); box-shadow: var(--shadow-sm); }
+  .server-row.is-active {
+    border-color: var(--accent-fg);
+    box-shadow: inset 2px 0 0 var(--accent-fg);
+  }
+  .server-row .icon {
+    flex: 0 0 auto;
+    width: 40px; height: 40px;
+    border-radius: var(--radius-md);
+    background: var(--bg-surface-raised);
+    display: grid; place-items: center;
+    color: var(--accent-fg);
+    font-size: 18px;
+  }
+  .server-row .body {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: grid;
+    gap: var(--space-3);
+  }
+  .server-row .name {
+    font: var(--weight-semibold) var(--text-base) / 1 var(--font-sans);
+    color: var(--text-primary);
+    display: flex; align-items: center; gap: var(--space-3); flex-wrap: wrap;
+  }
+  .server-row .meta {
+    font: var(--weight-regular) var(--text-sm) / var(--lh-sm) var(--font-sans);
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+  .server-row .meta .sep { margin: 0 var(--space-3); opacity: 0.5; }
+  .server-row .actions {
+    flex: 0 0 auto;
+    display: inline-flex; gap: var(--space-3); align-items: center;
+  }
+  .page-actions {
+    display: flex; align-items: center; gap: var(--space-4);
+    margin-bottom: var(--space-6);
+  }
+  .page-actions .spacer { margin-left: auto; }
+  .page-actions .filter {
+    width: 320px;
+    height: 36px;
+    padding: 0 var(--space-5);
+    background: var(--bg-surface-sunken);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    color: var(--text-primary);
+    font: var(--weight-regular) var(--text-sm) / var(--lh-sm) var(--font-sans);
+  }
+  @media (max-width: 768px) {
+    .page-actions { flex-direction: column; align-items: stretch; }
+    .page-actions .filter { width: 100%; }
+    .page-actions .spacer { display: none; }
+    .server-row {
+      flex-wrap: wrap;
+    }
+    .server-row .icon { width: 32px; height: 32px; font-size: 14px; }
+    .server-row .body { flex: 1 1 calc(100% - 32px - var(--space-5)); }
+    .server-row .actions {
+      flex: 1 1 100%;
+      flex-wrap: wrap; padding-top: var(--space-3);
+      border-top: 1px solid var(--border-subtle);
+    }
+  }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <aside class="sidebar">
+    <div class="brand"><span class="mark"></span> TS6 Manager</div>
+
+    <div class="nav-group">
+      <div class="nav-group-label">Server</div>
+      <a class="nav-item" href="dashboard.html"><span class="icn">▦</span> Dashboard</a>
+      <a class="nav-item" href="#"><span class="icn">#</span> Channels</a>
+      <a class="nav-item" href="#"><span class="icn">◆</span> Clients</a>
+      <a class="nav-item" href="#"><span class="icn">▤</span> Files</a>
+    </div>
+
+    <div class="nav-group">
+      <div class="nav-group-label">Moderation</div>
+      <a class="nav-item" href="#"><span class="icn">⚐</span> Server groups</a>
+      <a class="nav-item" href="#"><span class="icn">⚑</span> Channel groups</a>
+      <a class="nav-item" href="#"><span class="icn">⚒</span> Permissions</a>
+      <a class="nav-item" href="#"><span class="icn">⊘</span> Bans</a>
+      <a class="nav-item" href="#"><span class="icn">∘</span> Tokens</a>
+      <a class="nav-item" href="#"><span class="icn">!</span> Complaints</a>
+      <a class="nav-item" href="#"><span class="icn">✉</span> Messages</a>
+    </div>
+
+    <div class="nav-group">
+      <div class="nav-group-label">Automation</div>
+      <a class="nav-item" href="#"><span class="icn">⊕</span> Bots</a>
+      <a class="nav-item" href="#"><span class="icn">♪</span> Music bots</a>
+      <a class="nav-item" href="#"><span class="icn">▣</span> Widgets</a>
+    </div>
+
+    <div class="nav-group">
+      <div class="nav-group-label">Admin</div>
+      <a class="nav-item" href="#"><span class="icn">≡</span> Logs</a>
+      <a class="nav-item is-active" href="servers.html"><span class="icn">◯</span> Servers</a>
+      <a class="nav-item" href="#"><span class="icn">⚙</span> Settings</a>
+    </div>
+  </aside>
+
+  <header class="header">
+    <button class="btn btn-ghost btn-sm hamburger" style="display:none" aria-label="Open navigation">☰</button>
+    <button class="selector desktop-selector"><span class="mark">⬢</span> My Community <span style="opacity:.7;margin-left:6px">▾</span></button>
+    <span class="ws-dot" title="WebSocket connected"></span>
+    <span class="spacer"></span>
+    <button class="btn btn-ghost btn-sm" title="Toggle theme">☾</button>
+    <span class="user"><span class="avatar">RS</span> Robert <span style="opacity:.7">▾</span></span>
+    <button class="btn btn-secondary btn-sm logout-btn">Logout</button>
+  </header>
+
+  <div class="mobile-selector-bar" style="display:none">
+    <button class="selector" style="width:100%; justify-content:flex-start"><span class="mark">⬢</span> My Community <span style="margin-left:auto;opacity:.7">▾</span></button>
+  </div>
+
+  <style>
+    @media (max-width: 768px) {
+      .hamburger { display: inline-flex !important; }
+      .header .desktop-selector { display: none !important; }
+      .header .logout-btn { display: none !important; }
+      .header .user span:not(.avatar) { display: none; }
+      .mobile-selector-bar {
+        display: block !important;
+        grid-column: 1;
+        padding: var(--space-3) var(--space-5);
+        background: var(--bg-canvas);
+        border-bottom: 1px solid var(--border-subtle);
+      }
+    }
+  </style>
+
+  <main class="main">
+    <div class="crumb">Admin / Servers</div>
+    <h1>TeamSpeak servers</h1>
+    <p style="margin: 0 0 var(--space-7); color: var(--text-secondary); max-width: 60ch;">
+      Connect this manager to one or more TS6 server instances. Switch between them anytime from the header server selector.
+    </p>
+
+    <div class="page-actions">
+      <input type="text" class="filter" placeholder="Filter by name or host…" aria-label="Filter servers">
+      <span class="spacer"></span>
+      <button class="btn btn-primary">＋ Add server</button>
+    </div>
+
+    <div class="server-list">
+
+      <div class="server-row is-active">
+        <div class="icon">⬢</div>
+        <div class="body">
+          <div class="name">
+            My Community
+            <span class="tag tag-success"><span class="dot"></span>connected</span>
+            <span class="tag tag-info">active</span>
+          </div>
+          <div class="meta">ts.example.com<span class="sep">·</span>WebQuery 10080<span class="sep">·</span>last used 2 m ago</div>
+        </div>
+        <div class="actions">
+          <button class="btn btn-ghost btn-sm">Open</button>
+          <button class="btn btn-ghost btn-sm">Edit</button>
+          <button class="btn btn-ghost btn-sm" aria-label="More">⋯</button>
+        </div>
+      </div>
+
+      <div class="server-row">
+        <div class="icon">⬢</div>
+        <div class="body">
+          <div class="name">
+            Backup node
+            <span class="tag tag-success"><span class="dot"></span>connected</span>
+          </div>
+          <div class="meta">10.0.4.21<span class="sep">·</span>WebQuery 10080<span class="sep">·</span>last used yesterday</div>
+        </div>
+        <div class="actions">
+          <button class="btn btn-secondary btn-sm">Switch to</button>
+          <button class="btn btn-ghost btn-sm">Edit</button>
+          <button class="btn btn-ghost btn-sm" aria-label="More">⋯</button>
+        </div>
+      </div>
+
+      <div class="server-row">
+        <div class="icon">⬢</div>
+        <div class="body">
+          <div class="name">
+            Tournament server
+            <span class="tag tag-warning"><span class="dot"></span>reconnecting</span>
+          </div>
+          <div class="meta">tourney.example.com<span class="sep">·</span>WebQuery 10080<span class="sep">·</span>last used 3 d ago</div>
+        </div>
+        <div class="actions">
+          <button class="btn btn-secondary btn-sm">Switch to</button>
+          <button class="btn btn-ghost btn-sm">Edit</button>
+          <button class="btn btn-ghost btn-sm" aria-label="More">⋯</button>
+        </div>
+      </div>
+
+      <div class="server-row">
+        <div class="icon">⬢</div>
+        <div class="body">
+          <div class="name">
+            Lan party (legacy)
+            <span class="tag tag-danger"><span class="dot"></span>auth failed</span>
+          </div>
+          <div class="meta">192.168.10.4<span class="sep">·</span>WebQuery 10080<span class="sep">·</span>last used 18 d ago</div>
+        </div>
+        <div class="actions">
+          <button class="btn btn-secondary btn-sm">Reconnect</button>
+          <button class="btn btn-ghost btn-sm">Edit</button>
+          <button class="btn btn-ghost btn-sm" aria-label="More">⋯</button>
+        </div>
+      </div>
+
+    </div>
+
+    <p style="color: var(--text-muted); font-size: var(--text-xs); margin: var(--space-5) 0 0;">
+      4 servers configured. <a href="#" style="color: var(--text-link)">Learn how to add a server</a>.
+    </p>
+
+  </main>
+</div>
+</body>
+</html>

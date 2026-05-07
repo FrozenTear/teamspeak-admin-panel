@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TS6 Manager — Server Selector (open menu)</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="components.css">
+<style>
+  .menu {
+    position: absolute;
+    top: 60px; left: 16px;
+    width: 380px;
+    background: var(--bg-surface-raised);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-md);
+    padding: 0;
+    overflow: hidden;
+    z-index: 200;
+  }
+  .menu .menu-head {
+    padding: var(--space-4) var(--space-6);
+    font: var(--weight-semibold) var(--text-2xs) / 1 var(--font-sans);
+    color: var(--text-secondary);
+    text-transform: uppercase; letter-spacing: 0.05em;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  .menu .filter {
+    padding: var(--space-4) var(--space-5);
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  .menu .filter input {
+    width: 100%; height: 32px;
+    padding: 0 var(--space-4);
+    background: var(--bg-surface-sunken);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    color: var(--text-primary);
+    font: var(--weight-regular) var(--text-sm) / 1 var(--font-sans);
+  }
+  .menu .row {
+    display: grid;
+    grid-template-columns: 24px 1fr auto;
+    gap: var(--space-4);
+    align-items: center;
+    padding: var(--space-4) var(--space-6);
+    border-bottom: 1px solid var(--border-subtle);
+    font: var(--weight-medium) var(--text-sm) / var(--lh-sm) var(--font-sans);
+    cursor: pointer;
+  }
+  .menu .row:hover { background: var(--bg-hover); }
+  .menu .row.is-selected { background: var(--bg-selected); box-shadow: inset 2px 0 0 var(--accent-fg); }
+  .menu .row .ic { color: var(--accent-fg); font-size: 14px; line-height: 1; }
+  .menu .row .ic.degraded { color: var(--warning-fg); }
+  .menu .row .ic.offline { color: var(--danger-fg); }
+  .menu .row .meta {
+    display: grid;
+  }
+  .menu .row .name { color: var(--text-primary); }
+  .menu .row .host { color: var(--text-muted); font: var(--weight-regular) var(--text-xs) / 1 var(--font-mono); margin-top: 2px; }
+  .menu .row .right {
+    display: inline-flex; align-items: center; gap: var(--space-3);
+    color: var(--text-secondary);
+    font: var(--weight-regular) var(--text-xs) / 1 var(--font-sans);
+  }
+  .menu .row .right .check { color: var(--accent-fg); font-size: 14px; }
+  .menu .footer-row {
+    display: grid;
+    grid-template-columns: 20px 1fr;
+    gap: var(--space-4);
+    align-items: center;
+    padding: var(--space-4) var(--space-6);
+    font: var(--weight-medium) var(--text-sm) / 1 var(--font-sans);
+    color: var(--text-secondary);
+    cursor: pointer;
+  }
+  .menu .footer-row:first-of-type { border-top: 1px solid var(--border-subtle); }
+  .menu .footer-row:hover { background: var(--bg-hover); color: var(--accent-fg); }
+
+  /* fake header behind */
+  .header-fake {
+    height: var(--header-height);
+    background: var(--bg-canvas);
+    border-bottom: 1px solid var(--border-subtle);
+    display: flex; align-items: center; gap: var(--space-5);
+    padding: 0 var(--space-7);
+  }
+  body { background: var(--bg-canvas); padding: 0; min-height: 100vh; }
+</style>
+</head>
+<body>
+
+<div class="header-fake" style="position:relative">
+  <button class="selector" style="border-color: var(--accent-fg)"><span class="mark" style="color:var(--accent-fg)">⬢</span> My Community <span style="opacity:.7;margin-left:6px">▴</span></button>
+  <span class="ws-dot" title="WebSocket connected"></span>
+  <span class="spacer" style="margin-left:auto"></span>
+  <span class="user"><span class="avatar">RS</span> Robert <span style="opacity:.7">▾</span></span>
+
+  <div class="menu" role="listbox" aria-label="Switch server">
+    <div class="menu-head">Switch server</div>
+    <div class="filter"><input type="text" placeholder="🔍 Filter…"></div>
+
+    <div class="row is-selected" role="option" aria-selected="true">
+      <span class="ic">⬢</span>
+      <div class="meta">
+        <span class="name">My Community</span>
+        <span class="host">ts.example.com:10080</span>
+      </div>
+      <span class="right">
+        <span class="tag tag-success"><span class="dot"></span>47/512</span>
+        <span class="check">✓</span>
+      </span>
+    </div>
+
+    <div class="row" role="option">
+      <span class="ic">⬢</span>
+      <div class="meta">
+        <span class="name">Test server</span>
+        <span class="host">test.local:10080</span>
+      </div>
+      <span class="right">
+        <span class="tag tag-info"><span class="dot"></span>3/32</span>
+      </span>
+    </div>
+
+    <div class="row" role="option">
+      <span class="ic degraded">⬢</span>
+      <div class="meta">
+        <span class="name">Friends server</span>
+        <span class="host">friends.example.com:10080</span>
+      </div>
+      <span class="right">
+        <span class="tag tag-warning"><span class="dot"></span>degraded</span>
+      </span>
+    </div>
+
+    <div class="row" role="option">
+      <span class="ic offline">⬢</span>
+      <div class="meta">
+        <span class="name">Old test box</span>
+        <span class="host">old.test:10080</span>
+      </div>
+      <span class="right">
+        <span class="tag tag-danger"><span class="dot"></span>offline</span>
+      </span>
+    </div>
+
+    <div class="footer-row"><span style="color:var(--accent-fg)">＋</span> Add server</div>
+    <div class="footer-row"><span>⚙</span> Manage servers</div>
+  </div>
+</div>
+
+</body>
+</html>

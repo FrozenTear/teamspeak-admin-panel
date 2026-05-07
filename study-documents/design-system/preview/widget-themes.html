@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TS6 Manager — Widget Themes (6 palettes)</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="components.css">
+<style>
+  body { padding: var(--space-7); }
+  h1 { font: var(--weight-bold) var(--text-2xl) / var(--lh-2xl) var(--font-sans); margin: 0 0 var(--space-3); text-align:center; }
+  h1 + p { color: var(--text-secondary); text-align: center; margin: 0 0 var(--space-7); }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: var(--space-7);
+    max-width: 1380px;
+    margin: 0 auto;
+  }
+  .tile {
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    padding: var(--space-6);
+    text-align: center;
+  }
+  .tile h3 {
+    margin: 0 0 var(--space-3);
+    font: var(--weight-semibold) var(--text-base) / 1 var(--font-sans);
+  }
+  .tile .blurb {
+    color: var(--text-muted);
+    font: var(--weight-regular) var(--text-xs) / var(--lh-xs) var(--font-sans);
+    margin-bottom: var(--space-5);
+    height: 28px;
+  }
+  .tile .canvas {
+    display: grid; place-items: center;
+    padding: var(--space-5);
+    border-radius: var(--radius-md);
+  }
+  .tile.transparent .canvas {
+    background-image:
+      linear-gradient(45deg, var(--c-neutral-100) 25%, transparent 25%),
+      linear-gradient(-45deg, var(--c-neutral-100) 25%, transparent 25%),
+      linear-gradient(45deg, transparent 75%, var(--c-neutral-100) 75%),
+      linear-gradient(-45deg, transparent 75%, var(--c-neutral-100) 75%);
+    background-size: 16px 16px;
+    background-position: 0 0, 0 8px, 8px -8px, -8px 0px;
+    background-color: #20242E;
+  }
+  .swatches {
+    display: grid;
+    grid-template-columns: repeat(8, 1fr);
+    gap: 2px;
+    margin-top: var(--space-5);
+  }
+  .swatches span {
+    height: 14px; border-radius: 2px;
+    border: 1px solid rgba(255,255,255,0.1);
+  }
+</style>
+</head>
+<body>
+<h1>Public widget — 6 themes</h1>
+<p>Each rendered to spec §27.3 layout (400 px wide, dynamic height). Operator picker shows tiles like these.</p>
+
+<div class="grid">
+
+<!-- DARK -->
+<div class="tile dark">
+  <h3>dark</h3>
+  <div class="blurb">Default. Cool blue-black, cyan accent.</div>
+  <div class="canvas" style="background:#0F1218">
+    <!-- 400x290 SVG -->
+    <svg width="400" height="290" viewBox="0 0 400 290" xmlns="http://www.w3.org/2000/svg" style="border-radius:10px;">
+      <rect width="400" height="290" rx="10" fill="#0F1218"/>
+      <rect width="400" height="72" fill="#161B25"/>
+      <text x="14" y="34" font-family="Segoe UI, Helvetica Neue, Arial, sans-serif" font-weight="700" font-size="15" fill="#3CBEEF">My Community</text>
+      <rect x="334" y="20" width="52" height="18" rx="3" fill="#5DD299"/>
+      <text x="360" y="33" text-anchor="middle" font-family="Segoe UI" font-size="10" font-weight="700" fill="#FFFFFF">ONLINE</text>
+      <text x="14" y="58" font-family="Segoe UI" font-size="11" fill="#7A8398">47/512 users • 12d 3h uptime</text>
+      <line x1="0" y1="72" x2="400" y2="72" stroke="#283040"/>
+      <!-- channel rows -->
+      <text x="14" y="96" font-family="Segoe UI" font-size="12" font-weight="700" fill="#3CBEEF">#</text>
+      <text x="28" y="96" font-family="Segoe UI" font-size="12" fill="#E8ECF4">Lobby</text>
+      <text x="386" y="96" text-anchor="end" font-family="Segoe UI" font-size="10" fill="#7A8398">3</text>
+      <circle cx="38" cy="113" r="3" fill="#5DD299"/>
+      <text x="46" y="116" font-family="Segoe UI" font-size="11" fill="#5DD299">Alice</text>
+      <circle cx="38" cy="131" r="3" fill="#5DD299"/>
+      <text x="46" y="134" font-family="Segoe UI" font-size="11" fill="#5DD299">charlie [away]</text>
+      <text x="200" y="158" text-anchor="middle" font-family="Segoe UI" font-size="11" font-weight="600" letter-spacing=".5" fill="#7A8398">━━━ Music ━━━</text>
+      <text x="14" y="180" font-family="Segoe UI" font-size="12" font-weight="700" fill="#3CBEEF">#</text>
+      <text x="28" y="180" font-family="Segoe UI" font-size="12" fill="#E8ECF4">Music Lounge</text>
+      <text x="378" y="180" text-anchor="end" font-family="Segoe UI" font-size="11" fill="#7A8398">🔒</text>
+      <text x="14" y="204" font-family="Segoe UI" font-size="12" font-weight="700" fill="#3CBEEF">#</text>
+      <text x="28" y="204" font-family="Segoe UI" font-size="12" fill="#E8ECF4">Project Alpha</text>
+      <circle cx="38" cy="221" r="3" fill="#5DD299"/>
+      <text x="46" y="224" font-family="Segoe UI" font-size="11" fill="#5DD299">Bob</text>
+      <line x1="0" y1="248" x2="400" y2="248" stroke="#283040"/>
+      <text x="200" y="270" text-anchor="middle" font-family="Segoe UI" font-size="9" fill="#7A8398" opacity="0.6">TS6 WebUI Widget</text>
+    </svg>
+  </div>
+  <div class="swatches">
+    <span style="background:#0F1218"></span>
+    <span style="background:#161B25"></span>
+    <span style="background:#283040"></span>
+    <span style="background:#E8ECF4"></span>
+    <span style="background:#7A8398"></span>
+    <span style="background:#3CBEEF"></span>
+    <span style="background:#5DD299"></span>
+    <span style="background:#161B25"></span>
+  </div>
+</div>
+
+<!-- LIGHT -->
+<div class="tile light">
+  <h3>light</h3>
+  <div class="blurb">Mirror of dark. Same hue family, inverted ramp.</div>
+  <div class="canvas" style="background:#FAFBFE">
+    <svg width="400" height="290" viewBox="0 0 400 290" xmlns="http://www.w3.org/2000/svg" style="border-radius:10px;">
+      <rect width="400" height="290" rx="10" fill="#FAFBFE"/>
+      <rect width="400" height="72" fill="#EFF2F8"/>
+      <text x="14" y="34" font-family="Segoe UI" font-weight="700" font-size="15" fill="#1A8BC8">My Community</text>
+      <rect x="334" y="20" width="52" height="18" rx="3" fill="#2EB872"/>
+      <text x="360" y="33" text-anchor="middle" font-family="Segoe UI" font-size="10" font-weight="700" fill="#FFFFFF">ONLINE</text>
+      <text x="14" y="58" font-family="Segoe UI" font-size="11" fill="#5C6477">47/512 users • 12d 3h uptime</text>
+      <line x1="0" y1="72" x2="400" y2="72" stroke="#D7DCE6"/>
+      <text x="14" y="96" font-family="Segoe UI" font-size="12" font-weight="700" fill="#1A8BC8">#</text>
+      <text x="28" y="96" font-family="Segoe UI" font-size="12" fill="#1A1F2C">Lobby</text>
+      <text x="386" y="96" text-anchor="end" font-family="Segoe UI" font-size="10" fill="#5C6477">3</text>
+      <circle cx="38" cy="113" r="3" fill="#2EB872"/>
+      <text x="46" y="116" font-family="Segoe UI" font-size="11" fill="#2EB872">Alice</text>
+      <circle cx="38" cy="131" r="3" fill="#2EB872"/>
+      <text x="46" y="134" font-family="Segoe UI" font-size="11" fill="#2EB872">charlie [away]</text>
+      <text x="200" y="158" text-anchor="middle" font-family="Segoe UI" font-size="11" font-weight="600" letter-spacing=".5" fill="#5C6477">━━━ Music ━━━</text>
+      <text x="14" y="180" font-family="Segoe UI" font-size="12" font-weight="700" fill="#1A8BC8">#</text>
+      <text x="28" y="180" font-family="Segoe UI" font-size="12" fill="#1A1F2C">Music Lounge</text>
+      <text x="378" y="180" text-anchor="end" font-family="Segoe UI" font-size="11" fill="#5C6477">🔒</text>
+      <text x="14" y="204" font-family="Segoe UI" font-size="12" font-weight="700" fill="#1A8BC8">#</text>
+      <text x="28" y="204" font-family="Segoe UI" font-size="12" fill="#1A1F2C">Project Alpha</text>
+      <circle cx="38" cy="221" r="3" fill="#2EB872"/>
+      <text x="46" y="224" font-family="Segoe UI" font-size="11" fill="#2EB872">Bob</text>
+      <line x1="0" y1="248" x2="400" y2="248" stroke="#D7DCE6"/>
+      <text x="200" y="270" text-anchor="middle" font-family="Segoe UI" font-size="9" fill="#5C6477" opacity="0.6">TS6 WebUI Widget</text>
+    </svg>
+  </div>
+  <div class="swatches">
+    <span style="background:#FAFBFE"></span>
+    <span style="background:#EFF2F8"></span>
+    <span style="background:#D7DCE6"></span>
+    <span style="background:#1A1F2C"></span>
+    <span style="background:#5C6477"></span>
+    <span style="background:#1A8BC8"></span>
+    <span style="background:#2EB872"></span>
+    <span style="background:#EFF2F8"></span>
+  </div>
+</div>
+
+<!-- TRANSPARENT -->
+<div class="tile transparent">
+  <h3>transparent</h3>
+  <div class="blurb">Alpha bg. Best on dark host websites.</div>
+  <div class="canvas">
+    <svg width="400" height="290" viewBox="0 0 400 290" xmlns="http://www.w3.org/2000/svg" style="border-radius:10px;">
+      <rect width="400" height="290" rx="10" fill="rgba(0,0,0,0)"/>
+      <rect width="400" height="72" fill="rgba(0,0,0,0.40)"/>
+      <text x="14" y="34" font-family="Segoe UI" font-weight="700" font-size="15" fill="#7AD8FF">My Community</text>
+      <rect x="334" y="20" width="52" height="18" rx="3" fill="#5DD299"/>
+      <text x="360" y="33" text-anchor="middle" font-family="Segoe UI" font-size="10" font-weight="700" fill="#FFFFFF">ONLINE</text>
+      <text x="14" y="58" font-family="Segoe UI" font-size="11" fill="rgba(255,255,255,0.7)">47/512 users • 12d 3h uptime</text>
+      <line x1="0" y1="72" x2="400" y2="72" stroke="rgba(255,255,255,0.18)"/>
+      <text x="14" y="96" font-family="Segoe UI" font-size="12" font-weight="700" fill="#7AD8FF">#</text>
+      <text x="28" y="96" font-family="Segoe UI" font-size="12" fill="#FFFFFF">Lobby</text>
+      <text x="386" y="96" text-anchor="end" font-family="Segoe UI" font-size="10" fill="rgba(255,255,255,0.7)">3</text>
+      <circle cx="38" cy="113" r="3" fill="#5DD299"/>
+      <text x="46" y="116" font-family="Segoe UI" font-size="11" fill="#5DD299">Alice</text>
+      <circle cx="38" cy="131" r="3" fill="#5DD299"/>
+      <text x="46" y="134" font-family="Segoe UI" font-size="11" fill="#5DD299">charlie [away]</text>
+      <text x="200" y="158" text-anchor="middle" font-family="Segoe UI" font-size="11" font-weight="600" letter-spacing=".5" fill="rgba(255,255,255,0.7)">━━━ Music ━━━</text>
+      <text x="14" y="180" font-family="Segoe UI" font-size="12" font-weight="700" fill="#7AD8FF">#</text>
+      <text x="28" y="180" font-family="Segoe UI" font-size="12" fill="#FFFFFF">Music Lounge</text>
+      <text x="378" y="180" text-anchor="end" font-family="Segoe UI" font-size="11" fill="rgba(255,255,255,0.7)">🔒</text>
+      <text x="14" y="204" font-family="Segoe UI" font-size="12" font-weight="700" fill="#7AD8FF">#</text>
+      <text x="28" y="204" font-family="Segoe UI" font-size="12" fill="#FFFFFF">Project Alpha</text>
+      <circle cx="38" cy="221" r="3" fill="#5DD299"/>
+      <text x="46" y="224" font-family="Segoe UI" font-size="11" fill="#5DD299">Bob</text>
+      <line x1="0" y1="248" x2="400" y2="248" stroke="rgba(255,255,255,0.18)"/>
+      <text x="200" y="270" text-anchor="middle" font-family="Segoe UI" font-size="9" fill="rgba(255,255,255,0.7)" opacity="0.6">TS6 WebUI Widget</text>
+    </svg>
+  </div>
+  <div class="swatches">
+    <span style="background:transparent; border-style:dashed"></span>
+    <span style="background:rgba(255,255,255,0.04); border-style:dashed"></span>
+    <span style="background:rgba(255,255,255,0.18)"></span>
+    <span style="background:#FFFFFF"></span>
+    <span style="background:rgba(255,255,255,0.7)"></span>
+    <span style="background:#7AD8FF"></span>
+    <span style="background:#5DD299"></span>
+    <span style="background:rgba(0,0,0,0.4)"></span>
+  </div>
+</div>
+
+<!-- NEON -->
+<div class="tile neon">
+  <h3>neon</h3>
+  <div class="blurb">Saturated cyber/gaming. Magenta-violet pop.</div>
+  <div class="canvas" style="background:#06091F">
+    <svg width="400" height="290" viewBox="0 0 400 290" xmlns="http://www.w3.org/2000/svg" style="border-radius:10px;">
+      <rect width="400" height="290" rx="10" fill="#06091F"/>
+      <rect width="400" height="72" fill="#1A0E3F"/>
+      <text x="14" y="34" font-family="Segoe UI" font-weight="700" font-size="15" fill="#FF49C4">My Community</text>
+      <rect x="334" y="20" width="52" height="18" rx="3" fill="#22F0AA"/>
+      <text x="360" y="33" text-anchor="middle" font-family="Segoe UI" font-size="10" font-weight="700" fill="#FFFFFF">ONLINE</text>
+      <text x="14" y="58" font-family="Segoe UI" font-size="11" fill="#A99CD8">47/512 users • 12d 3h uptime</text>
+      <line x1="0" y1="72" x2="400" y2="72" stroke="#3A2A6E"/>
+      <text x="14" y="96" font-family="Segoe UI" font-size="12" font-weight="700" fill="#FF49C4">#</text>
+      <text x="28" y="96" font-family="Segoe UI" font-size="12" fill="#F0E8FF">Lobby</text>
+      <text x="386" y="96" text-anchor="end" font-family="Segoe UI" font-size="10" fill="#A99CD8">3</text>
+      <circle cx="38" cy="113" r="3" fill="#22F0AA"/>
+      <text x="46" y="116" font-family="Segoe UI" font-size="11" fill="#22F0AA">Alice</text>
+      <circle cx="38" cy="131" r="3" fill="#22F0AA"/>
+      <text x="46" y="134" font-family="Segoe UI" font-size="11" fill="#22F0AA">charlie [away]</text>
+      <text x="200" y="158" text-anchor="middle" font-family="Segoe UI" font-size="11" font-weight="600" letter-spacing=".5" fill="#A99CD8">━━━ Music ━━━</text>
+      <text x="14" y="180" font-family="Segoe UI" font-size="12" font-weight="700" fill="#FF49C4">#</text>
+      <text x="28" y="180" font-family="Segoe UI" font-size="12" fill="#F0E8FF">Music Lounge</text>
+      <text x="378" y="180" text-anchor="end" font-family="Segoe UI" font-size="11" fill="#A99CD8">🔒</text>
+      <text x="14" y="204" font-family="Segoe UI" font-size="12" font-weight="700" fill="#FF49C4">#</text>
+      <text x="28" y="204" font-family="Segoe UI" font-size="12" fill="#F0E8FF">Project Alpha</text>
+      <circle cx="38" cy="221" r="3" fill="#22F0AA"/>
+      <text x="46" y="224" font-family="Segoe UI" font-size="11" fill="#22F0AA">Bob</text>
+      <line x1="0" y1="248" x2="400" y2="248" stroke="#3A2A6E"/>
+      <text x="200" y="270" text-anchor="middle" font-family="Segoe UI" font-size="9" fill="#A99CD8" opacity="0.6">TS6 WebUI Widget</text>
+    </svg>
+  </div>
+  <div class="swatches">
+    <span style="background:#06091F"></span>
+    <span style="background:#0E1338"></span>
+    <span style="background:#3A2A6E"></span>
+    <span style="background:#F0E8FF"></span>
+    <span style="background:#A99CD8"></span>
+    <span style="background:#FF49C4"></span>
+    <span style="background:#22F0AA"></span>
+    <span style="background:#1A0E3F"></span>
+  </div>
+</div>
+
+<!-- MILITARY -->
+<div class="tile military">
+  <h3>military</h3>
+  <div class="blurb">Desaturated olive/khaki. "Ops console."</div>
+  <div class="canvas" style="background:#1A1E16">
+    <svg width="400" height="290" viewBox="0 0 400 290" xmlns="http://www.w3.org/2000/svg" style="border-radius:10px;">
+      <rect width="400" height="290" rx="10" fill="#1A1E16"/>
+      <rect width="400" height="72" fill="#22281D"/>
+      <text x="14" y="34" font-family="Segoe UI" font-weight="700" font-size="15" fill="#A4B86F">My Community</text>
+      <rect x="334" y="20" width="52" height="18" rx="3" fill="#C8D294"/>
+      <text x="360" y="33" text-anchor="middle" font-family="Segoe UI" font-size="10" font-weight="700" fill="#22281D">ONLINE</text>
+      <text x="14" y="58" font-family="Segoe UI" font-size="11" fill="#8A9078">47/512 users • 12d 3h uptime</text>
+      <line x1="0" y1="72" x2="400" y2="72" stroke="#3A4031"/>
+      <text x="14" y="96" font-family="Segoe UI" font-size="12" font-weight="700" fill="#A4B86F">#</text>
+      <text x="28" y="96" font-family="Segoe UI" font-size="12" fill="#D4D9C8">Lobby</text>
+      <text x="386" y="96" text-anchor="end" font-family="Segoe UI" font-size="10" fill="#8A9078">3</text>
+      <circle cx="38" cy="113" r="3" fill="#C8D294"/>
+      <text x="46" y="116" font-family="Segoe UI" font-size="11" fill="#C8D294">Alice</text>
+      <circle cx="38" cy="131" r="3" fill="#C8D294"/>
+      <text x="46" y="134" font-family="Segoe UI" font-size="11" fill="#C8D294">charlie [away]</text>
+      <text x="200" y="158" text-anchor="middle" font-family="Segoe UI" font-size="11" font-weight="600" letter-spacing=".5" fill="#8A9078">━━━ Music ━━━</text>
+      <text x="14" y="180" font-family="Segoe UI" font-size="12" font-weight="700" fill="#A4B86F">#</text>
+      <text x="28" y="180" font-family="Segoe UI" font-size="12" fill="#D4D9C8">Music Lounge</text>
+      <text x="378" y="180" text-anchor="end" font-family="Segoe UI" font-size="11" fill="#8A9078">🔒</text>
+      <text x="14" y="204" font-family="Segoe UI" font-size="12" font-weight="700" fill="#A4B86F">#</text>
+      <text x="28" y="204" font-family="Segoe UI" font-size="12" fill="#D4D9C8">Project Alpha</text>
+      <circle cx="38" cy="221" r="3" fill="#C8D294"/>
+      <text x="46" y="224" font-family="Segoe UI" font-size="11" fill="#C8D294">Bob</text>
+      <line x1="0" y1="248" x2="400" y2="248" stroke="#3A4031"/>
+      <text x="200" y="270" text-anchor="middle" font-family="Segoe UI" font-size="9" fill="#8A9078" opacity="0.6">TS6 WebUI Widget</text>
+    </svg>
+  </div>
+  <div class="swatches">
+    <span style="background:#1A1E16"></span>
+    <span style="background:#22281D"></span>
+    <span style="background:#3A4031"></span>
+    <span style="background:#D4D9C8"></span>
+    <span style="background:#8A9078"></span>
+    <span style="background:#A4B86F"></span>
+    <span style="background:#C8D294"></span>
+    <span style="background:#22281D"></span>
+  </div>
+</div>
+
+<!-- MINIMAL -->
+<div class="tile minimal">
+  <h3>minimal</h3>
+  <div class="blurb">Almost monochrome. Disappears into clean sites.</div>
+  <div class="canvas" style="background:#FFFFFF">
+    <svg width="400" height="290" viewBox="0 0 400 290" xmlns="http://www.w3.org/2000/svg" style="border-radius:10px;">
+      <rect width="400" height="290" rx="10" fill="#FFFFFF"/>
+      <rect width="400" height="72" fill="#F0F2F5"/>
+      <text x="14" y="34" font-family="Segoe UI" font-weight="700" font-size="15" fill="#5A6173">My Community</text>
+      <rect x="334" y="20" width="52" height="18" rx="3" fill="#5C6477"/>
+      <text x="360" y="33" text-anchor="middle" font-family="Segoe UI" font-size="10" font-weight="700" fill="#FFFFFF">ONLINE</text>
+      <text x="14" y="58" font-family="Segoe UI" font-size="11" fill="#7C8294">47/512 users • 12d 3h uptime</text>
+      <line x1="0" y1="72" x2="400" y2="72" stroke="#E2E5EC"/>
+      <text x="14" y="96" font-family="Segoe UI" font-size="12" font-weight="700" fill="#5A6173">#</text>
+      <text x="28" y="96" font-family="Segoe UI" font-size="12" fill="#2A2F3A">Lobby</text>
+      <text x="386" y="96" text-anchor="end" font-family="Segoe UI" font-size="10" fill="#7C8294">3</text>
+      <circle cx="38" cy="113" r="3" fill="#5C6477"/>
+      <text x="46" y="116" font-family="Segoe UI" font-size="11" fill="#5C6477">Alice</text>
+      <circle cx="38" cy="131" r="3" fill="#5C6477"/>
+      <text x="46" y="134" font-family="Segoe UI" font-size="11" fill="#5C6477">charlie [away]</text>
+      <text x="200" y="158" text-anchor="middle" font-family="Segoe UI" font-size="11" font-weight="600" letter-spacing=".5" fill="#7C8294">━━━ Music ━━━</text>
+      <text x="14" y="180" font-family="Segoe UI" font-size="12" font-weight="700" fill="#5A6173">#</text>
+      <text x="28" y="180" font-family="Segoe UI" font-size="12" fill="#2A2F3A">Music Lounge</text>
+      <text x="378" y="180" text-anchor="end" font-family="Segoe UI" font-size="11" fill="#7C8294">🔒</text>
+      <text x="14" y="204" font-family="Segoe UI" font-size="12" font-weight="700" fill="#5A6173">#</text>
+      <text x="28" y="204" font-family="Segoe UI" font-size="12" fill="#2A2F3A">Project Alpha</text>
+      <circle cx="38" cy="221" r="3" fill="#5C6477"/>
+      <text x="46" y="224" font-family="Segoe UI" font-size="11" fill="#5C6477">Bob</text>
+      <line x1="0" y1="248" x2="400" y2="248" stroke="#E2E5EC"/>
+      <text x="200" y="270" text-anchor="middle" font-family="Segoe UI" font-size="9" fill="#7C8294" opacity="0.6">TS6 WebUI Widget</text>
+    </svg>
+  </div>
+  <div class="swatches">
+    <span style="background:#FFFFFF"></span>
+    <span style="background:#F7F8FA"></span>
+    <span style="background:#E2E5EC"></span>
+    <span style="background:#2A2F3A"></span>
+    <span style="background:#7C8294"></span>
+    <span style="background:#5A6173"></span>
+    <span style="background:#5C6477"></span>
+    <span style="background:#F0F2F5"></span>
+  </div>
+</div>
+
+</div>
+</body>
+</html>

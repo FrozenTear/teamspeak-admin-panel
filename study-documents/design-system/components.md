@@ -415,7 +415,223 @@ Loading placeholder bars. Replace content during fetch; suppress for fetches exp
 
 ---
 
-## 10. Component naming for DioxusLead
+## 10. Card
+
+A surface for grouping related content. Used for KPI tiles, dashboard panels, the connection card, the login card, the per-server entry on `/servers`, etc. CSS class: `.card` (and the dashboard-local `.panel` is the same primitive — it should fold into `.card` by Phase 2).
+
+### 10.1 Spec
+
+| Token | Value |
+|---|---|
+| Background | `--bg-surface` |
+| Border | `1px solid --border-subtle` |
+| Radius | `--radius-md` (8px) |
+| Padding (default) | `--space-7` (24px) |
+| Padding (compact) | `--space-6` (16px) — for KPI tiles |
+| Shadow | `--shadow-sm` (raise to `--shadow-md` only on hover when interactive) |
+
+Only one elevation step per card. Cards do not nest in cards — switch to a `<section>` with no surface treatment instead.
+
+### 10.2 Variants
+
+| Variant | When |
+|---|---|
+| `default` | Static surface (login form, KPI tile, panel). |
+| `interactive` | Whole-card click target (server list row, dashboard "go to channels" tile). Add `cursor: pointer`, `:hover { box-shadow: var(--shadow-md); border-color: var(--border-strong); }`. |
+| `selected` | Currently active (e.g., the active server in `/servers`). Border becomes `--accent-fg`, optional 2px inset on the leading edge. |
+
+### 10.3 Anatomy
+
+`Card { header?, body, footer? }`. Header is optional; when present, it's a single row with title + optional `actions` slot (right-aligned). Footer is for primary/secondary action buttons; right-aligned, gap `--space-4`.
+
+### 10.4 Lens references
+
+- **Common Region (Gestalt)**: card border + shared padding tells the eye "these elements belong together."
+- **Pragnanz**: a single rectangle with one elevation step is more readable than a stack of dividers.
+
+---
+
+## 11. Layout chrome (Sidebar + Header)
+
+App chrome is two primitives: a fixed left **Sidebar** with grouped navigation and a top **Header** that hosts the server selector, websocket indicator, theme toggle, user menu, and logout. CSS classes: `.app`, `.sidebar`, `.header`, `.main`. Implemented end-to-end in `preview/dashboard.html`.
+
+### 11.1 Layout grid
+
+```
+┌──────────┬────────────────────────────────┐
+│  brand   │  header (selector / spacer / user)
+├──────────┼────────────────────────────────┤
+│  sidebar │  main
+│          │
+└──────────┴────────────────────────────────┘
+```
+
+| Token | Value |
+|---|---|
+| Sidebar width (expanded) | `--sidebar-width-expanded` (240px) |
+| Sidebar width (collapsed) | `--sidebar-width-collapsed` (64px) — Phase 2, not Phase 1 |
+| Header height | `--header-height` (56px) |
+| Sidebar background | `--bg-surface` |
+| Header background | `--bg-canvas` |
+
+### 11.2 Sidebar
+
+- Brand block at top (`.brand`) — wordmark + glow dot. Acts as "go home" link to `/dashboard`.
+- Nav groups (`.nav-group`) with uppercase 11px label (`.nav-group-label`) and items (`.nav-item`). Phase 1 ships four groups: **Server**, **Moderation**, **Automation**, **Admin**.
+- Active item: `--bg-selected` background, 2px leading-edge accent border, `--accent-fg` text. Hover: `--bg-hover`.
+- Group label is decoration only — not focusable, not announced as a heading. The whole sidebar is one `<nav aria-label="Primary">`.
+- Mobile (≤768px): sidebar hides, replaced by hamburger that opens it as a left-edge drawer over a backdrop. Drawer width = expanded width (240px), sheet animation `--motion-base var(--ease-standard)`.
+
+### 11.3 Header
+
+- Slot order, left → right: hamburger (mobile only) · server-selector trigger · websocket dot · spacer · theme toggle · user menu · logout.
+- Server-selector trigger is the `Dropdown` from §13 with the server-icon mark and chevron. Full spec lives in `server-selector.md`.
+- Websocket indicator (`.ws-dot`) is a status pill without a label — green = connected, amber = reconnecting, red = disconnected. Hover/focus reveals a tooltip with the live state. Color is never the only signal — pair with the tooltip text.
+- User menu trigger shows initials avatar + first name + caret. Opens a Dropdown with profile / settings / logout.
+- Mobile: sidebar hides, server-selector moves into a dedicated `.mobile-selector-bar` row directly under the header so it stays a one-tap reach. Logout collapses into the user menu.
+
+### 11.4 Acceptance
+
+- Sidebar nav has visible focus ring (per §1.4) on every item, in tab order matching visual order.
+- The active route is announced with `aria-current="page"`.
+- Sidebar is reachable via "skip to navigation" link from the header (the operator may need to jump back without ten tabs through main content).
+- At 768px and below, hamburger opens the sidebar drawer, Escape closes it, focus returns to the hamburger trigger.
+
+---
+
+## 12. Banner / Alert (inline)
+
+Form- or page-level inline message. NOT a toast. Banners stick to the surface they describe — login error above the form, server-add failure above the form, danger-zone warning at the top of a destructive section.
+
+### 12.1 Spec
+
+| Token | Value |
+|---|---|
+| Padding | `--space-5 --space-6` |
+| Radius | `--radius-md` |
+| Leading bar | 4px solid, color matches variant |
+| Background | variant-bg at ~10% opacity over surface |
+| Foreground | variant-fg |
+| Icon | `--text-md`, semantic for variant |
+
+### 12.2 Variants
+
+| Variant | When | Class |
+|---|---|---|
+| `danger` | Submission failed; required state isn't safe to act on. | `.banner` |
+| `warning` | Acceptable but risky (token expiring, action irreversible). | `.banner.banner-warning` |
+| `info` | Neutral context (read-only mode, restored from cache). | `.banner.banner-info` (add) |
+| `success` | Confirmed success that's load-bearing on the surface (e.g., "License activated"). Reserved — toast is usually right instead. | `.banner.banner-success` (add) |
+
+### 12.3 Behavior
+
+- `role="alert"` on `danger` and `warning`. `role="status"` on `info` / `success` so screen readers don't interrupt.
+- Dismiss button only when content is purely informational. Errors stay on screen until the underlying state changes.
+- Never use a banner where a `Field` error message belongs — banners are for state that affects the whole form/section, not a single input.
+
+### 12.4 Lens references
+
+- **Nielsen — visibility of system status**: pairs with the form, can't be missed.
+- **Forgiveness**: errors stay until resolved; nothing dismisses on a timer.
+
+---
+
+## 13. Dropdown / Menu
+
+Trigger + popover for choice lists. Used by: server selector (`server-selector.md`), user menu, table row actions, theme toggle when it grows beyond binary, dashboard time-range chooser. Modal is for confirmations and forms — NOT for a list of choices.
+
+### 13.1 Anatomy
+
+```
+[trigger ▾]              ← button or selector pill
+  └─[ menu ]
+     ├─ filter (optional, for >7 items)
+     ├─ section-label (optional)
+     ├─ item · item · item
+     └─ footer-actions (optional)
+```
+
+### 13.2 Trigger spec
+
+- Reuses Button (`ghost` or `secondary`) OR the `.selector` pill (server selector). Always shows a trailing chevron (`▾`) to signal "opens a menu" — Norman's signifier.
+- Pressing `Enter` / `Space` / `↓` opens the menu. Clicking outside closes it.
+
+### 13.3 Menu spec
+
+| Token | Value |
+|---|---|
+| Background | `--bg-surface-raised` |
+| Border | `1px solid --border-subtle` |
+| Radius | `--radius-md` |
+| Padding | `--space-2` block / 0 inline |
+| Shadow | `--shadow-md` |
+| Min width | match trigger; max 320px |
+| Item height | 32px (compact) or 40px (with avatar/icon) |
+| Item padding | `--space-3 --space-5` |
+| Active item bg | `--bg-hover` |
+| Focused item bg | `--bg-selected` (keyboard focus shown explicitly) |
+
+### 13.4 Behavior
+
+- Single-select: closes on selection, focus returns to trigger.
+- Multi-select: stays open until trigger click-out or `Esc`. Selected items get a leading checkmark.
+- Filter input (when used): autofocuses on open, narrows the list with substring match, keyboard `↑/↓` navigates filtered results.
+- Empty state: "No matches" centered, 8px vertical padding. No search-tip inception inside the menu.
+
+### 13.5 Keyboard
+
+- `↓` / `↑` move active item. `Enter` selects. `Esc` closes and returns focus to trigger. `Home` / `End` jump to first/last. Type-ahead jumps to first item beginning with the typed character.
+- Active item has a visible focus ring AND an `aria-activedescendant` reference so AT picks it up.
+
+### 13.6 When NOT to use
+
+- For 2 mutually exclusive choices → Toggle / Switch instead.
+- For a long catalog → searchable Combobox (Phase 2).
+- For "do you really want to do this" → Modal (§3).
+
+---
+
+## 14. Spinner (supporting primitive)
+
+Inline spinner used inside Buttons (`is-loading`), small status indicators, and the `is-pending` state in `Field`. CSS class: `.spinner`. Distinct from `Skeleton` (§9): spinner = "this one thing is busy"; skeleton = "this whole region is loading."
+
+### 14.1 Spec
+
+| Token | Value |
+|---|---|
+| Size | 16px (default), 12px (compact, `is-sm`) |
+| Stroke | 2px |
+| Track color | `--border-subtle` |
+| Spinner color | `currentColor` (so it inherits Button text color) |
+| Duration | `--motion-spinner` (1000ms) |
+| Easing | `linear` |
+
+### 14.2 Behavior
+
+- Pair with text (`Loading…`, `Saving…`) wherever the spinner alone wouldn't be self-evident — recognition over recall.
+- Hide for `prefers-reduced-motion` users by swapping rotation for a 3-dot ellipsis pulse.
+
+---
+
+## 15. Step indicator
+
+Used in the `/setup` wizard (3 steps) and reusable for any future ≤5-step linear flow. CSS class: `.steps`.
+
+### 15.1 Spec
+
+- Numbered circles (18px) with a 1px `--border-subtle` connector between them.
+- States: `default`, `is-active` (filled `--accent-bg`, white numeral), `is-done` (filled `--success-bg`, checkmark glyph).
+- Label below the circle for active step only on mobile, all steps on desktop.
+
+### 15.2 Behavior
+
+- Step indicators are NOT navigational — operator can't click ahead. Backward click to a completed step is allowed.
+- `aria-current="step"` on the active step.
+- Reduced motion: no shimmer / fade between steps; instant swap.
+
+---
+
+## 16. Component naming for DioxusLead
 
 Suggested Rust component names, for handoff:
 
@@ -430,5 +646,11 @@ Suggested Rust component names, for handoff:
 | §7 Empty state | `EmptyState { variant, title, description, actions, .. }` |
 | §8 Tag | `Tag`, `StatusPill` |
 | §9 Skeleton | `Skeleton`, `SkeletonText`, `SkeletonAvatar` |
+| §10 Card | `Card { variant, header?, footer? }` |
+| §11 Chrome | `AppShell`, `Sidebar`, `NavGroup`, `NavItem`, `Header`, `WebsocketIndicator`, `UserMenu` |
+| §12 Banner | `Banner { variant, dismissible? }` |
+| §13 Dropdown | `Dropdown { trigger, items }`, `Menu`, `MenuItem`, `MenuSection` |
+| §14 Spinner | `Spinner { size }` |
+| §15 Steps | `Steps`, `Step { state, label }` |
 
 All components accept a `class` / `style` prop (escape hatch) but must NOT require it for any documented use case.

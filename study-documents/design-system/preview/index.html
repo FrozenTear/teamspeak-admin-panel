@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TS6 Manager — Design System Preview Index</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="components.css">
+<style>
+  body { padding: var(--space-9) var(--space-7); }
+  .shell { max-width: 880px; margin: 0 auto; }
+  h1 { font: var(--weight-bold) var(--text-3xl) / var(--lh-3xl) var(--font-sans); margin: 0 0 var(--space-3); }
+  p.lead { color: var(--text-secondary); font-size: var(--text-md); margin: 0 0 var(--space-7); max-width: 64ch; }
+  .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: var(--space-5); }
+  .tile {
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    padding: var(--space-6);
+    text-decoration: none;
+    color: inherit;
+    transition: border-color var(--motion-fast);
+  }
+  .tile:hover { border-color: var(--accent-fg); }
+  .tile h3 { margin: 0 0 var(--space-3); font: var(--weight-semibold) var(--text-base) / 1 var(--font-sans); color: var(--accent-fg); }
+  .tile p { margin: 0; color: var(--text-secondary); font-size: var(--text-sm); line-height: var(--lh-md); }
+</style>
+</head>
+<body>
+<div class="shell">
+  <div style="display:flex;align-items:center;gap:var(--space-4);margin-bottom:var(--space-5)">
+    <span style="display:inline-block;width:18px;height:18px;background:var(--accent-fg);border-radius:var(--radius-full);box-shadow:0 0 16px rgba(60,190,239,0.7)"></span>
+    <span style="font-weight:var(--weight-bold);font-size:var(--text-md)">TS6 Manager</span>
+  </div>
+  <h1>Design System Preview</h1>
+  <p class="lead">Phase 1 design deliverables for <a href="../../../" style="color:var(--text-link)">PURA-6</a>. Each tile renders the surface in real CSS using the documented token set, ready for visual review at the desktop and mobile viewports.</p>
+
+  <div class="grid">
+    <a class="tile" href="components.html"><h3>Component primitives</h3><p>Button / Input / Field / Tag / Toast / Modal / Empty state / Skeleton / Table — every primitive on one page.</p></a>
+    <a class="tile" href="login.html"><h3>Login (happy)</h3><p>Two-pane brand + form. Accent glow background. Setup callout when needsSetup.</p></a>
+    <a class="tile" href="login-error.html"><h3>Login (error)</h3><p>Invalid-credentials banner above the form. Password cleared, focus returned.</p></a>
+    <a class="tile" href="setup-step1.html"><h3>Setup wizard — step 1</h3><p>Create admin. Live password rule list (per spec §6.2.2).</p></a>
+    <a class="tile" href="setup-step2.html"><h3>Setup wizard — step 2</h3><p>Connect TS6 server. Test connection inline; advanced section progressive-disclosed.</p></a>
+    <a class="tile" href="dashboard.html"><h3>Dashboard (happy)</h3><p>KPI strip · bandwidth chart · connection card · activity feed. Full chrome.</p></a>
+    <a class="tile" href="dashboard-empty.html"><h3>Dashboard (empty)</h3><p>Zero servers. Primary CTA, no dead end.</p></a>
+    <a class="tile" href="server-selector.html"><h3>Server selector</h3><p>Open menu over the header. Filter, status pills, footer actions.</p></a>
+    <a class="tile" href="servers.html"><h3>Servers (list)</h3><p>Multi-tenant management. Connection state, last-used, switch / edit / reconnect actions per row.</p></a>
+    <a class="tile" href="servers-add.html"><h3>Servers (add form)</h3><p>Inline add-server form with WebQuery test row + advanced SSH disclosure.</p></a>
+    <a class="tile" href="widget-themes.html"><h3>Widget themes</h3><p>All six palettes (dark/light/transparent/neon/military/minimal) rendered to spec §27.3 SVG layout.</p></a>
+  </div>
+</div>
+</body>
+</html>
