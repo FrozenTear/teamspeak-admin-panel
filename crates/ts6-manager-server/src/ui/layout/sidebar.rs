@@ -9,6 +9,11 @@ use dioxus::prelude::*;
 
 use crate::ui::routes::Route;
 
+/// `id` of the sidebar `<nav>` landmark. Shared so the AppShell's
+/// skip-to-navigation link can target it via `href="#primary-nav"` and the
+/// id stays in lock-step if it ever gets renamed.
+pub const NAV_LANDMARK_ID: &str = "primary-nav";
+
 /// One nav group with an uppercase label and a list of items. The label is
 /// decoration only — `<nav aria-label="Primary">` wraps the whole rail per
 /// §11.2.
@@ -106,7 +111,7 @@ pub fn Sidebar(props: SidebarProps) -> Element {
     let dashboard_active = matches!(props.active, Route::DashboardPlaceholder {});
     rsx! {
         aside { class: "sidebar",
-            nav { "aria-label": "Primary",
+            nav { id: "{NAV_LANDMARK_ID}", tabindex: "-1", "aria-label": "Primary",
                 Link { to: Route::DashboardPlaceholder {}, class: "brand",
                     span { class: "mark" }
                     "TS6 Manager"
@@ -148,6 +153,15 @@ pub fn Sidebar(props: SidebarProps) -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The skip-link in `AppShell` jumps focus to `#primary-nav`, which is
+    /// this sidebar's `<nav>` id. Pinning the constant to its literal value
+    /// means a typo or rename in either place becomes a unit-test failure
+    /// instead of silently breaking the keyboard-skip path.
+    #[test]
+    fn nav_landmark_id_is_pinned_to_primary_nav() {
+        assert_eq!(NAV_LANDMARK_ID, "primary-nav");
+    }
 
     /// `dashboard_active` derivation — pinned so adding a new route can't
     /// silently leave Dashboard highlighted on a different page.

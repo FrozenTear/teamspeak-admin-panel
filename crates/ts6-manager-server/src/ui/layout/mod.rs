@@ -13,7 +13,7 @@ mod header;
 mod sidebar;
 
 pub use header::Header;
-pub use sidebar::Sidebar;
+pub use sidebar::{NAV_LANDMARK_ID, Sidebar};
 
 use dioxus::prelude::*;
 
@@ -49,6 +49,16 @@ pub fn AppShell() -> Element {
 
     rsx! {
         div { class: "app",
+            // Skip-to-nav link is the first focusable element. Visually
+            // hidden until focused (via `.skip-link` in `layout.css`); on
+            // activation, browser focus jumps to the sidebar `<nav>` so a
+            // keyboard or screen-reader user doesn't have to tab through
+            // the header chrome to reach the route table.
+            a {
+                class: "skip-link",
+                href: "#{NAV_LANDMARK_ID}",
+                "Skip to navigation"
+            }
             Sidebar { active: route.clone() }
             Header {}
             div { class: "mobile-selector-bar",

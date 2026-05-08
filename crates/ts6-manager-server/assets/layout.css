@@ -59,6 +59,44 @@
   color: var(--text-secondary);
 }
 
+/* ─── Skip-to-navigation link (PURA-30) ───────────────── */
+/* Visually hidden for sighted-pointer users; visible & first focus when a
+ * keyboard or screen-reader operator tabs into the page. On activation the
+ * browser jumps focus to the sidebar `<nav id="primary-nav">` (which
+ * carries `tabindex="-1"` so it accepts programmatic focus without joining
+ * the natural tab order). The *only* place the link is visible is when it
+ * has focus, so we never paint over real chrome. */
+.skip-link {
+  position: absolute;
+  top: var(--space-3);
+  left: var(--space-3);
+  padding: var(--space-3) var(--space-5);
+  background: var(--bg-surface-raised);
+  color: var(--text-primary);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  font: var(--weight-medium) var(--text-sm) / var(--lh-sm) var(--font-sans);
+  text-decoration: none;
+  z-index: var(--z-sticky);
+  /* Visually hidden but reachable: clip-path collapses the box for
+   * sighted users while keeping the element in the focus order. The
+   * `:focus-visible` rule below restores the box on keyboard focus. */
+  clip-path: inset(50%);
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.skip-link:focus,
+.skip-link:focus-visible {
+  clip-path: none;
+  width: auto;
+  height: auto;
+  overflow: visible;
+  outline: none;
+  box-shadow: var(--shadow-focus);
+}
+
 /* ─── Layout-chrome supplements (PURA-21) ─────────────── */
 /* The base chrome rules live in components.css §"Layout chrome".
  * These tiny additions cover the parts the shipped components need
