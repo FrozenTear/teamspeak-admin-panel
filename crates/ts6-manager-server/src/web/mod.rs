@@ -12,10 +12,12 @@
 #![allow(dead_code)] // consumed by main.rs; re-exports for future workstreams
 
 pub mod cors;
+pub mod csp_nonce;
 pub mod headers;
 pub mod proxy;
 pub mod rate_limit;
 
 pub use cors::cors_layer;
+pub use csp_nonce::nonce_csp_middleware;
 #[allow(unused_imports)] // SecurityHeadersStack re-exported for future composers
 pub use headers::{SecurityHeadersStack, security_headers_stack};

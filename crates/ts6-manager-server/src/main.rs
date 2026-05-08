@@ -168,6 +168,13 @@ mod server_entry {
             .serve_dioxus_application(serve_cfg, ui::App)
             .layer(web::cors_layer(&cfg.frontend_url));
         let router = web::security_headers_stack(cfg.node_env).apply(router);
+        // PURA-48 — per-request nonce-based CSP. Layered LAST so it sits
+        // outermost: on the response path it runs after every inner layer,
+        // and `headers_mut().insert(CSP, …)` overrides any pre-existing CSP
+        // value (eg. the static one set by `security_headers_stack`).
+        // Cleanup of the now-redundant static CSP is deferred while
+        // PURA-49's predicate sanity-check runs on `web/headers.rs`.
+        let router = router.layer(axum::middleware::from_fn(web::nonce_csp_middleware));
 
         let addr: SocketAddr = format!("0.0.0.0:{}", cfg.port).parse()?;
         tracing::info!(

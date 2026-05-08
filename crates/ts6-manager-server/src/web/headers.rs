@@ -8,6 +8,16 @@
 //! `X-Frame-Options: DENY` is the global default; the public widget routes
 //! (spec §27) override to `SAMEORIGIN` at their handler so they remain
 //! embeddable. The override path is owned by WIDGETS, not SECURITY.
+//!
+//! ## CSP lives elsewhere (PURA-48)
+//!
+//! `Content-Security-Policy` is **not** set by this stack. It is owned by
+//! the per-response middleware in [`crate::web::csp_nonce`] so each
+//! response carries a unique `'nonce-…'` and `script-src` can drop
+//! `'unsafe-inline'`. Wire that middleware *outside* this stack on the
+//! router so both CSP and the static headers below land on every response.
+//! The integration tests below combine the two layers to verify the
+//! resulting CSP keeps the dx WASM SPA hydrating.
 
 use axum::http::{HeaderName, HeaderValue, header};
 use tower::layer::util::Identity;
@@ -33,42 +43,6 @@ pub fn security_headers_stack(node_env: NodeEnv) -> SecurityHeadersStack {
         header::REFERRER_POLICY,
         HeaderValue::from_static("no-referrer"),
     );
-    // CSP — directives chosen for the dx (Dioxus) WASM SPA:
-    //
-    //   * `script-src 'wasm-unsafe-eval'` is required by every evergreen browser
-    //     (Chromium ≥ 99, Firefox ≥ 102) for `WebAssembly.instantiateStreaming`;
-    //     without it the client never loads and only the SSR fallback renders.
-    //   * `script-src 'unsafe-inline'` is a Phase 1 trade-off. dx injects inline
-    //     hydration scripts (`window.hydrate_queue`, `window.initial_dioxus_hydration_data`)
-    //     whose body contains per-request JSON, so a static hash is not stable
-    //     and a per-request nonce would require hooking the dioxus-server HTML
-    //     emit. See PURA-48 follow-up to migrate to nonce-based CSP. Acceptable
-    //     here only because Phase 1 has no user-controlled `innerHTML` paths
-    //     and the inline scripts are dx-generated. Re-evaluate before any
-    //     route surfaces user-supplied HTML.
-    //   * `style-src 'unsafe-inline'` covers our existing inline `<style>` block
-    //     in the dx index.html template. `https://fonts.googleapis.com` is the
-    //     CSS host that the Inter `@import` resolves to; `https://fonts.gstatic.com`
-    //     is where the actual woff2 files are fetched from.
-    //   * Defense-in-depth: `object-src 'none'`, `base-uri 'self'`,
-    //     `frame-ancestors 'none'`, `form-action 'self'` reduce the blast radius
-    //     of the relaxed `script-src`. `frame-ancestors 'none'` duplicates XFO
-    //     DENY for clients that prefer CSP.
-    let csp = SetResponseHeaderLayer::if_not_present(
-        header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(
-            "default-src 'self'; \
-             img-src 'self' data:; \
-             connect-src 'self' ws: wss:; \
-             style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; \
-             font-src 'self' https://fonts.gstatic.com data:; \
-             script-src 'self' 'wasm-unsafe-eval' 'unsafe-inline'; \
-             object-src 'none'; \
-             base-uri 'self'; \
-             frame-ancestors 'none'; \
-             form-action 'self'",
-        ),
-    );
     // HSTS — production only. 6 months minimum per spec; we use 365 days.
     let hsts = if node_env.is_production() {
         Some(SetResponseHeaderLayer::if_not_present(
@@ -83,7 +57,6 @@ pub fn security_headers_stack(node_env: NodeEnv) -> SecurityHeadersStack {
         xcto,
         xfo,
         referrer,
-        csp,
         hsts,
     }
 }
@@ -95,7 +68,6 @@ pub struct SecurityHeadersStack {
     xcto: SetResponseHeaderLayer<HeaderValue>,
     xfo: SetResponseHeaderLayer<HeaderValue>,
     referrer: SetResponseHeaderLayer<HeaderValue>,
-    csp: SetResponseHeaderLayer<HeaderValue>,
     hsts: Option<SetResponseHeaderLayer<HeaderValue>>,
 }
 
@@ -104,11 +76,7 @@ impl SecurityHeadersStack {
     /// because every header has a distinct name and the layers all use
     /// `if_not_present`.
     pub fn apply(self, router: axum::Router) -> axum::Router {
-        let r = router
-            .layer(self.xcto)
-            .layer(self.xfo)
-            .layer(self.referrer)
-            .layer(self.csp);
+        let r = router.layer(self.xcto).layer(self.xfo).layer(self.referrer);
         match self.hsts {
             Some(h) => r.layer(h),
             None => r,
@@ -133,8 +101,23 @@ mod tests {
     use tower::ServiceExt;
 
     async fn fetch_root(node_env: NodeEnv) -> axum::http::Response<Body> {
-        let app = Router::new().route("/", get(|| async { "ok" }));
+        // Mirror the production wiring in `main.rs`: static header stack on
+        // the inside, the per-response nonce-CSP middleware on the outside.
+        // CSP-shape assertions below then exercise the same layered result
+        // a browser would see, not just one half of it.
+        let app = Router::new().route(
+            "/",
+            get(|| async {
+                axum::response::Response::builder()
+                    .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+                    .body(Body::from("ok"))
+                    .unwrap()
+            }),
+        );
         let app = security_headers_stack(node_env).apply(app);
+        let app = app.layer(axum::middleware::from_fn(
+            super::super::csp_nonce::nonce_csp_middleware,
+        ));
         let req = Request::builder().uri("/").body(Body::empty()).unwrap();
         app.oneshot(req).await.unwrap()
     }
