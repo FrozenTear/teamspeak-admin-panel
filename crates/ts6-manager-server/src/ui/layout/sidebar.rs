@@ -113,6 +113,11 @@ pub struct SidebarProps {
 #[component]
 pub fn Sidebar(props: SidebarProps) -> Element {
     let dashboard_active = matches!(props.active, Route::DashboardPlaceholder {});
+    let channels_active = matches!(props.active, Route::ChannelsPage {});
+    let clients_active = matches!(props.active, Route::ClientsPage {});
+    let bans_active = matches!(props.active, Route::BansPage {});
+    let server_info_active = matches!(props.active, Route::ServerInfoPage {});
+    let logs_active = matches!(props.active, Route::LogsPage {});
     rsx! {
         aside { class: "sidebar",
             // Brand sits OUTSIDE `<nav aria-label="Primary">` so the
@@ -129,8 +134,9 @@ pub fn Sidebar(props: SidebarProps) -> Element {
             nav { id: "{NAV_LANDMARK_ID}", tabindex: "-1", "aria-label": "Primary",
                 NavGroup { label: "Server",
                     NavItem { icon: "▦", label: "Dashboard", to: Route::DashboardPlaceholder {}, active: dashboard_active }
-                    PlaceholderItem { icon: "#", label: "Channels" }
-                    PlaceholderItem { icon: "◆", label: "Clients" }
+                    NavItem { icon: "#", label: "Channels", to: Route::ChannelsPage {}, active: channels_active }
+                    NavItem { icon: "◆", label: "Clients", to: Route::ClientsPage {}, active: clients_active }
+                    NavItem { icon: "⊙", label: "Server info", to: Route::ServerInfoPage {}, active: server_info_active }
                     PlaceholderItem { icon: "▤", label: "Files" }
                 }
 
@@ -138,7 +144,7 @@ pub fn Sidebar(props: SidebarProps) -> Element {
                     PlaceholderItem { icon: "⚐", label: "Server groups" }
                     PlaceholderItem { icon: "⚑", label: "Channel groups" }
                     PlaceholderItem { icon: "⚒", label: "Permissions" }
-                    PlaceholderItem { icon: "⊘", label: "Bans" }
+                    NavItem { icon: "⊘", label: "Bans", to: Route::BansPage {}, active: bans_active }
                     PlaceholderItem { icon: "∘", label: "Tokens" }
                     PlaceholderItem { icon: "!", label: "Complaints" }
                     PlaceholderItem { icon: "✉", label: "Messages" }
@@ -151,7 +157,7 @@ pub fn Sidebar(props: SidebarProps) -> Element {
                 }
 
                 NavGroup { label: "Admin",
-                    PlaceholderItem { icon: "≡", label: "Logs" }
+                    NavItem { icon: "≡", label: "Logs", to: Route::LogsPage {}, active: logs_active }
                     PlaceholderItem { icon: "◯", label: "Instance" }
                     PlaceholderItem { icon: "⚙", label: "Settings" }
                 }
@@ -314,18 +320,22 @@ mod tests {
     #[test]
     fn placeholder_items_carry_aria_disabled_and_tabindex_minus_one() {
         let html = render_sidebar_harness();
-        // 16 placeholder items in Phase 1 (3 × Server, 7 × Moderation,
-        // 3 × Automation, 3 × Admin). Pin the count so a future refactor
-        // that drops one is a flagged regression rather than a silent
-        // removal.
+        // Phase 2 (PURA-73) replaces five placeholders — Channels,
+        // Clients, Bans, Server info, Logs — with real routes. Remaining
+        // placeholders: 1 × Server (Files), 5 × Moderation (Server groups,
+        // Channel groups, Permissions, Tokens, Complaints, Messages =
+        // 6 actually), 3 × Automation (Bots, Music bots, Widgets),
+        // 2 × Admin (Instance, Settings) = 12. The Server info row uses
+        // the same `⊙` icon that previously belonged to a non-existent
+        // placeholder, so the count check is the authoritative signal.
         let disabled = html.matches(r#"aria-disabled="true""#).count();
         let tabindex_minus = html.matches(r#"tabindex="-1""#).count();
-        // 16 placeholders + the `<nav>` itself carries `tabindex=-1` for
-        // the skip-link target, so 17 total `tabindex="-1"` attributes.
-        assert_eq!(disabled, 16, "expected 16 aria-disabled placeholders, got {disabled}");
+        // 12 placeholders + the `<nav>` itself carries `tabindex=-1` for
+        // the skip-link target, so 13 total `tabindex="-1"` attributes.
+        assert_eq!(disabled, 12, "expected 12 aria-disabled placeholders, got {disabled}");
         assert_eq!(
-            tabindex_minus, 17,
-            "expected 17 tabindex='-1' (16 placeholders + nav landmark), got {tabindex_minus}"
+            tabindex_minus, 13,
+            "expected 13 tabindex='-1' (12 placeholders + nav landmark), got {tabindex_minus}"
         );
     }
 }

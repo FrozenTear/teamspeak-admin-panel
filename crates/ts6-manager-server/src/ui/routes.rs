@@ -17,7 +17,10 @@
 use dioxus::prelude::*;
 
 use crate::ui::layout::AppShell;
-use crate::ui::pages::{DashboardPlaceholder, Home, LoginPage, SetupPage};
+use crate::ui::pages::{
+    BansPage, ChannelsPage, ClientsPage, DashboardPlaceholder, Home, LoginPage, LogsPage,
+    ServerInfoPage, SetupPage,
+};
 
 #[rustfmt::skip]
 #[derive(Clone, Debug, PartialEq, Routable)]
@@ -34,4 +37,20 @@ pub enum Route {
 
     #[route("/dashboard")]
     DashboardPlaceholder {},
+
+    // PURA-73 — Phase 2 control surfaces.
+    #[route("/clients")]
+    ClientsPage {},
+
+    #[route("/channels")]
+    ChannelsPage {},
+
+    #[route("/bans")]
+    BansPage {},
+
+    #[route("/server-info")]
+    ServerInfoPage {},
+
+    #[route("/logs")]
+    LogsPage {},
 }

@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 /// WebQuery `clientlist -uid -away -voice -times -groups -info -country`
 /// projection (spec §7.8). `connection_client_ip` is admin-only — the
 /// route layer wipes it for non-admin callers.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ClientListItem {
     pub clid: i64,
     pub cid: i64,
@@ -96,7 +96,7 @@ pub struct LiveClient {
 /// `GET /api/servers/{configId}/vs/{sid}/channels` row. The route returns
 /// a flat list ordered by upstream `channel_order`; FE assembles the tree
 /// using `pid` (channels with `pid == 0` are top-level).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ChannelTreeNode {
     pub cid: i64,
     pub pid: i64,
@@ -199,7 +199,7 @@ pub struct BanCreated {
 }
 
 /// `GET /api/servers/{configId}/vs/{sid}/bans` row.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct BanListItem {
     pub banid: i64,
     pub ip: String,
@@ -218,7 +218,7 @@ pub struct BanListItem {
 
 /// `GET /api/servers/{configId}/vs/{sid}/info` body — `serverinfo`
 /// passthrough.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ServerInfoResponse {
     pub virtualserver_name: String,
     pub virtualserver_platform: String,

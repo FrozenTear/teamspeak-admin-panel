@@ -30,7 +30,8 @@ ts6-manager-shared = { path = "crates/shared" }
 # powers the gloo-net executor on the WASM target. `futures` is used on
 # every target for the `BoxFuture` type the refresh-gate trait returns.
 futures = { version = "0.3", default-features = false, features = ["std"] }
-gloo-net = { version = "0.6", default-features = false, features = ["http", "json"] }
+gloo-net = { version = "0.6", default-features = false, features = ["http", "json", "websocket"] }
+gloo-timers = { version = "0.3", default-features = false, features = ["futures"] }
 js-sys = "0.3"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
@@ -39,6 +40,7 @@ web-sys = { version = "0.3", features = [
     "Window",
     "Location",
 ] }
+urlencoding = "2"
 
 # Phase 1 SECURITY (PURA-4)
 aes-gcm = "0.10"

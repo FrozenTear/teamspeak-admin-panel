@@ -65,10 +65,12 @@ futures = { workspace = true }
 # PURA-14 — auth client slice. Source code is `cfg(target_arch = "wasm32")`
 # gated, so these compile cheaply on native (no network calls reachable).
 gloo-net = { workspace = true }
+gloo-timers = { workspace = true }
 js-sys = { workspace = true }
 wasm-bindgen = { workspace = true }
 wasm-bindgen-futures = { workspace = true }
 web-sys = { workspace = true }
+urlencoding = { workspace = true }
 
 # Server-only — gated by the `server` feature so the wasm32 build skips them.
 anyhow = { workspace = true, optional = true }

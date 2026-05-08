@@ -21,7 +21,10 @@ use dioxus::prelude::*;
 
 use crate::client::dioxus::use_session;
 use crate::client::store::AuthState;
-use crate::ui::components::{ServerSelector, ServerSelectorVariant};
+use crate::ui::components::{
+    ActivityFeedSubscription, ServerSelector, ServerSelectorVariant, ToasterRegion,
+    WsReconnectBanner,
+};
 use crate::ui::routes::Route;
 
 /// Authenticated layout. Dioxus mounts an `Outlet<Route>` for the matched
@@ -85,8 +88,14 @@ pub fn AppShell() -> Element {
                 ServerSelector { variant: ServerSelectorVariant::Mobile }
             }
             main { class: "main", tabindex: "0",
+                WsReconnectBanner {}
                 Outlet::<Route> {}
             }
+            // Subscribes to the selected server's `clients` topic and
+            // pushes activity entries + toasts. Renders nothing visible.
+            ActivityFeedSubscription {}
+            // Top-right transient feedback (kicks, bans, dropped events).
+            ToasterRegion {}
         }
     }
 }

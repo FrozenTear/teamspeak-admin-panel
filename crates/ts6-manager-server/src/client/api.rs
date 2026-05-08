@@ -160,6 +160,85 @@ where
     classify_response(status, &body)
 }
 
+/// `POST {base}{path}` with an optional JSON body and refresh-gating.
+///
+/// Pass `None` for a body-less POST (e.g. `unmute`). The control surface
+/// handlers in [`crate::routes::control`] return `204 No Content` on
+/// success — pass `()` for `T` to discard the empty body, or a typed
+/// payload for handlers that respond with JSON (`POST .../bans` → 201
+/// `{ banid }`).
+pub async fn authorized_post_json<B, T>(
+    gate: &RefreshGate,
+    base: &str,
+    path: &str,
+    body: Option<&B>,
+) -> Result<T, ApiError>
+where
+    B: serde::Serialize + ?Sized,
+    T: DeserializeOwned,
+{
+    let body_string = body
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| ApiError::Deserialise(e.to_string()))?;
+    let (status, body) = gate
+        .run(|snap| {
+            let base = base.to_owned();
+            let path = path.to_owned();
+            let body_string = body_string.clone();
+            async move {
+                authorized_send_raw(
+                    HttpMethod::Post,
+                    &base,
+                    &path,
+                    body_string.as_deref(),
+                    &snap,
+                )
+                .await
+            }
+        })
+        .await
+        .map_err(ApiError::from)?;
+
+    classify_maybe_empty(status, &body)
+}
+
+/// `DELETE {base}{path}` with refresh-gating. 204 → `Ok(())`.
+pub async fn authorized_delete(
+    gate: &RefreshGate,
+    base: &str,
+    path: &str,
+) -> Result<(), ApiError> {
+    let (status, body) = gate
+        .run(|snap| {
+            let base = base.to_owned();
+            let path = path.to_owned();
+            async move { authorized_send_raw(HttpMethod::Delete, &base, &path, None, &snap).await }
+        })
+        .await
+        .map_err(ApiError::from)?;
+
+    classify_maybe_empty::<()>(status, &body)
+}
+
+/// `POST` / `DELETE` body-less variant: `204 No Content` is treated as
+/// success when `T = ()`, and any 2xx body is parsed as JSON otherwise.
+/// Non-2xx responses go through [`classify_response`] for the spec §7.0.2
+/// error-envelope handling.
+pub(crate) fn classify_maybe_empty<T: DeserializeOwned>(status: u16, body: &str) -> Result<T, ApiError> {
+    if (200..300).contains(&status) {
+        if status == 204 || body.trim().is_empty() {
+            // For T = () this resolves to Ok(()). For typed payloads this
+            // is a programmer error — the route should have returned a
+            // body — so a deserialise failure here is the right surface.
+            return serde_json::from_str("null")
+                .map_err(|e| ApiError::Deserialise(e.to_string()));
+        }
+        return serde_json::from_str(body).map_err(|e| ApiError::Deserialise(e.to_string()));
+    }
+    classify_response::<T>(status, body)
+}
+
 /// Parse a (status, body) pair into a typed result, applying the spec §7.0.2
 /// envelope rules. Pulled out as a free function so it can be unit-tested
 /// without touching `gloo-net`, and reused by the unauth setup module which
@@ -195,6 +274,12 @@ struct BadGatewayBody {
     details: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum HttpMethod {
+    Post,
+    Delete,
+}
+
 #[cfg(target_arch = "wasm32")]
 async fn authorized_get_raw(
     base: &str,
@@ -226,6 +311,57 @@ async fn authorized_get_raw(
 async fn authorized_get_raw(
     _base: &str,
     _path: &str,
+    _snap: &SessionSnapshot,
+) -> Result<(u16, String), AuthError> {
+    Err(AuthError::UnsupportedTarget)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn authorized_send_raw(
+    method: HttpMethod,
+    base: &str,
+    path: &str,
+    body: Option<&str>,
+    snap: &SessionSnapshot,
+) -> Result<(u16, String), AuthError> {
+    use gloo_net::http::Request;
+    let url = format!("{}{}", base.trim_end_matches('/'), path);
+    let mut builder = match method {
+        HttpMethod::Post => Request::post(&url),
+        HttpMethod::Delete => Request::delete(&url),
+    };
+    builder = builder.header("authorization", &format!("Bearer {}", snap.access));
+    let resp = if let Some(b) = body {
+        builder = builder.header("content-type", "application/json");
+        builder
+            .body(b.to_string())
+            .map_err(|e| AuthError::Transport(e.to_string()))?
+            .send()
+            .await
+    } else {
+        builder.send().await
+    }
+    .map_err(|e| AuthError::Transport(e.to_string()))?;
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| AuthError::Transport(e.to_string()))?;
+    if status == 401 {
+        let msg = serde_json::from_str::<ErrorResponse>(&body)
+            .map(|e| e.error)
+            .unwrap_or_else(|_| body.clone());
+        return Err(AuthError::Unauthorized(msg));
+    }
+    Ok((status, body))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn authorized_send_raw(
+    _method: HttpMethod,
+    _base: &str,
+    _path: &str,
+    _body: Option<&str>,
     _snap: &SessionSnapshot,
 ) -> Result<(u16, String), AuthError> {
     Err(AuthError::UnsupportedTarget)
