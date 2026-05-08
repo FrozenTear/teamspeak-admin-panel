@@ -26,6 +26,7 @@
 pub mod cache;
 pub mod routes;
 pub mod snapshot;
+pub mod svg;
 pub mod themes;
 
 pub use cache::WidgetCache;

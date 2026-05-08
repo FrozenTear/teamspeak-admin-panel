@@ -23,7 +23,7 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use serde::Serialize;
-use ts6_manager_shared::widgets::WidgetData;
+use ts6_manager_shared::widgets::{WidgetData, WidgetThemeName};
 
 use crate::app_state::AppState;
 use crate::control::ControlBackendError;
@@ -31,12 +31,16 @@ use crate::repos::{server_connections, widgets as widget_repo};
 
 use super::cache::CACHE_TTL;
 use super::snapshot::{WidgetInputs, build_widget_data};
+use super::svg;
+use super::themes::theme_for;
 
 const CACHE_CONTROL_VALUE: &str = "public, max-age=45";
 
 /// Mount the public widget routes under `/api/widget/{token}/...`.
 pub fn router() -> Router<AppState> {
-    Router::new().route("/api/widget/{token}/data", get(data_handler))
+    Router::new()
+        .route("/api/widget/{token}/data", get(data_handler))
+        .route("/api/widget/{token}/image.svg", get(svg_handler))
 }
 
 #[derive(Debug, Serialize)]
@@ -90,6 +94,36 @@ async fn data_handler(
         [(
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/json"),
+        )],
+        body,
+    )
+        .into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(CACHE_CONTROL_VALUE),
+    );
+    Ok(response)
+}
+
+/// `GET /api/widget/{token}/image.svg`
+///
+/// Renders the same `WidgetData` snapshot that backs `/data`, so JSON and
+/// SVG share a single 45 s cache window. Theme is resolved via
+/// [`super::themes::theme_for`] from the snapshot's `theme` string. The
+/// renderer emits a self-contained SVG document with the SPA's font stack
+/// embedded as a `font-family` attribute on the root `<svg>`.
+async fn svg_handler(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+) -> Result<Response, Response> {
+    let data = resolve_widget_data(&state, &token).await?;
+    let theme = theme_for(WidgetThemeName::parse_or_default(&data.theme));
+    let body = svg::render(&data, theme);
+    let mut response = (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("image/svg+xml"),
         )],
         body,
     )
