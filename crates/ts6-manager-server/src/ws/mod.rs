@@ -16,18 +16,19 @@
 //!   ping/pong heartbeat, bounded send queue with drop-on-overflow.
 //!
 //! Out-of-scope follow-ups owned by sibling tickets:
-//! - PURA-70a — TS server-notify event source (SSHBRIDGE / PURA-80).
 //! - PURA-70c — `/metrics` endpoint exposing the hub counters.
 //!
 //! The PURA-70b periodic dashboard tick republisher landed in
-//! [`dashboard_tick`] (PURA-81).
+//! [`dashboard_tick`] (PURA-81); the PURA-70a TS server-notify event
+//! source landed in [`server_notify`] (PURA-80).
 
-#![allow(dead_code)] // consumed by PURA-70 follow-ups (70a/c) and the ws::session loop
+#![allow(dead_code)] // consumed by PURA-70 follow-ups and the ws::session loop
 
 pub mod auth;
 pub mod dashboard_tick;
 pub mod envelope;
 pub mod hub;
+pub mod server_notify;
 pub mod session;
 pub mod topic;
 

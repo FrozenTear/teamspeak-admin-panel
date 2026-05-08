@@ -144,6 +144,20 @@ mod server_entry {
             },
         );
 
+        // PURA-80 — TS server-notify event source. Spawns one worker
+        // per enabled SSH-controlled `server_connection`; each
+        // subscribes to the SSH transport's `notify*` broadcast,
+        // registers for server/channel/textserver/textchannel events,
+        // and re-publishes them onto the matching WS hub topic. Held
+        // as a drop-guard alongside the dashboard tick.
+        let _server_notify = crate::ws::server_notify::spawn(
+            crate::ws::server_notify::EventSourceDeps {
+                db: database.clone(),
+                hub: state.ws_hub.clone(),
+                control: state.control.clone(),
+            },
+        );
+
         // Phase 1 SECURITY (slice 4b): per-IP rate limit on the auth
         // surface. One bucket shared across `/login` and `/refresh` per
         // spec §6.8; `trusted_proxy_hops` decides whether the limiter

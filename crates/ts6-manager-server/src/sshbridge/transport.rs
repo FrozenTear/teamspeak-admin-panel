@@ -169,6 +169,14 @@ pub struct TransportHandle {
     config_id: i64,
     cmd_tx: mpsc::Sender<CommandRequest>,
     notify_tx: broadcast::Sender<NotifyFrame>,
+    /// PURA-80 — broadcast tick fired by [`run_with_reconnect`] each
+    /// time a fresh session reaches `error id=0 msg=ok` on the banner.
+    /// Subscribers re-issue any session-scoped state the upstream
+    /// resets on reconnect (notify subscriptions, sid selection, …).
+    /// The first banner-ok after `spawn` also fires this; subscribers
+    /// that called `subscribe_session_up()` BEFORE `spawn` returned
+    /// receive the bootstrap signal (see `spawn_inner` ordering).
+    session_up_tx: broadcast::Sender<()>,
     /// Set once when the dispatch supervisor terminates fatally
     /// (`SessionResult::AuthRejected`). Subsequent submissions
     /// short-circuit to `SshBridgeError::AuthRejected` rather than
@@ -192,6 +200,13 @@ impl TransportHandle {
     /// loop (broadcast channels drop the oldest messages).
     pub fn subscribe_notify(&self) -> broadcast::Receiver<NotifyFrame> {
         self.notify_tx.subscribe()
+    }
+
+    /// Subscribe to session-up signals. PURA-80 uses this to re-issue
+    /// `servernotifyregister` after every reconnect — the upstream
+    /// drops the notify subscription when the SSH session ends.
+    pub fn subscribe_session_up(&self) -> broadcast::Receiver<()> {
+        self.session_up_tx.subscribe()
     }
 
     /// Submit a wire ServerQuery line to the bridge. Returns the
@@ -537,6 +552,7 @@ async fn run_with_reconnect<C, F, Fut>(
     mut connect_factory: F,
     mut cmd_rx: mpsc::Receiver<CommandRequest>,
     notify_tx: broadcast::Sender<NotifyFrame>,
+    session_up_tx: broadcast::Sender<()>,
     auth_rejected_flag: Arc<Mutex<bool>>,
     host_key_mismatch_flag: Arc<Mutex<bool>>,
     db: Option<Arc<Database>>,
@@ -612,6 +628,13 @@ where
                     config_id = cfg.config_id,
                     "ssh banner OK — entering dispatch loop"
                 );
+                // PURA-80 — fan out the session-up tick to subscribers
+                // (server-notify event source re-issues
+                // `servernotifyregister` here). `send` errors only when
+                // there are zero receivers; that's fine — the signal
+                // is best-effort and a future first subscriber sees
+                // the next reconnect.
+                let _ = session_up_tx.send(());
                 attempts = 0;
             }
             Err(SshBridgeError::AuthRejected { .. }) => {
@@ -787,6 +810,11 @@ where
 {
     let (cmd_tx, cmd_rx) = mpsc::channel::<CommandRequest>(cfg.command_queue_capacity);
     let (notify_tx, _) = broadcast::channel::<NotifyFrame>(cfg.notify_capacity);
+    // Capacity 8 is plenty — `session_up` fires once per (re)connect,
+    // so even a fleet-wide network blip would only emit a handful of
+    // signals per server. Slow subscribers see `Lagged` and re-pull;
+    // missing a tick just means waiting for the next reconnect.
+    let (session_up_tx, _) = broadcast::channel::<()>(8);
     let auth_flag = Arc::new(Mutex::new(false));
     let host_key_flag = Arc::new(Mutex::new(false));
 
@@ -794,6 +822,7 @@ where
         config_id: cfg.config_id,
         cmd_tx,
         notify_tx: notify_tx.clone(),
+        session_up_tx: session_up_tx.clone(),
         auth_rejected: auth_flag.clone(),
         host_key_mismatch: host_key_flag.clone(),
     };
@@ -805,6 +834,7 @@ where
             connect_factory,
             cmd_rx,
             notify_tx,
+            session_up_tx,
             auth_flag,
             host_key_flag,
             db,
@@ -1274,6 +1304,7 @@ mod tests {
 
         let (cmd_tx, cmd_rx) = mpsc::channel::<CommandRequest>(8);
         let (notify_tx, _) = broadcast::channel::<NotifyFrame>(16);
+        let (session_up_tx, _) = broadcast::channel::<()>(4);
         let auth_flag = Arc::new(Mutex::new(false));
         let host_key_flag = Arc::new(Mutex::new(false));
 
@@ -1307,6 +1338,7 @@ mod tests {
             factory,
             cmd_rx,
             notify_tx,
+            session_up_tx,
             auth_flag.clone(),
             host_key_flag.clone(),
             None,
@@ -1423,6 +1455,7 @@ mod tests {
         };
         let (cmd_tx, cmd_rx) = mpsc::channel::<CommandRequest>(8);
         let (notify_tx, _) = broadcast::channel::<NotifyFrame>(16);
+        let (session_up_tx, _) = broadcast::channel::<()>(4);
         let auth_flag = Arc::new(Mutex::new(false));
         let host_key_flag = Arc::new(Mutex::new(false));
 
@@ -1431,6 +1464,7 @@ mod tests {
             factory,
             cmd_rx,
             notify_tx,
+            session_up_tx,
             auth_flag,
             host_key_flag,
             None,

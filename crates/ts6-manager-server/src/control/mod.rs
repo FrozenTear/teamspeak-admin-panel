@@ -57,7 +57,7 @@ use crate::sshbridge::{
     control_client::SshControlClient,
     hostkey::{HostKeyConfigError, HostKeyVerifier},
     russh_channel::{connect as ssh_connect, RusshAuth, RusshConnectParams},
-    transport::{spawn_with_db as spawn_transport_with_db, TransportConfig},
+    transport::{spawn_with_db as spawn_transport_with_db, TransportConfig, TransportHandle},
     SshBridgeError,
 };
 use zeroize::Zeroizing;
@@ -221,6 +221,16 @@ pub trait ControlBackend: Send + Sync + std::fmt::Debug {
 
     /// `serverrequestconnectioninfo` — virtual-server scope.
     async fn server_connection_info(&self, sid: i64) -> ControlResult<ConnectionInfo>;
+
+    /// Underlying SSH transport handle, if this backend is SSH-driven.
+    /// `None` for WebQuery — that path has no `notify*` event surface.
+    /// PURA-80 uses this to share the existing SSH session with the
+    /// server-notify event source so the upstream's notify
+    /// subscription stays bound to the same session that runs the
+    /// dashboard tick's commands.
+    fn ssh_transport(&self) -> Option<TransportHandle> {
+        None
+    }
 }
 
 /// Straight delegation. Method-call resolution prefers the inherent

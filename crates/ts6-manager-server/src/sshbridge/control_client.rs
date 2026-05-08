@@ -73,6 +73,16 @@ impl SshControlClient {
         self.config_id
     }
 
+    /// Return a clone of the underlying [`TransportHandle`]. Used by the
+    /// PURA-80 server-notify event source to share the SSH session with
+    /// the dashboard tick — registering for `notify*` events on a
+    /// separate session would double the SSH connection count per
+    /// server, and the upstream's notify subscription is bound to the
+    /// session that issued `servernotifyregister`.
+    pub fn transport_handle(&self) -> TransportHandle {
+        self.transport.clone()
+    }
+
     /// Submit one wire line, returning the [`CommandOutcome`] (body
     /// lines + terminator + latency) or a typed error.
     async fn execute(&self, line: &str, sid: Option<i64>) -> ControlResult<CommandOutcome> {
@@ -191,6 +201,10 @@ impl ControlBackend for SshControlClient {
             .run_scoped(sid, "serverrequestconnectioninfo")
             .await?;
         Self::parse_first(&outcome.body_lines)
+    }
+
+    fn ssh_transport(&self) -> Option<TransportHandle> {
+        Some(self.transport.clone())
     }
 }
 
