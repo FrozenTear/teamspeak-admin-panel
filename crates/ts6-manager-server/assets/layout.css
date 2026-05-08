@@ -58,3 +58,49 @@
   margin: 0;
   color: var(--text-secondary);
 }
+
+/* ─── Layout-chrome supplements (PURA-21) ─────────────── */
+/* The base chrome rules live in components.css §"Layout chrome".
+ * These tiny additions cover the parts the shipped components need
+ * but the preview HTML didn't (brand-as-link, disabled nav items, the
+ * mobile-selector-bar shown above 768px). Token-only — nothing here
+ * sets a hex literal. */
+
+/* Brand is rendered as a `Link` so the SPA navigates without reload;
+ * suppress the default underline so it visually matches the preview's
+ * non-link `<div>`. */
+.sidebar .brand {
+  text-decoration: none;
+}
+.sidebar .brand:hover,
+.sidebar .brand:focus-visible {
+  color: var(--accent-fg);
+}
+
+/* Inert nav items for routes that haven't been wired yet. They stay
+ * visible so the operator's mental map matches the spec's §28.1 route
+ * list, but they're not focusable / clickable. Mirrors the
+ * `aria-disabled="true"` set at the markup level. */
+.sidebar .nav-item.is-disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  pointer-events: none;
+}
+
+/* Mobile-only second row that holds the server selector pill below the
+ * header (per components.md §11.3). At desktop widths it's hidden
+ * because the pill rides inside the header; below the spec's `--bp-sm`
+ * breakpoint we flip it on so the operator keeps a one-tap reach to the
+ * server switcher even when the header collapses. */
+.app .mobile-selector-bar {
+  display: none;
+}
+@media (max-width: 768px) {
+  .app .mobile-selector-bar {
+    display: block;
+    grid-column: 1;
+    padding: var(--space-3) var(--space-5);
+    background: var(--bg-canvas);
+    border-bottom: 1px solid var(--border-subtle);
+  }
+}

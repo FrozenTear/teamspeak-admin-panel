@@ -17,6 +17,7 @@
 //! the rest of the §3.12 route table.
 
 pub mod components;
+pub mod layout;
 pub mod pages;
 pub mod routes;
 pub mod theme;
