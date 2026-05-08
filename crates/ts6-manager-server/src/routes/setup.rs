@@ -21,13 +21,17 @@
 //! - **Input handling**: password complexity (§6.2.2) is checked before
 //!   hashing so we don't burn Argon2 cycles on rejects.
 //! - **Rate limiting**: spec §6.8 mandates 15 reqs / 15 min on
-//!   `POST /api/setup/*`. Wired by the caller of [`router`] — the
-//!   middleware lives in [`crate::web::rate_limit`].
+//!   `POST /api/setup/*`. PURA-35 wires a DEDICATED limiter on
+//!   `POST /api/setup/init` (see [`router`]) — distinct from the
+//!   `/login` + `/refresh` bucket so login spam cannot DoS the
+//!   bootstrap wizard, and a stuck setup retry cannot DoS login.
+//!   `GET /api/setup/status` is read-only and stays unrestricted.
 
 use axum::Json;
 use axum::Router;
 use axum::extract::State;
 use axum::http::StatusCode;
+use axum::middleware::from_fn_with_state;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use ts6_manager_shared::auth::{ErrorResponse, UserInfo};
@@ -42,6 +46,7 @@ use crate::repos::server_connections::NewServerConnection;
 use crate::repos::users::NewUser;
 use crate::repos::{self, users};
 use crate::routes::server_summary_from_row;
+use crate::web::rate_limit::{RateLimitState, rate_limit_auth};
 
 /// Wire-string for the one-shot 409. PURA-22 fixes the body verbatim so the
 /// FE can branch without parsing English copy.
@@ -56,10 +61,17 @@ const DEFAULT_SSH_PORT: i64 = 10022;
 /// Build the `/api/setup` sub-router. Uses absolute paths to match the
 /// `merge` style adopted across non-auth routes — see [`crate::routes::servers`]
 /// for the rationale (axum 0.8 strict trailing-slash + spec §7.2 path names).
-pub fn router() -> Router<AppState> {
+///
+/// PURA-35: `POST /api/setup/init` is wrapped in the spec §6.8 per-IP
+/// rate-limit middleware via the caller-supplied [`RateLimitState`].
+/// `GET /api/setup/status` is read-only and unrestricted — it powers
+/// the wizard's needs-setup probe and rate-limiting it would just
+/// degrade the first-run UX without buying any defence.
+pub fn router(rate_limit: RateLimitState) -> Router<AppState> {
+    let rl_layer = from_fn_with_state(rate_limit, rate_limit_auth);
     Router::new()
         .route("/api/setup/status", get(status))
-        .route("/api/setup/init", post(init))
+        .route("/api/setup/init", post(init).layer(rl_layer))
 }
 
 async fn status(State(state): State<AppState>) -> Result<Json<SetupStatusResponse>, Response> {
@@ -216,8 +228,17 @@ mod tests {
         }
     }
 
+    fn fresh_rate_limit() -> RateLimitState {
+        RateLimitState {
+            limiter: crate::web::rate_limit::make_setup_limiter(),
+            trusted_hops: 0,
+        }
+    }
+
     fn app(state: AppState) -> Router {
-        Router::new().merge(router()).with_state(state)
+        Router::new()
+            .merge(router(fresh_rate_limit()))
+            .with_state(state)
     }
 
     fn json_body<T: serde::Serialize>(value: &T) -> Body {

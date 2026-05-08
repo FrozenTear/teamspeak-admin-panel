@@ -1,10 +1,16 @@
-//! Spec §6.8 — per-IP rate limit for authentication routes.
+//! Spec §6.8 — per-IP rate limit for the authentication and setup surfaces.
 //!
 //! Quota: 15 requests / 15 minutes, source-IP keyed (after the
 //! single-hop X-Forwarded-For trust policy in [`crate::web::proxy`]).
-//! Applies to `POST /api/auth/login` and `POST /api/auth/refresh`. The
-//! `/api/setup/*` and `/api/bots/webhook/*` buckets land with their
-//! respective routes.
+//! Applies to `POST /api/auth/login`, `POST /api/auth/refresh`, and
+//! `POST /api/setup/init`. The `/api/bots/webhook/*` bucket lands with
+//! that route's owner.
+//!
+//! Each protected surface gets its OWN [`RateLimiter`] instance (built
+//! via [`make_keyed_limiter`]) so a burst against one cannot starve the
+//! other — see PURA-35 / R-S5.1: conflating `/login` + `/setup/init`
+//! into a single bucket would let login spam DoS the bootstrap wizard
+//! (and vice versa).
 //!
 //! On rate-limit denial the middleware returns:
 //!
@@ -56,10 +62,34 @@ pub struct RateLimitState {
 /// max burst of 15. The 16th attempt within 5 seconds (spec §6.13 verify
 /// test) hits an empty bucket and is denied.
 pub fn auth_quota() -> Quota {
+    fifteen_per_fifteen_minutes()
+}
+
+/// Spec §6.8 quota for `POST /api/setup/init`: 15 requests / 15 minutes,
+/// source-IP keyed. Identical numerics to [`auth_quota`] but mounted on
+/// its OWN limiter instance so the auth surface and the bootstrap wizard
+/// can't DoS each other (R-S5.1, PURA-35).
+pub fn setup_quota() -> Quota {
+    fifteen_per_fifteen_minutes()
+}
+
+/// Spec §6.8 shared encoding: burst of 15, replenish 1/min. Centralised so
+/// the two callers (`auth_quota`, `setup_quota`) cannot drift if a future
+/// edit retunes one and forgets the other.
+fn fifteen_per_fifteen_minutes() -> Quota {
     let burst = NonZeroU32::new(15).expect("15 != 0");
     Quota::with_period(Duration::from_secs(60))
         .expect("60s != 0 — quota construction is infallible")
         .allow_burst(burst)
+}
+
+/// Build a per-IP keyed limiter with the supplied quota. Each protected
+/// surface (`/auth`, `/setup/init`, future `/bots/webhook`) gets its own
+/// instance — limiters are stateful (the GCRA bucket map) so two callers
+/// holding the same `Arc` would share buckets, defeating the bucket-
+/// isolation invariant from spec §6.8.
+pub fn make_keyed_limiter(quota: Quota) -> Arc<AuthRateLimiter> {
+    Arc::new(RateLimiter::keyed(quota))
 }
 
 /// Construct the keyed rate limiter for the auth routes. One limiter is
@@ -67,7 +97,14 @@ pub fn auth_quota() -> Quota {
 /// auth surface" intent holds — a single attacker can't side-step the
 /// 15/15min budget by alternating endpoints.
 pub fn make_auth_limiter() -> Arc<AuthRateLimiter> {
-    Arc::new(RateLimiter::keyed(auth_quota()))
+    make_keyed_limiter(auth_quota())
+}
+
+/// Construct the keyed rate limiter for `POST /api/setup/init`. Distinct
+/// instance from [`make_auth_limiter`] so login spam can't lock out the
+/// bootstrap wizard (and a stuck setup retry can't lock out login).
+pub fn make_setup_limiter() -> Arc<AuthRateLimiter> {
+    make_keyed_limiter(setup_quota())
 }
 
 /// Axum middleware: per-IP rate limit on the wrapped routes.
@@ -75,6 +112,12 @@ pub fn make_auth_limiter() -> Arc<AuthRateLimiter> {
 /// Resolves the source IP via the configured trusted-proxy policy,
 /// consults the limiter, and either calls `next.run(req)` or returns
 /// the spec-mandated 429 envelope.
+///
+/// The middleware is limiter-agnostic — every protected surface
+/// (auth, setup, future webhook) builds its own [`RateLimitState`] with
+/// the appropriate `make_*_limiter` and layers this same function. The
+/// historical name reflects its first call site; a rename would be
+/// pure churn.
 ///
 /// `ConnectInfo<SocketAddr>` is read from request extensions rather than
 /// a typed extractor parameter so the middleware survives test harnesses
@@ -308,6 +351,62 @@ mod tests {
             burned.status(),
             StatusCode::TOO_MANY_REQUESTS,
             "with trusted_hops=0, XFF rotation must NOT let an attacker bypass per-peer limits"
+        );
+    }
+
+    /// PURA-35 / R-S5.1 — cross-bucket isolation. Two callers, same source IP,
+    /// each going through a DIFFERENT limiter (`make_auth_limiter` vs
+    /// `make_setup_limiter`). Burning one bucket must NOT trip the other,
+    /// otherwise login spam DoSes the bootstrap wizard (and vice versa).
+    #[tokio::test]
+    async fn auth_and_setup_buckets_are_independent() {
+        let auth_state = RateLimitState {
+            limiter: make_auth_limiter(),
+            trusted_hops: 0,
+        };
+        let setup_state = RateLimitState {
+            limiter: make_setup_limiter(),
+            trusted_hops: 0,
+        };
+        // Two apps, each layered with its own limiter — mirrors how
+        // `auth::routes::router` and `routes::setup::router` are wired in
+        // `main.rs`.
+        let auth_app = app(auth_state);
+        let setup_app = app(setup_state);
+
+        let ip = "198.51.100.42";
+
+        // Burn the auth bucket entirely from `ip`.
+        for _ in 0..15 {
+            let r = auth_app.clone().oneshot(req_from(ip)).await.unwrap();
+            assert_eq!(r.status(), StatusCode::OK);
+        }
+        let auth_burned = auth_app.clone().oneshot(req_from(ip)).await.unwrap();
+        assert_eq!(
+            auth_burned.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "auth bucket should be empty after 15 hits"
+        );
+
+        // Same IP, setup bucket — must still be fully open.
+        for n in 1..=15 {
+            let r = setup_app.clone().oneshot(req_from(ip)).await.unwrap();
+            assert_eq!(
+                r.status(),
+                StatusCode::OK,
+                "setup attempt {n} from same IP must not be affected by a burned auth bucket"
+            );
+        }
+
+        // And the inverse: burning setup must not retroactively re-open auth
+        // or further restrict it. The 16th setup hit trips its own bucket.
+        let setup_burned = setup_app.clone().oneshot(req_from(ip)).await.unwrap();
+        assert_eq!(setup_burned.status(), StatusCode::TOO_MANY_REQUESTS);
+        let auth_still_burned = auth_app.oneshot(req_from(ip)).await.unwrap();
+        assert_eq!(
+            auth_still_burned.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "burning setup must not perturb the auth bucket"
         );
     }
 

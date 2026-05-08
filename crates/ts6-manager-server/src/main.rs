@@ -120,22 +120,31 @@ mod server_entry {
         // spec §6.8; `trusted_proxy_hops` decides whether the limiter
         // keys by ConnectInfo (direct listener) or by the rightmost XFF
         // entry (single trusted proxy in front).
-        let rate_limit_state = web::rate_limit::RateLimitState {
+        let auth_rate_limit_state = web::rate_limit::RateLimitState {
             limiter: web::rate_limit::make_auth_limiter(),
+            trusted_hops: cfg.trusted_proxy_hops,
+        };
+        // PURA-35: dedicated limiter for `POST /api/setup/init`. Same
+        // 15-req / 15-min spec §6.8 quota, but its OWN GCRA bucket map
+        // — login spam can't DoS the bootstrap wizard and a stuck setup
+        // retry can't DoS login (R-S5.1 from PURA-22 review).
+        let setup_rate_limit_state = web::rate_limit::RateLimitState {
+            limiter: web::rate_limit::make_setup_limiter(),
             trusted_hops: cfg.trusted_proxy_hops,
         };
 
         // Phase 1 SECURITY (slice 3 + 4a + 4b): build the stateful sub-routers
         // once with state baked in so they compose as `Router<()>` with the
         // rest of the app.
-        let auth_router = auth::routes::router(rate_limit_state).with_state(state.clone());
+        let auth_router = auth::routes::router(auth_rate_limit_state).with_state(state.clone());
         let ws_router = auth::routes::ws_router().with_state(state.clone());
         // PURA-22 SECURITY slice 5 — `/api/setup` (one-shot bootstrap) and
         // `/api/servers` (list / create with sealed-at-rest credentials). Both
         // sub-routers live under `crate::routes`; auth + RBAC checks happen
         // inside the handlers via the `RequireAuth` / `RequireAdmin`
         // extractors so we don't need a separate middleware layer here.
-        let setup_router = routes::setup::router().with_state(state.clone());
+        let setup_router =
+            routes::setup::router(setup_rate_limit_state).with_state(state.clone());
         let servers_router = routes::servers::router().with_state(state.clone());
         // PURA-23 — Phase 1 dashboard route. Lives at an absolute path under
         // `/api/servers/:configId/vs/:sid/dashboard` (spec §7.19); the rest of
