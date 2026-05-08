@@ -46,6 +46,13 @@ pub fn router() -> Router<AppState> {
         .route("/password", put(change_password))
 }
 
+/// Build the absolute `/ws` route as a `Router<AppState>` so it can be
+/// merged into the top-level router with state baked in alongside the auth
+/// routes. Phase 1 SECURITY (slice 4a) — see [`crate::auth::ws_handshake`].
+pub fn ws_router() -> Router<AppState> {
+    Router::new().route("/ws", get(crate::auth::ws_handshake::ws_upgrade))
+}
+
 /// Convenience: spec error body + status into an `axum::Response`.
 fn err(status: StatusCode, body: &str) -> Response {
     (status, Json(ErrorResponse::new(body))).into_response()

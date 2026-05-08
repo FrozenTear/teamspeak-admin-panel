@@ -111,8 +111,11 @@ mod server_entry {
         let serve_cfg = ServeConfig::new();
         let state = app_state::AppState::from_config(&cfg, database.clone());
 
-        // Phase 1 SECURITY (slice 3): /api/auth REST surface.
-        let auth_router = auth::routes::router().with_state(state);
+        // Phase 1 SECURITY (slice 3 + 4a): build the stateful sub-routers
+        // once with state baked in so they compose as `Router<()>` with the
+        // rest of the app.
+        let auth_router = auth::routes::router().with_state(state.clone());
+        let ws_router = auth::routes::ws_router().with_state(state);
 
         // PURA-17: `serve_dioxus_application` registers static assets +
         // server functions and adds a fallback that serves the dx-CLI
@@ -123,6 +126,10 @@ mod server_entry {
         let router: Router = Router::new()
             .route("/health", get(health))
             .nest("/api/auth", auth_router)
+            // Phase 1 SECURITY (slice 4a): authenticated WebSocket upgrade.
+            // Per-message fan-out (TS events, bot logs, voice/video status —
+            // spec §8.4) is owned by the future REST/Realtime engineer.
+            .merge(ws_router)
             .serve_dioxus_application(serve_cfg, ui::App)
             // CORS + security headers apply globally. Per-route rate-limit
             // middleware will wrap login/refresh paths in the next slice.
