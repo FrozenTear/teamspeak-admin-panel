@@ -37,7 +37,11 @@ pub struct CreateServerRequest {
 ///
 /// Deliberately omits `apiKey` and `sshPassword` — neither ciphertext
 /// nor plaintext belong on the wire (spec §7.5).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `PartialEq` is derived so this type can ride through Dioxus `Props`
+/// (which require their fields to be equality-comparable for change
+/// detection) without an in-FE wrapper newtype.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerSummary {
     pub id: i64,

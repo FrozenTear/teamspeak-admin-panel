@@ -162,8 +162,9 @@ where
 
 /// Parse a (status, body) pair into a typed result, applying the spec §7.0.2
 /// envelope rules. Pulled out as a free function so it can be unit-tested
-/// without touching `gloo-net`.
-fn classify_response<T: DeserializeOwned>(status: u16, body: &str) -> Result<T, ApiError> {
+/// without touching `gloo-net`, and reused by the unauth setup module which
+/// inherits the same `{error}`-envelope contract for non-2xx responses.
+pub(crate) fn classify_response<T: DeserializeOwned>(status: u16, body: &str) -> Result<T, ApiError> {
     if (200..300).contains(&status) {
         return serde_json::from_str(body).map_err(|e| ApiError::Deserialise(e.to_string()));
     }

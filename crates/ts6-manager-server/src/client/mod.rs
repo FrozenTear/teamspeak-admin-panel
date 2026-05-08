@@ -12,6 +12,10 @@
 //! - [`api`] — generic authorized JSON fetch helper (PURA-31). Wraps the
 //!   refresh gate around `gloo-net` so any non-auth endpoint inherits the
 //!   single-flight refresh contract for free.
+//! - [`setup`] — typed unauthenticated `/api/setup/*` calls (PURA-34). The
+//!   wizard runs before any session exists so it bypasses the refresh gate
+//!   on purpose; the `409 already_initialized` branch surfaces as its own
+//!   error variant for branchless wizard logic.
 //!
 //! Cleanroom-safe: this module is built from the spec and the wire shapes in
 //! `ts6_manager_shared::auth`; the reference repo is not consulted.
@@ -26,6 +30,7 @@ pub mod api;
 pub mod auth;
 pub mod dioxus;
 pub mod session;
+pub mod setup;
 pub mod storage;
 pub mod store;
 pub mod ui_prefs;

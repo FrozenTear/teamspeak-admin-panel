@@ -8,7 +8,9 @@
 mod dashboard_placeholder;
 mod home;
 mod login;
+mod setup;
 
 pub use dashboard_placeholder::DashboardPlaceholder;
 pub use home::Home;
 pub use login::LoginPage;
+pub use setup::SetupPage;

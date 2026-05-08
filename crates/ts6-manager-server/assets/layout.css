@@ -278,3 +278,41 @@
 .skeleton-line.narrow { width: 35%; }
 .skeleton-line.short  { width: 50%; height: 10px; }
 .skeleton-line.tall   { width: 80%; height: 22px; }
+
+/* ─── Setup wizard (PURA-34) ────────────────────────────── */
+/* Re-uses the chrome-less .login-page surface (no sidebar/header) so the
+ * first-run wizard sits on the same neutral background as /login. The
+ * .setup-card variant is wider than .login-card because the wizard packs
+ * two field groups (admin + first-server) into one form. */
+.setup-page {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  padding: var(--space-6);
+}
+.setup-card {
+  width: 100%;
+  max-width: 560px;
+  background: var(--bg-surface-raised);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  padding: var(--space-7) var(--space-7);
+}
+.setup-intro {
+  color: var(--text-muted);
+  margin: 0 0 var(--space-5) 0;
+}
+.setup-section-heading {
+  font: var(--weight-semibold) var(--text-md) / var(--lh-md) var(--font-sans);
+  color: var(--text-primary);
+  margin: var(--space-6) 0 var(--space-3) 0;
+  padding-bottom: var(--space-2);
+  border-bottom: 1px solid var(--border-subtle);
+}
+.setup-section-heading:first-of-type {
+  margin-top: var(--space-2);
+}
+@media (max-width: 480px) {
+  .setup-card { padding: var(--space-5) var(--space-4); }
+}

@@ -171,9 +171,10 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use crate::client::dioxus::DioxusSession;
+    use crate::client::dioxus::{DioxusSession, provide_auth_gate};
     use crate::client::storage::MemoryStore;
     use crate::client::store::AuthState;
+    use crate::ui::layout::{ServersContext, ServersData};
     use crate::ui::theme::ThemeContext;
     use ts6_manager_shared::auth::UserInfo;
 
@@ -223,7 +224,7 @@ mod tests {
     fn HeaderHarness() -> Element {
         // Authenticated session — `Header` matches `AuthState::Anonymous`
         // to render an empty fragment, so the test must seed a real user.
-        use_context_provider(|| DioxusSession {
+        let session = use_context_provider(|| DioxusSession {
             state: SyncSignal::new_maybe_sync(AuthState::Authenticated {
                 access: "stub-access".into(),
                 refresh: "stub-refresh".into(),
@@ -238,6 +239,15 @@ mod tests {
         });
         use_context_provider(|| ThemeContext {
             theme: Signal::new(crate::ui::theme::Theme::Dark),
+        });
+        // PURA-34: Header now hosts the live `ServerSelector`, which reaches
+        // for both the auth-gate (refresh-on-401) and the shared servers
+        // context. Production wires both via `App` and `AppShell`; the
+        // harness short-cuts both with synthetic providers so the SSR
+        // chrome contract can be asserted in isolation.
+        use_context_provider(|| provide_auth_gate(session));
+        use_context_provider(|| ServersContext {
+            data: Signal::new(ServersData::Loaded(Vec::new())),
         });
         rsx! { Header {} }
     }

@@ -10,9 +10,11 @@
 //! the spec puts it on its own surface.
 
 mod header;
+mod servers_context;
 mod sidebar;
 
 pub use header::Header;
+pub use servers_context::{ServersContext, ServersData, mount_servers_context, use_servers_context};
 pub use sidebar::{NAV_LANDMARK_ID, Sidebar};
 
 use dioxus::prelude::*;
@@ -43,6 +45,13 @@ pub fn AppShell() -> Element {
             });
         }
     });
+
+    // Single shared `/api/servers` resource for both selector variants and
+    // (eventually) any chrome surface that wants the same list. Mounted
+    // before the anon-session early return so the hook order is stable
+    // across renders — for anon sessions the fetch errors out harmlessly
+    // before the chrome bounces to /login.
+    let _servers = mount_servers_context();
 
     if !is_authed {
         return rsx! { "" };

@@ -21,6 +21,7 @@ use ts6_manager_shared::auth::{
 
 use crate::client::auth::{self, AuthError};
 use crate::client::dioxus::use_session;
+use crate::client::setup as setup_client;
 use crate::client::store::AuthState;
 use crate::ui::components::{
     Banner, BannerVariant, Button, ButtonSize, ButtonType, Field, PasswordInput, TextInput,
@@ -45,6 +46,27 @@ pub fn LoginPage(next: Option<String>) -> Element {
             nav.replace(target);
         }
     });
+
+    // First-run gate (PURA-34): if no admin exists yet, the login form is
+    // moot — bounce the operator to `/setup` so they can create one. We
+    // skip the gate for already-authed users (the previous effect handled
+    // them) and on status-fetch errors (the operator sees the login form
+    // as a fallback; they'll get a friendly auth error if there's truly no
+    // admin to log in as).
+    {
+        let nav = nav.clone();
+        use_future(move || async move {
+            if already {
+                return;
+            }
+            let base = api_base();
+            if let Ok(status) = setup_client::status(&base).await {
+                if status.needs_setup {
+                    nav.replace(Route::SetupPage {});
+                }
+            }
+        });
+    }
 
     let mut username = use_signal(String::new);
     let mut password = use_signal(String::new);
