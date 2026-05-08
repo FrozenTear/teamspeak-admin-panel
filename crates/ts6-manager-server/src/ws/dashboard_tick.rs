@@ -273,6 +273,18 @@ async fn tick_once(deps: &TickerDeps, connection: &ServerConnection) -> anyhow::
         .publish(
             Topic::new(connection.id, TopicKind::Channels),
             TICK_KIND,
+            data.clone(),
+        )
+        .await;
+    // PURA-72 Slice E — public widget viewers subscribe to
+    // `server:{id}:widget`. Fan the same dashboard tick out so the
+    // embedded SPA refetches its snapshot on the 5 s cadence even when
+    // the SSH event source (PURA-80) hasn't picked up a `notify*` for
+    // this server yet (e.g. WebQuery-only deployments).
+    deps.hub
+        .publish(
+            Topic::new(connection.id, TopicKind::Widget),
+            TICK_KIND,
             data,
         )
         .await;

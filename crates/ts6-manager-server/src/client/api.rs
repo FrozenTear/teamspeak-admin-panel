@@ -28,7 +28,7 @@ use crate::client::session::{RefreshGate, SessionSnapshot};
 /// spec §7.0.2 envelope so the dashboard (and any other surface that fans
 /// requests through to TeamSpeak) can render the upstream's diagnostic
 /// message instead of a generic "something went wrong".
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ApiError {
     /// 401 from a non-auth endpoint after a single failed refresh attempt,
     /// or 401 with a non-`Invalid or expired token` body (e.g. user

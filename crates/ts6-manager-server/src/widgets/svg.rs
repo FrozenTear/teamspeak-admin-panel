@@ -608,6 +608,7 @@ mod tests {
         WidgetData {
             name: "Test Widget".into(),
             theme: "dark".into(),
+            server_config_id: 1,
             show_channel_tree: true,
             show_clients: true,
             hide_empty_channels: false,

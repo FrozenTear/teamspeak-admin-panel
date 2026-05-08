@@ -330,6 +330,13 @@ async fn register_all(transport: &TransportHandle) -> Result<(), SshBridgeError>
 /// publish. Unknown events are logged at `debug` and dropped — TS6
 /// servers may add new event names in future builds, and silently
 /// ignoring them is preferable to publishing on a wrong topic.
+///
+/// Client- and channel-class events also fan out a parallel publish onto
+/// `server:{id}:widget` so public widget viewers (PURA-72 Slice E) refresh
+/// within ~1 s of a real upstream change. The widget topic intentionally
+/// receives the same wire envelope (kind + data); the public SPA's
+/// strategy is to refetch the JSON snapshot on any push, so the inner
+/// shape doesn't need to be widget-specific.
 async fn publish_notify(hub: &Hub, server_id: i64, frame: &NotifyFrame) {
     let Some((topic_kind, envelope_kind)) = classify_event(&frame.event) else {
         tracing::debug!(
@@ -342,7 +349,15 @@ async fn publish_notify(hub: &Hub, server_id: i64, frame: &NotifyFrame) {
     };
     let topic = Topic::new(server_id, topic_kind);
     let data = records_to_json(&frame.records);
-    hub.publish(topic, envelope_kind, data).await;
+    hub.publish(topic, envelope_kind, data.clone()).await;
+    if matches!(topic_kind, TopicKind::Clients | TopicKind::Channels) {
+        hub.publish(
+            Topic::new(server_id, TopicKind::Widget),
+            envelope_kind,
+            data,
+        )
+        .await;
+    }
 }
 
 fn classify_event(event: &str) -> Option<(TopicKind, &'static str)> {

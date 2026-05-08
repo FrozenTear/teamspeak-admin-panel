@@ -107,6 +107,7 @@ pub fn build_widget_data(widget: &Widget, inputs: WidgetInputs) -> WidgetData {
     WidgetData {
         name: widget.name.clone(),
         theme: widget.theme.clone(),
+        server_config_id: widget.serverConfigId,
         show_channel_tree: widget.showChannelTree,
         show_clients: widget.showClients,
         hide_empty_channels: widget.hideEmptyChannels,

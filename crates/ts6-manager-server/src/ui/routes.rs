@@ -19,7 +19,7 @@ use dioxus::prelude::*;
 use crate::ui::layout::AppShell;
 use crate::ui::pages::{
     BansPage, ChannelsPage, ClientsPage, DashboardPlaceholder, Home, LoginPage, LogsPage,
-    ServerInfoPage, SetupPage,
+    PublicWidgetPage, ServerInfoPage, SetupPage,
 };
 
 #[rustfmt::skip]
@@ -30,6 +30,12 @@ pub enum Route {
 
     #[route("/setup")]
     SetupPage {},
+
+    // PURA-72 Slice E — public widget page lives outside `AppShell` so it
+    // renders without the operator chrome (sidebar / header / auth gate).
+    // The token in the URL is the only credential.
+    #[route("/widget/:token")]
+    PublicWidgetPage { token: String },
 
     #[layout(AppShell)]
     #[route("/")]
