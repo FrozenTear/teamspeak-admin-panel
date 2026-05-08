@@ -8,12 +8,24 @@ FROM docker.io/rust:1.95-slim-bookworm AS builder
 
 WORKDIR /build
 
+# `gcc` / `libc6-dev` come in via `build-essential` and are required for the
+# dioxus-cli build scripts (link step on the wasm bundler). `git` is needed
+# by some transitive build scripts that read the worktree state.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
+        build-essential \
         pkg-config \
         libssl-dev \
         ca-certificates \
+        git \
  && rm -rf /var/lib/apt/lists/*
+
+# WASM client target for the dioxus-fullstack web bundle.
+RUN rustup target add wasm32-unknown-unknown
+
+# `dx` must be pinned to the dioxus runtime version (currently 0.7.7) — version
+# skew silently breaks asset URL substitution (impl-plan §10).
+RUN cargo install dioxus-cli --version 0.7.7 --locked
 
 COPY Cargo.toml ./
 COPY rust-toolchain.toml ./
@@ -22,7 +34,13 @@ COPY crates ./crates
 # Cargo.lock may not exist on a fresh checkout; tolerate either case.
 COPY Cargo.loc[k] ./
 
-RUN cargo build --release --bin ts6-manager-server
+# Build both the wasm client and the patched native server binary in one pass.
+# Output layout (impl-plan §10) — written under the workspace target dir:
+#   target/dx/ts6-manager-server/release/web/server
+#   target/dx/ts6-manager-server/release/web/public/{index.html,assets/*}
+# `dx` reads `Dioxus.toml` from the crate root, so we run it from there to
+# mirror the documented dev loop (`dx serve` from `crates/ts6-manager-server/`).
+RUN cd crates/ts6-manager-server && dx bundle --release --fullstack
 
 # -----------------------------------------------------------------------------
 # Stage 2 — runtime (non-root, slim)
@@ -39,7 +57,13 @@ RUN apt-get update \
  && mkdir -p /var/lib/ts6-manager/db /var/lib/ts6-manager/music \
  && chown -R ts6:ts6 /var/lib/ts6-manager
 
-COPY --from=builder /build/target/release/ts6-manager-server /usr/local/bin/ts6-manager-server
+# Copy the patched server binary AND the SSR/WASM static bundle next to it.
+# `dioxus_server::config` panics at boot if `<binary-dir>/public/` is missing
+# (PURA-93: the runtime image was previously copying only the binary, so the
+# server tripped on `Couldn't read public directory at "/usr/local/bin/public"`
+# the moment `serve_dioxus_application` registered static assets).
+COPY --from=builder /build/target/dx/ts6-manager-server/release/web/server /usr/local/bin/ts6-manager-server
+COPY --from=builder /build/target/dx/ts6-manager-server/release/web/public /usr/local/bin/public
 
 USER ts6:ts6
 WORKDIR /var/lib/ts6-manager
