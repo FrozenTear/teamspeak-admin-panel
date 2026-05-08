@@ -56,10 +56,11 @@ use crate::repos::server_connections::ServerConnection;
 use crate::sshbridge::{
     control_client::SshControlClient,
     hostkey::{HostKeyConfigError, HostKeyVerifier},
-    russh_channel::{connect_password, RusshConnectParams},
+    russh_channel::{connect as ssh_connect, RusshAuth, RusshConnectParams},
     transport::{spawn_with_db as spawn_transport_with_db, TransportConfig},
     SshBridgeError,
 };
+use zeroize::Zeroizing;
 use crate::webquery::{
     models::{
         ChannelEntry, ClientEntry, ConnectionInfo, ServerInfo, VersionInfo, VirtualServerEntry,
@@ -368,18 +369,42 @@ impl ControlBackendPool {
                 connection.id
             ))
         })?;
-        let pw_ct = connection.sshPassword.clone().ok_or_else(|| {
-            ControlBackendError::Config(format!(
-                "ssh control path selected for connection #{} but sshPassword is null",
-                connection.id
-            ))
-        })?;
-        let password = crate::crypto::unseal(&pw_ct).map_err(|e| {
-            ControlBackendError::Decrypt {
-                config_id: connection.id,
-                message: e.to_string(),
+
+        // PURA-85 — branch on `sshAuthMethod` (D-SSH-AUTH, PURA-77). Each
+        // method picks the row column it needs and unseals it; an
+        // unknown method short-circuits with `Config` so an operator who
+        // typoes the value sees a single explicit error rather than a
+        // `Decrypt` ("required column null") deeper in the stack. The
+        // unseal happens here so the `Zeroizing<String>` lives only as
+        // long as the closure capture below.
+        let auth = match connection.sshAuthMethod.as_str() {
+            "password" => RusshAuth::Password(unseal_for(
+                connection,
+                connection.sshPassword.as_deref(),
+                "sshPassword",
+                "password",
+            )?),
+            "key" => RusshAuth::Key(unseal_for(
+                connection,
+                connection.sshPrivateKey.as_deref(),
+                "sshPrivateKey",
+                "key",
+            )?),
+            "agent" => {
+                let socket = connection.sshKeyAgentSocket.clone().ok_or_else(|| {
+                    ControlBackendError::Config(format!(
+                        "sshAuthMethod='agent' for connection #{} but sshKeyAgentSocket is null",
+                        connection.id
+                    ))
+                })?;
+                RusshAuth::Agent(PathBuf::from(socket))
             }
-        })?;
+            method => {
+                return Err(ControlBackendError::Config(format!(
+                    "sshAuthMethod={method:?} not recognised; expected 'password', 'key', or 'agent'"
+                )));
+            }
+        };
 
         let port: u16 = connection.sshPort.try_into().unwrap_or(10022);
         let verifier = Arc::new(HostKeyVerifier::from_config(
@@ -393,21 +418,32 @@ impl ControlBackendPool {
         let cfg = TransportConfig::for_connection(connection.id);
         let host = connection.host.clone();
         let user_owned = user;
-        let pw_owned = password;
         let verifier_clone = verifier;
         let config_id = connection.id;
+        let auth_owned = auth;
 
-        // The connect factory clones the credentials per attempt — the
-        // supervisor calls it once per (re)connect cycle and `russh`
-        // takes the password by `&str`, so an owned `String` per call
-        // is the cheapest correct shape.
+        // The connect factory clones the credential per attempt — the
+        // supervisor calls it once per (re)connect cycle. Cloning a
+        // `Zeroizing<String>` produces a fresh allocation that is
+        // itself zeroized on drop, matching the bring-up cost of always
+        // producing fresh secret bytes per connect attempt. The
+        // [`ssh_connect`] dispatcher picks `connect_password` /
+        // `connect_key` / `connect_agent` from the variant.
         let factory = move || {
             let h = host.clone();
             let u = user_owned.clone();
-            let p = pw_owned.clone();
             let v = verifier_clone.clone();
+            let a = auth_owned.clone();
             async move {
-                connect_password(RusshConnectParams::new(config_id, h, port, u, p, v)).await
+                let params = RusshConnectParams {
+                    config_id,
+                    host: h,
+                    port,
+                    user: u,
+                    verifier: v,
+                    auth: a,
+                };
+                ssh_connect(params).await
             }
         };
 
@@ -415,6 +451,30 @@ impl ControlBackendPool {
         let client = SshControlClient::new(connection.id, handle);
         Ok(Arc::new(client))
     }
+}
+
+/// Helper for the `'password'` and `'key'` branches of
+/// [`ControlBackendPool::build_ssh_backend`] — unseals the named
+/// ciphertext column and wraps the cleartext in [`Zeroizing`]. Returns
+/// `Config` if the column is null and `Decrypt` if AES-GCM unseal fails.
+fn unseal_for(
+    connection: &ServerConnection,
+    column_value: Option<&str>,
+    column_name: &str,
+    method: &str,
+) -> ControlResult<Zeroizing<String>> {
+    let ct = column_value.ok_or_else(|| {
+        ControlBackendError::Config(format!(
+            "sshAuthMethod='{method}' for connection #{} but {column_name} is null",
+            connection.id
+        ))
+    })?;
+    let cleartext =
+        crate::crypto::unseal(ct).map_err(|e| ControlBackendError::Decrypt {
+            config_id: connection.id,
+            message: e.to_string(),
+        })?;
+    Ok(Zeroizing::new(cleartext))
 }
 
 #[cfg(test)]
@@ -501,6 +561,123 @@ mod tests {
                 assert!(s.contains("99"), "expected config id in error: {s}");
             }
             other => panic!("expected Transport, got {other:?}"),
+        }
+    }
+
+    /// Build a minimal `ServerConnection` with `controlPath='ssh'` for the
+    /// PURA-85 build-time guard tests. Each test overrides only the
+    /// auth-related fields it cares about.
+    fn ssh_connection(
+        id: i64,
+        ssh_auth_method: &str,
+        ssh_password: Option<&str>,
+        ssh_private_key: Option<&str>,
+        ssh_key_agent_socket: Option<&str>,
+    ) -> ServerConnection {
+        use chrono::Utc;
+        ServerConnection {
+            id,
+            name: format!("test-{id}"),
+            host: "ts.example".into(),
+            webqueryPort: 10080,
+            apiKey: "enc:ignored".into(),
+            useHttps: false,
+            sshPort: 10022,
+            sshUsername: Some("serveradmin".into()),
+            sshPassword: ssh_password.map(str::to_owned),
+            queryBotChannel: None,
+            queryBotNickname: None,
+            sshBotNickname: None,
+            enabled: true,
+            createdAt: Utc::now(),
+            updatedAt: Utc::now(),
+            controlPath: "ssh".into(),
+            sshAuthMethod: ssh_auth_method.into(),
+            sshPrivateKey: ssh_private_key.map(str::to_owned),
+            sshKeyAgentSocket: ssh_key_agent_socket.map(str::to_owned),
+            sshHostKeyFingerprint: None,
+        }
+    }
+
+    /// PURA-85 AC1 — an unrecognised `sshAuthMethod` short-circuits with
+    /// a `Config` error that names the offending value, not a `Decrypt`
+    /// or transport error from somewhere deeper in the stack.
+    #[tokio::test]
+    async fn build_ssh_backend_rejects_unknown_auth_method() {
+        let db = crate::db::connect_in_memory().await.expect("in-memory");
+        let pool = ControlBackendPool::new(false, db);
+        let conn = ssh_connection(1, "totp", Some("enc:ignored"), None, None);
+        let err = pool.build_ssh_backend(&conn).await.unwrap_err();
+        match err {
+            ControlBackendError::Config(s) => {
+                assert!(
+                    s.contains("\"totp\"") && s.contains("not recognised"),
+                    "expected unknown-method message, got: {s}"
+                );
+            }
+            other => panic!("expected Config, got {other:?}"),
+        }
+    }
+
+    /// PURA-85 AC1/AC2 — `sshAuthMethod='agent'` with a null
+    /// `sshKeyAgentSocket` returns an explicit `Config` error rather
+    /// than failing later inside `connect_agent`.
+    #[tokio::test]
+    async fn build_ssh_backend_agent_requires_socket_path() {
+        let db = crate::db::connect_in_memory().await.expect("in-memory");
+        let pool = ControlBackendPool::new(false, db);
+        let conn = ssh_connection(2, "agent", None, None, None);
+        let err = pool.build_ssh_backend(&conn).await.unwrap_err();
+        match err {
+            ControlBackendError::Config(s) => {
+                assert!(
+                    s.contains("sshAuthMethod='agent'") && s.contains("sshKeyAgentSocket"),
+                    "unexpected message: {s}"
+                );
+            }
+            other => panic!("expected Config, got {other:?}"),
+        }
+    }
+
+    /// PURA-85 AC1/AC2 — `sshAuthMethod='key'` with a null
+    /// `sshPrivateKey` returns an explicit `Config` error before the
+    /// `Zeroizing<String>` path is even constructed.
+    #[tokio::test]
+    async fn build_ssh_backend_key_requires_private_key() {
+        let db = crate::db::connect_in_memory().await.expect("in-memory");
+        let pool = ControlBackendPool::new(false, db);
+        let conn = ssh_connection(3, "key", None, None, None);
+        let err = pool.build_ssh_backend(&conn).await.unwrap_err();
+        match err {
+            ControlBackendError::Config(s) => {
+                assert!(
+                    s.contains("sshAuthMethod='key'") && s.contains("sshPrivateKey"),
+                    "unexpected message: {s}"
+                );
+            }
+            other => panic!("expected Config, got {other:?}"),
+        }
+    }
+
+    /// PURA-85 AC1 — `sshAuthMethod='password'` with a null
+    /// `sshPassword` still surfaces a `Config` error (mirrors the prior
+    /// behaviour, retained for regression). The message now also names
+    /// the auth method so an operator who switched to `'password'` from
+    /// another method sees the same explicit signal.
+    #[tokio::test]
+    async fn build_ssh_backend_password_requires_password() {
+        let db = crate::db::connect_in_memory().await.expect("in-memory");
+        let pool = ControlBackendPool::new(false, db);
+        let conn = ssh_connection(4, "password", None, None, None);
+        let err = pool.build_ssh_backend(&conn).await.unwrap_err();
+        match err {
+            ControlBackendError::Config(s) => {
+                assert!(
+                    s.contains("sshAuthMethod='password'") && s.contains("sshPassword"),
+                    "unexpected message: {s}"
+                );
+            }
+            other => panic!("expected Config, got {other:?}"),
         }
     }
 }

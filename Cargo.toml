@@ -79,6 +79,13 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # we expect to encounter on operator-supplied TS6 servers.
 russh = { version = "0.60", default-features = false, features = ["aws-lc-rs", "flate2", "rsa"] }
 
+# PURA-85 — `Zeroizing<String>` wraps cleartext SSH credentials
+# (`RusshAuth::Password` and `RusshAuth::Key`) so the dropped allocation is
+# scrubbed. `zeroize` is already in the dep tree transitively (aws-lc-rs,
+# bcrypt) — adding it as a first-class workspace dep lets the SSHBridge use
+# `Zeroizing<T>` directly without a re-export hack.
+zeroize = "1"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

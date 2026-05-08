@@ -393,7 +393,7 @@ mod tests {
             let p = pw_owned.clone();
             let v = verifier_clone.clone();
             async move {
-                connect_password(RusshConnectParams::new(42, h, port, u, p, v)).await
+                connect_password(RusshConnectParams::new_password(42, h, port, u, p, v)).await
             }
         };
 

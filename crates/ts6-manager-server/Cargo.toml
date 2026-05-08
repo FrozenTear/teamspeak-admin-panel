@@ -48,6 +48,7 @@ server = [
     "dep:surrealdb",
     "dep:reqwest",
     "dep:russh",
+    "dep:zeroize",
 ]
 web = ["dioxus/web"]
 
@@ -101,6 +102,10 @@ reqwest = { workspace = true, optional = true }
 # Phase 2 SSHBRIDGE (PURA-69 → PURA-76) — async SSH client. Server-only;
 # the WASM target never opens SSH sessions.
 russh = { workspace = true, optional = true }
+
+# Phase 2 SSHBRIDGE (PURA-85) — `Zeroizing<String>` for scrubbing cleartext
+# SSH credentials on drop. Server-only.
+zeroize = { workspace = true, optional = true }
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
