@@ -446,7 +446,6 @@
   .app .sidebar { display: none; }
   .app .header { grid-column: 1; padding: 0 var(--space-5); }
   .app .main { grid-column: 1; padding: var(--space-5) var(--space-5); }
-  .app .header .selector-mobile-bar { display: flex; }
 }
 .sidebar {
   grid-row: 1 / 3;
