@@ -14,7 +14,7 @@ use ts6_manager_shared::control::ChannelTreeNode;
 use crate::app_state::AppState;
 use crate::auth::extractors::RequireAuth;
 
-use super::{access, translate_webquery_error};
+use super::{access, translate_control_error};
 
 /// Spec §7.7 flag set — required at the REST layer per the deviations
 /// table in [`crate::webquery::models::ChannelEntry`].
@@ -27,15 +27,15 @@ pub async fn list(
 ) -> Result<Json<Vec<ChannelTreeNode>>, Response> {
     let connection = access::check_read(&state, &user, config_id).await?;
     let client = state
-        .webquery
+        .control
         .get_or_build(connection.id, Some(&connection))
         .await
-        .map_err(translate_webquery_error)?;
+        .map_err(translate_control_error)?;
 
     let rows = client
         .channellist_with_flags(sid, CHANNEL_FLAGS)
         .await
-        .map_err(translate_webquery_error)?;
+        .map_err(translate_control_error)?;
     let projected: Vec<ChannelTreeNode> = rows
         .into_iter()
         .map(|c| ChannelTreeNode {

@@ -32,16 +32,21 @@ pub struct AppState {
     /// mutex is sufficient. The handler still re-reads `user_count`
     /// inside the lock as a defence-in-depth check.
     pub setup_lock: Arc<Mutex<()>>,
-    /// PURA-23: pool of WebQuery clients keyed by `server_connection.id`.
-    /// Phase 1 fills lazily on first dashboard hit. Retained alongside
-    /// [`Self::control`] because the Phase 2 write surface
-    /// (`routes::control`) still talks to a [`crate::webquery::WebQueryClient`]
-    /// directly — the SSH write commands land in a later child issue.
+    /// PURA-23 → PURA-99: pool of WebQuery clients keyed by
+    /// `server_connection.id`. Production code now reaches for
+    /// [`Self::control`] for every typed dispatch — this field stays
+    /// alive only as a no-op slot for the existing test fixtures (each
+    /// constructs an `AppState` literal). Removing it would touch every
+    /// test file across the crate without functional benefit; a
+    /// dedicated cleanup ticket can rip it out once the test fixture
+    /// helper consolidates.
+    #[allow(dead_code)]
     pub webquery: WebQueryPool,
     /// PURA-78: backend-agnostic control plane. Lazy-built per
     /// `server_connection.id`; the per-server `controlPath` flag picks
     /// WebQuery vs. SSHBridge at first use. Consumed by the dashboard
-    /// route today; future read-only Phase 2 routes migrate here.
+    /// route, the widget data path, and (since PURA-99) every
+    /// `routes::control::*` REST handler.
     pub control: ControlBackendPool,
     /// PURA-70: live event bus. Per-server fan-out channels + ring
     /// buffer + metrics. Cheap to clone (Arc-shared internals).

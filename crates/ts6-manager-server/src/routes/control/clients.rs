@@ -1,4 +1,5 @@
-//! Client-scoped control endpoints — PURA-71.
+//! Client-scoped control endpoints — PURA-71, migrated to the
+//! backend-agnostic [`ControlBackend`] dispatch in PURA-99.
 //!
 //! Read endpoints:
 //! - `GET /api/servers/{configId}/vs/{sid}/clients` — clientlist with the
@@ -10,10 +11,11 @@
 //!
 //! Write endpoints (kick / mute / unmute / move) all:
 //! - run `access::check_write` for RBAC,
-//! - call the typed WebQuery write,
+//! - call the typed [`ControlBackend`] write,
 //! - publish a §8.4 event on `server:{configId}:clients` via the WS hub,
 //! - emit a `control::audit` log entry.
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use axum::Json;
@@ -27,11 +29,11 @@ use ts6_manager_shared::control::{
 
 use crate::app_state::AppState;
 use crate::auth::extractors::RequireAuth;
+use crate::control::{ControlBackend, ControlBackendError};
 use crate::repos::server_connections::ServerConnection;
-use crate::webquery::{WebQueryClient, WebQueryError};
 use crate::ws::topic::{Topic, TopicKind};
 
-use super::{access, audit, bad_request, translate_webquery_error};
+use super::{access, audit, bad_request, translate_control_error};
 
 /// Spec §7.8 — read flag set the FE always wants for the active list.
 /// `-ip` is admin-only and is appended in [`list`] when the caller is admin.
@@ -45,7 +47,7 @@ pub async fn list(
     Path((config_id, sid)): Path<(i64, i64)>,
 ) -> Result<Json<Vec<ClientListItem>>, Response> {
     let connection = access::check_read(&state, &user, config_id).await?;
-    let client = web_client(&state, &connection).await?;
+    let client = backend(&state, &connection).await?;
 
     // Admin-only `-ip` flag. Spec §7.8 marks `connection_client_ip` as
     // admin-only; non-admin callers also get the field stripped to empty
@@ -58,7 +60,7 @@ pub async fn list(
     let rows = client
         .clientlist_with_flags(sid, &flags)
         .await
-        .map_err(translate_webquery_error)?;
+        .map_err(translate_control_error)?;
     let projected: Vec<ClientListItem> = rows
         .into_iter()
         .map(|r| project_client_list_item(r, user.is_admin()))
@@ -72,12 +74,12 @@ pub async fn detail(
     Path((config_id, sid, cldbid)): Path<(i64, i64, i64)>,
 ) -> Result<Json<ClientDetail>, Response> {
     let connection = access::check_read(&state, &user, config_id).await?;
-    let client = web_client(&state, &connection).await?;
+    let client = backend(&state, &connection).await?;
 
     let db_row = client
         .clientdbinfo(sid, cldbid)
         .await
-        .map_err(translate_webquery_error)?;
+        .map_err(translate_control_error)?;
 
     // Locate the live `clid`, if any, by scanning the active client list
     // for a match on `client_database_id`. Cheap on small servers; for
@@ -87,7 +89,7 @@ pub async fn detail(
     let live_clid = client
         .clientlist(sid)
         .await
-        .map_err(translate_webquery_error)?
+        .map_err(translate_control_error)?
         .into_iter()
         .find(|c| c.client_database_id == cldbid)
         .map(|c| c.clid);
@@ -98,7 +100,7 @@ pub async fn detail(
                 .clientinfo(sid, clid)
                 .await
                 .map(|info| project_live_client(clid, info, user.is_admin()))
-                .map_err(translate_webquery_error)?,
+                .map_err(translate_control_error)?,
         )
     } else {
         None
@@ -128,7 +130,7 @@ pub async fn kick(
     Json(req): Json<KickRequest>,
 ) -> Result<StatusCode, Response> {
     let connection = access::check_write(&state, &user, config_id).await?;
-    let client = web_client(&state, &connection).await?;
+    let client = backend(&state, &connection).await?;
     let reason_id = req.kind.reason_id();
     let started = Instant::now();
     let action = "client.kick";
@@ -173,7 +175,7 @@ pub async fn mute(
     body: Option<Json<MuteRequest>>,
 ) -> Result<StatusCode, Response> {
     let connection = access::check_write(&state, &user, config_id).await?;
-    let client = web_client(&state, &connection).await?;
+    let client = backend(&state, &connection).await?;
     // Default behaviour with no body: mute both directions.
     let req = body.map(|Json(b)| b).unwrap_or(MuteRequest {
         input_muted: Some(true),
@@ -225,7 +227,7 @@ pub async fn unmute(
     Path((config_id, sid, clid)): Path<(i64, i64, i64)>,
 ) -> Result<StatusCode, Response> {
     let connection = access::check_write(&state, &user, config_id).await?;
-    let client = web_client(&state, &connection).await?;
+    let client = backend(&state, &connection).await?;
     let started = Instant::now();
     let action = "client.unmute";
     let details = "input_muted=false output_muted=false".to_string();
@@ -261,7 +263,7 @@ pub async fn move_to(
     Json(req): Json<MoveRequest>,
 ) -> Result<StatusCode, Response> {
     let connection = access::check_write(&state, &user, config_id).await?;
-    let client = web_client(&state, &connection).await?;
+    let client = backend(&state, &connection).await?;
     let started = Instant::now();
     let action = "client.move";
     let details = format!("cid={cid}", cid = req.cid);
@@ -304,15 +306,15 @@ fn kick_event_name(kind: KickKind) -> &'static str {
     }
 }
 
-async fn web_client(
+async fn backend(
     state: &AppState,
     connection: &ServerConnection,
-) -> Result<std::sync::Arc<WebQueryClient>, Response> {
+) -> Result<Arc<dyn ControlBackend>, Response> {
     state
-        .webquery
+        .control
         .get_or_build(connection.id, Some(connection))
         .await
-        .map_err(translate_webquery_error)
+        .map_err(translate_control_error)
 }
 
 async fn emit_success(
@@ -346,12 +348,12 @@ async fn emit_failure_and_translate(
     action: &'static str,
     target_id: Option<i64>,
     details: &str,
-    err: WebQueryError,
+    err: ControlBackendError,
     started: Instant,
 ) -> Response {
     let elapsed = started.elapsed();
     let entry = match &err {
-        WebQueryError::Upstream { code, message } => audit::AuditEntry::upstream_error(
+        ControlBackendError::Upstream { code, message } => audit::AuditEntry::upstream_error(
             connection.id,
             sid,
             user.id,
@@ -376,7 +378,7 @@ async fn emit_failure_and_translate(
         ),
     };
     entry.emit();
-    translate_webquery_error(err)
+    translate_control_error(err)
 }
 
 async fn publish_client_event(
@@ -451,4 +453,3 @@ fn project_live_client(
         },
     }
 }
-

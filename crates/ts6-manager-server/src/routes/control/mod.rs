@@ -5,23 +5,21 @@
 //! - Authenticates via the [`crate::auth::extractors::RequireAuth`] extractor
 //!   chain (JWT + DB user lookup, spec §6.4.1). Inside the handler we run an
 //!   additional per-server access check via [`access::check_read`] / [`access::check_write`].
-//! - Resolves the `server_connection` row by `configId` and pulls a
-//!   `WebQueryClient` from [`crate::app_state::AppState::webquery`].
-//! - Calls the typed WebQuery surface that landed in PURA-68. SSHBridge
-//!   wiring is owned by [PURA-78] (blocked on PURA-76 + PURA-77); this
-//!   module is WebQuery-only per the PURA-71 issue scope.
+//! - Resolves the `server_connection` row by `configId` and pulls an
+//!   `Arc<dyn ControlBackend>` from [`crate::app_state::AppState::control`]
+//!   (PURA-99). The pool branches on `controlPath` so kicks/moves/banadds
+//!   dispatch over WebQuery HTTP or SSH ServerQuery transparently.
+//! - Calls the typed [`crate::control::ControlBackend`] surface (read +
+//!   write commands the FE consumes).
 //! - On write success, emits a `tracing::info!` audit event under
 //!   `target = "control::audit"` (see [`audit`]) AND publishes a
 //!   `server:{configId}:clients` / `server:{configId}:channels` event on
 //!   [`crate::app_state::AppState::ws_hub`] for live propagation.
 //!
-//! Errors map per spec §7.0.2 — see [`translate_webquery_error`].
-//!
-//! Phase 2 does NOT add a per-server backend selector here. PURA-78 will
-//! introduce a `ControlBackend` trait that wraps WebQuery vs. SSHBridge
-//! and replace `state.webquery.get_or_build` with `backend_for(server)` —
-//! the call sites are already shaped around a single typed-handle return,
-//! so the swap is local to this module.
+//! Errors map per spec §7.0.2 — see [`translate_control_error`]. The
+//! envelope is identical for both backends because
+//! [`crate::control::ControlBackendError`] is shape-aligned with
+//! [`crate::webquery::WebQueryError`] / [`crate::sshbridge::SshBridgeError`].
 
 use axum::Json;
 use axum::Router;
@@ -31,7 +29,7 @@ use axum::routing::{delete, get, post};
 use serde::{Deserialize, Serialize};
 
 use crate::app_state::AppState;
-use crate::webquery::WebQueryError;
+use crate::control::ControlBackendError;
 
 pub mod access;
 pub mod audit;
@@ -129,9 +127,12 @@ pub(crate) fn bad_request(message: &str) -> Response {
     err(StatusCode::BAD_REQUEST, message)
 }
 
-/// §7.0.2 translation for `WebQueryError`. Single source of truth — every
-/// control handler funnels upstream errors through this.
-pub(crate) fn translate_webquery_error(e: WebQueryError) -> Response {
+/// §7.0.2 translation for [`ControlBackendError`]. Single source of
+/// truth — every control handler funnels upstream errors through this.
+/// Both WebQuery and SSH backends produce this same envelope because
+/// [`ControlBackendError`] is shape-aligned with each backend's typed
+/// error.
+pub(crate) fn translate_control_error(e: ControlBackendError) -> Response {
     let status = e.http_status();
     match status {
         StatusCode::BAD_GATEWAY => err_body(

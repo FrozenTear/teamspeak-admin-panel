@@ -19,11 +19,12 @@ use ts6_manager_shared::control::{BanCreateRequest, BanCreated, BanListItem};
 
 use crate::app_state::AppState;
 use crate::auth::extractors::RequireAuth;
+use crate::control::ControlBackendError;
 use crate::repos::server_connections::ServerConnection;
-use crate::webquery::{BanAddParams, WebQueryError};
+use crate::webquery::BanAddParams;
 use crate::ws::topic::{Topic, TopicKind};
 
-use super::{access, audit, bad_request, translate_webquery_error};
+use super::{access, audit, bad_request, translate_control_error};
 
 pub async fn list(
     State(state): State<AppState>,
@@ -32,14 +33,14 @@ pub async fn list(
 ) -> Result<Json<Vec<BanListItem>>, Response> {
     let connection = access::check_read(&state, &user, config_id).await?;
     let client = state
-        .webquery
+        .control
         .get_or_build(connection.id, Some(&connection))
         .await
-        .map_err(translate_webquery_error)?;
+        .map_err(translate_control_error)?;
     let rows = client
         .banlist(sid)
         .await
-        .map_err(translate_webquery_error)?;
+        .map_err(translate_control_error)?;
     let projected: Vec<BanListItem> = rows
         .into_iter()
         .map(|b| BanListItem {
@@ -69,10 +70,10 @@ pub async fn create(
 ) -> Result<(StatusCode, Json<BanCreated>), Response> {
     let connection = access::check_write(&state, &user, config_id).await?;
     let client = state
-        .webquery
+        .control
         .get_or_build(connection.id, Some(&connection))
         .await
-        .map_err(translate_webquery_error)?;
+        .map_err(translate_control_error)?;
 
     // At least one matcher must be set, otherwise the upstream returns
     // a generic parameter-missing error and we'd record a useless audit
@@ -136,10 +137,10 @@ pub async fn delete(
 ) -> Result<StatusCode, Response> {
     let connection = access::check_write(&state, &user, config_id).await?;
     let client = state
-        .webquery
+        .control
         .get_or_build(connection.id, Some(&connection))
         .await
-        .map_err(translate_webquery_error)?;
+        .map_err(translate_control_error)?;
     let started = Instant::now();
     let action = "ban.delete";
     let details = format!("banid={banid}");
@@ -204,12 +205,12 @@ fn emit_failure(
     action: &'static str,
     target_id: Option<i64>,
     details: &str,
-    err: WebQueryError,
+    err: ControlBackendError,
     started: Instant,
 ) -> Response {
     let elapsed = started.elapsed();
     let entry = match &err {
-        WebQueryError::Upstream { code, message } => audit::AuditEntry::upstream_error(
+        ControlBackendError::Upstream { code, message } => audit::AuditEntry::upstream_error(
             connection.id,
             sid,
             user.id,
@@ -234,7 +235,7 @@ fn emit_failure(
         ),
     };
     entry.emit();
-    translate_webquery_error(err)
+    translate_control_error(err)
 }
 
 async fn publish(

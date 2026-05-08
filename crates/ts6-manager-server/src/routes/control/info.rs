@@ -9,7 +9,7 @@ use ts6_manager_shared::control::ServerInfoResponse;
 use crate::app_state::AppState;
 use crate::auth::extractors::RequireAuth;
 
-use super::{access, translate_webquery_error};
+use super::{access, translate_control_error};
 
 pub async fn server_info(
     State(state): State<AppState>,
@@ -18,14 +18,14 @@ pub async fn server_info(
 ) -> Result<Json<ServerInfoResponse>, Response> {
     let connection = access::check_read(&state, &user, config_id).await?;
     let client = state
-        .webquery
+        .control
         .get_or_build(connection.id, Some(&connection))
         .await
-        .map_err(translate_webquery_error)?;
+        .map_err(translate_control_error)?;
     let info = client
         .serverinfo(sid)
         .await
-        .map_err(translate_webquery_error)?;
+        .map_err(translate_control_error)?;
     Ok(Json(ServerInfoResponse {
         virtualserver_name: info.virtualserver_name,
         virtualserver_platform: info.virtualserver_platform,

@@ -18,7 +18,7 @@ use ts6_manager_shared::control::{LogLine, LogTailQuery, LogTailResponse};
 use crate::app_state::AppState;
 use crate::auth::extractors::RequireAuth;
 
-use super::{access, translate_webquery_error};
+use super::{access, translate_control_error};
 
 const DEFAULT_LOG_LINES: u32 = 100;
 const MAX_LOG_LINES: u32 = 500;
@@ -31,10 +31,10 @@ pub async fn tail(
 ) -> Result<Json<LogTailResponse>, Response> {
     let connection = access::check_read(&state, &user, config_id).await?;
     let client = state
-        .webquery
+        .control
         .get_or_build(connection.id, Some(&connection))
         .await
-        .map_err(translate_webquery_error)?;
+        .map_err(translate_control_error)?;
 
     let lines = query
         .lines
@@ -44,7 +44,7 @@ pub async fn tail(
     let entries = client
         .logview(sid, lines, true, false, query.after)
         .await
-        .map_err(translate_webquery_error)?;
+        .map_err(translate_control_error)?;
 
     // Carry forward `last_pos` / `file_size` from the upstream's first
     // row. The TS `logview` shape only emits these on the leading entry.
