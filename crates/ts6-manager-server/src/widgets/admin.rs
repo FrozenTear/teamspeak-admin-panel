@@ -2,7 +2,11 @@
 //!
 //! Mounted under `/api/widgets`. Auth contract:
 //!
-//! - `GET` (list, detail) → [`crate::auth::extractors::RequireAuth`]; any role.
+//! - `GET` (list, detail) → [`crate::auth::extractors::RequireAuth`] +
+//!   per-server-access lens (PURA-72 M-3). Admins see every widget; every
+//!   other role only sees rows whose `serverConfigId` they have a
+//!   `server_user_grant` row on. `detail` for a non-granted server returns
+//!   404, mirroring the rest of the per-server surface.
 //! - `POST` / `PATCH` / `DELETE` / `regenerate-token` →
 //!   [`crate::auth::extractors::RequireModerator`] (admin OR moderator). Spec
 //!   §7.27 originally says "Y+admin"; the issue scope and §6.13 RBAC table
@@ -35,8 +39,9 @@ use ts6_manager_shared::widgets::{
 };
 
 use crate::app_state::AppState;
-use crate::auth::extractors::{RequireAuth, RequireModerator};
+use crate::auth::extractors::{AuthUser, RequireAuth, RequireModerator};
 use crate::repos::server_connections::{self, ServerConnection};
+use crate::repos::server_user_grants;
 use crate::repos::widgets::{self as widget_repo, NewWidget, Widget, WidgetUpdate};
 
 /// Spec §26.1 — token alphabet. URL-safe (`-` / `_`), 64 symbols / 6 bits per
@@ -118,10 +123,43 @@ fn summary_from(row: Widget, server: Option<&ServerConnection>) -> WidgetSummary
     }
 }
 
-/// `GET /api/widgets` — every row, with the joined server_connection.
+/// PURA-72 M-3 — per-server-access lens on widget reads.
+///
+/// Admins always see every row. Every other role only sees widgets whose
+/// `serverConfigId` they have a `server_user_grant` row on. Returns
+/// `Ok(true)` if the caller is allowed to see this row.
+///
+/// Used by `list` (filter) and `detail` (404 if false). Mirrors the
+/// `routes/control/access.rs::check_read` shape but without the
+/// `ServerConnection` resolve, which the caller already has from the
+/// join.
+async fn caller_can_view(
+    state: &AppState,
+    user: &AuthUser,
+    server_config_id: i64,
+) -> Result<bool, Response> {
+    if user.is_admin() {
+        return Ok(true);
+    }
+    server_user_grants::exists(&state.db, user.id, server_config_id)
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                err = %e,
+                user_id = user.id,
+                server_config_id,
+                "widgets admin: grant lookup failed",
+            );
+            internal()
+        })
+}
+
+/// `GET /api/widgets` — every row the caller has access to, with the
+/// joined `server_connection`. Viewers/moderators only see widgets on
+/// servers they hold a grant for; admins see every row.
 async fn list(
     State(state): State<AppState>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
 ) -> Result<Json<Vec<WidgetSummary>>, Response> {
     let rows = widget_repo::list(&state.db).await.map_err(|e| {
         tracing::error!(err = %e, "widgets admin: list failed");
@@ -129,6 +167,14 @@ async fn list(
     })?;
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
+        // PURA-72 M-3 — gate per-row before exposing the token. The grant
+        // lookup is N+1 alongside the existing server-connection join;
+        // Phase 2 expects a handful of widgets per deployment, so a
+        // per-row check is acceptable. Future hardening: collapse to a
+        // single SurrealQL JOIN once this becomes hot.
+        if !caller_can_view(&state, &user, row.serverConfigId).await? {
+            continue;
+        }
         // The join is N+1 against `server_connection.id` — Phase 2 expects a
         // small handful of widgets per deployment, so a per-row lookup is
         // fine. If this becomes hot we promote to a single SurrealQL `RELATE`
@@ -145,10 +191,12 @@ async fn list(
     Ok(Json(out))
 }
 
-/// `GET /api/widgets/{id}`.
+/// `GET /api/widgets/{id}`. Non-admins without a grant for the row's
+/// server get a 404 — preferred over 403 so widget existence is not
+/// enumerable across the deployment (PURA-72 M-3).
 async fn detail(
     State(state): State<AppState>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Path(id): Path<i64>,
 ) -> Result<Json<WidgetSummary>, Response> {
     let row = widget_repo::find_by_id(&state.db, id)
@@ -158,6 +206,11 @@ async fn detail(
             internal()
         })?
         .ok_or_else(not_found)?;
+    if !caller_can_view(&state, &user, row.serverConfigId).await? {
+        // 404 (not 403) — non-admins should not be able to enumerate
+        // widget ids across servers they have no access to.
+        return Err(not_found());
+    }
     let server = server_connections::find_by_id(&state.db, row.serverConfigId)
         .await
         .map_err(|e| {
@@ -509,11 +562,28 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
+    /// PURA-72 M-3 — every role gets a 200 from `GET /api/widgets`,
+    /// but the row set is now lensed by `server_user_grants`. Admins
+    /// see every widget; moderators / viewers only see widgets on
+    /// servers they hold a grant for. The pre-fix version of this test
+    /// asserted that *every* role saw *every* widget, which was the
+    /// buggy behaviour H-1's sibling M-3 closes.
     #[tokio::test]
-    async fn list_works_for_any_role() {
+    async fn list_lensed_per_role_via_server_user_grants() {
         let state = fresh_state().await;
+        let server = seed_server(&state).await;
+        let aid = seed_user(&state, "a", "admin").await;
+        let admin_token = mint(&state, aid, "a", "admin");
+        let widget = create_widget_as_admin(&state, &admin_token, server).await;
+
         for role in ["admin", "moderator", "viewer"] {
             let uid = seed_user(&state, role, role).await;
+            // Non-admins need a grant on the server to see the widget.
+            if role != "admin" {
+                server_user_grants::insert(&state.db, uid, server)
+                    .await
+                    .unwrap();
+            }
             let token = mint(&state, uid, role, role);
             let resp = app(state.clone())
                 .oneshot(
@@ -527,6 +597,13 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::OK, "role={role} must list");
+            let visible: Vec<WidgetSummary> = read_json(resp).await;
+            assert_eq!(
+                visible.len(),
+                1,
+                "role={role} must see the granted widget"
+            );
+            assert_eq!(visible[0].id, widget.id);
         }
     }
 
@@ -824,6 +901,269 @@ mod tests {
             .unwrap()
             .expect("new token resolves");
         assert_eq!(new_row.id, created.id);
+    }
+
+    // ---------------------------------------------------------------------
+    // PURA-72 M-3 — per-server-access lens on widget reads.
+    //
+    // Before this fix every authenticated user (including viewers without
+    // any grants) could enumerate every widget token in the deployment via
+    // `GET /api/widgets`. The token IS the credential, so that gave any
+    // viewer the ability to scrape `/api/widget/{token}/data` for every
+    // server in the panel — including servers they had no operator access
+    // to. The lens admin → all rows, others → only rows whose
+    // `serverConfigId` they have a `server_user_grant` row on closes the
+    // BOLA path.
+    // ---------------------------------------------------------------------
+
+    /// Helper — POST a widget as admin and return the created summary.
+    async fn create_widget_as_admin(
+        state: &AppState,
+        admin_token: &str,
+        server_id: i64,
+    ) -> WidgetSummary {
+        let resp = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/widgets")
+                    .header("authorization", auth(admin_token))
+                    .header("content-type", "application/json")
+                    .body(json(&{
+                        let mut body = create_body(server_id);
+                        body.name = "W".into();
+                        body
+                    }))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        read_json(resp).await
+    }
+
+    #[tokio::test]
+    async fn viewer_without_grant_lists_zero_widgets() {
+        let state = fresh_state().await;
+        let server_a = seed_server(&state).await;
+        let server_b = crate::repos::server_connections::insert(
+            &state.db,
+            NewServerConnection {
+                name: "Secondary".into(),
+                host: "ts2.example.com".into(),
+                webqueryPort: 10080,
+                apiKey: crypto::seal("k").unwrap(),
+                useHttps: false,
+                sshPort: 10022,
+                sshUsername: None,
+                sshPassword: None,
+                queryBotChannel: None,
+                queryBotNickname: None,
+                sshBotNickname: None,
+                enabled: true,
+                controlPath: None,
+                sshAuthMethod: None,
+                sshPrivateKey: None,
+                sshKeyAgentSocket: None,
+                sshHostKeyFingerprint: None,
+            },
+        )
+        .await
+        .unwrap()
+        .id;
+
+        let aid = seed_user(&state, "a", "admin").await;
+        let admin_token = mint(&state, aid, "a", "admin");
+        // Two widgets across two servers, both created by admin.
+        let _w1 = create_widget_as_admin(&state, &admin_token, server_a).await;
+        let _w2 = create_widget_as_admin(&state, &admin_token, server_b).await;
+
+        let viewer = seed_user(&state, "v", "viewer").await;
+        let vt = mint(&state, viewer, "v", "viewer");
+        let resp = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/widgets")
+                    .header("authorization", auth(&vt))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let visible: Vec<WidgetSummary> = read_json(resp).await;
+        assert!(
+            visible.is_empty(),
+            "viewer without any grants must not see any widget tokens, got {} rows",
+            visible.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn viewer_with_grant_lists_only_granted_server_widgets() {
+        let state = fresh_state().await;
+        let server_a = seed_server(&state).await;
+        let server_b = crate::repos::server_connections::insert(
+            &state.db,
+            NewServerConnection {
+                name: "Secondary".into(),
+                host: "ts2.example.com".into(),
+                webqueryPort: 10080,
+                apiKey: crypto::seal("k").unwrap(),
+                useHttps: false,
+                sshPort: 10022,
+                sshUsername: None,
+                sshPassword: None,
+                queryBotChannel: None,
+                queryBotNickname: None,
+                sshBotNickname: None,
+                enabled: true,
+                controlPath: None,
+                sshAuthMethod: None,
+                sshPrivateKey: None,
+                sshKeyAgentSocket: None,
+                sshHostKeyFingerprint: None,
+            },
+        )
+        .await
+        .unwrap()
+        .id;
+        let aid = seed_user(&state, "a", "admin").await;
+        let admin_token = mint(&state, aid, "a", "admin");
+        let w_a = create_widget_as_admin(&state, &admin_token, server_a).await;
+        let _w_b = create_widget_as_admin(&state, &admin_token, server_b).await;
+
+        let viewer = seed_user(&state, "v", "viewer").await;
+        server_user_grants::insert(&state.db, viewer, server_a)
+            .await
+            .unwrap();
+        let vt = mint(&state, viewer, "v", "viewer");
+
+        let resp = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/widgets")
+                    .header("authorization", auth(&vt))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let visible: Vec<WidgetSummary> = read_json(resp).await;
+        assert_eq!(visible.len(), 1, "viewer must only see granted server's widget");
+        assert_eq!(visible[0].id, w_a.id);
+        assert_eq!(visible[0].server_config_id, server_a);
+    }
+
+    #[tokio::test]
+    async fn admin_lists_every_widget() {
+        let state = fresh_state().await;
+        let server_a = seed_server(&state).await;
+        let server_b = crate::repos::server_connections::insert(
+            &state.db,
+            NewServerConnection {
+                name: "Secondary".into(),
+                host: "ts2.example.com".into(),
+                webqueryPort: 10080,
+                apiKey: crypto::seal("k").unwrap(),
+                useHttps: false,
+                sshPort: 10022,
+                sshUsername: None,
+                sshPassword: None,
+                queryBotChannel: None,
+                queryBotNickname: None,
+                sshBotNickname: None,
+                enabled: true,
+                controlPath: None,
+                sshAuthMethod: None,
+                sshPrivateKey: None,
+                sshKeyAgentSocket: None,
+                sshHostKeyFingerprint: None,
+            },
+        )
+        .await
+        .unwrap()
+        .id;
+        let aid = seed_user(&state, "a", "admin").await;
+        let admin_token = mint(&state, aid, "a", "admin");
+        let _w_a = create_widget_as_admin(&state, &admin_token, server_a).await;
+        let _w_b = create_widget_as_admin(&state, &admin_token, server_b).await;
+
+        let resp = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/widgets")
+                    .header("authorization", auth(&admin_token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let visible: Vec<WidgetSummary> = read_json(resp).await;
+        assert_eq!(visible.len(), 2, "admin must see every widget across servers");
+    }
+
+    #[tokio::test]
+    async fn viewer_without_grant_detail_returns_404_not_403() {
+        let state = fresh_state().await;
+        let server_a = seed_server(&state).await;
+        let aid = seed_user(&state, "a", "admin").await;
+        let admin_token = mint(&state, aid, "a", "admin");
+        let widget = create_widget_as_admin(&state, &admin_token, server_a).await;
+
+        let viewer = seed_user(&state, "v", "viewer").await;
+        let vt = mint(&state, viewer, "v", "viewer");
+        let resp = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/widgets/{}", widget.id))
+                    .header("authorization", auth(&vt))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "non-granted detail must be 404 (not 403) so widget existence is not enumerable"
+        );
+    }
+
+    #[tokio::test]
+    async fn viewer_with_grant_can_read_detail() {
+        let state = fresh_state().await;
+        let server_a = seed_server(&state).await;
+        let aid = seed_user(&state, "a", "admin").await;
+        let admin_token = mint(&state, aid, "a", "admin");
+        let widget = create_widget_as_admin(&state, &admin_token, server_a).await;
+
+        let viewer = seed_user(&state, "v", "viewer").await;
+        server_user_grants::insert(&state.db, viewer, server_a)
+            .await
+            .unwrap();
+        let vt = mint(&state, viewer, "v", "viewer");
+        let resp = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/widgets/{}", widget.id))
+                    .header("authorization", auth(&vt))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let fetched: WidgetSummary = read_json(resp).await;
+        assert_eq!(fetched.id, widget.id);
+        assert_eq!(fetched.token, widget.token);
     }
 
     #[tokio::test]
