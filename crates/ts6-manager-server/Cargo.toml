@@ -49,8 +49,18 @@ server = [
     "dep:reqwest",
     "dep:russh",
     "dep:zeroize",
+    "dep:resvg",
+    "dep:usvg",
+    "dep:tiny-skia",
 ]
 web = ["dioxus/web"]
+# PURA-72 Slice C (PURA-88) — verification feature flag. When enabled,
+# `widgets::png::rasterise` short-circuits to `Err(RasterError::Disabled)`
+# without invoking `resvg`. The widget route's graceful-fallback path
+# (spec §27.4) then serves the SVG bytes at the `/image.png` URL with a
+# WARN log line. Tests run with `--features widget-png-disabled` to pin
+# that fallback contract; default builds keep the rasteriser live.
+widget-png-disabled = []
 
 [dependencies]
 # Compiles on both server and wasm targets.
@@ -108,6 +118,14 @@ russh = { workspace = true, optional = true }
 # Phase 2 SSHBRIDGE (PURA-85) — `Zeroizing<String>` for scrubbing cleartext
 # SSH credentials on drop. Server-only.
 zeroize = { workspace = true, optional = true }
+
+# PURA-72 Slice C (PURA-88) — widget PNG rasterisation. Server-only; the
+# WASM build does not own a `/image.png` route. `default-features = false`
+# stays at the workspace level — see the workspace Cargo.toml note for
+# the precise feature subset (`text` + `system-fonts`).
+resvg = { workspace = true, optional = true }
+usvg = { workspace = true, optional = true }
+tiny-skia = { workspace = true, optional = true }
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }

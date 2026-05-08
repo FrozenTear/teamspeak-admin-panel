@@ -4,8 +4,9 @@
 //! credential is the token in the URL. Rate-limit + CORS relax + cache
 //! headers are applied per spec §7.28 / §7.29.
 //!
-//! Slice A (this commit) ships only `GET /api/widget/{token}/data`. The
-//! `image.svg` and `image.png` endpoints land in [PURA-72-B] and [PURA-72-C].
+//! Slice A shipped `/data`; Slice B ([PURA-87]) added `/image.svg`;
+//! Slice C ([PURA-88]) adds `/image.png`. All three render off the same
+//! 45 s `WidgetData` snapshot via [`resolve_widget_data`].
 //!
 //! Caching:
 //!
@@ -30,6 +31,7 @@ use crate::control::ControlBackendError;
 use crate::repos::{server_connections, widgets as widget_repo};
 
 use super::cache::CACHE_TTL;
+use super::png;
 use super::snapshot::{WidgetInputs, build_widget_data};
 use super::svg;
 use super::themes::theme_for;
@@ -42,6 +44,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/widget/{token}/data", get(data_handler))
         .route("/api/widget/{token}/image.svg", get(svg_handler))
+        .route("/api/widget/{token}/image.png", get(png_handler))
 }
 
 #[derive(Debug, Serialize)]
@@ -134,6 +137,83 @@ async fn svg_handler(
         HeaderValue::from_static(CACHE_CONTROL_VALUE),
     );
     Ok(response)
+}
+
+/// `GET /api/widget/{token}/image.png`
+///
+/// Renders the Slice B SVG and rasterises it to a 400 px-wide PNG via
+/// [`super::png::rasterise`]. Spec §27.4 graceful fallback: if the
+/// rasteriser is unavailable (compile-time `widget-png-disabled` feature)
+/// or fails at runtime, the route serves the SVG bytes at the same URL
+/// with `Content-Type: image/svg+xml` and logs a `WARN`. The cache header
+/// matches the JSON / SVG paths (`public, max-age=45`).
+async fn png_handler(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+) -> Result<Response, Response> {
+    let data = resolve_widget_data(&state, &token).await?;
+    let theme = theme_for(WidgetThemeName::parse_or_default(&data.theme));
+    let svg_body = svg::render(&data, theme);
+
+    // CPU-bound work; hop off the runtime so a slow rasterise does not
+    // stall other requests. The closure is `Send + 'static` since
+    // `String` is the only captured payload.
+    let svg_for_raster = svg_body.clone();
+    let raster_result = tokio::task::spawn_blocking(move || png::rasterise(&svg_for_raster)).await;
+
+    let cache_control = HeaderValue::from_static(CACHE_CONTROL_VALUE);
+    match raster_result {
+        Ok(Ok(bytes)) => {
+            let mut response = (
+                StatusCode::OK,
+                [(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("image/png"),
+                )],
+                bytes,
+            )
+                .into_response();
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, cache_control);
+            Ok(response)
+        }
+        outcome => {
+            // Spec §27.4 — fall back to SVG bytes at the PNG URL with
+            // `image/svg+xml`. WARN once per call so operators can spot
+            // a rasteriser regression without losing the request.
+            match outcome {
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        token_prefix = %short_token(&token),
+                        error = %e,
+                        "widget PNG rasterise failed; serving SVG fallback (spec §27.4)"
+                    );
+                }
+                Err(join_err) => {
+                    tracing::warn!(
+                        token_prefix = %short_token(&token),
+                        error = %join_err,
+                        "widget PNG rasterise task panicked; serving SVG fallback (spec §27.4)"
+                    );
+                }
+                Ok(Ok(_)) => unreachable!("Ok(Ok(_)) handled in the matching arm above"),
+            }
+            let mut response = (
+                StatusCode::OK,
+                [(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("image/svg+xml"),
+                )],
+                svg_body,
+            )
+                .into_response();
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, cache_control);
+            Ok(response)
+        }
+    }
 }
 
 /// Shared cache+upstream lookup driver. Slice B (`image.svg`) and Slice C

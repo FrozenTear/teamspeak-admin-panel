@@ -88,6 +88,18 @@ russh = { version = "0.60", default-features = false, features = ["aws-lc-rs", "
 # `Zeroizing<T>` directly without a re-export hack.
 zeroize = "1"
 
+# PURA-72 Slice C (PURA-88) — public widget PNG rasterisation per spec
+# §27.4. `usvg` parses the Slice B SVG, `resvg` rasterises onto a
+# `tiny_skia` pixmap, and the pixmap encodes itself to PNG. Default
+# features are off where possible: `text` + `system-fonts` stay on so
+# server name / channel name / nickname text actually renders, but
+# `raster-images` (only useful for embedded `<image>` elements; the
+# widget SVG has none) and `memmap-fonts` (release-only optimisation
+# we can revisit if PNG latency becomes a hotspot) stay off.
+resvg = { version = "0.45", default-features = false, features = ["text", "system-fonts"] }
+usvg = { version = "0.45", default-features = false, features = ["text", "system-fonts"] }
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "png-format"] }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
