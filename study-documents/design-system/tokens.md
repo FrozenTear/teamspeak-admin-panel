@@ -22,7 +22,7 @@ Hue families pinned to specific HSL ramps. Steps named `0..900` so future additi
 | `--c-neutral-200` | `#1E2533` | `hsl(220 26% 16%)` | Surface raised++ / hovered |
 | `--c-neutral-300` | `#2A3344` | `hsl(220 24% 22%)` | Borders |
 | `--c-neutral-400` | `#3D485E` | `hsl(220 21% 30%)` | Borders strong / disabled fg |
-| `--c-neutral-500` | `#737F98` | `hsl(220 16% 52%)` | Muted text (lifted PURA-61 to clear AA 4.5:1 against `--c-neutral-0`) |
+| `--c-neutral-500` | `#828FAA` | `hsl(220 18% 59%)` | Muted text (lifted PURA-63 from `#737F98` so AA 4.5:1 also clears on `--bg-surface-raised`; see §1.1 contrast table for ramp-ordering note) |
 | `--c-neutral-600` | `#7E8AA2` | `hsl(220 17% 57%)` | Secondary text |
 | `--c-neutral-700` | `#A4ADC2` | `hsl(220 18% 70%)` | Body text (low-contrast) |
 | `--c-neutral-800` | `#D5DAE5` | `hsl(220 17% 87%)` | Body text |
@@ -58,14 +58,17 @@ Hue families pinned to specific HSL ramps. Steps named `0..900` so future additi
 - `--c-neutral-800` on `--c-neutral-50`: **13.2:1** — passes AAA body
 - `--c-neutral-700` on `--c-neutral-50`: **8.4:1** — passes AAA body
 - `--c-neutral-600` on `--c-neutral-50`: **5.5:1** — passes AA body (use for secondary)
-- `--c-neutral-500` on `--c-neutral-0`: **4.80:1** — passes AA body (helper / meta on canvas)
-- `--c-neutral-500` on `--c-neutral-50`: **4.55:1** — passes AA body (helper inside cards)
-- `--c-neutral-500` on `--c-neutral-100`: **4.24:1** — AA large only (helper inside modals / dropdowns — see follow-up)
+- `--c-neutral-500` on `--c-neutral-0` (canvas): **5.94:1** — passes AA body (helper / meta on canvas)
+- `--c-neutral-500` on `--c-neutral-50` (surface): **5.62:1** — passes AA body (helper inside cards)
+- `--c-neutral-500` on `--c-neutral-100` (raised): **5.25:1** — passes AA body (helper inside modals / dropdowns / KPI cards)
+- `--c-neutral-600` on `--c-neutral-100` (raised): **4.91:1** — passes AA body (secondary on raised)
 - `--c-accent-600` on `--c-neutral-50`: **6.8:1** — passes AA body, links readable
 - `--c-danger-600` on `--c-neutral-50`: **5.7:1** — passes AA body for inline error text
 - White on `--c-accent-500`: **3.6:1** — passes AA large (button labels are ≥14px bold, qualifies)
 
-`--c-neutral-500` (PURA-61 lift, `#737F98`) clears AA body on canvas and default surface — the workhorse pairings for the operator chrome. On `--bg-surface-raised` (modals, dropdowns, popovers) it lands at 4.24:1, which is AA-large only; helper text inside those containers should either upgrade to `--text-secondary` (5.5:1) or remain placeholder-class (WCAG 1.4.3 exempts placeholder from text-contrast rules). A future raised-surface-specific muted token may be considered if modal helper density grows.
+`--c-neutral-500` (PURA-63 lift, `#828FAA`) now clears AA body on every neutral background up to and including `--bg-surface-raised` — the workhorse pairings for the operator chrome including dashboard KPI cards, modals, dropdowns, and popovers. The previous PURA-61 value `#737F98` cleared canvas (4.80:1) but failed on raised (4.24:1, AA-large only); axe flagged 12 nodes on `/dashboard`.
+
+**Ramp ordering note.** At `#828FAA` (L≈59%) the muted-text token is now slightly *brighter* than `--c-neutral-600` `#7E8AA2` (L≈57%, 4.91:1 on raised). The ramp's "muted" → "secondary" → "body" semantic ordering still reads correctly in usage (muted tends to sit at 12px, secondary at 14px, so the size cue dominates), but the raw luminance ordering now inverts between 500 and 600. If a future component places muted and secondary text adjacent at the same size, this could read as a regression and would justify lifting `--c-neutral-600` in tandem (e.g., `#8B98B0`).
 
 ### 1.2 Raw palette — light mode
 

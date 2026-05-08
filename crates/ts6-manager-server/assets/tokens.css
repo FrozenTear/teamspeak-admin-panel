@@ -9,12 +9,15 @@
   --c-neutral-200: #1E2533;
   --c-neutral-300: #2A3344;
   --c-neutral-400: #3D485E;
-  /* PURA-61: lifted from #5E6A82 (3.55:1 against --c-neutral-0 / --bg-canvas)
-   * to #737F98 (4.80:1) so `--text-muted` clears WCAG-AA 4.5:1 for normal-
-   * weight body text on the dashboard canvas. Disabled-button and step-dot
-   * usages of this ramp value sit on `--c-neutral-300` and remain exempt
-   * (WCAG 1.4.3 excludes disabled UI). */
-  --c-neutral-500: #737F98;
+  /* PURA-61 → PURA-63: lifted from #5E6A82 → #737F98 → #828FAA so
+   * `--text-muted` clears WCAG-AA 4.5:1 not just on `--bg-canvas`
+   * (5.94:1) but also on `--bg-surface` (5.62:1) and the raised
+   * surfaces of cards/modals/dropdowns (5.25:1 on --bg-surface-raised).
+   * The dashboard KPI labels render on `--bg-surface-raised` and were
+   * the proximate failing axe nodes (12 violations). Disabled-button
+   * and idle step-dot consumers sit on `--c-neutral-300` and remain
+   * WCAG 1.4.3-exempt (disabled UI is excluded from contrast rules). */
+  --c-neutral-500: #828FAA;
   --c-neutral-600: #7E8AA2;
   --c-neutral-700: #A4ADC2;
   --c-neutral-800: #D5DAE5;

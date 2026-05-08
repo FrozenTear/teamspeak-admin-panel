@@ -27,11 +27,15 @@ use crate::ui::routes::Route;
 /// Authenticated layout. Dioxus mounts an `Outlet<Route>` for the matched
 /// child route inside `<main class="main">`.
 ///
-/// PURA-61: `<main>` carries `tabindex="-1"` so axe's
-/// `scrollable-region-focusable` rule passes when the route content
-/// overflows the viewport (mobile especially). It also lets the eventual
-/// "skip to main content" link land focus inside the route — same pattern
-/// as the sidebar `<nav>` skip-link target.
+/// PURA-61 → PURA-63: `<main>` carries `tabindex="0"` so axe's
+/// `scrollable-region-focusable` rule passes when route content overflows
+/// the viewport (mobile especially). The rule requires the scrollable
+/// region to be **keyboard-reachable**, not merely programmatically
+/// focusable — `tabindex="-1"` (PURA-61's first pass) only let scripted
+/// focus land here and still flagged. The trade-off is one extra Tab stop
+/// in the global tab order, which is the WCAG-intended behavior so a
+/// keyboard-only operator can land on the region and arrow-scroll. Also
+/// serves as the target for the eventual "skip to main content" link.
 ///
 /// Anonymous sessions are bounced to `/login?next=<path>`; the inline
 /// rendered chrome is empty so there's no flash of authenticated UI before
@@ -80,7 +84,7 @@ pub fn AppShell() -> Element {
             div { class: "mobile-selector-bar",
                 ServerSelector { variant: ServerSelectorVariant::Mobile }
             }
-            main { class: "main", tabindex: "-1",
+            main { class: "main", tabindex: "0",
                 Outlet::<Route> {}
             }
         }
@@ -171,18 +175,20 @@ mod tests {
         assert!(html.contains(r#"role="banner""#), "missing header banner role: {html}");
     }
 
-    /// PURA-61: `<main>` must carry `tabindex="-1"` so axe's
+    /// PURA-61 → PURA-63: `<main>` must carry `tabindex="0"` so axe's
     /// `scrollable-region-focusable` rule passes when route content
-    /// overflows the viewport. A future refactor that drops this attribute
-    /// would silently regress the dashboard a11y contract; this test pins
-    /// it.
+    /// overflows the viewport. PURA-61 used `tabindex="-1"` which the
+    /// rule still flagged because it is only programmatically focusable;
+    /// the rule wants keyboard reachability. A future refactor that drops
+    /// or weakens this attribute would silently regress the dashboard
+    /// a11y contract; this test pins it.
     #[test]
-    fn app_shell_main_landmark_is_programmatically_focusable() {
+    fn app_shell_main_landmark_is_keyboard_focusable() {
         let html = render_app_shell();
         assert!(
-            html.contains(r#"<main class="main" tabindex="-1""#)
-                || html.contains(r#"<main tabindex="-1" class="main""#),
-            "missing tabindex='-1' on <main>: {html}"
+            html.contains(r#"<main class="main" tabindex="0""#)
+                || html.contains(r#"<main tabindex="0" class="main""#),
+            "missing tabindex='0' on <main>: {html}"
         );
     }
 }
