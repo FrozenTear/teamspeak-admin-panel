@@ -14,6 +14,7 @@ use crate::config::Config;
 use crate::control::ControlBackendPool;
 use crate::db::Database;
 use crate::webquery::WebQueryPool;
+use crate::widgets::WidgetCache;
 use crate::ws::Hub;
 
 #[derive(Clone)]
@@ -45,6 +46,10 @@ pub struct AppState {
     /// PURA-70: live event bus. Per-server fan-out channels + ring
     /// buffer + metrics. Cheap to clone (Arc-shared internals).
     pub ws_hub: Hub,
+    /// PURA-72: token-keyed 45 s widget data cache (spec §7.29). Public
+    /// widget JSON / SVG / PNG endpoints all read through this cache so
+    /// the upstream WebQuery client sees one fan-out per TTL window.
+    pub widget_cache: WidgetCache,
 }
 
 impl AppState {
@@ -59,6 +64,7 @@ impl AppState {
             webquery: WebQueryPool::new(cfg.ts_allow_self_signed),
             control,
             ws_hub: Hub::new(),
+            widget_cache: WidgetCache::new(),
         }
     }
 }

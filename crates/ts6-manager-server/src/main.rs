@@ -38,6 +38,8 @@ mod web;
 #[cfg(feature = "server")]
 mod webquery;
 #[cfg(feature = "server")]
+mod widgets;
+#[cfg(feature = "server")]
 mod ws;
 
 #[cfg(feature = "web")]
@@ -55,7 +57,7 @@ mod server_entry {
     use ts6_manager_shared::health::{Health, HealthStatus};
 
     use crate::config::Config;
-    use crate::{app_state, auth, db, logging, routes, ui, web, webquery};
+    use crate::{app_state, auth, db, logging, routes, ui, web, webquery, widgets};
 
     async fn health() -> Json<Health> {
         Json(Health {
@@ -184,7 +186,11 @@ mod server_entry {
         let control_router = routes::control::router().with_state(state.clone());
         // PURA-82 — `/metrics` Prometheus exposition for the WS hub.
         // Admin-JWT gated; see the route module for the auth-gate rationale.
-        let metrics_router = routes::metrics::router().with_state(state);
+        let metrics_router = routes::metrics::router().with_state(state.clone());
+        // PURA-72 (Slice A) — public widget JSON endpoint
+        // (`/api/widget/{token}/data`). No authentication; rate limit + CORS
+        // relax + cache headers per spec §7.28 / §7.29.
+        let widget_router = widgets::routes::router().with_state(state);
 
         // PURA-17: `serve_dioxus_application` registers static assets +
         // server functions and adds a fallback that serves the dx-CLI
@@ -212,6 +218,8 @@ mod server_entry {
             .merge(control_router)
             // PURA-82 — Prometheus metrics endpoint for the WS hub.
             .merge(metrics_router)
+            // PURA-72 — public widget endpoints (`/api/widget/{token}/...`).
+            .merge(widget_router)
             .serve_dioxus_application(serve_cfg, ui::App)
             .layer(web::cors_layer(&cfg.frontend_url));
         let router = web::security_headers_stack(cfg.node_env).apply(router);

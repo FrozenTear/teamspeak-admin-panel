@@ -102,6 +102,7 @@ mod tests {
             webquery: WebQueryPool::new(false),
             control,
             ws_hub: Hub::new(),
+            widget_cache: crate::widgets::WidgetCache::new(),
         }
     }
 

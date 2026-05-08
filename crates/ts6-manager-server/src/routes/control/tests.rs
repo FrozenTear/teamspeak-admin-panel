@@ -239,6 +239,7 @@ async fn fresh_state() -> AppState {
         webquery: WebQueryPool::new(false),
         control,
         ws_hub: Hub::new(),
+        widget_cache: crate::widgets::WidgetCache::new(),
     }
 }
 
