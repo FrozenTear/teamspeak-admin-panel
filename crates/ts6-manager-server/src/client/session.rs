@@ -74,7 +74,7 @@ impl RefreshFn for HttpRefresh {
             crate::client::auth::refresh(
                 &base,
                 &RefreshRequest {
-                    refreshToken: token,
+                    refresh_token: token,
                 },
             )
             .await
@@ -185,10 +185,10 @@ impl RefreshGate {
         match self.refresh_fn.refresh(after_lock.refresh.clone()).await {
             Ok(pair) => {
                 self.session
-                    .update_pair(pair.accessToken.clone(), pair.refreshToken.clone());
+                    .update_pair(pair.access_token.clone(), pair.refresh_token.clone());
                 let replay = SessionSnapshot {
-                    access: pair.accessToken,
-                    refresh: pair.refreshToken,
+                    access: pair.access_token,
+                    refresh: pair.refresh_token,
                     user: after_lock.user,
                 };
                 f(replay).await
@@ -306,7 +306,7 @@ mod tests {
         UserInfo {
             id: 1,
             username: "alice".into(),
-            displayName: "Alice".into(),
+            display_name: "Alice".into(),
             role: "viewer".into(),
         }
     }
@@ -406,8 +406,8 @@ mod tests {
         let stub = StubRefresh::new(|n| {
             assert_eq!(n, 1, "exactly one refresh expected");
             Ok(TokenPairResponse {
-                accessToken: "new-access".into(),
-                refreshToken: "new-refresh".into(),
+                access_token: "new-access".into(),
+                refresh_token: "new-refresh".into(),
             })
         });
         let gate = RefreshGate::new(session.clone(), stub.clone());
@@ -515,8 +515,8 @@ mod tests {
         let stub = StubRefresh::new(|n| {
             assert_eq!(n, 1, "single-flight: exactly one refresh");
             Ok(TokenPairResponse {
-                accessToken: "fresh-access".into(),
-                refreshToken: "fresh-refresh".into(),
+                access_token: "fresh-access".into(),
+                refresh_token: "fresh-refresh".into(),
             })
         });
         let gate = Arc::new(RefreshGate::new(session.clone(), stub.clone()));

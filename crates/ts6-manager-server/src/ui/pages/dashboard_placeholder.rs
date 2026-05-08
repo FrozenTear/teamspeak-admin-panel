@@ -51,7 +51,7 @@ pub fn DashboardPlaceholder() -> Element {
                 let _ = crate::client::auth::logout(
                     api_base().as_str(),
                     &ts6_manager_shared::auth::LogoutRequest {
-                        refreshToken: refresh,
+                        refresh_token: refresh,
                     },
                 )
                 .await;
@@ -68,7 +68,7 @@ pub fn DashboardPlaceholder() -> Element {
                 "today so the post-login redirect has a target."
             }
             section { class: "stack-md",
-                h1 { "Welcome, {user.displayName}" }
+                h1 { "Welcome, {user.display_name}" }
                 p { "Signed in as @{user.username} ({user.role})." }
                 Button {
                     variant: crate::ui::components::ButtonVariant::Secondary,

@@ -148,7 +148,7 @@ mod tests {
         UserInfo {
             id: 7,
             username: "alice".into(),
-            displayName: "Alice".into(),
+            display_name: "Alice".into(),
             role: role.into(),
         }
     }

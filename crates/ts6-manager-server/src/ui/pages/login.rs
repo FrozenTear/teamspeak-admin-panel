@@ -82,17 +82,17 @@ pub fn LoginPage(next: Option<String>) -> Element {
                     // the user profile. Fetch /me with the brand-new
                     // access token so the session is fully populated
                     // before we redirect.
-                    let user = auth::me(api_base().as_str(), &pair.accessToken)
+                    let user = auth::me(api_base().as_str(), &pair.access_token)
                         .await
                         .unwrap_or_else(|_| UserInfo {
                             id: 0,
                             username: String::new(),
-                            displayName: String::new(),
+                            display_name: String::new(),
                             role: String::new(),
                         });
                     session.replace(AuthState::Authenticated {
-                        access: pair.accessToken,
-                        refresh: pair.refreshToken,
+                        access: pair.access_token,
+                        refresh: pair.refresh_token,
                         user,
                     });
                     submitting.set(false);

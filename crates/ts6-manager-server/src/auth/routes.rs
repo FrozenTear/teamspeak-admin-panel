@@ -106,8 +106,8 @@ async fn login(
     let _ = users::mark_login(&state.db, user.id).await;
 
     Ok(Json(TokenPairResponse {
-        accessToken: access,
-        refreshToken: issued.token,
+        access_token: access,
+        refresh_token: issued.token,
     }))
 }
 
@@ -118,7 +118,7 @@ async fn refresh_handler(
     let lifetime = chrono::Duration::from_std(state.jwt_refresh_expiry)
         .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Internal error"))?;
 
-    let rotated = refresh::rotate(&state.db, &req.refreshToken, lifetime)
+    let rotated = refresh::rotate(&state.db, &req.refresh_token, lifetime)
         .await
         .map_err(|_| err(StatusCode::UNAUTHORIZED, msg::INVALID_TOKEN))?;
 
@@ -142,14 +142,14 @@ async fn refresh_handler(
     .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Internal error"))?;
 
     Ok(Json(TokenPairResponse {
-        accessToken: access,
-        refreshToken: rotated.token,
+        access_token: access,
+        refresh_token: rotated.token,
     }))
 }
 
 async fn logout(State(state): State<AppState>, Json(req): Json<LogoutRequest>) -> StatusCode {
     // Spec §6.5.5: idempotent; 204 whether or not a row existed.
-    let _ = refresh_tokens::delete_by_token(&state.db, &req.refreshToken).await;
+    let _ = refresh_tokens::delete_by_token(&state.db, &req.refresh_token).await;
     StatusCode::NO_CONTENT
 }
 
@@ -157,7 +157,7 @@ async fn me(RequireAuth(user): RequireAuth) -> Json<UserInfo> {
     Json(UserInfo {
         id: user.id,
         username: user.username,
-        displayName: user.display_name,
+        display_name: user.display_name,
         role: user.role,
     })
 }
@@ -174,7 +174,7 @@ async fn change_password(
         .ok_or_else(|| err(StatusCode::UNAUTHORIZED, msg::USER_DISABLED))?;
 
     let stored = user.passwordHash.clone();
-    let current = req.currentPassword.clone();
+    let current = req.current_password.clone();
     let ok = tokio::task::spawn_blocking(move || password::verify(&stored, &current))
         .await
         .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Internal error"))?
@@ -186,11 +186,11 @@ async fn change_password(
         ));
     }
 
-    if let Err(rule) = complexity::validate(&req.newPassword) {
+    if let Err(rule) = complexity::validate(&req.new_password) {
         return Err(err(StatusCode::BAD_REQUEST, rule.message()));
     }
 
-    let new_pw = req.newPassword.clone();
+    let new_pw = req.new_password.clone();
     let new_hash = tokio::task::spawn_blocking(move || password::hash_new(&new_pw))
         .await
         .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Internal error"))?
@@ -289,8 +289,8 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body: TokenPairResponse = read_json(resp).await;
-        assert!(!body.accessToken.is_empty());
-        assert_eq!(body.refreshToken.len(), 128, "spec §6.5.1: 64 bytes hex");
+        assert!(!body.access_token.is_empty());
+        assert_eq!(body.refresh_token.len(), 128, "spec §6.5.1: 64 bytes hex");
     }
 
     #[tokio::test]
@@ -366,7 +366,7 @@ mod tests {
                     .uri("/api/auth/refresh")
                     .header("content-type", "application/json")
                     .body(json_body(&RefreshRequest {
-                        refreshToken: pair1.refreshToken.clone(),
+                        refresh_token: pair1.refresh_token.clone(),
                     }))
                     .unwrap(),
             )
@@ -377,8 +377,8 @@ mod tests {
         // Refresh-token rotation is the security-critical invariant; access
         // tokens minted within the same second are byte-identical (same id,
         // username, role, iat, exp under the same secret) and that is fine.
-        assert_ne!(pair1.refreshToken, pair2.refreshToken);
-        assert!(!pair2.accessToken.is_empty());
+        assert_ne!(pair1.refresh_token, pair2.refresh_token);
+        assert!(!pair2.access_token.is_empty());
     }
 
     #[tokio::test]
@@ -411,7 +411,7 @@ mod tests {
                     .uri("/api/auth/me")
                     .header(
                         "authorization",
-                        HeaderValue::from_str(&format!("Bearer {}", pair.accessToken)).unwrap(),
+                        HeaderValue::from_str(&format!("Bearer {}", pair.access_token)).unwrap(),
                     )
                     .body(Body::empty())
                     .unwrap(),
@@ -490,7 +490,7 @@ mod tests {
                     .uri("/api/auth/logout")
                     .header("content-type", "application/json")
                     .body(json_body(&LogoutRequest {
-                        refreshToken: pair.refreshToken.clone(),
+                        refresh_token: pair.refresh_token.clone(),
                     }))
                     .unwrap(),
             )
@@ -506,7 +506,7 @@ mod tests {
                     .uri("/api/auth/refresh")
                     .header("content-type", "application/json")
                     .body(json_body(&RefreshRequest {
-                        refreshToken: pair.refreshToken,
+                        refresh_token: pair.refresh_token,
                     }))
                     .unwrap(),
             )
@@ -525,7 +525,7 @@ mod tests {
                     .uri("/api/auth/logout")
                     .header("content-type", "application/json")
                     .body(json_body(&LogoutRequest {
-                        refreshToken: "0000".into(),
+                        refresh_token: "0000".into(),
                     }))
                     .unwrap(),
             )
@@ -567,12 +567,12 @@ mod tests {
                     .uri("/api/auth/password")
                     .header(
                         "authorization",
-                        HeaderValue::from_str(&format!("Bearer {}", pair.accessToken)).unwrap(),
+                        HeaderValue::from_str(&format!("Bearer {}", pair.access_token)).unwrap(),
                     )
                     .header("content-type", "application/json")
                     .body(json_body(&ChangePasswordRequest {
-                        currentPassword: "Hunter2!ok".into(),
-                        newPassword: "NewPassw0rd!".into(),
+                        current_password: "Hunter2!ok".into(),
+                        new_password: "NewPassw0rd!".into(),
                     }))
                     .unwrap(),
             )
@@ -618,12 +618,12 @@ mod tests {
                     .uri("/api/auth/password")
                     .header(
                         "authorization",
-                        HeaderValue::from_str(&format!("Bearer {}", pair.accessToken)).unwrap(),
+                        HeaderValue::from_str(&format!("Bearer {}", pair.access_token)).unwrap(),
                     )
                     .header("content-type", "application/json")
                     .body(json_body(&ChangePasswordRequest {
-                        currentPassword: "Hunter2!ok".into(),
-                        newPassword: "abc".into(), // too short, no upper, no digit, no special
+                        current_password: "Hunter2!ok".into(),
+                        new_password: "abc".into(), // too short, no upper, no digit, no special
                     }))
                     .unwrap(),
             )
