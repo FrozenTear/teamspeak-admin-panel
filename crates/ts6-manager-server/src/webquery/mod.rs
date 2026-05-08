@@ -1,22 +1,35 @@
 //! Spec Chapter 10 — outbound HTTP client to the per-server TS6 WebQuery API.
 //!
-//! Phase 1 (PURA-23) ships the **read-only** subset:
+//! Phase 1 (PURA-23) shipped the **read-only** subset for the §7.19 dashboard.
+//! Phase 2 (PURA-68) extends this module with the full ServerQuery command
+//! surface the FE needs for ops actions:
+//!
+//! - **Read** — `clientlist`/`clientinfo`/`clientdblist`/`clientdbinfo`,
+//!   `channellist`/`channelinfo`/`channelclientlist`,
+//!   `serverinfo`/`hostinfo`/`logview`,
+//!   `channelclientpermlist`.
+//! - **Write** — `clientkick`/`clientpoke`/`clientmove`/`clientedit` (used by
+//!   the mute helper), `banadd`/`bandel`/`bandelall`.
+//!
+//! Cross-cutting:
 //!
 //! - [`WebQueryClient`] per `server_connection` row, single keep-alive socket
 //!   so each upstream registers exactly one ServerQuery slot (§10.1).
 //! - [`WebQueryPool`] keyed by `server_connection.id`, lazy-creating clients
 //!   on first call. Boot-time pre-population, `autoStart`, the 30s health
 //!   probe, and the `refreshClient` lifecycle on `PUT/DELETE /servers` are
-//!   Phase 2 follow-ups; the issue scope explicitly defers them.
-//! - Typed read methods needed by the §7.19 dashboard route plus the cheap
-//!   `version` probe used as a health check.
+//!   Phase 2 follow-ups owned by a separate ticket.
 //! - Spec §10.5/§10.6 envelope handling: non-zero `status.code` → typed
 //!   [`WebQueryError::Upstream`] which the route layer maps to `502
-//!   {error: "TeamSpeak API Error", code, details}` per §7.0.2.
+//!   {error: "TeamSpeak API Error", code, details}` per §7.0.2. Code `1281`
+//!   (`database_empty_result`) is opt-in coerced to an empty list by
+//!   list-shaped reads via [`WebQueryClient::list_or_empty`].
+//! - Tracing: every request runs inside a `webquery.request` span carrying
+//!   `config_id`, `method`, `path`, and emits a structured log with
+//!   `latency_ms` and outcome (`ok` / `upstream_err` / `transport`).
 //!
-//! Out of scope for Phase 1 (handed to future REST/WEBQUERY engineer):
-//! write-side commands, the SSH event bridge, the WebQuery command whitelist
-//! consumed by the bot flow runtime.
+//! Out of scope (separate issues): REST endpoints exposing these actions
+//! (PURA-71), WS event fan-out (separate child), SSH-based control path.
 //!
 //! ServerQuery `key=value` escaping (§10.4) lives in [`escape`]; it is **not**
 //! applied here because WebQuery's URL encoder already handles the wire-side
@@ -31,18 +44,27 @@ pub mod models;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::{Client, Method, StatusCode};
 use serde::Deserialize;
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock};
+use tracing::Instrument;
 
 use crate::crypto;
 use crate::repos::server_connections::ServerConnection;
 
-pub use models::{ChannelEntry, ClientEntry, ConnectionInfo, ServerInfo, VersionInfo, VirtualServerEntry};
+pub use models::{
+    BanAddResponse, BanEntry, ChannelClientPerm, ChannelEntry, ChannelInfo, ClientDbEntry,
+    ClientEntry, ClientInfo, ConnectionInfo, HostInfo, LogEntry, ServerInfo, VersionInfo,
+    VirtualServerEntry,
+};
+
+/// TS upstream code for `database_empty_result`. List reads opt into mapping
+/// this to an empty `Vec` via [`WebQueryClient::list_or_empty`] per §10.6.
+pub const DATABASE_EMPTY_RESULT: i64 = 1281;
 
 /// Spec §10.2 — fixed 15s request timeout.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
@@ -225,36 +247,95 @@ impl WebQueryClient {
         path: &str,
         params: &[(&str, &str)],
     ) -> WebQueryResult<T> {
-        // §10.1 — serialise to the single keep-alive socket.
-        let _permit = self.request_lock.lock().await;
+        let span = tracing::info_span!(
+            "webquery.request",
+            config_id = self.config_id,
+            method = %method,
+            path,
+        );
+        async move {
+            // §10.1 — serialise to the single keep-alive socket.
+            let _permit = self.request_lock.lock().await;
 
-        let url = format!("{}{}", self.base_url, path);
+            let url = format!("{}{}", self.base_url, path);
 
-        let mut headers = HeaderMap::new();
-        let key = HeaderValue::from_str(&self.api_key)
-            .map_err(|_| WebQueryError::Transport("apiKey is not a valid HTTP header".into()))?;
-        headers.insert(API_KEY_HEADER, key);
+            let mut headers = HeaderMap::new();
+            let key = HeaderValue::from_str(&self.api_key)
+                .map_err(|_| WebQueryError::Transport("apiKey is not a valid HTTP header".into()))?;
+            headers.insert(API_KEY_HEADER, key);
 
-        let response = self
-            .inner
-            .request(method, &url)
-            .headers(headers)
-            .query(params)
-            .send()
-            .await
-            .map_err(|e| WebQueryError::Transport(e.to_string()))?;
+            let started = Instant::now();
+            let send_result = self
+                .inner
+                .request(method.clone(), &url)
+                .headers(headers)
+                .query(params)
+                .send()
+                .await;
 
-        // §10.5 — body is the canonical signal even on non-2xx; only fall
-        // back to status-only error messaging when the body fails to parse.
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| WebQueryError::Transport(e.to_string()))?;
+            let response = match send_result {
+                Ok(resp) => resp,
+                Err(e) => {
+                    let latency_ms = started.elapsed().as_millis() as u64;
+                    tracing::warn!(latency_ms, outcome = "transport", error = %e);
+                    return Err(WebQueryError::Transport(e.to_string()));
+                }
+            };
 
-        let envelope: Envelope<T> = serde_json::from_slice(&bytes).map_err(|e| {
-            WebQueryError::InvalidResponse(format!("envelope parse failed: {e}"))
-        })?;
-        envelope.into_body()
+            // §10.5 — body is the canonical signal even on non-2xx; only fall
+            // back to status-only error messaging when the body fails to parse.
+            let bytes = match response.bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    let latency_ms = started.elapsed().as_millis() as u64;
+                    tracing::warn!(latency_ms, outcome = "transport", error = %e);
+                    return Err(WebQueryError::Transport(e.to_string()));
+                }
+            };
+
+            let latency_ms = started.elapsed().as_millis() as u64;
+
+            let envelope: Envelope<T> = serde_json::from_slice(&bytes).map_err(|e| {
+                tracing::warn!(latency_ms, outcome = "invalid_response", error = %e);
+                WebQueryError::InvalidResponse(format!("envelope parse failed: {e}"))
+            })?;
+
+            match envelope.into_body() {
+                Ok(body) => {
+                    tracing::debug!(latency_ms, outcome = "ok");
+                    Ok(body)
+                }
+                Err(WebQueryError::Upstream { code, message }) => {
+                    tracing::info!(latency_ms, outcome = "upstream_err", code, %message);
+                    Err(WebQueryError::Upstream { code, message })
+                }
+                Err(other) => {
+                    tracing::warn!(latency_ms, outcome = "invalid_response", error = %other);
+                    Err(other)
+                }
+            }
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// Run a list-shaped read and coerce TS upstream code `1281`
+    /// (`database_empty_result`) to an empty `Vec` per spec §10.6. Used by
+    /// `clientpermlist` / `channelclientpermlist` / `ftgetfilelist`-style
+    /// commands where "no rows" arrives as an upstream error rather than a
+    /// `body: []`.
+    async fn list_or_empty<T: for<'de> Deserialize<'de>>(
+        &self,
+        path: &str,
+        params: &[(&str, &str)],
+    ) -> WebQueryResult<Vec<T>> {
+        match self.get::<Vec<T>>(path, params).await {
+            Ok(v) => Ok(v),
+            Err(WebQueryError::Upstream { code, .. }) if code == DATABASE_EMPTY_RESULT => {
+                Ok(Vec::new())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// `version` (instance scope). Phase 1 health probe per §10.7.
@@ -300,6 +381,350 @@ impl WebQueryClient {
         )
         .await
     }
+
+    // =====================================================================
+    // Phase 2 (PURA-68) — full ServerQuery command surface
+    // =====================================================================
+
+    /// `clientlist` with the §7.8 flag set. Pass an empty slice for the
+    /// minimal `clid`/`cid`/`client_database_id`/`client_type`/`client_nickname`
+    /// projection. Standard flags: `-uid -away -voice -times -groups -info
+    /// -country`; `-ip` is admin-only and the route layer is responsible for
+    /// gating it.
+    pub async fn clientlist_with_flags(
+        &self,
+        sid: i64,
+        flags: &[&str],
+    ) -> WebQueryResult<Vec<ClientEntry>> {
+        let path = format!("/{sid}/clientlist{}", flag_suffix(flags));
+        self.get::<Vec<ClientEntry>>(&path, &[]).await
+    }
+
+    /// `clientinfo` (sid scope).
+    pub async fn clientinfo(&self, sid: i64, clid: i64) -> WebQueryResult<ClientInfo> {
+        let clid_s = clid.to_string();
+        self.get::<ClientInfo>(
+            &format!("/{sid}/clientinfo"),
+            &[("clid", clid_s.as_str())],
+        )
+        .await
+    }
+
+    /// `clientdblist` (sid scope) — paginated. Defaults per §7.8: `start=0`,
+    /// `duration=100`. The route layer enforces operator-supplied bounds.
+    pub async fn clientdblist(
+        &self,
+        sid: i64,
+        start: i64,
+        duration: i64,
+    ) -> WebQueryResult<Vec<ClientDbEntry>> {
+        let start_s = start.to_string();
+        let dur_s = duration.to_string();
+        self.get::<Vec<ClientDbEntry>>(
+            &format!("/{sid}/clientdblist"),
+            &[("start", start_s.as_str()), ("duration", dur_s.as_str())],
+        )
+        .await
+    }
+
+    /// `clientdbinfo` (sid scope).
+    pub async fn clientdbinfo(&self, sid: i64, cldbid: i64) -> WebQueryResult<ClientDbEntry> {
+        let cldbid_s = cldbid.to_string();
+        self.get::<ClientDbEntry>(
+            &format!("/{sid}/clientdbinfo"),
+            &[("cldbid", cldbid_s.as_str())],
+        )
+        .await
+    }
+
+    /// `channellist` with optional flags. Pass an empty slice for the minimal
+    /// projection (`cid`/`channel_name`/`pid`/`channel_order`). §7.7 mandates
+    /// `-topic -flags -voice -limits -icon -secondsempty` at the REST layer.
+    pub async fn channellist_with_flags(
+        &self,
+        sid: i64,
+        flags: &[&str],
+    ) -> WebQueryResult<Vec<ChannelEntry>> {
+        let path = format!("/{sid}/channellist{}", flag_suffix(flags));
+        self.get::<Vec<ChannelEntry>>(&path, &[]).await
+    }
+
+    /// `channelinfo` (sid scope).
+    pub async fn channelinfo(&self, sid: i64, cid: i64) -> WebQueryResult<ChannelInfo> {
+        let cid_s = cid.to_string();
+        self.get::<ChannelInfo>(
+            &format!("/{sid}/channelinfo"),
+            &[("cid", cid_s.as_str())],
+        )
+        .await
+    }
+
+    /// `channelclientlist` — clients in a specific channel.
+    pub async fn channelclientlist(
+        &self,
+        sid: i64,
+        cid: i64,
+    ) -> WebQueryResult<Vec<ClientEntry>> {
+        let cid_s = cid.to_string();
+        self.get::<Vec<ClientEntry>>(
+            &format!("/{sid}/channelclientlist"),
+            &[("cid", cid_s.as_str())],
+        )
+        .await
+    }
+
+    /// `hostinfo` (instance scope).
+    pub async fn hostinfo(&self) -> WebQueryResult<HostInfo> {
+        self.get::<HostInfo>("/hostinfo", &[]).await
+    }
+
+    /// `logview` (sid scope) — paginated log retrieval. Defaults follow
+    /// §7.17: `lines=100`, `reverse=1`, `instance=0`. `begin_pos` is omitted
+    /// when `None` (initial fetch); pass the previous response's `last_pos`
+    /// to page forward.
+    pub async fn logview(
+        &self,
+        sid: i64,
+        lines: u32,
+        reverse: bool,
+        instance: bool,
+        begin_pos: Option<i64>,
+    ) -> WebQueryResult<Vec<LogEntry>> {
+        let lines_s = lines.to_string();
+        let reverse_s = if reverse { "1" } else { "0" };
+        let instance_s = if instance { "1" } else { "0" };
+        let mut params: Vec<(&str, &str)> = vec![
+            ("lines", lines_s.as_str()),
+            ("reverse", reverse_s),
+            ("instance", instance_s),
+        ];
+        let begin_s;
+        if let Some(pos) = begin_pos {
+            begin_s = pos.to_string();
+            params.push(("begin_pos", begin_s.as_str()));
+        }
+        self.get::<Vec<LogEntry>>(&format!("/{sid}/logview"), &params)
+            .await
+    }
+
+    /// `clientkick` (sid scope) — moderator action. `reasonid` defaults to
+    /// `5` (server kick) per §7.8 / §14.1.
+    pub async fn clientkick(
+        &self,
+        sid: i64,
+        clid: i64,
+        reasonid: i64,
+        reasonmsg: Option<&str>,
+    ) -> WebQueryResult<()> {
+        let clid_s = clid.to_string();
+        let reasonid_s = reasonid.to_string();
+        let mut params: Vec<(&str, &str)> = vec![
+            ("clid", clid_s.as_str()),
+            ("reasonid", reasonid_s.as_str()),
+        ];
+        if let Some(msg) = reasonmsg {
+            params.push(("reasonmsg", msg));
+        }
+        self.get::<UnitBody>(&format!("/{sid}/clientkick"), &params)
+            .await?;
+        Ok(())
+    }
+
+    /// `clientpoke` (sid scope) — fire a popup at the targeted client.
+    pub async fn clientpoke(&self, sid: i64, clid: i64, msg: &str) -> WebQueryResult<()> {
+        let clid_s = clid.to_string();
+        self.get::<UnitBody>(
+            &format!("/{sid}/clientpoke"),
+            &[("clid", clid_s.as_str()), ("msg", msg)],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// `clientmove` (sid scope) — force-move client to channel `cid`. `cpw`
+    /// is the optional channel password.
+    pub async fn clientmove(
+        &self,
+        sid: i64,
+        clid: i64,
+        cid: i64,
+        cpw: Option<&str>,
+    ) -> WebQueryResult<()> {
+        let clid_s = clid.to_string();
+        let cid_s = cid.to_string();
+        let mut params: Vec<(&str, &str)> = vec![
+            ("clid", clid_s.as_str()),
+            ("cid", cid_s.as_str()),
+        ];
+        if let Some(pw) = cpw {
+            params.push(("cpw", pw));
+        }
+        self.get::<UnitBody>(&format!("/{sid}/clientmove"), &params)
+            .await?;
+        Ok(())
+    }
+
+    /// `clientedit` (sid scope) — flexible primitive for property changes
+    /// (e.g. `CLIENT_DESCRIPTION`, `CLIENT_IS_TALKER`). Used by
+    /// [`Self::client_set_muted`].
+    pub async fn clientedit_raw(
+        &self,
+        sid: i64,
+        clid: i64,
+        props: &[(&str, &str)],
+    ) -> WebQueryResult<()> {
+        let clid_s = clid.to_string();
+        let mut params: Vec<(&str, &str)> = Vec::with_capacity(props.len() + 1);
+        params.push(("clid", clid_s.as_str()));
+        params.extend_from_slice(props);
+        self.get::<UnitBody>(&format!("/{sid}/clientedit"), &params)
+            .await?;
+        Ok(())
+    }
+
+    /// Mute helper — sets `CLIENT_INPUT_MUTED` and/or `CLIENT_OUTPUT_MUTED`
+    /// on the client via `clientedit`. `None` leaves the field unchanged.
+    pub async fn client_set_muted(
+        &self,
+        sid: i64,
+        clid: i64,
+        input_muted: Option<bool>,
+        output_muted: Option<bool>,
+    ) -> WebQueryResult<()> {
+        let mut props: Vec<(&str, &str)> = Vec::with_capacity(2);
+        let in_s;
+        let out_s;
+        if let Some(v) = input_muted {
+            in_s = bool_to_int(v);
+            props.push(("CLIENT_INPUT_MUTED", in_s));
+        }
+        if let Some(v) = output_muted {
+            out_s = bool_to_int(v);
+            props.push(("CLIENT_OUTPUT_MUTED", out_s));
+        }
+        if props.is_empty() {
+            // Caller asked for no-op; avoid a wasted upstream round-trip.
+            return Ok(());
+        }
+        self.clientedit_raw(sid, clid, &props).await
+    }
+
+    /// `banlist` (sid scope).
+    pub async fn banlist(&self, sid: i64) -> WebQueryResult<Vec<BanEntry>> {
+        // Empty banlist surfaces as upstream 1281 on some upstreams.
+        self.list_or_empty::<BanEntry>(&format!("/{sid}/banlist"), &[])
+            .await
+    }
+
+    /// `banadd` (sid scope) — returns the new ban id. Per §7.12 the route
+    /// forwards `ip` / `uid` / `mytsid` / `name` / `banreason` / `time`;
+    /// `time = 0` is permanent.
+    pub async fn banadd(&self, sid: i64, params: &BanAddParams<'_>) -> WebQueryResult<i64> {
+        let mut q: Vec<(&str, &str)> = Vec::with_capacity(6);
+        if let Some(v) = params.ip {
+            q.push(("ip", v));
+        }
+        if let Some(v) = params.uid {
+            q.push(("uid", v));
+        }
+        if let Some(v) = params.mytsid {
+            q.push(("mytsid", v));
+        }
+        if let Some(v) = params.name {
+            q.push(("name", v));
+        }
+        if let Some(v) = params.banreason {
+            q.push(("banreason", v));
+        }
+        let time_s;
+        if let Some(t) = params.time {
+            time_s = t.to_string();
+            q.push(("time", time_s.as_str()));
+        }
+        let resp: BanAddResponse = self.get(&format!("/{sid}/banadd"), &q).await?;
+        Ok(resp.banid)
+    }
+
+    /// `bandel` (sid scope) — drop a single ban by id.
+    pub async fn bandel(&self, sid: i64, banid: i64) -> WebQueryResult<()> {
+        let banid_s = banid.to_string();
+        self.get::<UnitBody>(
+            &format!("/{sid}/bandel"),
+            &[("banid", banid_s.as_str())],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// `bandelall` (sid scope) — drop every ban on this virtual server.
+    pub async fn bandelall(&self, sid: i64) -> WebQueryResult<()> {
+        self.get::<UnitBody>(&format!("/{sid}/bandelall"), &[])
+            .await?;
+        Ok(())
+    }
+
+    /// `channelclientpermlist` — list a client's per-channel permission rows.
+    /// TS upstream code 1281 (`database_empty_result`) is mapped to `[]`
+    /// per §10.6 to match the route-layer contract.
+    pub async fn channelclientpermlist(
+        &self,
+        sid: i64,
+        cid: i64,
+        cldbid: i64,
+    ) -> WebQueryResult<Vec<ChannelClientPerm>> {
+        let cid_s = cid.to_string();
+        let cldbid_s = cldbid.to_string();
+        // `-permsid` toggles the symbolic name in the response (matches the
+        // §7.7 channelpermlist projection).
+        self.list_or_empty::<ChannelClientPerm>(
+            &format!("/{sid}/channelclientpermlist-permsid"),
+            &[("cid", cid_s.as_str()), ("cldbid", cldbid_s.as_str())],
+        )
+        .await
+    }
+}
+
+/// Sentinel for write commands that only carry a `status` envelope. TS
+/// returns `body: {}` (or sometimes `body: []`) on these; we accept either
+/// because [`Envelope::into_body`] only inspects `status.code`.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum UnitBody {
+    Object(serde_json::Value),
+    Tuple(()),
+}
+
+/// Render `&[&str]` flags into the `-foo-bar` suffix the TS WebQuery URL
+/// uses for command flags (e.g. `clientlist-uid-away`). An empty slice
+/// returns the empty string so callers can unconditionally append it.
+fn flag_suffix(flags: &[&str]) -> String {
+    if flags.is_empty() {
+        return String::new();
+    }
+    let mut out = String::with_capacity(flags.iter().map(|f| f.len() + 1).sum());
+    for flag in flags {
+        out.push('-');
+        out.push_str(flag.trim_start_matches('-'));
+    }
+    out
+}
+
+fn bool_to_int(v: bool) -> &'static str {
+    if v { "1" } else { "0" }
+}
+
+/// Parameters for [`WebQueryClient::banadd`]. All fields are optional —
+/// callers send the subset that applies (e.g. ban-by-IP vs. ban-by-uid).
+#[derive(Debug, Default, Clone)]
+pub struct BanAddParams<'a> {
+    pub ip: Option<&'a str>,
+    pub uid: Option<&'a str>,
+    pub mytsid: Option<&'a str>,
+    pub name: Option<&'a str>,
+    pub banreason: Option<&'a str>,
+    /// Ban duration in seconds. `Some(0)` is permanent per §7.12; `None`
+    /// omits the field entirely (upstream defaults apply).
+    pub time: Option<i64>,
 }
 
 /// Spec §10.5 envelope. Always parsed, regardless of HTTP status.

@@ -196,26 +196,31 @@ mod tests {
                 clid: 1,
                 client_type: 0,
                 client_nickname: "Alice".into(),
+                ..Default::default()
             },
             models::ClientEntry {
                 clid: 2,
                 client_type: 0,
                 client_nickname: "Bob".into(),
+                ..Default::default()
             },
             models::ClientEntry {
                 clid: 99,
                 client_type: 1,
                 client_nickname: "serveradmin".into(),
+                ..Default::default()
             },
         ];
         let channels = vec![
             models::ChannelEntry {
                 cid: 1,
                 channel_name: "A".into(),
+                ..Default::default()
             },
             models::ChannelEntry {
                 cid: 2,
                 channel_name: "B".into(),
+                ..Default::default()
             },
         ];
         let conn_info = models::ConnectionInfo {

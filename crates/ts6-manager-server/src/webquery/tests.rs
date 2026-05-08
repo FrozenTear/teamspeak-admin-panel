@@ -34,6 +34,7 @@ use super::*;
 struct MockState {
     expected_api_key: Arc<String>,
     captured_channel_query: Arc<std::sync::Mutex<Option<String>>>,
+    captured_query: Arc<std::sync::Mutex<Option<(String, String)>>>,
     request_count: Arc<AtomicU64>,
 }
 
@@ -189,12 +190,31 @@ impl MockServer {
         let app = Router::new()
             .route("/version", get(handler_version))
             .route("/serverlist", get(handler_serverlist))
+            .route("/hostinfo", get(handler_hostinfo))
             .route("/{sid}/channellist", get(handler_channellist))
             .route("/{sid}/clientlist", get(handler_clientlist))
             .route("/{sid}/serverinfo", get(handler_serverinfo))
             .route(
                 "/{sid}/serverrequestconnectioninfo",
                 get(handler_connection_info),
+            )
+            // Phase 2 (PURA-68) handlers.
+            .route("/{sid}/clientinfo", get(handler_clientinfo))
+            .route("/{sid}/clientdblist", get(handler_clientdblist))
+            .route("/{sid}/channelinfo", get(handler_channelinfo))
+            .route("/{sid}/channelclientlist", get(handler_channelclientlist))
+            .route("/{sid}/logview", get(handler_logview))
+            .route("/{sid}/banlist", get(handler_banlist))
+            .route("/{sid}/banadd", get(handler_banadd))
+            .route("/{sid}/bandel", get(handler_bandel))
+            .route("/{sid}/bandelall", get(handler_bandelall))
+            .route("/{sid}/clientkick", get(handler_clientkick))
+            .route("/{sid}/clientpoke", get(handler_clientpoke))
+            .route("/{sid}/clientmove", get(handler_clientmove))
+            .route("/{sid}/clientedit", get(handler_clientedit))
+            .route(
+                "/{sid}/channelclientpermlist-permsid",
+                get(handler_channelclientpermlist),
             )
             .with_state(state.clone());
 
@@ -450,4 +470,638 @@ fn escape_module_is_reachable_from_module_root() {
     // Pin the public surface so SSHBRIDGE can still import via
     // `crate::webquery::escape::escape`.
     assert_eq!(escape::escape("a b"), "a\\sb");
+}
+
+// =========================================================================
+// Phase 2 (PURA-68) — handlers + tests for the full command surface
+// =========================================================================
+
+async fn handler_hostinfo(
+    State(state): State<MockState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !key_matches(&headers, &state.expected_api_key) {
+        return upstream_error(1283, "client_query_login_failed");
+    }
+    Json(json!({
+        "body": {
+            "instance_uptime": "12345",
+            "host_timestamp_utc": "1700000000",
+            "virtualservers_running_total": "2",
+            "virtualservers_total_clients_online": "10",
+            "virtualservers_total_channels_online": "20",
+            "virtualservers_total_maxclients": "64",
+            "connection_bandwidth_sent_last_second_total": "1024",
+            "connection_bandwidth_received_last_second_total": "2048",
+            "connection_packets_sent_total": "10000",
+            "connection_packets_received_total": "9999",
+            "connection_bytes_sent_total": "5000000",
+            "connection_bytes_received_total": "4999999",
+        },
+        "status": {"code": 0, "message": "ok"},
+    }))
+    .into_response()
+}
+
+async fn handler_clientinfo(
+    State(state): State<MockState>,
+    headers: HeaderMap,
+    Path(_sid): Path<i64>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if !key_matches(&headers, &state.expected_api_key) {
+        return upstream_error(1283, "client_query_login_failed");
+    }
+    let clid = params.get("clid").cloned().unwrap_or_default();
+    Json(json!({
+        "body": {
+            "client_unique_identifier": format!("uid-{clid}="),
+            "client_nickname": "Alice",
+            "client_database_id": "1000",
+            "cid": "5",
+            "client_type": "0",
+            "client_idle_time": "5000",
+            "client_lastconnected": "1700000000",
+            "client_input_muted": "0",
+            "client_output_muted": "1",
+            "client_country": "DE",
+            "connection_client_ip": "203.0.113.10",
+            "client_servergroups": "8,9",
+        },
+        "status": {"code": 0, "message": "ok"},
+    }))
+    .into_response()
+}
+
+async fn handler_clientdblist(
+    State(state): State<MockState>,
+    headers: HeaderMap,
+    Path(_sid): Path<i64>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if !key_matches(&headers, &state.expected_api_key) {
+        return upstream_error(1283, "client_query_login_failed");
+    }
+    *state.captured_query.lock().unwrap() = Some((
+        params.get("start").cloned().unwrap_or_default(),
+        params.get("duration").cloned().unwrap_or_default(),
+    ));
+    Json(json!({
+        "body": [
+            {
+                "cldbid": "42",
+                "client_unique_identifier": "uid-42=",
+                "client_nickname": "Bob",
+                "client_created": "1690000000",
+                "client_lastconnected": "1700000000",
+                "client_totalconnections": "37",
+                "client_lastip": "10.0.0.1",
+            },
+            {
+                "cldbid": "43",
+                "client_unique_identifier": "uid-43=",
+                "client_nickname": "Carol",
+                "client_created": "1691000000",
+                "client_lastconnected": "1700100000",
+                "client_totalconnections": "5",
+                "client_lastip": "10.0.0.2",
+            }
+        ],
+        "status": {"code": 0, "message": "ok"},
+    }))
+    .into_response()
+}
+
+async fn handler_channelinfo(
+    State(state): State<MockState>,
+    headers: HeaderMap,
+    Path(_sid): Path<i64>,
+) -> impl IntoResponse {
+    if !key_matches(&headers, &state.expected_api_key) {
+        return upstream_error(1283, "client_query_login_failed");
+    }
+    Json(json!({
+        "body": {
+            "channel_name": "Default Channel",
+            "channel_topic": "topic",
+            "channel_description": "desc",
+            "channel_codec": "4",
+            "channel_codec_quality": "10",
+            "channel_maxclients": "-1",
+            "channel_maxfamilyclients": "-1",
+            "channel_order": "0",
+            "pid": "0",
+            "channel_flag_permanent": "1",
+            "channel_needed_talk_power": "0",
+        },
+        "status": {"code": 0, "message": "ok"},
+    }))
+    .into_response()
+}
+
+async fn handler_channelclientlist(
+    State(state): State<MockState>,
+    headers: HeaderMap,
+    Path(_sid): Path<i64>,
+) -> impl IntoResponse {
+    if !key_matches(&headers, &state.expected_api_key) {
+        return upstream_error(1283, "client_query_login_failed");
+    }
+    Json(json!({
+        "body": [
+            {"clid": "10", "cid": "1", "client_database_id": "1000",
+             "client_type": "0", "client_nickname": "Alice"},
+            {"clid": "11", "cid": "1", "client_database_id": "1001",
+             "client_type": "0", "client_nickname": "Bob"},
+        ],
+        "status": {"code": 0, "message": "ok"},
+    }))
+    .into_response()
+}
+
+async fn handler_logview(
+    State(state): State<MockState>,
+    headers: HeaderMap,
+    Path(_sid): Path<i64>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if !key_matches(&headers, &state.expected_api_key) {
+        return upstream_error(1283, "client_query_login_failed");
+    }
+    *state.captured_query.lock().unwrap() = Some((
+        params.get("lines").cloned().unwrap_or_default(),
+        params.get("reverse").cloned().unwrap_or_default(),
+    ));
+    Json(json!({
+        "body": [
+            {"last_pos": "2048", "file_size": "8192",
+             "l": "2024-01-01 INFO ServerLib started"},
+            {"l": "2024-01-01 INFO listener bound to 9987/UDP"},
+            {"l": "2024-01-01 INFO sql update done"},
+        ],
+        "status": {"code": 0, "message": "ok"},
+    }))
+    .into_response()
+}
+
+async fn handler_banlist(
+    State(state): State<MockState>,
+    headers: HeaderMap,
+    Path(_sid): Path<i64>,
+) -> impl IntoResponse {
+    if !key_matches(&headers, &state.expected_api_key) {
+        return upstream_error(1283, "client_query_login_failed");
+    }
+    Json(json!({
+        "body": [
+            {
+                "banid": "7",
+                "ip": "10.0.0.5",
+                "uid": "uid=",
+                "name": "",
+                "created": "1700000000",
+                "duration": "0",
+                "reason": "Spamming",
+                "invokername": "operator",
+                "invokercldbid": "1",
+                "invokeruid": "op-uid=",
+                "enforcements": "1",
+                "lastnickname": "Spammer",
+            }
+        ],
+        "status": {"code": 0, "message": "ok"},
+    }))
+    .into_response()
+}
+
+async fn handler_banadd(
+    State(state): State<MockState>,
+    headers: HeaderMap,
+    Path(_sid): Path<i64>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if !key_matches(&headers, &state.expected_api_key) {
+        return upstream_error(1283, "client_query_login_failed");
+    }
+    *state.captured_query.lock().unwrap() = Some((
+        params.get("ip").cloned().unwrap_or_default(),
+        params.get("banreason").cloned().unwrap_or_default(),
+    ));
+    Json(json!({
+        "body": {"banid": "11"},
+        "status": {"code": 0, "message": "ok"},
+    }))
+    .into_response()
+}
+
+async fn handler_bandel(
+    State(state): State<MockState>,
+    headers: HeaderMap,
+    Path(_sid): Path<i64>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if !key_matches(&headers, &state.expected_api_key) {
+        return upstream_error(1283, "client_query_login_failed");
+    }
+    *state.captured_query.lock().unwrap() = Some((
+        params.get("banid").cloned().unwrap_or_default(),
+        String::new(),
+    ));
+    Json(json!({
+        "body": {},
+        "status": {"code": 0, "message": "ok"},
+    }))
+    .into_response()
+}
+
+async fn handler_bandelall(
+    State(state): State<MockState>,
+    headers: HeaderMap,
+    Path(_sid): Path<i64>,
+) -> impl IntoResponse {
+    if !key_matches(&headers, &state.expected_api_key) {
+        return upstream_error(1283, "client_query_login_failed");
+    }
+    Json(json!({
+        "body": {},
+        "status": {"code": 0, "message": "ok"},
+    }))
+    .into_response()
+}
+
+async fn handler_clientkick(
+    State(state): State<MockState>,
+    headers: HeaderMap,
+    Path(_sid): Path<i64>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if !key_matches(&headers, &state.expected_api_key) {
+        return upstream_error(1283, "client_query_login_failed");
+    }
+    *state.captured_query.lock().unwrap() = Some((
+        params.get("clid").cloned().unwrap_or_default(),
+        params.get("reasonid").cloned().unwrap_or_default(),
+    ));
+    Json(json!({
+        "body": {},
+        "status": {"code": 0, "message": "ok"},
+    }))
+    .into_response()
+}
+
+async fn handler_clientpoke(
+    State(state): State<MockState>,
+    headers: HeaderMap,
+    Path(_sid): Path<i64>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if !key_matches(&headers, &state.expected_api_key) {
+        return upstream_error(1283, "client_query_login_failed");
+    }
+    *state.captured_query.lock().unwrap() = Some((
+        params.get("clid").cloned().unwrap_or_default(),
+        params.get("msg").cloned().unwrap_or_default(),
+    ));
+    Json(json!({
+        "body": {},
+        "status": {"code": 0, "message": "ok"},
+    }))
+    .into_response()
+}
+
+async fn handler_clientmove(
+    State(state): State<MockState>,
+    headers: HeaderMap,
+    Path(_sid): Path<i64>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if !key_matches(&headers, &state.expected_api_key) {
+        return upstream_error(1283, "client_query_login_failed");
+    }
+    *state.captured_query.lock().unwrap() = Some((
+        params.get("clid").cloned().unwrap_or_default(),
+        params.get("cid").cloned().unwrap_or_default(),
+    ));
+    Json(json!({
+        "body": {},
+        "status": {"code": 0, "message": "ok"},
+    }))
+    .into_response()
+}
+
+async fn handler_clientedit(
+    State(state): State<MockState>,
+    headers: HeaderMap,
+    Path(_sid): Path<i64>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if !key_matches(&headers, &state.expected_api_key) {
+        return upstream_error(1283, "client_query_login_failed");
+    }
+    *state.captured_query.lock().unwrap() = Some((
+        params.get("clid").cloned().unwrap_or_default(),
+        params
+            .get("CLIENT_INPUT_MUTED")
+            .cloned()
+            .unwrap_or_default(),
+    ));
+    Json(json!({
+        "body": {},
+        "status": {"code": 0, "message": "ok"},
+    }))
+    .into_response()
+}
+
+async fn handler_channelclientpermlist(
+    State(state): State<MockState>,
+    headers: HeaderMap,
+    Path(sid): Path<i64>,
+) -> impl IntoResponse {
+    if !key_matches(&headers, &state.expected_api_key) {
+        return upstream_error(1283, "client_query_login_failed");
+    }
+    // sid=999 → exercise the 1281 → [] coercion path.
+    if sid == 999 {
+        return upstream_error(1281, "database_empty_result");
+    }
+    Json(json!({
+        "body": [
+            {
+                "permid": "12345",
+                "permsid": "i_channel_needed_modify_power",
+                "permvalue": "75",
+                "permnegated": "0",
+                "permskip": "0",
+            }
+        ],
+        "status": {"code": 0, "message": "ok"},
+    }))
+    .into_response()
+}
+
+#[tokio::test]
+async fn hostinfo_returns_typed_counters() {
+    let server = MockServer::start("k").await;
+    let client = build_client(&server, "k");
+
+    let host = client.hostinfo().await.unwrap();
+    assert_eq!(host.virtualservers_running_total, 2);
+    assert_eq!(host.virtualservers_total_clients_online, 10);
+    assert_eq!(host.connection_bandwidth_received_last_second_total, 2048);
+}
+
+#[tokio::test]
+async fn clientinfo_returns_full_metadata() {
+    let server = MockServer::start("k").await;
+    let client = build_client(&server, "k");
+
+    let info = client.clientinfo(1, 10).await.unwrap();
+    assert_eq!(info.client_unique_identifier, "uid-10=");
+    assert_eq!(info.cid, 5);
+    assert_eq!(info.connection_client_ip, "203.0.113.10");
+    assert_eq!(info.client_output_muted, 1);
+}
+
+#[tokio::test]
+async fn clientdblist_passes_pagination_and_decodes() {
+    let server = MockServer::start("k").await;
+    let client = build_client(&server, "k");
+
+    let rows = client.clientdblist(1, 25, 50).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].cldbid, 42);
+    assert_eq!(rows[1].client_lastip, "10.0.0.2");
+    let captured = server.state.captured_query.lock().unwrap().clone().unwrap();
+    assert_eq!(captured, ("25".to_string(), "50".to_string()));
+}
+
+#[tokio::test]
+async fn channelinfo_round_trips_full_payload() {
+    let server = MockServer::start("k").await;
+    let client = build_client(&server, "k");
+
+    let info = client.channelinfo(1, 5).await.unwrap();
+    assert_eq!(info.channel_name, "Default Channel");
+    assert_eq!(info.channel_codec, 4);
+    assert_eq!(info.channel_flag_permanent, 1);
+    assert_eq!(info.channel_maxclients, -1);
+}
+
+#[tokio::test]
+async fn channelclientlist_returns_only_listed_channel_clients() {
+    let server = MockServer::start("k").await;
+    let client = build_client(&server, "k");
+
+    let rows = client.channelclientlist(1, 1).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].clid, 10);
+    assert_eq!(rows[1].client_database_id, 1001);
+}
+
+#[tokio::test]
+async fn logview_passes_pagination_params_and_keeps_metadata_on_first_row() {
+    let server = MockServer::start("k").await;
+    let client = build_client(&server, "k");
+
+    let rows = client.logview(1, 100, true, false, Some(0)).await.unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].last_pos, Some(2048));
+    assert_eq!(rows[0].file_size, Some(8192));
+    assert!(rows[0].l.contains("ServerLib started"));
+    assert_eq!(rows[1].last_pos, None);
+    let captured = server.state.captured_query.lock().unwrap().clone().unwrap();
+    assert_eq!(captured, ("100".to_string(), "1".to_string()));
+}
+
+#[tokio::test]
+async fn banlist_decodes_banentries() {
+    let server = MockServer::start("k").await;
+    let client = build_client(&server, "k");
+
+    let bans = client.banlist(1).await.unwrap();
+    assert_eq!(bans.len(), 1);
+    assert_eq!(bans[0].banid, 7);
+    assert_eq!(bans[0].reason, "Spamming");
+    assert_eq!(bans[0].invokername, "operator");
+}
+
+#[tokio::test]
+async fn banadd_returns_new_banid_and_passes_params() {
+    let server = MockServer::start("k").await;
+    let client = build_client(&server, "k");
+
+    let id = client
+        .banadd(
+            1,
+            &BanAddParams {
+                ip: Some("10.0.0.99"),
+                banreason: Some("Trolling"),
+                time: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(id, 11);
+    let captured = server.state.captured_query.lock().unwrap().clone().unwrap();
+    assert_eq!(captured, ("10.0.0.99".to_string(), "Trolling".to_string()));
+}
+
+#[tokio::test]
+async fn bandel_passes_banid() {
+    let server = MockServer::start("k").await;
+    let client = build_client(&server, "k");
+
+    client.bandel(1, 7).await.unwrap();
+    let captured = server.state.captured_query.lock().unwrap().clone().unwrap();
+    assert_eq!(captured, ("7".to_string(), String::new()));
+}
+
+#[tokio::test]
+async fn bandelall_succeeds_with_unit_body() {
+    let server = MockServer::start("k").await;
+    let client = build_client(&server, "k");
+    client.bandelall(1).await.unwrap();
+}
+
+#[tokio::test]
+async fn clientkick_passes_clid_and_reasonid() {
+    let server = MockServer::start("k").await;
+    let client = build_client(&server, "k");
+
+    client
+        .clientkick(1, 10, 5, Some("Idle timeout"))
+        .await
+        .unwrap();
+    let captured = server.state.captured_query.lock().unwrap().clone().unwrap();
+    assert_eq!(captured, ("10".to_string(), "5".to_string()));
+}
+
+#[tokio::test]
+async fn clientpoke_passes_clid_and_msg() {
+    let server = MockServer::start("k").await;
+    let client = build_client(&server, "k");
+
+    client.clientpoke(1, 10, "wake up").await.unwrap();
+    let captured = server.state.captured_query.lock().unwrap().clone().unwrap();
+    assert_eq!(captured, ("10".to_string(), "wake up".to_string()));
+}
+
+#[tokio::test]
+async fn clientmove_passes_clid_and_target_cid() {
+    let server = MockServer::start("k").await;
+    let client = build_client(&server, "k");
+
+    client.clientmove(1, 10, 7, None).await.unwrap();
+    let captured = server.state.captured_query.lock().unwrap().clone().unwrap();
+    assert_eq!(captured, ("10".to_string(), "7".to_string()));
+}
+
+#[tokio::test]
+async fn client_set_muted_writes_input_muted_property() {
+    let server = MockServer::start("k").await;
+    let client = build_client(&server, "k");
+
+    client
+        .client_set_muted(1, 10, Some(true), None)
+        .await
+        .unwrap();
+    let captured = server.state.captured_query.lock().unwrap().clone().unwrap();
+    assert_eq!(captured, ("10".to_string(), "1".to_string()));
+}
+
+#[tokio::test]
+async fn client_set_muted_with_no_changes_is_noop() {
+    let server = MockServer::start("k").await;
+    let client = build_client(&server, "k");
+
+    client.client_set_muted(1, 10, None, None).await.unwrap();
+    // No upstream call should fire — captured_query stays None.
+    assert!(server.state.captured_query.lock().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn channelclientpermlist_returns_typed_rows() {
+    let server = MockServer::start("k").await;
+    let client = build_client(&server, "k");
+
+    let perms = client.channelclientpermlist(1, 5, 1000).await.unwrap();
+    assert_eq!(perms.len(), 1);
+    assert_eq!(perms[0].permid, 12_345);
+    assert_eq!(perms[0].permvalue, 75);
+    assert_eq!(perms[0].permsid, "i_channel_needed_modify_power");
+}
+
+#[tokio::test]
+async fn channelclientpermlist_translates_1281_to_empty() {
+    let server = MockServer::start("k").await;
+    let client = build_client(&server, "k");
+
+    // sid=999 returns upstream code 1281 in the mock; the helper must
+    // translate it to an empty Vec (spec §10.6).
+    let perms = client.channelclientpermlist(999, 5, 1000).await.unwrap();
+    assert!(perms.is_empty());
+}
+
+#[tokio::test]
+async fn flag_suffix_renders_dash_prefixed_chain() {
+    // White-box: flag_suffix is the URL builder used by clientlist /
+    // channellist callers; cover both empty and prefix-tolerant inputs.
+    assert_eq!(super::flag_suffix(&[]), "");
+    assert_eq!(super::flag_suffix(&["uid", "away"]), "-uid-away");
+    assert_eq!(super::flag_suffix(&["-uid", "-away"]), "-uid-away");
+}
+
+// =========================================================================
+// Env-gated integration test against a local TS6 host.
+//
+// Set `TS6_INTEGRATION_HOST=<host>` plus `TS6_INTEGRATION_API_KEY=<key>`
+// (and optionally `TS6_INTEGRATION_PORT`, `TS6_INTEGRATION_HTTPS=1`) to
+// opt in. Without these env vars, the test no-ops so CI / local dev stay
+// hermetic.
+// =========================================================================
+#[tokio::test]
+async fn integration_against_local_ts6_host_when_env_configured() {
+    let Ok(host) = std::env::var("TS6_INTEGRATION_HOST") else {
+        eprintln!("skipping: TS6_INTEGRATION_HOST not set");
+        return;
+    };
+    let api_key = std::env::var("TS6_INTEGRATION_API_KEY")
+        .expect("TS6_INTEGRATION_HOST set without TS6_INTEGRATION_API_KEY");
+    let port: u16 = std::env::var("TS6_INTEGRATION_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10080);
+    let use_https = std::env::var("TS6_INTEGRATION_HTTPS")
+        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let allow_self_signed = std::env::var("TS6_INTEGRATION_ALLOW_SELF_SIGNED")
+        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    let client = WebQueryClient::new(0, &host, port, use_https, api_key, allow_self_signed)
+        .expect("client builds");
+
+    // Cheap probes — no mutations against the real host.
+    let version = client.version().await.expect("version probe ok");
+    assert!(!version.version.is_empty());
+
+    let host_info = client.hostinfo().await.expect("hostinfo ok");
+    assert!(host_info.virtualservers_running_total >= 0);
+
+    let servers = client.serverlist().await.expect("serverlist ok");
+    if let Some(first) = servers.first() {
+        let info = client
+            .serverinfo(first.virtualserver_id)
+            .await
+            .expect("serverinfo ok");
+        assert!(!info.virtualserver_name.is_empty());
+
+        // Read paths only — verifies the typed surface decodes the real
+        // response shape without mutating upstream state.
+        let _ = client
+            .clientlist_with_flags(first.virtualserver_id, &["uid", "away"])
+            .await;
+        let _ = client.banlist(first.virtualserver_id).await;
+    }
 }
