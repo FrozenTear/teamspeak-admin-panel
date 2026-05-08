@@ -22,8 +22,10 @@
 //! 4. **Reconnect** (spec §11.5). Connection-class transport failures
 //!    return [`SessionResult::Reconnect`] from the dispatch loop;
 //!    [`run_with_reconnect`] applies exponential backoff
-//!    `min(initial * 2^attempts, max)` and re-invokes
-//!    `connect_factory`. Auth-rejected is fatal — no reconnect.
+//!    `min(initial * 2^attempts, max)` with ±25% jitter and re-invokes
+//!    `connect_factory`. Jitter prevents fleet-wide synchronised
+//!    reconnect storms after a shared upstream blip. Auth-rejected is
+//!    fatal — no reconnect.
 //!
 //! ## Test seam
 //!
@@ -35,6 +37,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use rand::Rng;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tokio::time::Instant;
 
@@ -87,14 +90,27 @@ impl TransportConfig {
     }
 }
 
-/// Reconnect backoff math — `min(initial * 2^attempts, max)`. Exposed as
-/// a free function so it is unit-testable independently of the loop.
-pub fn next_backoff(attempts: u32, cfg: &TransportConfig) -> Duration {
+/// Deterministic capped backoff base — `min(initial * 2^attempts, max)`.
+/// Exposed as a free function so it is unit-testable independently of
+/// the jitter applied by [`next_backoff`].
+pub fn next_backoff_base(attempts: u32, cfg: &TransportConfig) -> Duration {
     let initial_ms = cfg.backoff_initial.as_millis() as u64;
     let max_ms = cfg.backoff_max.as_millis() as u64;
     let scale = 2u64.checked_pow(attempts).unwrap_or(u64::MAX);
     let scaled = initial_ms.saturating_mul(scale);
     Duration::from_millis(scaled.min(max_ms))
+}
+
+/// Reconnect backoff with ±25% jitter applied on top of the capped base.
+/// Cap is taken on the deterministic base before jitter, so the returned
+/// duration spans `[0.75 * base, 1.25 * base]` for a given `attempts`.
+/// Without jitter, fleet-wide network blips would re-converge every
+/// supervisor onto the same reconnect schedule and hammer the upstream
+/// in lock-step.
+pub fn next_backoff(attempts: u32, cfg: &TransportConfig) -> Duration {
+    let base_ms = next_backoff_base(attempts, cfg).as_millis() as u64;
+    let jitter: f64 = rand::thread_rng().gen_range(0.75..=1.25);
+    Duration::from_millis((base_ms as f64 * jitter) as u64)
 }
 
 /// One command submitted to the dispatch loop.
@@ -721,21 +737,67 @@ mod tests {
     }
 
     #[test]
-    fn backoff_doubles_then_caps() {
+    fn backoff_base_doubles_then_caps() {
         let cfg = TransportConfig {
             backoff_initial: Duration::from_millis(1000),
             backoff_max: Duration::from_millis(30000),
             ..test_cfg()
         };
         // 1000, 2000, 4000, 8000, 16000, 30000 (cap), 30000, ...
-        assert_eq!(next_backoff(0, &cfg), Duration::from_millis(1000));
-        assert_eq!(next_backoff(1, &cfg), Duration::from_millis(2000));
-        assert_eq!(next_backoff(2, &cfg), Duration::from_millis(4000));
-        assert_eq!(next_backoff(3, &cfg), Duration::from_millis(8000));
-        assert_eq!(next_backoff(4, &cfg), Duration::from_millis(16000));
+        assert_eq!(next_backoff_base(0, &cfg), Duration::from_millis(1000));
+        assert_eq!(next_backoff_base(1, &cfg), Duration::from_millis(2000));
+        assert_eq!(next_backoff_base(2, &cfg), Duration::from_millis(4000));
+        assert_eq!(next_backoff_base(3, &cfg), Duration::from_millis(8000));
+        assert_eq!(next_backoff_base(4, &cfg), Duration::from_millis(16000));
         // 32_000 ms would exceed the cap → 30_000.
-        assert_eq!(next_backoff(5, &cfg), Duration::from_millis(30000));
-        assert_eq!(next_backoff(50, &cfg), Duration::from_millis(30000));
+        assert_eq!(next_backoff_base(5, &cfg), Duration::from_millis(30000));
+        assert_eq!(next_backoff_base(50, &cfg), Duration::from_millis(30000));
+    }
+
+    /// Property test for jitter — every sample lands inside the ±25%
+    /// window, the mean is close to `base`, and the spread is positive
+    /// (i.e. jitter is actually being applied).
+    #[test]
+    fn backoff_jitter_within_range_with_positive_spread() {
+        let cfg = TransportConfig {
+            backoff_initial: Duration::from_millis(1000),
+            backoff_max: Duration::from_millis(30000),
+            ..test_cfg()
+        };
+        // attempts=5 hits the cap (30_000 ms) so we are testing the
+        // jitter applied to the capped base, which is the worst case
+        // for fleet-wide synchronisation.
+        let base_ms = next_backoff_base(5, &cfg).as_millis() as f64;
+        let lower = base_ms * 0.75;
+        let upper = base_ms * 1.25;
+
+        let n = 1000usize;
+        let mut samples = Vec::with_capacity(n);
+        for _ in 0..n {
+            let v = next_backoff(5, &cfg).as_millis() as f64;
+            assert!(
+                v >= lower && v <= upper,
+                "sample {v} outside [{lower}, {upper}]"
+            );
+            samples.push(v);
+        }
+
+        let mean: f64 = samples.iter().sum::<f64>() / n as f64;
+        // Allow ±2% drift on the mean — a uniform [0.75, 1.25] window
+        // has mean 1.0; with 1000 samples the sample mean is well
+        // within ±0.02 of `base` in practice.
+        assert!(
+            (mean - base_ms).abs() < base_ms * 0.02,
+            "mean {mean} not within 2% of base {base_ms}",
+        );
+
+        let variance: f64 =
+            samples.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n as f64;
+        let stddev = variance.sqrt();
+        assert!(
+            stddev > 0.0,
+            "stddev {stddev} should be positive — jitter not applied"
+        );
     }
 
     #[tokio::test]
