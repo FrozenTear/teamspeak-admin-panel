@@ -36,9 +36,12 @@ use serde_json::{Map, Value};
 use tokio::sync::Mutex;
 
 use crate::control::{ControlBackend, ControlBackendError, ControlResult};
+use crate::webquery::escape::escape;
 use crate::webquery::models::{
-    ChannelEntry, ClientEntry, ConnectionInfo, ServerInfo, VersionInfo, VirtualServerEntry,
+    BanEntry, ChannelEntry, ClientDbEntry, ClientEntry, ClientInfo, ConnectionInfo, LogEntry,
+    ServerInfo, VersionInfo, VirtualServerEntry,
 };
+use crate::webquery::BanAddParams;
 
 use super::transport::{CommandOutcome, TransportHandle};
 use super::wire::parse_records;
@@ -203,9 +206,199 @@ impl ControlBackend for SshControlClient {
         Self::parse_first(&outcome.body_lines)
     }
 
+    async fn clientlist_with_flags(
+        &self,
+        sid: i64,
+        flags: &[&str],
+    ) -> ControlResult<Vec<ClientEntry>> {
+        let line = format!("clientlist{}", append_flags(flags));
+        let outcome = self.run_scoped(sid, &line).await?;
+        Self::parse_list(&outcome.body_lines)
+    }
+
+    async fn clientinfo(&self, sid: i64, clid: i64) -> ControlResult<ClientInfo> {
+        let line = format!("clientinfo clid={clid}");
+        let outcome = self.run_scoped(sid, &line).await?;
+        Self::parse_first(&outcome.body_lines)
+    }
+
+    async fn clientdbinfo(&self, sid: i64, cldbid: i64) -> ControlResult<ClientDbEntry> {
+        let line = format!("clientdbinfo cldbid={cldbid}");
+        let outcome = self.run_scoped(sid, &line).await?;
+        Self::parse_first(&outcome.body_lines)
+    }
+
+    async fn channellist_with_flags(
+        &self,
+        sid: i64,
+        flags: &[&str],
+    ) -> ControlResult<Vec<ChannelEntry>> {
+        let line = format!("channellist{}", append_flags(flags));
+        let outcome = self.run_scoped(sid, &line).await?;
+        Self::parse_list(&outcome.body_lines)
+    }
+
+    async fn banlist(&self, sid: i64) -> ControlResult<Vec<BanEntry>> {
+        // Empty banlist surfaces as `database_empty_result` (1281) on
+        // some upstreams; collapse that to an empty `Vec` so the REST
+        // contract matches the WebQuery `list_or_empty` behaviour.
+        match self.run_scoped(sid, "banlist").await {
+            Ok(outcome) => Self::parse_list(&outcome.body_lines),
+            Err(ControlBackendError::Upstream { code, .. })
+                if code == crate::webquery::DATABASE_EMPTY_RESULT =>
+            {
+                Ok(Vec::new())
+            }
+            Err(other) => Err(other),
+        }
+    }
+
+    async fn logview(
+        &self,
+        sid: i64,
+        lines: u32,
+        reverse: bool,
+        instance: bool,
+        begin_pos: Option<i64>,
+    ) -> ControlResult<Vec<LogEntry>> {
+        let mut line = format!(
+            "logview lines={lines} reverse={r} instance={i}",
+            r = if reverse { 1 } else { 0 },
+            i = if instance { 1 } else { 0 }
+        );
+        if let Some(pos) = begin_pos {
+            line.push_str(&format!(" begin_pos={pos}"));
+        }
+        let outcome = self.run_scoped(sid, &line).await?;
+        Self::parse_list(&outcome.body_lines)
+    }
+
+    async fn clientkick(
+        &self,
+        sid: i64,
+        clid: i64,
+        reasonid: i64,
+        reasonmsg: Option<&str>,
+    ) -> ControlResult<()> {
+        let mut line = format!("clientkick reasonid={reasonid} clid={clid}");
+        if let Some(msg) = reasonmsg {
+            line.push_str(&format!(" reasonmsg={}", escape(msg)));
+        }
+        self.run_scoped(sid, &line).await?;
+        Ok(())
+    }
+
+    async fn clientmove(
+        &self,
+        sid: i64,
+        clid: i64,
+        cid: i64,
+        cpw: Option<&str>,
+    ) -> ControlResult<()> {
+        let mut line = format!("clientmove clid={clid} cid={cid}");
+        if let Some(pw) = cpw {
+            line.push_str(&format!(" cpw={}", escape(pw)));
+        }
+        self.run_scoped(sid, &line).await?;
+        Ok(())
+    }
+
+    async fn client_set_muted(
+        &self,
+        sid: i64,
+        clid: i64,
+        input_muted: Option<bool>,
+        output_muted: Option<bool>,
+    ) -> ControlResult<()> {
+        if input_muted.is_none() && output_muted.is_none() {
+            return Ok(());
+        }
+        let mut line = format!("clientedit clid={clid}");
+        if let Some(v) = input_muted {
+            line.push_str(&format!(
+                " CLIENT_INPUT_MUTED={}",
+                if v { 1 } else { 0 }
+            ));
+        }
+        if let Some(v) = output_muted {
+            line.push_str(&format!(
+                " CLIENT_OUTPUT_MUTED={}",
+                if v { 1 } else { 0 }
+            ));
+        }
+        self.run_scoped(sid, &line).await?;
+        Ok(())
+    }
+
+    async fn banadd(&self, sid: i64, params: &BanAddParams<'_>) -> ControlResult<i64> {
+        let mut line = String::from("banadd");
+        if let Some(v) = params.ip {
+            line.push_str(&format!(" ip={}", escape(v)));
+        }
+        if let Some(v) = params.uid {
+            line.push_str(&format!(" uid={}", escape(v)));
+        }
+        if let Some(v) = params.mytsid {
+            line.push_str(&format!(" mytsid={}", escape(v)));
+        }
+        if let Some(v) = params.name {
+            line.push_str(&format!(" name={}", escape(v)));
+        }
+        if let Some(v) = params.banreason {
+            line.push_str(&format!(" banreason={}", escape(v)));
+        }
+        if let Some(t) = params.time {
+            line.push_str(&format!(" time={t}"));
+        }
+        let outcome = self.run_scoped(sid, &line).await?;
+        // `banadd` returns a single record `banid=<id>`.
+        let mut records = Self::collect_records(&outcome.body_lines);
+        if records.is_empty() {
+            return Err(ControlBackendError::InvalidResponse(
+                "banadd returned no body record".into(),
+            ));
+        }
+        let r = records.remove(0);
+        let raw = r.get("banid").ok_or_else(|| {
+            ControlBackendError::InvalidResponse("banadd response missing banid field".into())
+        })?;
+        raw.parse::<i64>().map_err(|e| {
+            ControlBackendError::InvalidResponse(format!(
+                "banadd returned non-integer banid={raw:?}: {e}"
+            ))
+        })
+    }
+
+    async fn bandel(&self, sid: i64, banid: i64) -> ControlResult<()> {
+        let line = format!("bandel banid={banid}");
+        self.run_scoped(sid, &line).await?;
+        Ok(())
+    }
+
     fn ssh_transport(&self) -> Option<TransportHandle> {
         Some(self.transport.clone())
     }
+}
+
+/// Render `flags` into the `-foo -bar` suffix used by ServerQuery
+/// commands on the SSH wire (e.g. `clientlist -uid -away`). Empty
+/// `flags` returns an empty string so callers can append unconditionally.
+///
+/// Unlike WebQuery's URL form (`/clientlist-uid-away`), the SSH line
+/// protocol expects flags as space-separated tokens, each prefixed with
+/// a single `-`. Stripping a leading `-` from caller-supplied flag names
+/// keeps both call sites uniform.
+fn append_flags(flags: &[&str]) -> String {
+    if flags.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    for flag in flags {
+        out.push(' ');
+        out.push('-');
+        out.push_str(flag.trim_start_matches('-'));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -452,6 +645,36 @@ mod tests {
             .await
             .expect("version() after forced disconnect should succeed once supervisor reconnects");
         assert!(!v_after.version.is_empty());
+    }
+
+    /// PURA-99 — flag suffix renders as space-separated `-foo` tokens
+    /// matching the SSH ServerQuery line-protocol form. Empty flags
+    /// must yield the empty string so callers can append unconditionally.
+    #[test]
+    fn append_flags_renders_space_separated_dash_tokens() {
+        assert_eq!(append_flags(&[]), "");
+        assert_eq!(append_flags(&["uid"]), " -uid");
+        assert_eq!(
+            append_flags(&["uid", "away", "voice"]),
+            " -uid -away -voice"
+        );
+        // Caller-supplied leading `-` is normalised so both styles work.
+        assert_eq!(append_flags(&["-uid", "away"]), " -uid -away");
+    }
+
+    /// PURA-99 — `banadd` parses `banid` out of the upstream's record.
+    /// The wire returns one record like `banid=42`; we lift it through
+    /// `collect_records` and parse the integer.
+    #[test]
+    fn banadd_parses_banid_from_response() {
+        // Simulate the body lines a real upstream sends back. We only
+        // need `collect_records` + `parse::<i64>` to wire through.
+        let body = vec!["banid=17".to_string()];
+        let mut records = SshControlClient::collect_records(&body);
+        assert_eq!(records.len(), 1);
+        let r = records.remove(0);
+        let raw = r.get("banid").unwrap();
+        assert_eq!(raw.parse::<i64>().unwrap(), 17);
     }
 
     #[test]

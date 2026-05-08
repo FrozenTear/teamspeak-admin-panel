@@ -23,19 +23,18 @@
 //!   `connection.controlPath` on first miss to instantiate the matching
 //!   client and stores it as `Arc<dyn ControlBackend>`.
 //!
-//! ## Why a parallel pool to [`crate::webquery::WebQueryPool`]
+//! ## Single source of truth for the control plane
 //!
-//! The Phase 2 write surface ([`crate::routes::control`]) still talks
-//! to a [`WebQueryClient`] directly — the SSH write commands land in a
-//! later child issue. Keeping `WebQueryPool` in place avoids changing
-//! those call sites in this slice; the new [`ControlBackendPool`] is
-//! consumed only by the dashboard handler. Once the SSH write surface
-//! lands, the write side migrates onto a richer trait and
-//! [`WebQueryPool`] retires.
+//! As of PURA-99 the [`crate::routes::control`] REST handlers also go
+//! through this trait — the per-server `controlPath` flag now decides
+//! whether kicks / moves / banadds dispatch over WebQuery HTTP or SSH
+//! ServerQuery, and the routes never see the concrete backend type.
+//! [`crate::webquery::WebQueryPool`] is retained alongside this pool
+//! purely for legacy widget cache paths; new code reaches for
+//! [`ControlBackendPool`].
 //!
 //! ## Out of scope
 //!
-//! - SSHBridge write methods (`clientmove`, `clientkick`, `banadd`, …).
 //! - Pool eviction on `PUT/DELETE /servers` — that work belongs to a
 //!   later refresh-on-edit child.
 //! - Bulk-fleet operations.
@@ -63,9 +62,10 @@ use crate::sshbridge::{
 use zeroize::Zeroizing;
 use crate::webquery::{
     models::{
-        ChannelEntry, ClientEntry, ConnectionInfo, ServerInfo, VersionInfo, VirtualServerEntry,
+        BanEntry, ChannelEntry, ClientDbEntry, ClientEntry, ClientInfo, ConnectionInfo, LogEntry,
+        ServerInfo, VersionInfo, VirtualServerEntry,
     },
-    WebQueryClient, WebQueryError,
+    BanAddParams, WebQueryClient, WebQueryError,
 };
 
 /// Errors returned by [`ControlBackend`] methods. Variants are
@@ -195,10 +195,14 @@ impl From<HostKeyConfigError> for ControlBackendError {
 
 pub type ControlResult<T> = Result<T, ControlBackendError>;
 
-/// The Phase 1 read-only ServerQuery surface. Both backends implement
-/// the same six methods; the dashboard handler is the only consumer in
-/// this slice. Trait is `dyn`-safe (object-safe) so the pool can hand
-/// out `Arc<dyn ControlBackend + Send + Sync>` without an enum dispatch.
+/// Backend-agnostic ServerQuery surface — read + write commands consumed
+/// by the dashboard tick, the `routes::control` REST handlers, and the
+/// widget data path. Both [`WebQueryClient`] and [`SshControlClient`]
+/// implement it; the per-server `controlPath` flag picks one at pool
+/// construction time.
+///
+/// Trait is `dyn`-safe (object-safe) so the pool can hand out
+/// `Arc<dyn ControlBackend + Send + Sync>` without an enum dispatch.
 #[async_trait]
 pub trait ControlBackend: Send + Sync + std::fmt::Debug {
     /// `version` — instance scope. Doubles as the cheap health probe
@@ -221,6 +225,81 @@ pub trait ControlBackend: Send + Sync + std::fmt::Debug {
 
     /// `serverrequestconnectioninfo` — virtual-server scope.
     async fn server_connection_info(&self, sid: i64) -> ControlResult<ConnectionInfo>;
+
+    /// `clientlist` with explicit projection flags (spec §7.8). Empty
+    /// `flags` requests the minimal projection.
+    async fn clientlist_with_flags(
+        &self,
+        sid: i64,
+        flags: &[&str],
+    ) -> ControlResult<Vec<ClientEntry>>;
+
+    /// `clientinfo` — full connection-bound projection for one live
+    /// client.
+    async fn clientinfo(&self, sid: i64, clid: i64) -> ControlResult<ClientInfo>;
+
+    /// `clientdbinfo` — persistent client-database row, regardless of
+    /// online status.
+    async fn clientdbinfo(&self, sid: i64, cldbid: i64) -> ControlResult<ClientDbEntry>;
+
+    /// `channellist` with explicit projection flags (spec §7.7).
+    async fn channellist_with_flags(
+        &self,
+        sid: i64,
+        flags: &[&str],
+    ) -> ControlResult<Vec<ChannelEntry>>;
+
+    /// `banlist` (sid scope). Empty banlists collapse to an empty `Vec`
+    /// rather than surfacing the upstream §10.6 1281 envelope.
+    async fn banlist(&self, sid: i64) -> ControlResult<Vec<BanEntry>>;
+
+    /// `logview` (sid scope). The first row carries `last_pos` /
+    /// `file_size`; subsequent rows only carry `l`.
+    async fn logview(
+        &self,
+        sid: i64,
+        lines: u32,
+        reverse: bool,
+        instance: bool,
+        begin_pos: Option<i64>,
+    ) -> ControlResult<Vec<LogEntry>>;
+
+    /// `clientkick` (sid scope). `reasonid` defaults to 5 (server kick)
+    /// per §7.8.
+    async fn clientkick(
+        &self,
+        sid: i64,
+        clid: i64,
+        reasonid: i64,
+        reasonmsg: Option<&str>,
+    ) -> ControlResult<()>;
+
+    /// `clientmove` (sid scope) — force-move a connected client to the
+    /// target channel. `cpw` is the optional channel password.
+    async fn clientmove(
+        &self,
+        sid: i64,
+        clid: i64,
+        cid: i64,
+        cpw: Option<&str>,
+    ) -> ControlResult<()>;
+
+    /// Convenience over `clientedit` — sets `CLIENT_INPUT_MUTED` /
+    /// `CLIENT_OUTPUT_MUTED`. `None` leaves the field unchanged. A
+    /// fully-`None` call is a no-op (no upstream round-trip).
+    async fn client_set_muted(
+        &self,
+        sid: i64,
+        clid: i64,
+        input_muted: Option<bool>,
+        output_muted: Option<bool>,
+    ) -> ControlResult<()>;
+
+    /// `banadd` — returns the new ban id.
+    async fn banadd(&self, sid: i64, params: &BanAddParams<'_>) -> ControlResult<i64>;
+
+    /// `bandel` — drop a single ban by id.
+    async fn bandel(&self, sid: i64, banid: i64) -> ControlResult<()>;
 
     /// Underlying SSH transport handle, if this backend is SSH-driven.
     /// `None` for WebQuery — that path has no `notify*` event surface.
@@ -262,6 +341,89 @@ impl ControlBackend for WebQueryClient {
 
     async fn server_connection_info(&self, sid: i64) -> ControlResult<ConnectionInfo> {
         self.server_connection_info(sid).await.map_err(Into::into)
+    }
+
+    async fn clientlist_with_flags(
+        &self,
+        sid: i64,
+        flags: &[&str],
+    ) -> ControlResult<Vec<ClientEntry>> {
+        self.clientlist_with_flags(sid, flags).await.map_err(Into::into)
+    }
+
+    async fn clientinfo(&self, sid: i64, clid: i64) -> ControlResult<ClientInfo> {
+        self.clientinfo(sid, clid).await.map_err(Into::into)
+    }
+
+    async fn clientdbinfo(&self, sid: i64, cldbid: i64) -> ControlResult<ClientDbEntry> {
+        self.clientdbinfo(sid, cldbid).await.map_err(Into::into)
+    }
+
+    async fn channellist_with_flags(
+        &self,
+        sid: i64,
+        flags: &[&str],
+    ) -> ControlResult<Vec<ChannelEntry>> {
+        self.channellist_with_flags(sid, flags).await.map_err(Into::into)
+    }
+
+    async fn banlist(&self, sid: i64) -> ControlResult<Vec<BanEntry>> {
+        self.banlist(sid).await.map_err(Into::into)
+    }
+
+    async fn logview(
+        &self,
+        sid: i64,
+        lines: u32,
+        reverse: bool,
+        instance: bool,
+        begin_pos: Option<i64>,
+    ) -> ControlResult<Vec<LogEntry>> {
+        self.logview(sid, lines, reverse, instance, begin_pos)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn clientkick(
+        &self,
+        sid: i64,
+        clid: i64,
+        reasonid: i64,
+        reasonmsg: Option<&str>,
+    ) -> ControlResult<()> {
+        self.clientkick(sid, clid, reasonid, reasonmsg)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn clientmove(
+        &self,
+        sid: i64,
+        clid: i64,
+        cid: i64,
+        cpw: Option<&str>,
+    ) -> ControlResult<()> {
+        self.clientmove(sid, clid, cid, cpw).await.map_err(Into::into)
+    }
+
+    async fn client_set_muted(
+        &self,
+        sid: i64,
+        clid: i64,
+        input_muted: Option<bool>,
+        output_muted: Option<bool>,
+    ) -> ControlResult<()> {
+        self.client_set_muted(sid, clid, input_muted, output_muted)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn banadd(&self, sid: i64, params: &BanAddParams<'_>) -> ControlResult<i64> {
+        self.banadd(sid, params).await.map_err(Into::into)
+    }
+
+    async fn bandel(&self, sid: i64, banid: i64) -> ControlResult<()> {
+        self.bandel(sid, banid).await.map_err(Into::into)
     }
 }
 

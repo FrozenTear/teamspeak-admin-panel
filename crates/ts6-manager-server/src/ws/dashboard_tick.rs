@@ -305,8 +305,10 @@ mod tests {
     use crate::db::{connect_in_memory, migrations};
     use crate::repos::server_connections::NewServerConnection;
     use crate::webquery::models::{
-        ChannelEntry, ClientEntry, ConnectionInfo, ServerInfo, VersionInfo, VirtualServerEntry,
+        BanEntry, ChannelEntry, ClientDbEntry, ClientEntry, ClientInfo, ConnectionInfo, LogEntry,
+        ServerInfo, VersionInfo, VirtualServerEntry,
     };
+    use crate::webquery::BanAddParams;
     use crate::ws::auth::{Principal, UserPrincipal};
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -395,6 +397,72 @@ mod tests {
                 connection_bandwidth_received_last_second_total: 10,
                 connection_bandwidth_sent_last_second_total: 20,
             })
+        }
+        async fn clientlist_with_flags(
+            &self,
+            _sid: i64,
+            _flags: &[&str],
+        ) -> ControlResult<Vec<ClientEntry>> {
+            unimplemented!("not used by dashboard fetch")
+        }
+        async fn clientinfo(&self, _sid: i64, _clid: i64) -> ControlResult<ClientInfo> {
+            unimplemented!("not used by dashboard fetch")
+        }
+        async fn clientdbinfo(&self, _sid: i64, _cldbid: i64) -> ControlResult<ClientDbEntry> {
+            unimplemented!("not used by dashboard fetch")
+        }
+        async fn channellist_with_flags(
+            &self,
+            _sid: i64,
+            _flags: &[&str],
+        ) -> ControlResult<Vec<ChannelEntry>> {
+            unimplemented!("not used by dashboard fetch")
+        }
+        async fn banlist(&self, _sid: i64) -> ControlResult<Vec<BanEntry>> {
+            unimplemented!("not used by dashboard fetch")
+        }
+        async fn logview(
+            &self,
+            _sid: i64,
+            _lines: u32,
+            _reverse: bool,
+            _instance: bool,
+            _begin_pos: Option<i64>,
+        ) -> ControlResult<Vec<LogEntry>> {
+            unimplemented!("not used by dashboard fetch")
+        }
+        async fn clientkick(
+            &self,
+            _sid: i64,
+            _clid: i64,
+            _reasonid: i64,
+            _reasonmsg: Option<&str>,
+        ) -> ControlResult<()> {
+            unimplemented!("not used by dashboard fetch")
+        }
+        async fn clientmove(
+            &self,
+            _sid: i64,
+            _clid: i64,
+            _cid: i64,
+            _cpw: Option<&str>,
+        ) -> ControlResult<()> {
+            unimplemented!("not used by dashboard fetch")
+        }
+        async fn client_set_muted(
+            &self,
+            _sid: i64,
+            _clid: i64,
+            _input_muted: Option<bool>,
+            _output_muted: Option<bool>,
+        ) -> ControlResult<()> {
+            unimplemented!("not used by dashboard fetch")
+        }
+        async fn banadd(&self, _sid: i64, _params: &BanAddParams<'_>) -> ControlResult<i64> {
+            unimplemented!("not used by dashboard fetch")
+        }
+        async fn bandel(&self, _sid: i64, _banid: i64) -> ControlResult<()> {
+            unimplemented!("not used by dashboard fetch")
         }
     }
 
