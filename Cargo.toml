@@ -62,6 +62,12 @@ url = "2"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
 surrealdb = { version = "3", default-features = false, features = ["kv-surrealkv", "kv-mem"] }
 
+# Phase 1 WEBQUERY (PURA-23) — outbound HTTP client to the per-server TS6
+# WebQuery API. `rustls-tls` (no native-tls/openssl). `json` for envelope
+# parsing. `default-features = false` keeps `reqwest` from pulling
+# `default-tls`/openssl on top of rustls.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

@@ -6321,6 +6321,7 @@ dependencies = [
  "js-sys",
  "jsonwebtoken 9.3.1",
  "rand 0.8.6",
+ "reqwest",
  "scrypt",
  "serde",
  "serde_json",
@@ -6342,6 +6343,7 @@ dependencies = [
 name = "ts6-manager-shared"
 version = "0.0.1"
 dependencies = [
+ "chrono",
  "serde",
  "serde_json",
 ]

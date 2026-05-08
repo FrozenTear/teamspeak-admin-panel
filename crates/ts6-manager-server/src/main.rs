@@ -29,6 +29,8 @@ mod ssrf;
 mod ui;
 #[cfg(feature = "server")]
 mod web;
+#[cfg(feature = "server")]
+mod webquery;
 
 #[cfg(feature = "web")]
 fn main() {
@@ -45,7 +47,7 @@ mod server_entry {
     use ts6_manager_shared::health::{Health, HealthStatus};
 
     use crate::config::Config;
-    use crate::{app_state, auth, db, logging, ui, web};
+    use crate::{app_state, auth, db, logging, ui, web, webquery};
 
     async fn health() -> Json<Health> {
         Json(Health {
@@ -125,7 +127,12 @@ mod server_entry {
         // once with state baked in so they compose as `Router<()>` with the
         // rest of the app.
         let auth_router = auth::routes::router(rate_limit_state).with_state(state.clone());
-        let ws_router = auth::routes::ws_router().with_state(state);
+        let ws_router = auth::routes::ws_router().with_state(state.clone());
+        // PURA-23 — Phase 1 dashboard route. Lives at an absolute path under
+        // `/api/servers/:configId/vs/:sid/dashboard` (spec §7.19); the rest of
+        // the `/api/servers/...` surface is owned by SecurityEngineer's
+        // PURA-22 routes.
+        let dashboard_router = webquery::dashboard::router().with_state(state);
 
         // PURA-17: `serve_dioxus_application` registers static assets +
         // server functions and adds a fallback that serves the dx-CLI
@@ -140,6 +147,9 @@ mod server_entry {
             // Per-message fan-out (TS events, bot logs, voice/video status —
             // spec §8.4) is owned by the future REST/Realtime engineer.
             .merge(ws_router)
+            // PURA-23 dashboard route (spec §7.19). The handler enforces JWT
+            // auth itself via the `RequireAuth` extractor.
+            .merge(dashboard_router)
             .serve_dioxus_application(serve_cfg, ui::App)
             .layer(web::cors_layer(&cfg.frontend_url));
         let router = web::security_headers_stack(cfg.node_env).apply(router);

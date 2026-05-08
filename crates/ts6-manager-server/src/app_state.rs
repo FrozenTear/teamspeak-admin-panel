@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use crate::config::Config;
 use crate::db::Database;
+use crate::webquery::WebQueryPool;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -19,6 +20,10 @@ pub struct AppState {
     pub jwt_secret: Arc<Vec<u8>>,
     pub jwt_access_expiry: Duration,
     pub jwt_refresh_expiry: Duration,
+    /// PURA-23: pool of WebQuery clients keyed by `server_connection.id`.
+    /// Phase 1 fills lazily on first dashboard hit; Phase 2 will pre-populate
+    /// on boot and run the §10.7 30s health probe.
+    pub webquery: WebQueryPool,
 }
 
 impl AppState {
@@ -28,6 +33,7 @@ impl AppState {
             jwt_secret: Arc::new(cfg.jwt_secret.as_bytes().to_vec()),
             jwt_access_expiry: cfg.jwt_access_expiry,
             jwt_refresh_expiry: cfg.jwt_refresh_expiry,
+            webquery: WebQueryPool::new(cfg.ts_allow_self_signed),
         }
     }
 }

@@ -236,6 +236,7 @@ mod tests {
             jwt_secret: Arc::new(b"test-secret-bytes-please-32-or-more-bytes".to_vec()),
             jwt_access_expiry: Duration::from_secs(900),
             jwt_refresh_expiry: Duration::from_secs(7 * 24 * 3600),
+            webquery: crate::webquery::WebQueryPool::new(false),
         }
     }
 

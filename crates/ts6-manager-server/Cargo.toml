@@ -46,6 +46,7 @@ server = [
     "dep:tower-http",
     "dep:url",
     "dep:surrealdb",
+    "dep:reqwest",
 ]
 web = ["dioxus/web"]
 
@@ -92,6 +93,9 @@ url = { workspace = true, optional = true }
 
 # Phase 1 DATA (PURA-10) — server-only.
 surrealdb = { workspace = true, optional = true }
+
+# Phase 1 WEBQUERY (PURA-23) — outbound HTTP client. Server-only.
+reqwest = { workspace = true, optional = true }
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }

@@ -11,6 +11,8 @@
 #![deny(missing_debug_implementations)]
 
 pub mod auth;
+pub mod dashboard;
 pub mod health;
 
+pub use dashboard::{BandwidthSnapshot, DashboardData};
 pub use health::Health;
