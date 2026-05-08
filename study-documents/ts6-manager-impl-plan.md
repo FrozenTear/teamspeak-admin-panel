@@ -15,21 +15,22 @@ These were resolved before drafting; the rest of the plan flows from them.
 | D3 | Backend language | **Rust** | User input |
 | D4 | Frontend | **Dioxus + fullstack server functions** | User input — shared types between client and server |
 | D5 | Voice protocol path | **Fork `tsproto` / `tsclientlib`, port the TS6 handshake delta from the spec** | TS6 servers are wire-compatible with TS3 clients on most of the stack (UDP framing, Opus voice, command channel). The handshake / shared-secret derivation changed (see `Splamy/TS3AudioBot#1078`). Forking buys ~70% of the Chapter 19 work for free; the delta is implemented from the spec only. Cleanroom-safe: tsproto is independent of the reference system. |
-| D6 | Video transport | **MoQ over WebTransport + WebCodecs** instead of WebRTC | Conscious deviation from spec Chapter 24's external contract. Better fit for one-to-many public viewers; Chapter 24's HTTP control plane is redesigned around MoQ. Cost: custom WebCodecs playback in Dioxus, possible older-iOS gap. |
+| D6 | Video transport | **MoQ over WebTransport + WebCodecs** instead of WebRTC | Conscious deviation from spec Chapter 24's external contract — see `ts6-manager-impl-deviations.md` (D6). |
 | D7 | Optional cache | Same as spec — optional Valkey/Redis, graceful degradation | No reason to deviate |
-| D8 | Database | **SurrealDB v3** (board-ratified deviation 2026-05-07; supersedes original SQLite + sqlx choice)[^d8] | Spec's JSON wire-type keys map verbatim to SurrealDB field names; operator backups become SurrealDB exports rather than SQLite files |
+| D8 | Database | **SurrealDB v3** (board-ratified 2026-05-07; supersedes original SQLite + sqlx choice)[^d8] | JSON wire-type keys map verbatim to SurrealDB field names — see `ts6-manager-impl-deviations.md` (D8). |
 
-[^d8]: Original D8 was SQLite + `sqlx` because the spec's column names appear in JSON wire types and operator backups (so the schema is part of the external contract). The board ratified the SurrealDB v3 swap on 2026-05-07: the JSON wire-format keys are still preserved verbatim by mapping them to SurrealDB record field names, but operator backups become SurrealDB exports — that *is* a deviation from the spec's external contract, accepted explicitly. Embedded vs. server topology is RustPlatform's call in the first DATA PR.
+[^d8]: Full entry — including external-contract impact and cleanroom-preserved surfaces — lives in `ts6-manager-impl-deviations.md` (D8). Locked: do NOT re-open here.
 
 ### Cleanroom rules in force
 
 - **External contracts are preserved verbatim**: HTTP route paths, query parameters, env var names, default ports, on-disk paths, JSON keys (including those that mirror DB columns), TS ServerQuery command/event names, music-bot chat tokens, flow JSON tag strings, widget tokens.
 - **Internal source-code identifiers are NOT preserved**: file/module/function/class/type names from the reference system are unknown to us and stay unknown. We invent our own.
-- **Two intentional deviations from the spec's external contract** (allowed; documented):
-  - **Video sidecar HTTP API (Chapter 24)** is replaced with a MoQ control plane. Public widget HTML embeds a MoQ player rather than a WebRTC peer.
-  - **Backend process model (Chapter 2)** collapses the spec's separate static-front-end container into the Dioxus fullstack server. The spec's three-process topology becomes two processes (fullstack server + media sidecar) plus DB + optional cache.
+- **Conscious deviations from the spec's external contract** (allowed; documented). Each one has an entry — including external-contract impact and what stays preserved verbatim — in `ts6-manager-impl-deviations.md`:
+  - **D6** — Video sidecar transport (Chapter 24): MoQ over WebTransport + WebCodecs replaces WebRTC.
+  - **D8** — Database (Chapter 4 / §2.4): SurrealDB v3 replaces SQLite + `sqlx` (board-ratified 2026-05-07).
+  - **D-PROC** — Process model (Chapter 2): the spec's three-process topology collapses into Dioxus fullstack server + media sidecar.
 
-Both deviations are flagged in the source repo's README so future maintainers understand they are choices, not bugs.
+New deviations get appended to that register, not added to this list. The deviations are flagged in the source repo's README so future maintainers understand they are choices, not bugs.
 
 ---
 
