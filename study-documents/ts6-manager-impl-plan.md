@@ -397,6 +397,8 @@ Host volumes mounted into the pod:
 
 Rootless Podman is the default. Volumes use host paths owned by the operator's user. The SurrealDB store + the music directory live on the host and survive `podman pod rm`. If an operator switches to an external SurrealDB server (`DATABASE_URL=ws://…`), the `./data/db` host volume is unused and the SurrealDB container or external host owns its own storage.
 
+> **Dev-compose deviation ([PURA-67](/PURA/issues/PURA-67)).** `podman-compose.yml` uses **named podman volumes** (`ts6-db`, `ts6-music`) instead of `./data/*` host bind-mounts. Reason: under rootless podman the container's `ts6` uid (10001) maps through `/etc/subuid` to a shifted host uid that doesn't own the operator's `./data/*` directory, so SurrealKV fails to open the store with `Permission denied`. Named volumes let podman manage ownership across the userns boundary. The Quadlet / `podman kube play` shapes here still describe the host-bind layout above; the OPS workstream decides whether to keep host binds with `:U` or move to named volumes when those land.
+
 ### Notes for OPS workstream
 
 - Generate Quadlet units via `podman generate systemd` once a known-good `podman pod create` recipe is locked.

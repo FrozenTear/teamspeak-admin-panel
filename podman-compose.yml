@@ -20,7 +20,14 @@ services:
       FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
       DATABASE_URL: surrealkv:///var/lib/ts6-manager/db
       MUSIC_DIR: /var/lib/ts6-manager/music
+    # Named volumes, not host bind-mounts: under rootless podman the in-container
+    # uid 10001 maps to a shifted host subuid that doesn't own ./data/*, so
+    # SurrealKV can't open the store. Named volumes let podman own the chown.
     volumes:
-      - ./data/db:/var/lib/ts6-manager/db:Z
-      - ./data/music:/var/lib/ts6-manager/music:Z
+      - ts6-db:/var/lib/ts6-manager/db:Z
+      - ts6-music:/var/lib/ts6-manager/music:Z
     restart: unless-stopped
+
+volumes:
+  ts6-db:
+  ts6-music:
