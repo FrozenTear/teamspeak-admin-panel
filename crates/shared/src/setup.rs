@@ -39,6 +39,15 @@ pub struct SetupInitRequest {
 /// First-server fields supplied as part of the wizard. Mirrors the
 /// `POST /api/servers` body but lives here so the wizard can be served
 /// before any auth context exists.
+///
+/// PURA-99 added `controlPath` / `sshAuthMethod` / `sshHostKeyFingerprint`
+/// to the request side so the wizard can pick the SSH backend at first
+/// run. The response surface ([`SetupInitResponse::server`] →
+/// [`crate::servers::ServerSummary`]) intentionally still omits these
+/// fields — the D-SSH-AUTH redaction gate from PURA-77 stays intact.
+/// `sshPrivateKey` / `sshKeyAgentSocket` are NOT exposed on the wire
+/// here either; key-based SSH still requires a direct DB edit pending
+/// SecurityEngineer sign-off on the public surface.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetupInitServer {
@@ -50,6 +59,21 @@ pub struct SetupInitServer {
     pub ssh_port: Option<i64>,
     pub ssh_username: Option<String>,
     pub ssh_password: Option<String>,
+    /// `"webquery"` (default) or `"ssh"`. Picks the
+    /// [`crate::servers::ServerSummary`] backend lazily through
+    /// `ControlBackendPool` (PURA-78 / PURA-99).
+    #[serde(default)]
+    pub control_path: Option<String>,
+    /// `"password"` (default), `"key"`, or `"agent"`. Only consulted
+    /// when `controlPath == "ssh"`.
+    #[serde(default)]
+    pub ssh_auth_method: Option<String>,
+    /// SHA-256 host-key fingerprint pinned by the operator. The
+    /// SSH bridge refuses to connect when this is null and
+    /// `TS_SSH_KNOWN_HOSTS` is also unset — fail-closed posture per
+    /// PURA-76.
+    #[serde(default)]
+    pub ssh_host_key_fingerprint: Option<String>,
 }
 
 /// `POST /api/setup/init` success body (HTTP 201). Returns the freshly
@@ -89,6 +113,9 @@ mod tests {
                 ssh_port: Some(10022),
                 ssh_username: Some("serveradmin".into()),
                 ssh_password: Some("hunter2".into()),
+                control_path: None,
+                ssh_auth_method: None,
+                ssh_host_key_fingerprint: None,
             },
         };
         let json = serde_json::to_string(&req).unwrap();

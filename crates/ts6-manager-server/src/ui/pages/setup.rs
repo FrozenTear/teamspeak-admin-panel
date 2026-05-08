@@ -341,6 +341,9 @@ fn build_request(
             ssh_port: None,
             ssh_username: None,
             ssh_password: None,
+            control_path: None,
+            ssh_auth_method: None,
+            ssh_host_key_fingerprint: None,
         },
     }
 }

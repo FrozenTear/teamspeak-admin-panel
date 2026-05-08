@@ -152,6 +152,14 @@ async fn init(
         role: "admin".into(),
         enabled: true,
     };
+    // PURA-99 — accept `controlPath` / `sshAuthMethod` /
+    // `sshHostKeyFingerprint` from the wizard so a fresh deployment can
+    // pick the SSH backend at first run. Empty strings are coerced to
+    // `None` so the schema's `DEFAULT` clause kicks in (matches how
+    // `sshUsername` / `sshPassword` already behave). `sshPrivateKey`
+    // and `sshKeyAgentSocket` remain unexposed on the public surface
+    // pending SecurityEngineer sign-off; the cleanroom path for those
+    // is still a direct DB edit on the `server_connection` row.
     let new_server = NewServerConnection {
         name: req.server.name,
         host: req.server.host,
@@ -169,11 +177,15 @@ async fn init(
         queryBotNickname: None,
         sshBotNickname: None,
         enabled: true,
-        controlPath: None,
-        sshAuthMethod: None,
+        controlPath: req.server.control_path.clone().filter(|s| !s.is_empty()),
+        sshAuthMethod: req.server.ssh_auth_method.clone().filter(|s| !s.is_empty()),
         sshPrivateKey: None,
         sshKeyAgentSocket: None,
-        sshHostKeyFingerprint: None,
+        sshHostKeyFingerprint: req
+            .server
+            .ssh_host_key_fingerprint
+            .clone()
+            .filter(|s| !s.is_empty()),
     };
 
     let (user_row, server_row) =
@@ -278,6 +290,9 @@ mod tests {
                 ssh_port: Some(10022),
                 ssh_username: Some("serveradmin".into()),
                 ssh_password: Some("ssh-secret-pw".into()),
+                control_path: None,
+                ssh_auth_method: None,
+                ssh_host_key_fingerprint: None,
             },
         }
     }
@@ -511,6 +526,64 @@ mod tests {
             err.error.starts_with("Password must"),
             "spec §6.2.2 mandates a per-rule message; got {:?}",
             err.error
+        );
+    }
+
+    /// PURA-99 — wizard `controlPath: "ssh"` persists onto the row, and
+    /// the response surface stays redacted (D-SSH-AUTH gate from
+    /// PURA-77 still applies). End-to-end coverage of the
+    /// shared::setup → routes::setup → repos::setup → DB chain so a
+    /// future regression on any one of those layers fails this test.
+    #[tokio::test]
+    async fn wizard_persists_control_path_ssh_and_keeps_response_redacted() {
+        let state = fresh_state().await;
+        let app = app(state.clone());
+
+        let mut body = valid_init_body();
+        body.server.control_path = Some("ssh".into());
+        body.server.ssh_auth_method = Some("password".into());
+        body.server.ssh_host_key_fingerprint = Some(
+            "SHA256:0123456789abcdef0123456789abcdef0123456789abcdef0".into(),
+        );
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/setup/init")
+                    .header("content-type", "application/json")
+                    .body(json_body(&body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // Response must NOT leak D-SSH-AUTH fields — PURA-77 redaction
+        // gate is still in force on the response surface.
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let raw = String::from_utf8(bytes.to_vec()).unwrap();
+        for forbidden in [
+            "controlPath",
+            "sshAuthMethod",
+            "sshPrivateKey",
+            "sshKeyAgentSocket",
+            "sshHostKeyFingerprint",
+        ] {
+            assert!(
+                !raw.contains(forbidden),
+                "D-SSH-AUTH field `{forbidden}` leaked to /api/setup/init: {raw}"
+            );
+        }
+
+        // DB-side: the row must carry the wizard-supplied values.
+        let rows = server_connections::list(&state.db).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].controlPath, "ssh");
+        assert_eq!(rows[0].sshAuthMethod, "password");
+        assert_eq!(
+            rows[0].sshHostKeyFingerprint.as_deref(),
+            Some("SHA256:0123456789abcdef0123456789abcdef0123456789abcdef0")
         );
     }
 }

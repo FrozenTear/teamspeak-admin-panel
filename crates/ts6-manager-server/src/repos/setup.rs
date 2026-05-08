@@ -44,6 +44,23 @@ pub async fn init_admin_and_first_server(
     // memory). Bindings are query-scoped; the `u_` / `s_` prefixes keep
     // the user/server fields disjoint where their names overlap (e.g.
     // both records have an `enabled` field).
+    // PURA-99 — bind the D-SSH-AUTH columns (`controlPath`,
+    // `sshAuthMethod`, `sshPrivateKey`, `sshKeyAgentSocket`,
+    // `sshHostKeyFingerprint`) so a wizard-supplied
+    // `controlPath: "ssh"` actually lands on the row. Before this fix
+    // these fields fell through to the migration's `DEFAULT` clause,
+    // forcing every fresh deployment onto WebQuery regardless of what
+    // the wizard sent. `controlPath` and `sshAuthMethod` are non-option
+    // strings on the schema; like `repos::server_connections::insert`
+    // we coerce `None` to the canonical defaults so the bind value is
+    // always concrete.
+    let s_control_path = new_server
+        .controlPath
+        .unwrap_or_else(|| super::server_connections::DEFAULT_CONTROL_PATH.to_string());
+    let s_ssh_auth_method = new_server
+        .sshAuthMethod
+        .unwrap_or_else(|| super::server_connections::DEFAULT_SSH_AUTH_METHOD.to_string());
+
     let sql = format!(
         "BEGIN TRANSACTION;
          CREATE type::record('user', sequence::nextval('user_id'))
@@ -68,7 +85,12 @@ pub async fn init_admin_and_first_server(
                  queryBotChannel: $s_queryBotChannel,
                  queryBotNickname: $s_queryBotNickname,
                  sshBotNickname: $s_sshBotNickname,
-                 enabled: $s_enabled
+                 enabled: $s_enabled,
+                 controlPath: $s_controlPath,
+                 sshAuthMethod: $s_sshAuthMethod,
+                 sshPrivateKey: $s_sshPrivateKey,
+                 sshKeyAgentSocket: $s_sshKeyAgentSocket,
+                 sshHostKeyFingerprint: $s_sshHostKeyFingerprint
              }}
              RETURN {SERVER_PROJECTION};
          COMMIT TRANSACTION;",
@@ -95,6 +117,11 @@ pub async fn init_admin_and_first_server(
         .bind(("s_queryBotNickname", new_server.queryBotNickname))
         .bind(("s_sshBotNickname", new_server.sshBotNickname))
         .bind(("s_enabled", new_server.enabled))
+        .bind(("s_controlPath", s_control_path))
+        .bind(("s_sshAuthMethod", s_ssh_auth_method))
+        .bind(("s_sshPrivateKey", new_server.sshPrivateKey))
+        .bind(("s_sshKeyAgentSocket", new_server.sshKeyAgentSocket))
+        .bind(("s_sshHostKeyFingerprint", new_server.sshHostKeyFingerprint))
         .await
         .context("setup: transactional init query failed")?
         .check()
@@ -120,9 +147,12 @@ pub async fn init_admin_and_first_server(
 
 // `SERVER_PROJECTION` is re-exported from `repos::server_connections` so the
 // transactional `RETURN` below stays in lock-step with normal reads — PURA-77
-// drifted this projection silently and PURA-98 had to fix it after the fact.
-// `USER_PROJECTION` stays inline because the user table has no equivalent
-// drift history; if it grows D-* fields, mirror the server-side approach.
+// drifted this projection silently, PURA-98 fixed the read-side drift, and
+// PURA-99 closed the matching write-side drift (binding controlPath /
+// sshAuthMethod / sshPrivateKey / sshKeyAgentSocket / sshHostKeyFingerprint
+// into the CREATE). `USER_PROJECTION` stays inline because the user table has
+// no equivalent drift history; if it grows D-* fields, mirror the server-side
+// approach.
 const USER_PROJECTION: &str = "
     record::id(id) AS id,
     username,
@@ -204,6 +234,91 @@ mod tests {
         let servers = server_connections::list(&db).await.unwrap();
         assert_eq!(users.len(), 1);
         assert_eq!(servers.len(), 1);
+    }
+
+    /// PURA-99 regression — `controlPath` supplied to the wizard MUST
+    /// land on the row. Before this fix the `CREATE` statement omitted
+    /// the binding entirely, so a wizard-supplied `'ssh'` silently fell
+    /// through to the migration's `DEFAULT 'webquery'` clause and the
+    /// REST control plane forced every fresh deployment onto WebQuery
+    /// regardless of operator intent.
+    #[tokio::test]
+    async fn control_path_round_trip() {
+        let db = connect_in_memory().await.unwrap();
+        migrations::run(&db).await.unwrap();
+        let mut new_server = server_input("Primary", "ts.example.com");
+        new_server.controlPath = Some("ssh".into());
+        let (_, server) = init_admin_and_first_server(&db, user_input("admin"), new_server)
+            .await
+            .unwrap();
+        assert_eq!(server.controlPath, "ssh");
+
+        // Read back through `find_by_id` to prove the projection and
+        // the binding agree — drift on either side fails the test.
+        let stored = server_connections::find_by_id(&db, server.id)
+            .await
+            .unwrap()
+            .expect("server row must be readable after init");
+        assert_eq!(stored.controlPath, "ssh");
+    }
+
+    /// PURA-99 regression — same drift surface, distinct field. Lets us
+    /// catch single-column omissions if the next D-* deviation only
+    /// touches one of the two strings.
+    #[tokio::test]
+    async fn ssh_auth_method_round_trip() {
+        let db = connect_in_memory().await.unwrap();
+        migrations::run(&db).await.unwrap();
+        let mut new_server = server_input("Primary", "ts.example.com");
+        new_server.controlPath = Some("ssh".into());
+        new_server.sshAuthMethod = Some("key".into());
+        new_server.sshPrivateKey = Some("enc:ignored:sshkey".into());
+        new_server.sshHostKeyFingerprint = Some("SHA256:examplebase64".into());
+        let (_, server) = init_admin_and_first_server(&db, user_input("admin"), new_server)
+            .await
+            .unwrap();
+        assert_eq!(server.controlPath, "ssh");
+        assert_eq!(server.sshAuthMethod, "key");
+        assert_eq!(
+            server.sshPrivateKey.as_deref(),
+            Some("enc:ignored:sshkey")
+        );
+        assert_eq!(
+            server.sshHostKeyFingerprint.as_deref(),
+            Some("SHA256:examplebase64")
+        );
+
+        let stored = server_connections::find_by_id(&db, server.id)
+            .await
+            .unwrap()
+            .expect("server row must be readable after init");
+        assert_eq!(stored.sshAuthMethod, "key");
+        assert_eq!(
+            stored.sshPrivateKey.as_deref(),
+            Some("enc:ignored:sshkey")
+        );
+    }
+
+    /// PURA-99 — when the wizard omits the new fields the row falls
+    /// back to the migration's `DEFAULT` clause. Pins the existing
+    /// behaviour so we don't accidentally start producing
+    /// `controlPath = NULL` on the row.
+    #[tokio::test]
+    async fn omitted_d_ssh_auth_fields_use_defaults() {
+        let db = connect_in_memory().await.unwrap();
+        migrations::run(&db).await.unwrap();
+        let (_, server) = init_admin_and_first_server(
+            &db,
+            user_input("admin"),
+            server_input("Primary", "ts.example.com"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(server.controlPath, "webquery");
+        assert_eq!(server.sshAuthMethod, "password");
+        assert!(server.sshPrivateKey.is_none());
+        assert!(server.sshKeyAgentSocket.is_none());
+        assert!(server.sshHostKeyFingerprint.is_none());
     }
 
     #[tokio::test]
