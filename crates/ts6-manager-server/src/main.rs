@@ -111,10 +111,20 @@ mod server_entry {
         let serve_cfg = ServeConfig::new();
         let state = app_state::AppState::from_config(&cfg, database.clone());
 
-        // Phase 1 SECURITY (slice 3 + 4a): build the stateful sub-routers
+        // Phase 1 SECURITY (slice 4b): per-IP rate limit on the auth
+        // surface. One bucket shared across `/login` and `/refresh` per
+        // spec §6.8; `trusted_proxy_hops` decides whether the limiter
+        // keys by ConnectInfo (direct listener) or by the rightmost XFF
+        // entry (single trusted proxy in front).
+        let rate_limit_state = web::rate_limit::RateLimitState {
+            limiter: web::rate_limit::make_auth_limiter(),
+            trusted_hops: cfg.trusted_proxy_hops,
+        };
+
+        // Phase 1 SECURITY (slice 3 + 4a + 4b): build the stateful sub-routers
         // once with state baked in so they compose as `Router<()>` with the
         // rest of the app.
-        let auth_router = auth::routes::router().with_state(state.clone());
+        let auth_router = auth::routes::router(rate_limit_state).with_state(state.clone());
         let ws_router = auth::routes::ws_router().with_state(state);
 
         // PURA-17: `serve_dioxus_application` registers static assets +
@@ -131,16 +141,27 @@ mod server_entry {
             // spec §8.4) is owned by the future REST/Realtime engineer.
             .merge(ws_router)
             .serve_dioxus_application(serve_cfg, ui::App)
-            // CORS + security headers apply globally. Per-route rate-limit
-            // middleware will wrap login/refresh paths in the next slice.
             .layer(web::cors_layer(&cfg.frontend_url));
         let router = web::security_headers_stack(cfg.node_env).apply(router);
 
         let addr: SocketAddr = format!("0.0.0.0:{}", cfg.port).parse()?;
-        tracing::info!(%addr, "ts6-manager-server listening");
+        tracing::info!(
+            %addr,
+            trusted_proxy_hops = cfg.trusted_proxy_hops,
+            "ts6-manager-server listening"
+        );
 
+        // `into_make_service_with_connect_info::<SocketAddr>()` makes the
+        // peer socket address available via `ConnectInfo<SocketAddr>` — the
+        // rate-limit middleware uses it as the per-IP bucket key when
+        // `TRUSTED_PROXY_HOPS=0`, and as the fallback when XFF is missing
+        // / malformed at higher hop counts.
         let listener = tokio::net::TcpListener::bind(addr).await?;
-        axum::serve(listener, router).await?;
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await?;
         Ok(())
     }
 }

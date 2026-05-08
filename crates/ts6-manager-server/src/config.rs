@@ -70,6 +70,13 @@ pub struct Config {
     pub ts_allow_self_signed: bool,
     pub log_level: String,
     pub log_pretty: Option<bool>,
+    /// Number of trusted reverse-proxy hops in front of the listener
+    /// (spec §6.8). `0` means the listener is exposed directly and
+    /// `X-Forwarded-For` is ignored. `1` means a single trusted proxy
+    /// rewrote/appended the client IP and the rate limiter trusts the
+    /// rightmost XFF entry. Larger values are accepted but discouraged
+    /// (spec mandates "exactly one proxy hop").
+    pub trusted_proxy_hops: u8,
 }
 
 impl Config {
@@ -118,6 +125,8 @@ impl Config {
         let log_level = env_or("LOG_LEVEL", DEFAULT_LOG_LEVEL);
         let log_pretty = optional_env("LOG_PRETTY").map(|raw| matches!(raw.as_str(), "1" | "true"));
 
+        let trusted_proxy_hops = parse_env_u8("TRUSTED_PROXY_HOPS", 0)?;
+
         Ok(Self {
             node_env,
             port,
@@ -137,6 +146,7 @@ impl Config {
             ts_allow_self_signed,
             log_level,
             log_pretty,
+            trusted_proxy_hops,
         })
     }
 
@@ -197,6 +207,15 @@ fn parse_env_u16(key: &str, default: u16) -> Result<u16> {
         Ok(v) if !v.is_empty() => v
             .parse()
             .with_context(|| format!("env var {key} is not a valid u16: {v}")),
+        _ => Ok(default),
+    }
+}
+
+fn parse_env_u8(key: &str, default: u8) -> Result<u8> {
+    match env::var(key) {
+        Ok(v) if !v.is_empty() => v
+            .parse()
+            .with_context(|| format!("env var {key} is not a valid u8: {v}")),
         _ => Ok(default),
     }
 }

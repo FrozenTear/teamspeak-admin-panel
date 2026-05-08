@@ -35,6 +35,7 @@ server = [
     "dep:argon2",
     "dep:async-trait",
     "dep:bcrypt",
+    "dep:governor",
     "dep:hex",
     "dep:hickory-resolver",
     "dep:jsonwebtoken",
@@ -78,6 +79,7 @@ aes-gcm = { workspace = true, optional = true }
 argon2 = { workspace = true, optional = true }
 async-trait = { workspace = true, optional = true }
 bcrypt = { workspace = true, optional = true }
+governor = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
 hickory-resolver = { workspace = true, optional = true }
 jsonwebtoken = { workspace = true, optional = true }

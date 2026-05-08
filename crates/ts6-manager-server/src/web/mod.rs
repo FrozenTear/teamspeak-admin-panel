@@ -1,15 +1,20 @@
-//! Spec §6.9 / §6.10 — HTTP-layer hardening: CORS, security headers.
+//! HTTP-layer hardening for the axum listener.
 //!
-//! Phase 1 SECURITY slice 1.5: this module ships [`cors`] and [`headers`]
-//! middleware. Slice 2 will add [`rate_limit`] (login/refresh/setup/webhook
-//! windows per §6.8) and [`proxy`] (single-hop X-Forwarded-For parser per
-//! §6.8 last paragraph) once the auth REST surface lands and we have real
-//! handlers to gate.
+//! Phase 1 SECURITY:
+//!
+//! - [`cors`] — spec §6.10 `Access-Control-Allow-Origin` allowlist driven
+//!   by `FRONTEND_URL`.
+//! - [`headers`] — spec §6.9 sensible default security headers.
+//! - [`proxy`] — spec §6.8 single-hop `X-Forwarded-For` trust policy.
+//! - [`rate_limit`] — spec §6.8 per-IP bucket on `/api/auth/login` and
+//!   `/api/auth/refresh`.
 
 #![allow(dead_code)] // consumed by main.rs; re-exports for future workstreams
 
 pub mod cors;
 pub mod headers;
+pub mod proxy;
+pub mod rate_limit;
 
 pub use cors::cors_layer;
 #[allow(unused_imports)] // SecurityHeadersStack re-exported for future composers

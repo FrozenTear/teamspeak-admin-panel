@@ -6,12 +6,14 @@
 //!
 //! Per-route notes:
 //! - `POST /api/auth/login` — verify password, mint access JWT, issue first
-//!   refresh token in a fresh family. **Login rate-limit is NOT applied here
-//!   yet** (spec §6.8 — added in the rate-limit slice once `tower_governor`
-//!   wiring lands).
+//!   refresh token in a fresh family. Per-IP rate limit (15 reqs / 15 min,
+//!   spec §6.8) is layered on by the caller of [`router`] via
+//!   [`crate::web::rate_limit`].
 //! - `POST /api/auth/refresh` — rotate via `auth::refresh::rotate`. Reuse
 //!   detection (R5) is enforced inside that function; this handler just
-//!   maps `InvalidOrExpired` → 401 with the spec body.
+//!   maps `InvalidOrExpired` → 401 with the spec body. Shares the auth
+//!   rate-limit bucket with `/login` (single attacker can't side-step the
+//!   budget by alternating endpoints).
 //! - `POST /api/auth/logout` — delete the refresh token. No auth required;
 //!   the refresh token IS the credential. 204 regardless of whether a row
 //!   was deleted (idempotent per spec §6.5.5).
@@ -23,6 +25,7 @@ use axum::Json;
 use axum::Router;
 use axum::extract::State;
 use axum::http::StatusCode;
+use axum::middleware::from_fn_with_state;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use ts6_manager_shared::auth::{
@@ -34,13 +37,20 @@ use crate::app_state::AppState;
 use crate::auth::extractors::{AuthUser, RequireAuth};
 use crate::auth::{complexity, jwt, password, refresh};
 use crate::repos::{refresh_tokens, users};
+use crate::web::rate_limit::{RateLimitState, rate_limit_auth};
 
 /// Build the `/api/auth` sub-router. The caller nests it under `/api/auth`
 /// so the route paths in this module stay short.
-pub fn router() -> Router<AppState> {
+///
+/// `/login` and `/refresh` are wrapped in the spec §6.8 per-IP rate-limit
+/// middleware via the caller-supplied [`RateLimitState`]. `/logout`,
+/// `/me`, and `/password` are unrestricted (they are either credential-
+/// less or already JWT-gated).
+pub fn router(rate_limit: RateLimitState) -> Router<AppState> {
+    let rl_layer = from_fn_with_state(rate_limit, rate_limit_auth);
     Router::new()
-        .route("/login", post(login))
-        .route("/refresh", post(refresh_handler))
+        .route("/login", post(login).layer(rl_layer.clone()))
+        .route("/refresh", post(refresh_handler).layer(rl_layer))
         .route("/logout", post(logout))
         .route("/me", get(me))
         .route("/password", put(change_password))
@@ -264,8 +274,17 @@ mod tests {
         })
     }
 
+    fn fresh_rate_limit() -> RateLimitState {
+        RateLimitState {
+            limiter: crate::web::rate_limit::make_auth_limiter(),
+            trusted_hops: 0,
+        }
+    }
+
     fn app(state: AppState) -> Router {
-        Router::new().nest("/api/auth", router()).with_state(state)
+        Router::new()
+            .nest("/api/auth", router(fresh_rate_limit()))
+            .with_state(state)
     }
 
     #[tokio::test]
@@ -630,5 +649,65 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Spec §6.13 verify test: 16 login attempts in tight succession must
+    /// see the 16th rejected with HTTP 429. This exercises the full
+    /// `/api/auth/login` path through the rate-limit middleware to confirm
+    /// the wiring in [`router`] is correct (not just the standalone
+    /// middleware unit tests in [`crate::web::rate_limit`]).
+    #[tokio::test]
+    async fn login_429_after_15_attempt_burst_with_spec_body_and_retry_after() {
+        let state = fresh_state().await;
+        // Wrong password keeps the bucket-burn loop fast (no Argon2 cycles
+        // on the success path) and the test independent of any seeded user.
+        let app = app(state);
+        let body = || {
+            json_body(&LoginRequest {
+                username: "nobody".into(),
+                password: "wrong".into(),
+            })
+        };
+
+        // First 15 attempts must NOT see 429 — they may be 401 or 200, the
+        // rate-limit decision is what we're pinning here, not credential
+        // validity.
+        for n in 1..=15 {
+            let mut req = Request::builder()
+                .method(Method::POST)
+                .uri("/api/auth/login")
+                .header("content-type", "application/json")
+                .body(body())
+                .unwrap();
+            req.extensions_mut().insert(axum::extract::ConnectInfo(
+                std::net::SocketAddr::from(([198, 51, 100, 5], 50_000)),
+            ));
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_ne!(
+                resp.status(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "attempt {n} hit the rate limit before the 15-burst window was exhausted"
+            );
+        }
+
+        // 16th attempt — must be 429 with the exact spec body and a
+        // Retry-After header.
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/auth/login")
+            .header("content-type", "application/json")
+            .body(body())
+            .unwrap();
+        req.extensions_mut().insert(axum::extract::ConnectInfo(
+            std::net::SocketAddr::from(([198, 51, 100, 5], 50_000)),
+        ));
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            resp.headers().contains_key("retry-after"),
+            "spec §6.8 mandates a Retry-After header on 429"
+        );
+        let err: ErrorResponse = read_json(resp).await;
+        assert_eq!(err.error, msg::RATE_LIMIT_AUTH);
     }
 }
