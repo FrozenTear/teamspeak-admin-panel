@@ -19,7 +19,7 @@ use dioxus::prelude::*;
 use crate::ui::layout::AppShell;
 use crate::ui::pages::{
     BansPage, ChannelsPage, ClientsPage, DashboardPlaceholder, Home, LoginPage, LogsPage,
-    PublicWidgetPage, ServerInfoPage, SetupPage,
+    PublicWidgetPage, ServerInfoPage, SetupPage, WidgetsPage,
 };
 
 #[rustfmt::skip]
@@ -59,4 +59,8 @@ pub enum Route {
 
     #[route("/logs")]
     LogsPage {},
+
+    // PURA-92 — Slice G operator-facing Widget Manager (Chapter 34).
+    #[route("/widgets")]
+    WidgetsPage {},
 }

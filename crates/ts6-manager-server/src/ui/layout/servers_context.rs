@@ -28,7 +28,7 @@ use crate::client::dioxus::use_auth_gate;
 use crate::client::session::RefreshGate;
 
 /// Three-state load model for the `/api/servers` list.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ServersData {
     Loading,
     Loaded(Vec<ServerSummary>),

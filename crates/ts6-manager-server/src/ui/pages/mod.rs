@@ -16,6 +16,7 @@ mod logs;
 mod public_widget;
 mod server_info;
 mod setup;
+mod widgets;
 
 pub use bans::BansPage;
 pub use channels::ChannelsPage;
@@ -27,3 +28,4 @@ pub use logs::LogsPage;
 pub use public_widget::PublicWidgetPage;
 pub use server_info::ServerInfoPage;
 pub use setup::SetupPage;
+pub use widgets::WidgetsPage;

@@ -61,7 +61,7 @@ pub struct UpdateWidgetRequest {
 /// Three public-route URLs an operator can copy-paste into a third-party
 /// embed. Paths only — the FE prepends the host. Spec §34: the Widget Manager
 /// page surfaces the JSON / SVG / PNG embeds plus the public HTML page.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WidgetEmbedUrls {
     /// `/api/widget/{token}/data` — the JSON payload the SPA renders client-side.
     #[serde(rename = "dataUrl")]
@@ -93,7 +93,7 @@ impl WidgetEmbedUrls {
 /// Operator-side widget row. Mirrors the on-disk `widget` table verbatim and
 /// adds `serverName` / `serverHost` from the join requested by spec §7.27
 /// ("List widgets with their server config") plus the embed URL bundle.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WidgetSummary {
     pub id: i64,
     pub name: String,
@@ -195,7 +195,7 @@ impl WidgetThemeName {
 
 /// Eight-slot theme palette. Slot semantics live in
 /// `study-documents/design-system/widget-themes.md`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WidgetThemePalette {
     pub name: WidgetThemeName,
     pub background: &'static str,
