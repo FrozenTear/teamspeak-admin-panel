@@ -59,9 +59,10 @@ RUN apt-get update \
 
 # Copy the patched server binary AND the SSR/WASM static bundle next to it.
 # `dioxus_server::config` panics at boot if `<binary-dir>/public/` is missing
-# (PURA-93: the runtime image was previously copying only the binary, so the
-# server tripped on `Couldn't read public directory at "/usr/local/bin/public"`
-# the moment `serve_dioxus_application` registered static assets).
+# (PURA-75 wired the bundle copy; PURA-93 caught a regression where the
+# runtime image was copying only the binary, so the server tripped on
+# `Couldn't read public directory at "/usr/local/bin/public"` the moment
+# `serve_dioxus_application` registered static assets).
 COPY --from=builder /build/target/dx/ts6-manager-server/release/web/server /usr/local/bin/ts6-manager-server
 COPY --from=builder /build/target/dx/ts6-manager-server/release/web/public /usr/local/bin/public
 
