@@ -9,6 +9,7 @@
 //! `ts6_manager_shared::{setup, servers}`.
 
 pub mod control;
+pub mod metrics;
 pub mod servers;
 pub mod setup;
 

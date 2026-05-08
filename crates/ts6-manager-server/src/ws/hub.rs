@@ -11,8 +11,9 @@
 //! inside [`super::session`] and is the slow-consumer-detection point
 //! (see the §Backpressure header on [`super::session`]).
 //!
-//! Metrics are plain `AtomicU64`s. A future PURA-70c follow-up exposes
-//! them at `/metrics`; this module only collects.
+//! Metrics are plain `AtomicU64`s. PURA-82 wires
+//! [`Metrics::snapshot`] into the admin-JWT-gated `/metrics` route in
+//! [`crate::routes::metrics`]; this module only collects.
 
 use std::collections::HashMap;
 use std::sync::Arc;

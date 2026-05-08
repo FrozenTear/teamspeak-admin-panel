@@ -167,7 +167,10 @@ mod server_entry {
         // PURA-71 — Phase 2 control surface (clients/channels/bans/info/logs).
         // Mounts every `/api/servers/:configId/vs/:sid/...` action route; auth
         // and per-server access checks live inside each handler.
-        let control_router = routes::control::router().with_state(state);
+        let control_router = routes::control::router().with_state(state.clone());
+        // PURA-82 — `/metrics` Prometheus exposition for the WS hub.
+        // Admin-JWT gated; see the route module for the auth-gate rationale.
+        let metrics_router = routes::metrics::router().with_state(state);
 
         // PURA-17: `serve_dioxus_application` registers static assets +
         // server functions and adds a fallback that serves the dx-CLI
@@ -193,6 +196,8 @@ mod server_entry {
             .merge(dashboard_router)
             // PURA-71 — Phase 2 control surface.
             .merge(control_router)
+            // PURA-82 — Prometheus metrics endpoint for the WS hub.
+            .merge(metrics_router)
             .serve_dioxus_application(serve_cfg, ui::App)
             .layer(web::cors_layer(&cfg.frontend_url));
         let router = web::security_headers_stack(cfg.node_env).apply(router);
