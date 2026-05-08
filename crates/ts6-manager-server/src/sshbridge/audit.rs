@@ -9,10 +9,14 @@
 //! grep for `target=sshbridge::audit` to pull the audit slice out of the
 //! main log stream.
 //!
-//! **Persistence (DB-backed audit table) is deferred to a follow-up child
-//! issue under PURA-69 once SecurityEngineer has signed off on the field
-//! list.** The structured-tracing emission lands first so audit coverage is
-//! never missing while persistence is being designed.
+//! Persistence lives at [`AuditEntry::persist`] (PURA-79, follow-up D under
+//! PURA-69). The DB write is **best-effort and fire-and-forget**: a failed
+//! insert MUST NOT cancel the in-flight operator command. On any DB error
+//! the entry is re-emitted under target `sshbridge::audit::persist_failed`
+//! with every audit field plus the DB error so an operator who only
+//! watches the DB never sees a silent log/DB divergence (R5). The
+//! structured-tracing line in [`AuditEntry::emit`] still lands first, so
+//! audit coverage is never missing.
 //!
 //! Two non-negotiables, enforced at construction time:
 //!
@@ -30,6 +34,11 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 
 /// Outcome of one ServerQuery command issued over SSH.
+///
+/// **Source of truth.** `exit_code` is canonical; `outcome` is a derived
+/// convenience field stored explicit so SurrealQL filtering on the
+/// persisted log is ergonomic. A mismatch between the two indicates
+/// corruption.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditOutcome {
     /// Upstream `error id=0 msg=ok`.
@@ -40,6 +49,19 @@ pub enum AuditOutcome {
     /// Reported as `exit_code = -1` to match the WebQuery side's convention
     /// (see [`crate::webquery::WebQueryError::upstream_code`]).
     Transport,
+}
+
+impl AuditOutcome {
+    /// Lowercase enum-variant string used by the `outcome` column on the
+    /// `ssh_audit_log` table (PURA-79). Kept on the type so the repo and
+    /// downstream readers share one mapping.
+    pub fn as_db_string(self) -> &'static str {
+        match self {
+            AuditOutcome::Success => "success",
+            AuditOutcome::UpstreamError => "upstream_error",
+            AuditOutcome::Transport => "transport",
+        }
+    }
 }
 
 /// One audit-log entry. Emit with [`AuditEntry::emit`].
@@ -172,6 +194,68 @@ impl AuditEntry {
             "sshbridge command"
         );
     }
+
+    /// Best-effort DB persist (PURA-79). Companion to [`Self::emit`].
+    ///
+    /// **Never returns a `Result`.** A DB-write failure MUST NOT cancel the
+    /// in-flight operator command — that's the issue's hard rule. On any
+    /// failure we fall back to a `tracing::warn!` under target
+    /// `sshbridge::audit::persist_failed` carrying every audit field plus
+    /// the DB error string, so an operator who only watches the DB does not
+    /// see a silent log/DB divergence (R5).
+    ///
+    /// Callers should still call [`Self::emit`] **before** `persist`: the
+    /// info-line landing first guarantees audit coverage is never lost on a
+    /// DB outage.
+    pub async fn persist(&self, db: &crate::db::Database) {
+        if let Err(err) = self.persist_inner(db).await {
+            self.emit_persist_failed(&err);
+        }
+    }
+
+    async fn persist_inner(&self, db: &crate::db::Database) -> anyhow::Result<()> {
+        crate::repos::ssh_audit_log::insert(
+            db,
+            crate::repos::ssh_audit_log::NewSshAuditLog {
+                serverConfigId: self.server_config_id,
+                virtualServerId: self.virtual_server_id,
+                userId: self.user_id,
+                command: self.command.clone(),
+                commandLine: self.command_line.clone(),
+                exitCode: self.exit_code,
+                outcome: self.outcome.as_db_string().to_string(),
+                errorMsg: self.error_msg.clone(),
+                completedAt: self.completed_at,
+                latencyMs: self.latency.as_millis() as i64,
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// PURA-79 R5: re-emit every audit field under a distinct target on
+    /// persist failure. **Every field of [`emit`] MUST be reproduced here**
+    /// or an operator who only checks the DB sees a silent divergence;
+    /// `tests::emit_persist_failed_carries_every_audit_field` enforces this
+    /// at compile time via static source-grep.
+    fn emit_persist_failed(&self, err: &anyhow::Error) {
+        tracing::warn!(
+            target: "sshbridge::audit::persist_failed",
+            server_config_id = self.server_config_id,
+            virtual_server_id = self.virtual_server_id,
+            user_id = self.user_id,
+            command = %self.command,
+            command_line = %self.command_line,
+            exit_code = self.exit_code,
+            outcome = ?self.outcome,
+            error_msg = %self.error_msg,
+            completed_at = %self.completed_at.to_rfc3339(),
+            latency_ms = self.latency.as_millis() as u64,
+            audit_persist_status = "failed",
+            db_error = %err,
+            "sshbridge audit DB persist failed"
+        );
+    }
 }
 
 /// First whitespace-delimited token, as the canonical "command keyword"
@@ -234,5 +318,88 @@ mod tests {
         assert_eq!(extract_command("use sid=3"), "use");
         assert_eq!(extract_command(""), "");
         assert_eq!(extract_command("   leading"), "leading");
+    }
+
+    #[test]
+    fn outcome_db_string_mapping_is_lowercase_snake() {
+        // PURA-79 — the on-disk `outcome` column uses these exact values.
+        // A future contributor renaming a variant must update both ends.
+        assert_eq!(AuditOutcome::Success.as_db_string(), "success");
+        assert_eq!(AuditOutcome::UpstreamError.as_db_string(), "upstream_error");
+        assert_eq!(AuditOutcome::Transport.as_db_string(), "transport");
+    }
+
+    /// PURA-79 R5: static source-grep ensures the persist-failed warn macro
+    /// reproduces every audit field. If a future contributor drops a field
+    /// (e.g. forgets to mirror a new field added to `AuditEntry`), the silent
+    /// log/DB divergence SecurityEngineer flagged becomes a CI failure.
+    #[test]
+    fn emit_persist_failed_carries_every_audit_field() {
+        const SRC: &str = include_str!("audit.rs");
+
+        // Locate the function body.
+        let start = SRC
+            .find("fn emit_persist_failed")
+            .expect("emit_persist_failed function must exist");
+        let body = &SRC[start..];
+        // Function body ends at the first `\n    }` after the open brace.
+        // (The function lives inside `impl AuditEntry`, so 4-space indent.)
+        let end = body
+            .find("\n    }\n")
+            .expect("emit_persist_failed body must close at 4-space indent");
+        let body = &body[..end];
+
+        // Every field that `emit()` records MUST also be in the failure
+        // warn line — else an operator watching only the DB sees a silent
+        // divergence on persist failure.
+        let required_fields = [
+            "server_config_id",
+            "virtual_server_id",
+            "user_id",
+            "command",
+            "command_line",
+            "exit_code",
+            "outcome",
+            "error_msg",
+            "completed_at",
+            "latency_ms",
+            "audit_persist_status",
+            "db_error",
+        ];
+        for field in required_fields {
+            assert!(
+                body.contains(field),
+                "emit_persist_failed missing required field `{field}` — \
+                 PURA-79 R5 forbids silent log/DB divergence on persist failure"
+            );
+        }
+
+        // Target string must be the spec-required one so operator tooling
+        // can grep `sshbridge::audit::persist_failed` reliably.
+        assert!(
+            body.contains(r#"target: "sshbridge::audit::persist_failed""#),
+            "emit_persist_failed must use target `sshbridge::audit::persist_failed`"
+        );
+    }
+
+    /// PURA-79 hard-rule: a DB persist failure MUST NOT cancel the in-flight
+    /// operator command. We simulate "DB unavailable" by connecting to an
+    /// in-memory SurrealDB without applying migrations, so the
+    /// `ssh_audit_log` table doesn't exist and the insert fails.
+    #[tokio::test]
+    async fn persist_swallows_db_errors_no_panic_no_propagate() {
+        let db = crate::db::connect_in_memory()
+            .await
+            .expect("in-memory connect");
+        // Note: NO `migrations::run` call — table is missing on purpose.
+        let entry = AuditEntry::success(
+            7,
+            Some(3),
+            Some(42),
+            "clientlist -uid",
+            Duration::from_millis(15),
+        );
+        // Returns `()` — no `?`, no panic.
+        entry.persist(&db).await;
     }
 }

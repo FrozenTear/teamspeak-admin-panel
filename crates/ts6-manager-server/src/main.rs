@@ -116,6 +116,13 @@ mod server_entry {
             "migrations applied at boot"
         );
 
+        // PURA-79 R1/R6: hourly best-effort sweep that prunes
+        // `ssh_audit_log` per the operator-set retention policy. Spawned
+        // after migrations so the seeded `app_setting:ssh_audit_retention_days`
+        // row exists; bound to the same `Database` arc as the rest of the
+        // app so a shutdown of the runtime tears it down with everything else.
+        crate::sshbridge::retention::spawn_sweep(database.clone());
+
         let serve_cfg = ServeConfig::new();
         let state = app_state::AppState::from_config(&cfg, database.clone());
 

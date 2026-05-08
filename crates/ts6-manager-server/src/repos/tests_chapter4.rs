@@ -15,11 +15,12 @@
 #![allow(non_snake_case)]
 
 use chrono::{Duration, Utc};
+use surrealdb::types::SurrealValue;
 
 use super::{
     app_settings, bot_execution_logs, bot_executions, bot_flows, bot_variables, music_bots,
     music_requests, playlist_songs, playlists, radio_stations, server_connections, songs,
-    stream_sessions, widgets,
+    ssh_audit_log, stream_sessions, users, widgets,
 };
 use crate::db::{connect_in_memory, migrations};
 
@@ -1198,4 +1199,312 @@ async fn schema_roundtrip_one_row_per_entity() {
     // Time-fence so the `expires_at` style fields settle when running with
     // a fast clock.
     let _ = Utc::now() + Duration::seconds(1);
+}
+
+// =====================================================================
+// PURA-79 — `ssh_audit_log` repo + persistence integration tests.
+//
+// Covers the SecurityEngineer-required R-list (sign-off on PURA-79):
+//   R2 — per-field caps: errorMsg 4 KiB, commandLine 8 KiB, with sentinel.
+//   R7 — userId set-null on user delete; serverConfigId NON-cascading.
+//   end-to-end — AuditEntry::persist round-trips through the table.
+//
+// The R3 / R4 / R5 unit tests live next to the code they protect:
+//   R3 (debug_assert credential belt)        → repos/ssh_audit_log.rs::tests
+//   R4 (INSERT-only static-grep)             → repos/ssh_audit_log.rs::tests
+//   R5 (persist_failed field grep + no-panic) → sshbridge/audit.rs::tests
+// =====================================================================
+
+async fn seed_user(db: &crate::db::Database) -> i64 {
+    users::insert(
+        db,
+        users::NewUser {
+            username: format!("op-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)),
+            passwordHash: "$argon2id$v=19$m=64,t=1,p=1$YWFhYWFhYWE$ZmFrZQ".into(),
+            displayName: "Operator".into(),
+            role: "admin".into(),
+            enabled: true,
+        },
+    )
+    .await
+    .expect("seed user")
+    .id
+}
+
+fn new_audit_log(server_id: i64, user_id: Option<i64>) -> ssh_audit_log::NewSshAuditLog {
+    ssh_audit_log::NewSshAuditLog {
+        serverConfigId: server_id,
+        virtualServerId: Some(1),
+        userId: user_id,
+        command: "clientlist".into(),
+        commandLine: "clientlist -uid".into(),
+        exitCode: 0,
+        outcome: "success".into(),
+        errorMsg: String::new(),
+        completedAt: chrono::Utc::now(),
+        latencyMs: 15,
+    }
+}
+
+#[tokio::test]
+async fn ssh_audit_log_insert_roundtrips_every_field() {
+    let db = setup().await;
+    let server_id = seed_server(&db).await;
+    let user_id = seed_user(&db).await;
+
+    let row = ssh_audit_log::insert(&db, new_audit_log(server_id, Some(user_id)))
+        .await
+        .expect("insert");
+
+    assert!(row.id > 0, "id is server-allocated and > 0");
+    assert_eq!(row.serverConfigId, server_id);
+    assert_eq!(row.virtualServerId, Some(1));
+    assert_eq!(row.userId, Some(user_id));
+    assert_eq!(row.command, "clientlist");
+    assert_eq!(row.commandLine, "clientlist -uid");
+    assert_eq!(row.exitCode, 0);
+    assert_eq!(row.outcome, "success");
+    assert_eq!(row.errorMsg, "");
+    assert_eq!(row.latencyMs, 15);
+    // insertedAt is server-stamped — non-zero is enough; we don't pin a
+    // specific value, just confirm the field is populated.
+    assert!(row.insertedAt.timestamp() > 0);
+}
+
+#[tokio::test]
+async fn ssh_audit_log_insert_caps_errormsg_at_4kib_with_sentinel() {
+    // PURA-79 R2: a pathological upstream message must be truncated at the
+    // persistence boundary; original byte length recorded in the sentinel.
+    let db = setup().await;
+    let server_id = seed_server(&db).await;
+
+    let pathological = "x".repeat(10_000);
+    let mut new = new_audit_log(server_id, None);
+    new.errorMsg = pathological.clone();
+
+    let row = ssh_audit_log::insert(&db, new).await.expect("insert");
+    assert!(
+        row.errorMsg.len() <= ssh_audit_log::ERROR_MSG_MAX_BYTES,
+        "errorMsg must respect 4 KiB cap, got {} bytes",
+        row.errorMsg.len()
+    );
+    assert!(
+        row.errorMsg
+            .contains("[truncated, original 10000 bytes]"),
+        "truncation sentinel must record the original byte length"
+    );
+}
+
+#[tokio::test]
+async fn ssh_audit_log_insert_caps_command_line_at_8kib_with_sentinel() {
+    let db = setup().await;
+    let server_id = seed_server(&db).await;
+
+    // Build a long but credential-clean command line so R3's debug_assert
+    // doesn't fire — pad with a long flag list rather than `password=`.
+    let pad = "-flag ".repeat(2_000); // 12_000 bytes
+    let pathological = format!("clientlist {pad}");
+    let original_len = pathological.len();
+
+    let mut new = new_audit_log(server_id, None);
+    new.commandLine = pathological;
+
+    let row = ssh_audit_log::insert(&db, new).await.expect("insert");
+    assert!(
+        row.commandLine.len() <= ssh_audit_log::COMMAND_LINE_MAX_BYTES,
+        "commandLine must respect 8 KiB cap, got {} bytes",
+        row.commandLine.len()
+    );
+    assert!(
+        row.commandLine
+            .contains(&format!("[truncated, original {original_len} bytes]")),
+        "commandLine truncation sentinel must record the original byte length"
+    );
+}
+
+#[tokio::test]
+async fn ssh_audit_log_user_delete_sets_user_id_null_audit_row_survives() {
+    // PURA-79 R7: deleting a user nulls `userId` on the audit row but does
+    // NOT delete it. Mirrors `music_bot_set_null_playlist` (§4.2.12 / §4.5).
+    let db = setup().await;
+    let server_id = seed_server(&db).await;
+    let user_id = seed_user(&db).await;
+
+    let row = ssh_audit_log::insert(&db, new_audit_log(server_id, Some(user_id)))
+        .await
+        .expect("insert");
+    assert_eq!(row.userId, Some(user_id));
+
+    users::delete(&db, user_id).await.expect("delete user");
+
+    // Read every audit row back via a passthrough query — the repo deliberately
+    // does NOT export a single-row find (R4: INSERT-only repo), so the test
+    // uses a raw projection here.
+    #[derive(Debug, serde::Deserialize, SurrealValue)]
+    #[surreal(crate = "surrealdb::types")]
+    struct AuditUserId {
+        id: i64,
+        userId: Option<i64>,
+    }
+    let mut resp = db
+        .query(
+            "SELECT record::id(id) AS id, userId FROM ssh_audit_log
+                WHERE record::id(id) = $id;",
+        )
+        .bind(("id", row.id))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+    let after: Vec<AuditUserId> = resp.take(0).unwrap();
+    assert_eq!(after.len(), 1, "audit row MUST survive user delete");
+    assert_eq!(
+        after[0].userId, None,
+        "userId MUST be set to null on user delete (set-null, not cascade)"
+    );
+}
+
+#[tokio::test]
+async fn ssh_audit_log_server_delete_does_not_cascade_audit_row_survives() {
+    // PURA-79: `serverConfigId` is intentionally NON-cascading per the
+    // `bot_execution_log` precedent (§4.2.8). Audit history must outlive
+    // server-config deletion — that is the entire point of an audit trail.
+    let db = setup().await;
+    let server_id = seed_server(&db).await;
+
+    let row = ssh_audit_log::insert(&db, new_audit_log(server_id, None))
+        .await
+        .expect("insert");
+
+    server_connections::delete(&db, server_id)
+        .await
+        .expect("delete server");
+
+    let mut resp = db
+        .query(
+            "SELECT record::id(id) AS id FROM ssh_audit_log
+                WHERE record::id(id) = $id;",
+        )
+        .bind(("id", row.id))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+    #[derive(serde::Deserialize, SurrealValue)]
+    #[surreal(crate = "surrealdb::types")]
+    struct OnlyId {
+        id: i64,
+    }
+    let after: Vec<OnlyId> = resp.take(0).unwrap();
+    assert_eq!(
+        after.len(),
+        1,
+        "audit row MUST survive server_connection delete"
+    );
+}
+
+#[tokio::test]
+async fn ssh_audit_log_prune_older_than_chunks_oversize_set() {
+    // PURA-79 R6: prune_older_than chunks at 1000 rows — verify by inserting
+    // > chunk-size rows back-dated, calling prune, and confirming all
+    // back-dated rows are gone while a recent row survives.
+    let db = setup().await;
+    let server_id = seed_server(&db).await;
+
+    let old_completed = chrono::Utc::now() - chrono::Duration::days(400);
+    let recent_completed = chrono::Utc::now();
+
+    // 1010 old rows — straddles the 1000-row chunk so the inner loop must
+    // iterate twice.
+    for _ in 0..1010 {
+        let mut new = new_audit_log(server_id, None);
+        new.completedAt = old_completed;
+        ssh_audit_log::insert(&db, new).await.expect("insert old");
+    }
+    // One recent row that MUST survive.
+    let mut keeper_new = new_audit_log(server_id, None);
+    keeper_new.completedAt = recent_completed;
+    let keeper = ssh_audit_log::insert(&db, keeper_new)
+        .await
+        .expect("insert recent");
+
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(365);
+    let pruned = ssh_audit_log::prune_older_than(&db, cutoff)
+        .await
+        .expect("prune");
+    assert_eq!(
+        pruned, 1010,
+        "prune count must include every row across both chunks"
+    );
+
+    // Recent row survives.
+    let mut resp = db
+        .query("SELECT record::id(id) AS id FROM ssh_audit_log;")
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+    #[derive(serde::Deserialize, SurrealValue)]
+    #[surreal(crate = "surrealdb::types")]
+    struct Surv {
+        id: i64,
+    }
+    let survivors: Vec<Surv> = resp.take(0).unwrap();
+    assert_eq!(survivors.len(), 1, "only the recent row must remain");
+    assert_eq!(survivors[0].id, keeper.id);
+}
+
+#[tokio::test]
+async fn audit_entry_persist_round_trips_through_table() {
+    // End-to-end: AuditEntry::emit + persist writes a row that the repo
+    // can read back. Confirms the shaping inside `persist_inner` matches
+    // the table definition.
+    use crate::sshbridge::audit::{AuditEntry, AuditOutcome};
+    use std::time::Duration as StdDuration;
+
+    let db = setup().await;
+    let server_id = seed_server(&db).await;
+    let user_id = seed_user(&db).await;
+
+    let entry = AuditEntry::success(
+        server_id,
+        Some(1),
+        Some(user_id),
+        "clientlist -uid",
+        StdDuration::from_millis(42),
+    );
+    entry.emit();
+    entry.persist(&*db).await;
+
+    let mut resp = db
+        .query(
+            "SELECT record::id(id) AS id, command, commandLine, outcome, exitCode, latencyMs, userId
+                FROM ssh_audit_log;",
+        )
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+    #[allow(non_snake_case)]
+    #[derive(serde::Deserialize, SurrealValue)]
+    #[surreal(crate = "surrealdb::types")]
+    struct AuditMin {
+        id: i64,
+        command: String,
+        commandLine: String,
+        outcome: String,
+        exitCode: i64,
+        latencyMs: i64,
+        userId: Option<i64>,
+    }
+    let rows: Vec<AuditMin> = resp.take(0).unwrap();
+    assert_eq!(rows.len(), 1, "persist must produce exactly one row");
+    let r = &rows[0];
+    assert_eq!(r.command, "clientlist");
+    assert_eq!(r.commandLine, "clientlist -uid");
+    assert_eq!(r.outcome, AuditOutcome::Success.as_db_string());
+    assert_eq!(r.exitCode, 0);
+    assert_eq!(r.latencyMs, 42);
+    assert_eq!(r.userId, Some(user_id));
 }

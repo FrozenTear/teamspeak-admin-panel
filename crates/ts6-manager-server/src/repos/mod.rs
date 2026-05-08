@@ -28,6 +28,7 @@ pub mod server_connections;
 pub mod server_user_grants;
 pub mod setup;
 pub mod songs;
+pub mod ssh_audit_log;
 pub mod stream_sessions;
 pub mod users;
 pub mod widgets;

@@ -37,6 +37,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0005_ssh_bridge_auth",
         include_str!("../../migrations/0005_ssh_bridge_auth.surql"),
     ),
+    (
+        "0006_ssh_audit_log",
+        include_str!("../../migrations/0006_ssh_audit_log.surql"),
+    ),
 ];
 
 #[derive(Debug, Deserialize, SurrealValue)]

@@ -58,6 +58,7 @@
 pub mod audit;
 pub mod channel;
 pub mod hostkey;
+pub mod retention;
 pub mod russh_channel;
 pub mod transport;
 pub mod wire;
