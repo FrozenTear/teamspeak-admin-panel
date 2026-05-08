@@ -25,10 +25,10 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::time::Duration;
 
-use axum::extract::ws::{Message, WebSocket};
+use axum::extract::ws::{CloseFrame, Message, Utf8Bytes, WebSocket, close_code};
 use serde::Deserialize;
 use serde_json::json;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio::time::{Instant, interval};
 
 use crate::db::Database;
@@ -95,11 +95,20 @@ struct SessionLoop {
     /// Set true when a forwarder task signals the queue overflowed.
     /// The loop sends a final `dropped` envelope and closes.
     drop_pending: bool,
+    /// PURA-97 M-2 — widget-revocation receiver. Some(_) only when the
+    /// principal is a widget; the select! arm closes the connection on
+    /// receipt of this principal's `widget_id`.
+    widgets_revoked_rx: Option<broadcast::Receiver<i64>>,
 }
 
 impl SessionLoop {
     fn new(socket: WebSocket, principal: Principal, hub: Hub, db: std::sync::Arc<Database>) -> Self {
         let (out_tx, out_rx) = mpsc::channel(SEND_QUEUE_CAP);
+        // Subscribe to widget revocations only for widget principals.
+        // For JWT users this stays None and the select! arm pends
+        // forever, so it has zero runtime cost on the operator path.
+        let widgets_revoked_rx = matches!(principal, Principal::Widget(_))
+            .then(|| hub.subscribe_widget_revocations());
         Self {
             socket,
             principal,
@@ -110,6 +119,7 @@ impl SessionLoop {
             subscriptions: HashMap::new(),
             last_recv: Instant::now(),
             drop_pending: false,
+            widgets_revoked_rx,
         }
     }
 
@@ -138,6 +148,17 @@ impl SessionLoop {
                 // Server → client envelope ready.
                 Some(env) = self.out_rx.recv() => {
                     self.send_envelope(env).await?;
+                }
+                // PURA-97 M-2 — widget-token revocation. For widget
+                // principals, the admin path's `revoke_widget(id)` lands
+                // here; if the id matches our principal we close with
+                // 1008 (policy-violation) and exit. JWT users have
+                // `widgets_revoked_rx == None`, so this arm pends
+                // forever for them and is selected away.
+                revoke = next_revoke(self.widgets_revoked_rx.as_mut()) => {
+                    if self.handle_revoke(revoke).await? {
+                        return Ok(());
+                    }
                 }
                 // Client frame.
                 ws_msg = self.socket.recv() => {
@@ -171,6 +192,62 @@ impl SessionLoop {
                         return Err(SessionError::Transport);
                     }
                 }
+            }
+        }
+    }
+
+    /// PURA-97 M-2 — process a frame from the widget-revocation
+    /// broadcast. Returns `Ok(true)` if the session should exit (this
+    /// connection's widget was revoked, or the broadcast lagged so we
+    /// conservatively close), `Ok(false)` to keep looping (id was for a
+    /// different widget, or the channel closed unexpectedly).
+    async fn handle_revoke(
+        &mut self,
+        revoke: Result<i64, broadcast::error::RecvError>,
+    ) -> Result<bool, SessionError> {
+        match revoke {
+            Ok(id) => {
+                let our_id = match &self.principal {
+                    Principal::Widget(w) => w.widget_id,
+                    // Defensive: only widget sessions install the
+                    // receiver, but the type system can't prove it.
+                    _ => return Ok(false),
+                };
+                if id != our_id {
+                    return Ok(false);
+                }
+                // Match: send a clean close and exit. 1008 (policy
+                // violation) communicates "your credential is no
+                // longer accepted" without leaking the precise cause
+                // back to the (potentially attacker-controlled) viewer.
+                let _ = self
+                    .socket
+                    .send(Message::Close(Some(CloseFrame {
+                        code: close_code::POLICY,
+                        reason: Utf8Bytes::from_static("widget token revoked"),
+                    })))
+                    .await;
+                Ok(true)
+            }
+            Err(broadcast::error::RecvError::Lagged(_)) => {
+                // Conservative: a lagged receiver might have missed
+                // our revoke event. Closing with the same close-frame
+                // shape keeps the wire contract uniform across the
+                // matched-id and lagged paths.
+                let _ = self
+                    .socket
+                    .send(Message::Close(Some(CloseFrame {
+                        code: close_code::POLICY,
+                        reason: Utf8Bytes::from_static("widget token revoked"),
+                    })))
+                    .await;
+                Ok(true)
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                // Hub gone. Should not happen while the AppState is
+                // alive; treat as benign no-op so the loop keeps
+                // serving the rest of the session.
+                Ok(false)
             }
         }
     }
@@ -295,6 +372,21 @@ impl SessionLoop {
             .await
             .map_err(|_| SessionError::Transport)?;
         Ok(())
+    }
+}
+
+/// PURA-97 M-2 — bridge between `Option<broadcast::Receiver<i64>>` and
+/// the `tokio::select!` arm. When `rx` is `Some`, awaits the next
+/// receive. When `None` (JWT-user session), returns a future that never
+/// resolves so `select!` ignores this arm. Splitting the helper out
+/// keeps the borrow on `self.widgets_revoked_rx` tight enough for the
+/// other select arms to keep their disjoint borrows of `self`.
+async fn next_revoke(
+    rx: Option<&mut broadcast::Receiver<i64>>,
+) -> Result<i64, broadcast::error::RecvError> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
     }
 }
 

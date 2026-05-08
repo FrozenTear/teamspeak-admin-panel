@@ -329,6 +329,11 @@ async fn delete(
         tracing::error!(err = %e, widget_id = id, "widgets admin: delete failed");
         internal()
     })?;
+    // PURA-96 M-2 — close any active widget WS sessions still bound to
+    // this id. The DB row is gone so `resolve_principal` would already
+    // refuse a fresh handshake; this signal terminates connections that
+    // authenticated before the delete completed.
+    state.ws_hub.revoke_widget(id);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -369,6 +374,12 @@ async fn regenerate_token(
             internal()
         })?
         .ok_or_else(not_found)?;
+    // PURA-96 M-2 — fire AFTER `set_token` succeeds. Any WS session that
+    // authenticated against the old token is still subscribed to the
+    // hub's per-server fan-out under its (now-rotated) widget_id; this
+    // signal closes those connections. New handshakes with the old
+    // token already 401 because the DB row was rotated above.
+    state.ws_hub.revoke_widget(id);
 
     let server = server_connections::find_by_id(&state.db, updated.serverConfigId)
         .await
@@ -1164,6 +1175,131 @@ mod tests {
         let fetched: WidgetSummary = read_json(resp).await;
         assert_eq!(fetched.id, widget.id);
         assert_eq!(fetched.token, widget.token);
+    }
+
+    // ---------------------------------------------------------------------
+    // PURA-96 M-2 — admin handlers MUST publish to the hub's
+    // widget-revocation broadcast after a successful DB write so any
+    // active WS session bound to the same widget_id closes promptly.
+    // The session-side reaction (Close frame, exit) is unit-tested in
+    // `ws::session` and `ws::hub`; here we pin the route-handler hooks.
+    // ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn delete_publishes_widget_revocation() {
+        let state = fresh_state().await;
+        let server = seed_server(&state).await;
+        let aid = seed_user(&state, "a", "admin").await;
+        let t = mint(&state, aid, "a", "admin");
+        let created = create_widget_as_admin(&state, &t, server).await;
+
+        // Subscribe BEFORE the mutation — the broadcast does not retain
+        // a backlog for late subscribers.
+        let mut rx = state.ws_hub.subscribe_widget_revocations();
+
+        let resp = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("/api/widgets/{}", created.id))
+                    .header("authorization", auth(&t))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let id = tokio::time::timeout(Duration::from_millis(50), rx.recv())
+            .await
+            .expect("revoke broadcast must arrive within 50ms of DELETE")
+            .expect("recv must succeed");
+        assert_eq!(
+            id, created.id,
+            "DELETE must broadcast the revoked widget_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn regenerate_token_publishes_widget_revocation() {
+        let state = fresh_state().await;
+        let server = seed_server(&state).await;
+        let aid = seed_user(&state, "a", "admin").await;
+        let t = mint(&state, aid, "a", "admin");
+        let created = create_widget_as_admin(&state, &t, server).await;
+
+        let mut rx = state.ws_hub.subscribe_widget_revocations();
+
+        let resp = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/widgets/{}/regenerate-token", created.id))
+                    .header("authorization", auth(&t))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let id = tokio::time::timeout(Duration::from_millis(50), rx.recv())
+            .await
+            .expect("revoke broadcast must arrive within 50ms of regenerate-token")
+            .expect("recv must succeed");
+        assert_eq!(
+            id, created.id,
+            "regenerate-token must broadcast the revoked widget_id so live WS subscribers close"
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_does_not_publish_widget_revocation() {
+        // PATCH does not rotate the token (spec §7.27), so existing WS
+        // sessions remain valid. The revocation broadcast MUST NOT
+        // fire — guards against a future "PATCH also rotates" change
+        // accidentally severing live viewers.
+        let state = fresh_state().await;
+        let server = seed_server(&state).await;
+        let aid = seed_user(&state, "a", "admin").await;
+        let t = mint(&state, aid, "a", "admin");
+
+        let resp = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/widgets")
+                    .header("authorization", auth(&t))
+                    .header("content-type", "application/json")
+                    .body(json(&create_body(server)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let created: WidgetSummary = read_json(resp).await;
+
+        let mut rx = state.ws_hub.subscribe_widget_revocations();
+        let patch_body = serde_json::json!({ "theme": "neon" });
+        let resp = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::PATCH)
+                    .uri(format!("/api/widgets/{}", created.id))
+                    .header("authorization", auth(&t))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&patch_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let r = tokio::time::timeout(std::time::Duration::from_millis(20), rx.recv()).await;
+        assert!(
+            r.is_err(),
+            "PATCH must NOT publish a revoke event; got {:?}",
+            r
+        );
     }
 
     #[tokio::test]

@@ -33,6 +33,13 @@ use super::topic::{AuthRequirement, Topic, TopicKind};
 /// translates that to a `dropped` envelope plus close.
 const BROADCAST_CAPACITY: usize = 128;
 
+/// Capacity for the widget-revocation broadcast channel (PURA-97 M-2).
+/// Operator-driven revocations are rare, but every active widget session
+/// holds a receiver — sized to comfortably cover a fan-out of 50
+/// concurrent widget connections seeing the same revoke event without
+/// any one of them lagging.
+const REVOKE_CAPACITY: usize = 64;
+
 #[derive(Clone)]
 pub struct Hub {
     inner: Arc<HubInner>,
@@ -43,6 +50,11 @@ struct HubInner {
     /// Per-server channel + ring buffer. Created lazily on first publish
     /// or first subscribe for a given server id.
     servers: Mutex<HashMap<i64, ServerSlot>>,
+    /// PURA-97 M-2 — fan-out for `revoke_widget(id)` calls. Every active
+    /// widget session subscribes; admin handlers (`delete`,
+    /// `regenerate_token`) publish here after the DB write so connected
+    /// viewers using the now-stale token are forced to close.
+    widgets_revoked: broadcast::Sender<i64>,
     metrics: Metrics,
 }
 
@@ -100,10 +112,12 @@ pub enum AuthorizeError {
 
 impl Hub {
     pub fn new() -> Self {
+        let (widgets_revoked, _) = broadcast::channel(REVOKE_CAPACITY);
         Self {
             inner: Arc::new(HubInner {
                 next_event_id: AtomicU64::new(1),
                 servers: Mutex::new(HashMap::new()),
+                widgets_revoked,
                 metrics: Metrics::default(),
             }),
         }
@@ -111,6 +125,29 @@ impl Hub {
 
     pub fn metrics(&self) -> &Metrics {
         &self.inner.metrics
+    }
+
+    /// PURA-97 M-2 — subscribe to widget-revocation events. The session
+    /// loop calls this immediately after entering for any widget
+    /// principal; the receiver yields each `widget_id` published by
+    /// [`Hub::revoke_widget`]. Returns a receiver positioned at the
+    /// current end of the channel — events sent before this call are
+    /// not delivered.
+    pub fn subscribe_widget_revocations(&self) -> broadcast::Receiver<i64> {
+        self.inner.widgets_revoked.subscribe()
+    }
+
+    /// PURA-97 M-2 — fan a "this widget's token is no longer valid"
+    /// signal to every active session. Best-effort: returns silently if
+    /// no session is currently subscribed (the widget must not have any
+    /// live connections to drop, which is the desired outcome).
+    ///
+    /// Admin handlers MUST call this **after** the DB write that
+    /// invalidates the token (`set_token` for regenerate, `delete` for
+    /// delete) so a session that authenticated against the pre-write
+    /// state still gets closed.
+    pub fn revoke_widget(&self, widget_id: i64) {
+        let _ = self.inner.widgets_revoked.send(widget_id);
     }
 
     /// Subscribe to `topic` after running the per-topic ACL against
@@ -437,6 +474,39 @@ mod tests {
         let received = sub.receiver.recv().await.expect("must receive");
         assert_eq!(received.id, e.id);
         assert_eq!(received.kind, "ts:client:connected");
+    }
+
+    // ---------------------------------------------------------------------
+    // PURA-97 M-2 — widget revocation broadcast.
+    // ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn revoke_widget_reaches_subscribed_session() {
+        let hub = Hub::new();
+        let mut rx = hub.subscribe_widget_revocations();
+        hub.revoke_widget(42);
+        let id = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv())
+            .await
+            .expect("revoke must arrive within 50ms")
+            .expect("recv must succeed");
+        assert_eq!(id, 42);
+    }
+
+    #[tokio::test]
+    async fn revoke_widget_with_no_subscribers_is_a_noop() {
+        let hub = Hub::new();
+        // No panic / no error even though there's no receiver yet.
+        hub.revoke_widget(99);
+    }
+
+    #[tokio::test]
+    async fn revoke_fans_out_to_every_session() {
+        let hub = Hub::new();
+        let mut a = hub.subscribe_widget_revocations();
+        let mut b = hub.subscribe_widget_revocations();
+        hub.revoke_widget(7);
+        assert_eq!(a.recv().await.unwrap(), 7);
+        assert_eq!(b.recv().await.unwrap(), 7);
     }
 
     #[tokio::test]
