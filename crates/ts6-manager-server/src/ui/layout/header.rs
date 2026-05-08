@@ -180,6 +180,13 @@ fn api_base() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use crate::client::dioxus::DioxusSession;
+    use crate::client::storage::MemoryStore;
+    use crate::client::store::AuthState;
+    use crate::ui::theme::ThemeContext;
+    use ts6_manager_shared::auth::UserInfo;
 
     #[test]
     fn initials_use_first_letter_of_two_words() {
@@ -204,5 +211,87 @@ mod tests {
     #[test]
     fn initials_fall_back_to_question_mark_when_both_empty() {
         assert_eq!(initials_for("", ""), "?");
+    }
+
+    // ── Chrome-snapshot harness ──────────────────────────────────────────
+    //
+    // SSR-renders the Header inside a synthetic Router and provides the two
+    // contexts the production component reaches for: a Dioxus session in
+    // the `Authenticated` branch (so the component renders user-menu chrome
+    // instead of bailing out empty) and a theme context (so `use_theme()`
+    // doesn't panic). Production wiring lives in `provide_session` /
+    // `ThemeProvider`; the harness short-cuts both with in-memory state
+    // because we only inspect the rendered HTML.
+
+    #[derive(Clone, Routable, Debug, PartialEq)]
+    #[rustfmt::skip]
+    enum TestRoute {
+        #[route("/")]
+        HeaderHarness {},
+    }
+
+    #[component]
+    fn HeaderHarness() -> Element {
+        // Authenticated session — `Header` matches `AuthState::Anonymous`
+        // to render an empty fragment, so the test must seed a real user.
+        use_context_provider(|| DioxusSession {
+            state: SyncSignal::new_maybe_sync(AuthState::Authenticated {
+                access: "stub-access".into(),
+                refresh: "stub-refresh".into(),
+                user: UserInfo {
+                    id: 1,
+                    username: "rsoot".into(),
+                    display_name: "Robert Soot".into(),
+                    role: "admin".into(),
+                },
+            }),
+            storage: Arc::new(MemoryStore::new()),
+        });
+        use_context_provider(|| ThemeContext {
+            theme: Signal::new(crate::ui::theme::Theme::Dark),
+        });
+        rsx! { Header {} }
+    }
+
+    fn render_header_harness() -> String {
+        let mut dom = VirtualDom::new(|| {
+            rsx! { Router::<TestRoute> {} }
+        });
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    #[test]
+    fn header_carries_banner_role() {
+        let html = render_header_harness();
+        assert!(
+            html.contains(r#"role="banner""#),
+            "header missing role='banner': {html}"
+        );
+    }
+
+    #[test]
+    fn theme_toggle_button_has_descriptive_aria_label() {
+        let html = render_header_harness();
+        // Default seeded theme is `Dark`, so the toggle invites flipping
+        // to light. Pinning the label string keeps it from being silently
+        // localised away into something a screen-reader user can't follow.
+        assert!(
+            html.contains(r#"aria-label="Switch to light theme""#),
+            "theme toggle missing 'Switch to light theme' aria-label: {html}"
+        );
+    }
+
+    #[test]
+    fn ws_dot_has_status_role_for_assistive_tech() {
+        let html = render_header_harness();
+        assert!(
+            html.contains(r#"role="status""#),
+            "websocket indicator missing role='status': {html}"
+        );
+        assert!(
+            html.contains(r#"aria-label="WebSocket status: connected""#),
+            "websocket indicator missing aria-label describing connection state: {html}"
+        );
     }
 }

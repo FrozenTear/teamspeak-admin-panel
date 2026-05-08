@@ -61,11 +61,15 @@ pub fn NavItem(props: NavItemProps) -> Element {
     } else {
         "nav-item"
     };
+    // `dioxus_router::Link` auto-renders `aria-current="page"` when the
+    // link's destination matches the current URL — see
+    // `dioxus-router-0.7.7/src/components/link.rs:194`. Don't pass an
+    // explicit `aria-current`; it would render the attribute twice and
+    // confuse screen readers.
     rsx! {
         Link {
             to: props.to.clone(),
             class: "{class}",
-            "aria-current": if props.active { "page" } else { "false" },
             span { class: "icn", "{props.icon}" }
             "{props.label}"
         }
@@ -111,12 +115,18 @@ pub fn Sidebar(props: SidebarProps) -> Element {
     let dashboard_active = matches!(props.active, Route::DashboardPlaceholder {});
     rsx! {
         aside { class: "sidebar",
+            // Brand sits OUTSIDE `<nav aria-label="Primary">` so the
+            // primary-nav landmark contains only route entries — and a plain
+            // `<a>` (rather than `dioxus_router::Link`) keeps the brand
+            // from auto-rendering `aria-current="page"` whenever the
+            // dashboard happens to be the current route. Click behaviour is
+            // a full-page navigation back to `/`; brand-click is rare and
+            // a reload from `/` to `/` is effectively a no-op.
+            a { class: "brand", href: "/",
+                span { class: "mark" }
+                "TS6 Manager"
+            }
             nav { id: "{NAV_LANDMARK_ID}", tabindex: "-1", "aria-label": "Primary",
-                Link { to: Route::DashboardPlaceholder {}, class: "brand",
-                    span { class: "mark" }
-                    "TS6 Manager"
-                }
-
                 NavGroup { label: "Server",
                     NavItem { icon: "▦", label: "Dashboard", to: Route::DashboardPlaceholder {}, active: dashboard_active }
                     PlaceholderItem { icon: "#", label: "Channels" }
@@ -174,5 +184,85 @@ mod tests {
             Route::DashboardPlaceholder {}
         );
         assert!(!other);
+    }
+
+    // ── Chrome-snapshot harness ──────────────────────────────────────────
+    //
+    // SSR-renders the Sidebar inside a synthetic Router so the inner `Link`s
+    // see a router context (without one, `dioxus_router::Link` panics in
+    // debug builds — see Link.rs:158). We don't use the production `Route`
+    // enum because that would drag in `AppShell`'s session/theme contexts;
+    // a one-route test enum is enough to render the sidebar's markup.
+
+    /// Minimal route enum for the SSR harness — single page at `/` so the
+    /// memory-history default lands somewhere routable.
+    #[derive(Clone, Routable, Debug, PartialEq)]
+    #[rustfmt::skip]
+    enum TestRoute {
+        #[route("/")]
+        SidebarHarness {},
+    }
+
+    #[component]
+    fn SidebarHarness() -> Element {
+        rsx! { Sidebar { active: Route::DashboardPlaceholder {} } }
+    }
+
+    /// Build a SidebarHarness VirtualDom and SSR it to a string.
+    fn render_sidebar_harness() -> String {
+        let mut dom = VirtualDom::new(|| {
+            rsx! { Router::<TestRoute> {} }
+        });
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    #[test]
+    fn sidebar_nav_landmark_has_primary_id_and_aria_label() {
+        let html = render_sidebar_harness();
+        // Attribute order isn't part of the contract; assert each attribute
+        // independently inside the same `<nav …>` open tag.
+        assert!(html.contains("<nav "), "rendered html missing <nav: {html}");
+        assert!(
+            html.contains(r#"aria-label="Primary""#),
+            "missing aria-label='Primary' in nav: {html}"
+        );
+        assert!(
+            html.contains(r#"id="primary-nav""#),
+            "missing id='primary-nav' in nav: {html}"
+        );
+        assert!(
+            html.contains(r#"tabindex="-1""#),
+            "missing tabindex='-1' on nav (so the skip-link target is programmatically focusable): {html}"
+        );
+    }
+
+    #[test]
+    fn dashboard_nav_item_renders_aria_current_page_exactly_once() {
+        let html = render_sidebar_harness();
+        // The Phase-1 active route is `DashboardPlaceholder`. Exactly one
+        // `aria-current="page"` should appear in the SSR output — multiple
+        // would mean two nav items are claiming current-page state, which
+        // confuses screen readers.
+        let count = html.matches(r#"aria-current="page""#).count();
+        assert_eq!(count, 1, "expected aria-current='page' once, got {count} in {html}");
+    }
+
+    #[test]
+    fn placeholder_items_carry_aria_disabled_and_tabindex_minus_one() {
+        let html = render_sidebar_harness();
+        // 16 placeholder items in Phase 1 (3 × Server, 7 × Moderation,
+        // 3 × Automation, 3 × Admin). Pin the count so a future refactor
+        // that drops one is a flagged regression rather than a silent
+        // removal.
+        let disabled = html.matches(r#"aria-disabled="true""#).count();
+        let tabindex_minus = html.matches(r#"tabindex="-1""#).count();
+        // 16 placeholders + the `<nav>` itself carries `tabindex=-1` for
+        // the skip-link target, so 17 total `tabindex="-1"` attributes.
+        assert_eq!(disabled, 16, "expected 16 aria-disabled placeholders, got {disabled}");
+        assert_eq!(
+            tabindex_minus, 17,
+            "expected 17 tabindex='-1' (16 placeholders + nav landmark), got {tabindex_minus}"
+        );
     }
 }

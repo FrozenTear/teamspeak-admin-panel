@@ -80,6 +80,86 @@ pub fn AppShell() -> Element {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use dioxus::prelude::*;
+
+    use crate::client::dioxus::DioxusSession;
+    use crate::client::storage::MemoryStore;
+    use crate::client::store::AuthState;
+    use crate::ui::theme::{Theme, ThemeContext};
+    use ts6_manager_shared::auth::UserInfo;
+
+    use super::Route;
+
+    /// Wraps the production `Route::DashboardPlaceholder` inside an
+    /// authenticated session + a Dark theme so `AppShell` renders the full
+    /// chrome instead of bouncing to login. Pure SSR — no async, no async
+    /// hooks, no browser-only fallbacks.
+    #[component]
+    fn AppShellHarness() -> Element {
+        use_context_provider(|| DioxusSession {
+            state: SyncSignal::new_maybe_sync(AuthState::Authenticated {
+                access: "stub-access".into(),
+                refresh: "stub-refresh".into(),
+                user: UserInfo {
+                    id: 1,
+                    username: "rsoot".into(),
+                    display_name: "Robert Soot".into(),
+                    role: "admin".into(),
+                },
+            }),
+            storage: Arc::new(MemoryStore::new()),
+        });
+        use_context_provider(|| ThemeContext {
+            theme: Signal::new(Theme::Dark),
+        });
+        rsx! { Router::<Route> {} }
+    }
+
+    fn render_app_shell() -> String {
+        let mut dom = VirtualDom::new(AppShellHarness);
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    /// `components.md` §11.4 acceptance: the skip-to-navigation link is the
+    /// chrome's first focusable anchor and points at the sidebar's `<nav>`.
+    /// We assert ordering (skip-link emitted before the nav landmark) so a
+    /// future refactor that moves the link below the chrome is a flagged
+    /// regression.
+    #[test]
+    fn skip_link_precedes_primary_nav_landmark_in_app_shell() {
+        let html = render_app_shell();
+        let skip = html
+            .find(r#"class="skip-link""#)
+            .expect("skip-link not rendered in AppShell");
+        let nav_target = html
+            .find(r#"id="primary-nav""#)
+            .expect("primary-nav target not rendered in Sidebar");
+        assert!(
+            skip < nav_target,
+            "skip-link must appear before its target nav (skip @ {skip}, nav @ {nav_target}): {html}"
+        );
+        assert!(
+            html.contains(r##"href="#primary-nav""##),
+            "skip-link href must point at #primary-nav: {html}"
+        );
+    }
+
+    #[test]
+    fn app_shell_includes_both_chrome_landmarks() {
+        let html = render_app_shell();
+        // Belt-and-braces against an AppShell refactor that hides the
+        // sidebar or header — the chrome contract is "always both" for the
+        // authenticated layout.
+        assert!(html.contains(r#"<aside class="sidebar""#), "missing sidebar landmark: {html}");
+        assert!(html.contains(r#"role="banner""#), "missing header banner role: {html}");
+    }
+}
+
 /// Pull the current location path from the SPA URL. On the server (SSR)
 /// the navigator's serialised representation is used directly. The
 /// returned string is always a leading-slash path; `LoginPage::is_safe_internal_path`

@@ -6312,6 +6312,7 @@ dependencies = [
  "chrono",
  "dioxus",
  "dioxus-server",
+ "dioxus-ssr",
  "futures",
  "gloo-net",
  "governor",
