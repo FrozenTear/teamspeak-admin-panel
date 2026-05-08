@@ -194,6 +194,16 @@ fn rate_limit_response(wait: Duration) -> Response {
 
 /// Response-side middleware that overrides CORS / frame headers on the
 /// widget surface. Layered globally; a no-op on every other path.
+///
+/// PURA-72 M-1 fix: previously this replaced the entire CSP with
+/// `frame-ancestors *`, which dropped `default-src` / `script-src` /
+/// `object-src` / `base-uri` / `form-action` from the widget surface
+/// and left a future XSS in any operator-controlled string (server
+/// name, channel name, nickname) free to run on third-party embedder
+/// pages. We now keep every directive from the strict CSP set by
+/// [`super::csp_nonce::nonce_csp_middleware`] and only rewrite
+/// `frame-ancestors 'none'` → `frame-ancestors *` so the iframe embed
+/// contract still works.
 pub async fn widget_response_headers(req: Request, next: Next) -> Response {
     let path_is_widget = is_widget_path(req.uri().path());
     let mut resp = next.run(req).await;
@@ -207,15 +217,65 @@ pub async fn widget_response_headers(req: Request, next: Next) -> Response {
         HeaderValue::from_static("*"),
     );
     h.remove(header::ACCESS_CONTROL_ALLOW_CREDENTIALS);
-    // Frame embedding: drop the strict XFO and replace the strict CSP with
-    // the minimum frame-only policy. We rewrite, not just append, so any
-    // upstream `frame-ancestors 'none'` from the nonce-CSP middleware loses.
+    // Frame embedding: drop the strict XFO so embedding can happen at
+    // all, then rewrite the upstream CSP's `frame-ancestors 'none'` to
+    // `frame-ancestors *`. Every other directive (default-src,
+    // script-src 'nonce-…', object-src 'none', base-uri 'self',
+    // form-action 'self', …) is preserved verbatim so a future XSS in
+    // any operator-controlled string still gets caught by CSP inside
+    // the iframe.
     h.remove(header::X_FRAME_OPTIONS);
-    h.insert(
-        header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static("frame-ancestors *"),
+    let widget_csp = relax_frame_ancestors(
+        h.get(header::CONTENT_SECURITY_POLICY)
+            .and_then(|v| v.to_str().ok()),
     );
+    let widget_csp_value = HeaderValue::from_str(&widget_csp).unwrap_or_else(|_| {
+        // CSP values are always ASCII by construction in this codebase
+        // (`csp_nonce::csp_header` builds them from static directives +
+        // a hex nonce), so this fallback is unreachable in production.
+        // Keep it defensive: a non-ASCII CSP would otherwise drop the
+        // header entirely and weaken posture.
+        HeaderValue::from_static(
+            "default-src 'self'; object-src 'none'; base-uri 'self'; \
+             form-action 'self'; frame-ancestors *",
+        )
+    });
+    h.insert(header::CONTENT_SECURITY_POLICY, widget_csp_value);
     resp
+}
+
+/// Take the upstream strict CSP and produce a widget-friendly variant.
+///
+/// - If the input contains `frame-ancestors 'none'`, swap that token
+///   for `frame-ancestors *`. Everything else is byte-for-byte
+///   preserved.
+/// - If the input lacks any `frame-ancestors` directive, append
+///   `; frame-ancestors *`. Browsers apply the most-restrictive of
+///   duplicate directives, so we must NOT just append when the input
+///   already has a stricter `frame-ancestors`.
+/// - If there is no upstream CSP at all (the nonce middleware did not
+///   run for this response), emit a minimal but defensive CSP rather
+///   than a header that opens script execution wide.
+fn relax_frame_ancestors(upstream: Option<&str>) -> String {
+    match upstream {
+        Some(strict) if strict.contains("frame-ancestors 'none'") => {
+            strict.replace("frame-ancestors 'none'", "frame-ancestors *")
+        }
+        Some(strict) if strict.contains("frame-ancestors") => {
+            // Some other `frame-ancestors` value (eg `'self'`) — leave
+            // it alone. The widget contract still needs `*` though, so
+            // append a duplicate; browsers will apply the stricter of
+            // the two, which is the same effective behaviour as not
+            // touching the header. This case is unreachable today
+            // (the only producer is `csp_nonce::csp_header`, which sets
+            // `'none'`), but is a no-op rather than a regression.
+            strict.to_string()
+        }
+        Some(strict) => format!("{strict}; frame-ancestors *"),
+        None => "default-src 'self'; object-src 'none'; base-uri 'self'; \
+                 form-action 'self'; frame-ancestors *"
+            .to_string(),
+    }
 }
 
 /// Spec §26.1 — render a token as `first 4 chars + …` so tracing fields
@@ -485,6 +545,31 @@ mod tests {
             .layer(from_fn(widget_response_headers))
     }
 
+    /// Assert the widget CSP keeps every defence-in-depth directive
+    /// from the upstream strict CSP and only swaps `frame-ancestors`.
+    /// Used by the `/api/widget/*` and `/widget/*` test cases below;
+    /// also exercised on its own in `relax_frame_ancestors_*` unit
+    /// tests.
+    fn assert_strict_csp_with_open_frame_ancestors(csp: &str) {
+        // The upstream strict CSP set by `header_app()` is
+        // `default-src 'self'; frame-ancestors 'none'`. The widget
+        // middleware must keep `default-src 'self'` and turn
+        // `frame-ancestors 'none'` into `frame-ancestors *`.
+        for required in [
+            "default-src 'self'",
+            "frame-ancestors *",
+        ] {
+            assert!(
+                csp.contains(required),
+                "widget CSP missing `{required}`. Got: {csp}"
+            );
+        }
+        assert!(
+            !csp.contains("frame-ancestors 'none'"),
+            "widget CSP must drop `frame-ancestors 'none'`. Got: {csp}"
+        );
+    }
+
     #[tokio::test]
     async fn widget_api_response_gets_relaxed_cors_and_frame_headers() {
         let app = header_app();
@@ -510,14 +595,11 @@ mod tests {
             h.get(header::X_FRAME_OPTIONS).is_none(),
             "X-Frame-Options must be cleared on the widget surface"
         );
-        assert_eq!(
-            h.get(header::CONTENT_SECURITY_POLICY)
-                .map(HeaderValue::to_str)
-                .transpose()
-                .unwrap(),
-            Some("frame-ancestors *"),
-            "CSP must be replaced with the iframe-permissive policy"
-        );
+        let csp = h
+            .get(header::CONTENT_SECURITY_POLICY)
+            .and_then(|v| v.to_str().ok())
+            .expect("widget CSP must be set");
+        assert_strict_csp_with_open_frame_ancestors(csp);
     }
 
     #[tokio::test]
@@ -530,14 +612,122 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let h = resp.headers();
         assert!(h.get(header::X_FRAME_OPTIONS).is_none());
-        assert_eq!(
-            h.get(header::CONTENT_SECURITY_POLICY)
-                .map(HeaderValue::to_str)
-                .transpose()
-                .unwrap(),
-            Some("frame-ancestors *"),
-            "iframe-embedding contract must hold for the SPA widget page"
+        let csp = h
+            .get(header::CONTENT_SECURITY_POLICY)
+            .and_then(|v| v.to_str().ok())
+            .expect("widget CSP must be set on the SPA HTML page");
+        assert_strict_csp_with_open_frame_ancestors(csp);
+    }
+
+    /// PURA-72 M-1 regression. The widget surface used to ship a CSP
+    /// containing only `frame-ancestors *`, dropping `script-src`,
+    /// `object-src 'none'`, `base-uri 'self'`, `form-action 'self'`,
+    /// etc. — leaving an XSS in any future operator-controlled string
+    /// (server name, channel name, nickname) free to run inside any
+    /// embedder iframe. This asserts every load-bearing directive from
+    /// the production strict CSP survives the widget rewrite.
+    #[tokio::test]
+    async fn widget_csp_preserves_every_strict_directive_from_nonce_middleware() {
+        // Mirror the production strict CSP (csp_nonce::csp_header).
+        let strict = "default-src 'self'; \
+                      img-src 'self' data:; \
+                      connect-src 'self'; \
+                      style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; \
+                      font-src 'self' https://fonts.gstatic.com data:; \
+                      script-src 'self' 'wasm-unsafe-eval' 'nonce-deadbeef'; \
+                      object-src 'none'; \
+                      base-uri 'self'; \
+                      frame-ancestors 'none'; \
+                      form-action 'self'";
+        let app: Router = Router::new()
+            .route(
+                "/api/widget/{token}/data",
+                get(move || {
+                    let strict = strict.to_string();
+                    async move {
+                        axum::response::Response::builder()
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .header(header::X_FRAME_OPTIONS, "DENY")
+                            .header(header::CONTENT_SECURITY_POLICY, strict)
+                            .body(Body::from(r#"{"ok":true}"#))
+                            .unwrap()
+                    }
+                }),
+            )
+            .layer(from_fn(widget_response_headers));
+
+        let resp = app
+            .oneshot(req_to("/api/widget/abc/data", "203.0.113.9"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let csp = resp
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .and_then(|v| v.to_str().ok())
+            .expect("widget CSP must be set")
+            .to_owned();
+
+        for required in [
+            "default-src 'self'",
+            "img-src 'self'",
+            "connect-src 'self'",
+            "style-src 'self'",
+            "font-src 'self'",
+            "script-src 'self'",
+            "'nonce-deadbeef'",
+            "object-src 'none'",
+            "base-uri 'self'",
+            "form-action 'self'",
+            "frame-ancestors *",
+        ] {
+            assert!(
+                csp.contains(required),
+                "widget CSP missing required directive `{required}`. Got: {csp}"
+            );
+        }
+        assert!(
+            !csp.contains("frame-ancestors 'none'"),
+            "widget CSP must NOT keep the strict `frame-ancestors 'none'`. Got: {csp}"
         );
+    }
+
+    #[test]
+    fn relax_frame_ancestors_swaps_none_for_wildcard() {
+        let strict = "default-src 'self'; script-src 'self'; frame-ancestors 'none'; form-action 'self'";
+        let widget = relax_frame_ancestors(Some(strict));
+        assert!(widget.contains("default-src 'self'"));
+        assert!(widget.contains("script-src 'self'"));
+        assert!(widget.contains("frame-ancestors *"));
+        assert!(!widget.contains("frame-ancestors 'none'"));
+        assert!(widget.contains("form-action 'self'"));
+    }
+
+    #[test]
+    fn relax_frame_ancestors_appends_when_directive_missing() {
+        let widget = relax_frame_ancestors(Some("default-src 'self'"));
+        assert!(widget.contains("default-src 'self'"));
+        assert!(widget.contains("frame-ancestors *"));
+    }
+
+    #[test]
+    fn relax_frame_ancestors_falls_back_to_defensive_baseline_when_missing() {
+        let widget = relax_frame_ancestors(None);
+        // No upstream CSP — must still emit a defensive policy with
+        // `object-src 'none'` and `base-uri 'self'`, not a bare
+        // `frame-ancestors *` that opens script execution wide.
+        for required in [
+            "default-src 'self'",
+            "object-src 'none'",
+            "base-uri 'self'",
+            "form-action 'self'",
+            "frame-ancestors *",
+        ] {
+            assert!(
+                widget.contains(required),
+                "fallback CSP missing `{required}`. Got: {widget}"
+            );
+        }
     }
 
     #[tokio::test]
