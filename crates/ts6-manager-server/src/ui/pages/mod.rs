@@ -6,7 +6,9 @@
 //! by sibling PURA-5 children.
 
 mod dashboard_placeholder;
+mod home;
 mod login;
 
 pub use dashboard_placeholder::DashboardPlaceholder;
+pub use home::Home;
 pub use login::LoginPage;

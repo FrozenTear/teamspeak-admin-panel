@@ -116,13 +116,13 @@ pub fn Sidebar(props: SidebarProps) -> Element {
     rsx! {
         aside { class: "sidebar",
             // Brand sits OUTSIDE `<nav aria-label="Primary">` so the
-            // primary-nav landmark contains only route entries — and a plain
-            // `<a>` (rather than `dioxus_router::Link`) keeps the brand
-            // from auto-rendering `aria-current="page"` whenever the
-            // dashboard happens to be the current route. Click behaviour is
-            // a full-page navigation back to `/`; brand-click is rare and
-            // a reload from `/` to `/` is effectively a no-op.
-            a { class: "brand", href: "/",
+            // primary-nav landmark contains only route entries. The brand
+            // points at `Route::Home {}` (the `/` route), distinct from the
+            // dashboard's `/dashboard`, so `dioxus_router::Link`'s automatic
+            // `aria-current="page"` only ever fires on at most one element
+            // at a time — the brand on `/`, the Dashboard NavItem on
+            // `/dashboard`, and never both (PURA-37).
+            Link { to: Route::Home {}, class: "brand",
                 span { class: "mark" }
                 "TS6 Manager"
             }
@@ -193,13 +193,24 @@ mod tests {
     // debug builds — see Link.rs:158). We don't use the production `Route`
     // enum because that would drag in `AppShell`'s session/theme contexts;
     // a one-route test enum is enough to render the sidebar's markup.
+    //
+    // The harness pre-seeds a `MemoryHistory` at `/dashboard` so the
+    // production `Route::DashboardPlaceholder {}` Link inside the sidebar
+    // (which serializes to `/dashboard`) matches the router's current URL —
+    // that's how `dioxus_router::Link` decides to emit `aria-current="page"`
+    // (Link.rs:194). The brand Link's `to: Route::Home {}` serializes to
+    // `/`, so it does NOT match `/dashboard` and stays clean.
 
-    /// Minimal route enum for the SSR harness — single page at `/` so the
-    /// memory-history default lands somewhere routable.
+    use std::rc::Rc;
+
+    use dioxus::history::{History, MemoryHistory};
+
+    /// Minimal route enum for the SSR harness — single page at `/dashboard`
+    /// so the memory-history seed below lands somewhere routable.
     #[derive(Clone, Routable, Debug, PartialEq)]
     #[rustfmt::skip]
     enum TestRoute {
-        #[route("/")]
+        #[route("/dashboard")]
         SidebarHarness {},
     }
 
@@ -208,13 +219,45 @@ mod tests {
         rsx! { Sidebar { active: Route::DashboardPlaceholder {} } }
     }
 
-    /// Build a SidebarHarness VirtualDom and SSR it to a string.
+    /// Build a SidebarHarness VirtualDom seeded at `/dashboard` and SSR it.
     fn render_sidebar_harness() -> String {
-        let mut dom = VirtualDom::new(|| {
+        render_sidebar_harness_at("/dashboard")
+    }
+
+    fn render_sidebar_harness_at(path: &str) -> String {
+        // Inject the seeded history into the root scope BEFORE the Router
+        // calls `dioxus_history::history()` — without this, the router
+        // would fall back to `MemoryHistory::default()` (initial path `/`)
+        // and the Dashboard NavItem's Link wouldn't auto-emit
+        // `aria-current`. `VirtualDom::new` requires a non-capturing
+        // `fn` pointer for the root component, so the seed must be
+        // injected via `with_root_context` rather than a closure.
+        let history: Rc<dyn History> = Rc::new(MemoryHistory::with_initial_path(path));
+        fn root() -> Element {
             rsx! { Router::<TestRoute> {} }
-        });
+        }
+        let mut dom = VirtualDom::new(root).with_root_context(history);
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
+    }
+
+    /// Slice out the open tag of the brand `<a>` (start to first `>`) so we
+    /// can assert about its attributes without snagging attributes from
+    /// nested elements or sibling links.
+    fn brand_open_tag(html: &str) -> &str {
+        let start = html
+            .find(r#"class="brand""#)
+            .expect("brand element not found in sidebar render");
+        // `<a class="brand"` — walk backwards from `class=` to the `<a` so
+        // the slice covers the whole open tag from the leading `<`.
+        let tag_open = html[..start]
+            .rfind('<')
+            .expect("brand `class=` attribute is not inside an open tag");
+        let tag_close = html[tag_open..]
+            .find('>')
+            .expect("brand open tag is unterminated")
+            + tag_open;
+        &html[tag_open..=tag_close]
     }
 
     #[test]
@@ -240,12 +283,32 @@ mod tests {
     #[test]
     fn dashboard_nav_item_renders_aria_current_page_exactly_once() {
         let html = render_sidebar_harness();
-        // The Phase-1 active route is `DashboardPlaceholder`. Exactly one
-        // `aria-current="page"` should appear in the SSR output — multiple
-        // would mean two nav items are claiming current-page state, which
-        // confuses screen readers.
+        // The Phase-1 active route is `DashboardPlaceholder` (rendered at
+        // `/dashboard`). Exactly one `aria-current="page"` should appear in
+        // the SSR output — multiple would mean two nav items (or the brand)
+        // are claiming current-page state, which confuses screen readers.
         let count = html.matches(r#"aria-current="page""#).count();
         assert_eq!(count, 1, "expected aria-current='page' once, got {count} in {html}");
+    }
+
+    #[test]
+    fn brand_link_does_not_emit_aria_current_on_dashboard() {
+        // PURA-37 acceptance: visiting `/dashboard` must put `aria-current=
+        // "page"` on the Dashboard NavItem and NOT on the brand. The brand
+        // `Link { to: Route::Home {} }` serializes to `/`, so it diverges
+        // from the dashboard URL and `dioxus_router::Link` correctly omits
+        // the attribute. Pinning this means a future re-collapse of `/`
+        // and `/dashboard` would fail the chrome-snapshot gate.
+        let html = render_sidebar_harness_at("/dashboard");
+        let brand_tag = brand_open_tag(&html);
+        assert!(
+            !brand_tag.contains(r#"aria-current="page""#),
+            "brand must not emit aria-current on /dashboard, got: {brand_tag}"
+        );
+        assert!(
+            html.contains(r#"aria-current="page""#),
+            "Dashboard NavItem should still emit aria-current somewhere in: {html}"
+        );
     }
 
     #[test]

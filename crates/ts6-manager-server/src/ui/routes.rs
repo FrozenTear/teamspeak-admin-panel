@@ -1,14 +1,20 @@
 //! Route enum for the operator SPA.
 //!
 //! - `/login` is its own surface (matches spec §28.2 — login has no chrome).
-//! - Every authenticated route renders inside [`AppShell`] (sidebar + header
-//!   + main outlet, per `components.md` §11). PURA-5's remaining children
-//!   slot more pages into the same layout block.
+//! - `/` is a typed `Home` route so the sidebar brand can use the SPA
+//!   `Link` primitive (`components.md` §11.2). Its component immediately
+//!   `nav.replace`s to `/dashboard`; a real landing surface is Phase 2.
+//! - `/dashboard` is the dashboard surface. Keeping it on a distinct path
+//!   from the brand-target `/` is what lets `dioxus_router::Link` auto-emit
+//!   `aria-current="page"` on exactly one element (PURA-37).
+//! - Every authenticated route renders inside [`AppShell`] (sidebar +
+//!   header + main outlet, per `components.md` §11). PURA-5's remaining
+//!   children slot more pages into the same layout block.
 
 use dioxus::prelude::*;
 
 use crate::ui::layout::AppShell;
-use crate::ui::pages::{DashboardPlaceholder, LoginPage};
+use crate::ui::pages::{DashboardPlaceholder, Home, LoginPage};
 
 #[rustfmt::skip]
 #[derive(Clone, Debug, PartialEq, Routable)]
@@ -18,5 +24,8 @@ pub enum Route {
 
     #[layout(AppShell)]
     #[route("/")]
+    Home {},
+
+    #[route("/dashboard")]
     DashboardPlaceholder {},
 }
