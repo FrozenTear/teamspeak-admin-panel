@@ -20,14 +20,20 @@
 //!
 //! Two non-negotiables, enforced at construction time:
 //!
-//! - **No plaintext SSH password, key blob, or API key may be referenced
-//!   in `command`.** [`AuditEntry::for_command`] takes only the wire
-//!   ServerQuery line, which is constructed from public fields (`use sid=…`,
-//!   `clientlist -uid`, etc.). Operator credentials never travel through
-//!   command construction.
+//! - **No plaintext SSH password, key blob, or API key may land in
+//!   `command_line`.** Every public constructor pipes its incoming wire line
+//!   through [`redact_credentials`] (PURA-83), which replaces the value of
+//!   any `<name>=<value>` token whose name ends (case-insensitive) in
+//!   `password`, `secret`, `token`, or `key` with `<redacted>` before the
+//!   value is stored. The unredacted form is never assigned to
+//!   [`AuditEntry::command_line`], so a future caller of `persist` can never
+//!   re-leak it.
 //! - **`error_msg` may surface upstream messages but never the raw key,
 //!   key path, or agent socket.** Caller is responsible for substituting
-//!   sensitive fragments before passing them in.
+//!   sensitive fragments before passing them in. (Per spec §6.10 and the
+//!   PURA-83 scope, upstream `error id=…` messages don't echo input
+//!   parameters today; revisit only if a TS6 build is observed echoing
+//!   them.)
 
 use std::time::Duration;
 
@@ -108,7 +114,7 @@ impl AuditEntry {
         command_line: impl Into<String>,
         latency: Duration,
     ) -> Self {
-        let command_line = command_line.into();
+        let command_line = redact_credentials(&command_line.into());
         Self {
             server_config_id,
             virtual_server_id,
@@ -133,7 +139,7 @@ impl AuditEntry {
         upstream_msg: impl Into<String>,
         latency: Duration,
     ) -> Self {
-        let command_line = command_line.into();
+        let command_line = redact_credentials(&command_line.into());
         Self {
             server_config_id,
             virtual_server_id,
@@ -157,7 +163,7 @@ impl AuditEntry {
         error_msg: impl Into<String>,
         latency: Duration,
     ) -> Self {
-        let command_line = command_line.into();
+        let command_line = redact_credentials(&command_line.into());
         Self {
             server_config_id,
             virtual_server_id,
@@ -262,6 +268,76 @@ impl AuditEntry {
 /// audit grouping key.
 fn extract_command(line: &str) -> String {
     line.split_whitespace().next().unwrap_or("").to_string()
+}
+
+/// Replace credential-bearing parameter values in a wire ServerQuery line.
+///
+/// Walks ASCII-whitespace-delimited tokens. For each `<name>=<value>` token
+/// whose `<name>` ends (case-insensitive) in one of [`CREDENTIAL_SUFFIXES`]
+/// (`password`, `secret`, `token`, `key`), `<value>` is replaced with
+/// `<redacted>`. The boundary at the end of the value is the next ASCII
+/// whitespace; per spec §10.4 the upstream escape table runs in
+/// [`crate::sshbridge::wire`] before any line reaches this module, so a value
+/// never itself contains an unescaped space — the whitespace boundary is
+/// sufficient.
+///
+/// Command families enumerated by spec §10.4 / §6.10 that exercise this
+/// redactor: `clientupdate client_login_password=…`,
+/// `clientadd ..._password=…`, `tokendelete tokenkey=…`, `customset key=…`.
+///
+/// Tokens without `=`, tokens with non-credential names (`clid=`, `cid=`,
+/// `sid=`, `cgid=`), and an `=` immediately preceded by whitespace (no name)
+/// pass through untouched.
+fn redact_credentials(input: &str) -> String {
+    const REDACTED: &str = "<redacted>";
+    let mut out = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let ws_start = i;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if ws_start != i {
+            out.push_str(&input[ws_start..i]);
+        }
+        if i >= bytes.len() {
+            break;
+        }
+
+        let tok_start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let token = &input[tok_start..i];
+
+        if let Some(eq_offset) = token.find('=') {
+            let name = &token[..eq_offset];
+            if name_is_credential(name) {
+                out.push_str(name);
+                out.push('=');
+                out.push_str(REDACTED);
+                continue;
+            }
+        }
+        out.push_str(token);
+    }
+
+    out
+}
+
+/// Param-name suffixes whose value MUST be redacted before the audit line is
+/// emitted or persisted. Kept small and conservative so non-credential params
+/// (`clid=`, `cid=`, `sid=`, `cgid=`) pass through unchanged.
+const CREDENTIAL_SUFFIXES: &[&str] = &["password", "secret", "token", "key"];
+
+fn name_is_credential(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let lower = name.to_ascii_lowercase();
+    CREDENTIAL_SUFFIXES.iter().any(|s| lower.ends_with(s))
 }
 
 #[cfg(test)]
@@ -380,6 +456,150 @@ mod tests {
             body.contains(r#"target: "sshbridge::audit::persist_failed""#),
             "emit_persist_failed must use target `sshbridge::audit::persist_failed`"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // PURA-83 — credential redaction.
+    //
+    // SecurityEngineer's contract (issue PURA-83): the value of any
+    // `<name>=<value>` token whose name ends in (password|secret|token|key)
+    // (case-insensitive) MUST be replaced with `<redacted>` before the line
+    // is stored on `AuditEntry::command_line`. The `command_line` field is
+    // the only place the wire line is kept, so once redaction lands at
+    // construction time, neither `emit` nor `persist` can re-leak the secret.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn redact_replaces_password_value_at_construction() {
+        // The exact assertion from the issue's "Regression test" section.
+        let e = AuditEntry::success(
+            7,
+            Some(3),
+            Some(42),
+            "clientupdate client_login_password=hunter2",
+            Duration::from_millis(15),
+        );
+        assert!(e.command_line.contains("<redacted>"));
+        assert!(!e.command_line.contains("hunter2"));
+        assert_eq!(e.command_line, "clientupdate client_login_password=<redacted>");
+    }
+
+    #[test]
+    fn redact_clientadd_channel_and_server_password_pair() {
+        // §10.4 line 3158-3170: clientadd carries two base64-sha1 password
+        // params side-by-side. The base64 alphabet includes `=` padding, so
+        // the redactor must terminate the value at whitespace, not at `=`.
+        let r = redact_credentials(
+            "clientadd client_default_channel_password=AAAA== client_server_password=BBBBB==",
+        );
+        assert!(!r.contains("AAAA"));
+        assert!(!r.contains("BBBBB"));
+        assert_eq!(
+            r,
+            "clientadd client_default_channel_password=<redacted> client_server_password=<redacted>",
+        );
+    }
+
+    #[test]
+    fn redact_tokendelete_tokenkey() {
+        // §6.10 line 4164/4175: `tokenkey=…`. Name ends in `key` so the
+        // value is redacted via the `key` suffix rule.
+        let r = redact_credentials("tokendelete tokenkey=abcd1234secret");
+        assert!(!r.contains("abcd1234secret"));
+        assert_eq!(r, "tokendelete tokenkey=<redacted>");
+    }
+
+    #[test]
+    fn redact_customset_key_param() {
+        // `customset key=login_password value=…`. The `key=` token matches
+        // the `key` suffix and gets redacted. The `value=` half is NOT
+        // matched by the param-name rule alone (its name is `value`); per
+        // PURA-83's "Out of scope" note we follow the literal name-suffix
+        // rule. Command-specific value redaction (e.g. inferring the value
+        // is a secret because `key=login_password`) is a separate follow-up
+        // owned by SecurityEngineer if observed in practice.
+        let r = redact_credentials("customset key=login_password value=hunter2");
+        assert!(!r.contains("login_password"));
+        assert!(r.contains("key=<redacted>"));
+    }
+
+    #[test]
+    fn redact_value_with_internal_equals_stops_at_whitespace() {
+        // Per §10.4 escape-applied wire lines never contain unescaped
+        // whitespace inside a single value, so the boundary at the next
+        // ASCII space is sufficient. A base64-padded value with `=` inside
+        // must NOT cause the redactor to swallow the next param.
+        let r = redact_credentials("a=1 password=AAA==BBB c=2");
+        assert_eq!(r, "a=1 password=<redacted> c=2");
+    }
+
+    #[test]
+    fn redact_is_case_insensitive_on_param_name() {
+        let r = redact_credentials("clientupdate Client_Login_PASSWORD=hunter2");
+        assert!(!r.contains("hunter2"));
+        assert!(r.contains("Client_Login_PASSWORD=<redacted>"));
+    }
+
+    #[test]
+    fn redact_leaves_innocuous_params_alone() {
+        // Innocuous TS6 params that happen to use `=` must pass through.
+        // `clid`, `cid`, `sid`, `cgid` — none ends in a credential suffix.
+        let r = redact_credentials("clientmove clid=99 cid=2");
+        assert_eq!(r, "clientmove clid=99 cid=2");
+        let r2 = redact_credentials("use sid=1");
+        assert_eq!(r2, "use sid=1");
+    }
+
+    #[test]
+    fn redact_handles_empty_and_no_eq_tokens() {
+        assert_eq!(redact_credentials(""), "");
+        assert_eq!(redact_credentials("clientlist -uid"), "clientlist -uid");
+        // A bare `=value` (no name) does NOT match — empty name is not a
+        // credential suffix.
+        assert_eq!(redact_credentials("foo =bar"), "foo =bar");
+    }
+
+    #[test]
+    fn redact_applies_in_upstream_error_constructor() {
+        let e = AuditEntry::upstream_error(
+            1,
+            None,
+            None,
+            "clientadd client_server_password=hunter2",
+            2568,
+            "no",
+            Duration::from_millis(5),
+        );
+        assert!(!e.command_line.contains("hunter2"));
+        assert!(e.command_line.contains("<redacted>"));
+    }
+
+    #[test]
+    fn redact_applies_in_transport_constructor() {
+        let e = AuditEntry::transport(
+            1,
+            None,
+            None,
+            "tokendelete tokenkey=abcd1234secret",
+            "channel closed",
+            Duration::from_millis(1),
+        );
+        assert!(!e.command_line.contains("abcd1234secret"));
+        assert!(e.command_line.contains("<redacted>"));
+    }
+
+    #[test]
+    fn redact_preserves_command_keyword_for_extract_command() {
+        // After redaction the first whitespace token must still be the
+        // command keyword so `extract_command` keeps grouping cheaply.
+        let e = AuditEntry::success(
+            1,
+            None,
+            None,
+            "clientupdate client_login_password=hunter2",
+            Duration::from_millis(1),
+        );
+        assert_eq!(e.command, "clientupdate");
     }
 
     /// PURA-79 hard-rule: a DB persist failure MUST NOT cancel the in-flight
