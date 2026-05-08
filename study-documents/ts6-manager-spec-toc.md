@@ -4,6 +4,8 @@
 
 > **Status:** Draft ToC for review. Chapters marked **[scope]** below show estimated page counts. Reply with which chapters to keep, drop, or shorten before I commit to the full draft.
 
+> **Implementation deviation.** This document describes the upstream reference. The clean-room implementation in this repo uses **SurrealDB v3** instead of SQLite per impl-plan §1 D8 (board-ratified 2026-05-07). Sections that mention SQLite, `journal_mode`, `SQLITE_FULL`, sqlx, etc. describe the upstream contract; map them onto SurrealDB equivalents at implementation time.
+
 ---
 
 ## Reference

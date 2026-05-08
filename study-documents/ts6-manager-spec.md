@@ -2,6 +2,8 @@
 
 A behavioural specification for an independent reimplementation of the TS6 Manager system. This document is written for an implementer who is not permitted to read the source of the reference system.
 
+> **Implementation deviation.** This document describes the upstream reference. The clean-room implementation in this repo uses **SurrealDB v3** instead of SQLite per impl-plan §1 D8 (board-ratified 2026-05-07). Sections that mention SQLite, `journal_mode`, `SQLITE_FULL`, sqlx, etc. describe the upstream contract; map them onto SurrealDB equivalents at implementation time (record field names for column names, SurrealDB exports for `.sqlite` backups, `write-failure` / `transaction-conflict` / `capacity-pressure` for the three SQLite-full boundaries — see impl-plan §3.2, §3.8, §6 R8).
+
 ---
 
 ## Reference and Provenance

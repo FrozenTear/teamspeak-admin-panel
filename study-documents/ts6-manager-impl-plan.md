@@ -17,7 +17,9 @@ These were resolved before drafting; the rest of the plan flows from them.
 | D5 | Voice protocol path | **Fork `tsproto` / `tsclientlib`, port the TS6 handshake delta from the spec** | TS6 servers are wire-compatible with TS3 clients on most of the stack (UDP framing, Opus voice, command channel). The handshake / shared-secret derivation changed (see `Splamy/TS3AudioBot#1078`). Forking buys ~70% of the Chapter 19 work for free; the delta is implemented from the spec only. Cleanroom-safe: tsproto is independent of the reference system. |
 | D6 | Video transport | **MoQ over WebTransport + WebCodecs** instead of WebRTC | Conscious deviation from spec Chapter 24's external contract. Better fit for one-to-many public viewers; Chapter 24's HTTP control plane is redesigned around MoQ. Cost: custom WebCodecs playback in Dioxus, possible older-iOS gap. |
 | D7 | Optional cache | Same as spec — optional Valkey/Redis, graceful degradation | No reason to deviate |
-| D8 | Database | **SQLite** (matches spec's external contract: column names appear in JSON wire types and operator backups) | Schema is part of external contract |
+| D8 | Database | **SurrealDB v3** (board-ratified deviation 2026-05-07; supersedes original SQLite + sqlx choice)[^d8] | Spec's JSON wire-type keys map verbatim to SurrealDB field names; operator backups become SurrealDB exports rather than SQLite files |
+
+[^d8]: Original D8 was SQLite + `sqlx` because the spec's column names appear in JSON wire types and operator backups (so the schema is part of the external contract). The board ratified the SurrealDB v3 swap on 2026-05-07: the JSON wire-format keys are still preserved verbatim by mapping them to SurrealDB record field names, but operator backups become SurrealDB exports — that *is* a deviation from the spec's external contract, accepted explicitly. Embedded vs. server topology is RustPlatform's call in the first DATA PR.
 
 ### Cleanroom rules in force
 
@@ -64,16 +66,18 @@ Both deviations are flagged in the source repo's README so future maintainers un
    └──────┼──────────────────────────────────────────────────────────┘
           │                              │ HTTP control      │ DB
           │                              ▼                   ▼
-          │               ┌────────────────────────┐    ┌─────────┐
-          │               │  MoQ media sidecar     │    │ SQLite  │
-          │               │  - FFmpeg ingest       │    │  (file) │
-          │               │  - MoQ relay (Rust)    │    └─────────┘
-          │               │  - WebTransport server │
+          │               ┌────────────────────────┐    ┌──────────────┐
+          │               │  MoQ media sidecar     │    │ SurrealDB v3 │
+          │               │  - FFmpeg ingest       │    │  (embedded   │
+          │               │  - MoQ relay (Rust)    │    │   or server) │
+          │               │  - WebTransport server │    └──────────────┘
           │               └─────────┬──────────────┘
           ▼                         │ WebTransport
    TeamSpeak 6 server               ▼
    (WebQuery + SSH)         Browsers (public widget viewers)
 ```
+
+> **DB topology.** SurrealDB v3 supersedes the original SQLite choice (D8, board-ratified 2026-05-07). The diagram shows the database as a single logical box; in practice it is either embedded (SurrealKV file backend, single-binary self-host — current default) or an external `surreal start` server. The choice surfaces only as a `DATABASE_URL` connection string and is RustPlatform's call in the first DATA PR.
 
 ### Crate selection (recommended)
 
@@ -81,8 +85,8 @@ Both deviations are flagged in the source repo's README so future maintainers un
 |---|---|---|
 | Web framework | `axum` (via Dioxus fullstack) | Server-functions ride on top |
 | Frontend | `dioxus` + `dioxus-fullstack` + `dioxus-web` | Shared types FE↔BE |
-| ORM / SQL | `sqlx` | Compile-time query checking; preserves SQL surface for the column-name external contract. Avoid `sea-orm` / `diesel` if you want SQL strings to stay close to spec |
-| Migrations | `sqlx::migrate!` | Driven from `migrations/*.sql` |
+| Database client | `surrealdb` (Rust crate) | SurrealDB v3 per D8 (board-ratified 2026-05-07). Embedded SurrealKV backend (single binary) by default; same crate also speaks `ws://` for an external `surreal start` server. Spec wire-format JSON keys map to SurrealDB record field names verbatim |
+| Migrations | hand-rolled `.surql` runner | Driven from `migrations/*.surql`; runnable via `cargo run -- migrate` |
 | Password hashing | `argon2` | Default `Argon2id` |
 | JWT | `jsonwebtoken` | HS256 with `JWT_SECRET` |
 | Symmetric encryption | `aes-gcm` | AES-256-GCM with `ENCRYPTION_KEY` |
@@ -116,10 +120,10 @@ Fourteen workstreams, each with: **scope** (what chapters of the spec it covers)
 - **Risk:** Low. Standard Rust infra.
 
 ### 3.2 Database + data model (DATA)
-- **Scope:** Schema for the ~17 entities in Chapter 4, migrations, seed/fixture loader. Column names follow the spec verbatim where they appear in JSON wire types. Two starter migrations (the spec's "two nickname-field migrations").
+- **Scope:** SurrealQL schema (`DEFINE TABLE` / `DEFINE FIELD`) for the ~17 entities in Chapter 4, `.surql` migration files, seed/fixture loader. Field names follow the spec verbatim where they appear in JSON wire types (the original SQLite-column-name external contract is preserved at the SurrealDB record-field level). Two starter migrations (the spec's "two nickname-field migrations").
 - **Dependencies:** FOUNDATION.
-- **Integration contract:** `sqlx` types + a `repos::*` module per entity exposing typed CRUD. Migrations runnable via `cargo run -- migrate`.
-- **Risk:** Low. Spec is precise on shape and FK cascades.
+- **Integration contract:** `surrealdb` Rust crate + a `repos::*` module per entity exposing typed CRUD. Migrations runnable via `cargo run -- migrate`. First DATA PR picks **embedded SurrealDB (SurrealKV file backend, single-binary self-host) vs. external `surreal start` server** and flags the choice in the PR description; both are reachable via the same `surrealdb` crate by varying `DATABASE_URL`.
+- **Risk:** Low. Spec is precise on shape and FK cascades; cascades map onto SurrealDB record links + manual cleanup in the affected delete paths (no `ON DELETE CASCADE` analogue in SurrealQL — codify in repo methods).
 
 ### 3.3 Auth + security (SECURITY)
 - **Scope:** Chapter 6 — Argon2id password hashing, JWT access (15 min default) + refresh-token rotation with reuse detection by family, refresh-token revocation cascade on user delete, RBAC (admin/moderator/viewer), per-server access grants, AES-256-GCM credential encryption (TS API keys + SSH passwords), CORS allowlist driven by `FRONTEND_URL`, security headers, SSRF blocklist (Chapter 9), password complexity rules, authenticated WebSocket handshake, login rate limit.
@@ -155,7 +159,7 @@ Fourteen workstreams, each with: **scope** (what chapters of the spec it covers)
 - **Risk:** Medium. Backpressure + reconnection are easy to get wrong.
 
 ### 3.8 Bot flow engine (FLOW)
-- **Scope:** Chapters 12–17 — flow document model (nodes/edges/handles, `'true'`/`'false'` condition outputs), 4 trigger kinds (event / cron / webhook / command), 25+ action kinds (TS-control, composite TS-control, network, WebQuery passthrough, stateful, domain), conditions, variables (flow + temp scopes), delays, logging, execution loop with three named SQLite-full boundaries, per-flow concurrency, run-log persistence, WebQuery command whitelist, 17 pre-built templates.
+- **Scope:** Chapters 12–17 — flow document model (nodes/edges/handles, `'true'`/`'false'` condition outputs), 4 trigger kinds (event / cron / webhook / command), 25+ action kinds (TS-control, composite TS-control, network, WebQuery passthrough, stateful, domain), conditions, variables (flow + temp scopes), delays, logging, execution loop with the three named storage-full boundaries — **write-failure**, **transaction-conflict**, **capacity-pressure** — that map the spec's SQLite-full concept (spec §16.2 / §4.4) onto SurrealDB equivalents in the `surrealdb` Rust client, per-flow concurrency, run-log persistence, WebQuery command whitelist, 17 pre-built templates.
 - **Dependencies:** SECURITY (SSRF for webhook actions; encryption for stored secrets in flow data), DATA, WEBQUERY (for TS-control actions and webquery passthrough), SSHBRIDGE (for event triggers), WS (for live execution-log streaming to the editor), REST (CRUD for flows + manual run + log fetch).
 - **Integration contract:** `flow::execute(flow, trigger_payload) -> ExecutionId` spawns a `tokio::task`. Output: `BotExecution` rows + log lines, also broadcast over WS.
 - **Risk:** High. Largest engine in the system. The 25+ actions × 4 triggers × condition/variable substitution explodes the test surface. Suggested approach: implement triggers + 5 most-used actions first as a vertical slice; fill in the rest after the slice passes.
@@ -317,7 +321,7 @@ Roughly **6–9 months** of calendar time depending on team size and the voice-p
 | R5 | Refresh-token reuse-detection-by-family logic ships a subtle bug enabling token replay | Low | High | Write reuse-detection unit tests first; security review at Phase 1 gate |
 | R6 | SSRF blocklist gaps (e.g., DNS rebinding, IPv6 link-local, octal-encoded private ranges) | Medium | High | Use a battle-tested allow/deny library; add tests for known SSRF tricks; security review before Phase 2 gate |
 | R7 | TS ServerQuery escaping bug corrupts strings with pipes/spaces | Medium | Medium | Fuzz the escaper against the spec rules; add a roundtrip test |
-| R8 | SQLite-full conditions surface differently in Rust / sqlx than the three named boundaries the spec assumes | Low | Medium | Implement the three boundaries explicitly per spec; add error-injection tests |
+| R8 | Storage-full conditions surface differently in the `surrealdb` Rust client than the three named SQLite-full boundaries the spec assumes (spec §16.2 / §4.4) | Low | Medium | Implement the three boundaries explicitly as **write-failure / transaction-conflict / capacity-pressure** against SurrealDB error variants (per D8 deviation); add error-injection tests on each |
 | R9 | Synthetic SSH events (mute/away/recording) drift from the source's exact derivation rules | Medium | Low | Use spec's "How to verify" sections as test cases; flag remaining ambiguities to Appendix B for spec author follow-up |
 | R10 | Dioxus fullstack server-functions hit a scalability ceiling for high-fanout WS workloads | Low | Medium | Use raw axum WS for the realtime hub instead of routing it through server functions; server functions are for request/response, not push |
 
@@ -385,12 +389,12 @@ ts6-manager.pod
 └── valkey.container      (optional; only if cache is configured)
 
 Host volumes mounted into the pod:
-  - ./data/sqlite       → /var/lib/ts6-manager/db        (DATABASE_URL points here)
+  - ./data/db           → /var/lib/ts6-manager/db        (DATABASE_URL points here; SurrealKV embedded backend by default — `surrealkv://./data/db`)
   - ./data/music        → /var/lib/ts6-manager/music     (MUSIC_DIR)
   - ./data/yt-cookies   → /var/lib/ts6-manager/cookies   (YT_COOKIE_FILE)
 ```
 
-Rootless Podman is the default. Volumes use host paths owned by the operator's user. SQLite + the music directory live on the host and survive `podman pod rm`.
+Rootless Podman is the default. Volumes use host paths owned by the operator's user. The SurrealDB store + the music directory live on the host and survive `podman pod rm`. If an operator switches to an external SurrealDB server (`DATABASE_URL=ws://…`), the `./data/db` host volume is unused and the SurrealDB container or external host owns its own storage.
 
 ### Notes for OPS workstream
 
