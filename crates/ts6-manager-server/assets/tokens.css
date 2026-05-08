@@ -9,16 +9,20 @@
   --c-neutral-200: #1E2533;
   --c-neutral-300: #2A3344;
   --c-neutral-400: #3D485E;
-  /* PURA-61 → PURA-63: lifted from #5E6A82 → #737F98 → #828FAA so
-   * `--text-muted` clears WCAG-AA 4.5:1 not just on `--bg-canvas`
-   * (5.94:1) but also on `--bg-surface` (5.62:1) and the raised
-   * surfaces of cards/modals/dropdowns (5.25:1 on --bg-surface-raised).
-   * The dashboard KPI labels render on `--bg-surface-raised` and were
-   * the proximate failing axe nodes (12 violations). Disabled-button
-   * and idle step-dot consumers sit on `--c-neutral-300` and remain
-   * WCAG 1.4.3-exempt (disabled UI is excluded from contrast rules). */
+  /* PURA-61 → PURA-63 → PURA-64: lifted 500 from #5E6A82 → #737F98 →
+   * #828FAA so `--text-muted` clears WCAG-AA 4.5:1 not just on
+   * `--bg-canvas` (5.94:1) but also on `--bg-surface` (5.62:1) and the
+   * raised surfaces of cards/modals/dropdowns (5.25:1 on
+   * --bg-surface-raised). The dashboard KPI labels render on
+   * --bg-surface-raised and were the proximate failing axe nodes (12
+   * violations). 600 then lifted in tandem from #7E8AA2 → #8B98B0 so
+   * the muted→secondary→body neutral ramp stays monotonic in dark mode
+   * (500 L≈59% / raised 5.25:1, 600 L≈63% / raised ~5.6:1, 700 L=70%).
+   * Disabled-button and idle step-dot consumers sit on --c-neutral-300
+   * and remain WCAG 1.4.3-exempt (disabled UI is excluded from
+   * contrast rules). */
   --c-neutral-500: #828FAA;
-  --c-neutral-600: #7E8AA2;
+  --c-neutral-600: #8B98B0;
   --c-neutral-700: #A4ADC2;
   --c-neutral-800: #D5DAE5;
   --c-neutral-900: #F2F4F8;
