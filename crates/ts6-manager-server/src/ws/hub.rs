@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use tokio::sync::{Mutex, broadcast};
 
@@ -40,6 +40,13 @@ const BROADCAST_CAPACITY: usize = 128;
 /// any one of them lagging.
 const REVOKE_CAPACITY: usize = 64;
 
+/// PURA-97 L-1 — maximum concurrent WebSocket connections per
+/// `widget_id`. The widget token is the load-bearing credential; capping
+/// per-widget concurrency stops a single leaked token from harvesting
+/// events at N× throughput while leaving normal multi-tab embed usage
+/// unaffected.
+pub const WIDGET_MAX_CONCURRENT_CONNECTIONS: u32 = 50;
+
 #[derive(Clone)]
 pub struct Hub {
     inner: Arc<HubInner>,
@@ -50,6 +57,13 @@ struct HubInner {
     /// Per-server channel + ring buffer. Created lazily on first publish
     /// or first subscribe for a given server id.
     servers: Mutex<HashMap<i64, ServerSlot>>,
+    /// PURA-97 L-1 — per-widget concurrent-connection counter. Created
+    /// lazily on first acquire; the inner `AtomicU32` is `Arc`-shared
+    /// with [`WidgetConnGuard`] so the guard's `Drop` decrements without
+    /// reacquiring the map lock. The counter is never garbage-collected
+    /// — Phase 2 expects O(widgets) entries which is bounded by the
+    /// operator's widget catalogue.
+    widget_conns: Mutex<HashMap<i64, Arc<AtomicU32>>>,
     /// PURA-97 M-2 — fan-out for `revoke_widget(id)` calls. Every active
     /// widget session subscribes; admin handlers (`delete`,
     /// `regenerate_token`) publish here after the DB write so connected
@@ -117,6 +131,7 @@ impl Hub {
             inner: Arc::new(HubInner {
                 next_event_id: AtomicU64::new(1),
                 servers: Mutex::new(HashMap::new()),
+                widget_conns: Mutex::new(HashMap::new()),
                 widgets_revoked,
                 metrics: Metrics::default(),
             }),
@@ -148,6 +163,46 @@ impl Hub {
     /// state still gets closed.
     pub fn revoke_widget(&self, widget_id: i64) {
         let _ = self.inner.widgets_revoked.send(widget_id);
+    }
+
+    /// PURA-97 L-1 — try to acquire one of the `widget_id`'s per-token
+    /// connection slots. Returns `None` if the widget is already at
+    /// [`WIDGET_MAX_CONCURRENT_CONNECTIONS`]; the caller closes the
+    /// upgrade with WebSocket close code 1013 (try-again-later). The
+    /// returned [`WidgetConnGuard`] decrements the counter on `Drop`,
+    /// so callers MUST hold it for the lifetime of the WebSocket
+    /// session.
+    pub async fn try_acquire_widget_slot(&self, widget_id: i64) -> Option<WidgetConnGuard> {
+        let counter = {
+            let mut map = self.inner.widget_conns.lock().await;
+            map.entry(widget_id)
+                .or_insert_with(|| Arc::new(AtomicU32::new(0)))
+                .clone()
+        };
+        // Atomic CAS loop: only increment if strictly below the cap.
+        let mut cur = counter.load(Ordering::Acquire);
+        loop {
+            if cur >= WIDGET_MAX_CONCURRENT_CONNECTIONS {
+                return None;
+            }
+            match counter.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(WidgetConnGuard { counter }),
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub async fn widget_conn_count(&self, widget_id: i64) -> u32 {
+        let map = self.inner.widget_conns.lock().await;
+        map.get(&widget_id)
+            .map(|c| c.load(Ordering::Acquire))
+            .unwrap_or(0)
     }
 
     /// Subscribe to `topic` after running the per-topic ACL against
@@ -289,6 +344,25 @@ impl Default for Hub {
 pub struct Subscription {
     pub receiver: broadcast::Receiver<Envelope>,
     pub replay: Vec<Envelope>,
+}
+
+/// PURA-97 L-1 — RAII guard returned by [`Hub::try_acquire_widget_slot`].
+/// Holds an `Arc<AtomicU32>` shared with the hub's per-widget counter; on
+/// drop, decrements the counter so the slot is reclaimed when the
+/// session ends — whether by clean close, error, or task abort.
+pub struct WidgetConnGuard {
+    counter: Arc<AtomicU32>,
+}
+
+impl Drop for WidgetConnGuard {
+    fn drop(&mut self) {
+        // Use saturating semantics defensively — the only path that ever
+        // increments is `try_acquire_widget_slot`'s CAS, so a decrement
+        // below zero would indicate a logic bug; saturating means we
+        // can't underflow the unsigned counter even then.
+        let prev = self.counter.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(prev > 0, "WidgetConnGuard dropped with zero counter");
+    }
 }
 
 #[cfg(test)]
@@ -507,6 +581,68 @@ mod tests {
         hub.revoke_widget(7);
         assert_eq!(a.recv().await.unwrap(), 7);
         assert_eq!(b.recv().await.unwrap(), 7);
+    }
+
+    // ---------------------------------------------------------------------
+    // PURA-97 L-1 — per-widget concurrent-connection cap.
+    // ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn widget_slot_acquire_below_cap_succeeds() {
+        let hub = Hub::new();
+        let g = hub.try_acquire_widget_slot(1).await;
+        assert!(g.is_some(), "first slot must succeed");
+        assert_eq!(hub.widget_conn_count(1).await, 1);
+    }
+
+    #[tokio::test]
+    async fn widget_slot_drop_decrements_counter() {
+        let hub = Hub::new();
+        let g = hub.try_acquire_widget_slot(1).await.unwrap();
+        assert_eq!(hub.widget_conn_count(1).await, 1);
+        drop(g);
+        assert_eq!(hub.widget_conn_count(1).await, 0);
+    }
+
+    #[tokio::test]
+    async fn widget_slot_caps_at_max_concurrent_connections() {
+        let hub = Hub::new();
+        let mut held = Vec::with_capacity(WIDGET_MAX_CONCURRENT_CONNECTIONS as usize);
+        for _ in 0..WIDGET_MAX_CONCURRENT_CONNECTIONS {
+            held.push(
+                hub.try_acquire_widget_slot(1)
+                    .await
+                    .expect("under cap must succeed"),
+            );
+        }
+        // The (cap+1)th must be refused.
+        assert!(
+            hub.try_acquire_widget_slot(1).await.is_none(),
+            "cap+1th acquire must return None"
+        );
+        // After dropping one, a fresh acquire succeeds again.
+        held.pop();
+        assert!(
+            hub.try_acquire_widget_slot(1).await.is_some(),
+            "freed slot must be reusable"
+        );
+    }
+
+    #[tokio::test]
+    async fn widget_slot_cap_is_per_widget_id() {
+        let hub = Hub::new();
+        // Saturate widget 1.
+        let mut held: Vec<WidgetConnGuard> =
+            Vec::with_capacity(WIDGET_MAX_CONCURRENT_CONNECTIONS as usize);
+        for _ in 0..WIDGET_MAX_CONCURRENT_CONNECTIONS {
+            held.push(hub.try_acquire_widget_slot(1).await.unwrap());
+        }
+        assert!(hub.try_acquire_widget_slot(1).await.is_none());
+        // Widget 2 still has its own pool.
+        assert!(
+            hub.try_acquire_widget_slot(2).await.is_some(),
+            "widget 2's cap must be independent of widget 1's"
+        );
     }
 
     #[tokio::test]

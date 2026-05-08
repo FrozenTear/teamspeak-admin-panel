@@ -16,6 +16,7 @@
 //! to [`crate::ws::session::run`] which fans live events to the client.
 
 use axum::Json;
+use axum::extract::ws::{CloseFrame, Message, Utf8Bytes, close_code};
 use axum::extract::{Query, State, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -26,7 +27,7 @@ use crate::app_state::AppState;
 use crate::auth::extractors::AuthUser;
 use crate::auth::jwt;
 use crate::repos::users;
-use crate::ws::auth::{AuthenticateError, resolve_principal};
+use crate::ws::auth::{AuthenticateError, Principal, resolve_principal};
 use crate::ws::session;
 
 #[derive(Debug, Deserialize)]
@@ -71,9 +72,40 @@ pub async fn ws_upgrade(
         }
     };
 
+    // PURA-97 L-1 — per-widget concurrent-connection cap. The cap is
+    // imposed BEFORE the upgrade so a token that's already saturated
+    // can't be used to keep opening sockets that get killed late. We
+    // still accept the upgrade in the over-cap branch so the close
+    // shows up to the client as a proper WS Close frame with code 1013
+    // (try-again-later) — RFC 6455 §7.4.1, axum `close_code::AGAIN` —
+    // matching the acceptance criteria in the issue.
+    let widget_guard = if let Principal::Widget(w) = &principal {
+        match state.ws_hub.try_acquire_widget_slot(w.widget_id).await {
+            Some(g) => Some(g),
+            None => {
+                tracing::warn!(
+                    widget_id = w.widget_id,
+                    "widget WS connection cap exceeded"
+                );
+                return ws.on_upgrade(|mut socket| async move {
+                    let _ = socket
+                        .send(Message::Close(Some(CloseFrame {
+                            code: close_code::AGAIN,
+                            reason: Utf8Bytes::from_static(
+                                "widget connection cap exceeded",
+                            ),
+                        })))
+                        .await;
+                });
+            }
+        }
+    } else {
+        None
+    };
+
     let hub = state.ws_hub.clone();
     let db = state.db.clone();
-    ws.on_upgrade(move |socket| session::run(socket, principal, hub, db))
+    ws.on_upgrade(move |socket| session::run(socket, principal, hub, db, widget_guard))
 }
 
 /// Pure-async auth path, factored out so unit tests can exercise it without

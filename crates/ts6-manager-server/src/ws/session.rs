@@ -35,7 +35,7 @@ use crate::db::Database;
 
 use super::auth::Principal;
 use super::envelope::Envelope;
-use super::hub::{AuthorizeError, Hub};
+use super::hub::{AuthorizeError, Hub, WidgetConnGuard};
 use super::topic::Topic;
 
 /// Per-connection bounded send queue size. Picked at the smaller end of
@@ -48,15 +48,21 @@ const PING_INTERVAL: Duration = Duration::from_secs(20);
 const POND_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Run the session loop until the connection closes. Consumes the
-/// `WebSocket` and the [`Principal`] from the handshake.
+/// `WebSocket` and the [`Principal`] from the handshake. `widget_guard`
+/// is the per-widget concurrent-connection slot acquired by the
+/// handshake (PURA-97 L-1) — held here for the lifetime of the session
+/// so its `Drop` reclaims the slot on any exit path.
 pub async fn run(
     socket: WebSocket,
     principal: Principal,
     hub: Hub,
     db: std::sync::Arc<Database>,
+    widget_guard: Option<WidgetConnGuard>,
 ) {
     hub.record_connection_open();
-    let result = SessionLoop::new(socket, principal, hub.clone(), db).run().await;
+    let result = SessionLoop::new(socket, principal, hub.clone(), db, widget_guard)
+        .run()
+        .await;
     hub.record_connection_close();
     if let Err(e) = result {
         tracing::debug!(error = %e, "ws session ended");
@@ -99,10 +105,21 @@ struct SessionLoop {
     /// principal is a widget; the select! arm closes the connection on
     /// receipt of this principal's `widget_id`.
     widgets_revoked_rx: Option<broadcast::Receiver<i64>>,
+    /// PURA-97 L-1 — per-widget connection-count slot. Held for the
+    /// session's lifetime; `Drop` reclaims the slot on any exit.
+    /// `_`-prefixed because it is never read after construction —
+    /// the handle exists purely for its destructor.
+    _widget_conn_guard: Option<WidgetConnGuard>,
 }
 
 impl SessionLoop {
-    fn new(socket: WebSocket, principal: Principal, hub: Hub, db: std::sync::Arc<Database>) -> Self {
+    fn new(
+        socket: WebSocket,
+        principal: Principal,
+        hub: Hub,
+        db: std::sync::Arc<Database>,
+        widget_guard: Option<WidgetConnGuard>,
+    ) -> Self {
         let (out_tx, out_rx) = mpsc::channel(SEND_QUEUE_CAP);
         // Subscribe to widget revocations only for widget principals.
         // For JWT users this stays None and the select! arm pends
@@ -120,6 +137,7 @@ impl SessionLoop {
             last_recv: Instant::now(),
             drop_pending: false,
             widgets_revoked_rx,
+            _widget_conn_guard: widget_guard,
         }
     }
 

@@ -329,7 +329,7 @@ async fn delete(
         tracing::error!(err = %e, widget_id = id, "widgets admin: delete failed");
         internal()
     })?;
-    // PURA-96 M-2 — close any active widget WS sessions still bound to
+    // PURA-97 M-2 — close any active widget WS sessions still bound to
     // this id. The DB row is gone so `resolve_principal` would already
     // refuse a fresh handshake; this signal terminates connections that
     // authenticated before the delete completed.
@@ -374,7 +374,7 @@ async fn regenerate_token(
             internal()
         })?
         .ok_or_else(not_found)?;
-    // PURA-96 M-2 — fire AFTER `set_token` succeeds. Any WS session that
+    // PURA-97 M-2 — fire AFTER `set_token` succeeds. Any WS session that
     // authenticated against the old token is still subscribed to the
     // hub's per-server fan-out under its (now-rotated) widget_id; this
     // signal closes those connections. New handshakes with the old
@@ -1178,7 +1178,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // PURA-96 M-2 — admin handlers MUST publish to the hub's
+    // PURA-97 M-2 — admin handlers MUST publish to the hub's
     // widget-revocation broadcast after a successful DB write so any
     // active WS session bound to the same widget_id closes promptly.
     // The session-side reaction (Close frame, exit) is unit-tested in
