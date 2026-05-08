@@ -147,6 +147,47 @@ Fourteen workstreams, each with: **scope** (what chapters of the spec it covers)
 - **Integration contract:** A `tokio::sync::broadcast<Event>` per server connection. Subscribers: WebSocket hub, flow runtime, voice bot pool.
 - **Risk:** Medium. Synthetic event derivation has state-machine subtleties; reconnection needs to flush stale state.
 
+#### 3.5.1 Phase 2 control-path trait (PURA-78)
+SSHBridge doubles as a control path — every TS ServerQuery command we
+need on the read side can run over the SSH session as well as the
+WebQuery HTTP endpoint. PURA-78 introduces the seam that lets the REST
+layer choose per server:
+
+- **`crate::control::ControlBackend`** — async trait covering the Phase 1
+  read-only surface (`version`, `serverlist`, `serverinfo`,
+  `channellist`, `clientlist`, `server_connection_info`). All methods
+  return the same typed shapes (`VersionInfo`, `VirtualServerEntry`,
+  `ServerInfo`, `ChannelEntry`, `ClientEntry`, `ConnectionInfo`) so the
+  route layer never needs to know which backend served a response.
+  `ControlBackendError` is shape-aligned with `WebQueryError` and
+  `SshBridgeError` and exposes the same `http_status` /
+  `upstream_code` / `upstream_message` helpers, preserving the
+  spec §7.0.2 envelope on either path.
+- **`WebQueryClient` and `SshControlClient` both `impl ControlBackend`.**
+  The SSH client wraps the russh `TransportHandle` (PURA-76); sid-scoped
+  commands serialise `(use sid=N, command)` pairs behind an internal
+  mutex so concurrent callers never interleave on the FIFO transport
+  queue. No sid caching — the upstream's "selected vserver" resets on
+  reconnect, so a stale cache would skip `use` and the next scoped
+  command would fail.
+- **`ControlBackendPool`** — keyed by `server_connection.id`; reads
+  `connection.controlPath` (added in PURA-77) on first miss to pick
+  WebQuery (default) vs. SSH and stores the result as
+  `Arc<dyn ControlBackend + Send + Sync>`. The legacy `WebQueryPool`
+  stays in `AppState` alongside it because the Phase 2 **write**
+  surface (`routes::control`) still talks to `WebQueryClient` directly;
+  the SSH write commands land in a later child issue, at which point
+  the write side migrates onto a richer trait and `WebQueryPool`
+  retires.
+- The dashboard route (`/api/servers/:configId/vs/:sid/dashboard`) is
+  the only handler routed onto `ControlBackend` in this slice. All
+  other call sites continue to fetch a `WebQueryClient` from
+  `WebQueryPool` until SSH-write parity lands.
+- An env-gated integration test (`TS6_SSH_INTEGRATION=1`) covers
+  bring-up, one read command, an upstream-error path, and a forced
+  disconnect → reconnect against a containerised target running under
+  the `ssh-integration` profile in `podman-compose.yml`.
+
 ### 3.6 REST API surface (REST)
 - **Scope:** Chapter 7 — 25 route groups, all request/response shapes, error responses, role checks. Many are thin proxies through WEBQUERY; some are pure backend (auth, users, settings, widgets, flows, music, video).
 - **Dependencies:** SECURITY, DATA, WEBQUERY (most route groups depend on it).

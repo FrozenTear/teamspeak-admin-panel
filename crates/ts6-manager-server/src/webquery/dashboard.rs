@@ -1,4 +1,5 @@
-//! `GET /api/servers/:configId/vs/:sid/dashboard` (spec §7.19) — PURA-23.
+//! `GET /api/servers/:configId/vs/:sid/dashboard` (spec §7.19) — PURA-23,
+//! re-pointed onto [`crate::control::ControlBackend`] in PURA-78.
 //!
 //! Auth-gated by [`RequireAuth`] (the Phase 1 surface only requires `Y`
 //! authentication; per-server access gating lands when the per-server
@@ -7,8 +8,10 @@
 //!
 //! The handler:
 //! 1. Looks up `server_connections.id == configId`. Missing → `404`.
-//! 2. Pulls / lazily creates the `WebQueryClient` from
-//!    [`crate::app_state::AppState::webquery`].
+//! 2. Pulls / lazily creates the [`crate::control::ControlBackend`] for
+//!    the connection from [`crate::app_state::AppState::control`]. The
+//!    per-server `controlPath` flag picks WebQuery vs. SSHBridge —
+//!    this handler stays oblivious.
 //! 3. Issues `serverinfo`, `clientlist`, `channellist`, and
 //!    `serverrequestconnectioninfo` against `:sid` *in parallel* (spec
 //!    §7.19 mandates parallel dispatch).
@@ -18,10 +21,10 @@
 //! - Missing connection row → `404 {"error": "Not found"}` (§7.0.2).
 //! - Bad integer URL params → `400 {"error": "Invalid <name>: must be a
 //!   number"}` (§7.0.1).
-//! - WebQuery upstream non-zero status → `502 {"error": "TeamSpeak API
+//! - Backend upstream non-zero status → `502 {"error": "TeamSpeak API
 //!   Error", "code": <int>, "details": "<message>"}` (§7.0.2).
-//! - WebQuery transport / TLS / decrypt failure → `502` with `code: -1` and
-//!   the error message in `details` (§10.5).
+//! - Transport / TLS / decrypt / SSH-auth failure → `502` with
+//!   `code: -1` and the error message in `details` (§10.5).
 
 use axum::Json;
 use axum::Router;
@@ -34,9 +37,10 @@ use ts6_manager_shared::dashboard::{BandwidthSnapshot, DashboardData};
 
 use crate::app_state::AppState;
 use crate::auth::extractors::RequireAuth;
+use crate::control::ControlBackendError;
 use crate::repos::server_connections;
 
-use super::{WebQueryError, models};
+use super::models;
 
 /// Build the dashboard sub-router. Caller mounts it at
 /// `/api/servers/{configId}/vs/{sid}/dashboard`.
@@ -61,7 +65,7 @@ fn err_body(status: StatusCode, body: ErrorBody) -> Response {
     (status, Json(body)).into_response()
 }
 
-fn translate_webquery_error(err: WebQueryError) -> Response {
+fn translate_control_error(err: ControlBackendError) -> Response {
     let status = err.http_status();
     let body = match status {
         StatusCode::BAD_GATEWAY => ErrorBody {
@@ -117,19 +121,21 @@ async fn handler(
         })?;
 
     let client = state
-        .webquery
+        .control
         .get_or_build(config_id, Some(&connection))
         .await
-        .map_err(translate_webquery_error)?;
+        .map_err(translate_control_error)?;
 
-    // Spec §7.19: issue the four upstream calls in parallel.
+    // Spec §7.19: issue the four upstream calls in parallel. Trait
+    // dispatch routes through whichever backend `controlPath` selected
+    // for this connection.
     let (info, clients, channels, conn_info) = tokio::try_join!(
         client.serverinfo(sid),
         client.clientlist(sid),
         client.channellist(sid),
         client.server_connection_info(sid),
     )
-    .map_err(translate_webquery_error)?;
+    .map_err(translate_control_error)?;
 
     Ok(Json(aggregate(info, clients, channels, conn_info)))
 }

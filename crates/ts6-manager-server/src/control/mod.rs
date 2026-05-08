@@ -1,0 +1,460 @@
+//! Phase 2 PURA-78 — backend-agnostic control plane for read-only TS6
+//! ServerQuery commands. The trait covers exactly the Phase 1 surface
+//! [`crate::webquery::dashboard`] consumes; both [`WebQueryClient`] and
+//! [`SshControlClient`] implement it and a per-server `controlPath`
+//! flag picks one at pool construction time.
+//!
+//! ## What's here
+//!
+//! - [`ControlBackend`] — async trait with `version` / `serverlist` /
+//!   `serverinfo` / `channellist` / `clientlist` /
+//!   `server_connection_info`. Each method returns the same typed shape
+//!   ([`VersionInfo`], [`VirtualServerEntry`], [`ServerInfo`],
+//!   [`ChannelEntry`], [`ClientEntry`], [`ConnectionInfo`]) so the REST
+//!   layer never needs to know which backend served the response.
+//! - [`ControlBackendError`] — shape-aligned with [`WebQueryError`] and
+//!   [`SshBridgeError`]; `http_status`, `upstream_code`, and
+//!   `upstream_message` mirror them so the §7.0.2 envelope is preserved
+//!   on either control path.
+//! - `impl ControlBackend for` [`WebQueryClient`] — straight delegation.
+//! - `impl ControlBackend for` [`SshControlClient`] — defined alongside
+//!   the type in [`crate::sshbridge::control_client`].
+//! - [`ControlBackendPool`] — keyed by `server_connection.id`; reads
+//!   `connection.controlPath` on first miss to instantiate the matching
+//!   client and stores it as `Arc<dyn ControlBackend>`.
+//!
+//! ## Why a parallel pool to [`crate::webquery::WebQueryPool`]
+//!
+//! The Phase 2 write surface ([`crate::routes::control`]) still talks
+//! to a [`WebQueryClient`] directly — the SSH write commands land in a
+//! later child issue. Keeping `WebQueryPool` in place avoids changing
+//! those call sites in this slice; the new [`ControlBackendPool`] is
+//! consumed only by the dashboard handler. Once the SSH write surface
+//! lands, the write side migrates onto a richer trait and
+//! [`WebQueryPool`] retires.
+//!
+//! ## Out of scope
+//!
+//! - SSHBridge write methods (`clientmove`, `clientkick`, `banadd`, …).
+//! - Pool eviction on `PUT/DELETE /servers` — that work belongs to a
+//!   later refresh-on-edit child.
+//! - Bulk-fleet operations.
+
+#![allow(dead_code)] // trait surface + pool helpers consumed by routes / future Phase 2 hooks.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use reqwest::StatusCode;
+use thiserror::Error;
+use tokio::sync::RwLock;
+
+use crate::repos::server_connections::ServerConnection;
+use crate::sshbridge::{
+    control_client::SshControlClient,
+    hostkey::{HostKeyConfigError, HostKeyVerifier},
+    russh_channel::{connect_password, RusshConnectParams},
+    transport::{spawn as spawn_transport, TransportConfig},
+    SshBridgeError,
+};
+use crate::webquery::{
+    models::{
+        ChannelEntry, ClientEntry, ConnectionInfo, ServerInfo, VersionInfo, VirtualServerEntry,
+    },
+    WebQueryClient, WebQueryError,
+};
+
+/// Errors returned by [`ControlBackend`] methods. Variants are
+/// shape-aligned with both [`WebQueryError`] and [`SshBridgeError`] so
+/// callers map either backend's failures through the same §7.0.2 path.
+#[derive(Debug, Error)]
+pub enum ControlBackendError {
+    /// Upstream returned a non-zero status code (`error id=…` on SSH;
+    /// `status.code != 0` on WebQuery). Maps to `502 {error: "TeamSpeak
+    /// API Error", code, details}` per §7.0.2.
+    #[error("TS upstream error {code}: {message}")]
+    Upstream { code: i64, message: String },
+
+    /// Transport-class failure (network, TLS, SSH session). Maps to
+    /// `502` with `code = -1` per §10.5.
+    #[error("control transport error: {0}")]
+    Transport(String),
+
+    /// The response could not be parsed into the expected typed shape.
+    /// Maps to `502` with `code = -1`.
+    #[error("malformed control response: {0}")]
+    InvalidResponse(String),
+
+    /// Stored credential (apiKey ciphertext, sshPassword ciphertext)
+    /// failed to decrypt. Construction-time only.
+    #[error("failed to decrypt control credentials for connection #{config_id}: {message}")]
+    Decrypt { config_id: i64, message: String },
+
+    /// SSH-only — auth was rejected by the upstream SSH daemon. The
+    /// REST layer reports this as `502` (operator sees the same
+    /// envelope shape as transport errors) but the bridge surfaces a
+    /// separate "credentials need attention" signal via the connection
+    /// lifecycle.
+    #[error("control auth rejected for connection #{config_id}")]
+    AuthRejected { config_id: i64 },
+
+    /// Configuration-time error (host-key fingerprint malformed,
+    /// required column missing). Maps to `500` because the operator
+    /// row needs editing before the request can succeed.
+    #[error("control backend configuration error: {0}")]
+    Config(String),
+}
+
+impl ControlBackendError {
+    /// HTTP status code per §7.0.2 / §10.5 — same mapping as the
+    /// individual backend errors.
+    pub fn http_status(&self) -> StatusCode {
+        match self {
+            Self::Upstream { .. }
+            | Self::Transport(_)
+            | Self::InvalidResponse(_)
+            | Self::AuthRejected { .. } => StatusCode::BAD_GATEWAY,
+            Self::Decrypt { .. } | Self::Config(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    /// Upstream code surfaced in the §7.0.2 body. Non-upstream errors
+    /// report `-1`.
+    pub fn upstream_code(&self) -> i64 {
+        match self {
+            Self::Upstream { code, .. } => *code,
+            _ => -1,
+        }
+    }
+
+    /// Operator-friendly `details` string for the §7.0.2 body.
+    pub fn upstream_message(&self) -> String {
+        match self {
+            Self::Upstream { message, .. } => message.clone(),
+            other => other.to_string(),
+        }
+    }
+}
+
+impl From<WebQueryError> for ControlBackendError {
+    fn from(e: WebQueryError) -> Self {
+        match e {
+            WebQueryError::Upstream { code, message } => Self::Upstream { code, message },
+            WebQueryError::Transport(s) => Self::Transport(s),
+            WebQueryError::InvalidResponse(s) => Self::InvalidResponse(s),
+            WebQueryError::Decrypt { config_id, source } => Self::Decrypt {
+                config_id,
+                message: source.to_string(),
+            },
+        }
+    }
+}
+
+impl From<SshBridgeError> for ControlBackendError {
+    fn from(e: SshBridgeError) -> Self {
+        match e {
+            SshBridgeError::Upstream { code, message } => Self::Upstream { code, message },
+            SshBridgeError::Transport(s) => Self::Transport(s),
+            SshBridgeError::InvalidResponse(s) => Self::InvalidResponse(s),
+            SshBridgeError::Decrypt { config_id, source } => Self::Decrypt {
+                config_id,
+                message: source.to_string(),
+            },
+            SshBridgeError::AuthRejected { config_id } => Self::AuthRejected { config_id },
+        }
+    }
+}
+
+impl From<HostKeyConfigError> for ControlBackendError {
+    fn from(e: HostKeyConfigError) -> Self {
+        Self::Config(e.to_string())
+    }
+}
+
+pub type ControlResult<T> = Result<T, ControlBackendError>;
+
+/// The Phase 1 read-only ServerQuery surface. Both backends implement
+/// the same six methods; the dashboard handler is the only consumer in
+/// this slice. Trait is `dyn`-safe (object-safe) so the pool can hand
+/// out `Arc<dyn ControlBackend + Send + Sync>` without an enum dispatch.
+#[async_trait]
+pub trait ControlBackend: Send + Sync + std::fmt::Debug {
+    /// `version` — instance scope. Doubles as the cheap health probe
+    /// per §10.7.
+    async fn version(&self) -> ControlResult<VersionInfo>;
+
+    /// `serverlist` — instance scope. Drives the virtual-server
+    /// selector.
+    async fn serverlist(&self) -> ControlResult<Vec<VirtualServerEntry>>;
+
+    /// `serverinfo` — virtual-server scope.
+    async fn serverinfo(&self, sid: i64) -> ControlResult<ServerInfo>;
+
+    /// `channellist` — virtual-server scope. Basic projection only;
+    /// flag-driven projections are a Phase 2 follow-up.
+    async fn channellist(&self, sid: i64) -> ControlResult<Vec<ChannelEntry>>;
+
+    /// `clientlist` — virtual-server scope. Basic projection only.
+    async fn clientlist(&self, sid: i64) -> ControlResult<Vec<ClientEntry>>;
+
+    /// `serverrequestconnectioninfo` — virtual-server scope.
+    async fn server_connection_info(&self, sid: i64) -> ControlResult<ConnectionInfo>;
+}
+
+/// Straight delegation. Method-call resolution prefers the inherent
+/// methods on [`WebQueryClient`] over the trait's, so `self.version()`
+/// in the trait body does NOT recurse — Rust picks
+/// `WebQueryClient::version` first. Disambiguating UFCS would only
+/// add noise.
+#[async_trait]
+impl ControlBackend for WebQueryClient {
+    async fn version(&self) -> ControlResult<VersionInfo> {
+        self.version().await.map_err(Into::into)
+    }
+
+    async fn serverlist(&self) -> ControlResult<Vec<VirtualServerEntry>> {
+        self.serverlist().await.map_err(Into::into)
+    }
+
+    async fn serverinfo(&self, sid: i64) -> ControlResult<ServerInfo> {
+        self.serverinfo(sid).await.map_err(Into::into)
+    }
+
+    async fn channellist(&self, sid: i64) -> ControlResult<Vec<ChannelEntry>> {
+        self.channellist(sid).await.map_err(Into::into)
+    }
+
+    async fn clientlist(&self, sid: i64) -> ControlResult<Vec<ClientEntry>> {
+        self.clientlist(sid).await.map_err(Into::into)
+    }
+
+    async fn server_connection_info(&self, sid: i64) -> ControlResult<ConnectionInfo> {
+        self.server_connection_info(sid).await.map_err(Into::into)
+    }
+}
+
+/// Pool of [`ControlBackend`] clients keyed by `server_connection.id`.
+///
+/// Lazy build on first miss. The `connection.controlPath` flag selects
+/// the backend variant — `"webquery"` (default) builds a
+/// [`WebQueryClient`]; `"ssh"` builds an [`SshControlClient`] backed by
+/// a russh transport. Unknown values fall back to WebQuery so a
+/// future deviation in the column does not break booted servers.
+#[derive(Clone)]
+pub struct ControlBackendPool {
+    inner: Arc<RwLock<HashMap<i64, Arc<dyn ControlBackend>>>>,
+    allow_self_signed: bool,
+    /// Optional path to the operator's `known_hosts` file. Sourced
+    /// from `TS_SSH_KNOWN_HOSTS` at boot; `None` falls through to the
+    /// per-server fingerprint column or `Reject`.
+    ssh_known_hosts_path: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for ControlBackendPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlBackendPool")
+            .field("allow_self_signed", &self.allow_self_signed)
+            .field(
+                "ssh_known_hosts_path",
+                &self
+                    .ssh_known_hosts_path
+                    .as_ref()
+                    .map(|p| p.display().to_string()),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl ControlBackendPool {
+    pub fn new(allow_self_signed: bool) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(HashMap::new())),
+            allow_self_signed,
+            ssh_known_hosts_path: None,
+        }
+    }
+
+    pub fn with_known_hosts(mut self, path: Option<PathBuf>) -> Self {
+        self.ssh_known_hosts_path = path;
+        self
+    }
+
+    /// Fetch the backend for `config_id`, building one from `connection`
+    /// on first miss.  Returns `Transport`-class error when no
+    /// connection row is supplied and the cache is cold (matches the
+    /// dashboard's §10.7 mapping to `500 "No connection configured for
+    /// server config ID"`).
+    pub async fn get_or_build(
+        &self,
+        config_id: i64,
+        connection: Option<&ServerConnection>,
+    ) -> ControlResult<Arc<dyn ControlBackend>> {
+        if let Some(existing) = self.inner.read().await.get(&config_id).cloned() {
+            return Ok(existing);
+        }
+        let connection = connection.ok_or_else(|| {
+            ControlBackendError::Transport(format!(
+                "No connection configured for server config ID {config_id}"
+            ))
+        })?;
+        let backend = self.build_backend(connection).await?;
+        self.inner
+            .write()
+            .await
+            .insert(config_id, backend.clone());
+        Ok(backend)
+    }
+
+    /// Drop the cached backend for `config_id`. Reserved for the
+    /// future refresh-on-edit hook on `PUT/DELETE /servers/:configId`.
+    pub async fn remove(&self, config_id: i64) {
+        self.inner.write().await.remove(&config_id);
+    }
+
+    async fn build_backend(
+        &self,
+        connection: &ServerConnection,
+    ) -> ControlResult<Arc<dyn ControlBackend>> {
+        match connection.controlPath.as_str() {
+            "ssh" => self.build_ssh_backend(connection).await,
+            // "webquery" and any unknown value: default to WebQuery.
+            _ => self.build_webquery_backend(connection),
+        }
+    }
+
+    fn build_webquery_backend(
+        &self,
+        connection: &ServerConnection,
+    ) -> ControlResult<Arc<dyn ControlBackend>> {
+        let client = WebQueryClient::from_connection(connection, self.allow_self_signed)?;
+        Ok(Arc::new(client))
+    }
+
+    async fn build_ssh_backend(
+        &self,
+        connection: &ServerConnection,
+    ) -> ControlResult<Arc<dyn ControlBackend>> {
+        let user = connection.sshUsername.clone().ok_or_else(|| {
+            ControlBackendError::Config(format!(
+                "ssh control path selected for connection #{} but sshUsername is null",
+                connection.id
+            ))
+        })?;
+        let pw_ct = connection.sshPassword.clone().ok_or_else(|| {
+            ControlBackendError::Config(format!(
+                "ssh control path selected for connection #{} but sshPassword is null",
+                connection.id
+            ))
+        })?;
+        let password = crate::crypto::unseal(&pw_ct).map_err(|e| {
+            ControlBackendError::Decrypt {
+                config_id: connection.id,
+                message: e.to_string(),
+            }
+        })?;
+
+        let port: u16 = connection.sshPort.try_into().unwrap_or(10022);
+        let verifier = Arc::new(HostKeyVerifier::from_config(
+            connection.id,
+            connection.host.clone(),
+            port,
+            connection.sshHostKeyFingerprint.as_deref(),
+            self.ssh_known_hosts_path.clone(),
+        )?);
+
+        let cfg = TransportConfig::for_connection(connection.id);
+        let host = connection.host.clone();
+        let user_owned = user;
+        let pw_owned = password;
+        let verifier_clone = verifier;
+        let config_id = connection.id;
+
+        // The connect factory clones the credentials per attempt — the
+        // supervisor calls it once per (re)connect cycle and `russh`
+        // takes the password by `&str`, so an owned `String` per call
+        // is the cheapest correct shape.
+        let factory = move || {
+            let h = host.clone();
+            let u = user_owned.clone();
+            let p = pw_owned.clone();
+            let v = verifier_clone.clone();
+            async move {
+                connect_password(RusshConnectParams::new(config_id, h, port, u, p, v)).await
+            }
+        };
+
+        let handle = spawn_transport(cfg, factory);
+        let client = SshControlClient::new(connection.id, handle);
+        Ok(Arc::new(client))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn http_status_aligns_with_per_backend_mapping() {
+        let upstream = ControlBackendError::Upstream {
+            code: 2568,
+            message: "x".into(),
+        };
+        assert_eq!(upstream.http_status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(upstream.upstream_code(), 2568);
+
+        let transport = ControlBackendError::Transport("boom".into());
+        assert_eq!(transport.http_status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(transport.upstream_code(), -1);
+
+        let auth = ControlBackendError::AuthRejected { config_id: 7 };
+        assert_eq!(auth.http_status(), StatusCode::BAD_GATEWAY);
+
+        let cfg = ControlBackendError::Config("missing column".into());
+        assert_eq!(cfg.http_status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn webquery_error_round_trips() {
+        let we = WebQueryError::Upstream {
+            code: 1281,
+            message: "empty".into(),
+        };
+        let ce: ControlBackendError = we.into();
+        assert!(matches!(ce, ControlBackendError::Upstream { code: 1281, .. }));
+
+        let we = WebQueryError::Transport("dns".into());
+        let ce: ControlBackendError = we.into();
+        assert!(matches!(ce, ControlBackendError::Transport(_)));
+    }
+
+    #[test]
+    fn ssh_error_round_trips() {
+        let se = SshBridgeError::AuthRejected { config_id: 9 };
+        let ce: ControlBackendError = se.into();
+        assert!(matches!(
+            ce,
+            ControlBackendError::AuthRejected { config_id: 9 }
+        ));
+
+        let se = SshBridgeError::Upstream {
+            code: 2568,
+            message: "permissions".into(),
+        };
+        let ce: ControlBackendError = se.into();
+        assert!(matches!(ce, ControlBackendError::Upstream { code: 2568, .. }));
+    }
+
+    #[tokio::test]
+    async fn pool_returns_transport_error_when_connection_missing() {
+        let pool = ControlBackendPool::new(false);
+        let err = pool.get_or_build(99, None).await.unwrap_err();
+        match err {
+            ControlBackendError::Transport(s) => {
+                assert!(s.contains("99"), "expected config id in error: {s}");
+            }
+            other => panic!("expected Transport, got {other:?}"),
+        }
+    }
+}

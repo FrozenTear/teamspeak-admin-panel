@@ -99,6 +99,7 @@ mod tests {
             jwt_refresh_expiry: Duration::from_secs(7 * 24 * 3600),
             setup_lock: Arc::new(Mutex::new(())),
             webquery: WebQueryPool::new(false),
+            control: crate::control::ControlBackendPool::new(false),
             ws_hub: Hub::new(),
         }
     }

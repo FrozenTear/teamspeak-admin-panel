@@ -28,6 +28,37 @@ services:
       - ts6-music:/var/lib/ts6-manager/music:Z
     restart: unless-stopped
 
+  # PURA-78 SSHBridge integration target — opt-in profile so it does
+  # not run on every dev compose-up. Bring it up explicitly with
+  #
+  #   podman-compose --profile ssh-integration up -d ssh-integration
+  #
+  # Then point the env-gated test at it:
+  #
+  #   TS6_SSH_INTEGRATION=1 \
+  #   TS6_SSH_HOST=127.0.0.1 \
+  #   TS6_SSH_PORT=10022 \
+  #   TS6_SSH_USER=serveradmin \
+  #   TS6_SSH_PASSWORD=$(podman logs ts6-ssh-integration | grep token1=) \
+  #   cargo test -p ts6-manager-server --features server -- \
+  #     sshbridge::control_client::tests::integration --ignored --nocapture
+  #
+  # The TS3 server image speaks the same line protocol the spec
+  # mandates for TS6 SSH ServerQuery (Chapter 11 §11.4) — that is the
+  # whole rationale for SSHBridge as a parallel control path. We pin
+  # to a versioned tag so the test target stays stable across image
+  # updates.
+  ssh-integration:
+    container_name: ts6-ssh-integration
+    image: docker.io/teamspeak/teamspeak3-server:3.13.7
+    profiles:
+      - ssh-integration
+    environment:
+      TS3SERVER_LICENSE: accept
+    ports:
+      - "10022:10022"
+    restart: "no"
+
 volumes:
   ts6-db:
   ts6-music:

@@ -11,6 +11,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 
 use crate::config::Config;
+use crate::control::ControlBackendPool;
 use crate::db::Database;
 use crate::webquery::WebQueryPool;
 use crate::ws::Hub;
@@ -31,9 +32,16 @@ pub struct AppState {
     /// inside the lock as a defence-in-depth check.
     pub setup_lock: Arc<Mutex<()>>,
     /// PURA-23: pool of WebQuery clients keyed by `server_connection.id`.
-    /// Phase 1 fills lazily on first dashboard hit; Phase 2 will pre-populate
-    /// on boot and run the §10.7 30s health probe.
+    /// Phase 1 fills lazily on first dashboard hit. Retained alongside
+    /// [`Self::control`] because the Phase 2 write surface
+    /// (`routes::control`) still talks to a [`crate::webquery::WebQueryClient`]
+    /// directly — the SSH write commands land in a later child issue.
     pub webquery: WebQueryPool,
+    /// PURA-78: backend-agnostic control plane. Lazy-built per
+    /// `server_connection.id`; the per-server `controlPath` flag picks
+    /// WebQuery vs. SSHBridge at first use. Consumed by the dashboard
+    /// route today; future read-only Phase 2 routes migrate here.
+    pub control: ControlBackendPool,
     /// PURA-70: live event bus. Per-server fan-out channels + ring
     /// buffer + metrics. Cheap to clone (Arc-shared internals).
     pub ws_hub: Hub,
@@ -48,6 +56,7 @@ impl AppState {
             jwt_refresh_expiry: cfg.jwt_refresh_expiry,
             setup_lock: Arc::new(Mutex::new(())),
             webquery: WebQueryPool::new(cfg.ts_allow_self_signed),
+            control: ControlBackendPool::new(cfg.ts_allow_self_signed),
             ws_hub: Hub::new(),
         }
     }

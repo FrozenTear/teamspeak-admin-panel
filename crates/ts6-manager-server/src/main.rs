@@ -17,6 +17,8 @@ mod client;
 #[cfg(feature = "server")]
 mod config;
 #[cfg(feature = "server")]
+mod control;
+#[cfg(feature = "server")]
 mod crypto;
 #[cfg(feature = "server")]
 mod db;

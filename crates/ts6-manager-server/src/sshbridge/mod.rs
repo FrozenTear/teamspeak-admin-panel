@@ -33,11 +33,16 @@
 //! - **Host-key verification.** `known_hosts` vs strict-fingerprint vs TOFU.
 //!   Explicit SecurityEngineer review item — the foundation slice does NOT
 //!   ship a verifier yet.
-//! - **`ControlBackend` trait.** Common interface implemented by both
-//!   `WebQueryClient` and the SSH client; per-server `controlPath` flag
-//!   ('webquery' default, 'ssh' opt-in) selects the impl at pool construction.
-//! - **Env-gated integration test** against a containerised TS6 SSH target
-//!   (skipped without `TS6_SSH_INTEGRATION` env var).
+//! - **`ControlBackend` trait** — landed in PURA-78. The common
+//!   interface lives in [`crate::control`]; both `WebQueryClient` and
+//!   [`control_client::SshControlClient`] implement it, and the
+//!   per-server `controlPath` flag (`'webquery'` default, `'ssh'`
+//!   opt-in) selects the impl at pool construction.
+//! - **Env-gated integration test** against a containerised TS SSH
+//!   ServerQuery target (skipped without `TS6_SSH_INTEGRATION`) — also
+//!   landed under PURA-78. The container itself is wired into
+//!   `podman-compose.yml` under the `ssh-integration` profile so it
+//!   does not run on every dev start.
 //! - **Persistent audit table** (DB-backed) once the field list is signed
 //!   off by SecurityEngineer.
 //!
@@ -57,6 +62,7 @@
 
 pub mod audit;
 pub mod channel;
+pub mod control_client;
 pub mod hostkey;
 pub mod retention;
 pub mod russh_channel;
