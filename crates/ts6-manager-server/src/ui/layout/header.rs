@@ -3,7 +3,8 @@
 //!
 //! Phase 1 ships:
 //!  - hamburger button (mobile only, currently inert — drawer animation is Phase 2)
-//!  - server-selector pill (stub display; functional dropdown is a follow-up)
+//!  - server-selector pill — functional Dropdown (PURA-27) backed by stub data
+//!    until the live `GET /api/servers` route lands
 //!  - websocket dot (stub status; wires to the real WS hub when it lands)
 //!  - theme toggle (live — flips `data-theme="dark"`/`"light"`)
 //!  - user menu (stub — initials avatar + display name; dropdown follows)
@@ -15,7 +16,7 @@ use crate::client::auth as auth_client;
 use crate::client::dioxus::use_session;
 use crate::client::session::SessionHandle;
 use crate::client::store::AuthState;
-use crate::ui::components::{Button, ButtonSize, ButtonVariant};
+use crate::ui::components::{Button, ButtonSize, ButtonVariant, ServerSelector, ServerSelectorVariant};
 use crate::ui::routes::Route;
 use crate::ui::theme::{Theme, use_theme};
 use ts6_manager_shared::auth::LogoutRequest;
@@ -87,19 +88,7 @@ pub fn Header() -> Element {
                 "☰"
             }
 
-            // Stub server selector — non-interactive pill that mirrors the
-            // preview markup. The functional Dropdown lands in a follow-up
-            // child once `GET /api/servers` is callable.
-            button {
-                class: "selector desktop-selector",
-                r#type: "button",
-                "aria-haspopup": "menu",
-                "aria-disabled": "true",
-                title: "Server selector — interactive in a follow-up child",
-                span { class: "mark", "⬢" }
-                span { class: "name", "No server selected" }
-                span { class: "chev", "▾" }
-            }
+            ServerSelector { variant: ServerSelectorVariant::Desktop }
 
             span {
                 class: "ws-dot",

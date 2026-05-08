@@ -469,6 +469,43 @@
 }
 .menu-footer .btn { flex: 1 1 auto; }
 
+/* Anchor wrapper for the Dropdown primitive (PURA-27). The trigger lives
+ * in normal flow; the menu absolute-positions flush below the trigger by
+ * default, with a `var(--space-2)` gap (4px) per `components.md` §13.9.
+ * Token-only — nothing here sets a hex literal. */
+.dropdown-anchor {
+  position: relative;
+  display: inline-flex;
+}
+.dropdown-anchor > .menu {
+  position: absolute;
+  top: calc(100% + var(--space-2));
+  left: 0;
+}
+.dropdown-anchor.is-above > .menu {
+  top: auto;
+  bottom: calc(100% + var(--space-2));
+}
+/* Mobile sheet variant per `components.md` §13.9 + `dropdown.html` §6:
+ * the menu slides up from the bottom edge as a full-width sheet with a
+ * 4px accent top bar. The sheet replaces the regular below-trigger
+ * placement at ≤480px. */
+@media (max-width: 480px) {
+  .dropdown-anchor > .menu {
+    position: fixed;
+    top: auto;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    width: 100vw;
+    max-width: none;
+    max-height: 60vh;
+    border-radius: var(--radius-md) var(--radius-md) 0 0;
+    border-top: 4px solid var(--accent-fg);
+    box-shadow: var(--shadow-lg);
+  }
+}
+
 /* ─── Modal ──────────────────────────────────────────── */
 .modal-backdrop {
   position: fixed; inset: 0;

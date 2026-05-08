@@ -19,6 +19,7 @@ use dioxus::prelude::*;
 
 use crate::client::dioxus::use_session;
 use crate::client::store::AuthState;
+use crate::ui::components::{ServerSelector, ServerSelectorVariant};
 use crate::ui::routes::Route;
 
 /// Authenticated layout. Dioxus mounts an `Outlet<Route>` for the matched
@@ -62,16 +63,7 @@ pub fn AppShell() -> Element {
             Sidebar { active: route.clone() }
             Header {}
             div { class: "mobile-selector-bar",
-                button {
-                    class: "selector",
-                    r#type: "button",
-                    "aria-haspopup": "menu",
-                    "aria-disabled": "true",
-                    "title": "Server selector — interactive in a follow-up child",
-                    span { class: "mark", "⬢" }
-                    span { class: "name", "No server selected" }
-                    span { class: "chev", "▾" }
-                }
+                ServerSelector { variant: ServerSelectorVariant::Mobile }
             }
             main { class: "main",
                 Outlet::<Route> {}

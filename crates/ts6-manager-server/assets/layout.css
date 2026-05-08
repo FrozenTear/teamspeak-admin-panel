@@ -148,7 +148,11 @@
   }
   /* Mobile pill stretches the row + pulls the chevron to the trailing
    * edge so the trigger reads "tap-anywhere-to-open" instead of a
-   * floating button. */
+   * floating button. The PURA-27 wiring nests the trigger inside a
+   * `.dropdown-anchor` wrapper, so the full-width rule applies to the
+   * anchor + the trigger so neither shrinks back to content-width. */
+  .app .mobile-selector-bar .dropdown-anchor,
+  .app .mobile-selector-bar .server-selector-anchor,
   .app .mobile-selector-bar .selector {
     width: 100%;
     justify-content: flex-start;
@@ -163,7 +167,10 @@
   .app .hamburger {
     display: inline-flex;
   }
-  .app .header > .selector,
+  /* PURA-27 wraps the in-header trigger in `.server-selector-anchor`, so
+   * the hide-on-mobile rule keys off the wrapper instead of the bare
+   * `.selector` button (which is now nested one level deeper). */
+  .app .header > .server-selector-anchor.desktop-selector,
   .app .header > .logout-btn {
     display: none;
   }
