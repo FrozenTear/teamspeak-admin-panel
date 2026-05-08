@@ -589,6 +589,178 @@ Trigger + popover for choice lists. Used by: server selector (`server-selector.m
 - For a long catalog → searchable Combobox (Phase 2).
 - For "do you really want to do this" → Modal (§3).
 
+### 13.7 Reference markup
+
+The trigger is whatever already-built control invokes the menu — for the server selector that's `.selector`, for the user menu it's a Button. The menu portal is the same shape regardless of trigger:
+
+```html
+<!-- Trigger lives in normal flow. -->
+<button class="selector"
+        id="server-selector-trigger"
+        aria-haspopup="menu"
+        aria-expanded="true"
+        aria-controls="server-selector-menu">
+  <span class="mark">⬢</span>
+  <span class="label">My Community</span>
+  <span class="chev">▾</span>
+</button>
+
+<!-- Menu is positioned by the host (portal or relative parent). -->
+<div class="menu"
+     id="server-selector-menu"
+     role="menu"
+     aria-labelledby="server-selector-trigger"
+     aria-activedescendant="server-selector-item-2">
+  <input class="menu-filter"
+         type="text"
+         placeholder="Filter servers…"
+         aria-label="Filter servers">
+
+  <div class="menu-section-label">Servers</div>
+
+  <a class="menu-item is-rich"
+     id="server-selector-item-1"
+     role="menuitemradio"
+     aria-checked="true">
+    <span class="check">✓</span>
+    <span class="label">My Community</span>
+    <span class="meta">connected</span>
+  </a>
+
+  <a class="menu-item is-rich"
+     id="server-selector-item-2"
+     role="menuitemradio"
+     aria-checked="false">
+    <span class="check"></span>
+    <span class="label">Tournament server</span>
+    <span class="meta">reconnecting</span>
+  </a>
+
+  <div class="menu-divider" role="separator"></div>
+
+  <button class="menu-item" role="menuitem">
+    <span class="icn">＋</span>
+    <span class="label">Add server</span>
+  </button>
+</div>
+```
+
+For an empty filter result, replace items with `<div class="menu-empty">No matches</div>`. For destructive items, add `is-danger` to `.menu-item`.
+
+### 13.8 ARIA wiring contract
+
+| Element | Required attributes |
+|---|---|
+| Trigger | `aria-haspopup="menu"`, `aria-expanded` toggled with state, `aria-controls` pointing at the menu's `id` |
+| Menu container | `role="menu"`, `aria-labelledby` pointing at the trigger's `id`, `aria-activedescendant` pointing at the focused item's `id` while keyboard navigating |
+| Single-select item | `role="menuitemradio"` + `aria-checked` |
+| Multi-select item | `role="menuitemcheckbox"` + `aria-checked` |
+| Plain action item | `role="menuitem"` |
+| Filter input | own `aria-label` (it's not a `menuitem` — it's chrome) |
+| Section label | not focusable; never a `role="heading"` (would split the menu's announce stream) |
+| Divider | `role="separator"` |
+| Disabled item | `aria-disabled="true"` (do NOT set `disabled`; it removes from focus order and breaks keyboard nav) |
+
+Do not ship a Dropdown that omits `aria-activedescendant`. Type-ahead and arrow nav need it for screen-reader users to follow the focus.
+
+### 13.9 Positioning contract
+
+Position is the **host's** responsibility — the primitive does not decide. Concrete recipe for the server selector and user menu (matches the visible mock):
+
+- Anchor to the trigger's bounding box.
+- Place flush below by default, gap = `--space-2` (4px).
+- Width: `max(trigger-width, 240px)`, capped at 320px (the menu's `max-width`). For a `.selector` trigger that's 200–300px wide, this is "match the trigger".
+- Viewport-aware shift: if menu would overflow the bottom edge, flip to above. If it would overflow right (mobile, RTL), shift left so the right edge aligns with the trigger's right edge.
+- On mobile (≤480px), prefer the **sheet variant** — slide up from the bottom edge, full width, max-height 60vh, with a 4px top accent bar (use `--bg-surface-raised`, no border-radius on the bottom). The bot-flow drawer pattern in `bot-canvas-brief.md` §4.2 is the same idea.
+
+Implementation freedom: a hand-rolled `getBoundingClientRect`-based positioner is fine for Phase 1. A fancier `floating-ui` port comes when more menus arrive — Phase 2 cleanup.
+
+### 13.10 Rust component contract (for DioxusLead)
+
+```rust
+#[derive(Clone, PartialEq, Eq)]
+pub enum MenuItemKind {
+    Action,
+    Radio { checked: bool },
+    Checkbox { checked: bool },
+}
+
+#[component]
+pub fn Dropdown(
+    /// Element id for the trigger; used for aria-controls / aria-labelledby.
+    trigger_id: String,
+    /// Element id for the menu portal.
+    menu_id: String,
+    /// Open/closed state. Owned by the host so it can be controlled.
+    open: Signal<bool>,
+    /// Trigger node (e.g., a Button or a `.selector` pill). Caller wires
+    /// `aria-haspopup`, `aria-expanded`, `aria-controls` from the host
+    /// using the ids above — Dropdown does NOT mutate the trigger.
+    trigger: Element,
+    /// Menu body. Compose with Menu / MenuItem / MenuSection / etc.
+    children: Element,
+    /// Optional placement override; default = below trigger, viewport-aware.
+    #[props(default)] placement: MenuPlacement,
+    /// Closes when focus leaves; default true. Off for sticky multi-select.
+    #[props(default = true)] close_on_select: bool,
+) -> Element { /* … */ }
+
+#[component]
+pub fn Menu(
+    /// Active item id for `aria-activedescendant`. None = no keyboard cursor yet.
+    active_id: Option<String>,
+    /// Menu node id; matches Dropdown's `menu_id`.
+    id: String,
+    /// `aria-labelledby` target — usually Dropdown's `trigger_id`.
+    labelled_by: String,
+    children: Element,
+) -> Element { /* … */ }
+
+#[component]
+pub fn MenuItem(
+    id: String,
+    kind: MenuItemKind,
+    #[props(default)] disabled: bool,
+    #[props(default)] danger: bool,
+    #[props(default)] rich: bool,           // 40px height
+    #[props(default)] onselect: EventHandler<()>,
+    children: Element,
+) -> Element { /* … */ }
+
+#[component]
+pub fn MenuSection(label: String, children: Element) -> Element { /* … */ }
+
+#[component]
+pub fn MenuFilter(
+    value: Signal<String>,
+    #[props(default)] placeholder: Option<String>,
+) -> Element { /* … */ }
+
+#[component]
+pub fn MenuDivider() -> Element { /* … */ }
+
+#[component]
+pub fn MenuEmpty(#[props(default = "No matches".into())] text: String) -> Element { /* … */ }
+
+#[component]
+pub fn MenuFooter(children: Element) -> Element { /* … */ }
+```
+
+State ownership: the **host** owns `open`, the active item id, and the filter value. The Dropdown primitive owns: outside-click detection, Escape handling, focus return on close, and the keyboard handler (`↑`/`↓`/`Home`/`End`/`Enter`/type-ahead).
+
+The keyboard handler updates `active_id` (a signal the host controls — pass it down via context) so screen readers see `aria-activedescendant` move. `Enter` calls the focused item's `onselect`. Items themselves don't need to be focusable HTML elements — `tabindex="-1"` on them keeps Tab-traversal sane.
+
+### 13.11 Server-selector specialization
+
+The server selector (`server-selector.md`) is a Dropdown with these specifics layered on:
+- Trigger uses `.selector` (not Button).
+- Items are radios (`MenuItemKind::Radio`) — single-select. Selected = current server.
+- `MenuFilter` shown only when `servers.len() > 7` (per §13.4).
+- `MenuFooter` contains a "Manage servers…" link routing to `/servers`.
+- Optimistic switch: on select, close, fire route change, mark new active. On switch failure, surface a toast (`server-selector.md` §4.3).
+
+The server-selector implementation can compose Dropdown directly — no need for a one-off pill.
+
 ---
 
 ## 14. Spinner (supporting primitive)
@@ -722,7 +894,7 @@ Suggested Rust component names, for handoff:
 | §10 Card | `Card { variant, header?, footer? }` |
 | §11 Chrome | `AppShell`, `Sidebar`, `NavGroup`, `NavItem`, `Header`, `WebsocketIndicator`, `UserMenu` |
 | §12 Banner | `Banner { variant, dismissible? }` |
-| §13 Dropdown | `Dropdown { trigger, items }`, `Menu`, `MenuItem`, `MenuSection` |
+| §13 Dropdown | `Dropdown`, `Menu`, `MenuItem`, `MenuSection`, `MenuFilter`, `MenuDivider`, `MenuEmpty`, `MenuFooter` (full prop signatures in §13.10) |
 | §14 Spinner | `Spinner { size }` |
 | §15 Steps | `Steps`, `Step { state, label }` |
 

@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TS6 Manager — Dropdown / Menu primitive</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="components.css">
+<style>
+  body { padding: var(--space-7); display: grid; gap: var(--space-7); align-items: start; grid-template-columns: repeat(3, 1fr); max-width: 1280px; margin: 0 auto; }
+  body > section { display: grid; gap: var(--space-4); }
+  h1 { grid-column: 1 / -1; margin: 0 0 var(--space-3); font: var(--weight-bold) var(--text-2xl) / 1 var(--font-sans); }
+  h2 { margin: 0; font: var(--weight-semibold) var(--text-base) / 1 var(--font-sans); color: var(--text-primary); }
+  .lede { grid-column: 1 / -1; margin: 0; max-width: 70ch; color: var(--text-secondary); font: var(--weight-regular) var(--text-base) / var(--lh-base) var(--font-sans); }
+  .anchor { position: relative; height: auto; }
+  .anchor .menu { margin-top: var(--space-2); }
+  /* Anchored menu — sits flush below the trigger. */
+  .pop { position: relative; }
+  .pop .menu { margin-top: var(--space-2); }
+  .selector {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-3);
+    height: 36px;
+    padding: 0 var(--space-5);
+    background: var(--bg-surface-raised);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    color: var(--text-primary);
+    font: var(--weight-medium) var(--text-base) / var(--lh-base) var(--font-sans);
+    cursor: pointer;
+  }
+  .selector .mark { color: var(--accent-fg); }
+  .selector .chev { opacity: 0.7; margin-left: 4px; }
+  .selector[aria-expanded="true"] { border-color: var(--accent-fg); }
+
+  .lbl { color: var(--text-muted); font: var(--weight-regular) var(--text-xs) / 1 var(--font-sans); }
+  .swatch { background: var(--bg-canvas); border: 1px dashed var(--border-subtle); border-radius: var(--radius-md); padding: var(--space-7); display: grid; gap: var(--space-3); justify-items: start; }
+  .sheet {
+    width: 360px;
+    background: var(--bg-surface-raised);
+    border: 1px solid var(--border-subtle);
+    border-top: 4px solid var(--accent-fg);
+    border-radius: var(--radius-md) var(--radius-md) 0 0;
+    box-shadow: var(--shadow-lg);
+    margin-top: var(--space-4);
+  }
+  .sheet .menu { box-shadow: none; border: 0; max-width: none; max-height: none; padding: 0; }
+  @media (max-width: 768px) {
+    body { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<h1>Dropdown / Menu — primitive states</h1>
+<p class="lede">
+  All states the [<code>Dropdown</code>] primitive must support, rendered with real CSS so DioxusLead can pixel-match while wiring the Rust component contract from <code>components.md</code> §13.
+</p>
+
+<section>
+  <h2>1. Server selector — open</h2>
+  <span class="lbl">single-select · radio · with filter · sectioned · footer</span>
+  <div class="swatch pop">
+    <button class="selector"
+            id="srv-trigger"
+            aria-haspopup="menu"
+            aria-expanded="true"
+            aria-controls="srv-menu">
+      <span class="mark">⬢</span>
+      <span class="label">My Community</span>
+      <span class="chev">▾</span>
+    </button>
+    <div class="menu"
+         id="srv-menu"
+         role="menu"
+         aria-labelledby="srv-trigger"
+         aria-activedescendant="srv-item-2"
+         style="min-width: 280px">
+      <input class="menu-filter" type="text" placeholder="Filter servers…" aria-label="Filter servers">
+      <div class="menu-section-label">Servers</div>
+      <a class="menu-item is-rich" id="srv-item-1" role="menuitemradio" aria-checked="true" tabindex="-1">
+        <span class="check">✓</span>
+        <span class="label">My Community</span>
+        <span class="meta">connected</span>
+      </a>
+      <a class="menu-item is-rich is-active" id="srv-item-2" role="menuitemradio" aria-checked="false" tabindex="-1">
+        <span class="check"></span>
+        <span class="label">Backup node</span>
+        <span class="meta">connected</span>
+      </a>
+      <a class="menu-item is-rich" id="srv-item-3" role="menuitemradio" aria-checked="false" tabindex="-1">
+        <span class="check"></span>
+        <span class="label">Tournament server</span>
+        <span class="meta">reconnecting</span>
+      </a>
+      <a class="menu-item is-rich" id="srv-item-4" role="menuitemradio" aria-checked="false" aria-disabled="true" tabindex="-1">
+        <span class="check"></span>
+        <span class="label">Lan party (legacy)</span>
+        <span class="meta">auth failed</span>
+      </a>
+      <div class="menu-divider" role="separator"></div>
+      <div class="menu-footer">
+        <a class="btn btn-secondary btn-sm" href="servers.html">Manage servers…</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>2. User menu</h2>
+  <span class="lbl">trigger-on-Button · plain action items · destructive item</span>
+  <div class="swatch pop">
+    <button class="btn btn-ghost btn-sm"
+            id="user-trigger"
+            aria-haspopup="menu"
+            aria-expanded="true"
+            aria-controls="user-menu"
+            style="gap: var(--space-3)">
+      <span class="avatar" style="width:24px; height:24px; background: var(--c-accent-100); color: var(--accent-fg); border-radius: var(--radius-full); display:inline-grid; place-items:center; font-size: var(--text-xs); font-weight: var(--weight-semibold)">RS</span>
+      Robert
+      <span class="chev">▾</span>
+    </button>
+    <div class="menu"
+         id="user-menu"
+         role="menu"
+         aria-labelledby="user-trigger">
+      <button class="menu-item" role="menuitem" tabindex="-1">
+        <span class="icn">◯</span>
+        <span class="label">Profile</span>
+      </button>
+      <button class="menu-item" role="menuitem" tabindex="-1">
+        <span class="icn">⚙</span>
+        <span class="label">Settings</span>
+      </button>
+      <div class="menu-divider" role="separator"></div>
+      <button class="menu-item is-danger" role="menuitem" tabindex="-1">
+        <span class="icn">⏏</span>
+        <span class="label">Sign out</span>
+      </button>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>3. Multi-select (table row actions)</h2>
+  <span class="lbl">checkbox semantics · sticks open on select</span>
+  <div class="swatch pop">
+    <button class="btn btn-secondary btn-sm"
+            id="filt-trigger"
+            aria-haspopup="menu"
+            aria-expanded="true"
+            aria-controls="filt-menu">
+      Columns
+      <span class="chev">▾</span>
+    </button>
+    <div class="menu"
+         id="filt-menu"
+         role="menu"
+         aria-labelledby="filt-trigger">
+      <button class="menu-item" role="menuitemcheckbox" aria-checked="true" tabindex="-1">
+        <span class="check">✓</span>
+        <span class="label">Name</span>
+      </button>
+      <button class="menu-item" role="menuitemcheckbox" aria-checked="true" tabindex="-1">
+        <span class="check">✓</span>
+        <span class="label">Group</span>
+      </button>
+      <button class="menu-item" role="menuitemcheckbox" aria-checked="false" tabindex="-1">
+        <span class="check"></span>
+        <span class="label">Last seen</span>
+      </button>
+      <button class="menu-item" role="menuitemcheckbox" aria-checked="true" tabindex="-1">
+        <span class="check">✓</span>
+        <span class="label">Channel</span>
+      </button>
+      <button class="menu-item" role="menuitemcheckbox" aria-checked="false" tabindex="-1">
+        <span class="check"></span>
+        <span class="label">IP</span>
+      </button>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>4. Empty filter result</h2>
+  <span class="lbl">filter narrows to nothing</span>
+  <div class="swatch pop">
+    <button class="selector" aria-haspopup="menu" aria-expanded="true">
+      <span class="mark">⬢</span>
+      <span class="label">My Community</span>
+      <span class="chev">▾</span>
+    </button>
+    <div class="menu" role="menu" style="min-width: 280px">
+      <input class="menu-filter" type="text" value="staging-007" aria-label="Filter servers">
+      <div class="menu-empty">No servers match "staging-007".</div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>5. Closed state</h2>
+  <span class="lbl">trigger only · aria-expanded false</span>
+  <div class="swatch pop">
+    <button class="selector"
+            aria-haspopup="menu"
+            aria-expanded="false">
+      <span class="mark">⬢</span>
+      <span class="label">My Community</span>
+      <span class="chev">▾</span>
+    </button>
+    <p class="lbl" style="margin: 0; max-width: 36ch">Click / Enter / Space / ↓ opens the menu and moves focus to the filter input (when present) or the active item.</p>
+  </div>
+</section>
+
+<section>
+  <h2>6. Mobile sheet variant</h2>
+  <span class="lbl">≤480px breakpoint · slides up from bottom · 4px accent bar</span>
+  <div class="swatch" style="padding: var(--space-5); justify-items: stretch">
+    <div class="sheet" style="width: 100%">
+      <div class="menu" role="menu" aria-label="Server selector">
+        <div class="menu-section-label">Servers</div>
+        <a class="menu-item is-rich" role="menuitemradio" aria-checked="true">
+          <span class="check">✓</span>
+          <span class="label">My Community</span>
+          <span class="meta">connected</span>
+        </a>
+        <a class="menu-item is-rich" role="menuitemradio" aria-checked="false">
+          <span class="check"></span>
+          <span class="label">Backup node</span>
+          <span class="meta">connected</span>
+        </a>
+        <div class="menu-divider" role="separator"></div>
+        <div class="menu-footer">
+          <a class="btn btn-secondary btn-sm" href="#">Manage servers…</a>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+</body>
+</html>
