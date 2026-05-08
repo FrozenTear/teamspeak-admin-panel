@@ -128,6 +128,20 @@ mod server_entry {
         let serve_cfg = ServeConfig::new();
         let state = app_state::AppState::from_config(&cfg, database.clone());
 
+        // PURA-81 — periodic dashboard tick republisher. Spawns one
+        // worker per enabled `server_connection`; each pushes a
+        // `dashboard:tick` envelope onto the WS hub every 5 s. The
+        // handle is held in a `_`-prefixed binding so it lives for
+        // the lifetime of `run_serve` — a future graceful-shutdown
+        // path can take ownership and call `.shutdown().await`.
+        let _dashboard_ticks = crate::ws::dashboard_tick::spawn(
+            crate::ws::dashboard_tick::TickerDeps {
+                db: database.clone(),
+                hub: state.ws_hub.clone(),
+                control: state.control.clone(),
+            },
+        );
+
         // Phase 1 SECURITY (slice 4b): per-IP rate limit on the auth
         // surface. One bucket shared across `/login` and `/refresh` per
         // spec §6.8; `trusted_proxy_hops` decides whether the limiter

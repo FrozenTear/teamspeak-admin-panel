@@ -340,6 +340,19 @@ impl ControlBackendPool {
         self.inner.write().await.remove(&config_id);
     }
 
+    /// Inject a backend for `config_id` (test-only). The PURA-81
+    /// dashboard-tick suite uses this to bypass the WebQuery / SSH
+    /// builders and exercise the supervisor + worker logic against a
+    /// hand-rolled [`ControlBackend`] fake.
+    #[cfg(test)]
+    pub(crate) async fn insert_for_test(
+        &self,
+        config_id: i64,
+        backend: Arc<dyn ControlBackend>,
+    ) {
+        self.inner.write().await.insert(config_id, backend);
+    }
+
     async fn build_backend(
         &self,
         connection: &ServerConnection,

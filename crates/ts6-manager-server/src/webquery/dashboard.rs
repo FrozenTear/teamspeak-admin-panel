@@ -37,10 +37,27 @@ use ts6_manager_shared::dashboard::{BandwidthSnapshot, DashboardData};
 
 use crate::app_state::AppState;
 use crate::auth::extractors::RequireAuth;
-use crate::control::ControlBackendError;
+use crate::control::{ControlBackend, ControlBackendError, ControlResult};
 use crate::repos::server_connections;
 
 use super::models;
+
+/// Fan-out the four §7.19 ServerQuery calls in parallel against `client`
+/// and reduce them into a [`DashboardData`] snapshot. Shared between the
+/// HTTP handler and the WS tick republisher (PURA-81) so both report the
+/// exact same payload.
+pub(crate) async fn fetch_dashboard(
+    client: &dyn ControlBackend,
+    sid: i64,
+) -> ControlResult<DashboardData> {
+    let (info, clients, channels, conn_info) = tokio::try_join!(
+        client.serverinfo(sid),
+        client.clientlist(sid),
+        client.channellist(sid),
+        client.server_connection_info(sid),
+    )?;
+    Ok(aggregate(info, clients, channels, conn_info))
+}
 
 /// Build the dashboard sub-router. Caller mounts it at
 /// `/api/servers/{configId}/vs/{sid}/dashboard`.
@@ -129,15 +146,11 @@ async fn handler(
     // Spec §7.19: issue the four upstream calls in parallel. Trait
     // dispatch routes through whichever backend `controlPath` selected
     // for this connection.
-    let (info, clients, channels, conn_info) = tokio::try_join!(
-        client.serverinfo(sid),
-        client.clientlist(sid),
-        client.channellist(sid),
-        client.server_connection_info(sid),
-    )
-    .map_err(translate_control_error)?;
+    let dashboard = fetch_dashboard(client.as_ref(), sid)
+        .await
+        .map_err(translate_control_error)?;
 
-    Ok(Json(aggregate(info, clients, channels, conn_info)))
+    Ok(Json(dashboard))
 }
 
 /// Reduce the four typed responses into the §7.19.1 wire shape. ServerQuery
