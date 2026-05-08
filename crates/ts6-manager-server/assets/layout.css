@@ -95,6 +95,11 @@
 .app .mobile-selector-bar {
   display: none;
 }
+/* Hamburger lives in the header for slot order but is desktop-hidden;
+ * it flips on at the same breakpoint that collapses the sidebar. */
+.app .hamburger {
+  display: none;
+}
 @media (max-width: 768px) {
   .app .mobile-selector-bar {
     display: block;
@@ -102,5 +107,30 @@
     padding: var(--space-3) var(--space-5);
     background: var(--bg-canvas);
     border-bottom: 1px solid var(--border-subtle);
+  }
+  /* Mobile pill stretches the row + pulls the chevron to the trailing
+   * edge so the trigger reads "tap-anywhere-to-open" instead of a
+   * floating button. */
+  .app .mobile-selector-bar .selector {
+    width: 100%;
+    justify-content: flex-start;
+  }
+  .app .mobile-selector-bar .selector .chev {
+    margin-left: auto;
+  }
+  /* On mobile the hamburger replaces the desktop sidebar entry point;
+   * the in-header desktop selector pill, the logout button, and the
+   * user-menu's first-name + chevron all collapse so the slot order
+   * (`hamburger · ws-dot · spacer · theme · avatar`) stays one row. */
+  .app .hamburger {
+    display: inline-flex;
+  }
+  .app .header > .selector,
+  .app .header > .logout-btn {
+    display: none;
+  }
+  .app .header .user .name,
+  .app .header .user .chev {
+    display: none;
   }
 }
