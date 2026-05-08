@@ -45,6 +45,11 @@ async fn seed_server(db: &crate::db::Database) -> i64 {
             queryBotNickname: None,
             sshBotNickname: None,
             enabled: true,
+            controlPath: None,
+            sshAuthMethod: None,
+            sshPrivateKey: None,
+            sshKeyAgentSocket: None,
+            sshHostKeyFingerprint: None,
         },
     )
     .await

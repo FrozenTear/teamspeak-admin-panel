@@ -165,6 +165,11 @@ mod tests {
             queryBotNickname: None,
             sshBotNickname: None,
             enabled: true,
+            controlPath: None,
+            sshAuthMethod: None,
+            sshPrivateKey: None,
+            sshKeyAgentSocket: None,
+            sshHostKeyFingerprint: None,
         }
     }
 

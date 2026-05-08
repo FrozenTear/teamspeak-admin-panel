@@ -18,6 +18,7 @@ async fn migrations_apply_priority_slice_on_fresh_db() {
             "0002_query_bot_nickname".to_string(),
             "0003_ssh_bot_nickname".to_string(),
             "0004_chapter4_remaining_entities".to_string(),
+            "0005_ssh_bridge_auth".to_string(),
         ],
         "first run should apply every migration"
     );
@@ -37,7 +38,7 @@ async fn migrations_runner_is_idempotent() {
     );
     assert_eq!(
         second.skipped.len(),
-        4,
+        5,
         "second run should skip every migration applied on the first run"
     );
 }

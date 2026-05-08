@@ -462,6 +462,12 @@ fn sample_connection(id: i64, host: &str, api_key: &str) -> ServerConnection {
         enabled: true,
         createdAt: Utc::now(),
         updatedAt: Utc::now(),
+        // D-SSH-AUTH (PURA-77) defaults — webquery path, password auth.
+        controlPath: "webquery".into(),
+        sshAuthMethod: "password".into(),
+        sshPrivateKey: None,
+        sshKeyAgentSocket: None,
+        sshHostKeyFingerprint: None,
     }
 }
 

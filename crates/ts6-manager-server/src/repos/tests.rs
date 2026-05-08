@@ -113,6 +113,11 @@ async fn deleting_user_cascades_to_refresh_tokens_and_grants() {
             queryBotNickname: None,
             sshBotNickname: None,
             enabled: true,
+            controlPath: None,
+            sshAuthMethod: None,
+            sshPrivateKey: None,
+            sshKeyAgentSocket: None,
+            sshHostKeyFingerprint: None,
         },
     )
     .await
@@ -289,6 +294,11 @@ async fn server_user_grant_composite_uniqueness_is_enforced() {
             queryBotNickname: None,
             sshBotNickname: None,
             enabled: true,
+            controlPath: None,
+            sshAuthMethod: None,
+            sshPrivateKey: None,
+            sshKeyAgentSocket: None,
+            sshHostKeyFingerprint: None,
         },
     )
     .await
@@ -336,6 +346,11 @@ async fn deleting_server_cascades_to_grants() {
             queryBotNickname: None,
             sshBotNickname: None,
             enabled: true,
+            controlPath: None,
+            sshAuthMethod: None,
+            sshPrivateKey: None,
+            sshKeyAgentSocket: None,
+            sshHostKeyFingerprint: None,
         },
     )
     .await
@@ -380,4 +395,163 @@ async fn user_set_password_hash_and_mark_login_persist() {
     users::mark_login(&db, user.id).await.unwrap();
     let after_login = users::find_by_id(&db, user.id).await.unwrap().unwrap();
     assert!(after_login.lastLoginAt.is_some());
+}
+
+// ====================================================================
+// D-SSH-AUTH (PURA-77) — schema + binder coverage for the SSHBridge
+// auth-model fields added in `0005_ssh_bridge_auth.surql`. See
+// study-documents/ts6-manager-impl-deviations.md → D-SSH-AUTH for the
+// full rationale and external-contract audit.
+// ====================================================================
+
+/// A row inserted with the new fields left as `None` MUST come back with
+/// the migration-side defaults applied: `controlPath = 'webquery'`,
+/// `sshAuthMethod = 'password'`, and the three option fields NULL. This
+/// is the load-bearing invariant for the existing `POST /api/servers`
+/// handler that has not been taught about the new fields yet — it relies
+/// on the defaults to produce a row consistent with the spec's password-
+/// only auth model.
+#[tokio::test]
+async fn server_connection_ssh_bridge_auth_defaults_apply_when_unset() {
+    let db = setup().await;
+    let row = server_connections::insert(
+        &db,
+        server_connections::NewServerConnection {
+            name: "default-row".into(),
+            host: "ts.example.com".into(),
+            webqueryPort: 10080,
+            apiKey: "enc:0:0:0".into(),
+            useHttps: false,
+            sshPort: 10022,
+            sshUsername: None,
+            sshPassword: None,
+            queryBotChannel: None,
+            queryBotNickname: None,
+            sshBotNickname: None,
+            enabled: true,
+            controlPath: None,
+            sshAuthMethod: None,
+            sshPrivateKey: None,
+            sshKeyAgentSocket: None,
+            sshHostKeyFingerprint: None,
+        },
+    )
+    .await
+    .expect("insert");
+
+    assert_eq!(row.controlPath, "webquery");
+    assert_eq!(row.sshAuthMethod, "password");
+    assert!(row.sshPrivateKey.is_none());
+    assert!(row.sshKeyAgentSocket.is_none());
+    assert!(row.sshHostKeyFingerprint.is_none());
+}
+
+/// Explicit non-default values must round-trip verbatim through the repo
+/// for both the agent-auth path (`sshAuthMethod = 'agent'`, agent socket
+/// path stored plaintext) and the strict-fingerprint host-key verifier.
+#[tokio::test]
+async fn server_connection_ssh_bridge_auth_explicit_values_round_trip() {
+    let db = setup().await;
+    let row = server_connections::insert(
+        &db,
+        server_connections::NewServerConnection {
+            name: "agent-row".into(),
+            host: "ts.example.com".into(),
+            webqueryPort: 10080,
+            apiKey: "enc:0:0:0".into(),
+            useHttps: true,
+            sshPort: 10022,
+            sshUsername: Some("serveradmin".into()),
+            sshPassword: None,
+            queryBotChannel: None,
+            queryBotNickname: None,
+            sshBotNickname: None,
+            enabled: true,
+            controlPath: Some("ssh".into()),
+            sshAuthMethod: Some("agent".into()),
+            sshPrivateKey: None,
+            sshKeyAgentSocket: Some("/run/user/1000/ssh-agent.socket".into()),
+            sshHostKeyFingerprint: Some(
+                "SHA256:abcd1234abcd1234abcd1234abcd1234abcd1234ab".into(),
+            ),
+        },
+    )
+    .await
+    .expect("insert");
+
+    assert_eq!(row.controlPath, "ssh");
+    assert_eq!(row.sshAuthMethod, "agent");
+    assert_eq!(
+        row.sshKeyAgentSocket.as_deref(),
+        Some("/run/user/1000/ssh-agent.socket")
+    );
+    assert_eq!(
+        row.sshHostKeyFingerprint.as_deref(),
+        Some("SHA256:abcd1234abcd1234abcd1234abcd1234abcd1234ab")
+    );
+
+    // Read-back via list() also surfaces the same values — proves the
+    // PROJECTION includes the new fields (not just the post-CREATE RETURN).
+    let listed = server_connections::list(&db).await.unwrap();
+    let stored = listed.iter().find(|r| r.name == "agent-row").unwrap();
+    assert_eq!(stored.controlPath, "ssh");
+    assert_eq!(stored.sshAuthMethod, "agent");
+    assert_eq!(stored.sshKeyAgentSocket, row.sshKeyAgentSocket);
+    assert_eq!(stored.sshHostKeyFingerprint, row.sshHostKeyFingerprint);
+}
+
+/// `sshPrivateKey` is the only D-SSH-AUTH field that holds operator-
+/// supplied secret material, so it MUST round-trip through the spec
+/// §6.3.2 envelope (`enc:<iv>:<tag>:<ct>`). The repo treats ciphertext as
+/// an opaque string; this test pins the seal/unseal round-trip end-to-end
+/// from the row write back through the row read.
+#[tokio::test]
+async fn server_connection_ssh_private_key_seals_and_unseals_through_row() {
+    crate::crypto::init("test-seed-pura-77-key-roundtrip");
+    let db = setup().await;
+
+    let plaintext_key = "-----BEGIN OPENSSH PRIVATE KEY-----\nfake-key-bytes\n-----END OPENSSH PRIVATE KEY-----\n";
+    let sealed = crate::crypto::seal(plaintext_key).expect("seal private key");
+    assert!(
+        sealed.starts_with("enc:"),
+        "sealed envelope must use the spec §6.3.2 prefix"
+    );
+
+    let row = server_connections::insert(
+        &db,
+        server_connections::NewServerConnection {
+            name: "key-row".into(),
+            host: "ts.example.com".into(),
+            webqueryPort: 10080,
+            apiKey: crate::crypto::seal("api-k").expect("seal api key"),
+            useHttps: false,
+            sshPort: 10022,
+            sshUsername: Some("serveradmin".into()),
+            sshPassword: None,
+            queryBotChannel: None,
+            queryBotNickname: None,
+            sshBotNickname: None,
+            enabled: true,
+            controlPath: Some("ssh".into()),
+            sshAuthMethod: Some("key".into()),
+            sshPrivateKey: Some(sealed.clone()),
+            sshKeyAgentSocket: None,
+            sshHostKeyFingerprint: None,
+        },
+    )
+    .await
+    .expect("insert");
+
+    let stored_ciphertext = row
+        .sshPrivateKey
+        .as_deref()
+        .expect("private key must persist");
+    assert!(
+        stored_ciphertext.starts_with("enc:"),
+        "stored value must remain in the spec §6.3.2 envelope, never plaintext"
+    );
+    assert_eq!(stored_ciphertext, sealed, "ciphertext must round-trip verbatim");
+
+    let unsealed = crate::crypto::unseal(stored_ciphertext).expect("unseal");
+    assert_eq!(unsealed, plaintext_key, "unsealed text must equal the operator's key");
 }

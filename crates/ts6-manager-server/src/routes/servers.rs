@@ -88,6 +88,12 @@ async fn create(
         _ => None,
     };
 
+    // D-SSH-AUTH (PURA-77): the new SSHBridge auth fields are not part of
+    // the public `CreateServerRequest` body yet — they default to None here
+    // and the migration's `DEFAULT 'webquery'` / `DEFAULT 'password'` clauses
+    // produce the spec-equivalent row. PURA-69 follow-up C extends this
+    // handler with the key/agent/fingerprint fields once SecurityEngineer
+    // signs off on the wire surface.
     let new = NewServerConnection {
         name: req.name,
         host: req.host,
@@ -101,6 +107,11 @@ async fn create(
         queryBotNickname: None,
         sshBotNickname: None,
         enabled: true,
+        controlPath: None,
+        sshAuthMethod: None,
+        sshPrivateKey: None,
+        sshKeyAgentSocket: None,
+        sshHostKeyFingerprint: None,
     };
 
     let row = server_connections::insert(&state.db, new).await.map_err(|e| {
@@ -236,11 +247,26 @@ mod tests {
 
         // Pull the response BODY into raw text so we can pin the spec
         // §7.5 invariant ("apiKey MUST NOT appear in any response") at
-        // the wire level, not just the typed level.
+        // the wire level, not just the typed level. The trailing checks
+        // also pin the D-SSH-AUTH (PURA-77) deviation gate: the new
+        // SSHBridge auth fields MUST stay off `/api/servers` until
+        // SecurityEngineer signs off on the public surface.
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let raw = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(!raw.contains("apiKey"), "apiKey leaked: {raw}");
         assert!(!raw.contains("sshPassword"), "sshPassword leaked: {raw}");
+        for forbidden in [
+            "controlPath",
+            "sshAuthMethod",
+            "sshPrivateKey",
+            "sshKeyAgentSocket",
+            "sshHostKeyFingerprint",
+        ] {
+            assert!(
+                !raw.contains(forbidden),
+                "D-SSH-AUTH field `{forbidden}` leaked to /api/servers: {raw}"
+            );
+        }
         let body: ServerSummary = serde_json::from_str(&raw).unwrap();
         assert_eq!(body.name, "Primary");
         assert!(body.has_ssh_credentials);
@@ -329,6 +355,11 @@ mod tests {
                     queryBotNickname: None,
                     sshBotNickname: None,
                     enabled: true,
+                    controlPath: None,
+                    sshAuthMethod: None,
+                    sshPrivateKey: None,
+                    sshKeyAgentSocket: None,
+                    sshHostKeyFingerprint: None,
                 },
             )
             .await
@@ -378,6 +409,11 @@ mod tests {
                     queryBotNickname: None,
                     sshBotNickname: None,
                     enabled: true,
+                    controlPath: None,
+                    sshAuthMethod: None,
+                    sshPrivateKey: None,
+                    sshKeyAgentSocket: None,
+                    sshHostKeyFingerprint: None,
                 },
             )
             .await
@@ -431,6 +467,11 @@ mod tests {
                     queryBotNickname: None,
                     sshBotNickname: None,
                     enabled: true,
+                    controlPath: None,
+                    sshAuthMethod: None,
+                    sshPrivateKey: None,
+                    sshKeyAgentSocket: None,
+                    sshHostKeyFingerprint: None,
                 },
             )
             .await

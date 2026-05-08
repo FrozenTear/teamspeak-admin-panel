@@ -1,10 +1,17 @@
-//! `TsServerConfig` repo (spec §4.2.4).
+//! `TsServerConfig` repo (spec §4.2.4) — plus the D-SSH-AUTH deviation
+//! columns added in migration `0005_ssh_bridge_auth.surql` (PURA-77).
 //!
 //! Mapped to the `server_connection` table. The on-disk representation
-//! stores `apiKey` and `sshPassword` as ciphertext (`enc:<iv>:<tag>:<ct>`,
-//! spec §6.3.2); the repo treats them as opaque strings — encryption /
-//! decryption sit in `crate::crypto` and are applied by the REST handlers
-//! that read or write these fields.
+//! stores `apiKey`, `sshPassword`, and `sshPrivateKey` as ciphertext
+//! (`enc:<iv>:<tag>:<ct>`, spec §6.3.2); the repo treats them as opaque
+//! strings — encryption / decryption sit in `crate::crypto` and are applied
+//! by the REST handlers (or, for the future SSH transport, by the russh
+//! consumer) that read or write these fields.
+//!
+//! `controlPath` and `sshAuthMethod` are stored as `string` (not Rust enums)
+//! so adding new variants does not require a schema migration. Validation
+//! lives at the wire boundary (the REST handler that admits writes); the
+//! repo trusts what it persists.
 
 #![allow(non_snake_case)]
 
@@ -34,6 +41,12 @@ pub struct ServerConnection {
     pub enabled: bool,
     pub createdAt: DateTime<Utc>,
     pub updatedAt: DateTime<Utc>,
+    // D-SSH-AUTH (PURA-77) — see study-documents/ts6-manager-impl-deviations.md
+    pub controlPath: String,
+    pub sshAuthMethod: String,
+    pub sshPrivateKey: Option<String>,
+    pub sshKeyAgentSocket: Option<String>,
+    pub sshHostKeyFingerprint: Option<String>,
 }
 
 #[allow(non_snake_case)]
@@ -51,6 +64,15 @@ pub struct NewServerConnection {
     pub queryBotNickname: Option<String>,
     pub sshBotNickname: Option<String>,
     pub enabled: bool,
+    // D-SSH-AUTH (PURA-77). `None` lets the migration-side DEFAULT take
+    // over for `controlPath` and `sshAuthMethod`, which is the right
+    // behaviour for the existing `POST /api/servers` handler that has not
+    // yet been taught about these fields (PURA-69 follow-up C scope).
+    pub controlPath: Option<String>,
+    pub sshAuthMethod: Option<String>,
+    pub sshPrivateKey: Option<String>,
+    pub sshKeyAgentSocket: Option<String>,
+    pub sshHostKeyFingerprint: Option<String>,
 }
 
 pub(crate) const PROJECTION: &str = "
@@ -68,8 +90,21 @@ pub(crate) const PROJECTION: &str = "
     sshBotNickname,
     enabled,
     createdAt,
-    updatedAt
+    updatedAt,
+    controlPath,
+    sshAuthMethod,
+    sshPrivateKey,
+    sshKeyAgentSocket,
+    sshHostKeyFingerprint
 ";
+
+// Migration `0005_ssh_bridge_auth.surql` defines these as the canonical
+// defaults. Mirroring them in the repo lets the existing `POST /api/servers`
+// handler — which predates the SSHBridge follow-ups — keep building
+// `NewServerConnection` without setting the new fields and still produce
+// rows consistent with the migration's `DEFAULT` clause.
+pub const DEFAULT_CONTROL_PATH: &str = "webquery";
+pub const DEFAULT_SSH_AUTH_METHOD: &str = "password";
 
 pub async fn insert(db: &Database, new: NewServerConnection) -> Result<ServerConnection> {
     let sql = format!(
@@ -86,10 +121,27 @@ pub async fn insert(db: &Database, new: NewServerConnection) -> Result<ServerCon
                 queryBotChannel: $queryBotChannel,
                 queryBotNickname: $queryBotNickname,
                 sshBotNickname: $sshBotNickname,
-                enabled: $enabled
+                enabled: $enabled,
+                controlPath: $controlPath,
+                sshAuthMethod: $sshAuthMethod,
+                sshPrivateKey: $sshPrivateKey,
+                sshKeyAgentSocket: $sshKeyAgentSocket,
+                sshHostKeyFingerprint: $sshHostKeyFingerprint
             }}
             RETURN {PROJECTION};"
     );
+
+    // `controlPath` and `sshAuthMethod` are non-option strings on the schema
+    // side — passing `null` would fail validation. `unwrap_or_else` here gives
+    // us the same effective behaviour as omitting the field and letting the
+    // schema `DEFAULT` clause fire, but with the binder always sending a
+    // concrete value so the SQL stays uniform.
+    let control_path = new
+        .controlPath
+        .unwrap_or_else(|| DEFAULT_CONTROL_PATH.to_string());
+    let ssh_auth_method = new
+        .sshAuthMethod
+        .unwrap_or_else(|| DEFAULT_SSH_AUTH_METHOD.to_string());
 
     let mut resp = db
         .query(sql)
@@ -105,6 +157,11 @@ pub async fn insert(db: &Database, new: NewServerConnection) -> Result<ServerCon
         .bind(("queryBotNickname", new.queryBotNickname))
         .bind(("sshBotNickname", new.sshBotNickname))
         .bind(("enabled", new.enabled))
+        .bind(("controlPath", control_path))
+        .bind(("sshAuthMethod", ssh_auth_method))
+        .bind(("sshPrivateKey", new.sshPrivateKey))
+        .bind(("sshKeyAgentSocket", new.sshKeyAgentSocket))
+        .bind(("sshHostKeyFingerprint", new.sshHostKeyFingerprint))
         .await
         .context("server_connection insert query failed")?
         .check()?;
