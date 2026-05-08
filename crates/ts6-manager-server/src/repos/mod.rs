@@ -26,6 +26,7 @@ pub mod radio_stations;
 pub mod refresh_tokens;
 pub mod server_connections;
 pub mod server_user_grants;
+pub mod setup;
 pub mod songs;
 pub mod stream_sessions;
 pub mod users;

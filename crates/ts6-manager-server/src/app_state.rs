@@ -8,6 +8,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::Mutex;
+
 use crate::config::Config;
 use crate::db::Database;
 use crate::webquery::WebQueryPool;
@@ -20,6 +22,13 @@ pub struct AppState {
     pub jwt_secret: Arc<Vec<u8>>,
     pub jwt_access_expiry: Duration,
     pub jwt_refresh_expiry: Duration,
+    /// Mutex held by `POST /api/setup/init` to serialise concurrent
+    /// one-shot initialisation attempts (PURA-22 acceptance: concurrent
+    /// inits resolve to one success + one `409`). The lock is process-
+    /// scoped — Phase 1 deploys a single process, so the in-memory
+    /// mutex is sufficient. The handler still re-reads `user_count`
+    /// inside the lock as a defence-in-depth check.
+    pub setup_lock: Arc<Mutex<()>>,
     /// PURA-23: pool of WebQuery clients keyed by `server_connection.id`.
     /// Phase 1 fills lazily on first dashboard hit; Phase 2 will pre-populate
     /// on boot and run the §10.7 30s health probe.
@@ -33,6 +42,7 @@ impl AppState {
             jwt_secret: Arc::new(cfg.jwt_secret.as_bytes().to_vec()),
             jwt_access_expiry: cfg.jwt_access_expiry,
             jwt_refresh_expiry: cfg.jwt_refresh_expiry,
+            setup_lock: Arc::new(Mutex::new(())),
             webquery: WebQueryPool::new(cfg.ts_allow_self_signed),
         }
     }

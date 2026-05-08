@@ -121,6 +121,23 @@ pub async fn list(db: &Database) -> Result<Vec<User>> {
     Ok(resp.take(0)?)
 }
 
+/// Total number of `user` rows. Used by `/api/setup/status` (spec §7.2 —
+/// `needsSetup == (user_count == 0)`) and the `/api/setup/init` re-check
+/// guard. `array::len` over the row set sidesteps SurrealDB-version
+/// quirks around `count()` aggregation typing — the response is a single
+/// integer wrapped in `Option`.
+pub async fn count(db: &Database) -> Result<i64> {
+    let mut resp = db
+        .query("RETURN array::len(SELECT id FROM user);")
+        .await
+        .context("user count query failed")?
+        .check()?;
+    let n: Option<i64> = resp
+        .take(0)
+        .context("user count: deserialise failed")?;
+    Ok(n.unwrap_or(0))
+}
+
 pub async fn update(db: &Database, id: i64, patch: UserUpdate) -> Result<Option<User>> {
     // SurrealDB MERGE preserves keys not present in the patch payload, so
     // we build a sparse payload from the optional fields.

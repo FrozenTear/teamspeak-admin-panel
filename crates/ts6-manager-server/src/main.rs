@@ -25,6 +25,8 @@ mod logging;
 #[cfg(feature = "server")]
 mod repos;
 #[cfg(feature = "server")]
+mod routes;
+#[cfg(feature = "server")]
 mod ssrf;
 mod ui;
 #[cfg(feature = "server")]
@@ -47,7 +49,7 @@ mod server_entry {
     use ts6_manager_shared::health::{Health, HealthStatus};
 
     use crate::config::Config;
-    use crate::{app_state, auth, db, logging, ui, web, webquery};
+    use crate::{app_state, auth, db, logging, routes, ui, web, webquery};
 
     async fn health() -> Json<Health> {
         Json(Health {
@@ -128,6 +130,13 @@ mod server_entry {
         // rest of the app.
         let auth_router = auth::routes::router(rate_limit_state).with_state(state.clone());
         let ws_router = auth::routes::ws_router().with_state(state.clone());
+        // PURA-22 SECURITY slice 5 — `/api/setup` (one-shot bootstrap) and
+        // `/api/servers` (list / create with sealed-at-rest credentials). Both
+        // sub-routers live under `crate::routes`; auth + RBAC checks happen
+        // inside the handlers via the `RequireAuth` / `RequireAdmin`
+        // extractors so we don't need a separate middleware layer here.
+        let setup_router = routes::setup::router().with_state(state.clone());
+        let servers_router = routes::servers::router().with_state(state.clone());
         // PURA-23 — Phase 1 dashboard route. Lives at an absolute path under
         // `/api/servers/:configId/vs/:sid/dashboard` (spec §7.19); the rest of
         // the `/api/servers/...` surface is owned by SecurityEngineer's
@@ -143,6 +152,12 @@ mod server_entry {
         let router: Router = Router::new()
             .route("/health", get(health))
             .nest("/api/auth", auth_router)
+            // PURA-22 — first-run wizard + server CRUD (list / create).
+            // Both sub-routers use absolute paths so we `merge` rather than
+            // `nest` (avoids axum 0.8's strict-trailing-slash interaction
+            // with the no-slash spec URIs).
+            .merge(setup_router)
+            .merge(servers_router)
             // Phase 1 SECURITY (slice 4a): authenticated WebSocket upgrade.
             // Per-message fan-out (TS events, bot logs, voice/video status —
             // spec §8.4) is owned by the future REST/Realtime engineer.

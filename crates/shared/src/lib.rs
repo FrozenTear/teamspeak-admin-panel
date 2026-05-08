@@ -13,6 +13,8 @@
 pub mod auth;
 pub mod dashboard;
 pub mod health;
+pub mod servers;
+pub mod setup;
 
 pub use dashboard::{BandwidthSnapshot, DashboardData};
 pub use health::Health;

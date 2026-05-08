@@ -128,6 +128,30 @@ pub async fn list(db: &Database) -> Result<Vec<ServerConnection>> {
     Ok(resp.take(0)?)
 }
 
+/// List server connections the user has been granted access to via
+/// `server_user_grant` (spec §6.6 / §7.5). Used by `GET /api/servers`
+/// for non-admin callers — admins see the full [`list`] above.
+///
+/// The inner subquery returns the integer `serverConfigId` set; the outer
+/// projection compares against `record::id(id)` so the join works against
+/// SurrealDB's record-id encoding rather than the typed `RecordId`.
+pub async fn list_for_user(db: &Database, user_id: i64) -> Result<Vec<ServerConnection>> {
+    let sql = format!(
+        "SELECT {PROJECTION} FROM server_connection
+            WHERE record::id(id) IN (
+                SELECT VALUE serverConfigId FROM server_user_grant WHERE userId = $uid
+            )
+            ORDER BY id ASC;"
+    );
+    let mut resp = db
+        .query(sql)
+        .bind(("uid", user_id))
+        .await
+        .context("server_connection list_for_user query failed")?
+        .check()?;
+    Ok(resp.take(0)?)
+}
+
 /// Delete a server connection. The `server_connection_cascade` event in
 /// 0001_baseline.surql wipes dependent `server_user_grant` rows for this
 /// connection (per spec §4.2 cascade rules).
