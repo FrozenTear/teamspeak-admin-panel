@@ -174,6 +174,12 @@ pub struct TransportHandle {
     /// short-circuit to `SshBridgeError::AuthRejected` rather than
     /// blocking on a dead mpsc.
     auth_rejected: Arc<Mutex<bool>>,
+    /// Set once when the host-key verifier rejected the server-presented
+    /// key. Parallel to [`auth_rejected`](TransportHandle::auth_rejected) —
+    /// fail-closed and short-circuit fresh submissions so the operator
+    /// sees a typed `HostKeyMismatch` envelope instead of a generic
+    /// transport-class error after the supervisor exits.
+    host_key_mismatch: Arc<Mutex<bool>>,
 }
 
 impl TransportHandle {
@@ -197,6 +203,15 @@ impl TransportHandle {
         user_id: Option<i64>,
         virtual_server_id: Option<i64>,
     ) -> SshBridgeResult<CommandOutcome> {
+        // Host-key check first — re-keying is a security signal the
+        // operator must clear by editing the row, so we short-circuit
+        // even ahead of auth-rejected. Both flags are sticky once set;
+        // order between them is observably the same to callers.
+        if *self.host_key_mismatch.lock().await {
+            return Err(SshBridgeError::HostKeyMismatch {
+                config_id: self.config_id,
+            });
+        }
         if *self.auth_rejected.lock().await {
             return Err(SshBridgeError::AuthRejected {
                 config_id: self.config_id,
@@ -523,6 +538,7 @@ async fn run_with_reconnect<C, F, Fut>(
     mut cmd_rx: mpsc::Receiver<CommandRequest>,
     notify_tx: broadcast::Sender<NotifyFrame>,
     auth_rejected_flag: Arc<Mutex<bool>>,
+    host_key_mismatch_flag: Arc<Mutex<bool>>,
     db: Option<Arc<Database>>,
 )
 where
@@ -554,6 +570,16 @@ where
             Err(TransportError::AuthRejected) => {
                 *auth_rejected_flag.lock().await = true;
                 drain_with_auth_rejected(&mut cmd_rx, cfg.config_id).await;
+                return;
+            }
+            Err(TransportError::HostKeyMismatch) => {
+                tracing::warn!(
+                    target: "sshbridge::transport",
+                    config_id = cfg.config_id,
+                    "ssh host-key verifier rejected server key — fatal, no reconnect"
+                );
+                *host_key_mismatch_flag.lock().await = true;
+                drain_with_host_key_mismatch(&mut cmd_rx, cfg.config_id).await;
                 return;
             }
             Err(e) => {
@@ -702,6 +728,17 @@ async fn drain_with_auth_rejected(rx: &mut mpsc::Receiver<CommandRequest>, confi
     }
 }
 
+async fn drain_with_host_key_mismatch(
+    rx: &mut mpsc::Receiver<CommandRequest>,
+    config_id: i64,
+) {
+    while let Ok(cmd) = rx.try_recv() {
+        let _ = cmd
+            .reply
+            .send(Err(SshBridgeError::HostKeyMismatch { config_id }));
+    }
+}
+
 /// Public constructor — wires the connect factory into the supervisor
 /// and returns a [`TransportHandle`] callers use to submit commands.
 /// The supervisor task is detached; it runs until the handle (and all
@@ -751,17 +788,28 @@ where
     let (cmd_tx, cmd_rx) = mpsc::channel::<CommandRequest>(cfg.command_queue_capacity);
     let (notify_tx, _) = broadcast::channel::<NotifyFrame>(cfg.notify_capacity);
     let auth_flag = Arc::new(Mutex::new(false));
+    let host_key_flag = Arc::new(Mutex::new(false));
 
     let handle = TransportHandle {
         config_id: cfg.config_id,
         cmd_tx,
         notify_tx: notify_tx.clone(),
         auth_rejected: auth_flag.clone(),
+        host_key_mismatch: host_key_flag.clone(),
     };
 
     let cfg_clone = cfg.clone();
     tokio::spawn(async move {
-        run_with_reconnect(cfg_clone, connect_factory, cmd_rx, notify_tx, auth_flag, db).await;
+        run_with_reconnect(
+            cfg_clone,
+            connect_factory,
+            cmd_rx,
+            notify_tx,
+            auth_flag,
+            host_key_flag,
+            db,
+        )
+        .await;
     });
 
     handle
@@ -1188,6 +1236,160 @@ mod tests {
         drop(cmd_tx);
     }
 
+    /// PURA-86 acceptance criterion #2 — a `connect_factory` returning
+    /// `Err(TransportError::HostKeyMismatch)` makes the supervisor drain
+    /// queued commands with [`SshBridgeError::HostKeyMismatch`] and
+    /// return without entering the backoff/retry loop. Mirrors
+    /// [`dispatch_auth_rejected_short_circuits_no_reconnect`] for the
+    /// connect-side path.
+    ///
+    /// Without this short-circuit, an operator who legitimately re-keyed
+    /// the upstream sees a backoff-loop noise of warn lines and any
+    /// queued operator command resolves as a generic transport timeout —
+    /// they have to grep `sshbridge::hostkey` logs to figure out the
+    /// verifier rejected the new key.
+    #[tokio::test]
+    async fn run_with_reconnect_short_circuits_on_host_key_mismatch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cfg = TransportConfig {
+            // Tiny backoffs so a buggy implementation that DOES retry
+            // would fail the "factory called exactly once" assertion
+            // within the test's lifetime.
+            backoff_initial: Duration::from_millis(1),
+            backoff_max: Duration::from_millis(2),
+            ..test_cfg()
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let factory = {
+            let calls = calls.clone();
+            move || {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Err::<StubChannel, _>(TransportError::HostKeyMismatch)
+                }
+            }
+        };
+
+        let (cmd_tx, cmd_rx) = mpsc::channel::<CommandRequest>(8);
+        let (notify_tx, _) = broadcast::channel::<NotifyFrame>(16);
+        let auth_flag = Arc::new(Mutex::new(false));
+        let host_key_flag = Arc::new(Mutex::new(false));
+
+        // Pre-load two queued commands before the supervisor runs so
+        // the drain has something to drain.
+        let (reply_tx_a, reply_rx_a) = oneshot::channel();
+        let (reply_tx_b, reply_rx_b) = oneshot::channel();
+        cmd_tx
+            .send(CommandRequest {
+                line: "version".into(),
+                timeout: None,
+                user_id: None,
+                virtual_server_id: None,
+                reply: reply_tx_a,
+            })
+            .await
+            .unwrap();
+        cmd_tx
+            .send(CommandRequest {
+                line: "hostinfo".into(),
+                timeout: None,
+                user_id: None,
+                virtual_server_id: None,
+                reply: reply_tx_b,
+            })
+            .await
+            .unwrap();
+
+        let supervisor = tokio::spawn(run_with_reconnect(
+            cfg.clone(),
+            factory,
+            cmd_rx,
+            notify_tx,
+            auth_flag.clone(),
+            host_key_flag.clone(),
+            None,
+        ));
+
+        // Supervisor must terminate on its own — no abort, no timeout.
+        // If this hangs, the short-circuit is broken and the supervisor
+        // is stuck in the backoff/retry loop.
+        supervisor.await.unwrap();
+
+        // Both queued commands report the typed HostKeyMismatch error
+        // with the config-id from the test config (7).
+        let r_a = reply_rx_a.await.unwrap();
+        let r_b = reply_rx_b.await.unwrap();
+        assert!(
+            matches!(r_a, Err(SshBridgeError::HostKeyMismatch { config_id: 7 })),
+            "expected HostKeyMismatch on first queued cmd, got {r_a:?}"
+        );
+        assert!(
+            matches!(r_b, Err(SshBridgeError::HostKeyMismatch { config_id: 7 })),
+            "expected HostKeyMismatch on second queued cmd, got {r_b:?}"
+        );
+
+        // Factory invoked exactly once — fail-closed, no retry storm.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "host-key mismatch must short-circuit reconnect; factory called \
+             {} time(s) but expected exactly 1",
+            calls.load(Ordering::SeqCst)
+        );
+
+        // Sticky flag is set so subsequent submissions through the
+        // public TransportHandle short-circuit instead of blocking on a
+        // dead mpsc.
+        assert!(
+            *host_key_flag.lock().await,
+            "host_key_mismatch_flag must be set after a verifier rejection"
+        );
+        // Auth-rejected flag stays false — the two signals are
+        // independent and operator-visible separately.
+        assert!(
+            !*auth_flag.lock().await,
+            "auth_rejected_flag must NOT be set on a host-key mismatch"
+        );
+
+        drop(cmd_tx);
+    }
+
+    /// PURA-86 — once the supervisor flips `host_key_mismatch_flag`,
+    /// fresh `TransportHandle::execute` submissions resolve to
+    /// `HostKeyMismatch` immediately. Without the flag check the handle
+    /// would either block on a dead mpsc or resolve to a generic
+    /// `Transport(...)` error after the receiver-dropped detection,
+    /// neither of which lets the REST layer surface the typed code.
+    #[tokio::test]
+    async fn handle_short_circuits_after_host_key_mismatch() {
+        let factory = || async {
+            Err::<StubChannel, _>(TransportError::HostKeyMismatch)
+        };
+        let cfg = test_cfg();
+        let handle = spawn(cfg, factory);
+
+        // First submission either races into the queue (then drained) or
+        // arrives after the flag is set — both paths must yield the
+        // typed error.
+        let r1 = handle.execute("version", None, None).await;
+        assert!(
+            matches!(r1, Err(SshBridgeError::HostKeyMismatch { config_id: 7 })),
+            "expected HostKeyMismatch on first submission, got {r1:?}"
+        );
+
+        // By now the supervisor has flipped the flag (the only way r1
+        // resolved to HostKeyMismatch is via the supervisor reaching
+        // either the drain or the sticky-flag short-circuit). Subsequent
+        // submissions hit the flag check first.
+        let r2 = handle.execute("hostinfo", None, None).await;
+        assert!(
+            matches!(r2, Err(SshBridgeError::HostKeyMismatch { config_id: 7 })),
+            "expected HostKeyMismatch on second submission, got {r2:?}"
+        );
+    }
+
     #[tokio::test]
     async fn run_with_reconnect_bounds_hanging_connect_factory() {
         // F2 regression: a connect factory that never completes
@@ -1222,6 +1424,7 @@ mod tests {
         let (cmd_tx, cmd_rx) = mpsc::channel::<CommandRequest>(8);
         let (notify_tx, _) = broadcast::channel::<NotifyFrame>(16);
         let auth_flag = Arc::new(Mutex::new(false));
+        let host_key_flag = Arc::new(Mutex::new(false));
 
         let supervisor = tokio::spawn(run_with_reconnect(
             cfg.clone(),
@@ -1229,6 +1432,7 @@ mod tests {
             cmd_rx,
             notify_tx,
             auth_flag,
+            host_key_flag,
             None,
         ));
 

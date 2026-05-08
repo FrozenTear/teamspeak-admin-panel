@@ -135,6 +135,17 @@ pub enum SshBridgeError {
     /// updated before retrying.
     #[error("SSH auth rejected for connection #{config_id}")]
     AuthRejected { config_id: i64 },
+
+    /// Host-key verifier rejected the server-presented key. Fail-closed:
+    /// no command runs against an unverified host. Like
+    /// [`SshBridgeError::AuthRejected`] this is fatal — the supervisor
+    /// short-circuits the reconnect loop so an operator who legitimately
+    /// re-keyed the upstream sees a typed signal instead of an unending
+    /// backoff/retry storm. Per ADR-0002 §Consequences the operator
+    /// remediates by verifying the new fingerprint via `ssh-keyscan` and
+    /// updating `sshHostKeyFingerprint` on the row.
+    #[error("SSH host-key fingerprint mismatch for connection #{config_id}")]
+    HostKeyMismatch { config_id: i64 },
 }
 
 impl SshBridgeError {
@@ -150,6 +161,13 @@ impl SshBridgeError {
             // attention" signal via the connection lifecycle, but the REST
             // response stays in the §7.0.2 envelope shape.
             SshBridgeError::AuthRejected { .. } => StatusCode::BAD_GATEWAY,
+            // Host-key mismatch is also surfaced as a transport-class
+            // 502 — the dashboard / control routes render it as
+            // "the host key changed; verify and update" via the
+            // operator-visible details string. Parallel to AuthRejected
+            // — both are fatal and flip a per-connection operator-
+            // attention signal.
+            SshBridgeError::HostKeyMismatch { .. } => StatusCode::BAD_GATEWAY,
         }
     }
 
@@ -166,6 +184,9 @@ impl SshBridgeError {
     pub fn upstream_message(&self) -> String {
         match self {
             SshBridgeError::Upstream { message, .. } => message.clone(),
+            SshBridgeError::HostKeyMismatch { config_id } => format!(
+                "host-key fingerprint did not match the pinned value for connection #{config_id}"
+            ),
             other => other.to_string(),
         }
     }
@@ -210,6 +231,17 @@ mod tests {
         let auth = SshBridgeError::AuthRejected { config_id: 7 };
         assert_eq!(auth.http_status(), StatusCode::BAD_GATEWAY);
         assert_eq!(auth.upstream_code(), -1);
+
+        let host_key = SshBridgeError::HostKeyMismatch { config_id: 9 };
+        assert_eq!(host_key.http_status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(host_key.upstream_code(), -1);
+        // The `details` string carries the config-id — the UI uses this to
+        // tell the operator which row to verify and update.
+        let details = host_key.upstream_message();
+        assert!(
+            details.contains("#9") && details.contains("fingerprint"),
+            "host-key mismatch upstream_message lost the config-id or fingerprint hint: {details}"
+        );
 
         // No public `AeadError` constructor; only check the variants we can
         // build directly.

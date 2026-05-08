@@ -101,6 +101,16 @@ pub enum ControlBackendError {
     #[error("control auth rejected for connection #{config_id}")]
     AuthRejected { config_id: i64 },
 
+    /// SSH-only — the host-key verifier rejected the server-presented
+    /// key. Parallel to [`AuthRejected`] — both are fatal, fail-closed,
+    /// and surface a separate operator-attention signal. The REST layer
+    /// renders the operator-friendly remediation hint
+    /// ("verify the new fingerprint via `ssh-keyscan` and update
+    /// `sshHostKeyFingerprint` on the row") in the §7.0.2 `details`
+    /// string.
+    #[error("control host-key mismatch for connection #{config_id}")]
+    HostKeyMismatch { config_id: i64 },
+
     /// Configuration-time error (host-key fingerprint malformed,
     /// required column missing). Maps to `500` because the operator
     /// row needs editing before the request can succeed.
@@ -116,7 +126,8 @@ impl ControlBackendError {
             Self::Upstream { .. }
             | Self::Transport(_)
             | Self::InvalidResponse(_)
-            | Self::AuthRejected { .. } => StatusCode::BAD_GATEWAY,
+            | Self::AuthRejected { .. }
+            | Self::HostKeyMismatch { .. } => StatusCode::BAD_GATEWAY,
             Self::Decrypt { .. } | Self::Config(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -134,6 +145,10 @@ impl ControlBackendError {
     pub fn upstream_message(&self) -> String {
         match self {
             Self::Upstream { message, .. } => message.clone(),
+            Self::HostKeyMismatch { config_id } => format!(
+                "host-key fingerprint did not match the pinned value for connection #{config_id}; \
+                 verify the new fingerprint via `ssh-keyscan` and update sshHostKeyFingerprint on the row"
+            ),
             other => other.to_string(),
         }
     }
@@ -164,6 +179,9 @@ impl From<SshBridgeError> for ControlBackendError {
                 message: source.to_string(),
             },
             SshBridgeError::AuthRejected { config_id } => Self::AuthRejected { config_id },
+            SshBridgeError::HostKeyMismatch { config_id } => {
+                Self::HostKeyMismatch { config_id }
+            }
         }
     }
 }
@@ -452,6 +470,23 @@ mod tests {
         };
         let ce: ControlBackendError = se.into();
         assert!(matches!(ce, ControlBackendError::Upstream { code: 2568, .. }));
+
+        // PURA-86: HostKeyMismatch round-trips with config-id preserved
+        // and the §7.0.2 envelope carries the operator remediation hint.
+        let se = SshBridgeError::HostKeyMismatch { config_id: 42 };
+        let ce: ControlBackendError = se.into();
+        assert!(matches!(
+            ce,
+            ControlBackendError::HostKeyMismatch { config_id: 42 }
+        ));
+        assert_eq!(ce.http_status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(ce.upstream_code(), -1);
+        let details = ce.upstream_message();
+        assert!(
+            details.contains("#42") && details.contains("ssh-keyscan"),
+            "host-key mismatch details must carry the row id and remediation \
+             hint: {details}"
+        );
     }
 
     #[tokio::test]
