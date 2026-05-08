@@ -11,6 +11,7 @@
 #![deny(missing_debug_implementations)]
 
 pub mod auth;
+pub mod control;
 pub mod dashboard;
 pub mod health;
 pub mod servers;
