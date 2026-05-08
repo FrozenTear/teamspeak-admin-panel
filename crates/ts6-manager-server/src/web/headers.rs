@@ -33,12 +33,40 @@ pub fn security_headers_stack(node_env: NodeEnv) -> SecurityHeadersStack {
         header::REFERRER_POLICY,
         HeaderValue::from_static("no-referrer"),
     );
+    // CSP — directives chosen for the dx (Dioxus) WASM SPA:
+    //
+    //   * `script-src 'wasm-unsafe-eval'` is required by every evergreen browser
+    //     (Chromium ≥ 99, Firefox ≥ 102) for `WebAssembly.instantiateStreaming`;
+    //     without it the client never loads and only the SSR fallback renders.
+    //   * `script-src 'unsafe-inline'` is a Phase 1 trade-off. dx injects inline
+    //     hydration scripts (`window.hydrate_queue`, `window.initial_dioxus_hydration_data`)
+    //     whose body contains per-request JSON, so a static hash is not stable
+    //     and a per-request nonce would require hooking the dioxus-server HTML
+    //     emit. See PURA-48 follow-up to migrate to nonce-based CSP. Acceptable
+    //     here only because Phase 1 has no user-controlled `innerHTML` paths
+    //     and the inline scripts are dx-generated. Re-evaluate before any
+    //     route surfaces user-supplied HTML.
+    //   * `style-src 'unsafe-inline'` covers our existing inline `<style>` block
+    //     in the dx index.html template. `https://fonts.googleapis.com` is the
+    //     CSS host that the Inter `@import` resolves to; `https://fonts.gstatic.com`
+    //     is where the actual woff2 files are fetched from.
+    //   * Defense-in-depth: `object-src 'none'`, `base-uri 'self'`,
+    //     `frame-ancestors 'none'`, `form-action 'self'` reduce the blast radius
+    //     of the relaxed `script-src`. `frame-ancestors 'none'` duplicates XFO
+    //     DENY for clients that prefer CSP.
     let csp = SetResponseHeaderLayer::if_not_present(
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(
-            "default-src 'self'; img-src 'self' data:; \
+            "default-src 'self'; \
+             img-src 'self' data:; \
              connect-src 'self' ws: wss:; \
-             style-src 'self' 'unsafe-inline'; script-src 'self'",
+             style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; \
+             font-src 'self' https://fonts.gstatic.com data:; \
+             script-src 'self' 'wasm-unsafe-eval' 'unsafe-inline'; \
+             object-src 'none'; \
+             base-uri 'self'; \
+             frame-ancestors 'none'; \
+             form-action 'self'",
         ),
     );
     // HSTS — production only. 6 months minimum per spec; we use 365 days.
@@ -132,6 +160,74 @@ mod tests {
             h.get("strict-transport-security").is_none(),
             "HSTS must NOT be set in dev"
         );
+    }
+
+    /// PURA-47 regression — every directive that had to land for the dx WASM
+    /// SPA to hydrate. Each `assert!` is the load-bearing check for one
+    /// concrete browser-side error from the original repro: WASM compile
+    /// blocked, dx hydration scripts blocked, Google Fonts CSS blocked,
+    /// Google Fonts woff2 blocked. If any of these regress, the SPA stops
+    /// loading in Chromium and Firefox.
+    #[tokio::test]
+    async fn csp_allows_wasm_and_dx_hydration_and_fonts() {
+        for env in [NodeEnv::Development, NodeEnv::Production] {
+            let resp = fetch_root(env).await;
+            let csp = resp
+                .headers()
+                .get(header::CONTENT_SECURITY_POLICY)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_else(|| panic!("CSP missing in {env:?}"));
+
+            // WASM compile/instantiate (both Chromium and Firefox).
+            assert!(
+                csp.contains("'wasm-unsafe-eval'"),
+                "{env:?}: script-src must include 'wasm-unsafe-eval' so \
+                 WebAssembly.instantiateStreaming is not blocked. Got: {csp}"
+            );
+
+            // dx-injected inline hydration scripts. Phase 1 trade-off; revisit
+            // when nonce-based CSP lands.
+            assert!(
+                csp.contains("script-src") && csp.contains("'unsafe-inline'"),
+                "{env:?}: script-src must include 'unsafe-inline' until \
+                 nonce-based CSP lands; otherwise dx hydration scripts are \
+                 rejected. Got: {csp}"
+            );
+
+            // Google Fonts CSS host (the @import target inside the inline
+            // <style>). `style-src` already had 'unsafe-inline' for the
+            // inline block itself; this allows the *fetched* CSS file.
+            assert!(
+                csp.contains("https://fonts.googleapis.com"),
+                "{env:?}: style-src must include https://fonts.googleapis.com \
+                 so the Inter @import is not blocked. Got: {csp}"
+            );
+
+            // Google Fonts woff2 host (referenced from the fetched CSS).
+            assert!(
+                csp.contains("font-src") && csp.contains("https://fonts.gstatic.com"),
+                "{env:?}: font-src must include https://fonts.gstatic.com so \
+                 the Inter woff2 files load. Got: {csp}"
+            );
+
+            // Defense-in-depth additions paired with the relaxed script-src.
+            assert!(
+                csp.contains("object-src 'none'"),
+                "{env:?}: object-src 'none' missing. Got: {csp}"
+            );
+            assert!(
+                csp.contains("base-uri 'self'"),
+                "{env:?}: base-uri 'self' missing. Got: {csp}"
+            );
+            assert!(
+                csp.contains("frame-ancestors 'none'"),
+                "{env:?}: frame-ancestors 'none' missing. Got: {csp}"
+            );
+            assert!(
+                csp.contains("form-action 'self'"),
+                "{env:?}: form-action 'self' missing. Got: {csp}"
+            );
+        }
     }
 
     #[tokio::test]
