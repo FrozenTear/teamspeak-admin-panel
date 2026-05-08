@@ -77,6 +77,16 @@ pub struct Config {
     /// rightmost XFF entry. Larger values are accepted but discouraged
     /// (spec mandates "exactly one proxy hop").
     pub trusted_proxy_hops: u8,
+    /// PURA-72 Slice F — per-token request budget for `/api/widget/*`.
+    /// Defaults to 30 req/min; overridable via
+    /// `WIDGET_RATE_LIMIT_PER_TOKEN_PER_MINUTE`. Protects upstream
+    /// WebQuery from a single token spammer.
+    pub widget_rate_limit_per_token_rpm: u32,
+    /// PURA-72 Slice F — per-IP request budget for `/api/widget/*`.
+    /// Defaults to 30 req/min; overridable via
+    /// `WIDGET_RATE_LIMIT_PER_IP_PER_MINUTE`. Protects the box from a
+    /// single client iterating tokens.
+    pub widget_rate_limit_per_ip_rpm: u32,
 }
 
 impl Config {
@@ -127,6 +137,14 @@ impl Config {
 
         let trusted_proxy_hops = parse_env_u8("TRUSTED_PROXY_HOPS", 0)?;
 
+        // PURA-72 Slice F — widget rate-limit budgets. Default 30/min per
+        // token and per IP. The two buckets are independent — see
+        // `web::widget_security` for how they compose.
+        let widget_rate_limit_per_token_rpm =
+            parse_env_u32("WIDGET_RATE_LIMIT_PER_TOKEN_PER_MINUTE", 30)?;
+        let widget_rate_limit_per_ip_rpm =
+            parse_env_u32("WIDGET_RATE_LIMIT_PER_IP_PER_MINUTE", 30)?;
+
         Ok(Self {
             node_env,
             port,
@@ -147,6 +165,8 @@ impl Config {
             log_level,
             log_pretty,
             trusted_proxy_hops,
+            widget_rate_limit_per_token_rpm,
+            widget_rate_limit_per_ip_rpm,
         })
     }
 
@@ -216,6 +236,15 @@ fn parse_env_u8(key: &str, default: u8) -> Result<u8> {
         Ok(v) if !v.is_empty() => v
             .parse()
             .with_context(|| format!("env var {key} is not a valid u8: {v}")),
+        _ => Ok(default),
+    }
+}
+
+fn parse_env_u32(key: &str, default: u32) -> Result<u32> {
+    match env::var(key) {
+        Ok(v) if !v.is_empty() => v
+            .parse()
+            .with_context(|| format!("env var {key} is not a valid u32: {v}")),
         _ => Ok(default),
     }
 }

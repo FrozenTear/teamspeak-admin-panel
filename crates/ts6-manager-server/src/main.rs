@@ -202,9 +202,30 @@ mod server_entry {
         // Admin-JWT gated; see the route module for the auth-gate rationale.
         let metrics_router = routes::metrics::router().with_state(state.clone());
         // PURA-72 (Slice A) — public widget JSON endpoint
-        // (`/api/widget/{token}/data`). No authentication; rate limit + CORS
-        // relax + cache headers per spec §7.28 / §7.29.
-        let widget_router = widgets::routes::router().with_state(state);
+        // (`/api/widget/{token}/data`). No authentication.
+        //
+        // PURA-72 Slice F adds the per-token + per-IP `governor` bucket via
+        // `widget_rate_limit`, mounted as a route-layer so it lands only on
+        // the API surface — the SPA `/widget/*` HTML page doesn't hit
+        // upstream WebQuery and only needs the relaxed CORS / frame
+        // headers, which are applied globally further down.
+        let widget_rl_state = web::make_widget_rate_limit_state(
+            cfg.widget_rate_limit_per_token_rpm,
+            cfg.widget_rate_limit_per_ip_rpm,
+            cfg.trusted_proxy_hops,
+        );
+        let widget_router = widgets::routes::router()
+            .with_state(state.clone())
+            .layer(axum::middleware::from_fn_with_state(
+                widget_rl_state,
+                web::widget_rate_limit,
+            ));
+        // PURA-72 Slice D ([PURA-89]) — operator widget CRUD `/api/widgets`.
+        // RequireAuth for reads; RequireModerator (admin OR moderator) for
+        // writes. PATCH / DELETE / regenerate-token invalidate the public
+        // `widget_cache` so a rotated or deleted token 404s on the next
+        // public-route call (spec §7.29 / §26.4).
+        let widget_admin_router = widgets::admin::router().with_state(state);
 
         // PURA-17: `serve_dioxus_application` registers static assets +
         // server functions and adds a fallback that serves the dx-CLI
@@ -234,6 +255,8 @@ mod server_entry {
             .merge(metrics_router)
             // PURA-72 — public widget endpoints (`/api/widget/{token}/...`).
             .merge(widget_router)
+            // PURA-72 Slice D ([PURA-89]) — operator widget CRUD `/api/widgets`.
+            .merge(widget_admin_router)
             .serve_dioxus_application(serve_cfg, ui::App)
             .layer(web::cors_layer(&cfg.frontend_url));
         let router = web::security_headers_stack(cfg.node_env).apply(router);
@@ -244,6 +267,11 @@ mod server_entry {
         // Cleanup of the now-redundant static CSP is deferred while
         // PURA-49's predicate sanity-check runs on `web/headers.rs`.
         let router = router.layer(axum::middleware::from_fn(web::nonce_csp_middleware));
+        // PURA-72 Slice F — widget-route response-header override. Layered
+        // OUTSIDE the nonce-CSP middleware so its CSP rewrite (`frame-ancestors *`
+        // on `/api/widget/*` and `/widget/*`) and `X-Frame-Options` removal
+        // run last on the response path and win over the strict defaults.
+        let router = router.layer(axum::middleware::from_fn(web::widget_response_headers));
 
         let addr: SocketAddr = format!("0.0.0.0:{}", cfg.port).parse()?;
         tracing::info!(

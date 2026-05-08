@@ -33,6 +33,7 @@ use super::cache::CACHE_TTL;
 use super::snapshot::{WidgetInputs, build_widget_data};
 use super::svg;
 use super::themes::theme_for;
+use crate::web::widget_security::short_token;
 
 const CACHE_CONTROL_VALUE: &str = "public, max-age=45";
 
@@ -242,29 +243,7 @@ pub async fn resolve_widget_data(
     Ok(data)
 }
 
-/// Spec §26.1 — never log full tokens above DEBUG. This helper renders the
-/// first 4 chars + "…" so tracing fields stay searchable without leaking
-/// the credential. Used by INFO/WARN log lines.
-fn short_token(token: &str) -> String {
-    let mut chars: Vec<char> = token.chars().take(4).collect();
-    if token.chars().count() > 4 {
-        chars.push('…');
-    }
-    chars.into_iter().collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn short_token_truncates_long_inputs() {
-        assert_eq!(short_token("abcdefgh"), "abcd…");
-    }
-
-    #[test]
-    fn short_token_passes_short_inputs_through() {
-        assert_eq!(short_token("abc"), "abc");
-        assert_eq!(short_token("abcd"), "abcd");
-    }
-}
+// Spec §26.1 — never log full tokens above DEBUG. The redaction helper
+// `short_token` lives in [`crate::web::widget_security`] (Slice F) and is
+// reused here for INFO/WARN log lines. Tests for the helper itself live
+// alongside the implementation.
