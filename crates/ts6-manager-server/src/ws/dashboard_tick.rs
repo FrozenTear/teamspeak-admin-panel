@@ -41,7 +41,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
@@ -66,6 +66,12 @@ const BACKOFF_INITIAL_SECS: u64 = 5;
 const BACKOFF_CAP_SECS: u64 = 60;
 /// Spec §8.4 envelope `type` for the periodic dashboard republisher.
 const TICK_KIND: &str = "dashboard:tick";
+/// PURA-72 H-1 — widget topic stub. Public viewers only need a refresh
+/// signal; the JSON snapshot at `/api/widget/{token}/data` is what
+/// enforces §7.29 redaction. Republishing the full operator-side
+/// `DashboardData` (real `platform`, `version`, bandwidth, ping)
+/// onto the widget topic is what the H-1 finding called out.
+const WIDGET_REFRESH_KIND: &str = "widget:refresh";
 /// Default virtual-server id used by the republisher. See module docs.
 const DEFAULT_SID: i64 = 1;
 
@@ -273,19 +279,20 @@ async fn tick_once(deps: &TickerDeps, connection: &ServerConnection) -> anyhow::
         .publish(
             Topic::new(connection.id, TopicKind::Channels),
             TICK_KIND,
-            data.clone(),
+            data,
         )
         .await;
     // PURA-72 Slice E — public widget viewers subscribe to
-    // `server:{id}:widget`. Fan the same dashboard tick out so the
-    // embedded SPA refetches its snapshot on the 5 s cadence even when
-    // the SSH event source (PURA-80) hasn't picked up a `notify*` for
-    // this server yet (e.g. WebQuery-only deployments).
+    // `server:{id}:widget`. The widget fan-out is a redacted **stub**
+    // (`{"refresh": true}`) so the SPA refetches `/api/widget/{token}/data`
+    // — the JSON route is what enforces §7.29 redaction. Fanning the raw
+    // operator `DashboardData` (real `platform`, `version`, bandwidth,
+    // ping) onto this public topic is what the PURA-72 H-1 review found.
     deps.hub
         .publish(
             Topic::new(connection.id, TopicKind::Widget),
-            TICK_KIND,
-            data,
+            WIDGET_REFRESH_KIND,
+            json!({ "refresh": true }),
         )
         .await;
     Ok(())
@@ -313,6 +320,15 @@ mod tests {
             role: "admin".into(),
             is_admin: true,
             is_at_least_moderator: true,
+        })
+    }
+
+    fn widget_principal(server_config_id: i64) -> Principal {
+        use crate::ws::auth::WidgetPrincipal;
+        Principal::Widget(WidgetPrincipal {
+            widget_id: 1,
+            server_config_id,
+            virtual_server_id: 1,
         })
     }
 
@@ -480,6 +496,95 @@ mod tests {
             topics.contains(&channels_topic.to_string().as_str()),
             "missing channels topic publish: got {topics:?}",
         );
+
+        handle.shutdown().await;
+    }
+
+    /// PURA-72 H-1 regression. The 5 s dashboard tick must not put real
+    /// `platform` / `version` / bandwidth / ping fields on the widget
+    /// topic. A widget-token subscriber receives only the redacted
+    /// refresh stub.
+    #[tokio::test]
+    async fn widget_topic_dashboard_tick_is_refresh_stub() {
+        let db = connect_in_memory().await.unwrap();
+        migrations::run(&db).await.unwrap();
+        let connection = seed_connection(&db, "primary", true).await;
+
+        let hub = Hub::new();
+        let control = ControlBackendPool::new(false, db.clone());
+        let fake = Arc::new(FakeBackend::default());
+
+        // Subscribe BEFORE spawning so the broadcast captures the first
+        // tick (which fires immediately on boot).
+        let widget = widget_principal(connection.id);
+        let widget_topic = Topic::new(connection.id, TopicKind::Widget);
+        let mut sub = hub
+            .subscribe(&db, &widget, widget_topic, None)
+            .await
+            .unwrap();
+
+        let handle = boot(
+            TickerDeps {
+                db: db.clone(),
+                hub: hub.clone(),
+                control: control.clone(),
+            },
+            fake.clone(),
+            connection.id,
+        )
+        .await;
+
+        // Hub broadcast is per-server. The session loop is what filters
+        // by topic, so this raw subscriber sees clients/channels/widget
+        // publishes from `tick_once`. Drain up to three envelopes and
+        // pull out the widget one.
+        let mut widget_env = None;
+        for _ in 0..3 {
+            match timeout(Duration::from_secs(2), sub.receiver.recv()).await {
+                Ok(Ok(env)) => {
+                    if env.topic == widget_topic.to_string() {
+                        widget_env = Some(env);
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        let env = widget_env.expect("widget envelope must be published");
+
+        assert_eq!(env.topic, widget_topic.to_string());
+        assert_eq!(
+            env.kind, WIDGET_REFRESH_KIND,
+            "widget envelope kind must be the redaction stub, not the operator dashboard tick"
+        );
+        assert_eq!(
+            env.data,
+            serde_json::json!({ "refresh": true }),
+            "widget envelope body must be a static refresh stub"
+        );
+
+        // Belt-and-braces: assert no operator-side telemetry leaked
+        // through. The FakeBackend reports platform=Linux,
+        // version=3.13.7, bandwidth=10/20 — none of those literals may
+        // appear in the public envelope.
+        let payload = env.data.to_string();
+        for forbidden in [
+            "Linux",
+            "3.13.7",
+            "platform",
+            "version",
+            "bandwidth",
+            "incoming",
+            "outgoing",
+            "packetloss",
+            "ping",
+            "Fake",
+        ] {
+            assert!(
+                !payload.contains(forbidden),
+                "widget envelope leaked operator telemetry `{forbidden}`: {payload}"
+            );
+        }
 
         handle.shutdown().await;
     }

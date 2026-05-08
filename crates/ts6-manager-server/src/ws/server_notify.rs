@@ -49,7 +49,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
@@ -326,6 +326,22 @@ async fn register_all(transport: &TransportHandle) -> Result<(), SshBridgeError>
     Ok(())
 }
 
+/// Envelope kind broadcast on `server:{id}:widget` whenever an upstream
+/// notify frame would refresh the public snapshot. Spec §7.29 — public
+/// widget surfaces MUST NOT carry client UIDs, IPs, or permissions
+/// metadata, so the widget topic never re-publishes the operator-side
+/// `NotifyFrame` payload. Public viewers refetch
+/// `/api/widget/{token}/data` whenever they receive a frame on this
+/// topic (see `ui/pages/public_widget.rs::drive_socket`), and the JSON
+/// route is what enforces redaction.
+const WIDGET_REFRESH_KIND: &str = "widget:refresh";
+
+/// Static body for [`WIDGET_REFRESH_KIND`] envelopes. Carries no
+/// upstream fields — just a refresh signal.
+fn widget_refresh_payload() -> Value {
+    json!({ "refresh": true })
+}
+
 /// Translate a parsed [`NotifyFrame`] into a `(Topic, kind, data)`
 /// publish. Unknown events are logged at `debug` and dropped — TS6
 /// servers may add new event names in future builds, and silently
@@ -333,10 +349,11 @@ async fn register_all(transport: &TransportHandle) -> Result<(), SshBridgeError>
 ///
 /// Client- and channel-class events also fan out a parallel publish onto
 /// `server:{id}:widget` so public widget viewers (PURA-72 Slice E) refresh
-/// within ~1 s of a real upstream change. The widget topic intentionally
-/// receives the same wire envelope (kind + data); the public SPA's
-/// strategy is to refetch the JSON snapshot on any push, so the inner
-/// shape doesn't need to be widget-specific.
+/// within ~1 s of a real upstream change. The widget envelope is a
+/// **stub** — kind `widget:refresh`, body `{"refresh": true}` — so no
+/// operator-side fields (UIDs, db ids, server-groups, country, IP,
+/// platform/version, bandwidth, …) can leak onto a public surface that
+/// only requires a widget token. PURA-72 H-1 fix.
 async fn publish_notify(hub: &Hub, server_id: i64, frame: &NotifyFrame) {
     let Some((topic_kind, envelope_kind)) = classify_event(&frame.event) else {
         tracing::debug!(
@@ -349,12 +366,12 @@ async fn publish_notify(hub: &Hub, server_id: i64, frame: &NotifyFrame) {
     };
     let topic = Topic::new(server_id, topic_kind);
     let data = records_to_json(&frame.records);
-    hub.publish(topic, envelope_kind, data.clone()).await;
+    hub.publish(topic, envelope_kind, data).await;
     if matches!(topic_kind, TopicKind::Clients | TopicKind::Channels) {
         hub.publish(
             Topic::new(server_id, TopicKind::Widget),
-            envelope_kind,
-            data,
+            WIDGET_REFRESH_KIND,
+            widget_refresh_payload(),
         )
         .await;
     }
@@ -547,6 +564,141 @@ mod tests {
         assert_eq!(env.topic, "server:7:channels");
         assert_eq!(env.data["cid"], "5");
         assert_eq!(env.data["channel_name"], "renamed");
+    }
+
+    fn widget_principal(server_config_id: i64) -> Principal {
+        use crate::ws::auth::WidgetPrincipal;
+        Principal::Widget(WidgetPrincipal {
+            widget_id: 1,
+            server_config_id,
+            virtual_server_id: 1,
+        })
+    }
+
+    /// PURA-72 H-1 regression. The widget topic must NOT republish the
+    /// operator-side `NotifyFrame` envelope — anyone with a widget token
+    /// could otherwise harvest UIDs / db ids / server-groups / IPs /
+    /// country off `/api/ws`. Spec §7.29: the public widget surface
+    /// carries no client UIDs, IPs, or permissions metadata.
+    ///
+    /// The hub broadcast is per-server (the session loop is what
+    /// filters by topic), so subscribing to the widget topic returns
+    /// the channel receiver that sees both publishes from
+    /// `publish_notify`. We drain both envelopes and assert that the
+    /// one bound to `server:N:widget` is the refresh stub.
+    #[tokio::test]
+    async fn widget_topic_publishes_redacted_refresh_stub_only() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        crate::db::migrations::run(&db).await.unwrap();
+
+        let hub = Hub::new();
+        let topic = Topic::new(7, TopicKind::Widget);
+        let mut sub = hub
+            .subscribe(&db, &widget_principal(7), topic, None)
+            .await
+            .unwrap();
+
+        // The exact field set a leaker would sniff for. Every key here
+        // must be absent from the widget envelope.
+        let frame = NotifyFrame {
+            event: "notifycliententerview".into(),
+            records: vec![record(&[
+                ("clid", "12"),
+                ("client_nickname", "bob"),
+                ("client_unique_identifier", "uniqueId="),
+                ("client_database_id", "42"),
+                ("client_servergroups", "1,7,12"),
+                ("client_channel_group_id", "8"),
+                ("client_country", "DE"),
+                ("client_meta_data", "secret"),
+                ("connection_client_ip", "203.0.113.4"),
+                ("client_platform", "Linux"),
+                ("client_version", "3.13.7"),
+            ])],
+        };
+        publish_notify(&hub, 7, &frame).await;
+
+        // Drain up to two envelopes (operator + widget fan-outs share
+        // the per-server broadcast). Find the widget one.
+        let mut widget_env = None;
+        for _ in 0..2 {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                sub.receiver.recv(),
+            )
+            .await
+            {
+                Ok(Ok(env)) => {
+                    if env.topic == "server:7:widget" {
+                        widget_env = Some(env);
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        let env = widget_env.expect("widget envelope must be published on server:7:widget");
+        assert_eq!(
+            env.kind, WIDGET_REFRESH_KIND,
+            "widget envelope kind must be the redaction stub, not the operator name"
+        );
+        assert_eq!(
+            env.data,
+            json!({ "refresh": true }),
+            "widget envelope body must be a static refresh stub — no upstream fields"
+        );
+        // Belt-and-braces — flatten and assert no PII leaked even if
+        // `widget_refresh_payload` is changed in future.
+        let payload = env.data.to_string();
+        for forbidden in [
+            "uniqueId=",
+            "client_unique_identifier",
+            "client_database_id",
+            "client_servergroups",
+            "client_channel_group_id",
+            "client_country",
+            "client_meta_data",
+            "connection_client_ip",
+            "203.0.113.4",
+            "Linux",
+            "3.13.7",
+            "bob",
+        ] {
+            assert!(
+                !payload.contains(forbidden),
+                "widget envelope leaked `{forbidden}` from operator frame: {payload}"
+            );
+        }
+    }
+
+    /// Operator topics must keep the full envelope — only the widget
+    /// fan-out is stubbed. Belt-and-braces companion to the H-1 test:
+    /// regressing the publish path back to "fan everything everywhere"
+    /// would also fail this assertion if the operator envelope is
+    /// quietly stripped.
+    #[tokio::test]
+    async fn operator_clients_topic_keeps_full_envelope() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        crate::db::migrations::run(&db).await.unwrap();
+
+        let hub = Hub::new();
+        let topic = Topic::new(7, TopicKind::Clients);
+        let mut sub = hub.subscribe(&db, &admin(), topic, None).await.unwrap();
+
+        let frame = NotifyFrame {
+            event: "notifycliententerview".into(),
+            records: vec![record(&[
+                ("clid", "12"),
+                ("client_unique_identifier", "uniqueId="),
+                ("client_database_id", "42"),
+            ])],
+        };
+        publish_notify(&hub, 7, &frame).await;
+
+        let env = sub.receiver.recv().await.expect("operator envelope");
+        assert_eq!(env.kind, "ts:client:connected");
+        assert_eq!(env.data["client_unique_identifier"], "uniqueId=");
+        assert_eq!(env.data["client_database_id"], "42");
     }
 
     #[tokio::test]
