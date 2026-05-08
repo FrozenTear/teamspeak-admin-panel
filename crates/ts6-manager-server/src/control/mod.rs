@@ -51,12 +51,13 @@ use reqwest::StatusCode;
 use thiserror::Error;
 use tokio::sync::RwLock;
 
+use crate::db::Database;
 use crate::repos::server_connections::ServerConnection;
 use crate::sshbridge::{
     control_client::SshControlClient,
     hostkey::{HostKeyConfigError, HostKeyVerifier},
     russh_channel::{connect_password, RusshConnectParams},
-    transport::{spawn as spawn_transport, TransportConfig},
+    transport::{spawn_with_db as spawn_transport_with_db, TransportConfig},
     SshBridgeError,
 };
 use crate::webquery::{
@@ -250,6 +251,12 @@ pub struct ControlBackendPool {
     /// from `TS_SSH_KNOWN_HOSTS` at boot; `None` falls through to the
     /// per-server fingerprint column or `Reject`.
     ssh_known_hosts_path: Option<PathBuf>,
+    /// PURA-79: SurrealDB handle threaded into the SSH transport
+    /// supervisor via [`spawn_transport_with_db`]. Without it the
+    /// dispatch loop only `tracing::info!`s audit events and
+    /// `ssh_audit_log` stays empty in production. Cheap to clone — the
+    /// `Surreal<Any>` handle is internally `Arc`-shared.
+    db: Arc<Database>,
 }
 
 impl std::fmt::Debug for ControlBackendPool {
@@ -268,11 +275,12 @@ impl std::fmt::Debug for ControlBackendPool {
 }
 
 impl ControlBackendPool {
-    pub fn new(allow_self_signed: bool) -> Self {
+    pub fn new(allow_self_signed: bool, db: Arc<Database>) -> Self {
         Self {
             inner: Arc::new(RwLock::new(HashMap::new())),
             allow_self_signed,
             ssh_known_hosts_path: None,
+            db,
         }
     }
 
@@ -385,7 +393,7 @@ impl ControlBackendPool {
             }
         };
 
-        let handle = spawn_transport(cfg, factory);
+        let handle = spawn_transport_with_db(cfg, factory, self.db.clone());
         let client = SshControlClient::new(connection.id, handle);
         Ok(Arc::new(client))
     }
@@ -448,7 +456,10 @@ mod tests {
 
     #[tokio::test]
     async fn pool_returns_transport_error_when_connection_missing() {
-        let pool = ControlBackendPool::new(false);
+        let db = crate::db::connect_in_memory()
+            .await
+            .expect("in-memory connect");
+        let pool = ControlBackendPool::new(false, db);
         let err = pool.get_or_build(99, None).await.unwrap_err();
         match err {
             ControlBackendError::Transport(s) => {

@@ -119,6 +119,7 @@ mod tests {
     async fn fresh_state() -> AppState {
         let db = connect_in_memory().await.unwrap();
         migrations::run(&db).await.unwrap();
+        let control = crate::control::ControlBackendPool::new(false, db.clone());
         AppState {
             db,
             jwt_secret: Arc::new(b"test-secret-bytes-please-32-or-more".to_vec()),
@@ -126,7 +127,7 @@ mod tests {
             jwt_refresh_expiry: Duration::from_secs(7 * 24 * 3600),
             setup_lock: Arc::new(tokio::sync::Mutex::new(())),
             webquery: WebQueryPool::new(false),
-            control: crate::control::ControlBackendPool::new(false),
+            control,
             ws_hub: crate::ws::Hub::new(),
         }
     }

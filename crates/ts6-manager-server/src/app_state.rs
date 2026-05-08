@@ -49,6 +49,7 @@ pub struct AppState {
 
 impl AppState {
     pub fn from_config(cfg: &Config, db: Arc<Database>) -> Self {
+        let control = ControlBackendPool::new(cfg.ts_allow_self_signed, db.clone());
         Self {
             db,
             jwt_secret: Arc::new(cfg.jwt_secret.as_bytes().to_vec()),
@@ -56,7 +57,7 @@ impl AppState {
             jwt_refresh_expiry: cfg.jwt_refresh_expiry,
             setup_lock: Arc::new(Mutex::new(())),
             webquery: WebQueryPool::new(cfg.ts_allow_self_signed),
-            control: ControlBackendPool::new(cfg.ts_allow_self_signed),
+            control,
             ws_hub: Hub::new(),
         }
     }
