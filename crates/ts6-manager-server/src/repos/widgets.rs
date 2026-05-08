@@ -119,6 +119,77 @@ pub async fn list_for_server(db: &Database, server_config_id: i64) -> Result<Vec
     Ok(resp.take(0)?)
 }
 
+pub async fn list(db: &Database) -> Result<Vec<Widget>> {
+    let sql = format!("SELECT {PROJECTION} FROM widget ORDER BY id ASC;");
+    let mut resp = db.query(sql).await?.check()?;
+    Ok(resp.take(0)?)
+}
+
+/// Patch shape for [`update`]. Every field is optional; absent fields are
+/// preserved by SurrealDB's `MERGE` semantics. `serverConfigId` and
+/// `virtualServerId` are intentionally *not* patchable — re-pointing a
+/// widget at a different upstream server is a new widget; recreate it.
+#[derive(Debug, Clone, Default)]
+pub struct WidgetUpdate {
+    pub name: Option<String>,
+    pub theme: Option<String>,
+    pub showChannelTree: Option<bool>,
+    pub showClients: Option<bool>,
+    pub hideEmptyChannels: Option<bool>,
+    pub maxChannelDepth: Option<i64>,
+}
+
+pub async fn update(db: &Database, id: i64, patch: WidgetUpdate) -> Result<Option<Widget>> {
+    let mut merge = serde_json::Map::new();
+    if let Some(v) = patch.name {
+        merge.insert("name".into(), serde_json::Value::String(v));
+    }
+    if let Some(v) = patch.theme {
+        merge.insert("theme".into(), serde_json::Value::String(v));
+    }
+    if let Some(v) = patch.showChannelTree {
+        merge.insert("showChannelTree".into(), serde_json::Value::Bool(v));
+    }
+    if let Some(v) = patch.showClients {
+        merge.insert("showClients".into(), serde_json::Value::Bool(v));
+    }
+    if let Some(v) = patch.hideEmptyChannels {
+        merge.insert("hideEmptyChannels".into(), serde_json::Value::Bool(v));
+    }
+    if let Some(v) = patch.maxChannelDepth {
+        merge.insert("maxChannelDepth".into(), serde_json::Value::Number(v.into()));
+    }
+    if merge.is_empty() {
+        return find_by_id(db, id).await;
+    }
+    let sql = format!(
+        "UPDATE type::record('widget', $id) MERGE $patch RETURN {PROJECTION};"
+    );
+    let mut resp = db
+        .query(sql)
+        .bind(("id", id))
+        .bind(("patch", serde_json::Value::Object(merge)))
+        .await?
+        .check()?;
+    Ok(resp.take(0)?)
+}
+
+/// Replace the widget's URL token. Used by `POST /api/widgets/{id}/regenerate-token`
+/// (spec §7.27). The repo doesn't invalidate the public-data cache — the
+/// route handler does that under the *old* token before calling `set_token`.
+pub async fn set_token(db: &Database, id: i64, new_token: &str) -> Result<Option<Widget>> {
+    let sql = format!(
+        "UPDATE type::record('widget', $id) MERGE {{ token: $tok }} RETURN {PROJECTION};"
+    );
+    let mut resp = db
+        .query(sql)
+        .bind(("id", id))
+        .bind(("tok", new_token.to_string()))
+        .await?
+        .check()?;
+    Ok(resp.take(0)?)
+}
+
 pub async fn delete(db: &Database, id: i64) -> Result<()> {
     let sql = "DELETE type::record('widget', $id);";
     db.query(sql).bind(("id", id)).await?.check()?;

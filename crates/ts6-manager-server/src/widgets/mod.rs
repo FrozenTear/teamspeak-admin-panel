@@ -16,14 +16,16 @@
 //!
 //! - SVG renderer per §27.3 — [PURA-72-B].
 //! - PNG via `resvg` per §27.4 — [PURA-72-C].
-//! - Operator widget CRUD (§7.27) — [PURA-72-D].
+//! - Operator widget CRUD (§7.27) — Slice D ([PURA-89]) lives in [`admin`].
 //! - Public `/widget/:token` HTML page (§3.9) — [PURA-72-E].
 //! - Cross-cutting CORS/CSP/rate-limit on widget routes — [PURA-72-F].
-//! - Operator Widget Manager UI (Chapter 34) — [PURA-72-G].
+//! - Operator Widget Manager UI (Chapter 34) — [PURA-92].
 
-#![allow(dead_code)] // Slice B/C/D consumers land in follow-up tickets.
+#![allow(dead_code)] // Slice B/C consumers land in follow-up tickets.
 
+pub mod admin;
 pub mod cache;
+pub mod png;
 pub mod routes;
 pub mod snapshot;
 pub mod svg;
