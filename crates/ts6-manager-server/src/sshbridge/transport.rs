@@ -45,6 +45,7 @@ use super::audit::AuditEntry;
 use super::channel::{looks_like_auth_failure, SshChannel, TransportError};
 use super::wire::{ErrorFrame, Frame, LineBuffer, NotifyFrame};
 use super::{SshBridgeError, SshBridgeResult};
+use crate::db::Database;
 
 /// Tunable timings. Defaults reflect the PURA-76 acceptance criteria.
 #[derive(Debug, Clone)]
@@ -55,6 +56,13 @@ pub struct TransportConfig {
     /// Banner deadline. Spec §11.3 — banner usually arrives in
     /// milliseconds; pad generously for high-latency networks.
     pub banner_timeout: Duration,
+    /// Wall-clock ceiling on the connect future returned by
+    /// `connect_factory`. Wraps the entire pre-banner sequence (TCP
+    /// connect, SSH key exchange, password auth, channel open,
+    /// `request_shell`). Without this a slow-loris peer or a wedged
+    /// MITM can keep the supervisor parked indefinitely with no
+    /// observable failure event. PURA-76 — 30 s default.
+    pub connect_timeout: Duration,
     /// Keepalive cadence. PURA-76 — `whoami` every 30 s.
     pub keepalive_interval: Duration,
     /// Per-keepalive deadline. PURA-76 — 5 s.
@@ -79,6 +87,7 @@ impl TransportConfig {
             config_id,
             command_timeout: Duration::from_secs(10),
             banner_timeout: Duration::from_secs(15),
+            connect_timeout: Duration::from_secs(30),
             keepalive_interval: Duration::from_secs(30),
             keepalive_timeout: Duration::from_secs(5),
             keepalive_failure_threshold: 3,
@@ -217,9 +226,32 @@ impl TransportHandle {
 
 /// Per-session shared state — held by the dispatch loop, surfaced
 /// through [`TransportHandle`].
+///
+/// `db` carries the audit-log persistence handle (PURA-79 BLOCKER fix). When
+/// `Some`, [`dispatch_loop`] schedules a fire-and-forget
+/// [`AuditEntry::persist`] task after each `.emit()` so operator commands
+/// land in `ssh_audit_log` rather than only in the `tracing::info!` stream.
+/// When `None`, the loop only emits — the test seam exercises this path
+/// without standing up a migrated database.
 struct DispatchContext {
     cfg: TransportConfig,
     notify_tx: broadcast::Sender<NotifyFrame>,
+    db: Option<Arc<Database>>,
+}
+
+/// Schedule a best-effort DB write for `entry` if `db` is wired.
+///
+/// PURA-79 BLOCKER: detaches the persist call from the dispatch loop so
+/// `cmd.reply.send(…)` never blocks on DB latency, and so the issue's
+/// hard rule — "a DB-write failure MUST NOT cancel the in-flight operator
+/// command" — is satisfied two ways: `persist` already swallows errors
+/// internally, *and* spawning detaches the call from the reply path.
+fn fire_and_forget_persist(db: Option<&Arc<Database>>, entry: &AuditEntry) {
+    if let Some(db) = db {
+        let db = db.clone();
+        let entry = entry.clone();
+        tokio::spawn(async move { entry.persist(&db).await });
+    }
 }
 
 /// Read until the banner-terminator `error id=0 msg=ok` arrives — spec
@@ -263,7 +295,12 @@ pub(crate) async fn read_banner<C: SshChannel>(
                 return Err(SshBridgeError::Transport(e.to_string()));
             }
         };
-        parser.push(&chunk);
+        if let Err(e) = parser.push(&chunk) {
+            // F1: line-buffer overflow surfaces as a transport-class
+            // failure. The buffer cleared itself on rejection so the
+            // reconnect that follows starts clean.
+            return Err(SshBridgeError::Transport(e.to_string()));
+        }
         for line in parser.drain_lines() {
             match Frame::classify(&line) {
                 Frame::Notify(_) => {
@@ -314,7 +351,12 @@ async fn execute_one<C: SshChannel>(
             }
             Ok(Err(e)) => return Err(e),
         };
-        parser.push(&chunk);
+        // F1: bound the in-flight line accumulator. A peer that streams
+        // bytes without CR-LF would otherwise drive the bridge process
+        // to OOM; on overflow `push` clears `pending` and returns
+        // TransportError::Io so this command resolves as a transport
+        // failure and the supervisor reconnects.
+        parser.push(&chunk)?;
         for ln in parser.drain_lines() {
             match Frame::classify(&ln) {
                 Frame::Notify(n) => {
@@ -369,17 +411,19 @@ async fn dispatch_loop<C: SshChannel>(
                     Ok(outcome) => {
                         let public = match super::frame_to_result(outcome.error.clone()) {
                             Ok(()) => {
-                                AuditEntry::success(
+                                let entry = AuditEntry::success(
                                     ctx.cfg.config_id,
                                     cmd.virtual_server_id,
                                     cmd.user_id,
                                     cmd.line.clone(),
                                     outcome.latency,
-                                ).emit();
+                                );
+                                entry.emit();
+                                fire_and_forget_persist(ctx.db.as_ref(), &entry);
                                 Ok(outcome)
                             }
                             Err(SshBridgeError::Upstream { code, message }) => {
-                                AuditEntry::upstream_error(
+                                let entry = AuditEntry::upstream_error(
                                     ctx.cfg.config_id,
                                     cmd.virtual_server_id,
                                     cmd.user_id,
@@ -387,7 +431,9 @@ async fn dispatch_loop<C: SshChannel>(
                                     code,
                                     message.clone(),
                                     outcome.latency,
-                                ).emit();
+                                );
+                                entry.emit();
+                                fire_and_forget_persist(ctx.db.as_ref(), &entry);
                                 Err(SshBridgeError::Upstream { code, message })
                             }
                             Err(other) => Err(other),
@@ -402,14 +448,16 @@ async fn dispatch_loop<C: SshChannel>(
                     }
                     Err(e) => {
                         let is_auth = matches!(&e, TransportError::Closed(s) | TransportError::Io(s) if looks_like_auth_failure(s));
-                        AuditEntry::transport(
+                        let entry = AuditEntry::transport(
                             ctx.cfg.config_id,
                             cmd.virtual_server_id,
                             cmd.user_id,
                             cmd.line.clone(),
                             e.to_string(),
                             Duration::from_millis(0),
-                        ).emit();
+                        );
+                        entry.emit();
+                        fire_and_forget_persist(ctx.db.as_ref(), &entry);
                         let public_err = if is_auth {
                             SshBridgeError::AuthRejected { config_id: ctx.cfg.config_id }
                         } else {
@@ -475,6 +523,7 @@ async fn run_with_reconnect<C, F, Fut>(
     mut cmd_rx: mpsc::Receiver<CommandRequest>,
     notify_tx: broadcast::Sender<NotifyFrame>,
     auth_rejected_flag: Arc<Mutex<bool>>,
+    db: Option<Arc<Database>>,
 )
 where
     C: SshChannel,
@@ -483,7 +532,23 @@ where
 {
     let mut attempts: u32 = 0;
     loop {
-        let connect_attempt = connect_factory().await;
+        // F2: cap the entire connect future (TCP + KEX + auth + channel
+        // open + request_shell) at `connect_timeout`. Without this, a
+        // slow-loris peer parks the supervisor task forever — the
+        // supervisor never reaches `read_banner`, so `banner_timeout`
+        // never fires and the operator sees no failure event.
+        let connect_attempt = match tokio::time::timeout(
+            cfg.connect_timeout,
+            connect_factory(),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => Err(TransportError::Io(format!(
+                "connect timeout after {:?}",
+                cfg.connect_timeout
+            ))),
+        };
         let mut channel = match connect_attempt {
             Ok(c) => c,
             Err(TransportError::AuthRejected) => {
@@ -549,7 +614,8 @@ where
         // can't `move` `cmd_rx` because we may need it for the next
         // reconnect attempt — instead transfer ownership in and out
         // via the helper.
-        let (returned_rx, result) = dispatch_loop_owning(channel, cmd_rx, &cfg, &notify_tx).await;
+        let (returned_rx, result) =
+            dispatch_loop_owning(channel, cmd_rx, &cfg, &notify_tx, db.clone()).await;
         cmd_rx = returned_rx;
         match result {
             SessionResult::ShuttingDown => return,
@@ -581,6 +647,7 @@ async fn dispatch_loop_owning<C: SshChannel>(
     cmd_rx: mpsc::Receiver<CommandRequest>,
     cfg: &TransportConfig,
     notify_tx: &broadcast::Sender<NotifyFrame>,
+    db: Option<Arc<Database>>,
 ) -> (mpsc::Receiver<CommandRequest>, SessionResult) {
     // Spawn the dispatch loop with a private channel pair; pump
     // commands from the outer receiver into the inner one. When the
@@ -599,6 +666,7 @@ async fn dispatch_loop_owning<C: SshChannel>(
         DispatchContext {
             cfg: cfg.clone(),
             notify_tx: notify_tx.clone(),
+            db,
         },
     )
     .await;
@@ -638,7 +706,43 @@ async fn drain_with_auth_rejected(rx: &mut mpsc::Receiver<CommandRequest>, confi
 /// and returns a [`TransportHandle`] callers use to submit commands.
 /// The supervisor task is detached; it runs until the handle (and all
 /// clones) are dropped.
+///
+/// **No audit-DB persistence.** Audit events still emit via
+/// [`AuditEntry::emit`], but `ssh_audit_log` rows are not written. Use
+/// [`spawn_with_db`] from production paths so the audit table is
+/// populated; this thin variant exists for callers (tests, future
+/// experiments) that genuinely have no DB to hand over.
 pub fn spawn<C, F, Fut>(cfg: TransportConfig, connect_factory: F) -> TransportHandle
+where
+    C: SshChannel + 'static,
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<C, TransportError>> + Send,
+{
+    spawn_inner(cfg, connect_factory, None)
+}
+
+/// Production constructor — same as [`spawn`] but threads `db` into
+/// [`DispatchContext`] so [`dispatch_loop`] schedules a fire-and-forget
+/// [`AuditEntry::persist`] after each emission. Operator commands
+/// queryable via `ssh_audit_log` (PURA-79 BLOCKER).
+pub fn spawn_with_db<C, F, Fut>(
+    cfg: TransportConfig,
+    connect_factory: F,
+    db: Arc<Database>,
+) -> TransportHandle
+where
+    C: SshChannel + 'static,
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<C, TransportError>> + Send,
+{
+    spawn_inner(cfg, connect_factory, Some(db))
+}
+
+fn spawn_inner<C, F, Fut>(
+    cfg: TransportConfig,
+    connect_factory: F,
+    db: Option<Arc<Database>>,
+) -> TransportHandle
 where
     C: SshChannel + 'static,
     F: FnMut() -> Fut + Send + 'static,
@@ -657,7 +761,7 @@ where
 
     let cfg_clone = cfg.clone();
     tokio::spawn(async move {
-        run_with_reconnect(cfg_clone, connect_factory, cmd_rx, notify_tx, auth_flag).await;
+        run_with_reconnect(cfg_clone, connect_factory, cmd_rx, notify_tx, auth_flag, db).await;
     });
 
     handle
@@ -726,6 +830,7 @@ mod tests {
             config_id: 7,
             command_timeout: Duration::from_millis(500),
             banner_timeout: Duration::from_millis(500),
+            connect_timeout: Duration::from_millis(500),
             keepalive_interval: Duration::from_secs(3600),
             keepalive_timeout: Duration::from_millis(500),
             keepalive_failure_threshold: 3,
@@ -883,6 +988,7 @@ mod tests {
         let ctx = DispatchContext {
             cfg: cfg.clone(),
             notify_tx,
+            db: None,
         };
 
         // Queue three commands.
@@ -958,6 +1064,7 @@ mod tests {
         let ctx = DispatchContext {
             cfg: cfg.clone(),
             notify_tx,
+            db: None,
         };
 
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -1013,6 +1120,7 @@ mod tests {
         let ctx = DispatchContext {
             cfg: cfg.clone(),
             notify_tx,
+            db: None,
         };
 
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -1050,6 +1158,7 @@ mod tests {
         let ctx = DispatchContext {
             cfg: cfg.clone(),
             notify_tx,
+            db: None,
         };
 
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -1077,5 +1186,198 @@ mod tests {
         let session = dispatch.await.unwrap();
         assert!(matches!(session, SessionResult::AuthRejected));
         drop(cmd_tx);
+    }
+
+    #[tokio::test]
+    async fn run_with_reconnect_bounds_hanging_connect_factory() {
+        // F2 regression: a connect factory that never completes
+        // (slow-loris peer, wedged MITM, or a misconfigured host:port
+        // that accepts TCP without ever finishing the SSH handshake)
+        // must NOT park the supervisor indefinitely. With
+        // `connect_timeout` set, the supervisor unsticks after the
+        // ceiling fires and proceeds into the backoff/retry loop.
+        // Without the fix this test hangs (the outer
+        // `tokio::time::timeout` makes that observable as a fail).
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cfg = TransportConfig {
+            connect_timeout: Duration::from_millis(20),
+            backoff_initial: Duration::from_millis(1),
+            backoff_max: Duration::from_millis(2),
+            ..test_cfg()
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let factory = {
+            let calls = calls.clone();
+            move || {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    // Hang forever — only the connect_timeout in
+                    // run_with_reconnect can rescue the supervisor.
+                    std::future::pending::<Result<StubChannel, TransportError>>().await
+                }
+            }
+        };
+        let (cmd_tx, cmd_rx) = mpsc::channel::<CommandRequest>(8);
+        let (notify_tx, _) = broadcast::channel::<NotifyFrame>(16);
+        let auth_flag = Arc::new(Mutex::new(false));
+
+        let supervisor = tokio::spawn(run_with_reconnect(
+            cfg.clone(),
+            factory,
+            cmd_rx,
+            notify_tx,
+            auth_flag,
+            None,
+        ));
+
+        // Wait for several timeout-and-backoff cycles. Each cycle is
+        // ~connect_timeout + backoff(<= backoff_max) ≈ 22 ms; 200 ms
+        // gives plenty of headroom for >= 3 attempts on a busy CI box.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let observed = calls.load(Ordering::SeqCst);
+
+        // The supervisor never escapes the connect loop on its own
+        // (factory always hangs), so we abort it explicitly.
+        drop(cmd_tx);
+        supervisor.abort();
+        let _ = supervisor.await;
+
+        assert!(
+            observed >= 3,
+            "expected the supervisor to time out and retry the connect future at least 3 times within 200ms; observed {observed}"
+        );
+    }
+
+    /// PURA-79 BLOCKER regression — drive a successful command through
+    /// [`dispatch_loop`] with `db: Some(...)` wired into [`DispatchContext`]
+    /// and assert a row lands in `ssh_audit_log`.
+    ///
+    /// Without the BLOCKER fix the dispatch loop only calls `.emit()` and
+    /// the table stays empty in production. SecurityEngineer's review on
+    /// commit `3e9c73d` flagged that the existing
+    /// `audit_entry_persist_round_trips_through_table` test exercises only
+    /// the standalone `AuditEntry::persist` seam — it does not catch a
+    /// regression where someone refactors out the `dispatch_loop` ↔
+    /// `persist` wiring. This end-to-end test is the regression belt.
+    #[allow(non_snake_case)] // `commandLine` mirrors the on-disk column name.
+    #[tokio::test]
+    async fn dispatch_loop_persists_audit_row_when_db_wired() {
+        use surrealdb::types::SurrealValue;
+
+        let db = crate::db::connect_in_memory()
+            .await
+            .expect("in-memory connect");
+        crate::db::migrations::run(&db).await.expect("migrations run");
+
+        let (channel, read_tx, _writes_rx) = StubChannel::new();
+        let cfg = test_cfg();
+        let (cmd_tx, cmd_rx) = mpsc::channel::<CommandRequest>(8);
+        let (notify_tx, _) = broadcast::channel::<NotifyFrame>(16);
+        let ctx = DispatchContext {
+            cfg: cfg.clone(),
+            notify_tx,
+            db: Some(db.clone()),
+        };
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        cmd_tx
+            .send(CommandRequest {
+                line: "clientlist -uid".into(),
+                timeout: None,
+                user_id: None,
+                virtual_server_id: Some(1),
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        drop(cmd_tx);
+
+        let dispatch = tokio::spawn(dispatch_loop(channel, cmd_rx, ctx));
+        read_tx
+            .send(Ok(Some(b"error id=0 msg=ok\r\n".to_vec())))
+            .await
+            .unwrap();
+
+        // Reply lands first — caller is unblocked before persist runs.
+        let outcome = reply_rx.await.unwrap().unwrap();
+        assert_eq!(outcome.error.id, 0);
+        let _session = dispatch.await.unwrap();
+
+        // Persist is `tokio::spawn`-fired so the DB write may not have
+        // completed by the time `cmd.reply.send(...)` resolved. Poll
+        // under a generous deadline — anything over a few hundred ms in
+        // practice means the wiring is broken.
+        #[derive(serde::Deserialize, SurrealValue)]
+        #[surreal(crate = "surrealdb::types")]
+        struct Row {
+            #[allow(dead_code)]
+            id: i64,
+            commandLine: String,
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut rows: Vec<Row> = Vec::new();
+        while std::time::Instant::now() < deadline {
+            let mut resp = db
+                .query(
+                    "SELECT record::id(id) AS id, commandLine FROM ssh_audit_log;",
+                )
+                .await
+                .unwrap()
+                .check()
+                .unwrap();
+            rows = resp.take(0).unwrap();
+            if !rows.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !rows.is_empty(),
+            "PURA-79 BLOCKER: dispatch_loop must persist an `ssh_audit_log` \
+             row when `db: Some(...)` is wired into DispatchContext. Found 0 rows."
+        );
+        assert_eq!(rows[0].commandLine, "clientlist -uid");
+    }
+
+    /// Companion to [`dispatch_loop_persists_audit_row_when_db_wired`] —
+    /// asserts that the `db: None` path stays viable for tests / future
+    /// non-DB consumers (no panic, no DB write attempted).
+    #[tokio::test]
+    async fn dispatch_loop_emit_only_when_db_is_none() {
+        let (channel, read_tx, _writes_rx) = StubChannel::new();
+        let cfg = test_cfg();
+        let (cmd_tx, cmd_rx) = mpsc::channel::<CommandRequest>(8);
+        let (notify_tx, _) = broadcast::channel::<NotifyFrame>(16);
+        let ctx = DispatchContext {
+            cfg: cfg.clone(),
+            notify_tx,
+            db: None,
+        };
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        cmd_tx
+            .send(CommandRequest {
+                line: "version".into(),
+                timeout: None,
+                user_id: None,
+                virtual_server_id: None,
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        drop(cmd_tx);
+
+        let dispatch = tokio::spawn(dispatch_loop(channel, cmd_rx, ctx));
+        read_tx
+            .send(Ok(Some(b"error id=0 msg=ok\r\n".to_vec())))
+            .await
+            .unwrap();
+
+        let outcome = reply_rx.await.unwrap().unwrap();
+        assert_eq!(outcome.error.id, 0);
+        let session = dispatch.await.unwrap();
+        assert!(matches!(session, SessionResult::ShuttingDown));
     }
 }

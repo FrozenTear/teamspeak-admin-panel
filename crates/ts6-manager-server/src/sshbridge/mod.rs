@@ -81,8 +81,8 @@ pub use hostkey::{HostKeyConfigError, HostKeyPolicy, HostKeyVerifier};
 pub use russh_channel::{connect_password, RusshChannel, RusshConnectParams};
 #[allow(unused_imports)]
 pub use transport::{
-    next_backoff, spawn as spawn_transport, CommandOutcome, SessionResult, TransportConfig,
-    TransportHandle,
+    next_backoff, spawn as spawn_transport, spawn_with_db as spawn_transport_with_db,
+    CommandOutcome, SessionResult, TransportConfig, TransportHandle,
 };
 
 use reqwest::StatusCode;

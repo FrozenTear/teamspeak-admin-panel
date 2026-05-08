@@ -277,25 +277,37 @@ mod tests {
         // forbidden contiguous form never appears as a contiguous substring
         // anywhere else in this file — otherwise the test self-matches its
         // own description and panics on innocent doc comments.
+        //
+        // SurrealDB-specific: the keyword set covers every SurrealQL form
+        // that can rewrite an existing record — `UPDATE`, `UPSERT`,
+        // `MERGE`, and `RELATE`. R4-medium follow-up tightening: any of
+        // those keywords applied to the audit table would otherwise
+        // bypass the static-grep belt entirely and land tamper-able
+        // audit rows. (Doc-comment phrasing is deliberately keyword-
+        // free of the forbidden contiguous form so the grep does not
+        // trip over its own description.)
         const SOURCE: &str = include_str!("ssh_audit_log.rs");
 
         let table = "ssh_audit_log";
-        let mutate_keyword = "UPDATE";
+        let mutate_keywords = ["UPDATE", "UPSERT", "MERGE", "RELATE"];
         let by_id_marker = ":";
 
-        // Forbidden: open-quote + keyword + space + table. An honest
-        // mutation path inside a SurrealQL string literal would land as
-        // db.query(STR …) where STR begins with that token sequence.
-        let forbidden_update = ["\"", mutate_keyword, " ", table].concat();
+        for kw in mutate_keywords {
+            // Forbidden: open-quote + keyword + space + table. An honest
+            // mutation path inside a SurrealQL string literal would land
+            // as `db.query(STR …)` where `STR` begins with that token
+            // sequence.
+            let forbidden = ["\"", kw, " ", table].concat();
+            assert!(
+                !SOURCE.contains(&forbidden),
+                "tamper-resistance violation: audit table must not see a \
+                 `{kw}` mutation query. INSERT-only per PURA-79 R4."
+            );
+        }
+
         // Forbidden: keyword + space + table + colon-form id marker.
         // The prune flow uses WHERE record id IN $ids, never the colon-form.
         let forbidden_by_id_delete = ["DELETE", " ", table, by_id_marker].concat();
-
-        assert!(
-            !SOURCE.contains(&forbidden_update),
-            "tamper-resistance violation: audit table must not see a \
-             mutation query. INSERT-only per PURA-79 R4."
-        );
         assert!(
             !SOURCE.contains(&forbidden_by_id_delete),
             "tamper-resistance violation: audit table must not see by-id \

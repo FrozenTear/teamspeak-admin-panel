@@ -25,7 +25,16 @@
 
 use std::collections::HashMap;
 
+use super::channel::TransportError;
 use crate::webquery::escape::unescape;
+
+/// Default cap on the in-flight (un-terminated) line accumulator. A
+/// well-behaved TS6 ServerQuery line — even with §10.4 escape-table
+/// expansion on every byte — sits comfortably under a few hundred KiB; 1
+/// MiB is a generous ceiling that still stops a misbehaving peer from
+/// driving the bridge process to OOM by streaming bytes without ever
+/// sending CR-LF.
+pub const DEFAULT_MAX_LINE_BYTES: usize = 1_048_576;
 
 /// Buffers incoming bytes from the SSH channel and yields complete lines.
 ///
@@ -34,9 +43,27 @@ use crate::webquery::escape::unescape;
 /// buffer holds a trailing partial line until the next push completes it.
 ///
 /// Per spec §11.4: split on `/\r?\n/`, discard empty lines.
-#[derive(Debug, Default)]
+///
+/// `pending` is capped at [`max_line_bytes`] (default
+/// [`DEFAULT_MAX_LINE_BYTES`]). A peer that streams more bytes than the
+/// cap without delivering a `\n` is treated as a transport error rather
+/// than allowed to drive the process to OOM. On overflow the buffer is
+/// cleared so a subsequent reconnect starts from a clean slate.
+///
+/// [`max_line_bytes`]: LineBuffer::max_line_bytes
+#[derive(Debug)]
 pub struct LineBuffer {
     pending: Vec<u8>,
+    max_line_bytes: usize,
+}
+
+impl Default for LineBuffer {
+    fn default() -> Self {
+        Self {
+            pending: Vec::new(),
+            max_line_bytes: DEFAULT_MAX_LINE_BYTES,
+        }
+    }
 }
 
 impl LineBuffer {
@@ -44,9 +71,32 @@ impl LineBuffer {
         Self::default()
     }
 
-    /// Append raw bytes from the channel.
-    pub fn push(&mut self, bytes: &[u8]) {
+    /// Construct with an explicit ceiling on the in-flight accumulator.
+    /// Tests use this to make the overflow path observable without
+    /// allocating a megabyte.
+    pub fn with_max_line_bytes(max_line_bytes: usize) -> Self {
+        Self {
+            pending: Vec::new(),
+            max_line_bytes,
+        }
+    }
+
+    /// Append raw bytes from the channel. Returns
+    /// [`TransportError::Io`] if the would-be size exceeds
+    /// [`max_line_bytes`]; on overflow the buffer is cleared so the
+    /// reconnect that follows starts clean.
+    ///
+    /// [`max_line_bytes`]: LineBuffer::max_line_bytes
+    pub fn push(&mut self, bytes: &[u8]) -> Result<(), TransportError> {
+        if self.pending.len().saturating_add(bytes.len()) > self.max_line_bytes {
+            self.pending.clear();
+            return Err(TransportError::Io(format!(
+                "line exceeded max length ({} bytes)",
+                self.max_line_bytes
+            )));
+        }
         self.pending.extend_from_slice(bytes);
+        Ok(())
     }
 
     /// Drain every complete (CR-LF terminated) line from the buffer.
@@ -214,12 +264,12 @@ mod tests {
     #[test]
     fn line_buffer_yields_complete_lines_only() {
         let mut buf = LineBuffer::new();
-        buf.push(b"error id=0 msg=ok\r\nnotifycliententer ");
+        buf.push(b"error id=0 msg=ok\r\nnotifycliententer ").unwrap();
         let lines = buf.drain_lines();
         assert_eq!(lines, vec!["error id=0 msg=ok"]);
         // partial line stays in the buffer
         assert_eq!(buf.drain_lines(), Vec::<String>::new());
-        buf.push(b"clid=5\r\n");
+        buf.push(b"clid=5\r\n").unwrap();
         assert_eq!(buf.drain_lines(), vec!["notifycliententer clid=5"]);
     }
 
@@ -227,15 +277,47 @@ mod tests {
     fn line_buffer_handles_lf_only() {
         // Some servers strip the CR; spec allows `/\r?\n/`.
         let mut buf = LineBuffer::new();
-        buf.push(b"first\nsecond\n");
+        buf.push(b"first\nsecond\n").unwrap();
         assert_eq!(buf.drain_lines(), vec!["first", "second"]);
     }
 
     #[test]
     fn line_buffer_discards_empty_lines() {
         let mut buf = LineBuffer::new();
-        buf.push(b"\r\n\r\nreal\r\n\r\n");
+        buf.push(b"\r\n\r\nreal\r\n\r\n").unwrap();
         assert_eq!(buf.drain_lines(), vec!["real"]);
+    }
+
+    #[test]
+    fn line_buffer_caps_pending_and_clears_on_overflow() {
+        // F1 regression: a peer that streams un-terminated bytes past
+        // the cap surfaces as TransportError::Io and the buffer drops
+        // its accumulator so the reconnect path starts clean.
+        let mut buf = LineBuffer::with_max_line_bytes(1024);
+        let flood = vec![b'x'; 2048];
+        let err = buf.push(&flood).expect_err("push should reject overflow");
+        match err {
+            TransportError::Io(msg) => assert!(
+                msg.contains("line exceeded max length"),
+                "unexpected message: {msg}"
+            ),
+            other => panic!("expected TransportError::Io, got {other:?}"),
+        }
+        // Buffer is reset after the rejection.
+        assert!(buf.drain_lines().is_empty());
+        // And the next well-formed push still works.
+        buf.push(b"first\r\n").unwrap();
+        assert_eq!(buf.drain_lines(), vec!["first"]);
+    }
+
+    #[test]
+    fn line_buffer_at_exact_cap_is_accepted() {
+        // Boundary: filling exactly to the cap is valid; the next byte
+        // tips it over.
+        let mut buf = LineBuffer::with_max_line_bytes(8);
+        buf.push(b"abcdefgh").unwrap();
+        let one_more = buf.push(b"i");
+        assert!(matches!(one_more, Err(TransportError::Io(_))));
     }
 
     #[test]
