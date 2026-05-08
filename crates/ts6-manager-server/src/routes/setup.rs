@@ -169,6 +169,11 @@ async fn init(
         queryBotNickname: None,
         sshBotNickname: None,
         enabled: true,
+        controlPath: None,
+        sshAuthMethod: None,
+        sshPrivateKey: None,
+        sshKeyAgentSocket: None,
+        sshHostKeyFingerprint: None,
     };
 
     let (user_row, server_row) =
@@ -225,6 +230,7 @@ mod tests {
             jwt_refresh_expiry: Duration::from_secs(7 * 24 * 3600),
             setup_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             webquery: crate::webquery::WebQueryPool::new(false),
+            ws_hub: crate::ws::Hub::new(),
         }
     }
 

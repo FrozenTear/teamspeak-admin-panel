@@ -7,14 +7,15 @@
 //! 401-equivalent — we return an HTTP 401 with the spec error body, which
 //! the browser surfaces as a connection failure.
 //!
-//! After the handshake succeeds we currently `on_upgrade` into a minimal
-//! placeholder loop that closes immediately. The real event fan-out (TS
-//! events, bot execution logs, music updates, video status — spec §8.4) is
-//! owned by the future REST/Realtime engineer; this module ships only the
-//! authenticated upgrade so the SECURITY surface for Phase 1 is complete.
+//! PURA-70 (Phase 2): the handshake also accepts widget tokens. We try
+//! the JWT path first; on `InvalidOrExpired` (the only error class that
+//! means "shape parsed but isn't a JWT"), we fall through to a widget-
+//! token lookup. `Disabled` and `Backend` short-circuit so a JWT for a
+//! disabled user can't silently downgrade to anonymous widget access.
+//! After resolving a [`crate::ws::Principal`], the upgraded socket goes
+//! to [`crate::ws::session::run`] which fans live events to the client.
 
 use axum::Json;
-use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Query, State, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -25,10 +26,14 @@ use crate::app_state::AppState;
 use crate::auth::extractors::AuthUser;
 use crate::auth::jwt;
 use crate::repos::users;
+use crate::ws::auth::{AuthenticateError, resolve_principal};
+use crate::ws::session;
 
 #[derive(Debug, Deserialize)]
 pub struct WsTokenQuery {
-    /// The access JWT. Required (no anonymous WS sessions).
+    /// The access JWT (operator) or widget token (public widget). The
+    /// handshake tries the JWT path first; on `InvalidOrExpired`, falls
+    /// back to looking the value up in the `widget` table.
     pub token: Option<String>,
 }
 
@@ -54,11 +59,10 @@ pub async fn ws_upgrade(
         _ => return unauthorized(msg::NO_TOKEN),
     };
 
-    let user = match authenticate_token(&state, token).await {
-        Ok(u) => u,
-        Err(WsAuthError::InvalidOrExpired) => return unauthorized(msg::INVALID_TOKEN),
-        Err(WsAuthError::Disabled) => return unauthorized(msg::USER_DISABLED),
-        Err(WsAuthError::Backend) => {
+    let principal = match resolve_principal(&state, token).await {
+        Ok(p) => p,
+        Err(AuthenticateError::Unauthorized) => return unauthorized(msg::INVALID_TOKEN),
+        Err(AuthenticateError::Backend) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new("Internal error")),
@@ -67,7 +71,9 @@ pub async fn ws_upgrade(
         }
     };
 
-    ws.on_upgrade(move |socket| ws_session_placeholder(socket, user))
+    let hub = state.ws_hub.clone();
+    let db = state.db.clone();
+    ws.on_upgrade(move |socket| session::run(socket, principal, hub, db))
 }
 
 /// Pure-async auth path, factored out so unit tests can exercise it without
@@ -106,14 +112,6 @@ fn unauthorized(body: &'static str) -> Response {
     (StatusCode::UNAUTHORIZED, Json(ErrorResponse::new(body))).into_response()
 }
 
-/// Placeholder WS session — closes immediately. The realtime fan-out logic
-/// (spec §8.4 categories: `bot:execution:*`, `voice:*`, `ts:event`, etc.)
-/// is owned by the REST/Realtime engineer; SECURITY only ships the gated
-/// upgrade.
-async fn ws_session_placeholder(mut socket: WebSocket, _user: AuthUser) {
-    let _ = socket.send(Message::Close(None)).await;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,6 +130,7 @@ mod tests {
             jwt_refresh_expiry: Duration::from_secs(7 * 24 * 3600),
             setup_lock: Arc::new(tokio::sync::Mutex::new(())),
             webquery: crate::webquery::WebQueryPool::new(false),
+            ws_hub: crate::ws::Hub::new(),
         }
     }
 

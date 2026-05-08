@@ -56,11 +56,16 @@ pub fn router(rate_limit: RateLimitState) -> Router<AppState> {
         .route("/password", put(change_password))
 }
 
-/// Build the absolute `/ws` route as a `Router<AppState>` so it can be
+/// Build the absolute WS routes as a `Router<AppState>` so they can be
 /// merged into the top-level router with state baked in alongside the auth
-/// routes. Phase 1 SECURITY (slice 4a) — see [`crate::auth::ws_handshake`].
+/// routes. Phase 1 SECURITY (slice 4a) shipped the spec-canonical `/ws`
+/// upgrade (§8.1); PURA-70 (Phase 2) also exposes `/api/ws` so the path
+/// matches the Phase 2 task wording. Both paths route to the same
+/// handler — see [`crate::auth::ws_handshake`].
 pub fn ws_router() -> Router<AppState> {
-    Router::new().route("/ws", get(crate::auth::ws_handshake::ws_upgrade))
+    Router::new()
+        .route("/ws", get(crate::auth::ws_handshake::ws_upgrade))
+        .route("/api/ws", get(crate::auth::ws_handshake::ws_upgrade))
 }
 
 /// Convenience: spec error body + status into an `axum::Response`.
@@ -238,6 +243,7 @@ mod tests {
             jwt_refresh_expiry: Duration::from_secs(7 * 24 * 3600),
             setup_lock: Arc::new(tokio::sync::Mutex::new(())),
             webquery: crate::webquery::WebQueryPool::new(false),
+            ws_hub: crate::ws::Hub::new(),
         }
     }
 

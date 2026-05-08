@@ -35,6 +35,8 @@ mod ui;
 mod web;
 #[cfg(feature = "server")]
 mod webquery;
+#[cfg(feature = "server")]
+mod ws;
 
 #[cfg(feature = "web")]
 fn main() {

@@ -13,6 +13,7 @@ use tokio::sync::Mutex;
 use crate::config::Config;
 use crate::db::Database;
 use crate::webquery::WebQueryPool;
+use crate::ws::Hub;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -33,6 +34,9 @@ pub struct AppState {
     /// Phase 1 fills lazily on first dashboard hit; Phase 2 will pre-populate
     /// on boot and run the §10.7 30s health probe.
     pub webquery: WebQueryPool,
+    /// PURA-70: live event bus. Per-server fan-out channels + ring
+    /// buffer + metrics. Cheap to clone (Arc-shared internals).
+    pub ws_hub: Hub,
 }
 
 impl AppState {
@@ -44,6 +48,7 @@ impl AppState {
             jwt_refresh_expiry: cfg.jwt_refresh_expiry,
             setup_lock: Arc::new(Mutex::new(())),
             webquery: WebQueryPool::new(cfg.ts_allow_self_signed),
+            ws_hub: Hub::new(),
         }
     }
 }
