@@ -476,10 +476,13 @@ App chrome is two primitives: a fixed left **Sidebar** with grouped navigation a
 
 ### 11.2 Sidebar
 
-- Brand block at top (`.brand`) — wordmark + glow dot. Acts as "go home" link to `/dashboard`.
+- Brand block at top (`.brand`) — wordmark + glow dot. **Identity, not navigation.** Sits OUTSIDE `<nav aria-label="Primary">` so the primary-nav landmark contains only route entries (a screen-reader landing on the landmark hears "Primary navigation: Dashboard, Channels, …" without the brand reading as a peer entry).
+  - The brand MAY optionally link to a home route, but only if that URL is distinct from every primary-nav entry. If the brand and a nav item share a URL, both will auto-emit `aria-current="page"` on that route — two elements claiming current page is non-conformant. In that case, render the brand as a non-routed element (plain `<a href="/">` or no link at all). Phase 1 currently aliases `/` to dashboard, so brand-as-plain-anchor is the right choice today; see [PURA-37](/PURA/issues/PURA-37) for the route-disambiguation follow-up that lets brand return to SPA `Link`.
+  - The brand is NOT a focusable nav target by default — operators reach the dashboard via the explicit Dashboard NavItem. Brand-as-link is a courtesy redundancy, not the primary affordance.
 - Nav groups (`.nav-group`) with uppercase 11px label (`.nav-group-label`) and items (`.nav-item`). Phase 1 ships four groups: **Server**, **Moderation**, **Automation**, **Admin**.
 - Active item: `--bg-selected` background, 2px leading-edge accent border, `--accent-fg` text. Hover: `--bg-hover`.
-- Group label is decoration only — not focusable, not announced as a heading. The whole sidebar is one `<nav aria-label="Primary">`.
+- Group label is decoration only — not focusable, not announced as a heading. The `<nav aria-label="Primary">` landmark wraps the nav-groups + items only.
+- Active-route indication relies on the SPA router's automatic `aria-current="page"` (Dioxus `Link` handles this). Do NOT pass an explicit `aria-current` prop on top of a router-aware Link — duplicate emission is a real a11y bug, not a hypothetical one.
 - Mobile (≤768px): sidebar hides, replaced by hamburger that opens it as a left-edge drawer over a backdrop. Drawer width = expanded width (240px), sheet animation `--motion-base var(--ease-standard)`.
 
 ### 11.3 Header
@@ -493,7 +496,8 @@ App chrome is two primitives: a fixed left **Sidebar** with grouped navigation a
 ### 11.4 Acceptance
 
 - Sidebar nav has visible focus ring (per §1.4) on every item, in tab order matching visual order.
-- The active route is announced with `aria-current="page"`.
+- The active route is announced with `aria-current="page"` exactly once. The brand and any other chrome element MUST NOT also emit `aria-current` on the active route.
+- Brand sits outside the `<nav aria-label="Primary">` landmark. The landmark contains only route entries.
 - Sidebar is reachable via "skip to navigation" link from the header (the operator may need to jump back without ten tabs through main content).
 - At 768px and below, hamburger opens the sidebar drawer, Escape closes it, focus returns to the hamburger trigger.
 
