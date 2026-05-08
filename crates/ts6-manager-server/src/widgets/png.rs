@@ -136,7 +136,9 @@ mod tests {
     /// pixmap → encode) without depending on the Slice B renderer's
     /// shape. The widget renderer's own SVG is exercised end-to-end in
     /// the route-level test alongside this one.
-    const TINY_SVG: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="400" height="100" viewBox="0 0 400 100"><rect x="0" y="0" width="400" height="100" fill="#102030"/><circle cx="200" cy="50" r="30" fill="#3CBEEF"/></svg>"#;
+    // `r##"..."##` (not `r#"..."#`) so the SVG body's `"#102030"` /
+    // `"#3CBEEF"` hex colour literals don't terminate the raw string.
+    const TINY_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="400" height="100" viewBox="0 0 400 100"><rect x="0" y="0" width="400" height="100" fill="#102030"/><circle cx="200" cy="50" r="30" fill="#3CBEEF"/></svg>"##;
 
     #[cfg(not(feature = "widget-png-disabled"))]
     #[test]
