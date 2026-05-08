@@ -205,7 +205,14 @@ fn DashboardReady(props: DashboardReadyProps) -> Element {
                 span { class: "config-host", title: "{config_name}", "{host}" }
             }
         }
-        dl { class: "dashboard-kpis",
+        // PURA-61: parent is a `<div>` (not `<dl>`) so we can host a sibling
+        // `<p class="kpi-hint">` per card without violating axe's
+        // `definition-list` rule (which forbids non-`<dt>`/`<dd>`/`<div>`
+        // children of `<dl>`, and inside a wrapping `<div>` forbids `<div>`
+        // siblings of `<dt>`/`<dd>`). The dt/dd pair lives in its own
+        // `<dl class="kpi-pair">` per KPI so the screen-reader announcement
+        // contract ("Online users — 4 / 32") is preserved.
+        div { class: "dashboard-kpis",
             DashboardKpi {
                 label: "Online users",
                 value: format_clients(data.online_users, data.max_clients),
@@ -251,9 +258,11 @@ struct DashboardKpiProps {
 fn DashboardKpi(props: DashboardKpiProps) -> Element {
     rsx! {
         div { class: "kpi",
-            dt { class: "kpi-label", "{props.label}" }
-            dd { class: "kpi-value", "{props.value}" }
-            div { class: "kpi-hint", "{props.hint}" }
+            dl { class: "kpi-pair",
+                dt { class: "kpi-label", "{props.label}" }
+                dd { class: "kpi-value", "{props.value}" }
+            }
+            p { class: "kpi-hint", "{props.hint}" }
         }
     }
 }

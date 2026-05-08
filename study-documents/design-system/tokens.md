@@ -22,7 +22,7 @@ Hue families pinned to specific HSL ramps. Steps named `0..900` so future additi
 | `--c-neutral-200` | `#1E2533` | `hsl(220 26% 16%)` | Surface raised++ / hovered |
 | `--c-neutral-300` | `#2A3344` | `hsl(220 24% 22%)` | Borders |
 | `--c-neutral-400` | `#3D485E` | `hsl(220 21% 30%)` | Borders strong / disabled fg |
-| `--c-neutral-500` | `#5E6A82` | `hsl(220 16% 44%)` | Muted text |
+| `--c-neutral-500` | `#737F98` | `hsl(220 16% 52%)` | Muted text (lifted PURA-61 to clear AA 4.5:1 against `--c-neutral-0`) |
 | `--c-neutral-600` | `#7E8AA2` | `hsl(220 17% 57%)` | Secondary text |
 | `--c-neutral-700` | `#A4ADC2` | `hsl(220 18% 70%)` | Body text (low-contrast) |
 | `--c-neutral-800` | `#D5DAE5` | `hsl(220 17% 87%)` | Body text |
@@ -58,12 +58,14 @@ Hue families pinned to specific HSL ramps. Steps named `0..900` so future additi
 - `--c-neutral-800` on `--c-neutral-50`: **13.2:1** — passes AAA body
 - `--c-neutral-700` on `--c-neutral-50`: **8.4:1** — passes AAA body
 - `--c-neutral-600` on `--c-neutral-50`: **5.5:1** — passes AA body (use for secondary)
-- `--c-neutral-500` on `--c-neutral-50`: **3.4:1** — passes AA large only (helper / placeholder)
+- `--c-neutral-500` on `--c-neutral-0`: **4.80:1** — passes AA body (helper / meta on canvas)
+- `--c-neutral-500` on `--c-neutral-50`: **4.55:1** — passes AA body (helper inside cards)
+- `--c-neutral-500` on `--c-neutral-100`: **4.24:1** — AA large only (helper inside modals / dropdowns — see follow-up)
 - `--c-accent-600` on `--c-neutral-50`: **6.8:1** — passes AA body, links readable
 - `--c-danger-600` on `--c-neutral-50`: **5.7:1** — passes AA body for inline error text
 - White on `--c-accent-500`: **3.6:1** — passes AA large (button labels are ≥14px bold, qualifies)
 
-`--c-neutral-500` is intentionally below body-text AA — it is reserved for placeholder, helper, and meta text where the **content is non-essential** and a more legible variant exists (the input value, the headline, the label). Per WCAG 1.4.3, placeholder text is not text content for contrast purposes.
+`--c-neutral-500` (PURA-61 lift, `#737F98`) clears AA body on canvas and default surface — the workhorse pairings for the operator chrome. On `--bg-surface-raised` (modals, dropdowns, popovers) it lands at 4.24:1, which is AA-large only; helper text inside those containers should either upgrade to `--text-secondary` (5.5:1) or remain placeholder-class (WCAG 1.4.3 exempts placeholder from text-contrast rules). A future raised-surface-specific muted token may be considered if modal helper density grows.
 
 ### 1.2 Raw palette — light mode
 

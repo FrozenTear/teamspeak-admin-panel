@@ -27,6 +27,12 @@ use crate::ui::routes::Route;
 /// Authenticated layout. Dioxus mounts an `Outlet<Route>` for the matched
 /// child route inside `<main class="main">`.
 ///
+/// PURA-61: `<main>` carries `tabindex="-1"` so axe's
+/// `scrollable-region-focusable` rule passes when the route content
+/// overflows the viewport (mobile especially). It also lets the eventual
+/// "skip to main content" link land focus inside the route — same pattern
+/// as the sidebar `<nav>` skip-link target.
+///
 /// Anonymous sessions are bounced to `/login?next=<path>`; the inline
 /// rendered chrome is empty so there's no flash of authenticated UI before
 /// the redirect lands.
@@ -74,7 +80,7 @@ pub fn AppShell() -> Element {
             div { class: "mobile-selector-bar",
                 ServerSelector { variant: ServerSelectorVariant::Mobile }
             }
-            main { class: "main",
+            main { class: "main", tabindex: "-1",
                 Outlet::<Route> {}
             }
         }
@@ -163,6 +169,21 @@ mod tests {
         // authenticated layout.
         assert!(html.contains(r#"<aside class="sidebar""#), "missing sidebar landmark: {html}");
         assert!(html.contains(r#"role="banner""#), "missing header banner role: {html}");
+    }
+
+    /// PURA-61: `<main>` must carry `tabindex="-1"` so axe's
+    /// `scrollable-region-focusable` rule passes when route content
+    /// overflows the viewport. A future refactor that drops this attribute
+    /// would silently regress the dashboard a11y contract; this test pins
+    /// it.
+    #[test]
+    fn app_shell_main_landmark_is_programmatically_focusable() {
+        let html = render_app_shell();
+        assert!(
+            html.contains(r#"<main class="main" tabindex="-1""#)
+                || html.contains(r#"<main tabindex="-1" class="main""#),
+            "missing tabindex='-1' on <main>: {html}"
+        );
     }
 }
 

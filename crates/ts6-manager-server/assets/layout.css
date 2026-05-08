@@ -225,9 +225,10 @@
 }
 
 /* KPI grid: auto-fit so the cards reflow at narrow widths without media
- * queries. `dl` semantic so a screen reader hears "Online users — 4 / 32"
- * naturally; the visual layout is grid via `display: grid` overriding the
- * default block flow. */
+ * queries. PURA-61: parent is now a `<div>`; each card hosts its own
+ * `<dl class="kpi-pair">` so the screen-reader announcement
+ * ("Online users — 4 / 32") survives, while the hint paragraph sits as a
+ * sibling outside the dl (axe `definition-list` rule complies). */
 .dashboard-kpis {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
@@ -243,6 +244,13 @@
   flex-direction: column;
   gap: var(--space-2);
 }
+.dashboard-kpis .kpi-pair {
+  /* Reset UA `<dl>` block margin so the card's flex column owns spacing. */
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
 .dashboard-kpis .kpi-label {
   font: var(--weight-medium) var(--text-xs) / var(--lh-sm) var(--font-sans);
   color: var(--text-muted);
@@ -253,11 +261,16 @@
 .dashboard-kpis .kpi-value {
   font: var(--weight-bold) var(--text-xl) / var(--lh-xl) var(--font-sans);
   color: var(--text-primary);
+  /* Reset UA `<dd>` margin-inline-start so the value lines up with its
+   * label rather than indenting 40px under flex layout. */
   margin: 0;
 }
 .dashboard-kpis .kpi-hint {
   font: var(--weight-regular) var(--text-xs) / var(--lh-sm) var(--font-sans);
   color: var(--text-muted);
+  /* `<p>` carries a UA block margin; reset so the card's flex gap owns the
+   * rhythm between the dl pair and the hint. */
+  margin: 0;
 }
 
 /* Loading variant: skeleton blocks sized to mirror the loaded layout so

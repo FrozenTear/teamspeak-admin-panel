@@ -9,7 +9,12 @@
   --c-neutral-200: #1E2533;
   --c-neutral-300: #2A3344;
   --c-neutral-400: #3D485E;
-  --c-neutral-500: #5E6A82;
+  /* PURA-61: lifted from #5E6A82 (3.55:1 against --c-neutral-0 / --bg-canvas)
+   * to #737F98 (4.80:1) so `--text-muted` clears WCAG-AA 4.5:1 for normal-
+   * weight body text on the dashboard canvas. Disabled-button and step-dot
+   * usages of this ramp value sit on `--c-neutral-300` and remain exempt
+   * (WCAG 1.4.3 excludes disabled UI). */
+  --c-neutral-500: #737F98;
   --c-neutral-600: #7E8AA2;
   --c-neutral-700: #A4ADC2;
   --c-neutral-800: #D5DAE5;
