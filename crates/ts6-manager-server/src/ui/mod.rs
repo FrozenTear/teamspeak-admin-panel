@@ -25,7 +25,7 @@ pub mod tokens;
 
 use dioxus::prelude::*;
 
-use crate::client::dioxus::provide_session;
+use crate::client::dioxus::{provide_auth_gate, provide_session};
 use crate::ui::routes::Route;
 
 const TOKENS_CSS: Asset = asset!("/assets/tokens.css");
@@ -36,6 +36,10 @@ const LAYOUT_CSS: Asset = asset!("/assets/layout.css");
 pub fn App() -> Element {
     let session = use_context_provider(provide_session);
     let storage = session.storage.clone();
+    // Single shared refresh gate for every non-auth fetch (PURA-31). Mounting
+    // it once here means every descendant route can `use_auth_gate()` and
+    // inherit the single-flight refresh contract.
+    use_context_provider(|| provide_auth_gate(session.clone()));
     rsx! {
         document::Stylesheet { href: TOKENS_CSS }
         document::Stylesheet { href: COMPONENTS_CSS }

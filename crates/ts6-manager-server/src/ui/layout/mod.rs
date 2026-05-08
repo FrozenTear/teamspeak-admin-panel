@@ -78,7 +78,7 @@ mod tests {
 
     use dioxus::prelude::*;
 
-    use crate::client::dioxus::DioxusSession;
+    use crate::client::dioxus::{DioxusSession, provide_auth_gate};
     use crate::client::storage::MemoryStore;
     use crate::client::store::AuthState;
     use crate::ui::theme::{Theme, ThemeContext};
@@ -92,7 +92,7 @@ mod tests {
     /// hooks, no browser-only fallbacks.
     #[component]
     fn AppShellHarness() -> Element {
-        use_context_provider(|| DioxusSession {
+        let session = use_context_provider(|| DioxusSession {
             state: SyncSignal::new_maybe_sync(AuthState::Authenticated {
                 access: "stub-access".into(),
                 refresh: "stub-refresh".into(),
@@ -108,6 +108,11 @@ mod tests {
         use_context_provider(|| ThemeContext {
             theme: Signal::new(Theme::Dark),
         });
+        // PURA-31 — every authed page descends from the gate provider in
+        // production. SSR rendering never fires a fetch through it, but the
+        // dashboard route reads it from context, so the harness must mount
+        // one to avoid a "missing context" panic during chrome-snapshot tests.
+        use_context_provider(|| provide_auth_gate(session));
         rsx! { Router::<Route> {} }
     }
 

@@ -10,7 +10,8 @@ use std::sync::Arc;
 
 use dioxus::prelude::*;
 
-use crate::client::session::SessionHandle;
+use crate::client::api;
+use crate::client::session::{HttpRefresh, RefreshFn, RefreshGate, SessionHandle};
 use crate::client::storage::Storage;
 use crate::client::store::{AuthState, load_state, save_state};
 
@@ -84,6 +85,25 @@ impl SessionHandle for DioxusSession {
 /// is a programmer error, not a runtime situation to recover from.
 pub fn use_session() -> DioxusSession {
     use_context::<DioxusSession>()
+}
+
+/// Pull the shared [`RefreshGate`] out of context. Same contract as
+/// [`use_session`] — every authenticated surface descends from `<App>`,
+/// which provides exactly one gate that funnels every fetch through the
+/// single-flight refresh interceptor.
+pub fn use_auth_gate() -> Arc<RefreshGate> {
+    use_context::<Arc<RefreshGate>>()
+}
+
+/// Build the [`RefreshGate`] backing every non-auth fetch in the SPA.
+///
+/// One gate per `<App>`: the single mutex inside ensures that no matter how
+/// many concurrent fetches see a 401 at once, exactly one refresh fires.
+/// Reuse via `use_context` — see [`use_auth_gate`].
+pub fn provide_auth_gate(session: DioxusSession) -> Arc<RefreshGate> {
+    let session: Arc<dyn SessionHandle> = Arc::new(session);
+    let refresh: Arc<dyn RefreshFn> = Arc::new(HttpRefresh::new(api::api_base()));
+    Arc::new(RefreshGate::new(session, refresh))
 }
 
 /// Provide a [`DioxusSession`] backed by `localStorage` on the browser and

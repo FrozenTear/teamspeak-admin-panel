@@ -179,3 +179,102 @@
     display: none;
   }
 }
+
+/* ─── sr-only utility ─────────────────────────────────── */
+/* Visually hidden but exposed to assistive tech. Used by surfaces that
+ * need a polite live-region announcement (loading / status updates) while
+ * keeping the chrome quiet for sighted users. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ─── Dashboard (PURA-31) ─────────────────────────────── */
+/* Server-name + tech meta strip rendered above the KPI grid. Uses the
+ * existing typography tokens — no hex literals, no one-off font sizes. */
+.dashboard-meta {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-bottom: var(--space-3);
+}
+.dashboard-meta-name {
+  font: var(--weight-semibold) var(--text-lg) / var(--lh-md) var(--font-sans);
+  color: var(--text-primary);
+}
+.dashboard-meta-tech {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  align-items: center;
+  font: var(--weight-regular) var(--text-sm) / var(--lh-sm) var(--font-sans);
+  color: var(--text-muted);
+}
+.dashboard-meta-tech .dot {
+  color: var(--border-subtle);
+}
+.dashboard-meta-tech .config-host {
+  font-family: var(--font-mono);
+}
+
+/* KPI grid: auto-fit so the cards reflow at narrow widths without media
+ * queries. `dl` semantic so a screen reader hears "Online users — 4 / 32"
+ * naturally; the visual layout is grid via `display: grid` overriding the
+ * default block flow. */
+.dashboard-kpis {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: var(--space-5);
+  margin: 0;
+}
+.dashboard-kpis .kpi {
+  background: var(--bg-surface-raised);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: var(--space-5) var(--space-6);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.dashboard-kpis .kpi-label {
+  font: var(--weight-medium) var(--text-xs) / var(--lh-sm) var(--font-sans);
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin: 0;
+}
+.dashboard-kpis .kpi-value {
+  font: var(--weight-bold) var(--text-xl) / var(--lh-xl) var(--font-sans);
+  color: var(--text-primary);
+  margin: 0;
+}
+.dashboard-kpis .kpi-hint {
+  font: var(--weight-regular) var(--text-xs) / var(--lh-sm) var(--font-sans);
+  color: var(--text-muted);
+}
+
+/* Loading variant: skeleton blocks sized to mirror the loaded layout so
+ * the chrome doesn't reflow when data lands. */
+.dashboard-loading {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+.dashboard-meta-skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-bottom: var(--space-3);
+}
+.skeleton-line { height: 14px; border-radius: var(--radius-sm); }
+.skeleton-line.wide   { width: 60%; }
+.skeleton-line.narrow { width: 35%; }
+.skeleton-line.short  { width: 50%; height: 10px; }
+.skeleton-line.tall   { width: 80%; height: 22px; }

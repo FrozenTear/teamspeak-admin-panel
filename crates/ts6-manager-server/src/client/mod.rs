@@ -9,6 +9,9 @@
 //!   hydrates from storage and clears on logout / refresh failure.
 //! - [`session`] — single-flight refresh interceptor that wraps any
 //!   `(access_token) -> Future<Result>` closure with refresh-on-401.
+//! - [`api`] — generic authorized JSON fetch helper (PURA-31). Wraps the
+//!   refresh gate around `gloo-net` so any non-auth endpoint inherits the
+//!   single-flight refresh contract for free.
 //!
 //! Cleanroom-safe: this module is built from the spec and the wire shapes in
 //! `ts6_manager_shared::auth`; the reference repo is not consulted.
@@ -19,6 +22,7 @@
 
 #![allow(dead_code)] // public APIs are consumed by /login + future routes.
 
+pub mod api;
 pub mod auth;
 pub mod dioxus;
 pub mod session;
