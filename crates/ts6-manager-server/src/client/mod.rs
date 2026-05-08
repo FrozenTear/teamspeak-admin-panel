@@ -24,3 +24,4 @@ pub mod dioxus;
 pub mod session;
 pub mod storage;
 pub mod store;
+pub mod ui_prefs;

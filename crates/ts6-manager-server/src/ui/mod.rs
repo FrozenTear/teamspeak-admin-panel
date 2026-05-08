@@ -34,12 +34,13 @@ const LAYOUT_CSS: Asset = asset!("/assets/layout.css");
 
 #[allow(non_snake_case)]
 pub fn App() -> Element {
-    use_context_provider(provide_session);
+    let session = use_context_provider(provide_session);
+    let storage = session.storage.clone();
     rsx! {
         document::Stylesheet { href: TOKENS_CSS }
         document::Stylesheet { href: COMPONENTS_CSS }
         document::Stylesheet { href: LAYOUT_CSS }
-        theme::ThemeProvider {
+        theme::ThemeProvider { storage: storage,
             Router::<Route> {}
         }
     }
