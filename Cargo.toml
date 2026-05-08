@@ -69,6 +69,16 @@ surrealdb = { version = "3", default-features = false, features = ["kv-surrealkv
 # `default-tls`/openssl on top of rustls.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
+# Phase 2 SSHBRIDGE (PURA-69 → PURA-76) — pure-Rust async SSH client.
+# ADR-0001 picked russh; ADR-0001 said to pin both `russh` and
+# `russh-keys`, but at 0.60 the russh maintainers absorbed the keys
+# crate back into `russh::keys`, so a separate `russh-keys` line would
+# pull in a stale beta. Pin the minor (`0.60` → `>=0.60.0, <0.61.0`)
+# and bump deliberately. Default features `aws-lc-rs + flate2 + rsa`
+# match the rustls posture (no OpenSSL) and cover every key algorithm
+# we expect to encounter on operator-supplied TS6 servers.
+russh = { version = "0.60", default-features = false, features = ["aws-lc-rs", "flate2", "rsa"] }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

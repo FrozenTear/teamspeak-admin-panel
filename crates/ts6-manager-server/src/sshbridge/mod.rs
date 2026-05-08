@@ -56,7 +56,27 @@
 #![allow(dead_code)] // consumed by REST routes + russh transport (follow-up children).
 
 pub mod audit;
+pub mod channel;
+pub mod hostkey;
+pub mod russh_channel;
+pub mod transport;
 pub mod wire;
+
+// Re-exports for the eventual REST seam (PURA-69 follow-up C). Until
+// that lands the rest of the crate references these through their
+// module path; the explicit allow keeps the unused-imports lint quiet
+// without weakening visibility.
+#[allow(unused_imports)]
+pub use channel::{SshChannel, TransportError};
+#[allow(unused_imports)]
+pub use hostkey::{HostKeyConfigError, HostKeyPolicy, HostKeyVerifier};
+#[allow(unused_imports)]
+pub use russh_channel::{connect_password, RusshChannel, RusshConnectParams};
+#[allow(unused_imports)]
+pub use transport::{
+    next_backoff, spawn as spawn_transport, CommandOutcome, SessionResult, TransportConfig,
+    TransportHandle,
+};
 
 use reqwest::StatusCode;
 use thiserror::Error;

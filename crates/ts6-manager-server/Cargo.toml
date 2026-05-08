@@ -47,6 +47,7 @@ server = [
     "dep:url",
     "dep:surrealdb",
     "dep:reqwest",
+    "dep:russh",
 ]
 web = ["dioxus/web"]
 
@@ -96,6 +97,10 @@ surrealdb = { workspace = true, optional = true }
 
 # Phase 1 WEBQUERY (PURA-23) — outbound HTTP client. Server-only.
 reqwest = { workspace = true, optional = true }
+
+# Phase 2 SSHBRIDGE (PURA-69 → PURA-76) — async SSH client. Server-only;
+# the WASM target never opens SSH sessions.
+russh = { workspace = true, optional = true }
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }

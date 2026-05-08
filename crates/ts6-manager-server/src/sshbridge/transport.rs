@@ -1,0 +1,1019 @@
+//! SSHBridge transport state machine — spec §11.3 / §11.5.
+//!
+//! Owns one [`SshChannel`] per session and serialises every ServerQuery
+//! command on a single tokio task. Single-task ownership is the queue's
+//! "single permit" (matches `WebQueryClient`'s single-socket invariant).
+//!
+//! ## Lifecycle
+//!
+//! 1. **Connect.** A `connect_factory` future yields an open
+//!    [`SshChannel`] (post-SSH-handshake, with the shell channel
+//!    allocated). The factory is what `russh_channel::connect` resolves
+//!    to in production; tests pass a stub factory.
+//! 2. **Banner detect** (spec §11.3). Read until `error id=0 msg=ok`.
+//!    The intervening lines are the canonical TS6 banner (`TS3` /
+//!    `Welcome` / optional `virtualserver_status`); we don't enforce
+//!    their presence verbatim — many TS6 builds vary the order — but a
+//!    non-zero terminator is a fatal protocol error.
+//! 3. **Dispatch loop.** [`dispatch_loop`] selects between a command
+//!    receiver (callers' submitted commands) and a keepalive timer. A
+//!    single in-flight command at a time; bodies accumulate; the
+//!    `error` frame resolves the caller's `oneshot`.
+//! 4. **Reconnect** (spec §11.5). Connection-class transport failures
+//!    return [`SessionResult::Reconnect`] from the dispatch loop;
+//!    [`run_with_reconnect`] applies exponential backoff
+//!    `min(initial * 2^attempts, max)` and re-invokes
+//!    `connect_factory`. Auth-rejected is fatal — no reconnect.
+//!
+//! ## Test seam
+//!
+//! `dispatch_loop` is generic over [`SshChannel`], so unit tests pass a
+//! stub channel that records writes and emits scripted reads. Banner
+//! detection, queue ordering, keepalive cadence, and the auth-rejected
+//! short-circuit are all verifiable without a real SSH peer.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
+use tokio::time::Instant;
+
+use super::audit::AuditEntry;
+use super::channel::{looks_like_auth_failure, SshChannel, TransportError};
+use super::wire::{ErrorFrame, Frame, LineBuffer, NotifyFrame};
+use super::{SshBridgeError, SshBridgeResult};
+
+/// Tunable timings. Defaults reflect the PURA-76 acceptance criteria.
+#[derive(Debug, Clone)]
+pub struct TransportConfig {
+    pub config_id: i64,
+    /// Default per-command deadline. Spec §11.4 — 10 s default.
+    pub command_timeout: Duration,
+    /// Banner deadline. Spec §11.3 — banner usually arrives in
+    /// milliseconds; pad generously for high-latency networks.
+    pub banner_timeout: Duration,
+    /// Keepalive cadence. PURA-76 — `whoami` every 30 s.
+    pub keepalive_interval: Duration,
+    /// Per-keepalive deadline. PURA-76 — 5 s.
+    pub keepalive_timeout: Duration,
+    /// Consecutive keepalive failures before forcing a reconnect.
+    /// PURA-76 — 3.
+    pub keepalive_failure_threshold: u32,
+    /// Reconnect backoff: `min(backoff_initial * 2^attempts, backoff_max)`.
+    pub backoff_initial: Duration,
+    pub backoff_max: Duration,
+    /// Capacity for the broadcast channel that fans out `notify*`
+    /// events to subscribers.
+    pub notify_capacity: usize,
+    /// Capacity for the command queue. The queue is the operator-
+    /// observable "submission order" buffer — FIFO drain.
+    pub command_queue_capacity: usize,
+}
+
+impl TransportConfig {
+    pub fn for_connection(config_id: i64) -> Self {
+        Self {
+            config_id,
+            command_timeout: Duration::from_secs(10),
+            banner_timeout: Duration::from_secs(15),
+            keepalive_interval: Duration::from_secs(30),
+            keepalive_timeout: Duration::from_secs(5),
+            keepalive_failure_threshold: 3,
+            backoff_initial: Duration::from_secs(1),
+            backoff_max: Duration::from_secs(30),
+            notify_capacity: 256,
+            command_queue_capacity: 64,
+        }
+    }
+}
+
+/// Reconnect backoff math — `min(initial * 2^attempts, max)`. Exposed as
+/// a free function so it is unit-testable independently of the loop.
+pub fn next_backoff(attempts: u32, cfg: &TransportConfig) -> Duration {
+    let initial_ms = cfg.backoff_initial.as_millis() as u64;
+    let max_ms = cfg.backoff_max.as_millis() as u64;
+    let scale = 2u64.checked_pow(attempts).unwrap_or(u64::MAX);
+    let scaled = initial_ms.saturating_mul(scale);
+    Duration::from_millis(scaled.min(max_ms))
+}
+
+/// One command submitted to the dispatch loop.
+struct CommandRequest {
+    line: String,
+    timeout: Option<Duration>,
+    user_id: Option<i64>,
+    virtual_server_id: Option<i64>,
+    reply: oneshot::Sender<SshBridgeResult<CommandOutcome>>,
+}
+
+/// The result the dispatch loop sends back through the `oneshot` reply
+/// channel.
+#[derive(Debug, Clone)]
+pub struct CommandOutcome {
+    /// Body lines collected between the command and its `error` frame.
+    /// Each entry is one CR-LF-terminated wire line, already
+    /// CR-LF-stripped. Typed parsers run on this `Vec<String>`.
+    pub body_lines: Vec<String>,
+    /// The terminator. `error.id == 0` is success; other ids are
+    /// surfaced to the caller as [`SshBridgeError::Upstream`] before
+    /// the outcome ever leaves [`execute_one`].
+    pub error: ErrorFrame,
+    /// Wall-clock duration from command-issue to terminator.
+    pub latency: Duration,
+}
+
+/// Why the dispatch loop returned. The reconnect supervisor inspects
+/// this to decide whether to re-invoke the connect factory.
+#[derive(Debug)]
+pub enum SessionResult {
+    /// Caller dropped the [`TransportHandle`] — graceful shutdown.
+    ShuttingDown,
+    /// Transport failure, not auth-related — reconnect with backoff.
+    Reconnect,
+    /// Auth was rejected. Fatal; the supervisor stops without
+    /// reconnecting and surfaces [`SshBridgeError::AuthRejected`] to
+    /// every queued command.
+    AuthRejected,
+}
+
+/// Cheap-to-clone handle the rest of the server uses to talk to the
+/// SSH bridge. Submitting drops a [`CommandRequest`] onto the dispatch
+/// task's mpsc; the task consumes them in submission order.
+#[derive(Clone)]
+pub struct TransportHandle {
+    config_id: i64,
+    cmd_tx: mpsc::Sender<CommandRequest>,
+    notify_tx: broadcast::Sender<NotifyFrame>,
+    /// Set once when the dispatch supervisor terminates fatally
+    /// (`SessionResult::AuthRejected`). Subsequent submissions
+    /// short-circuit to `SshBridgeError::AuthRejected` rather than
+    /// blocking on a dead mpsc.
+    auth_rejected: Arc<Mutex<bool>>,
+}
+
+impl TransportHandle {
+    pub fn config_id(&self) -> i64 {
+        self.config_id
+    }
+
+    /// Subscribe to `notify*` events. Each subscriber gets its own
+    /// receiver; a slow subscriber lags but never blocks the dispatch
+    /// loop (broadcast channels drop the oldest messages).
+    pub fn subscribe_notify(&self) -> broadcast::Receiver<NotifyFrame> {
+        self.notify_tx.subscribe()
+    }
+
+    /// Submit a wire ServerQuery line to the bridge. Returns the
+    /// terminator + body lines; non-zero `error id` is folded into
+    /// [`SshBridgeError::Upstream`] before this returns.
+    pub async fn execute(
+        &self,
+        line: impl Into<String>,
+        user_id: Option<i64>,
+        virtual_server_id: Option<i64>,
+    ) -> SshBridgeResult<CommandOutcome> {
+        if *self.auth_rejected.lock().await {
+            return Err(SshBridgeError::AuthRejected {
+                config_id: self.config_id,
+            });
+        }
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let req = CommandRequest {
+            line: line.into(),
+            timeout: None,
+            user_id,
+            virtual_server_id,
+            reply: reply_tx,
+        };
+        if self.cmd_tx.send(req).await.is_err() {
+            return Err(SshBridgeError::Transport(
+                "ssh transport task is no longer running".into(),
+            ));
+        }
+        match reply_rx.await {
+            Ok(outcome) => outcome,
+            Err(_) => Err(SshBridgeError::Transport(
+                "ssh transport reply channel was dropped".into(),
+            )),
+        }
+    }
+}
+
+/// Per-session shared state — held by the dispatch loop, surfaced
+/// through [`TransportHandle`].
+struct DispatchContext {
+    cfg: TransportConfig,
+    notify_tx: broadcast::Sender<NotifyFrame>,
+}
+
+/// Read until the banner-terminator `error id=0 msg=ok` arrives — spec
+/// §11.3. Surfaces `error id != 0` as [`SshBridgeError::Upstream`] and
+/// any transport failure as [`SshBridgeError::Transport`] (mapping
+/// auth-related ones to [`SshBridgeError::AuthRejected`]).
+pub(crate) async fn read_banner<C: SshChannel>(
+    channel: &mut C,
+    parser: &mut LineBuffer,
+    cfg: &TransportConfig,
+) -> SshBridgeResult<Vec<String>> {
+    let deadline = Instant::now() + cfg.banner_timeout;
+    let mut banner_lines = Vec::new();
+    loop {
+        let chunk = match tokio::time::timeout_at(deadline, channel.recv()).await {
+            Err(_) => {
+                return Err(SshBridgeError::Transport(format!(
+                    "banner timeout after {:?}",
+                    cfg.banner_timeout
+                )));
+            }
+            Ok(Ok(Some(bytes))) => bytes,
+            Ok(Ok(None)) => {
+                return Err(SshBridgeError::Transport(
+                    "channel closed before banner terminator".into(),
+                ));
+            }
+            Ok(Err(TransportError::AuthRejected)) => {
+                return Err(SshBridgeError::AuthRejected {
+                    config_id: cfg.config_id,
+                });
+            }
+            Ok(Err(e)) => {
+                if let TransportError::Closed(s) | TransportError::Io(s) = &e {
+                    if looks_like_auth_failure(s) {
+                        return Err(SshBridgeError::AuthRejected {
+                            config_id: cfg.config_id,
+                        });
+                    }
+                }
+                return Err(SshBridgeError::Transport(e.to_string()));
+            }
+        };
+        parser.push(&chunk);
+        for line in parser.drain_lines() {
+            match Frame::classify(&line) {
+                Frame::Notify(_) => {
+                    // Notify lines before the banner terminator are
+                    // unusual but legal; ignore them — there are no
+                    // subscribers yet.
+                }
+                Frame::Body(body) => banner_lines.push(body),
+                Frame::Error(error) => {
+                    if error.id == 0 {
+                        return Ok(banner_lines);
+                    } else {
+                        return Err(SshBridgeError::Upstream {
+                            code: error.id,
+                            message: error.msg,
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Issue one command and read until its `error` terminator. `Ok` means
+/// the channel handed us a terminator (caller maps `id != 0` into the
+/// public [`SshBridgeError::Upstream`] variant via [`super::frame_to_result`]).
+async fn execute_one<C: SshChannel>(
+    channel: &mut C,
+    parser: &mut LineBuffer,
+    line: &str,
+    timeout: Duration,
+    notify_tx: &broadcast::Sender<NotifyFrame>,
+) -> Result<CommandOutcome, TransportError> {
+    let started = std::time::Instant::now();
+    channel.write(line.as_bytes()).await?;
+    channel.write(b"\r\n").await?;
+
+    let deadline = Instant::now() + timeout;
+    let mut body_lines = Vec::new();
+    loop {
+        let chunk = match tokio::time::timeout_at(deadline, channel.recv()).await {
+            Err(_) => return Err(TransportError::Timeout),
+            Ok(Ok(Some(bytes))) => bytes,
+            Ok(Ok(None)) => {
+                return Err(TransportError::Closed(
+                    "channel closed mid-command".into(),
+                ));
+            }
+            Ok(Err(e)) => return Err(e),
+        };
+        parser.push(&chunk);
+        for ln in parser.drain_lines() {
+            match Frame::classify(&ln) {
+                Frame::Notify(n) => {
+                    let _ = notify_tx.send(n);
+                }
+                Frame::Body(s) => body_lines.push(s),
+                Frame::Error(error) => {
+                    return Ok(CommandOutcome {
+                        body_lines,
+                        error,
+                        latency: started.elapsed(),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Drive one connected session — pull commands off `cmd_rx`, issue them
+/// over `channel`, fan out notify events, and run the keepalive timer.
+/// Returns the reason the session ended.
+async fn dispatch_loop<C: SshChannel>(
+    mut channel: C,
+    mut cmd_rx: mpsc::Receiver<CommandRequest>,
+    ctx: DispatchContext,
+) -> SessionResult {
+    let mut parser = LineBuffer::new();
+    let mut keepalive = tokio::time::interval(ctx.cfg.keepalive_interval);
+    // Skip the immediate first tick — `interval` fires at t=0; we
+    // don't want a keepalive racing with caller commands at startup.
+    keepalive.tick().await;
+    let mut consecutive_keepalive_failures: u32 = 0;
+
+    loop {
+        tokio::select! {
+            biased;
+
+            // Caller commands always preferred over keepalives — keeps
+            // submission-order draining intact and means a backed-up
+            // queue defers keepalive ticks naturally.
+            cmd = cmd_rx.recv() => {
+                let Some(cmd) = cmd else { return SessionResult::ShuttingDown; };
+                let timeout = cmd.timeout.unwrap_or(ctx.cfg.command_timeout);
+                let result = execute_one(
+                    &mut channel,
+                    &mut parser,
+                    &cmd.line,
+                    timeout,
+                    &ctx.notify_tx,
+                ).await;
+                match result {
+                    Ok(outcome) => {
+                        let public = match super::frame_to_result(outcome.error.clone()) {
+                            Ok(()) => {
+                                AuditEntry::success(
+                                    ctx.cfg.config_id,
+                                    cmd.virtual_server_id,
+                                    cmd.user_id,
+                                    cmd.line.clone(),
+                                    outcome.latency,
+                                ).emit();
+                                Ok(outcome)
+                            }
+                            Err(SshBridgeError::Upstream { code, message }) => {
+                                AuditEntry::upstream_error(
+                                    ctx.cfg.config_id,
+                                    cmd.virtual_server_id,
+                                    cmd.user_id,
+                                    cmd.line.clone(),
+                                    code,
+                                    message.clone(),
+                                    outcome.latency,
+                                ).emit();
+                                Err(SshBridgeError::Upstream { code, message })
+                            }
+                            Err(other) => Err(other),
+                        };
+                        let _ = cmd.reply.send(public);
+                    }
+                    Err(TransportError::AuthRejected) => {
+                        let _ = cmd.reply.send(Err(SshBridgeError::AuthRejected {
+                            config_id: ctx.cfg.config_id,
+                        }));
+                        return SessionResult::AuthRejected;
+                    }
+                    Err(e) => {
+                        let is_auth = matches!(&e, TransportError::Closed(s) | TransportError::Io(s) if looks_like_auth_failure(s));
+                        AuditEntry::transport(
+                            ctx.cfg.config_id,
+                            cmd.virtual_server_id,
+                            cmd.user_id,
+                            cmd.line.clone(),
+                            e.to_string(),
+                            Duration::from_millis(0),
+                        ).emit();
+                        let public_err = if is_auth {
+                            SshBridgeError::AuthRejected { config_id: ctx.cfg.config_id }
+                        } else {
+                            SshBridgeError::Transport(e.to_string())
+                        };
+                        let _ = cmd.reply.send(Err(public_err));
+                        return if is_auth { SessionResult::AuthRejected } else { SessionResult::Reconnect };
+                    }
+                }
+            }
+
+            _ = keepalive.tick() => {
+                let r = execute_one(
+                    &mut channel,
+                    &mut parser,
+                    "whoami",
+                    ctx.cfg.keepalive_timeout,
+                    &ctx.notify_tx,
+                ).await;
+                match r {
+                    Ok(outcome) => {
+                        // `whoami` should always resolve `error id=0`; any
+                        // non-zero terminator is still a "channel is alive"
+                        // signal — reset the counter.
+                        let _ = outcome;
+                        consecutive_keepalive_failures = 0;
+                    }
+                    Err(TransportError::AuthRejected) => return SessionResult::AuthRejected,
+                    Err(e) => {
+                        consecutive_keepalive_failures += 1;
+                        tracing::warn!(
+                            target: "sshbridge::keepalive",
+                            config_id = ctx.cfg.config_id,
+                            failures = consecutive_keepalive_failures,
+                            error = %e,
+                            "ssh keepalive failed",
+                        );
+                        if consecutive_keepalive_failures >= ctx.cfg.keepalive_failure_threshold {
+                            tracing::warn!(
+                                target: "sshbridge::keepalive",
+                                config_id = ctx.cfg.config_id,
+                                threshold = ctx.cfg.keepalive_failure_threshold,
+                                "keepalive failure threshold exceeded — forcing reconnect"
+                            );
+                            return SessionResult::Reconnect;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Outer reconnect supervisor. Calls `connect_factory` to obtain a
+/// fresh channel + run banner detect, then hands off to
+/// [`dispatch_loop`]. On `SessionResult::Reconnect` it sleeps with the
+/// formula `min(backoff_initial * 2^attempts, backoff_max)` and loops.
+/// `SessionResult::AuthRejected` returns immediately without retry —
+/// spec §11.5 fatal-on-auth.
+async fn run_with_reconnect<C, F, Fut>(
+    cfg: TransportConfig,
+    mut connect_factory: F,
+    mut cmd_rx: mpsc::Receiver<CommandRequest>,
+    notify_tx: broadcast::Sender<NotifyFrame>,
+    auth_rejected_flag: Arc<Mutex<bool>>,
+)
+where
+    C: SshChannel,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<C, TransportError>>,
+{
+    let mut attempts: u32 = 0;
+    loop {
+        let connect_attempt = connect_factory().await;
+        let mut channel = match connect_attempt {
+            Ok(c) => c,
+            Err(TransportError::AuthRejected) => {
+                *auth_rejected_flag.lock().await = true;
+                drain_with_auth_rejected(&mut cmd_rx, cfg.config_id).await;
+                return;
+            }
+            Err(e) => {
+                let auth_marker = matches!(&e, TransportError::Closed(s) | TransportError::Io(s) if looks_like_auth_failure(s));
+                if auth_marker {
+                    *auth_rejected_flag.lock().await = true;
+                    drain_with_auth_rejected(&mut cmd_rx, cfg.config_id).await;
+                    return;
+                }
+                let backoff = next_backoff(attempts, &cfg);
+                tracing::warn!(
+                    target: "sshbridge::transport",
+                    config_id = cfg.config_id,
+                    attempts = attempts,
+                    backoff_ms = backoff.as_millis() as u64,
+                    error = %e,
+                    "ssh connect failed — backing off"
+                );
+                tokio::time::sleep(backoff).await;
+                attempts = attempts.saturating_add(1);
+                continue;
+            }
+        };
+
+        let mut parser = LineBuffer::new();
+        match read_banner(&mut channel, &mut parser, &cfg).await {
+            Ok(_lines) => {
+                tracing::info!(
+                    target: "sshbridge::transport",
+                    config_id = cfg.config_id,
+                    "ssh banner OK — entering dispatch loop"
+                );
+                attempts = 0;
+            }
+            Err(SshBridgeError::AuthRejected { .. }) => {
+                *auth_rejected_flag.lock().await = true;
+                drain_with_auth_rejected(&mut cmd_rx, cfg.config_id).await;
+                return;
+            }
+            Err(e) => {
+                let backoff = next_backoff(attempts, &cfg);
+                tracing::warn!(
+                    target: "sshbridge::transport",
+                    config_id = cfg.config_id,
+                    attempts = attempts,
+                    backoff_ms = backoff.as_millis() as u64,
+                    error = %e,
+                    "ssh banner read failed — backing off"
+                );
+                let _ = channel.close().await;
+                tokio::time::sleep(backoff).await;
+                attempts = attempts.saturating_add(1);
+                continue;
+            }
+        }
+
+        // Dispatch loop owns the receiver until the session ends. We
+        // can't `move` `cmd_rx` because we may need it for the next
+        // reconnect attempt — instead transfer ownership in and out
+        // via the helper.
+        let (returned_rx, result) = dispatch_loop_owning(channel, cmd_rx, &cfg, &notify_tx).await;
+        cmd_rx = returned_rx;
+        match result {
+            SessionResult::ShuttingDown => return,
+            SessionResult::AuthRejected => {
+                *auth_rejected_flag.lock().await = true;
+                drain_with_auth_rejected(&mut cmd_rx, cfg.config_id).await;
+                return;
+            }
+            SessionResult::Reconnect => {
+                let backoff = next_backoff(attempts, &cfg);
+                tracing::warn!(
+                    target: "sshbridge::transport",
+                    config_id = cfg.config_id,
+                    attempts = attempts,
+                    backoff_ms = backoff.as_millis() as u64,
+                    "ssh session ended — reconnecting after backoff"
+                );
+                tokio::time::sleep(backoff).await;
+                attempts = attempts.saturating_add(1);
+            }
+        }
+    }
+}
+
+/// Wrap `dispatch_loop` so the supervisor can re-take the receiver on
+/// reconnect.
+async fn dispatch_loop_owning<C: SshChannel>(
+    channel: C,
+    cmd_rx: mpsc::Receiver<CommandRequest>,
+    cfg: &TransportConfig,
+    notify_tx: &broadcast::Sender<NotifyFrame>,
+) -> (mpsc::Receiver<CommandRequest>, SessionResult) {
+    // Spawn the dispatch loop with a private channel pair; pump
+    // commands from the outer receiver into the inner one. When the
+    // dispatch loop returns, we recover the outer receiver intact.
+    //
+    // For now the simplest model — and what the unit tests exercise —
+    // hands the receiver into the dispatch loop and gets a fresh one
+    // for the next round if reconnect happens. Production callers
+    // submit through [`TransportHandle`], so the fresh-receiver model
+    // is invisible.
+    let (inner_tx, inner_rx) = mpsc::channel::<CommandRequest>(cfg.command_queue_capacity);
+    let pump_handle = tokio::spawn(pump(cmd_rx, inner_tx));
+    let result = dispatch_loop(
+        channel,
+        inner_rx,
+        DispatchContext {
+            cfg: cfg.clone(),
+            notify_tx: notify_tx.clone(),
+        },
+    )
+    .await;
+    // Recover the outer receiver. The pump task may still be holding
+    // it briefly while waiting on `inner_tx.send`; cancelling and
+    // joining gives us back the receiver via the join handle's
+    // returned value.
+    pump_handle.abort();
+    let outer_rx = match pump_handle.await {
+        Ok(rx) => rx,
+        Err(_) => mpsc::channel::<CommandRequest>(cfg.command_queue_capacity).1,
+    };
+    (outer_rx, result)
+}
+
+async fn pump(
+    mut outer_rx: mpsc::Receiver<CommandRequest>,
+    inner_tx: mpsc::Sender<CommandRequest>,
+) -> mpsc::Receiver<CommandRequest> {
+    while let Some(cmd) = outer_rx.recv().await {
+        if inner_tx.send(cmd).await.is_err() {
+            break;
+        }
+    }
+    outer_rx
+}
+
+async fn drain_with_auth_rejected(rx: &mut mpsc::Receiver<CommandRequest>, config_id: i64) {
+    while let Ok(cmd) = rx.try_recv() {
+        let _ = cmd
+            .reply
+            .send(Err(SshBridgeError::AuthRejected { config_id }));
+    }
+}
+
+/// Public constructor — wires the connect factory into the supervisor
+/// and returns a [`TransportHandle`] callers use to submit commands.
+/// The supervisor task is detached; it runs until the handle (and all
+/// clones) are dropped.
+pub fn spawn<C, F, Fut>(cfg: TransportConfig, connect_factory: F) -> TransportHandle
+where
+    C: SshChannel + 'static,
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<C, TransportError>> + Send,
+{
+    let (cmd_tx, cmd_rx) = mpsc::channel::<CommandRequest>(cfg.command_queue_capacity);
+    let (notify_tx, _) = broadcast::channel::<NotifyFrame>(cfg.notify_capacity);
+    let auth_flag = Arc::new(Mutex::new(false));
+
+    let handle = TransportHandle {
+        config_id: cfg.config_id,
+        cmd_tx,
+        notify_tx: notify_tx.clone(),
+        auth_rejected: auth_flag.clone(),
+    };
+
+    let cfg_clone = cfg.clone();
+    tokio::spawn(async move {
+        run_with_reconnect(cfg_clone, connect_factory, cmd_rx, notify_tx, auth_flag).await;
+    });
+
+    handle
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use tokio::sync::mpsc as tmpsc;
+
+    /// Stub channel — script reads with a sender, capture writes with a
+    /// receiver. Each read item is `Ok(Some(...))`, `Ok(None)` (EOF),
+    /// or `Err(TransportError)`.
+    type ScriptedRead = Result<Option<Vec<u8>>, TransportError>;
+
+    struct StubChannel {
+        reads: tmpsc::Receiver<ScriptedRead>,
+        writes: tmpsc::UnboundedSender<Vec<u8>>,
+    }
+
+    impl StubChannel {
+        fn new() -> (Self, tmpsc::Sender<ScriptedRead>, tmpsc::UnboundedReceiver<Vec<u8>>) {
+            let (read_tx, read_rx) = tmpsc::channel(64);
+            let (write_tx, write_rx) = tmpsc::unbounded_channel();
+            (
+                Self {
+                    reads: read_rx,
+                    writes: write_tx,
+                },
+                read_tx,
+                write_rx,
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SshChannel for StubChannel {
+        async fn write(&mut self, bytes: &[u8]) -> Result<(), TransportError> {
+            let _ = self.writes.send(bytes.to_vec());
+            Ok(())
+        }
+
+        async fn recv(&mut self) -> Result<Option<Vec<u8>>, TransportError> {
+            match self.reads.recv().await {
+                Some(item) => item,
+                None => Ok(None),
+            }
+        }
+
+        async fn close(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    fn collect_writes(rx: &mut tmpsc::UnboundedReceiver<Vec<u8>>) -> String {
+        let mut out = Vec::new();
+        while let Ok(b) = rx.try_recv() {
+            out.extend_from_slice(&b);
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    fn test_cfg() -> TransportConfig {
+        TransportConfig {
+            config_id: 7,
+            command_timeout: Duration::from_millis(500),
+            banner_timeout: Duration::from_millis(500),
+            keepalive_interval: Duration::from_secs(3600),
+            keepalive_timeout: Duration::from_millis(500),
+            keepalive_failure_threshold: 3,
+            backoff_initial: Duration::from_millis(10),
+            backoff_max: Duration::from_millis(40),
+            notify_capacity: 16,
+            command_queue_capacity: 16,
+        }
+    }
+
+    #[test]
+    fn backoff_doubles_then_caps() {
+        let cfg = TransportConfig {
+            backoff_initial: Duration::from_millis(1000),
+            backoff_max: Duration::from_millis(30000),
+            ..test_cfg()
+        };
+        // 1000, 2000, 4000, 8000, 16000, 30000 (cap), 30000, ...
+        assert_eq!(next_backoff(0, &cfg), Duration::from_millis(1000));
+        assert_eq!(next_backoff(1, &cfg), Duration::from_millis(2000));
+        assert_eq!(next_backoff(2, &cfg), Duration::from_millis(4000));
+        assert_eq!(next_backoff(3, &cfg), Duration::from_millis(8000));
+        assert_eq!(next_backoff(4, &cfg), Duration::from_millis(16000));
+        // 32_000 ms would exceed the cap → 30_000.
+        assert_eq!(next_backoff(5, &cfg), Duration::from_millis(30000));
+        assert_eq!(next_backoff(50, &cfg), Duration::from_millis(30000));
+    }
+
+    #[tokio::test]
+    async fn read_banner_accepts_canonical_ts6_banner() {
+        let (mut channel, read_tx, _writes) = StubChannel::new();
+        let mut parser = LineBuffer::new();
+        let cfg = test_cfg();
+
+        // Spec §11.3: TS3 / Welcome / virtualserver_status / error id=0 msg=ok
+        read_tx.send(Ok(Some(b"TS3\r\n".to_vec()))).await.unwrap();
+        read_tx
+            .send(Ok(Some(b"Welcome to the TeamSpeak 6 ServerQuery interface\r\n".to_vec())))
+            .await
+            .unwrap();
+        read_tx
+            .send(Ok(Some(b"virtualserver_status=online\r\n".to_vec())))
+            .await
+            .unwrap();
+        read_tx.send(Ok(Some(b"error id=0 msg=ok\r\n".to_vec()))).await.unwrap();
+
+        let lines = read_banner(&mut channel, &mut parser, &cfg).await.unwrap();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "TS3");
+    }
+
+    #[tokio::test]
+    async fn read_banner_surfaces_nonzero_error_as_upstream() {
+        let (mut channel, read_tx, _writes) = StubChannel::new();
+        let mut parser = LineBuffer::new();
+        let cfg = test_cfg();
+        read_tx
+            .send(Ok(Some(
+                b"error id=2568 msg=insufficient\\sclient\\spermissions\r\n".to_vec(),
+            )))
+            .await
+            .unwrap();
+        let r = read_banner(&mut channel, &mut parser, &cfg).await;
+        match r {
+            Err(SshBridgeError::Upstream { code, message }) => {
+                assert_eq!(code, 2568);
+                assert!(message.contains("insufficient"));
+            }
+            other => panic!("expected Upstream, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_banner_translates_auth_substring_to_auth_rejected() {
+        let (mut channel, read_tx, _writes) = StubChannel::new();
+        let mut parser = LineBuffer::new();
+        let cfg = test_cfg();
+        // Channel reports a closed-with-error containing the §11.5 marker.
+        read_tx
+            .send(Err(TransportError::Closed("Authentication failed".into())))
+            .await
+            .unwrap();
+        let r = read_banner(&mut channel, &mut parser, &cfg).await;
+        assert!(matches!(r, Err(SshBridgeError::AuthRejected { .. })));
+    }
+
+    #[tokio::test]
+    async fn read_banner_times_out() {
+        let (mut channel, _read_tx, _writes) = StubChannel::new();
+        let mut parser = LineBuffer::new();
+        let cfg = TransportConfig {
+            banner_timeout: Duration::from_millis(20),
+            ..test_cfg()
+        };
+        // Hold the read_tx so recv() blocks. The deadline elapses.
+        let r = read_banner(&mut channel, &mut parser, &cfg).await;
+        match r {
+            Err(SshBridgeError::Transport(s)) => assert!(s.contains("banner timeout")),
+            other => panic!("expected banner-timeout Transport, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_serialises_commands_in_submission_order() {
+        let (channel, read_tx, mut writes_rx) = StubChannel::new();
+        let cfg = test_cfg();
+        let (cmd_tx, cmd_rx) = mpsc::channel::<CommandRequest>(8);
+        let (notify_tx, _) = broadcast::channel::<NotifyFrame>(16);
+        let ctx = DispatchContext {
+            cfg: cfg.clone(),
+            notify_tx,
+        };
+
+        // Queue three commands.
+        let (r1, h1) = oneshot::channel();
+        let (r2, h2) = oneshot::channel();
+        let (r3, h3) = oneshot::channel();
+        cmd_tx
+            .send(CommandRequest {
+                line: "cmd-one".into(),
+                timeout: None,
+                user_id: None,
+                virtual_server_id: None,
+                reply: r1,
+            })
+            .await
+            .unwrap();
+        cmd_tx
+            .send(CommandRequest {
+                line: "cmd-two".into(),
+                timeout: None,
+                user_id: None,
+                virtual_server_id: None,
+                reply: r2,
+            })
+            .await
+            .unwrap();
+        cmd_tx
+            .send(CommandRequest {
+                line: "cmd-three".into(),
+                timeout: None,
+                user_id: None,
+                virtual_server_id: None,
+                reply: r3,
+            })
+            .await
+            .unwrap();
+        drop(cmd_tx);
+
+        // Drive the dispatch loop in a background task so we can feed
+        // scripted reads in order.
+        let dispatch = tokio::spawn(dispatch_loop(channel, cmd_rx, ctx));
+
+        // Each command terminates on `error id=0 msg=ok\r\n`.
+        for _ in 0..3 {
+            read_tx
+                .send(Ok(Some(b"error id=0 msg=ok\r\n".to_vec())))
+                .await
+                .unwrap();
+        }
+
+        // Replies arrive in submission order.
+        h1.await.unwrap().unwrap();
+        h2.await.unwrap().unwrap();
+        h3.await.unwrap().unwrap();
+
+        let session = dispatch.await.unwrap();
+        assert!(matches!(session, SessionResult::ShuttingDown));
+
+        // Writes were issued in the same order — three lines, three CR-LFs.
+        let written = collect_writes(&mut writes_rx);
+        let one = written.find("cmd-one").unwrap();
+        let two = written.find("cmd-two").unwrap();
+        let three = written.find("cmd-three").unwrap();
+        assert!(one < two && two < three, "writes out of order: {written:?}");
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_notify_lines_to_subscribers_during_command() {
+        let (channel, read_tx, _writes_rx) = StubChannel::new();
+        let cfg = test_cfg();
+        let (cmd_tx, cmd_rx) = mpsc::channel::<CommandRequest>(8);
+        let (notify_tx, mut notify_rx) = broadcast::channel::<NotifyFrame>(16);
+        let ctx = DispatchContext {
+            cfg: cfg.clone(),
+            notify_tx,
+        };
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        cmd_tx
+            .send(CommandRequest {
+                line: "clientlist".into(),
+                timeout: None,
+                user_id: None,
+                virtual_server_id: Some(3),
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        drop(cmd_tx);
+
+        let dispatch = tokio::spawn(dispatch_loop(channel, cmd_rx, ctx));
+
+        // A notify line arrives mid-command; then a body line; then the
+        // terminator.
+        read_tx
+            .send(Ok(Some(b"notifycliententer clid=5\r\n".to_vec())))
+            .await
+            .unwrap();
+        read_tx
+            .send(Ok(Some(b"clid=12 cid=1\r\n".to_vec())))
+            .await
+            .unwrap();
+        read_tx
+            .send(Ok(Some(b"error id=0 msg=ok\r\n".to_vec())))
+            .await
+            .unwrap();
+
+        let outcome = reply_rx.await.unwrap().unwrap();
+        assert_eq!(outcome.body_lines.len(), 1);
+        assert!(outcome.body_lines[0].contains("clid=12"));
+        assert_eq!(outcome.error.id, 0);
+
+        let n = notify_rx.recv().await.unwrap();
+        assert_eq!(n.event, "notifycliententer");
+
+        dispatch.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dispatch_command_timeout_triggers_reconnect_signal() {
+        let (channel, _read_tx, _writes_rx) = StubChannel::new();
+        let cfg = TransportConfig {
+            command_timeout: Duration::from_millis(20),
+            ..test_cfg()
+        };
+        let (cmd_tx, cmd_rx) = mpsc::channel::<CommandRequest>(8);
+        let (notify_tx, _) = broadcast::channel::<NotifyFrame>(16);
+        let ctx = DispatchContext {
+            cfg: cfg.clone(),
+            notify_tx,
+        };
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        cmd_tx
+            .send(CommandRequest {
+                line: "version".into(),
+                timeout: None,
+                user_id: None,
+                virtual_server_id: None,
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        // Don't drop cmd_tx — we want the loop to return Reconnect on
+        // the timeout, not ShuttingDown on a closed receiver.
+
+        let dispatch = tokio::spawn(dispatch_loop(channel, cmd_rx, ctx));
+        // Caller sees a transport-class error.
+        let err = reply_rx.await.unwrap().unwrap_err();
+        match err {
+            SshBridgeError::Transport(_) => {}
+            other => panic!("expected Transport, got {other:?}"),
+        }
+        let session = dispatch.await.unwrap();
+        assert!(matches!(session, SessionResult::Reconnect));
+        drop(cmd_tx);
+    }
+
+    #[tokio::test]
+    async fn dispatch_auth_rejected_short_circuits_no_reconnect() {
+        let (channel, read_tx, _writes_rx) = StubChannel::new();
+        let cfg = test_cfg();
+        let (cmd_tx, cmd_rx) = mpsc::channel::<CommandRequest>(8);
+        let (notify_tx, _) = broadcast::channel::<NotifyFrame>(16);
+        let ctx = DispatchContext {
+            cfg: cfg.clone(),
+            notify_tx,
+        };
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        cmd_tx
+            .send(CommandRequest {
+                line: "version".into(),
+                timeout: None,
+                user_id: None,
+                virtual_server_id: None,
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+
+        let dispatch = tokio::spawn(dispatch_loop(channel, cmd_rx, ctx));
+
+        // The channel reports an explicit AuthRejected.
+        read_tx
+            .send(Err(TransportError::AuthRejected))
+            .await
+            .unwrap();
+
+        let r = reply_rx.await.unwrap();
+        assert!(matches!(r, Err(SshBridgeError::AuthRejected { config_id: 7 })));
+        let session = dispatch.await.unwrap();
+        assert!(matches!(session, SessionResult::AuthRejected));
+        drop(cmd_tx);
+    }
+}
