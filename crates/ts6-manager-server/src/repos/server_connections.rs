@@ -53,7 +53,7 @@ pub struct NewServerConnection {
     pub enabled: bool,
 }
 
-const PROJECTION: &str = "
+pub(crate) const PROJECTION: &str = "
     record::id(id) AS id,
     name,
     host,

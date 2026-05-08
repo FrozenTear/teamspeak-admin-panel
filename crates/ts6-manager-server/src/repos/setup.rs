@@ -25,7 +25,9 @@ use anyhow::{Context, Result};
 
 use crate::db::Database;
 
-use super::server_connections::{NewServerConnection, ServerConnection};
+use super::server_connections::{
+    NewServerConnection, PROJECTION as SERVER_PROJECTION, ServerConnection,
+};
 use super::users::{NewUser, User};
 
 /// Insert the bootstrap admin user and first server connection inside a
@@ -116,13 +118,11 @@ pub async fn init_admin_and_first_server(
     Ok((user, server))
 }
 
-// Field projections kept in sync with `repos::users::PROJECTION` and
-// `repos::server_connections::PROJECTION`. Duplicated here (rather than
-// re-exported) so the transactional SurrealQL above is a single
-// self-contained block readable end-to-end. If a field is added to either
-// repo's PROJECTION, mirror it here — the per-repo unit tests would catch
-// a drift on the read side, and the `happy_path_creates_both_rows` test
-// here catches it on the setup write side.
+// `SERVER_PROJECTION` is re-exported from `repos::server_connections` so the
+// transactional `RETURN` below stays in lock-step with normal reads — PURA-77
+// drifted this projection silently and PURA-98 had to fix it after the fact.
+// `USER_PROJECTION` stays inline because the user table has no equivalent
+// drift history; if it grows D-* fields, mirror the server-side approach.
 const USER_PROJECTION: &str = "
     record::id(id) AS id,
     username,
@@ -133,24 +133,6 @@ const USER_PROJECTION: &str = "
     createdAt,
     updatedAt,
     lastLoginAt
-";
-
-const SERVER_PROJECTION: &str = "
-    record::id(id) AS id,
-    name,
-    host,
-    webqueryPort,
-    apiKey,
-    useHttps,
-    sshPort,
-    sshUsername,
-    sshPassword,
-    queryBotChannel,
-    queryBotNickname,
-    sshBotNickname,
-    enabled,
-    createdAt,
-    updatedAt
 ";
 
 #[cfg(test)]
