@@ -5,9 +5,27 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[lib]
+name = "ts6_voice_fixture"
+path = "src/lib.rs"
+
 [[bin]]
 name = "ts6-voice-fixture"
 path = "src/main.rs"
+
+[features]
+default = []
+# PURA-110 — gate for the audio-E2E integration test in `tests/audio_e2e.rs`.
+# Off by default. Pulls in `audiopus` (libopus binding) + `tsproto-packets`
+# so the test can build Opus frames and walk the on-wire `AudioData` body.
+# Run via:
+#
+#   TS6_VOICE_FIXTURE=1 cargo test -p ts6-voice-fixture \
+#     --features ts6-voice-fixture -- ts6_voice_fixture::audio_e2e \
+#     --ignored --nocapture
+#
+# See `docs/ts6-fixture.md` §3 for the local fixture bring-up.
+ts6-voice-fixture = ["dep:audiopus", "dep:tsproto-packets", "tsclientlib/audio"]
 
 [dependencies]
 # PURA-106 — connect-only headless voice-client fixture for V4/V7 visual e2e.
@@ -24,10 +42,15 @@ path = "src/main.rs"
 # (system TLS for resolver) — silence is fine for V4/V7 and we don't need
 # the resolver's HTTPS lookup against an IP:port fixture.
 tsclientlib = { git = "https://github.com/ReSpeak/tsclientlib", rev = "04aa24917abbf6a0c8442a79742d6d2d40ecf71e", default-features = false }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time", "fs", "io-util"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time", "fs", "io-util", "sync"] }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 futures = { workspace = true }
 serde_json = { workspace = true }
+
+# Optional — only pulled in with --features ts6-voice-fixture (audio E2E test).
+# Same git+rev as tsclientlib above so cargo dedupes the package.
+audiopus = { version = "0.3.0-rc.0", optional = true }
+tsproto-packets = { git = "https://github.com/ReSpeak/tsclientlib", rev = "04aa24917abbf6a0c8442a79742d6d2d40ecf71e", optional = true }

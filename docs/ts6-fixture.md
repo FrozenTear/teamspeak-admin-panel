@@ -106,3 +106,78 @@ podman-compose --profile ts6-fixture up -d ts6-fixture
 
 The compose-managed fixture uses a named volume (`ts6-fixture-data`) so
 the API key persists across `podman-compose down`.
+
+## Audio-E2E assertion (PURA-110)
+
+The `ts6-voice-fixture` crate ships a feature-gated integration test that
+asserts Opus frames flow end-to-end through the live fixture, not just
+that the connection succeeds. It builds on PURA-106 (connect-only) and
+the PURA-7 Day-2 voice-tx spike findings (body layout
+`voice_id u16 BE | codec_id u8 | opus_payload`).
+
+**What it does:**
+
+1. Spawns two `tsclientlib` participants against `127.0.0.1:9987`.
+2. The sender encodes a 20 ms Opus frame (440 Hz mono sine) and re-uses
+   the same encoded payload for ≥1500 frames (≥30 s @ 20 ms cadence),
+   then a final empty Opus frame as the voice-stop signal.
+3. The receiver collects every `S2C` audio frame off the wire.
+4. Asserts: frame count ≥(1 − drop_tol)×sent (default 5 % UDP-loss
+   budget); every frame uses the codec the sender used (default
+   `OpusVoice` = byte 4); ≥1 voice-stop received.
+
+**Run it:**
+
+```bash
+podman-compose --profile ts6-fixture up -d ts6-fixture
+TS6_VOICE_FIXTURE=1 cargo test -p ts6-voice-fixture \
+    --features ts6-voice-fixture -- ts6_voice_fixture::audio_e2e \
+    --ignored --nocapture
+```
+
+The test is gated *three* ways so it cannot wedge default CI:
+
+| Gate | Purpose |
+|---|---|
+| `--features ts6-voice-fixture` | Pulls in `audiopus` + `tsproto-packets`; without it the test file is `cfg`-stripped to nothing. |
+| `#[ignore]` | `cargo test --workspace` skips it even when the feature is on; only `--ignored` includes it. |
+| `TS6_VOICE_FIXTURE=1` env | Runtime guard. The test prints a skip line if missing, so the operator knows why nothing ran. |
+
+**Tunables (env vars):**
+
+| Var | Default | Purpose |
+|---|---|---|
+| `TS6_VOICE_FIXTURE_ADDR` | `127.0.0.1:9987` | Voice port to connect to. |
+| `TS6_VOICE_FIXTURE_FRAMES` | `1500` | Frames to send (×20 ms). |
+| `TS6_VOICE_FIXTURE_DROP_TOL` | `0.05` | Fractional drop budget (0.0 = strict). |
+| `RUST_LOG` | see below | Standard tracing filter. |
+
+A useful filter:
+
+```
+RUST_LOG=info,ts6_voice_fixture=debug,tsclientlib=warn,tsproto=warn
+```
+
+**Failure modes the test surfaces with a useful diagnostic:**
+
+- *Handshake never completes.* Likely the fixture is wedged on the
+  passt port-forward issue (§ "Why `--network=host` is mandatory").
+  The error names the symptom and points back to the compose recipe.
+- *Frames sent but ≪drop_tol received.* Diagnostic includes the
+  receiver's last-seen `CanSendAudio` / `CanReceiveAudio` state and a
+  hint to check that the default Guest server-group has
+  `b_channel_voice_speak` in the Default Channel — the
+  `beta.voice.teamspeak.com` policy that bit the Day-2 spike could
+  apply to a fresh self-hosted fixture too if the operator has tightened
+  Guest perms.
+- *Codec mismatch.* The receiver got an unexpected `codec_id` byte.
+  Should be impossible against the sender we control; if it fires,
+  the on-wire `AudioData` parse contract has drifted.
+- *No voice-stop.* The sender dispatched one but the receiver never
+  saw an empty-payload S2C frame; usually downstream of one of the
+  failures above (receiver disconnected before tail).
+
+The test is **not** part of any default CI lane. It exists as a
+single-command local-rig regression net for PURA-108 / Phase 3 work
+and is consumed by the WS-4 prototype (parent ticket
+[PURA-108](/PURA/issues/PURA-108)). Owner: VoiceProtocol.

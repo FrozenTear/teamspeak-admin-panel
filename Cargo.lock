@@ -356,6 +356,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
+name = "audiopus"
+version = "0.3.0-rc.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab55eb0e56d7c6de3d59f544e5db122d7725ec33be6a276ee8241f3be6473955"
+dependencies = [
+ "audiopus_sys",
+]
+
+[[package]]
+name = "audiopus_sys"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62314a1546a2064e033665d658e88c620a62904be945f8147e6b16c3db9f8651"
+dependencies = [
+ "cmake",
+ "log",
+ "pkg-config",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5300,6 +5320,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "pkg-config"
+version = "0.3.33"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
+
+[[package]]
 name = "png"
 version = "0.17.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8106,6 +8132,7 @@ name = "ts6-voice-fixture"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "audiopus",
  "clap",
  "futures",
  "serde_json",
@@ -8113,6 +8140,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tsclientlib",
+ "tsproto-packets",
 ]
 
 [[package]]
@@ -8120,6 +8148,7 @@ name = "tsclientlib"
 version = "0.2.0"
 source = "git+https://github.com/ReSpeak/tsclientlib?rev=04aa24917abbf6a0c8442a79742d6d2d40ecf71e#04aa24917abbf6a0c8442a79742d6d2d40ecf71e"
 dependencies = [
+ "audiopus",
  "base64",
  "futures",
  "git-testament",
