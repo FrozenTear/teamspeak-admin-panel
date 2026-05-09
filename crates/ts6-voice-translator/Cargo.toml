@@ -1,0 +1,36 @@
+[package]
+name = "ts6-voice-translator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "ts6-voice-translator"
+path = "src/main.rs"
+
+[dependencies]
+# PURA-108 WS-7 / PURA-114 — Phase 3.5 WebRTC bridge translator scaffold (slice b).
+#
+# Same tsclientlib pin as crates/ts6-voice-prototype: master @ 04aa249. The
+# `audio` feature unlocks `StreamItem::Audio` so slice c can subscribe to
+# inbound TS6 voice frames without reshuffling deps. Default-features off
+# (no SRV resolver — we connect to host:port directly, no resolver TLS).
+tsclientlib = { git = "https://github.com/ReSpeak/tsclientlib", rev = "04aa24917abbf6a0c8442a79742d6d2d40ecf71e", default-features = false, features = ["audio"] }
+tsproto-packets = { git = "https://github.com/ReSpeak/tsclientlib", rev = "04aa24917abbf6a0c8442a79742d6d2d40ecf71e" }
+
+# LiveKit access-token minting. The full LiveKit Rust SDK lands in slice c
+# (it depends on a native libwebrtc build); the access-token format is plain
+# JWT and well-documented (https://docs.livekit.io/home/get-started/authentication/),
+# so we mint tokens from scratch with `jsonwebtoken`. Keeps slice b a
+# pure-Rust scaffold with no native build chain.
+jsonwebtoken = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time", "fs", "io-util", "sync"] }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { version = "4", features = ["derive", "env"] }
+futures = { workspace = true }

@@ -96,3 +96,37 @@ s.sendto(b"\x00\x01\x00\x00\x21\x12\xa4\x42" + tid, ("127.0.0.1", 3478)); \
 data, _ = s.recvfrom(1500); \
 assert data[:2] == b"\x01\x01", "expected STUN Binding Success"; \
 print("==> coturn OK"); s.close()'
+
+# PURA-108 WS-7 / PURA-114 slice b — translator daemon scaffold. Connects to
+# the running `voice-translator` profile (ts6-fixture + LiveKit + coturn),
+# mints a LiveKit access token, drives the TS6 handshake, and exits cleanly
+# after the configured duration. Useful as a deeper bring-up smoke test
+# than `voice-translator-smoke` even before the audio forwarding lands in
+# slices c-e. Operator notes: docs/voice-translator.md.
+
+.PHONY: voice-translator-build voice-translator-run voice-translator-test \
+        voice-translator-clean
+
+VOICE_TRANSLATOR_DURATION ?= 10
+VOICE_TRANSLATOR_OUT_DIR  ?= target/voice-translator
+VOICE_TRANSLATOR_TS6      ?= 127.0.0.1:9987
+VOICE_TRANSLATOR_LIVEKIT  ?= ws://127.0.0.1:7880
+VOICE_TRANSLATOR_ROOM     ?= ts6-bridge
+
+voice-translator-build:
+	cargo build --release -p ts6-voice-translator
+
+voice-translator-run: voice-translator-build
+	@mkdir -p $(VOICE_TRANSLATOR_OUT_DIR)
+	./target/release/ts6-voice-translator \
+	    --ts6-server $(VOICE_TRANSLATOR_TS6) \
+	    --identity-dir $(VOICE_TRANSLATOR_OUT_DIR) \
+	    --livekit-url $(VOICE_TRANSLATOR_LIVEKIT) \
+	    --livekit-room $(VOICE_TRANSLATOR_ROOM) \
+	    --duration-secs $(VOICE_TRANSLATOR_DURATION)
+
+voice-translator-test:
+	cargo test -p ts6-voice-translator
+
+voice-translator-clean:
+	rm -rf $(VOICE_TRANSLATOR_OUT_DIR)
