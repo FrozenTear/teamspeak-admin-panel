@@ -56,6 +56,15 @@ pub struct TransportConfig {
     /// Banner deadline. Spec §11.3 — banner usually arrives in
     /// milliseconds; pad generously for high-latency networks.
     pub banner_timeout: Duration,
+    /// Idle window for banner-complete detection on lazy upstreams.
+    /// Spec §11.3 says the banner ends with `error id=0 msg=ok`, but
+    /// `teamspeak6-server:6.0.0-beta9` (libssh-backed) only emits the
+    /// `TS3` / `Welcome` body lines and waits for a command before
+    /// sending any `error` frame. After the first banner body line
+    /// arrives, [`read_banner`] returns `Ok` if no further bytes
+    /// arrive within this window — without it, the supervisor sits at
+    /// the spec terminator until [`banner_timeout`] fires. PURA-101.
+    pub banner_idle_window: Duration,
     /// Wall-clock ceiling on the connect future returned by
     /// `connect_factory`. Wraps the entire pre-banner sequence (TCP
     /// connect, SSH key exchange, password auth, channel open,
@@ -87,6 +96,7 @@ impl TransportConfig {
             config_id,
             command_timeout: Duration::from_secs(10),
             banner_timeout: Duration::from_secs(15),
+            banner_idle_window: Duration::from_millis(500),
             connect_timeout: Duration::from_secs(30),
             keepalive_interval: Duration::from_secs(30),
             keepalive_timeout: Duration::from_secs(5),
@@ -284,26 +294,56 @@ fn fire_and_forget_persist(db: Option<&Arc<Database>>, entry: &AuditEntry) {
     }
 }
 
-/// Read until the banner-terminator `error id=0 msg=ok` arrives — spec
-/// §11.3. Surfaces `error id != 0` as [`SshBridgeError::Upstream`] and
-/// any transport failure as [`SshBridgeError::Transport`] (mapping
-/// auth-related ones to [`SshBridgeError::AuthRejected`]).
+/// Read until either the banner terminator `error id=0 msg=ok` arrives
+/// (spec §11.3, canonical TS3 form) or the upstream goes idle for
+/// [`TransportConfig::banner_idle_window`] after at least one body
+/// line (PURA-101 — `teamspeak6-server:6.0.0-beta9` emits the
+/// `TS3` / `Welcome` body lines and stops, never sending the spec
+/// terminator until a command lands). Surfaces `error id != 0` as
+/// [`SshBridgeError::Upstream`] and any transport failure as
+/// [`SshBridgeError::Transport`] (mapping auth-related ones to
+/// [`SshBridgeError::AuthRejected`]).
 pub(crate) async fn read_banner<C: SshChannel>(
     channel: &mut C,
     parser: &mut LineBuffer,
     cfg: &TransportConfig,
 ) -> SshBridgeResult<Vec<String>> {
-    let deadline = Instant::now() + cfg.banner_timeout;
-    let mut banner_lines = Vec::new();
+    let banner_deadline = Instant::now() + cfg.banner_timeout;
+    let mut banner_lines: Vec<String> = Vec::new();
+    let mut last_byte_at: Option<Instant> = None;
     loop {
-        let chunk = match tokio::time::timeout_at(deadline, channel.recv()).await {
+        // While we haven't seen any banner body lines, hold the strict
+        // banner_timeout deadline — a server that's totally silent is
+        // still a fail. Once at least one body line has arrived, accept
+        // a banner_idle_window of silence as "lazy banner complete".
+        let next_deadline = if banner_lines.is_empty() {
+            banner_deadline
+        } else if let Some(t) = last_byte_at {
+            banner_deadline.min(t + cfg.banner_idle_window)
+        } else {
+            banner_deadline
+        };
+        let chunk = match tokio::time::timeout_at(next_deadline, channel.recv()).await {
             Err(_) => {
+                if !banner_lines.is_empty() && Instant::now() < banner_deadline {
+                    tracing::debug!(
+                        target: "sshbridge::transport",
+                        config_id = cfg.config_id,
+                        idle_window_ms = cfg.banner_idle_window.as_millis() as u64,
+                        body_lines = banner_lines.len(),
+                        "ssh banner idle-window settled (lazy banner — no `error id=0` terminator from upstream)"
+                    );
+                    return Ok(banner_lines);
+                }
                 return Err(SshBridgeError::Transport(format!(
                     "banner timeout after {:?}",
                     cfg.banner_timeout
                 )));
             }
-            Ok(Ok(Some(bytes))) => bytes,
+            Ok(Ok(Some(bytes))) => {
+                last_byte_at = Some(Instant::now());
+                bytes
+            }
             Ok(Ok(None)) => {
                 return Err(SshBridgeError::Transport(
                     "channel closed before banner terminator".into(),
@@ -495,6 +535,84 @@ async fn dispatch_loop<C: SshChannel>(
                         };
                         let _ = cmd.reply.send(Err(public_err));
                         return if is_auth { SessionResult::AuthRejected } else { SessionResult::Reconnect };
+                    }
+                }
+            }
+
+            // PURA-101 — watch the SSH channel between commands so an
+            // upstream that closes the session asynchronously gets
+            // detected promptly. TS6 (`teamspeak6-server:6.0.0-beta9`)
+            // closes the shell channel *after* sending the
+            // `error id=0 msg=ok` response for `quit`, not mid-response.
+            // Without this branch the supervisor sees `quit` succeed,
+            // idles waiting for the next command, and only learns
+            // about the close when the next user command's write hits
+            // a dead russh channel — surfacing as a transport error
+            // to the caller rather than triggering a transparent
+            // reconnect.
+            //
+            // Stray notify frames between commands also get routed to
+            // subscribers here. Stray Body / Error frames are
+            // unsolicited (the single-in-flight invariant means no
+            // command is awaiting them) and are logged-and-dropped.
+            chunk = channel.recv() => {
+                match chunk {
+                    Ok(Some(bytes)) => {
+                        if let Err(e) = parser.push(&bytes) {
+                            tracing::warn!(
+                                target: "sshbridge::transport",
+                                config_id = ctx.cfg.config_id,
+                                error = %e,
+                                "line buffer overflow on idle channel data — reconnecting"
+                            );
+                            return SessionResult::Reconnect;
+                        }
+                        for line in parser.drain_lines() {
+                            match Frame::classify(&line) {
+                                Frame::Notify(n) => {
+                                    let _ = ctx.notify_tx.send(n);
+                                }
+                                Frame::Body(s) => {
+                                    tracing::debug!(
+                                        target: "sshbridge::transport",
+                                        config_id = ctx.cfg.config_id,
+                                        line = %s,
+                                        "stray body line between commands — discarding"
+                                    );
+                                }
+                                Frame::Error(e) => {
+                                    tracing::debug!(
+                                        target: "sshbridge::transport",
+                                        config_id = ctx.cfg.config_id,
+                                        id = e.id,
+                                        msg = %e.msg,
+                                        "stray error frame between commands — discarding"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        tracing::warn!(
+                            target: "sshbridge::transport",
+                            config_id = ctx.cfg.config_id,
+                            "ssh channel closed by peer between commands — reconnecting"
+                        );
+                        return SessionResult::Reconnect;
+                    }
+                    Err(TransportError::AuthRejected) => return SessionResult::AuthRejected,
+                    Err(e) => {
+                        let is_auth = matches!(&e, TransportError::Closed(s) | TransportError::Io(s) if looks_like_auth_failure(s));
+                        if is_auth {
+                            return SessionResult::AuthRejected;
+                        }
+                        tracing::warn!(
+                            target: "sshbridge::transport",
+                            config_id = ctx.cfg.config_id,
+                            error = %e,
+                            "ssh channel error between commands — reconnecting"
+                        );
+                        return SessionResult::Reconnect;
                     }
                 }
             }
@@ -691,6 +809,17 @@ where
 
 /// Wrap `dispatch_loop` so the supervisor can re-take the receiver on
 /// reconnect.
+///
+/// PURA-101: pump exits cleanly when the dispatch loop returns,
+/// preserving `outer_rx` across reconnect cycles. The previous
+/// implementation called `pump_handle.abort()` after `dispatch_loop`
+/// returned — but pump was usually parked on `outer_rx.recv()` at
+/// that moment, so the abort cancelled it before it could observe
+/// `inner_tx`'s closure and return `outer_rx`. The recovery branch
+/// then synthesised a *fresh* (unconnected) receiver, which orphaned
+/// the public `cmd_tx` held by [`TransportHandle`] — every
+/// post-reconnect submission resolved to "ssh transport task is no
+/// longer running", silently destroying the reconnect contract.
 async fn dispatch_loop_owning<C: SshChannel>(
     channel: C,
     cmd_rx: mpsc::Receiver<CommandRequest>,
@@ -700,13 +829,8 @@ async fn dispatch_loop_owning<C: SshChannel>(
 ) -> (mpsc::Receiver<CommandRequest>, SessionResult) {
     // Spawn the dispatch loop with a private channel pair; pump
     // commands from the outer receiver into the inner one. When the
-    // dispatch loop returns, we recover the outer receiver intact.
-    //
-    // For now the simplest model — and what the unit tests exercise —
-    // hands the receiver into the dispatch loop and gets a fresh one
-    // for the next round if reconnect happens. Production callers
-    // submit through [`TransportHandle`], so the fresh-receiver model
-    // is invisible.
+    // dispatch loop returns, pump observes `inner_tx.closed()` and
+    // returns `outer_rx` intact for the next reconnect cycle.
     let (inner_tx, inner_rx) = mpsc::channel::<CommandRequest>(cfg.command_queue_capacity);
     let pump_handle = tokio::spawn(pump(cmd_rx, inner_tx));
     let result = dispatch_loop(
@@ -719,25 +843,62 @@ async fn dispatch_loop_owning<C: SshChannel>(
         },
     )
     .await;
-    // Recover the outer receiver. The pump task may still be holding
-    // it briefly while waiting on `inner_tx.send`; cancelling and
-    // joining gives us back the receiver via the join handle's
-    // returned value.
-    pump_handle.abort();
+    // Pump exits within a few microseconds of `inner_rx` drop (the
+    // dispatch loop's exit dropped `inner_rx`). Awaiting it returns
+    // the original `outer_rx` so the supervisor can resume the
+    // reconnect cycle without losing the public `cmd_tx` connection.
     let outer_rx = match pump_handle.await {
         Ok(rx) => rx,
-        Err(_) => mpsc::channel::<CommandRequest>(cfg.command_queue_capacity).1,
+        Err(e) => {
+            // Pump panicked (should not happen — its body is a plain
+            // mpsc forwarder). Log and synthesise a fresh receiver so
+            // the supervisor can at least surface a clean "task no
+            // longer running" rather than wedging silently. Any
+            // queued user commands on the public cmd_tx will still
+            // surface as transport errors — the operator's next
+            // submission is the canary.
+            tracing::error!(
+                target: "sshbridge::transport",
+                config_id = cfg.config_id,
+                error = %e,
+                "pump task ended abnormally — reconnect cycle will surface as transport errors to callers"
+            );
+            mpsc::channel::<CommandRequest>(cfg.command_queue_capacity).1
+        }
     };
     (outer_rx, result)
 }
 
+/// Forward commands from the public `outer_rx` (driven by
+/// [`TransportHandle::execute`]) into the dispatch loop's private
+/// `inner_tx`. Exits cleanly under three conditions:
+///
+/// 1. The public `cmd_tx` is dropped (`outer_rx.recv()` returns
+///    `None`) — supervisor is shutting down.
+/// 2. `inner_tx.send(cmd)` fails — the dispatch loop already
+///    returned and dropped `inner_rx`, with a command in flight that
+///    we couldn't forward.
+/// 3. `inner_tx.closed()` fires — the dispatch loop returned while
+///    pump was idle on `outer_rx.recv()`. PURA-101 — without this
+///    branch, the supervisor's `pump_handle.abort()` cancelled the
+///    parked recv and the recovery path synthesised a fresh
+///    (unconnected) outer_rx, breaking the reconnect contract.
+///
+/// In all three cases the function returns `outer_rx` so the
+/// supervisor can hand it to the next dispatch loop cycle.
 async fn pump(
     mut outer_rx: mpsc::Receiver<CommandRequest>,
     inner_tx: mpsc::Sender<CommandRequest>,
 ) -> mpsc::Receiver<CommandRequest> {
-    while let Some(cmd) = outer_rx.recv().await {
-        if inner_tx.send(cmd).await.is_err() {
-            break;
+    loop {
+        tokio::select! {
+            cmd = outer_rx.recv() => {
+                let Some(cmd) = cmd else { break; };
+                if inner_tx.send(cmd).await.is_err() {
+                    break;
+                }
+            }
+            _ = inner_tx.closed() => break,
         }
     }
     outer_rx
@@ -908,6 +1069,10 @@ mod tests {
             config_id: 7,
             command_timeout: Duration::from_millis(500),
             banner_timeout: Duration::from_millis(500),
+            // Tight idle window keeps the lazy-banner regression tests
+            // fast; the production default (500ms) only matters on the
+            // wire path.
+            banner_idle_window: Duration::from_millis(50),
             connect_timeout: Duration::from_millis(500),
             keepalive_interval: Duration::from_secs(3600),
             keepalive_timeout: Duration::from_millis(500),
@@ -1004,6 +1169,73 @@ mod tests {
         let lines = read_banner(&mut channel, &mut parser, &cfg).await.unwrap();
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0], "TS3");
+    }
+
+    /// PURA-101 — `teamspeak6-server:6.0.0-beta9` emits the `TS3` /
+    /// `Welcome to the TeamSpeak ServerQuery interface` body lines and
+    /// then goes idle, **never** sending the spec's `error id=0 msg=ok`
+    /// banner terminator until a command lands. `read_banner` must
+    /// settle on `banner_idle_window` of silence after at least one
+    /// body line; without this, the supervisor blocks until
+    /// `banner_timeout` fires and the operator sees a `banner timeout`
+    /// transport error.
+    #[tokio::test]
+    async fn read_banner_settles_on_idle_after_lazy_ts6_banner() {
+        let (mut channel, read_tx, _writes) = StubChannel::new();
+        let mut parser = LineBuffer::new();
+        let cfg = TransportConfig {
+            // Plenty of headroom on the absolute timeout; the idle
+            // window is what should trigger the return.
+            banner_timeout: Duration::from_millis(500),
+            banner_idle_window: Duration::from_millis(50),
+            ..test_cfg()
+        };
+
+        // Lazy banner: TS6 sends only the welcome lines, no terminator.
+        // Wire bytes match the captured 4-chunk pattern from the live
+        // fixture (russh fragments the banner across small Data msgs).
+        read_tx.send(Ok(Some(b"TS3".to_vec()))).await.unwrap();
+        read_tx.send(Ok(Some(b"\n\r".to_vec()))).await.unwrap();
+        read_tx
+            .send(Ok(Some(b"Welcome to the TeamSpeak ServerQuery interface, type \"help\" for a list of commands and \"help <command>\" for information on a specific command.".to_vec())))
+            .await
+            .unwrap();
+        read_tx.send(Ok(Some(b"\n\r".to_vec()))).await.unwrap();
+        // No more sends — the channel goes silent. We hold `read_tx`
+        // alive so `recv()` blocks rather than EOFing.
+        let started = std::time::Instant::now();
+        let lines = read_banner(&mut channel, &mut parser, &cfg)
+            .await
+            .expect("lazy TS6 banner must settle on idle window, not timeout");
+        let elapsed = started.elapsed();
+        assert_eq!(lines.len(), 2, "expected TS3 + Welcome lines, got {lines:?}");
+        assert_eq!(lines[0], "TS3");
+        assert!(lines[1].contains("ServerQuery interface"));
+        // Sanity: settled via the 50ms idle window, well under the
+        // 500ms strict banner_timeout.
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "banner should settle on idle window quickly; took {elapsed:?}"
+        );
+    }
+
+    /// PURA-101 — silent server (no banner at all) still fails on the
+    /// strict `banner_timeout`. The idle-window only kicks in *after*
+    /// at least one body line has arrived.
+    #[tokio::test]
+    async fn read_banner_idle_window_does_not_short_circuit_silent_upstream() {
+        let (mut channel, _read_tx, _writes) = StubChannel::new();
+        let mut parser = LineBuffer::new();
+        let cfg = TransportConfig {
+            banner_timeout: Duration::from_millis(80),
+            banner_idle_window: Duration::from_millis(20),
+            ..test_cfg()
+        };
+        let r = read_banner(&mut channel, &mut parser, &cfg).await;
+        match r {
+            Err(SshBridgeError::Transport(s)) => assert!(s.contains("banner timeout")),
+            other => panic!("expected banner-timeout Transport, got {other:?}"),
+        }
     }
 
     /// PURA-101 — live TS6 SSH ServerQuery emits LF-CR (`\n\r`), not
@@ -1162,6 +1394,221 @@ mod tests {
         let two = written.find("cmd-two").unwrap();
         let three = written.find("cmd-three").unwrap();
         assert!(one < two && two < three, "writes out of order: {written:?}");
+    }
+
+    /// PURA-101 — the dispatch loop watches the channel between
+    /// commands so an upstream Eof (channel closed by peer with no
+    /// command in flight) returns `Reconnect` immediately rather than
+    /// only when the next user command's write fails. Mirrors the
+    /// real-world TS6 behaviour where `quit` is acked cleanly *then*
+    /// the channel closes — without this branch the supervisor sits
+    /// idle and the next user command surfaces a transport error.
+    #[tokio::test]
+    async fn dispatch_idle_channel_close_triggers_reconnect() {
+        let (channel, read_tx, _writes_rx) = StubChannel::new();
+        let cfg = test_cfg();
+        let (cmd_tx, cmd_rx) = mpsc::channel::<CommandRequest>(8);
+        let (notify_tx, _) = broadcast::channel::<NotifyFrame>(16);
+        let ctx = DispatchContext {
+            cfg: cfg.clone(),
+            notify_tx,
+            db: None,
+        };
+
+        let dispatch = tokio::spawn(dispatch_loop(channel, cmd_rx, ctx));
+
+        // No command in flight; simulate an upstream Eof. With the
+        // pre-fix dispatch_loop this would have been ignored until the
+        // next command tried to write.
+        read_tx.send(Ok(None)).await.unwrap();
+
+        let session = dispatch.await.unwrap();
+        assert!(
+            matches!(session, SessionResult::Reconnect),
+            "expected Reconnect on idle channel close, got {session:?}"
+        );
+        // cmd_tx is preserved; the supervisor will resume with it on
+        // the next reconnect cycle.
+        drop(cmd_tx);
+    }
+
+    /// PURA-101 — stray notify frames that arrive between commands
+    /// must still flow to subscribers even when no command is awaiting
+    /// the channel. Without the idle channel watcher these would sit
+    /// in russh's buffer until the next command consumed them.
+    #[tokio::test]
+    async fn dispatch_idle_channel_routes_notify_to_subscribers() {
+        let (channel, read_tx, _writes_rx) = StubChannel::new();
+        let cfg = test_cfg();
+        let (cmd_tx, cmd_rx) = mpsc::channel::<CommandRequest>(8);
+        let (notify_tx, mut notify_rx) = broadcast::channel::<NotifyFrame>(16);
+        let ctx = DispatchContext {
+            cfg: cfg.clone(),
+            notify_tx,
+            db: None,
+        };
+
+        let dispatch = tokio::spawn(dispatch_loop(channel, cmd_rx, ctx));
+
+        // Send a notify between commands — no command in flight.
+        read_tx
+            .send(Ok(Some(b"notifycliententer clid=99\r\n".to_vec())))
+            .await
+            .unwrap();
+        // Subscriber receives it.
+        let n = tokio::time::timeout(Duration::from_millis(200), notify_rx.recv())
+            .await
+            .expect("notify should be routed even with no command in flight")
+            .unwrap();
+        assert_eq!(n.event, "notifycliententer");
+
+        // Then close the channel to terminate dispatch_loop.
+        read_tx.send(Ok(None)).await.unwrap();
+        let session = dispatch.await.unwrap();
+        assert!(matches!(session, SessionResult::Reconnect));
+        drop(cmd_tx);
+    }
+
+    /// PURA-101 — a forced session end (Reconnect) must NOT lose the
+    /// outer command receiver. The previous `dispatch_loop_owning`
+    /// implementation called `pump_handle.abort()` while pump was
+    /// parked on `outer_rx.recv()`, and the recovery branch then
+    /// synthesised a fresh, unconnected receiver — orphaning the
+    /// public `cmd_tx` held by [`TransportHandle`] and breaking every
+    /// post-reconnect submission with "ssh transport task is no
+    /// longer running". This regression drives the supervisor through
+    /// one full reconnect cycle and asserts a post-reconnect
+    /// submission still reaches the new dispatch loop.
+    #[tokio::test]
+    async fn run_with_reconnect_preserves_outer_rx_across_reconnect() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cfg = TransportConfig {
+            // Tight backoff so the test finishes quickly.
+            backoff_initial: Duration::from_millis(5),
+            backoff_max: Duration::from_millis(20),
+            // Generous banner-detect so the second connection is
+            // definitely up before we submit the post-reconnect cmd.
+            banner_timeout: Duration::from_secs(2),
+            banner_idle_window: Duration::from_millis(50),
+            // Disable keepalive so it doesn't fire in this test window.
+            keepalive_interval: Duration::from_secs(3600),
+            ..test_cfg()
+        };
+
+        // Factory yields a fresh StubChannel each call. Each scripted
+        // channel: first-cycle drives a normal banner+`error id=0` flow,
+        // the script for that cycle is set up via the read_tx we get
+        // from `StubChannel::new()`. We have to set up TWO cycles —
+        // one for the initial connect, one for the reconnect.
+        let cycle = Arc::new(AtomicUsize::new(0));
+        let read_txs: Arc<Mutex<Vec<tmpsc::Sender<ScriptedRead>>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let read_txs_factory = read_txs.clone();
+        let cycle_factory = cycle.clone();
+        let factory = move || {
+            let read_txs = read_txs_factory.clone();
+            let cycle = cycle_factory.clone();
+            async move {
+                let (channel, read_tx, _writes_rx) = StubChannel::new();
+                read_txs.lock().await.push(read_tx);
+                cycle.fetch_add(1, Ordering::SeqCst);
+                Ok::<StubChannel, TransportError>(channel)
+            }
+        };
+
+        let (cmd_tx, cmd_rx) = mpsc::channel::<CommandRequest>(8);
+        let (notify_tx, _) = broadcast::channel::<NotifyFrame>(16);
+        let (session_up_tx, _) = broadcast::channel::<()>(4);
+        let auth_flag = Arc::new(Mutex::new(false));
+        let host_key_flag = Arc::new(Mutex::new(false));
+
+        let supervisor = tokio::spawn(run_with_reconnect(
+            cfg.clone(),
+            factory,
+            cmd_rx,
+            notify_tx,
+            session_up_tx,
+            auth_flag,
+            host_key_flag,
+            None,
+        ));
+
+        // Wait for the FIRST cycle's read_tx to land.
+        loop {
+            if let Some(tx) = read_txs.lock().await.first().cloned() {
+                // Cycle 1 banner — canonical CR-LF form so the test
+                // exercises the `error id=0` banner-detect path.
+                tx.send(Ok(Some(b"TS3\r\nWelcome\r\nerror id=0 msg=ok\r\n".to_vec())))
+                    .await
+                    .unwrap();
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        // Force the dispatch loop to return Reconnect by closing the
+        // first channel (Eof).
+        let first_tx = {
+            let guard = read_txs.lock().await;
+            guard[0].clone()
+        };
+        first_tx.send(Ok(None)).await.unwrap();
+
+        // Wait for the second cycle to come up. With backoff ~5ms,
+        // this is essentially immediate.
+        loop {
+            if cycle.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        // Cycle 2 banner.
+        let second_tx = {
+            let guard = read_txs.lock().await;
+            guard[1].clone()
+        };
+        second_tx
+            .send(Ok(Some(b"TS3\r\nWelcome\r\nerror id=0 msg=ok\r\n".to_vec())))
+            .await
+            .unwrap();
+
+        // The CRITICAL check: a submission via the original cmd_tx
+        // (held by what would be `TransportHandle::cmd_tx`) must reach
+        // the new dispatch loop. Pre-fix this would block forever
+        // because the synthesised fresh outer_rx isn't connected to
+        // cmd_tx.
+        let (reply_tx, reply_rx) = oneshot::channel();
+        cmd_tx
+            .send(CommandRequest {
+                line: "post-reconnect-cmd".into(),
+                timeout: None,
+                user_id: None,
+                virtual_server_id: None,
+                reply: reply_tx,
+            })
+            .await
+            .expect("send to original cmd_tx must succeed after reconnect");
+
+        // Cycle 2 dispatch_loop: respond with `error id=0 msg=ok`.
+        second_tx
+            .send(Ok(Some(b"error id=0 msg=ok\r\n".to_vec())))
+            .await
+            .unwrap();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(2), reply_rx)
+            .await
+            .expect("post-reconnect cmd should complete within 2s")
+            .expect("reply channel must not be dropped")
+            .expect("post-reconnect cmd must succeed");
+        assert_eq!(outcome.error.id, 0);
+
+        // Tear down: drop cmd_tx, supervisor exits via ShuttingDown.
+        drop(cmd_tx);
+        // Close the second channel so dispatch_loop returns ShuttingDown.
+        second_tx.send(Ok(None)).await.ok();
+        let _ = tokio::time::timeout(Duration::from_secs(2), supervisor).await;
     }
 
     #[tokio::test]

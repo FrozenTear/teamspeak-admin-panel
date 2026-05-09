@@ -604,6 +604,13 @@ mod tests {
             }
         };
 
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            )
+            .with_writer(std::io::stderr)
+            .try_init();
         let handle = spawn_transport(cfg, factory);
         let client = SshControlClient::new(42, handle.clone());
 
@@ -613,6 +620,25 @@ mod tests {
             .await
             .expect("version() against the live SSH ServerQuery should succeed");
         assert!(!v.version.is_empty(), "version field must be populated");
+
+        // (2b) Sid-scoped command — `clientlist` against the default
+        // virtual server. PURA-101 panel-smoke surrogate: this is the
+        // exact command the `/api/servers/{id}/vs/{vsid}/clients`
+        // route invokes, so a successful response here proves the
+        // HTTP route's bridge call path will succeed within its
+        // per-route deadline.
+        match client.clientlist(1).await {
+            Ok(_clients) => {
+                // Body parses cleanly — the bridge correctly drains
+                // the pipe-separated record list and the upstream's
+                // terminator. Empty client list is fine (the fixture
+                // has only the ServerQuery user joined, which doesn't
+                // appear in `clientlist` by default).
+            }
+            Err(e) => panic!(
+                "client.clientlist(1) against the live SSH ServerQuery should succeed: {e:?}"
+            ),
+        }
 
         // (3) Upstream error path — `serverinfo` against a sid that
         // does not exist. TS upstreams return `error id=1281`
