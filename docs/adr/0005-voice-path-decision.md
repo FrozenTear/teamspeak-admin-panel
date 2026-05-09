@@ -201,7 +201,9 @@ maintenance cost, not a kill criterion.
   topology + the eventual WebRTC translator deployment shape**.
   Federation in the TS6 ecosystem is per-server-membership rather
   than SFU-cascade; the memo articulates how a community of
-  operators surfaces a multi-server experience. Own ADR amendment.
+  operators surfaces a multi-server experience. Landed as
+  [ADR-0006](./0006-voice-topology-and-translator-deployment.md)
+  ([PURA-111](/PURA/issues/PURA-111)).
 - WS-4 ("two clients can talk" prototype): two `tsclientlib`-based
   clients (Rust binaries or extensions of the PURA-7 voice-tx
   spike) connected to the local `teamspeak6-server` fixture,
