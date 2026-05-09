@@ -18,13 +18,16 @@
 //! ## What gets rewritten
 //!
 //! A literal `<script>` open tag (no attributes) is replaced with
-//! `<script nonce="…">` **only when the bytes immediately following the
-//! tag start with one of [`KNOWN_INLINE_SCRIPT_PREFIXES`]** — the three
-//! shapes dx-server 0.7.7 actually emits. Any other inline `<script>` is
-//! left untouched and therefore blocked by the per-request CSP nonce.
-//! External scripts in the dx-CLI prod bundle use
-//! `<script type="module" async src="…"></script>` and stay covered by
-//! `script-src 'self'` — the trailing `>` ensures we don't touch them.
+//! `<script nonce="…">` **only when the bytes following the tag (after
+//! stripping leading ASCII whitespace) start with one of
+//! [`KNOWN_INLINE_SCRIPT_PREFIXES`]** — the four shapes the dx 0.7.x
+//! stack emits: three from dioxus-server SSR and one from the dx-CLI
+//! dev shell `dev.index.html` (the dx-toast template, PURA-104). Any
+//! other inline `<script>` is left untouched and therefore blocked by
+//! the per-request CSP nonce. External scripts in the dx-CLI prod
+//! bundle use `<script type="module" async src="…"></script>` and stay
+//! covered by `script-src 'self'` — the trailing `>` ensures we don't
+//! touch them.
 //!
 //! ## Defense-in-depth posture (PURA-53)
 //!
@@ -109,11 +112,13 @@ fn make_nonce() -> String {
 const MAX_HTML_SIZE: usize = 4 * 1024 * 1024;
 
 /// Body-prefix allowlist: the rewriter only nonces a `<script>` open tag
-/// when the bytes that follow it start with one of these prefixes.
+/// when the bytes that follow it (after stripping leading ASCII
+/// whitespace, see [`script_body_is_dx_emitted`]) start with one of these
+/// prefixes.
 ///
-/// Pinned verbatim to dioxus-server 0.7.7's three SSR emit sites (a
-/// follow-up snapshot test imports this constant so any version bump
-/// that drifts the emit shape fails CI):
+/// Pinned verbatim to the four inline `<script>` shapes the dx 0.7.x
+/// stack emits into HTML the manager serves. A snapshot test imports
+/// this constant so any version bump that drifts an emit shape fails CI:
 ///
 /// - `dioxus-server-0.7.7/src/ssr.rs:717`
 ///   `write!(to, "<script>{INITIALIZE_STREAMING_JS}</script>")` where
@@ -124,6 +129,14 @@ const MAX_HTML_SIZE: usize = 4 * 1024 * 1024;
 ///   `r#"<script>window.initial_dioxus_hydration_data="{raw_data}";"#`.
 /// - `dioxus-server-0.7.7/src/streaming.rs:131`
 ///   `r#"</div><script>window.dx_hydrate([{id}], "{}""#`.
+/// - `dioxus-cli-0.7.7/assets/web/dev.index.html:101-170` — the dx-toast
+///   template runtime baked into the dev-shell `index.html` by
+///   `prepare_html()` (PURA-104). The dx-CLI prod shell
+///   (`prod.index.html`) does not contain this block, so this entry is
+///   dormant in release builds. Body starts with
+///   `const STORAGE_KEY = "SCHEDULED-DX-TOAST";` (preceded by HTML
+///   indentation, which the leading-whitespace trim in the gate
+///   absorbs).
 ///
 /// These prefixes are intentionally fingerprint-shaped, not minimal: an
 /// attacker who lands literal `<script>` in user-controlled HTML would
@@ -133,6 +146,7 @@ pub const KNOWN_INLINE_SCRIPT_PREFIXES: &[&[u8]] = &[
     b"window.hydrate_queue=[];",
     b"window.initial_dioxus_hydration_data=\"",
     b"window.dx_hydrate(",
+    b"const STORAGE_KEY = \"SCHEDULED-DX-TOAST\";",
 ];
 
 /// axum middleware: generates the nonce, rewrites HTML, sets CSP.
@@ -211,13 +225,19 @@ fn rewrite_inline_scripts(body: &[u8], nonce: &str) -> Vec<u8> {
     out
 }
 
-/// True iff `script_body` starts with one of the dx-server 0.7.7 inline
-/// script prefixes. Defense-in-depth gate for the rewriter — see
+/// True iff `script_body` starts with one of the dx 0.7.x inline script
+/// prefixes. Defense-in-depth gate for the rewriter — see
 /// [`KNOWN_INLINE_SCRIPT_PREFIXES`].
+///
+/// Leading ASCII whitespace is stripped before testing so the dx-CLI
+/// dev-shell template (`<script>\n            const STORAGE_KEY = …`)
+/// matches alongside dioxus-server's tightly-packed output (which has
+/// no leading whitespace, so the trim is a no-op for those prefixes).
 fn script_body_is_dx_emitted(script_body: &[u8]) -> bool {
+    let trimmed = script_body.trim_ascii_start();
     KNOWN_INLINE_SCRIPT_PREFIXES
         .iter()
-        .any(|prefix| script_body.starts_with(prefix))
+        .any(|prefix| trimmed.starts_with(prefix))
 }
 
 #[cfg(test)]
@@ -497,6 +517,58 @@ mod tests {
                 std::str::from_utf8(prefix).unwrap_or("<non-utf8>")
             );
         }
+    }
+
+    /// PURA-104: the dx-CLI dev-shell `dev.index.html` bakes a dx-toast
+    /// runtime as an inline `<script>`. The body has HTML indentation
+    /// (newline + leading spaces) before the JS, so the gate's
+    /// leading-whitespace trim is what makes the prefix match. Without
+    /// the trim, Playwright QA against `dx serve --web` blocks because
+    /// the un-nonced toast script trips strict CSP and the page never
+    /// finishes hydrating.
+    #[test]
+    fn rewrite_nonces_dx_cli_dev_shell_toast_template() {
+        // Mirrors the head of `dev.index.html` from dioxus-cli 0.7.7
+        // (`assets/web/dev.index.html`, lines 101-105) — `<script>`,
+        // newline, twelve-space indent, then the storage-key declaration.
+        let body = b"<script>\n            const STORAGE_KEY = \"SCHEDULED-DX-TOAST\";\n            let currentTimeout = null;\n        </script>";
+        let out = rewrite_inline_scripts(body, "n4");
+        assert!(
+            out.starts_with(b"<script nonce=\"n4\">"),
+            "PURA-104: dx-CLI dev-shell dx-toast template must be nonced. Got: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+        // The body bytes after the rewritten tag are unchanged — only
+        // the open tag carries the new attribute.
+        assert!(
+            out.windows(b"const STORAGE_KEY = \"SCHEDULED-DX-TOAST\";".len())
+                .any(|w| w == b"const STORAGE_KEY = \"SCHEDULED-DX-TOAST\";"),
+            "rewriter must preserve the script body verbatim. Got: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    /// PURA-104 sanity: relaxing the gate to skip leading whitespace
+    /// must not relax it for arbitrary bodies — an attacker payload
+    /// padded with newlines/spaces (eg. via a pretty-printer that
+    /// indents user content) is still refused.
+    #[test]
+    fn rewrite_refuses_whitespace_padded_attacker_script() {
+        let evil = b"<script>\n            alert(1)\n        </script>";
+        let out = rewrite_inline_scripts(evil, "x");
+        assert_eq!(
+            out,
+            evil.to_vec(),
+            "leading-whitespace trim must not let attacker payloads through"
+        );
+
+        let near_miss = b"<script>\t  window.evil=1;</script>";
+        let out = rewrite_inline_scripts(near_miss, "x");
+        assert_eq!(
+            out,
+            near_miss.to_vec(),
+            "tab-prefixed near-miss must still fail the prefix gate"
+        );
     }
 
     /// Mixed-content sanity: a single buffer with an attacker tag, a
