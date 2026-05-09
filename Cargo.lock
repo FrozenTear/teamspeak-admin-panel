@@ -3483,6 +3483,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "hound"
+version = "3.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62adaabb884c94955b19907d60019f4e145d091c75345379e70d1ee696f7854f"
+
+[[package]]
 name = "html5ever"
 version = "0.35.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8135,6 +8141,23 @@ dependencies = [
  "audiopus",
  "clap",
  "futures",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "tsclientlib",
+ "tsproto-packets",
+]
+
+[[package]]
+name = "ts6-voice-prototype"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "audiopus",
+ "clap",
+ "futures",
+ "hound",
  "serde_json",
  "tokio",
  "tracing",

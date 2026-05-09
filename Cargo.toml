@@ -4,6 +4,7 @@ members = [
     "crates/shared",
     "crates/ts6-manager-server",
     "crates/ts6-voice-fixture",
+    "crates/ts6-voice-prototype",
 ]
 
 [workspace.package]

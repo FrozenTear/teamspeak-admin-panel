@@ -1,0 +1,46 @@
+[package]
+name = "ts6-voice-prototype"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "ts6-voice-prototype"
+path = "src/main.rs"
+
+[dependencies]
+# PURA-112 / PURA-108 WS-4 — "two clients can talk" prototype.
+#
+# Same tsclientlib pin as crates/ts6-voice-fixture (master @ 04aa249) — the
+# PURA-7 voice handshake spike verified this commit handshakes against TS6
+# and the PURA-7 Day-2 voice-tx leg verified frames are accepted on the wire.
+#
+# Unlike the connect-only fixture we keep `default-features = false` here
+# too (no resolver TLS — we connect to 127.0.0.1:9987 directly, no SRV
+# lookup needed) and pull `tsproto-packets` separately for `OutAudio` /
+# `AudioData` / `CodecType`. Opus encode/decode is done with `audiopus`
+# directly so we don't depend on tsclientlib's bundled `AudioHandler`
+# (which targets cpal/SDL2 for live playback — overkill for WAV capture).
+# `audio` feature pulls audiopus into tsclientlib and unlocks `StreamItem::Audio`
+# (the receive path is `#[cfg(feature = "audio")]`-gated upstream). `default-tls`
+# stays off because we connect to an IP:port directly, no SRV resolver needed.
+tsclientlib = { git = "https://github.com/ReSpeak/tsclientlib", rev = "04aa24917abbf6a0c8442a79742d6d2d40ecf71e", default-features = false, features = ["audio"] }
+tsproto-packets = { git = "https://github.com/ReSpeak/tsclientlib", rev = "04aa24917abbf6a0c8442a79742d6d2d40ecf71e" }
+
+# Opus 1.x via `audiopus` — same crate the PURA-7 Day-2 spike used. The
+# `0.3.0-rc.0` line is pre-release on crates.io but tracks the upstream
+# 1.x C library and is API-stable enough for a prototype.
+audiopus = "0.3.0-rc.0"
+
+# WAV writing — `hound` is the standard pure-Rust WAV encoder. We need
+# 16-bit PCM @ 48 kHz mono, which is its happy path.
+hound = "3.5"
+
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time", "fs", "io-util", "sync"] }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+futures = { workspace = true }
+serde_json = { workspace = true }
