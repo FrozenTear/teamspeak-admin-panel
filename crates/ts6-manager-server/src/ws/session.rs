@@ -327,7 +327,12 @@ impl SessionLoop {
                 for env in sub.replay {
                     self.send_envelope(env).await?;
                 }
-                let handle = spawn_forwarder(self.hub.clone(), self.out_tx.clone(), sub.receiver);
+                let handle = spawn_forwarder(
+                    self.hub.clone(),
+                    parsed,
+                    self.out_tx.clone(),
+                    sub.receiver,
+                );
                 self.subscriptions.insert(parsed, handle);
                 self.send_ack("subscribed", &topic).await?;
             }
@@ -408,34 +413,55 @@ async fn next_revoke(
     }
 }
 
+/// PURA-103 — per-subscription forwarder bridging the hub's per-server
+/// `broadcast` channel into this session's bounded `mpsc`. The hub fans
+/// out **every** event for `topic.server_id` regardless of `TopicKind`,
+/// so this task MUST drop any envelope whose `env.topic` does not match
+/// the subscribed topic — otherwise an operator-only `server:N:clients`
+/// `dashboard:tick` would leak to a public widget viewer subscribed to
+/// `server:N:widget`. The Hub::authorize gate runs at subscribe time and
+/// stops a widget token from asking for an operator topic, but the
+/// per-server broadcast crosses topic boundaries so the filter is
+/// load-bearing for confidentiality.
 fn spawn_forwarder(
     hub: Hub,
+    topic: super::topic::Topic,
     out: mpsc::Sender<Envelope>,
     mut rx: tokio::sync::broadcast::Receiver<Envelope>,
 ) -> tokio::task::JoinHandle<()> {
+    let topic_str = topic.to_string();
     tokio::spawn(async move {
         loop {
             match rx.recv().await {
-                Ok(env) => match out.try_send(env) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        hub.record_dropped();
-                        // Best-effort `dropped` ahead of close. The
-                        // session loop will pick up the channel close
-                        // signal and emit a final `dropped` envelope.
-                        let _ = out
-                            .send(Envelope {
-                                id: 0,
-                                topic: String::new(),
-                                kind: "dropped".into(),
-                                data: json!({"reason": "send-queue-overflow"}),
-                                ts: chrono::Utc::now().timestamp_millis(),
-                            })
-                            .await;
-                        return;
+                Ok(env) => {
+                    if env.topic != topic_str {
+                        // Different topic on the shared per-server
+                        // broadcast — silently drop. Not a backpressure
+                        // event, so do NOT emit a `dropped` envelope.
+                        continue;
                     }
-                    Err(mpsc::error::TrySendError::Closed(_)) => return,
-                },
+                    match out.try_send(env) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            hub.record_dropped();
+                            // Best-effort `dropped` ahead of close. The
+                            // session loop will pick up the channel
+                            // close signal and emit a final `dropped`
+                            // envelope.
+                            let _ = out
+                                .send(Envelope {
+                                    id: 0,
+                                    topic: String::new(),
+                                    kind: "dropped".into(),
+                                    data: json!({"reason": "send-queue-overflow"}),
+                                    ts: chrono::Utc::now().timestamp_millis(),
+                                })
+                                .await;
+                            return;
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => return,
+                    }
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                     hub.record_dropped();
                     let _ = out
@@ -511,6 +537,106 @@ mod tests {
     fn rejects_unknown_kind() {
         let r: Result<ClientFrame, _> = serde_json::from_str(r#"{"kind":"shutdown"}"#);
         assert!(r.is_err(), "unknown kind must fail to parse");
+    }
+
+    /// PURA-103 regression — `spawn_forwarder` MUST drop envelopes whose
+    /// `topic` does not match the subscribed `Topic`. Without this filter,
+    /// a public `server:N:widget` subscriber would receive operator-only
+    /// `server:N:clients` / `server:N:channels` `dashboard:tick` envelopes
+    /// (platform/version/uptime/bandwidth) leaked through the per-server
+    /// broadcast. This test fails on the pre-fix forwarder and passes on
+    /// the post-fix forwarder.
+    #[tokio::test]
+    async fn forwarder_drops_envelopes_for_other_topics_on_same_server() {
+        use crate::ws::topic::{Topic, TopicKind};
+        use serde_json::json;
+        use tokio::sync::broadcast;
+
+        let hub = Hub::new();
+        // Per-server broadcast standing in for the hub's per-server
+        // channel. The bug is that this channel carries every TopicKind
+        // for the server, and the forwarder used to forward all of them.
+        let (server_tx, server_rx) = broadcast::channel::<Envelope>(16);
+        let (out_tx, mut out_rx) = mpsc::channel::<Envelope>(16);
+
+        let widget_topic = Topic::new(1, TopicKind::Widget);
+        let clients_topic = Topic::new(1, TopicKind::Clients);
+        let channels_topic = Topic::new(1, TopicKind::Channels);
+
+        // Subscriber asks for the widget topic only.
+        let h = spawn_forwarder(hub, widget_topic, out_tx, server_rx);
+
+        // Operator-only payload (PURA-72 H-1 leak vector — full
+        // `dashboard:tick` with platform + version).
+        server_tx
+            .send(Envelope::new(
+                1,
+                &clients_topic,
+                "dashboard:tick",
+                json!({
+                    "serverName": "TeamSpeak 6 Server",
+                    "platform": "Linux",
+                    "version": "6.0.0-beta9 [Build:…]",
+                    "uptime": 1141,
+                    "onlineUsers": 0,
+                }),
+                0,
+            ))
+            .unwrap();
+        server_tx
+            .send(Envelope::new(
+                2,
+                &channels_topic,
+                "dashboard:tick",
+                json!({
+                    "serverName": "TeamSpeak 6 Server",
+                    "platform": "Linux",
+                    "channelCount": 1,
+                }),
+                0,
+            ))
+            .unwrap();
+        // The redacted widget stub IS for the subscribed topic — must be
+        // delivered.
+        server_tx
+            .send(Envelope::new(
+                3,
+                &widget_topic,
+                "widget:refresh",
+                json!({"refresh": true}),
+                0,
+            ))
+            .unwrap();
+
+        // Drop the sender so the forwarder exits its loop on Closed.
+        drop(server_tx);
+        let _ = h.await;
+
+        let mut received = Vec::new();
+        while let Some(env) = out_rx.recv().await {
+            received.push(env);
+        }
+
+        assert_eq!(
+            received.len(),
+            1,
+            "widget subscriber must only receive widget-topic envelopes; got {received:?}"
+        );
+        assert_eq!(received[0].topic, "server:1:widget");
+        assert_eq!(received[0].kind, "widget:refresh");
+        // Defence in depth: nothing leaked carries the operator
+        // `platform` field that spec §7.29 requires redacted on the
+        // public widget surface.
+        for env in &received {
+            assert!(
+                env.data.get("platform").is_none(),
+                "leaked platform field on forwarded envelope: {env:?}"
+            );
+            assert!(
+                env.data.get("version").is_none(),
+                "leaked version field on forwarded envelope: {env:?}"
+            );
+        }
     }
 
     #[test]
