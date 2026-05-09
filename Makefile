@@ -104,8 +104,8 @@ print("==> coturn OK"); s.close()'
 # than `voice-translator-smoke` even before the audio forwarding lands in
 # slices c-e. Operator notes: docs/voice-translator.md.
 
-.PHONY: voice-translator-build voice-translator-run voice-translator-test \
-        voice-translator-clean
+.PHONY: voice-translator-build voice-translator-run voice-translator-bridge-smoke \
+        voice-translator-test voice-translator-clean
 
 VOICE_TRANSLATOR_DURATION ?= 10
 VOICE_TRANSLATOR_OUT_DIR  ?= target/voice-translator
@@ -127,6 +127,45 @@ voice-translator-run: voice-translator-build
 
 voice-translator-test:
 	cargo test -p ts6-voice-translator
+
+# Slice-c bridge smoke: spin up the translator AND a TS6 prototype "alice"
+# that talks 440Hz for 8s, verify the translator counted frames forwarded
+# 1:1 from TS6 to LiveKit. Run after `make voice-translator-up`.
+# Pass criterion: audio_frames_seen == audio_frames_published, both > 0.
+voice-translator-bridge-smoke: voice-translator-build
+	@cargo build --release -p ts6-voice-prototype
+	@rm -rf $(VOICE_TRANSLATOR_OUT_DIR)/bridge-smoke
+	@mkdir -p $(VOICE_TRANSLATOR_OUT_DIR)/bridge-smoke/translator \
+	          $(VOICE_TRANSLATOR_OUT_DIR)/bridge-smoke/alice
+	@echo "==> spawning translator (15s window) + alice (8s of 440Hz tone)"
+	@./target/release/ts6-voice-translator \
+	    --ts6-server $(VOICE_TRANSLATOR_TS6) \
+	    --identity-dir $(VOICE_TRANSLATOR_OUT_DIR)/bridge-smoke/translator \
+	    --livekit-url $(VOICE_TRANSLATOR_LIVEKIT) \
+	    --livekit-room $(VOICE_TRANSLATOR_ROOM) \
+	    --duration-secs 15 \
+	    >$(VOICE_TRANSLATOR_OUT_DIR)/bridge-smoke/translator.log 2>&1 & \
+	  TRANS=$$!; \
+	  sleep 5; \
+	  ./target/release/ts6-voice-prototype \
+	      --server $(VOICE_TRANSLATOR_TS6) \
+	      --name alice --send-tone-hz 440 --duration-secs 8 \
+	      --identity-dir $(VOICE_TRANSLATOR_OUT_DIR)/bridge-smoke/alice \
+	      --out-wav $(VOICE_TRANSLATOR_OUT_DIR)/bridge-smoke/alice.wav \
+	      >$(VOICE_TRANSLATOR_OUT_DIR)/bridge-smoke/alice.log 2>&1; \
+	  wait $$TRANS
+	@grep -E "audio_frames_(seen|published)|exited cleanly" \
+	    $(VOICE_TRANSLATOR_OUT_DIR)/bridge-smoke/translator.log | tail -3
+	@python3 -c 'import re; \
+raw = open("$(VOICE_TRANSLATOR_OUT_DIR)/bridge-smoke/translator.log").read(); \
+log = re.sub(r"\x1b\[[0-9;]*[mGKH]", "", raw); \
+m = re.search(r"exited cleanly.*?audio_frames_seen=(\d+).*?audio_frames_published=(\d+)", log, re.DOTALL); \
+assert m, "translator did not exit cleanly with the audio counters line"; \
+seen, pub = int(m.group(1)), int(m.group(2)); \
+print(f"==> bridge frames: seen={seen} published={pub}"); \
+assert seen > 0, f"expected audio_frames_seen > 0, got {seen}"; \
+assert seen == pub, f"expected seen == published, got seen={seen} published={pub}"; \
+print("==> bridge smoke OK")'
 
 voice-translator-clean:
 	rm -rf $(VOICE_TRANSLATOR_OUT_DIR)

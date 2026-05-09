@@ -18,12 +18,16 @@ ships the SFU + TURN side of the WebRTC bridge per [ADR-0006 Decision B](./adr/0
   networking (`3478/udp+tcp` plus `49152-49252/udp` relay range).
 
 The translator daemon ships incrementally on the same [PURA-114](/PURA/issues/PURA-114)
-ticket. Slice b (the **scaffold** — `crates/ts6-voice-translator`) joins
-the TS6 voice room as a synthetic `tsclientlib` client, mints a LiveKit
-access token (HS256 JWT, video grant for the room), and brings up a
-stub LiveKit bridge so an operator can validate both legs of the bridge
-before audio forwarding lands. Slices c-e fill in the actual Opus
-forwarding — see "What remains in WS-7" below.
+ticket. Slice b shipped the **scaffold** (`crates/ts6-voice-translator`):
+TS6 handshake via `tsclientlib`, LiveKit access-token minter, and a stub
+publish bridge. Slice c (this revision) replaces the stub with the
+**real publisher**: the daemon now joins a LiveKit room with the
+official `livekit` Rust SDK, opens a `LocalAudioTrack` over a
+`NativeAudioSource`, and forwards inbound TS6 Opus voice frames into
+the LiveKit track 1:1. Browser participants subscribed to the room
+hear the synthetic `ts6-bridge` Microphone track (slice e wires the
+end-to-end browser demo). Slices d-e fill in the reverse path — see
+"What remains in WS-7" below.
 
 ## Bring-up
 
@@ -34,10 +38,16 @@ make voice-translator-up
 # Smoke check — LiveKit health on :7880 and a real STUN Binding Request to coturn
 make voice-translator-smoke
 
-# Slice-b daemon dry-run — TS6 handshake + LiveKit token mint + stub bridge
+# Slice-c daemon dry-run — TS6 handshake + LiveKit Room::connect + real
+# publisher track (no talker, no audio forwarded yet — exits cleanly).
 make voice-translator-run VOICE_TRANSLATOR_DURATION=10
 
-# Slice-b unit tests — JWT roundtrip + signature/TTL bounds
+# Slice-c bridge smoke — translator + a TS6 prototype "alice" talking
+# 440Hz for 8 s, asserts audio_frames_seen == audio_frames_published > 0.
+# Pass = the publisher track is forwarding TS6 Opus 1:1 into LiveKit.
+make voice-translator-bridge-smoke
+
+# Unit tests — JWT roundtrip + signature/TTL bounds
 make voice-translator-test
 
 # Tear down
@@ -113,6 +123,14 @@ on a dev box. For a real deployment:
    ```
    See the LiveKit upstream `config-sample.yaml` for the full schema.
 
+   Then flip `rtc.use_external_ip` back to `true` and add `node_ip:
+   <public-ip>` so LiveKit advertises the operator's reachable address
+   in ICE candidates. The dev profile sets `use_external_ip: false`
+   because LiveKit's STUN-based auto-detection picks up a WAN IP that
+   the local translator daemon (talking to `ws://127.0.0.1:7880`)
+   can't actually reach, so the peer-connection handshake times out
+   (`wait_pc_connection timed out`).
+
 3. Confirm the host firewall opens 3478, 7880-7882, and the coturn relay
    range. The compose mappings only land the ports inside the rootless
    network namespace — host firewall (`firewalld` / `nftables`) is the
@@ -160,13 +178,14 @@ browser demo land in the remaining slices on the same WS-7 epic
   handshake via `tsclientlib` (lifted from `ts6-voice-prototype`);
   LiveKit access-token minter (HS256 JWT, video grant); stub
   publish/subscribe bridge gating slice c. [Shipped.]
-- **WS-7c** — TS6 → LiveKit half-duplex. Replace `StubLiveKitBridge`
-  with a real `livekit` Rust SDK-backed implementation; forward
-  inbound TS6 Opus frames into a LiveKit room as a publisher track;
-  browser tab can hear native TS6 clients.
-- **WS-7d** — LiveKit → TS6 reverse path. Subscribe to LiveKit Opus,
-  forward into the TS6 voice room as a synthetic-client send so native
-  clients hear the browser.
+- ✅ **WS-7c** — TS6 → LiveKit half-duplex. Real `livekit` Rust SDK
+  publisher (`Room::connect` + `LocalAudioTrack` over a
+  `NativeAudioSource`). TS6 Opus → PCM → LiveKit RTP/Opus over
+  SRTP/DTLS. `make voice-translator-bridge-smoke` validates 1:1 frame
+  forwarding (401 frames over 8 s). [Shipped.]
+- **WS-7d** — LiveKit → TS6 reverse path. Subscribe to LiveKit Opus
+  on the same `Room` handle, forward into the TS6 voice room as a
+  synthetic-client send so native clients hear the browser.
 - **WS-7e** — Browser demo + acceptance recipe. LiveKit Web SDK demo
   page (or `meet.livekit.io` against the local SFU), end-to-end ≥30 s
   bidirectional audible voice between TS6 client and browser tab,

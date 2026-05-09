@@ -11,16 +11,19 @@
 
 port: 7880
 
-# Single UDP port mux. The compose mapping exposes 7882/udp so symmetric-NAT
-# clients reach the SFU through the host. Production deployments behind a
-# strict firewall pair this with `turn_servers` (coturn) below.
+# Single UDP port mux. With `network_mode: host` in podman-compose.yml the
+# bound interface is the host's, so ICE candidates advertise host IPs that
+# the translator + browser can actually reach. Production deployments
+# behind a strict firewall pair this with `turn_servers` (coturn) below.
 rtc:
   tcp_port: 7881
   udp_port: 7882
-  # `use_external_ip: true` lets LiveKit auto-detect its public IP via STUN
-  # so it advertises usable ICE candidates from inside a NATed dev box. On
-  # a Linux host with bound public IP this is harmless and idempotent.
-  use_external_ip: true
+  # Dev: stay on local interfaces, do NOT auto-detect the WAN IP via STUN.
+  # The auto-detected WAN IP is unreachable from a translator that talks
+  # ws://127.0.0.1:7880 (the IP appears in ICE candidates and the peer
+  # connection times out). Production operators flip this back to `true`
+  # alongside a `node_ip` override pointing at their public address.
+  use_external_ip: false
 
 # JWT auth. The committed value is obviously a development key — the
 # secret is the literal string "DEV_ONLY_CHANGE_ME…" so anyone scanning

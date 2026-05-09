@@ -110,10 +110,16 @@ services:
     # The committed file ships obviously-dev keys; production operators
     # override the file (or supply LIVEKIT_CONFIG_FILE pointing at their
     # own YAML) per docs/voice-translator.md.
-    ports:
-      - "7880:7880"             # WebSocket signaling + JWT auth
-      - "7881:7881"             # ICE/TCP fallback for restrictive networks
-      - "7882:7882/udp"         # ICE/UDP single-port mux (when use_external_ip is off)
+    #
+    # `network_mode: host` (matching ts6-fixture and coturn) is mandatory
+    # for the dev profile: LiveKit's WebRTC ICE candidates advertise the
+    # interface the SFU binds. Under rootless podman's bridge networking
+    # the bound interface is the container's private IP, which the host
+    # translator/browser can't reach, so the peer-connection handshake
+    # times out (`wait_pc_connection timed out`). Host networking makes
+    # the bound interface == the host's interface, which is reachable
+    # from translator + browser.
+    network_mode: host
     volumes:
       - ./deploy/voice/livekit.yaml:/etc/livekit/livekit.yaml:ro,Z
     restart: unless-stopped

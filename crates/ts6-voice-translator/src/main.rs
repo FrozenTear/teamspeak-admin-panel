@@ -31,8 +31,10 @@ use futures::StreamExt;
 use tokio::time::Instant;
 use tracing::{error, info, warn};
 
-use crate::livekit::{LiveKitConfig, StubLiveKitBridge};
+use crate::livekit::{LiveKitBridge, LiveKitConfig};
 use crate::ts6::{Ts6Config, Ts6Connection};
+use tsclientlib::StreamItem;
+use tsproto_packets::packets::{AudioData, CodecType};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -144,13 +146,16 @@ async fn main() -> Result<()> {
     let mut ts6 = Ts6Connection::connect(&ts6_config).await?;
     info!("TS6 handshake complete");
 
-    // 3. Stub LiveKit bridge — slice c plugs in the real Rust SDK.
-    let mut bridge = StubLiveKitBridge::connect(&livekit_config, &token).await?;
-    info!(state = ?bridge.state(), "LiveKit bridge stub up");
+    // 3. Real LiveKit bridge — `Room::connect` + `LocalAudioTrack` published
+    //    as `TrackSource::Microphone`. Slice d will subscribe to remote
+    //    Opus through the same `Room` handle and feed it back into TS6.
+    let mut bridge = LiveKitBridge::connect(&livekit_config, &token).await?;
+    info!(state = ?bridge.state(), "LiveKit bridge up");
 
-    // 4. Idle until duration. Slice c-e wires the actual Opus forwarding
-    //    into this loop. For the scaffold we drain TS6 events to keep
-    //    the connection healthy and emit a heartbeat log every 10 s.
+    // 4. Drive the TS6 event stream and forward inbound Opus voice frames
+    //    into the LiveKit publisher track. Heartbeat every 10 s carries the
+    //    forwarded-frame count so an operator can confirm audio is flowing
+    //    without having to grep the WAV outputs.
     let deadline = tokio::time::sleep(Duration::from_secs(cli.duration_secs));
     tokio::pin!(deadline);
     let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
@@ -158,11 +163,13 @@ async fn main() -> Result<()> {
     let mut tick = 0u64;
     let started = Instant::now();
     let mut events_seen = 0u64;
+    let mut audio_frames_seen = 0u64;
+    let mut audio_frames_published = 0u64;
 
     'outer: loop {
         // Borrow-checker dance from `ts6-voice-prototype`: the events
         // stream borrows the inner `Connection` for as long as it
-        // lives, which would conflict with future slice-c calls to
+        // lives, which would conflict with future slice-d calls to
         // `con.send_audio(...)` inside other arms. Create the events
         // future inline so `tokio::select!` drops the non-selected
         // arms' futures before running the chosen arm's body.
@@ -172,6 +179,8 @@ async fn main() -> Result<()> {
                 info!(
                     elapsed_ms = started.elapsed().as_millis() as u64,
                     events_seen,
+                    audio_frames_seen,
+                    audio_frames_published,
                     "duration reached — shutting down"
                 );
                 break 'outer;
@@ -182,22 +191,33 @@ async fn main() -> Result<()> {
                     tick,
                     elapsed_s = started.elapsed().as_secs(),
                     events_seen,
+                    audio_frames_seen,
+                    audio_frames_published,
                     bridge_state = ?bridge.state(),
                     "heartbeat"
                 );
             }
             ev = async { ts6.raw().events().next().await } => match ev {
-                Some(Ok(_item)) => {
+                Some(Ok(item)) => {
                     events_seen += 1;
-                    // Slice c: forward AudioData::S2C / S2CWhisper into
-                    // `bridge.publish_opus_frame(...)` here.
+                    if let Some((from, opus)) = extract_inbound_opus(&item) {
+                        audio_frames_seen += 1;
+                        // Decouple lifetime: the `opus` slice borrows the TS6
+                        // Connection's read buffer, so we must copy before the
+                        // bridge's `.await` resumes the event loop.
+                        let owned: Vec<u8> = opus.to_vec();
+                        match bridge.publish_opus_frame(from, &owned).await {
+                            Ok(()) => audio_frames_published += 1,
+                            Err(err) => warn!(?err, from, "publish_opus_frame failed"),
+                        }
+                    }
                 }
                 Some(Err(err)) => {
-                    error!(?err, "TS6 stream error during scaffold idle");
+                    error!(?err, "TS6 stream error");
                     break 'outer;
                 }
                 None => {
-                    warn!("TS6 stream ended during scaffold idle");
+                    warn!("TS6 stream ended");
                     break 'outer;
                 }
             }
@@ -206,6 +226,30 @@ async fn main() -> Result<()> {
 
     bridge.disconnect().await?;
     ts6.disconnect("ts6-voice-translator shutdown").await;
-    info!(events_seen, "ts6-voice-translator exited cleanly");
+    info!(
+        events_seen,
+        audio_frames_seen,
+        audio_frames_published,
+        "ts6-voice-translator exited cleanly"
+    );
     Ok(())
+}
+
+/// Pull `(speaker_id, opus_bytes)` out of a `StreamItem::Audio(InAudioBuf)`
+/// when the inbound packet is an Opus voice / whisper frame. Non-audio
+/// stream items and non-Opus codecs return `None`.
+fn extract_inbound_opus(item: &StreamItem) -> Option<(u16, &[u8])> {
+    let buf = match item {
+        StreamItem::Audio(buf) => buf,
+        _ => return None,
+    };
+    let (from, codec, data): (u16, CodecType, &[u8]) = match buf.data().data() {
+        AudioData::S2C { from, codec, data, .. } => (*from, *codec, *data),
+        AudioData::S2CWhisper { from, codec, data, .. } => (*from, *codec, *data),
+        _ => return None,
+    };
+    if !matches!(codec, CodecType::OpusVoice | CodecType::OpusMusic) {
+        return None;
+    }
+    Some((from, data))
 }

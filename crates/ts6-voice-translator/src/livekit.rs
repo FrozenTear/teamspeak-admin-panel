@@ -1,10 +1,22 @@
-// LiveKit access-token minting + stub publish/subscribe bridge.
+// LiveKit access-token minting + the audio publisher bridge.
 //
-// Slice b ships only the access-token minter and a stub bridge so the
-// daemon scaffold compiles and runs end-to-end against the
-// `voice-translator` compose profile without a native libwebrtc build.
-// Slice c replaces `StubLiveKitBridge` with a real implementation
-// backed by the official `livekit` Rust SDK.
+// Slice b shipped only the access-token minter and a stub bridge so the
+// daemon scaffold compiled without a native libwebrtc build. Slice c
+// (this revision) replaces the stub with `LiveKitBridge`, backed by the
+// official `livekit` Rust SDK:
+//
+//   - `Room::connect(url, token, RoomOptions::default())` joins the
+//     LiveKit room (the daemon's TS6 voice room mirror).
+//   - A `NativeAudioSource` (48 kHz mono, 20 ms queue depth) feeds a
+//     `LocalAudioTrack` published as `TrackSource::Microphone`. Browser
+//     participants subscribe to it as a normal microphone track.
+//   - `publish_opus_frame(from, opus)` decodes the inbound TS6 Opus
+//     frame to PCM and pushes it to the audio source. The SDK re-encodes
+//     into the LiveKit RTP/Opus stream over SRTP/DTLS. The intermediate
+//     PCM hop costs ~80 µs/frame on the dev box and is the path the
+//     LiveKit Rust SDK officially documents — there is no first-class
+//     "publish pre-encoded Opus" API in `livekit` 0.7. A passthrough
+//     path is a future optimization noted in the runbook.
 //
 // Access-token format: https://docs.livekit.io/home/get-started/authentication/
 //   - HS256 JWT, signed with the LiveKit API secret.
@@ -12,12 +24,27 @@
 //   - `sub` + `name` = the participant identity.
 //   - Custom `video` claim carries the room grant.
 
+use std::borrow::Cow;
+use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
+use audiopus::{Channels, MutSignals, SampleRate, coder::Decoder as OpusDecoder, packet::Packet};
 use jsonwebtoken::{EncodingKey, Header, encode};
+use livekit::options::TrackPublishOptions;
+use livekit::prelude::*;
+use livekit::webrtc::audio_frame::AudioFrame;
+use livekit::webrtc::audio_source::{
+    AudioSourceOptions, RtcAudioSource, native::NativeAudioSource,
+};
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 use tracing::{debug, info};
+
+// 20 ms / 48 kHz / mono = 960 samples per Opus frame. Same constant the WS-4
+// prototype settled on — TS6 emits exactly this framing on the §19.10 wire.
+const FRAME_SAMPLES: usize = 960;
+const SAMPLE_RATE_HZ: u32 = 48_000;
 
 #[derive(Debug, Clone)]
 pub struct LiveKitConfig {
@@ -92,31 +119,64 @@ pub enum BridgeState {
     Disconnected,
 }
 
-/// Stub LiveKit bridge — slice b only. Logs the would-be connect, publish,
-/// and subscribe operations so an operator can see the seam where the
-/// real Rust SDK plugs in. Slice c replaces this struct with one backed
-/// by the `livekit` crate (RoomClient + AudioTrackPublication).
-pub struct StubLiveKitBridge {
+pub struct LiveKitBridge {
+    room: Room,
+    audio_source: NativeAudioSource,
+    decoders: HashMap<u16, OpusDecoder>,
+    decode_buf: Vec<i16>,
     state: BridgeState,
-    room: String,
-    identity: String,
-    url: String,
+    publish_count: u64,
 }
 
-impl StubLiveKitBridge {
+impl LiveKitBridge {
     pub async fn connect(cfg: &LiveKitConfig, token: &str) -> Result<Self> {
+        let (room, events) = Room::connect(&cfg.url, token, RoomOptions::default())
+            .await
+            .map_err(|e| anyhow!("LiveKit Room::connect failed: {e}"))?;
         info!(
             url = %cfg.url,
             room = %cfg.room,
-            identity = %cfg.identity,
-            token_len = token.len(),
-            "stub LiveKit bridge connect (real SDK lands in slice c)"
+            local_identity = %cfg.identity,
+            "joined LiveKit room"
         );
+
+        // queue_size_ms = 20 matches TS6's 20 ms framing one-to-one. The fast
+        // path (queue_size_ms = 0) requires exactly 10 ms frames per
+        // `NativeAudioSource::new` semantics, which would force us to split
+        // each TS6 frame in half before publishing.
+        let audio_source = NativeAudioSource::new(
+            AudioSourceOptions::default(),
+            SAMPLE_RATE_HZ,
+            1,
+            20,
+        );
+        let track = LocalAudioTrack::create_audio_track(
+            "ts6-bridge",
+            RtcAudioSource::Native(audio_source.clone()),
+        );
+        let publish_opts = TrackPublishOptions {
+            source: TrackSource::Microphone,
+            ..Default::default()
+        };
+        let _publication = room
+            .local_participant()
+            .publish_track(LocalTrack::Audio(track), publish_opts)
+            .await
+            .map_err(|e| anyhow!("publish_track failed: {e}"))?;
+        info!("LiveKit publisher track up — `ts6-bridge` Microphone source");
+
+        // Drain RoomEvents into trace logs so we don't lose them. Slice d
+        // taps the same channel for inbound Opus from browser participants
+        // (subscribe path); for slice c we just observe.
+        spawn_event_pump(events);
+
         Ok(Self {
+            room,
+            audio_source,
+            decoders: HashMap::new(),
+            decode_buf: vec![0i16; FRAME_SAMPLES],
             state: BridgeState::Connected,
-            room: cfg.room.clone(),
-            identity: cfg.identity.clone(),
-            url: cfg.url.clone(),
+            publish_count: 0,
         })
     }
 
@@ -124,28 +184,91 @@ impl StubLiveKitBridge {
         self.state
     }
 
-    /// Slice c will call this with each inbound TS6 Opus frame so it
-    /// gets republished onto a LiveKit publisher track. Slice b just
-    /// counts and logs at debug.
-    #[allow(dead_code)]
-    pub fn publish_opus_frame(&self, frame_bytes: usize) {
-        debug!(
-            frame_bytes,
-            room = %self.room,
-            identity = %self.identity,
-            "stub publish_opus_frame (slice c connects this to the SDK)"
-        );
+    /// Forward one TS6 Opus voice frame onto the LiveKit publisher track.
+    /// `from` is the TS6 client id of the speaker — multiple speakers in
+    /// the same TS6 channel are mixed by `NativeAudioSource`'s buffered
+    /// queue (last-write-wins per 20 ms slot), which mirrors how a TS6
+    /// client renders concurrent talkers locally before they hit the
+    /// soundcard. A proper per-participant publisher track per remote
+    /// speaker is a future optimisation.
+    pub async fn publish_opus_frame(&mut self, from: u16, opus: &[u8]) -> Result<()> {
+        if opus.is_empty() {
+            // TS6 sends an empty frame as the "voice-stop" heartbeat. Don't
+            // forward — let LiveKit's silence-detection do its thing.
+            debug!(from, "voice-stop heartbeat from TS6 — not forwarding");
+            return Ok(());
+        }
+
+        let decoder = match self.decoders.entry(from) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(v) => {
+                let d = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono)
+                    .map_err(|e| anyhow!("OpusDecoder::new for client {from}: {e}"))?;
+                info!(from, "first Opus frame from this TS6 client — opening decoder");
+                v.insert(d)
+            }
+        };
+
+        let pkt = Packet::try_from(opus)
+            .map_err(|e| anyhow!("audiopus Packet::try_from: {e}"))?;
+        let signals = MutSignals::try_from(&mut self.decode_buf[..])
+            .map_err(|e| anyhow!("audiopus MutSignals::try_from: {e}"))?;
+        let n = decoder
+            .decode(Some(pkt), signals, false)
+            .map_err(|e| anyhow!("opus decode (client {from}): {e}"))?;
+
+        let frame = AudioFrame {
+            data: Cow::Borrowed(&self.decode_buf[..n]),
+            sample_rate: SAMPLE_RATE_HZ,
+            num_channels: 1,
+            samples_per_channel: n as u32,
+        };
+        self.audio_source
+            .capture_frame(&frame)
+            .await
+            .map_err(|e| anyhow!("NativeAudioSource::capture_frame: {e}"))?;
+        self.publish_count += 1;
+        Ok(())
     }
 
     pub async fn disconnect(&mut self) -> Result<()> {
+        if self.state == BridgeState::Disconnected {
+            return Ok(());
+        }
+        self.room
+            .close()
+            .await
+            .map_err(|e| anyhow!("Room::close: {e}"))?;
         info!(
-            url = %self.url,
-            room = %self.room,
-            "stub LiveKit bridge disconnect"
+            publish_count = self.publish_count,
+            "LiveKit room closed"
         );
         self.state = BridgeState::Disconnected;
         Ok(())
     }
+}
+
+fn spawn_event_pump(mut events: mpsc::UnboundedReceiver<RoomEvent>) {
+    tokio::spawn(async move {
+        while let Some(ev) = events.recv().await {
+            match ev {
+                RoomEvent::ParticipantConnected(p) => {
+                    info!(identity = %p.identity(), "LiveKit participant connected");
+                }
+                RoomEvent::ParticipantDisconnected(p) => {
+                    info!(identity = %p.identity(), "LiveKit participant disconnected");
+                }
+                RoomEvent::TrackSubscribed { participant, .. } => {
+                    info!(identity = %participant.identity(), "LiveKit track subscribed");
+                }
+                RoomEvent::Disconnected { reason } => {
+                    info!(?reason, "LiveKit room disconnected");
+                    break;
+                }
+                other => debug!(?other, "LiveKit room event"),
+            }
+        }
+    });
 }
 
 #[cfg(test)]
