@@ -29,7 +29,12 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, anyhow};
-use audiopus::{Channels, MutSignals, SampleRate, coder::Decoder as OpusDecoder, packet::Packet};
+use audiopus::{
+    Application, Channels, MutSignals, SampleRate,
+    coder::{Decoder as OpusDecoder, Encoder as OpusEncoder},
+    packet::Packet,
+};
+use futures::StreamExt;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use livekit::options::TrackPublishOptions;
 use livekit::prelude::*;
@@ -37,9 +42,10 @@ use livekit::webrtc::audio_frame::AudioFrame;
 use livekit::webrtc::audio_source::{
     AudioSourceOptions, RtcAudioSource, native::NativeAudioSource,
 };
+use livekit::webrtc::audio_stream::native::NativeAudioStream;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 // 20 ms / 48 kHz / mono = 960 samples per Opus frame. Same constant the WS-4
 // prototype settled on — TS6 emits exactly this framing on the §19.10 wire.
@@ -119,13 +125,22 @@ pub enum BridgeState {
     Disconnected,
 }
 
+/// Reverse-path Opus frame: a 20 ms / 48 kHz mono Opus payload encoded
+/// from a remote LiveKit participant's audio. Main loop forwards each
+/// of these into the TS6 voice room as a synthetic-client send so
+/// native TS6 clients hear the browser participant.
+pub type InboundOpusFrame = Vec<u8>;
+
 pub struct LiveKitBridge {
     room: Room,
     audio_source: NativeAudioSource,
     decoders: HashMap<u16, OpusDecoder>,
     decode_buf: Vec<i16>,
     state: BridgeState,
-    publish_count: u64,
+    /// Receiver for browser-side Opus frames produced by per-track
+    /// subscriber tasks spawned in `connect`. Drained by the main
+    /// loop's `select!` and forwarded into TS6.
+    inbound_opus_rx: mpsc::Receiver<InboundOpusFrame>,
 }
 
 impl LiveKitBridge {
@@ -165,10 +180,16 @@ impl LiveKitBridge {
             .map_err(|e| anyhow!("publish_track failed: {e}"))?;
         info!("LiveKit publisher track up — `ts6-bridge` Microphone source");
 
-        // Drain RoomEvents into trace logs so we don't lose them. Slice d
-        // taps the same channel for inbound Opus from browser participants
-        // (subscribe path); for slice c we just observe.
-        spawn_event_pump(events);
+        // Slice d: per-track subscriber tasks send 20 ms Opus frames here,
+        // drained by the main loop's `select!`. Bounded so a stalled TS6
+        // sender backs pressure into the LiveKit subscribe path instead of
+        // queueing unbounded across the bridge.
+        let (inbound_opus_tx, inbound_opus_rx) = mpsc::channel::<InboundOpusFrame>(256);
+
+        // Pump RoomEvents: log everything, and on every TrackSubscribed
+        // for an audio track, spawn a per-track subscriber that produces
+        // 20 ms Opus frames into `inbound_opus_tx`.
+        spawn_event_pump(events, inbound_opus_tx);
 
         Ok(Self {
             room,
@@ -176,8 +197,14 @@ impl LiveKitBridge {
             decoders: HashMap::new(),
             decode_buf: vec![0i16; FRAME_SAMPLES],
             state: BridgeState::Connected,
-            publish_count: 0,
+            inbound_opus_rx,
         })
+    }
+
+    /// Consume the next browser-side Opus frame produced by a subscribed
+    /// remote audio track. Returns `None` when the bridge's room closes.
+    pub async fn recv_inbound_opus(&mut self) -> Option<InboundOpusFrame> {
+        self.inbound_opus_rx.recv().await
     }
 
     pub fn state(&self) -> BridgeState {
@@ -227,7 +254,6 @@ impl LiveKitBridge {
             .capture_frame(&frame)
             .await
             .map_err(|e| anyhow!("NativeAudioSource::capture_frame: {e}"))?;
-        self.publish_count += 1;
         Ok(())
     }
 
@@ -239,16 +265,16 @@ impl LiveKitBridge {
             .close()
             .await
             .map_err(|e| anyhow!("Room::close: {e}"))?;
-        info!(
-            publish_count = self.publish_count,
-            "LiveKit room closed"
-        );
+        info!("LiveKit room closed");
         self.state = BridgeState::Disconnected;
         Ok(())
     }
 }
 
-fn spawn_event_pump(mut events: mpsc::UnboundedReceiver<RoomEvent>) {
+fn spawn_event_pump(
+    mut events: mpsc::UnboundedReceiver<RoomEvent>,
+    inbound_opus_tx: mpsc::Sender<InboundOpusFrame>,
+) {
     tokio::spawn(async move {
         while let Some(ev) = events.recv().await {
             match ev {
@@ -258,8 +284,24 @@ fn spawn_event_pump(mut events: mpsc::UnboundedReceiver<RoomEvent>) {
                 RoomEvent::ParticipantDisconnected(p) => {
                     info!(identity = %p.identity(), "LiveKit participant disconnected");
                 }
-                RoomEvent::TrackSubscribed { participant, .. } => {
-                    info!(identity = %participant.identity(), "LiveKit track subscribed");
+                RoomEvent::TrackSubscribed { track, participant, .. } => {
+                    let identity = participant.identity().to_string();
+                    match track {
+                        RemoteTrack::Audio(audio) => {
+                            info!(
+                                identity = %identity,
+                                sid = %audio.sid(),
+                                "LiveKit audio track subscribed — spawning reverse-path encoder"
+                            );
+                            spawn_audio_subscriber(audio, identity, inbound_opus_tx.clone());
+                        }
+                        RemoteTrack::Video(_) => {
+                            debug!(identity = %identity, "ignoring subscribed video track");
+                        }
+                    }
+                }
+                RoomEvent::TrackUnsubscribed { participant, .. } => {
+                    info!(identity = %participant.identity(), "LiveKit track unsubscribed");
                 }
                 RoomEvent::Disconnected { reason } => {
                     info!(?reason, "LiveKit room disconnected");
@@ -268,6 +310,92 @@ fn spawn_event_pump(mut events: mpsc::UnboundedReceiver<RoomEvent>) {
                 other => debug!(?other, "LiveKit room event"),
             }
         }
+    });
+}
+
+/// Per-track reverse-path task. Drains the `NativeAudioStream` for one
+/// remote audio track, accumulates 10 ms PCM blocks into 20 ms windows
+/// (TS6's §19.10 framing), encodes each window to Opus with a fresh
+/// `OpusEncoder`, and forwards over the bridge's inbound channel.
+///
+/// Each subscribed track gets its own encoder so multiple browser
+/// participants don't fight for the same predictor state. Slice e
+/// (browser demo) is the natural acceptance gate for this path.
+fn spawn_audio_subscriber(
+    audio: RemoteAudioTrack,
+    identity: String,
+    inbound_opus_tx: mpsc::Sender<InboundOpusFrame>,
+) {
+    tokio::spawn(async move {
+        // The public `NativeAudioStream::new` takes (track, sample_rate,
+        // num_channels). Backpressure is handled inside the SDK; if the
+        // consumer falls behind, the SDK drops the oldest queued frames
+        // (live-voice-friendly behaviour).
+        let mut stream = NativeAudioStream::new(
+            audio.rtc_track(),
+            SAMPLE_RATE_HZ as i32,
+            1,
+        );
+
+        let encoder = match OpusEncoder::new(
+            SampleRate::Hz48000,
+            Channels::Mono,
+            Application::Voip,
+        ) {
+            Ok(e) => e,
+            Err(err) => {
+                warn!(?err, identity = %identity, "OpusEncoder::new failed; track abandoned");
+                return;
+            }
+        };
+
+        // 20 ms Opus frame fits comfortably under 1 KB at typical voice bitrates;
+        // a 4 KB scratch buffer is a generous upper bound.
+        let mut opus_out = vec![0u8; 4096];
+        let mut frame_window: Vec<i16> = Vec::with_capacity(FRAME_SAMPLES * 2);
+        let mut frames_published = 0u64;
+
+        while let Some(frame) = stream.next().await {
+            // The SDK sometimes delivers frames at sample rates other than
+            // what we asked for (typical when libwebrtc resamples internally
+            // before the sink). Skip such frames; we ask for 48 kHz mono.
+            if frame.sample_rate != SAMPLE_RATE_HZ || frame.num_channels != 1 {
+                debug!(
+                    sample_rate = frame.sample_rate,
+                    num_channels = frame.num_channels,
+                    "dropping LiveKit frame with unexpected format"
+                );
+                continue;
+            }
+            frame_window.extend_from_slice(&frame.data);
+
+            while frame_window.len() >= FRAME_SAMPLES {
+                let window: Vec<i16> = frame_window.drain(..FRAME_SAMPLES).collect();
+                let opus_len = match encoder.encode(&window, &mut opus_out[..]) {
+                    Ok(n) => n,
+                    Err(err) => {
+                        warn!(?err, "opus encode failed; dropping window");
+                        continue;
+                    }
+                };
+                let opus_frame: InboundOpusFrame = opus_out[..opus_len].to_vec();
+                if inbound_opus_tx.send(opus_frame).await.is_err() {
+                    debug!(
+                        identity = %identity,
+                        frames_published,
+                        "inbound Opus channel closed — bridge consumer gone"
+                    );
+                    return;
+                }
+                frames_published += 1;
+            }
+        }
+
+        info!(
+            identity = %identity,
+            frames_published,
+            "LiveKit audio subscriber drained — track ended"
+        );
     });
 }
 

@@ -105,7 +105,7 @@ print("==> coturn OK"); s.close()'
 # slices c-e. Operator notes: docs/voice-translator.md.
 
 .PHONY: voice-translator-build voice-translator-run voice-translator-bridge-smoke \
-        voice-translator-test voice-translator-clean
+        voice-translator-reverse-smoke voice-translator-test voice-translator-clean
 
 VOICE_TRANSLATOR_DURATION ?= 10
 VOICE_TRANSLATOR_OUT_DIR  ?= target/voice-translator
@@ -166,6 +166,76 @@ print(f"==> bridge frames: seen={seen} published={pub}"); \
 assert seen > 0, f"expected audio_frames_seen > 0, got {seen}"; \
 assert seen == pub, f"expected seen == published, got seen={seen} published={pub}"; \
 print("==> bridge smoke OK")'
+
+
+# Slice-d reverse-path smoke. Spawns two translator instances (T1, T2)
+# joined to the same LiveKit room with distinct identities; each subscribes
+# to the other's published track and forwards remote Opus into TS6 as a
+# synthetic-client send. Pass criterion: at least one instance reports
+# `reverse_frames_received > 0`, proving the LiveKit → TS6 forwarding
+# path fires end-to-end. Looser than the slice-c bridge smoke because
+# without a non-TS6 audio source the closed loop is symmetric and prone
+# to amplification — slice e's browser demo is the natural acceptance
+# gate for the full reverse path.
+#
+# Operator note: this test brings up two TS6 connections from 127.0.0.1
+# in quick succession; if you've recently run other TS6 prototypes on
+# the same fixture the IP rate-limiter may ban one of the connections.
+# Reset the fixture data volume first if so:
+#
+#   JWT_SECRET=devjwt podman-compose --profile voice-translator down -v
+#   make voice-translator-up
+voice-translator-reverse-smoke: voice-translator-build
+	@cargo build --release -p ts6-voice-prototype
+	@rm -rf $(VOICE_TRANSLATOR_OUT_DIR)/reverse-smoke
+	@mkdir -p $(VOICE_TRANSLATOR_OUT_DIR)/reverse-smoke/t1 \
+	          $(VOICE_TRANSLATOR_OUT_DIR)/reverse-smoke/t2 \
+	          $(VOICE_TRANSLATOR_OUT_DIR)/reverse-smoke/alice
+	@echo "==> spawning T1 (28s) + T2 (22s) + alice (12s of 440Hz) in the same LiveKit room"
+	@./target/release/ts6-voice-translator \
+	    --ts6-server $(VOICE_TRANSLATOR_TS6) \
+	    --identity-dir $(VOICE_TRANSLATOR_OUT_DIR)/reverse-smoke/t1 \
+	    --ts6-name translator-1 \
+	    --livekit-url $(VOICE_TRANSLATOR_LIVEKIT) \
+	    --livekit-room $(VOICE_TRANSLATOR_ROOM) \
+	    --livekit-identity translator-1 \
+	    --duration-secs 28 \
+	    >$(VOICE_TRANSLATOR_OUT_DIR)/reverse-smoke/t1.log 2>&1 & \
+	  T1=$$!; \
+	  sleep 6; \
+	  ./target/release/ts6-voice-translator \
+	      --ts6-server $(VOICE_TRANSLATOR_TS6) \
+	      --identity-dir $(VOICE_TRANSLATOR_OUT_DIR)/reverse-smoke/t2 \
+	      --ts6-name translator-2 \
+	      --livekit-url $(VOICE_TRANSLATOR_LIVEKIT) \
+	      --livekit-room $(VOICE_TRANSLATOR_ROOM) \
+	      --livekit-identity translator-2 \
+	      --duration-secs 22 \
+	      >$(VOICE_TRANSLATOR_OUT_DIR)/reverse-smoke/t2.log 2>&1 & \
+	  T2=$$!; \
+	  sleep 4; \
+	  ./target/release/ts6-voice-prototype \
+	      --server $(VOICE_TRANSLATOR_TS6) \
+	      --name alice --send-tone-hz 440 --duration-secs 12 \
+	      --identity-dir $(VOICE_TRANSLATOR_OUT_DIR)/reverse-smoke/alice \
+	      --out-wav $(VOICE_TRANSLATOR_OUT_DIR)/reverse-smoke/alice.wav \
+	      >$(VOICE_TRANSLATOR_OUT_DIR)/reverse-smoke/alice.log 2>&1; \
+	  wait $$T2; wait $$T1
+	@SUM=0; for tag in t1 t2; do \
+	    LOG=$(VOICE_TRANSLATOR_OUT_DIR)/reverse-smoke/$$tag.log; \
+	    PLAIN=$$(sed 's/\x1b\[[0-9;]*[mGKH]//g' $$LOG); \
+	    N=$$(printf '%s' "$$PLAIN" | grep -oE 'exited cleanly.*reverse_frames_received=[0-9]+' \
+	        | grep -oE '[0-9]+$$' | head -1); \
+	    [ -z "$$N" ] && N=0; \
+	    echo "==> $$tag: reverse_frames_received=$$N"; \
+	    SUM=$$((SUM + N)); \
+	done; \
+	if [ "$$SUM" -gt 0 ]; then \
+	    echo "==> reverse smoke OK (total received=$$SUM)"; \
+	else \
+	    echo "FAIL: expected at least one translator to report reverse_frames_received > 0"; \
+	    exit 1; \
+	fi
 
 voice-translator-clean:
 	rm -rf $(VOICE_TRANSLATOR_OUT_DIR)

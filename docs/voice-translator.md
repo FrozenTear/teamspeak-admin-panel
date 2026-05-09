@@ -47,6 +47,12 @@ make voice-translator-run VOICE_TRANSLATOR_DURATION=10
 # Pass = the publisher track is forwarding TS6 Opus 1:1 into LiveKit.
 make voice-translator-bridge-smoke
 
+# Slice-d reverse smoke — two translator instances + alice on TS6.
+# Each translator subscribes to the other's published track and forwards
+# remote Opus into TS6. Pass = at least one translator reports
+# reverse_frames_received > 0.
+make voice-translator-reverse-smoke
+
 # Unit tests — JWT roundtrip + signature/TTL bounds
 make voice-translator-test
 
@@ -183,9 +189,13 @@ browser demo land in the remaining slices on the same WS-7 epic
   `NativeAudioSource`). TS6 Opus → PCM → LiveKit RTP/Opus over
   SRTP/DTLS. `make voice-translator-bridge-smoke` validates 1:1 frame
   forwarding (401 frames over 8 s). [Shipped.]
-- **WS-7d** — LiveKit → TS6 reverse path. Subscribe to LiveKit Opus
-  on the same `Room` handle, forward into the TS6 voice room as a
-  synthetic-client send so native clients hear the browser.
+- ✅ **WS-7d** — LiveKit → TS6 reverse path. `RoomEvent::TrackSubscribed`
+  spawns a per-track subscriber that drains a `NativeAudioStream`,
+  reframes 10 ms PCM blocks into 20 ms windows (TS6's §19.10 framing),
+  encodes to Opus with `audiopus`, and forwards via mpsc to the main
+  loop, which calls `ts6.send_audio` as a synthetic-client send.
+  `make voice-translator-reverse-smoke` validates the path end-to-end
+  with two translator instances + a TS6 talker. [Shipped.]
 - **WS-7e** — Browser demo + acceptance recipe. LiveKit Web SDK demo
   page (or `meet.livekit.io` against the local SFU), end-to-end ≥30 s
   bidirectional audible voice between TS6 client and browser tab,

@@ -34,7 +34,7 @@ use tracing::{error, info, warn};
 use crate::livekit::{LiveKitBridge, LiveKitConfig};
 use crate::ts6::{Ts6Config, Ts6Connection};
 use tsclientlib::StreamItem;
-use tsproto_packets::packets::{AudioData, CodecType};
+use tsproto_packets::packets::{AudioData, CodecType, OutAudio};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -165,22 +165,31 @@ async fn main() -> Result<()> {
     let mut events_seen = 0u64;
     let mut audio_frames_seen = 0u64;
     let mut audio_frames_published = 0u64;
+    let mut reverse_frames_received = 0u64;
+    let mut reverse_frames_sent = 0u64;
 
     'outer: loop {
         // Borrow-checker dance from `ts6-voice-prototype`: the events
         // stream borrows the inner `Connection` for as long as it
-        // lives, which would conflict with future slice-d calls to
-        // `con.send_audio(...)` inside other arms. Create the events
-        // future inline so `tokio::select!` drops the non-selected
-        // arms' futures before running the chosen arm's body.
+        // lives, which would conflict with `con.send_audio(...)` calls
+        // inside other arms. Create the events future inline so
+        // `tokio::select!` drops the non-selected arms' futures
+        // before running the chosen arm's body.
+        //
+        // No `biased;` here: TS6 events and LiveKit inbound Opus both
+        // arrive at ~50 fps. With biased ordering the events arm wins
+        // every tie and starves `recv_inbound_opus`, leaving the
+        // reverse-path channel full and the SDK's audio queue
+        // overflowing. Random selection drains both fairly.
         tokio::select! {
-            biased;
             _ = &mut deadline => {
                 info!(
                     elapsed_ms = started.elapsed().as_millis() as u64,
                     events_seen,
                     audio_frames_seen,
                     audio_frames_published,
+                    reverse_frames_received,
+                    reverse_frames_sent,
                     "duration reached — shutting down"
                 );
                 break 'outer;
@@ -193,32 +202,60 @@ async fn main() -> Result<()> {
                     events_seen,
                     audio_frames_seen,
                     audio_frames_published,
+                    reverse_frames_received,
+                    reverse_frames_sent,
                     bridge_state = ?bridge.state(),
                     "heartbeat"
                 );
             }
-            ev = async { ts6.raw().events().next().await } => match ev {
-                Some(Ok(item)) => {
-                    events_seen += 1;
-                    if let Some((from, opus)) = extract_inbound_opus(&item) {
-                        audio_frames_seen += 1;
-                        // Decouple lifetime: the `opus` slice borrows the TS6
-                        // Connection's read buffer, so we must copy before the
-                        // bridge's `.await` resumes the event loop.
-                        let owned: Vec<u8> = opus.to_vec();
-                        match bridge.publish_opus_frame(from, &owned).await {
-                            Ok(()) => audio_frames_published += 1,
-                            Err(err) => warn!(?err, from, "publish_opus_frame failed"),
+            ev = async { ts6.raw().events().next().await } => {
+                match ev {
+                    Some(Ok(item)) => {
+                        events_seen += 1;
+                        if let Some((from, opus)) = extract_inbound_opus(&item) {
+                            audio_frames_seen += 1;
+                            // Decouple lifetime: the `opus` slice borrows the TS6
+                            // Connection's read buffer, so we must copy before the
+                            // bridge's `.await` resumes the event loop.
+                            let owned: Vec<u8> = opus.to_vec();
+                            match bridge.publish_opus_frame(from, &owned).await {
+                                Ok(()) => audio_frames_published += 1,
+                                Err(err) => warn!(?err, from, "publish_opus_frame failed"),
+                            }
                         }
                     }
+                    Some(Err(err)) => {
+                        error!(?err, "TS6 stream error");
+                        break 'outer;
+                    }
+                    None => {
+                        warn!("TS6 stream ended");
+                        break 'outer;
+                    }
                 }
-                Some(Err(err)) => {
-                    error!(?err, "TS6 stream error");
-                    break 'outer;
-                }
-                None => {
-                    warn!("TS6 stream ended");
-                    break 'outer;
+            }
+            // Reverse path (slice d): browser-side Opus arriving from a
+            // remote LiveKit participant, encoded back to 20 ms / 48 kHz /
+            // mono Opus by the per-track subscriber. Forward as a
+            // synthetic-client send so native TS6 clients hear the browser.
+            maybe_opus = bridge.recv_inbound_opus() => {
+                match maybe_opus {
+                    Some(opus) => {
+                        reverse_frames_received += 1;
+                        let pkt = OutAudio::new(&AudioData::C2S {
+                            id: 0,
+                            codec: CodecType::OpusVoice,
+                            data: &opus,
+                        });
+                        match ts6.raw().send_audio(pkt) {
+                            Ok(()) => reverse_frames_sent += 1,
+                            Err(err) => warn!(?err, "ts6 send_audio for reverse-path frame failed"),
+                        }
+                    }
+                    None => {
+                        warn!("LiveKit inbound Opus channel closed — bridge gone");
+                        break 'outer;
+                    }
                 }
             }
         }
@@ -230,6 +267,8 @@ async fn main() -> Result<()> {
         events_seen,
         audio_frames_seen,
         audio_frames_published,
+        reverse_frames_received,
+        reverse_frames_sent,
         "ts6-voice-translator exited cleanly"
     );
     Ok(())
