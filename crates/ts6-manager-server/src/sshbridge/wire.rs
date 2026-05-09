@@ -1,6 +1,15 @@
 //! Spec §11.4 — ServerQuery line-protocol wire parsing for the SSH bridge.
 //!
-//! The SSH session yields a CR-LF terminated stream. Three line shapes matter:
+//! The SSH session yields a line-terminated stream. The spec says
+//! "CR-LF terminated", but the live TS6 SSH ServerQuery (libssh-backed,
+//! observed against `teamspeak6-server:6.0.0-beta9`) actually emits
+//! **LF then CR** (`\n\r`) — the bytes of every banner / body / error
+//! line look like `TS3\n\r`, `error id=0 msg=ok\n\r`, etc. PURA-101.
+//! [`LineBuffer::drain_lines`] is tolerant of all three styles
+//! (`\r\n`, `\n`, `\n\r`) by stripping any leading or trailing `\r`
+//! around the `\n` split.
+//!
+//! Three line shapes matter:
 //!
 //! - `notify*` — events. First space-separated token is the event name; the
 //!   remainder is a pipe-separated list of records, each record a
@@ -99,7 +108,17 @@ impl LineBuffer {
         Ok(())
     }
 
-    /// Drain every complete (CR-LF terminated) line from the buffer.
+    /// Drain every complete line from the buffer.
+    ///
+    /// Tolerant of three line-ending styles around the `\n` split byte:
+    /// CR-LF (`\r\n`), LF only (`\n`), and LF-CR (`\n\r`). The TS6 SSH
+    /// ServerQuery actually emits LF-CR (PURA-101), so the leading `\r`
+    /// from the prior line's terminator arrives at the *start* of the
+    /// next line — we strip both leading and trailing `\r` around each
+    /// `\n` boundary. Without the leading-`\r` strip, `error id=0 msg=ok`
+    /// arrives as `\rerror id=0 msg=ok` and [`Frame::classify`] folds it
+    /// into [`Frame::Body`] instead of detecting the terminator, so
+    /// `read_banner` hangs until its deadline.
     ///
     /// Empty lines are discarded per spec §11.4. The trailing partial line
     /// (if any) stays in the buffer for the next [`push`].
@@ -118,12 +137,16 @@ impl LineBuffer {
         let mut i = 0usize;
         while i < self.pending.len() {
             if self.pending[i] == b'\n' {
+                let mut s = start;
+                while s < i && self.pending[s] == b'\r' {
+                    s += 1;
+                }
                 let mut end = i;
-                if end > start && self.pending[end - 1] == b'\r' {
+                while end > s && self.pending[end - 1] == b'\r' {
                     end -= 1;
                 }
-                if end > start {
-                    out.push(String::from_utf8_lossy(&self.pending[start..end]).into_owned());
+                if end > s {
+                    out.push(String::from_utf8_lossy(&self.pending[s..end]).into_owned());
                 }
                 // empty lines silently discarded
                 start = i + 1;
@@ -279,6 +302,43 @@ mod tests {
         let mut buf = LineBuffer::new();
         buf.push(b"first\nsecond\n").unwrap();
         assert_eq!(buf.drain_lines(), vec!["first", "second"]);
+    }
+
+    /// PURA-101 regression — the live TS6 SSH ServerQuery emits LF-CR
+    /// (`\n\r`), not the spec's nominal CR-LF. Without the leading-`\r`
+    /// strip the second line surfaces as `\rWelcome…` and the `error`
+    /// terminator surfaces as `\rerror id=0 msg=ok`, so
+    /// `Frame::classify` folds the terminator into `Frame::Body` and
+    /// `read_banner` hangs until its deadline.
+    #[test]
+    fn line_buffer_handles_lf_cr_ts6_wire() {
+        let mut buf = LineBuffer::new();
+        // Bytes captured from `teamspeak6-server:6.0.0-beta9` SSH
+        // ServerQuery on `whoami` + auto-`error` terminator.
+        buf.push(b"TS3\n\rWelcome\n\rerror id=0 msg=ok\n\r")
+            .unwrap();
+        let lines = buf.drain_lines();
+        assert_eq!(lines, vec!["TS3", "Welcome", "error id=0 msg=ok"]);
+        // Trailing `\r` from the last LF-CR has no following `\n`, so it
+        // stays in the buffer waiting for the next push.
+        // A subsequent LF-CR line continues to parse cleanly.
+        buf.push(b"second\n\r").unwrap();
+        assert_eq!(buf.drain_lines(), vec!["second"]);
+    }
+
+    /// PURA-101 regression — verify the LF-CR fix doesn't smear lines
+    /// when bytes arrive split across multiple `recv()` calls. The
+    /// transport layer pushes whatever russh hands it, which can split
+    /// at any byte boundary — including between the `\n` and the
+    /// trailing `\r`.
+    #[test]
+    fn line_buffer_lf_cr_split_across_pushes() {
+        let mut buf = LineBuffer::new();
+        // Split between `TS3\n` and `\rerror`.
+        buf.push(b"TS3\n").unwrap();
+        assert_eq!(buf.drain_lines(), vec!["TS3"]);
+        buf.push(b"\rerror id=0 msg=ok\n\r").unwrap();
+        assert_eq!(buf.drain_lines(), vec!["error id=0 msg=ok"]);
     }
 
     #[test]

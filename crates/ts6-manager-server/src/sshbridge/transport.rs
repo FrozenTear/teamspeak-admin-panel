@@ -1006,6 +1006,37 @@ mod tests {
         assert_eq!(lines[0], "TS3");
     }
 
+    /// PURA-101 — live TS6 SSH ServerQuery emits LF-CR (`\n\r`), not
+    /// the spec's nominal CR-LF. Before the [`super::wire::LineBuffer`]
+    /// fix, `error id=0 msg=ok\n\r` arrived after a leading `\r` from
+    /// the prior line's terminator and fell through `Frame::classify`
+    /// as `Frame::Body`, so `read_banner` hung until `banner_timeout`
+    /// fired. This regression wires the exact byte pattern observed
+    /// against `teamspeak6-server:6.0.0-beta9` through `read_banner`.
+    #[tokio::test]
+    async fn read_banner_accepts_ts6_lf_cr_wire() {
+        let (mut channel, read_tx, _writes) = StubChannel::new();
+        let mut parser = LineBuffer::new();
+        let cfg = test_cfg();
+
+        // Single SSH packet carrying the full banner exactly as the
+        // live fixture sends it: every line LF-CR terminated.
+        read_tx
+            .send(Ok(Some(
+                b"TS3\n\rWelcome to the TeamSpeak ServerQuery interface\n\rerror id=0 msg=ok\n\r"
+                    .to_vec(),
+            )))
+            .await
+            .unwrap();
+
+        let lines = read_banner(&mut channel, &mut parser, &cfg)
+            .await
+            .expect("LF-CR banner must parse to Ok");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "TS3");
+        assert!(lines[1].contains("ServerQuery"));
+    }
+
     #[tokio::test]
     async fn read_banner_surfaces_nonzero_error_as_upstream() {
         let (mut channel, read_tx, _writes) = StubChannel::new();
