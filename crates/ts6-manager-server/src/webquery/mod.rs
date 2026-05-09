@@ -227,7 +227,9 @@ impl WebQueryClient {
         self.config_id
     }
 
-    /// Issue a GET request and parse the spec §10.5 envelope.
+    /// Issue a GET request and parse the spec §10.5 envelope as a list-shaped
+    /// body. Use [`Self::get_one`] for inherently single-row commands; the
+    /// TS6 wire wraps those in a one-element array (see [`OneOrSingleton`]).
     ///
     /// `path` is everything after the host:port — e.g. `/version` for an
     /// instance-scoped command, `/3/serverinfo` for a sid-scoped one.
@@ -239,6 +241,30 @@ impl WebQueryClient {
         params: &[(&str, &str)],
     ) -> WebQueryResult<T> {
         self.request(Method::GET, path, params).await
+    }
+
+    /// Singleton variant of [`Self::get`]. TS6's HTTP query interface wraps
+    /// `body` in a one-element JSON array even for inherently single-row
+    /// commands (`serverinfo`, `hostinfo`, `version`, `clientinfo`,
+    /// `channelinfo`, `banadd`, …). This helper accepts either `body: {...}`
+    /// (the legacy TS3 shape preserved for older fixtures) or `body: [{...}]`
+    /// (the TS6-beta9 shape captured in the field) and yields one `T`.
+    ///
+    /// Note: the dispatch is done on `serde_json::Value` rather than via an
+    /// `#[serde(untagged)]` wrapper. Some response models (`HostInfo`,
+    /// `ConnectionInfo`) declare every field with `#[serde(default)]`, which
+    /// causes the auto-derived `visit_seq` path to accept a JSON array as a
+    /// positional struct and silently default every field. Going through
+    /// `Value` makes the array-vs-object decision before model decoding.
+    async fn get_one<T: for<'de> Deserialize<'de>>(
+        &self,
+        path: &str,
+        params: &[(&str, &str)],
+    ) -> WebQueryResult<T> {
+        let body: serde_json::Value = self.request(Method::GET, path, params).await?;
+        let one = unwrap_singleton_body(body)?;
+        serde_json::from_value(one)
+            .map_err(|e| WebQueryError::InvalidResponse(format!("singleton body decode: {e}")))
     }
 
     async fn request<T: for<'de> Deserialize<'de>>(
@@ -340,7 +366,7 @@ impl WebQueryClient {
 
     /// `version` (instance scope). Phase 1 health probe per §10.7.
     pub async fn version(&self) -> WebQueryResult<VersionInfo> {
-        self.get::<VersionInfo>("/version", &[]).await
+        self.get_one::<VersionInfo>("/version", &[]).await
     }
 
     /// Returns true if [`Self::version`] succeeds. Suitable for the cheap
@@ -357,7 +383,7 @@ impl WebQueryClient {
 
     /// `serverinfo` (sid scope).
     pub async fn serverinfo(&self, sid: i64) -> WebQueryResult<ServerInfo> {
-        self.get::<ServerInfo>(&format!("/{sid}/serverinfo"), &[])
+        self.get_one::<ServerInfo>(&format!("/{sid}/serverinfo"), &[])
             .await
     }
 
@@ -375,7 +401,7 @@ impl WebQueryClient {
 
     /// `serverrequestconnectioninfo` (sid scope).
     pub async fn server_connection_info(&self, sid: i64) -> WebQueryResult<ConnectionInfo> {
-        self.get::<ConnectionInfo>(
+        self.get_one::<ConnectionInfo>(
             &format!("/{sid}/serverrequestconnectioninfo"),
             &[],
         )
@@ -403,7 +429,7 @@ impl WebQueryClient {
     /// `clientinfo` (sid scope).
     pub async fn clientinfo(&self, sid: i64, clid: i64) -> WebQueryResult<ClientInfo> {
         let clid_s = clid.to_string();
-        self.get::<ClientInfo>(
+        self.get_one::<ClientInfo>(
             &format!("/{sid}/clientinfo"),
             &[("clid", clid_s.as_str())],
         )
@@ -430,7 +456,7 @@ impl WebQueryClient {
     /// `clientdbinfo` (sid scope).
     pub async fn clientdbinfo(&self, sid: i64, cldbid: i64) -> WebQueryResult<ClientDbEntry> {
         let cldbid_s = cldbid.to_string();
-        self.get::<ClientDbEntry>(
+        self.get_one::<ClientDbEntry>(
             &format!("/{sid}/clientdbinfo"),
             &[("cldbid", cldbid_s.as_str())],
         )
@@ -452,7 +478,7 @@ impl WebQueryClient {
     /// `channelinfo` (sid scope).
     pub async fn channelinfo(&self, sid: i64, cid: i64) -> WebQueryResult<ChannelInfo> {
         let cid_s = cid.to_string();
-        self.get::<ChannelInfo>(
+        self.get_one::<ChannelInfo>(
             &format!("/{sid}/channelinfo"),
             &[("cid", cid_s.as_str())],
         )
@@ -475,7 +501,7 @@ impl WebQueryClient {
 
     /// `hostinfo` (instance scope).
     pub async fn hostinfo(&self) -> WebQueryResult<HostInfo> {
-        self.get::<HostInfo>("/hostinfo", &[]).await
+        self.get_one::<HostInfo>("/hostinfo", &[]).await
     }
 
     /// `logview` (sid scope) — paginated log retrieval. Defaults follow
@@ -641,7 +667,7 @@ impl WebQueryClient {
             time_s = t.to_string();
             q.push(("time", time_s.as_str()));
         }
-        let resp: BanAddResponse = self.get(&format!("/{sid}/banadd"), &q).await?;
+        let resp: BanAddResponse = self.get_one(&format!("/{sid}/banadd"), &q).await?;
         Ok(resp.banid)
     }
 
@@ -675,9 +701,10 @@ impl WebQueryClient {
         let cid_s = cid.to_string();
         let cldbid_s = cldbid.to_string();
         // `-permsid` toggles the symbolic name in the response (matches the
-        // §7.7 channelpermlist projection).
+        // §7.7 channelpermlist projection). Same query-string flag rule as
+        // `clientlist`/`channellist` — TS6 rejects path-suffix concatenation.
         self.list_or_empty::<ChannelClientPerm>(
-            &format!("/{sid}/channelclientpermlist-permsid"),
+            &format!("/{sid}/channelclientpermlist{}", flag_suffix(&["permsid"])),
             &[("cid", cid_s.as_str()), ("cldbid", cldbid_s.as_str())],
         )
         .await
@@ -694,15 +721,24 @@ enum UnitBody {
     Tuple(()),
 }
 
-/// Render `&[&str]` flags into the `-foo-bar` suffix the TS WebQuery URL
-/// uses for command flags (e.g. `clientlist-uid-away`). An empty slice
-/// returns the empty string so callers can unconditionally append it.
+/// Render `&[&str]` flags into the query-string suffix TS6 WebQuery uses
+/// for command flags (e.g. `?-uid&-away` for `clientlist`). TS3-era path
+/// concatenation (`clientlist-uid-away`) is rejected by TS6 with code 1538
+/// (`invalid parameter`); the bare-key query form is what the upstream's
+/// own `curl -G` examples produce. An empty slice returns the empty string
+/// so callers can unconditionally append it.
 fn flag_suffix(flags: &[&str]) -> String {
     if flags.is_empty() {
         return String::new();
     }
-    let mut out = String::with_capacity(flags.iter().map(|f| f.len() + 1).sum());
+    let mut out = String::with_capacity(flags.iter().map(|f| f.len() + 2).sum::<usize>() + 1);
+    out.push('?');
+    let mut first = true;
     for flag in flags {
+        if !first {
+            out.push('&');
+        }
+        first = false;
         out.push('-');
         out.push_str(flag.trim_start_matches('-'));
     }
@@ -725,6 +761,26 @@ pub struct BanAddParams<'a> {
     /// Ban duration in seconds. `Some(0)` is permanent per §7.12; `None`
     /// omits the field entirely (upstream defaults apply).
     pub time: Option<i64>,
+}
+
+/// Unwrap the TS6 singleton-wrap shape into a bare JSON value suitable for
+/// model decoding. Accepts either `{...}` (the legacy TS3 shape kept around
+/// for older fixtures) or `[{...}]` (TS6 wire — `6.0.0-beta9` captured).
+/// Multi-element arrays and empty arrays are rejected as `InvalidResponse`
+/// to surface wiring mistakes (e.g. a list-shaped command routed through
+/// [`WebQueryClient::get_one`] by accident).
+fn unwrap_singleton_body(body: serde_json::Value) -> WebQueryResult<serde_json::Value> {
+    match body {
+        serde_json::Value::Array(mut arr) if arr.len() == 1 => Ok(arr.pop().unwrap()),
+        serde_json::Value::Array(arr) if arr.is_empty() => Err(WebQueryError::InvalidResponse(
+            "expected single-element body, got empty array".into(),
+        )),
+        serde_json::Value::Array(arr) => Err(WebQueryError::InvalidResponse(format!(
+            "expected single-element body, got {}-element array",
+            arr.len()
+        ))),
+        other => Ok(other),
+    }
 }
 
 /// Spec §10.5 envelope. Always parsed, regardless of HTTP status.

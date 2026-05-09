@@ -46,8 +46,11 @@ async fn handler_version(
     if !key_matches(&headers, &state.expected_api_key) {
         return upstream_error(1283, "client_query_login_failed");
     }
+    // TS6 wire shape captured against `6.0.0-beta9`: singleton commands
+    // wrap `body` in a one-element array. The legacy `body: {...}` form is
+    // exercised by `singleton_envelope_accepts_legacy_object_shape` below.
     Json(json!({
-        "body": {"version": "3.13.7", "build": "20250101", "platform": "Linux"},
+        "body": [{"version": "3.13.7", "build": "20250101", "platform": "Linux"}],
         "status": {"code": 0, "message": "ok"},
     }))
     .into_response()
@@ -100,10 +103,14 @@ async fn handler_clientlist(
     State(state): State<MockState>,
     headers: HeaderMap,
     Path(_sid): Path<i64>,
+    axum::extract::RawQuery(raw): axum::extract::RawQuery,
 ) -> impl IntoResponse {
     if !key_matches(&headers, &state.expected_api_key) {
         return upstream_error(1283, "client_query_login_failed");
     }
+    // Capture the raw query string (not the parsed map) so flag-only tests
+    // can assert the exact `-uid&-away` wire format TS6 expects.
+    *state.captured_channel_query.lock().unwrap() = raw;
     Json(json!({
         "body": [
             {"clid": "10", "client_type": "0", "client_nickname": "Alice"},
@@ -124,8 +131,9 @@ async fn handler_serverinfo(
     if !key_matches(&headers, &state.expected_api_key) {
         return upstream_error(1283, "client_query_login_failed");
     }
+    // TS6 singleton wire shape: `body` wrapped in a one-element array.
     Json(json!({
-        "body": {
+        "body": [{
             "virtualserver_name": "Alpha",
             "virtualserver_platform": "Linux",
             "virtualserver_version": "3.13.7",
@@ -133,7 +141,7 @@ async fn handler_serverinfo(
             "virtualserver_uptime": "12345",
             "virtualserver_total_packetloss_total": "0.001",
             "virtualserver_total_ping": "12.5"
-        },
+        }],
         "status": {"code": 0, "message": "ok"},
     }))
     .into_response()
@@ -148,10 +156,10 @@ async fn handler_connection_info(
         return upstream_error(1283, "client_query_login_failed");
     }
     Json(json!({
-        "body": {
+        "body": [{
             "connection_bandwidth_received_last_second_total": "1000",
             "connection_bandwidth_sent_last_second_total": "2000"
-        },
+        }],
         "status": {"code": 0, "message": "ok"},
     }))
     .into_response()
@@ -213,7 +221,7 @@ impl MockServer {
             .route("/{sid}/clientmove", get(handler_clientmove))
             .route("/{sid}/clientedit", get(handler_clientedit))
             .route(
-                "/{sid}/channelclientpermlist-permsid",
+                "/{sid}/channelclientpermlist",
                 get(handler_channelclientpermlist),
             )
             .with_state(state.clone());
@@ -490,7 +498,7 @@ async fn handler_hostinfo(
         return upstream_error(1283, "client_query_login_failed");
     }
     Json(json!({
-        "body": {
+        "body": [{
             "instance_uptime": "12345",
             "host_timestamp_utc": "1700000000",
             "virtualservers_running_total": "2",
@@ -503,7 +511,7 @@ async fn handler_hostinfo(
             "connection_packets_received_total": "9999",
             "connection_bytes_sent_total": "5000000",
             "connection_bytes_received_total": "4999999",
-        },
+        }],
         "status": {"code": 0, "message": "ok"},
     }))
     .into_response()
@@ -520,7 +528,7 @@ async fn handler_clientinfo(
     }
     let clid = params.get("clid").cloned().unwrap_or_default();
     Json(json!({
-        "body": {
+        "body": [{
             "client_unique_identifier": format!("uid-{clid}="),
             "client_nickname": "Alice",
             "client_database_id": "1000",
@@ -533,7 +541,7 @@ async fn handler_clientinfo(
             "client_country": "DE",
             "connection_client_ip": "203.0.113.10",
             "client_servergroups": "8,9",
-        },
+        }],
         "status": {"code": 0, "message": "ok"},
     }))
     .into_response()
@@ -587,7 +595,7 @@ async fn handler_channelinfo(
         return upstream_error(1283, "client_query_login_failed");
     }
     Json(json!({
-        "body": {
+        "body": [{
             "channel_name": "Default Channel",
             "channel_topic": "topic",
             "channel_description": "desc",
@@ -599,7 +607,7 @@ async fn handler_channelinfo(
             "pid": "0",
             "channel_flag_permanent": "1",
             "channel_needed_talk_power": "0",
-        },
+        }],
         "status": {"code": 0, "message": "ok"},
     }))
     .into_response()
@@ -694,7 +702,7 @@ async fn handler_banadd(
         params.get("banreason").cloned().unwrap_or_default(),
     ));
     Json(json!({
-        "body": {"banid": "11"},
+        "body": [{"banid": "11"}],
         "status": {"code": 0, "message": "ok"},
     }))
     .into_response()
@@ -1050,12 +1058,83 @@ async fn channelclientpermlist_translates_1281_to_empty() {
 }
 
 #[tokio::test]
-async fn flag_suffix_renders_dash_prefixed_chain() {
-    // White-box: flag_suffix is the URL builder used by clientlist /
-    // channellist callers; cover both empty and prefix-tolerant inputs.
+async fn flag_suffix_renders_query_string_flag_chain() {
+    // PURA-102 (Defect 2): TS6 rejects path-concat (`clientlist-uid-away`)
+    // with code 1538. Bare-key query form (`?-uid&-away`) is the upstream's
+    // own documented input. Cover empty and prefix-tolerant inputs.
     assert_eq!(super::flag_suffix(&[]), "");
-    assert_eq!(super::flag_suffix(&["uid", "away"]), "-uid-away");
-    assert_eq!(super::flag_suffix(&["-uid", "-away"]), "-uid-away");
+    assert_eq!(super::flag_suffix(&["uid", "away"]), "?-uid&-away");
+    assert_eq!(super::flag_suffix(&["-uid", "-away"]), "?-uid&-away");
+}
+
+#[tokio::test]
+async fn clientlist_with_flags_emits_query_string_flags() {
+    // PURA-102 (Defect 2): wire-level proof that `clientlist -uid -away`
+    // hits the upstream as `clientlist?-uid&-away` (no path concat, no
+    // `=` after the flags). Captured by [`handler_clientlist`] from the
+    // raw request URI.
+    let server = MockServer::start("k").await;
+    let client = build_client(&server, "k");
+
+    let _ = client
+        .clientlist_with_flags(1, &["uid", "away"])
+        .await
+        .expect("clientlist_with_flags decodes the response");
+
+    let raw = server
+        .state
+        .captured_channel_query
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("handler must have captured the request query");
+    assert_eq!(
+        raw, "-uid&-away",
+        "TS6 expects bare-key query flags; got `{raw}`"
+    );
+}
+
+#[test]
+fn unwrap_singleton_body_accepts_legacy_object_shape() {
+    // PURA-102 (Defect 1): the singleton dispatch must still pass through
+    // the legacy `body: {...}` form so TS3-shaped fixtures and any future
+    // proxies that unwrap the array on our behalf keep decoding cleanly.
+    let v = json!({"version": "3.13.7", "build": "20250101", "platform": "Linux"});
+    let unwrapped = super::unwrap_singleton_body(v.clone()).unwrap();
+    assert_eq!(unwrapped, v);
+    let info: VersionInfo = serde_json::from_value(unwrapped).unwrap();
+    assert_eq!(info.version, "3.13.7");
+}
+
+#[test]
+fn unwrap_singleton_body_accepts_ts6_array_wrap() {
+    // PURA-102 (Defect 1): TS6 always wraps singleton bodies in a one-
+    // element array. Dispatch must unwrap it transparently.
+    let v = json!([{"version": "6.0.0-beta9", "build": "1776774292", "platform": "Linux"}]);
+    let unwrapped = super::unwrap_singleton_body(v).unwrap();
+    let info: VersionInfo = serde_json::from_value(unwrapped).unwrap();
+    assert_eq!(info.version, "6.0.0-beta9");
+    assert_eq!(info.build, "1776774292");
+}
+
+#[test]
+fn unwrap_singleton_body_rejects_multi_element_array() {
+    // Defensive: a multi-element array on a singleton call indicates a
+    // wiring mistake (a list-shaped command got routed through `get_one`).
+    // Surface it as `InvalidResponse` so we get a clear error instead of
+    // silently dropping the extra rows.
+    let v = json!([
+        {"version": "a", "build": "1", "platform": "Linux"},
+        {"version": "b", "build": "2", "platform": "Linux"}
+    ]);
+    let err = super::unwrap_singleton_body(v).unwrap_err();
+    assert!(matches!(err, WebQueryError::InvalidResponse(_)));
+}
+
+#[test]
+fn unwrap_singleton_body_rejects_empty_array() {
+    let err = super::unwrap_singleton_body(json!([])).unwrap_err();
+    assert!(matches!(err, WebQueryError::InvalidResponse(_)));
 }
 
 // =========================================================================
