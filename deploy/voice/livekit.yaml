@@ -1,0 +1,51 @@
+# LiveKit dev config for the voice-translator compose profile.
+#
+# PURA-108 WS-7 / PURA-114, ADR-0006 Decision B. This file ships with
+# development defaults so `podman-compose --profile voice-translator up`
+# brings the SFU up rootless without further configuration. Production
+# operators override the bind ports, the API key, and the `turn_servers`
+# block via environment variables and a per-deployment override file —
+# see docs/voice-translator.md.
+#
+# Reference: github.com/livekit/livekit/blob/master/config-sample.yaml
+
+port: 7880
+
+# Single UDP port mux. The compose mapping exposes 7882/udp so symmetric-NAT
+# clients reach the SFU through the host. Production deployments behind a
+# strict firewall pair this with `turn_servers` (coturn) below.
+rtc:
+  tcp_port: 7881
+  udp_port: 7882
+  # `use_external_ip: true` lets LiveKit auto-detect its public IP via STUN
+  # so it advertises usable ICE candidates from inside a NATed dev box. On
+  # a Linux host with bound public IP this is harmless and idempotent.
+  use_external_ip: true
+
+# JWT auth. The committed value is obviously a development key — the
+# secret is the literal string "DEV_ONLY_CHANGE_ME…" so anyone scanning
+# the running container can tell at a glance the deployment is unhardened.
+# Production operators replace this file (or `--config` flag points at
+# their own YAML) with `openssl rand -hex 32` secrets per
+# docs/voice-translator.md.
+keys:
+  devkey: DEV_ONLY_CHANGE_ME_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+
+# Logging — pretty for dev, JSON in production. Set `LIVEKIT_LOG_FORMAT`
+# in the operator override to flip.
+logging:
+  level: info
+
+# Default room template. The translator (lands in WS-7 slice b) creates rooms
+# named after TS6 channel ids and joins them as a publisher/subscriber.
+# `enabled_codecs` is documented under LiveKit's room config; the v1.7
+# schema accepts `audio/opus` and `audio/red`.
+room:
+  enabled_codecs:
+    - mime: audio/opus
+  empty_timeout: 300
+
+# coturn integration is configured via the `turn` block in production
+# overrides; an empty/omitted block falls back to LiveKit's embedded ICE
+# (which the dev profile relies on). See docs/voice-translator.md for the
+# turn block once a realm/secret are decided.

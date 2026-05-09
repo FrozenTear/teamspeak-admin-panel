@@ -77,6 +77,7 @@ services:
     image: docker.io/teamspeaksystems/teamspeak6-server:latest
     profiles:
       - ts6-fixture
+      - voice-translator
     network_mode: host
     environment:
       TSSERVER_LICENSE_ACCEPTED: accept
@@ -85,6 +86,65 @@ services:
     volumes:
       - ts6-fixture-data:/var/tsserver
     restart: "no"
+
+  # PURA-108 WS-7 / PURA-114 — Phase 3.5 WebRTC bridge translator. Self-hosted
+  # SFU per ADR-0006 Decision B. Operator brings the bridge up alongside the
+  # TS6 fixture with:
+  #
+  #   podman-compose --profile voice-translator up -d
+  #
+  # The translator daemon (ts6-voice-translator crate, lands in a follow-up
+  # WS-7 slice) joins the TS6 voice room as a synthetic tsclientlib client and
+  # bridges Opus frames to LiveKit room participants, including browser tabs
+  # speaking WebRTC. Until the daemon ships, this profile gives operators the
+  # SFU + TURN surface to bring up and smoke-test independently. See
+  # docs/voice-translator.md for env vars, port surface, and the JWT key
+  # rotation playbook.
+  livekit:
+    container_name: ts6-livekit
+    image: docker.io/livekit/livekit-server:v1.7
+    profiles:
+      - voice-translator
+    command: ["--config", "/etc/livekit/livekit.yaml"]
+    # API key + secret live in deploy/voice/livekit.yaml under `keys:`.
+    # The committed file ships obviously-dev keys; production operators
+    # override the file (or supply LIVEKIT_CONFIG_FILE pointing at their
+    # own YAML) per docs/voice-translator.md.
+    ports:
+      - "7880:7880"             # WebSocket signaling + JWT auth
+      - "7881:7881"             # ICE/TCP fallback for restrictive networks
+      - "7882:7882/udp"         # ICE/UDP single-port mux (when use_external_ip is off)
+    volumes:
+      - ./deploy/voice/livekit.yaml:/etc/livekit/livekit.yaml:ro,Z
+    restart: unless-stopped
+
+  # coturn TURN/STUN relay. Required for symmetric-NAT browser participants.
+  # Operators on public-IP boxes without restrictive firewalls can disable
+  # this service and fall back to LiveKit's embedded ICE; see ADR-0006
+  # Decision B (TURN) and docs/voice-translator.md.
+  coturn:
+    container_name: ts6-coturn
+    image: docker.io/coturn/coturn:4.6
+    profiles:
+      - voice-translator
+    network_mode: host
+    command:
+      - --no-cli
+      - --no-tls
+      - --no-dtls
+      - --listening-port=3478
+      - --realm=${COTURN_REALM:-voice.local}
+      - --use-auth-secret
+      - --static-auth-secret=${COTURN_AUTH_SECRET:-devturnsecretdevturnsecretdevturn}
+      - --min-port=49152
+      - --max-port=49252
+      - --log-file=stdout
+      # Production deployments add `--no-loopback-peers` and
+      # `--no-multicast-peers` — they exist in upstream coturn but are
+      # built out of the official `coturn/coturn` Docker image. The
+      # operator-runbook section in docs/voice-translator.md covers the
+      # equivalent guard via `denied-peer-ip` for hardened deployments.
+    restart: unless-stopped
 
 volumes:
   ts6-db:
