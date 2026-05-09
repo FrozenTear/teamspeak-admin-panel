@@ -1,0 +1,33 @@
+[package]
+name = "ts6-voice-fixture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "ts6-voice-fixture"
+path = "src/main.rs"
+
+[dependencies]
+# PURA-106 — connect-only headless voice-client fixture for V4/V7 visual e2e.
+#
+# We pin tsclientlib to upstream master @ 04aa249 (NOT the published 0.2.0).
+# Reason: the PURA-7 voice-handshake spike (closed 2026-05-08, document
+# #document-final-memo) verified this commit handshakes against a real TS6
+# server; the published 0.2.0 is the older TS3-only protocol revision and
+# fails on the TS6 license-chain block tag (verified live in this run —
+# `IntermediateInvalidData(260)`). Pin is intentional, not "latest" — bump
+# only with the spec-author / VoiceProtocol coordinated.
+#
+# `default-features = false` drops `audio` (audiopus/SDL2) and `default-tls`
+# (system TLS for resolver) — silence is fine for V4/V7 and we don't need
+# the resolver's HTTPS lookup against an IP:port fixture.
+tsclientlib = { git = "https://github.com/ReSpeak/tsclientlib", rev = "04aa24917abbf6a0c8442a79742d6d2d40ecf71e", default-features = false }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time", "fs", "io-util"] }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+futures = { workspace = true }
+serde_json = { workspace = true }

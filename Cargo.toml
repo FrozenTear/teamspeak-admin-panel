@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/shared",
     "crates/ts6-manager-server",
+    "crates/ts6-voice-fixture",
 ]
 
 [workspace.package]
