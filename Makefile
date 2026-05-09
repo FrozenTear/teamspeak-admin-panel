@@ -239,3 +239,34 @@ voice-translator-reverse-smoke: voice-translator-build
 
 voice-translator-clean:
 	rm -rf $(VOICE_TRANSLATOR_OUT_DIR)
+
+# PURA-108 WS-7 / PURA-114 slice e — browser demo.
+#
+# `voice-translator-mint-token` prints a LiveKit JWT to stdout for a
+# given identity + room. Operator pastes it into deploy/voice/demo.html
+# in a browser. `voice-translator-demo-up` serves deploy/voice as a
+# rootless static site on :8080 so the operator opens
+# http://localhost:8080/demo.html without an npm/build chain.
+#
+# Together these close the description's acceptance bar (TS6 client +
+# browser tab, ≥30 s bidirectional audible voice), gated by the
+# operator's manual ear-check.
+
+.PHONY: voice-translator-mint-token voice-translator-demo-up
+
+# Override-able knobs; `IDENTITY` is the only one you usually pass.
+VOICE_TRANSLATOR_IDENTITY ?= browser-demo
+VOICE_TRANSLATOR_DEMO_PORT ?= 8080
+
+voice-translator-mint-token: voice-translator-build
+	@./target/release/ts6-voice-translator \
+	    --livekit-url $(VOICE_TRANSLATOR_LIVEKIT) \
+	    --livekit-room $(VOICE_TRANSLATOR_ROOM) \
+	    --livekit-identity $(VOICE_TRANSLATOR_IDENTITY) \
+	    --duration-secs 3600 \
+	    --print-token
+
+voice-translator-demo-up:
+	@echo "==> serving deploy/voice on :$(VOICE_TRANSLATOR_DEMO_PORT)"
+	@echo "==> open http://localhost:$(VOICE_TRANSLATOR_DEMO_PORT)/demo.html"
+	@cd deploy/voice && python3 -m http.server $(VOICE_TRANSLATOR_DEMO_PORT)

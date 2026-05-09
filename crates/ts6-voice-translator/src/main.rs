@@ -50,9 +50,19 @@ struct Cli {
     #[arg(long, default_value = "ts6-voice-translator")]
     ts6_name: String,
 
-    /// Per-instance directory for the cached TS6 identity.
+    /// Per-instance directory for the cached TS6 identity. Required for
+    /// the normal bridge run; ignored when `--print-token` is set (slice e
+    /// uses the daemon's JWT minter for the browser demo without doing
+    /// any TS6 work).
+    #[arg(long, required_unless_present = "print_token")]
+    identity_dir: Option<PathBuf>,
+
+    /// Print a LiveKit access token for `--livekit-room` /
+    /// `--livekit-identity` and exit. Used by the slice-e browser demo
+    /// (`make voice-translator-mint-token`); the token's TTL follows
+    /// `--duration-secs + 60`.
     #[arg(long)]
-    identity_dir: PathBuf,
+    print_token: bool,
 
     /// LiveKit signaling URL (typically ws://host:7880 or wss://...).
     #[arg(long, default_value = "ws://127.0.0.1:7880")]
@@ -105,10 +115,34 @@ async fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
 
+    let livekit_config = LiveKitConfig {
+        url: cli.livekit_url.clone(),
+        room: cli.livekit_room.clone(),
+        identity: cli.livekit_identity.clone(),
+        api_key: cli.livekit_api_key.clone(),
+        api_secret: cli.livekit_api_secret.clone(),
+        ttl: Duration::from_secs(cli.duration_secs.saturating_add(60)),
+    };
+
+    if cli.print_token {
+        // Slice-e browser-demo helper. Mint a token for the configured
+        // room/identity and emit it on stdout — operator pastes into the
+        // demo HTML page. No TS6 handshake, no LiveKit Room::connect.
+        let token = livekit_config
+            .mint_token()
+            .context("mint LiveKit access token")?;
+        println!("{token}");
+        return Ok(());
+    }
+
+    let identity_dir = cli
+        .identity_dir
+        .as_ref()
+        .expect("clap requires --identity-dir unless --print-token is set");
     info!(
         ts6_server = %cli.ts6_server,
         ts6_name = %cli.ts6_name,
-        identity_dir = %cli.identity_dir.display(),
+        identity_dir = %identity_dir.display(),
         livekit_url = %cli.livekit_url,
         livekit_room = %cli.livekit_room,
         livekit_identity = %cli.livekit_identity,
@@ -118,14 +152,6 @@ async fn main() -> Result<()> {
 
     // 1. Mint the LiveKit access token. Cheap, deterministic, runs first
     //    so config errors fail before we spend a TS6 handshake on them.
-    let livekit_config = LiveKitConfig {
-        url: cli.livekit_url.clone(),
-        room: cli.livekit_room.clone(),
-        identity: cli.livekit_identity.clone(),
-        api_key: cli.livekit_api_key.clone(),
-        api_secret: cli.livekit_api_secret.clone(),
-        ttl: Duration::from_secs(cli.duration_secs.saturating_add(60)),
-    };
     let token = livekit_config
         .mint_token()
         .context("mint LiveKit access token")?;
@@ -140,7 +166,7 @@ async fn main() -> Result<()> {
     let ts6_config = Ts6Config {
         server: cli.ts6_server.clone(),
         name: cli.ts6_name.clone(),
-        identity_dir: cli.identity_dir.clone(),
+        identity_dir: identity_dir.clone(),
         connect_timeout: Duration::from_secs(cli.connect_timeout_secs),
     };
     let mut ts6 = Ts6Connection::connect(&ts6_config).await?;

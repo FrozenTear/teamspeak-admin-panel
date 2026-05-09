@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<!--
+  Browser-side demo page for the WS-7 voice translator (PURA-114, slice e).
+
+  Acceptance gate per the [PURA-114] description: the operator opens this
+  page in a browser, joins the same LiveKit room the translator daemon is
+  bridging, and exchanges Opus audio bidirectionally with native TS6
+  clients in the channel for >=30 seconds. Audibility is human-verified
+  (operator listens and confirms; the TS6-side prototype client also
+  records a WAV that the operator can spectrogram-check after the run).
+
+  This file is intentionally a single self-contained HTML page with no
+  build step. The LiveKit Web SDK loads from a pinned CDN URL by
+  default; operators who want a fully-offline deployment download the
+  file once with `wget` and edit the `<script src="...">` to point at
+  the local copy. Recipe in docs/voice-translator.md.
+
+  Cleanroom: drafted from public LiveKit docs only — the Web SDK
+  README, the documented `Room` / `LocalAudioTrack` /
+  `RemoteParticipant` API surface, and the Apache-2.0
+  livekit/client-sdk-js source on GitHub. No closed-source
+  Agent-Fennec material.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>TS6 ↔ WebRTC voice bridge demo</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      :root { color-scheme: light dark; }
+      body {
+        font: 14px/1.45 system-ui, sans-serif;
+        max-width: 720px;
+        margin: 2rem auto;
+        padding: 0 1rem;
+      }
+      h1 { font-size: 1.4rem; margin: 0 0 0.5rem; }
+      h2 { font-size: 1.1rem; margin: 1.5rem 0 0.5rem; }
+      label { display: block; margin: 0.5rem 0 0.2rem; font-weight: 600; }
+      input, textarea, button {
+        font: inherit;
+        padding: 0.4rem 0.6rem;
+        border: 1px solid #888;
+        border-radius: 4px;
+        box-sizing: border-box;
+      }
+      input, textarea { width: 100%; }
+      textarea#token { font-family: ui-monospace, monospace; font-size: 12px; min-height: 4rem; }
+      button { cursor: pointer; }
+      button[disabled] { cursor: not-allowed; opacity: 0.6; }
+      .row { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+      .row > * { flex: 1; min-width: 200px; }
+      #log {
+        background: rgba(0,0,0,0.06);
+        border-radius: 4px;
+        padding: 0.5rem 0.75rem;
+        font-family: ui-monospace, monospace;
+        font-size: 12px;
+        max-height: 16rem;
+        overflow-y: auto;
+        white-space: pre-wrap;
+      }
+      #remote-tracks > div {
+        margin: 0.4rem 0;
+        padding: 0.4rem 0.6rem;
+        border: 1px solid #888;
+        border-radius: 4px;
+      }
+      .ok { color: #2a7a2a; }
+      .warn { color: #b06000; }
+      .err { color: #b03030; }
+    </style>
+  </head>
+  <body>
+    <h1>TS6 ↔ WebRTC voice bridge demo</h1>
+    <p>
+      Joins a LiveKit room, publishes the browser microphone, and plays
+      back any audio tracks the room subscribes you to. Pair this with a
+      running <code>ts6-voice-translator</code> daemon to exchange Opus
+      voice frames with native TS6 clients in the bridged channel.
+      Acceptance: ≥30 seconds bidirectional audio between TS6 client + browser.
+      See <code>docs/voice-translator.md</code> for the full recipe.
+    </p>
+
+    <h2>Connection</h2>
+    <div class="row">
+      <div>
+        <label for="url">LiveKit signaling URL</label>
+        <input id="url" value="ws://127.0.0.1:7880" />
+      </div>
+      <div>
+        <label for="room">Room</label>
+        <input id="room" value="ts6-bridge" />
+      </div>
+      <div>
+        <label for="identity">Identity</label>
+        <input id="identity" value="browser-demo" />
+      </div>
+    </div>
+    <label for="token">
+      Token (mint with <code>make voice-translator-mint-token IDENTITY=browser-demo</code>)
+    </label>
+    <textarea id="token" placeholder="Paste a LiveKit JWT here"></textarea>
+
+    <div class="row" style="margin-top: 0.75rem;">
+      <button id="connect">Connect + publish microphone</button>
+      <button id="disconnect" disabled>Disconnect</button>
+    </div>
+
+    <h2>Status</h2>
+    <div id="log">Idle.</div>
+
+    <h2>Remote audio</h2>
+    <div id="remote-tracks"><em>(none yet)</em></div>
+
+    <!--
+      LiveKit Web SDK, pinned to v2.5.7. Operators preferring a fully-
+      offline deployment download the file once:
+        wget https://cdn.jsdelivr.net/npm/livekit-client@2.5.7/dist/livekit-client.umd.min.js
+      and replace `src` with `./livekit-client.umd.min.js`.
+
+      No `integrity=` attribute on the dev profile — the runbook section
+      "Locking the demo SDK" walks through computing the SHA-384 from a
+      verified copy and adding it here for operator deployments.
+    -->
+    <script src="https://cdn.jsdelivr.net/npm/livekit-client@2.5.7/dist/livekit-client.umd.min.js"
+            crossorigin="anonymous"></script>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+      const logEl = $("log");
+      const remoteEl = $("remote-tracks");
+      const connectBtn = $("connect");
+      const disconnectBtn = $("disconnect");
+
+      let room = null;
+
+      function log(msg, cls) {
+        const ts = new Date().toISOString().slice(11, 19);
+        const line = document.createElement("div");
+        line.textContent = `[${ts}] ${msg}`;
+        if (cls) line.className = cls;
+        logEl.appendChild(line);
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+
+      function clearRemote() {
+        remoteEl.innerHTML = "<em>(none yet)</em>";
+      }
+
+      function attachRemoteTrack(track, participant) {
+        if (track.kind !== "audio") return;
+        if (remoteEl.querySelector("em")) remoteEl.innerHTML = "";
+        const wrap = document.createElement("div");
+        wrap.dataset.sid = track.sid;
+        wrap.innerHTML =
+          `<strong>${participant.identity}</strong> ` +
+          `<small>(${track.sid})</small>`;
+        const el = track.attach();
+        el.controls = true;
+        el.autoplay = true;
+        wrap.appendChild(el);
+        remoteEl.appendChild(wrap);
+        log(`subscribed: ${participant.identity} ${track.sid}`, "ok");
+      }
+
+      function detachRemoteTrack(track) {
+        const wrap = remoteEl.querySelector(`[data-sid="${track.sid}"]`);
+        if (wrap) wrap.remove();
+        if (!remoteEl.children.length) clearRemote();
+        track.detach().forEach((el) => el.remove());
+        log(`unsubscribed: ${track.sid}`, "warn");
+      }
+
+      async function connect() {
+        if (!window.LivekitClient) {
+          log("LiveKit SDK not loaded — check the <script> URL", "err");
+          return;
+        }
+        const url = $("url").value.trim();
+        const token = $("token").value.trim();
+        if (!url || !token) {
+          log("URL and token are required", "err");
+          return;
+        }
+        connectBtn.disabled = true;
+        try {
+          room = new LivekitClient.Room({ adaptiveStream: false });
+          room
+            .on(LivekitClient.RoomEvent.TrackSubscribed,
+                (track, _pub, participant) => attachRemoteTrack(track, participant))
+            .on(LivekitClient.RoomEvent.TrackUnsubscribed,
+                (track) => detachRemoteTrack(track))
+            .on(LivekitClient.RoomEvent.Disconnected,
+                (reason) => log(`disconnected: ${reason}`, "warn"));
+          log(`connecting to ${url} as ${$("identity").value}`);
+          await room.connect(url, token);
+          log(`connected; room=${room.name}, participants=${room.numParticipants}`, "ok");
+          await room.localParticipant.setMicrophoneEnabled(true);
+          log("microphone published", "ok");
+          disconnectBtn.disabled = false;
+        } catch (err) {
+          log(`connect failed: ${err.message || err}`, "err");
+          connectBtn.disabled = false;
+          room = null;
+        }
+      }
+
+      async function disconnect() {
+        disconnectBtn.disabled = true;
+        if (room) {
+          try {
+            await room.disconnect();
+          } catch (err) {
+            log(`disconnect error: ${err.message || err}`, "err");
+          }
+          room = null;
+        }
+        clearRemote();
+        connectBtn.disabled = false;
+        log("disconnected");
+      }
+
+      connectBtn.addEventListener("click", connect);
+      disconnectBtn.addEventListener("click", disconnect);
+    </script>
+  </body>
+</html>

@@ -196,7 +196,110 @@ browser demo land in the remaining slices on the same WS-7 epic
   loop, which calls `ts6.send_audio` as a synthetic-client send.
   `make voice-translator-reverse-smoke` validates the path end-to-end
   with two translator instances + a TS6 talker. [Shipped.]
-- **WS-7e** — Browser demo + acceptance recipe. LiveKit Web SDK demo
+- ✅ **WS-7e** — Browser demo + acceptance recipe. `deploy/voice/demo.html`
+  using `livekit-client` Web SDK; `make voice-translator-mint-token`
+  prints a JWT; `make voice-translator-demo-up` serves the demo via
+  rootless `python3 -m http.server`. Operator-driven ≥30 s
+  bidirectional acceptance check below. [Shipped.]
+
+## Browser demo recipe (slice e)
+
+Closes the description's acceptance bar. Runtime: ~5 minutes including
+the 30 s acceptance window.
+
+```bash
+# 0. One-time / per-fresh-fixture: bring up the bridge profile.
+make voice-translator-up
+make voice-translator-smoke              # confirm livekit + coturn healthy
+
+# 1. Start the translator daemon. Lives for the duration of the demo.
+mkdir -p target/voice-translator/demo
+./target/release/ts6-voice-translator \
+    --identity-dir target/voice-translator/demo \
+    --duration-secs 600 \
+    >target/voice-translator/demo/translator.log 2>&1 &
+
+# 2. Mint a JWT for the browser tab. Identity must be unique within the
+#    room; use anything other than the translator's own
+#    `ts6-bridge-translator`.
+make voice-translator-mint-token IDENTITY=browser-demo
+
+# 3. Serve the static demo (rootless, no npm). Leave running in another
+#    terminal.
+make voice-translator-demo-up
+#    ==> open http://localhost:8080/demo.html
+
+# 4. In the demo tab: paste the JWT into the Token textarea, leave URL +
+#    room at defaults, click "Connect + publish microphone". Browser
+#    grants mic permission; "subscribed: ts6-bridge-translator …" line
+#    appears in the status pane.
+
+# 5. In a second terminal, spawn a TS6 talker. The prototype recording
+#    captures everything the browser publishes for post-run inspection.
+mkdir -p target/voice-translator/demo/alice
+./target/release/ts6-voice-prototype \
+    --name alice --send-tone-hz 440 --duration-secs 35 \
+    --identity-dir target/voice-translator/demo/alice \
+    --out-wav target/voice-translator/demo/alice.wav
+
+# 6. Speak into the browser microphone for the full window. Listen for
+#    the 440 Hz tone in the browser tab's <audio> element. Watch the
+#    translator's heartbeat log:
+grep -E "audio_frames|reverse_frames" target/voice-translator/demo/translator.log \
+    | sed 's/\x1b\[[0-9;]*[mGKH]//g' | tail
+```
+
+Acceptance:
+
+- The 440 Hz tone is audible in the browser tab for ≥30 seconds.
+- The browser microphone audio is audible in the TS6 channel; the
+  prototype WAV (`target/voice-translator/demo/alice.from-*.wav`)
+  contains it. Spectrogram-check is fastest:
+  ```bash
+  sox target/voice-translator/demo/alice.from-*.wav -n spectrogram \
+      -o /tmp/browser-into-ts6.png
+  ```
+- Translator's final `exited cleanly` heartbeat shows
+  `audio_frames_published > 0` AND `reverse_frames_sent > 0`.
+- No `wait_pc_connection timed out`, no `ConnectFailedBanned`,
+  no `opus encode failed` lines.
+
+### Locking the demo SDK
+
+The dev profile loads `livekit-client@2.5.7` from `cdn.jsdelivr.net`
+without an `integrity=` attribute so a fresh-clone operator can demo
+without further setup. Production-style deployments lock the SDK by:
+
+```bash
+SDK_URL="https://cdn.jsdelivr.net/npm/livekit-client@2.5.7/dist/livekit-client.umd.min.js"
+
+# Option A — drop the file next to demo.html, fully offline.
+curl -fL -o deploy/voice/livekit-client.umd.min.js "$SDK_URL"
+sed -i 's#https://[^"]*livekit-client[^"]*#./livekit-client.umd.min.js#' \
+    deploy/voice/demo.html
+
+# Option B — keep the CDN URL, add Subresource Integrity.
+HASH=$(curl -fLs "$SDK_URL" | openssl dgst -sha384 -binary | base64)
+sed -i "s#crossorigin=\"anonymous\"#integrity=\"sha384-${HASH}\" crossorigin=\"anonymous\"#" \
+    deploy/voice/demo.html
+```
+
+### Limitations of the demo page
+
+- **No stats UI.** Track sids and connection state are dumped to the
+  status log; LiveKit's full RTC stats are reachable via
+  `room.localParticipant.getTrackStats()` in DevTools but the demo
+  doesn't render them.
+- **No reconnect handling.** The page treats `Disconnected` as terminal.
+  Operator clicks Connect again to recover.
+- **Mic device picking.** The demo uses the browser's default
+  microphone — pick a specific device via the browser's site
+  permissions UI before clicking Connect if needed.
+
+A polished browser-side product is a separate Phase 4+ epic per
+ADR-0006 §"Out of scope". The demo page exists to close the
+WS-7 acceptance bar and to serve as the bring-up template for
+operator-supplied UIs.
   page (or `meet.livekit.io` against the local SFU), end-to-end ≥30 s
   bidirectional audible voice between TS6 client and browser tab,
   acceptance per [PURA-114](/PURA/issues/PURA-114) description.
