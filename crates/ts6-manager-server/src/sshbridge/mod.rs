@@ -66,6 +66,7 @@ pub mod control_client;
 pub mod hostkey;
 pub mod retention;
 pub mod russh_channel;
+pub mod tofu;
 pub mod transport;
 pub mod wire;
 

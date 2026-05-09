@@ -59,7 +59,19 @@ pub struct AppState {
 
 impl AppState {
     pub fn from_config(cfg: &Config, db: Arc<Database>) -> Self {
-        let control = ControlBackendPool::new(cfg.ts_allow_self_signed, db.clone());
+        // PURA-100 — opt-in TOFU. Spawning the worker only when the
+        // operator set `TS_SSH_TOFU=1` keeps the default boot path
+        // free of an idle background task and means the Reject
+        // posture from ADR-0002 is preserved bit-for-bit for every
+        // operator who has not actively chosen the tradeoff.
+        let tofu_sink = if cfg.ssh_tofu {
+            Some(crate::sshbridge::tofu::spawn_capture_worker(db.clone()))
+        } else {
+            None
+        };
+        let control = ControlBackendPool::new(cfg.ts_allow_self_signed, db.clone())
+            .with_known_hosts(cfg.ssh_known_hosts_path.clone())
+            .with_tofu(tofu_sink);
         Self {
             db,
             jwt_secret: Arc::new(cfg.jwt_secret.as_bytes().to_vec()),

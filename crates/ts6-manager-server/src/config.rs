@@ -68,6 +68,22 @@ pub struct Config {
     pub sidecar_binary_path: Option<PathBuf>,
     pub yt_cookie_file: Option<PathBuf>,
     pub ts_allow_self_signed: bool,
+    /// PURA-100 — opt-in trust-on-first-use for SSHBridge host keys.
+    /// Default `false`. When `true`, the SSH transport's host-key
+    /// verifier captures the upstream's fingerprint on first connect
+    /// (subject to the per-server `sshHostKeyFingerprint` column being
+    /// NULL and `TS_SSH_KNOWN_HOSTS` being unset), persists it onto
+    /// the row, and falls through to strict-fingerprint enforcement
+    /// for every later connect. Documented operator tradeoff: the
+    /// first-connect MitM window is the exposure surface.
+    pub ssh_tofu: bool,
+    /// PURA-100 — operator-supplied path to a shared OpenSSH
+    /// `known_hosts` file consumed by the SSHBridge host-key
+    /// verifier's `KnownHostsFile` policy. Sourced from
+    /// `TS_SSH_KNOWN_HOSTS`; empty/unset stays `None` and the
+    /// verifier falls back to per-row fingerprint pinning (or TOFU
+    /// when opted in, or `Reject` otherwise).
+    pub ssh_known_hosts_path: Option<PathBuf>,
     pub log_level: String,
     pub log_pretty: Option<bool>,
     /// Number of trusted reverse-proxy hops in front of the listener
@@ -131,6 +147,8 @@ impl Config {
         let yt_cookie_file = optional_env("YT_COOKIE_FILE").map(PathBuf::from);
 
         let ts_allow_self_signed = parse_bool_flag("TS_ALLOW_SELF_SIGNED");
+        let ssh_tofu = parse_bool_flag("TS_SSH_TOFU");
+        let ssh_known_hosts_path = optional_env("TS_SSH_KNOWN_HOSTS").map(PathBuf::from);
 
         let log_level = env_or("LOG_LEVEL", DEFAULT_LOG_LEVEL);
         let log_pretty = optional_env("LOG_PRETTY").map(|raw| matches!(raw.as_str(), "1" | "true"));
@@ -162,6 +180,8 @@ impl Config {
             sidecar_binary_path,
             yt_cookie_file,
             ts_allow_self_signed,
+            ssh_tofu,
+            ssh_known_hosts_path,
             log_level,
             log_pretty,
             trusted_proxy_hops,
@@ -183,6 +203,8 @@ impl Config {
             jwt_secret_short = self.jwt_secret_short,
             encryption_key_fell_back = self.encryption_key_fell_back,
             ts_allow_self_signed = self.ts_allow_self_signed,
+            ssh_tofu = self.ssh_tofu,
+            ssh_known_hosts_set = self.ssh_known_hosts_path.is_some(),
             sidecar_url_set = self.sidecar_url.is_some(),
             sidecar_binary_path_set = self.sidecar_binary_path.is_some(),
             yt_cookie_file_set = self.yt_cookie_file.is_some(),
@@ -203,6 +225,22 @@ impl Config {
         if !self.encryption_key_fell_back && self.encryption_key == self.jwt_secret {
             tracing::warn!(
                 "ENCRYPTION_KEY equals JWT_SECRET; use separate values for better security"
+            );
+        }
+        if self.ssh_tofu {
+            // PURA-100 — TOFU is a security-weakening tradeoff. Log
+            // every boot so the operator (and any reviewer auditing
+            // the journal) sees that the manager is in TOFU mode.
+            // Only the first-connect window is the exposure surface;
+            // every later connect falls through to strict-fingerprint
+            // enforcement against the captured key.
+            tracing::warn!(
+                "TS_SSH_TOFU=1 — SSHBridge will trust the upstream's host key on \
+                 first connect for any server_connection row whose \
+                 sshHostKeyFingerprint is NULL and where TS_SSH_KNOWN_HOSTS is unset. \
+                 The first-connect MitM window is the security exposure. \
+                 Operators who can extract the fingerprint out-of-band SHOULD pin \
+                 sshHostKeyFingerprint manually instead."
             );
         }
     }

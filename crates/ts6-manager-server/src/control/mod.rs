@@ -56,6 +56,7 @@ use crate::sshbridge::{
     control_client::SshControlClient,
     hostkey::{HostKeyConfigError, HostKeyVerifier},
     russh_channel::{connect as ssh_connect, RusshAuth, RusshConnectParams},
+    tofu::TofuCaptureSink,
     transport::{spawn_with_db as spawn_transport_with_db, TransportConfig, TransportHandle},
     SshBridgeError,
 };
@@ -442,6 +443,13 @@ pub struct ControlBackendPool {
     /// from `TS_SSH_KNOWN_HOSTS` at boot; `None` falls through to the
     /// per-server fingerprint column or `Reject`.
     ssh_known_hosts_path: Option<PathBuf>,
+    /// PURA-100 — opt-in TOFU capture sink. `Some(_)` means the
+    /// operator set `TS_SSH_TOFU=1` and the boot path spawned the
+    /// capture worker. The verifier consumes this in
+    /// [`HostKeyVerifier::from_config`]; selection rules in that
+    /// function ensure TOFU is only chosen for rows that have neither
+    /// a strict-fingerprint pin nor a known-hosts file path.
+    ssh_tofu_sink: Option<TofuCaptureSink>,
     /// PURA-79: SurrealDB handle threaded into the SSH transport
     /// supervisor via [`spawn_transport_with_db`]. Without it the
     /// dispatch loop only `tracing::info!`s audit events and
@@ -461,6 +469,7 @@ impl std::fmt::Debug for ControlBackendPool {
                     .as_ref()
                     .map(|p| p.display().to_string()),
             )
+            .field("ssh_tofu_enabled", &self.ssh_tofu_sink.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -471,12 +480,24 @@ impl ControlBackendPool {
             inner: Arc::new(RwLock::new(HashMap::new())),
             allow_self_signed,
             ssh_known_hosts_path: None,
+            ssh_tofu_sink: None,
             db,
         }
     }
 
     pub fn with_known_hosts(mut self, path: Option<PathBuf>) -> Self {
         self.ssh_known_hosts_path = path;
+        self
+    }
+
+    /// PURA-100 — wire the TOFU capture sink that the host-key
+    /// verifier emits captures to. Pass `None` (the default after
+    /// [`Self::new`]) to keep TOFU disabled — strict-fingerprint and
+    /// known-hosts policies still work. `Some(_)` is set by
+    /// `AppState::from_config` when the operator opted in via
+    /// `TS_SSH_TOFU=1`.
+    pub fn with_tofu(mut self, sink: Option<TofuCaptureSink>) -> Self {
+        self.ssh_tofu_sink = sink;
         self
     }
 
@@ -598,6 +619,7 @@ impl ControlBackendPool {
             port,
             connection.sshHostKeyFingerprint.as_deref(),
             self.ssh_known_hosts_path.clone(),
+            self.ssh_tofu_sink.clone(),
         )?);
 
         let cfg = TransportConfig::for_connection(connection.id);
