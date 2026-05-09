@@ -59,6 +59,34 @@ services:
       - "10022:10022"
     restart: "no"
 
+  # Upstream TS6 server fixture — opt-in profile for QA bring-up. Brings up
+  # the manager's target server locally so verifications 4 & 7 can run
+  # against a real TS6 instance:
+  #
+  #   podman-compose --profile ts6-fixture up -d ts6-fixture
+  #
+  # `network_mode: host` is mandatory: under rootless podman's default
+  # passt port-forward, the upstream WebQuery HTTP interface wedges after
+  # exactly 5 requests (TCP accept then immediate close) until the
+  # container is restarted. Host networking removes passt from the path
+  # and the fixture handles sustained traffic. Full operator notes,
+  # repro, and root-cause investigation status live in
+  # `docs/ts6-fixture.md` (PURA-105).
+  ts6-fixture:
+    container_name: ts6-fixture
+    image: docker.io/teamspeaksystems/teamspeak6-server:latest
+    profiles:
+      - ts6-fixture
+    network_mode: host
+    environment:
+      TSSERVER_LICENSE_ACCEPTED: accept
+      TSSERVER_QUERY_ADMIN_PASSWORD: ${TS6_FIXTURE_ADMIN_PASSWORD:-qa-admin}
+      TSSERVER_QUERY_SKIP_BRUTE_FORCE_CHECK: "1"
+    volumes:
+      - ts6-fixture-data:/var/tsserver
+    restart: "no"
+
 volumes:
   ts6-db:
   ts6-music:
+  ts6-fixture-data:
