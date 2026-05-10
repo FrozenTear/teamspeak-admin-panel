@@ -1,5 +1,7 @@
 /target
 /data
+crates/*/data/
+qa-evidence/
 **/*.rs.bk
 .env
 .env.local
