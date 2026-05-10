@@ -13,6 +13,7 @@ mod dashboard_placeholder;
 mod home;
 mod login;
 mod logs;
+mod music_bots;
 mod public_widget;
 mod server_info;
 mod setup;
@@ -25,6 +26,9 @@ pub use dashboard_placeholder::DashboardPlaceholder;
 pub use home::Home;
 pub use login::LoginPage;
 pub use logs::LogsPage;
+pub use music_bots::{
+    BotDetailPage, BotsIndexPage, MusicLibraryPage, MusicPlaylistsPage, RadioStationsPage,
+};
 pub use public_widget::PublicWidgetPage;
 pub use server_info::ServerInfoPage;
 pub use setup::SetupPage;
