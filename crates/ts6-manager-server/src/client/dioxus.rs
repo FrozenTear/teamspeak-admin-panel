@@ -34,14 +34,22 @@ pub struct DioxusSession {
 }
 
 impl DioxusSession {
-    /// Build a session whose initial state is hydrated from `storage`.
+    /// Build a session whose initial state is `Anonymous` regardless of
+    /// platform.
+    ///
+    /// Reading `storage` synchronously here would diverge between SSR
+    /// (`MemoryStore` — always empty) and the browser (`LocalStorageStore`
+    /// — holds the persisted blob), producing different first-render trees
+    /// and a hydration mismatch (`this.nodes[id]` undefined inside
+    /// `dioxus-interpreter-js`). The post-mount rehydrate happens in
+    /// [`rehydrate_from_storage`] via a client-only `use_effect`, so first
+    /// render lines up byte-for-byte across server and browser.
     ///
     /// Call this once from the root component (`use_context_provider`) so
     /// every consumer sees the same `Signal`.
-    pub fn hydrated(storage: SessionStorage) -> Self {
-        let initial = load_state(&*storage);
+    pub fn new_anonymous(storage: SessionStorage) -> Self {
         Self {
-            state: SyncSignal::new_maybe_sync(initial),
+            state: SyncSignal::new_maybe_sync(AuthState::Anonymous),
             storage,
         }
     }
@@ -110,12 +118,33 @@ pub fn provide_auth_gate(session: DioxusSession) -> Arc<RefreshGate> {
 /// by an in-memory `MemoryStore` everywhere else (server SSR / native
 /// tests / sandboxed iframes where `window.localStorage` is missing).
 ///
+/// Returns the session in the `Anonymous` state. The browser-side blob is
+/// applied post-mount by [`rehydrate_from_storage`].
+///
 /// Returns the session by value so the caller can push it into context
 /// (`use_context_provider(|| provide_session())`) and also hand a clone to
 /// any non-context consumer such as a button-click closure.
 pub fn provide_session() -> DioxusSession {
     let storage: SessionStorage = pick_default_storage();
-    DioxusSession::hydrated(storage)
+    DioxusSession::new_anonymous(storage)
+}
+
+/// Read the persisted auth blob and copy it into `session.state`.
+///
+/// Mount this from the root component inside a `use_effect` — `use_effect`
+/// is client-only (it does not run during SSR), so the first render on
+/// both server and browser observes the same `Anonymous` state, hydration
+/// walks identical trees, and the real auth state is applied immediately
+/// after mount. Any UI gated on `session.state` (the auth-redirect inside
+/// `AppShell`, `use_ws_lifecycle`, the auth-aware page guards) sees the
+/// transition `Anonymous → Authenticated` and reacts via its existing
+/// signal subscriptions.
+pub fn rehydrate_from_storage(session: &DioxusSession) {
+    let loaded = load_state(&*session.storage);
+    if matches!(loaded, AuthState::Authenticated { .. }) {
+        let state = session.state;
+        *state.write_unchecked() = loaded;
+    }
 }
 
 #[cfg(target_arch = "wasm32")]

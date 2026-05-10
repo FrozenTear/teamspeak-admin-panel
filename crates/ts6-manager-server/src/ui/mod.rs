@@ -25,7 +25,7 @@ pub mod tokens;
 
 use dioxus::prelude::*;
 
-use crate::client::dioxus::{provide_auth_gate, provide_session};
+use crate::client::dioxus::{provide_auth_gate, provide_session, rehydrate_from_storage};
 use crate::client::ws::{provide_ws_hub, use_ws_lifecycle};
 use crate::ui::components::{provide_activity_feed, provide_toaster};
 use crate::ui::routes::Route;
@@ -49,6 +49,20 @@ pub fn App() -> Element {
     let _toaster = provide_toaster();
     let _feed = provide_activity_feed();
     use_ws_lifecycle(hub);
+
+    // PURA-129 — copy the persisted session out of `localStorage` after the
+    // first paint completes. `provide_session` keeps the signal `Anonymous`
+    // on first render so SSR and the browser hydrate identical trees;
+    // `use_effect` is client-only, so this fires exactly once on mount and
+    // upgrades the auth state in place. Downstream effects
+    // (`AppShell`'s redirect, `use_ws_lifecycle`, route guards) react via
+    // their existing signal subscriptions.
+    {
+        let session_for_rehydrate = session.clone();
+        use_effect(move || {
+            rehydrate_from_storage(&session_for_rehydrate);
+        });
+    }
     rsx! {
         document::Stylesheet { href: TOKENS_CSS }
         document::Stylesheet { href: COMPONENTS_CSS }

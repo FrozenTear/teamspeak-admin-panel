@@ -64,24 +64,38 @@ impl PartialEq for ThemeProviderProps {
 /// selectors override the `:root` defaults. Children consume tokens via CSS
 /// custom properties — there is no hex literal in component code.
 ///
-/// On mount, hydrates the theme signal from `storage` (falling back to
-/// `initial` and then to [`Theme::default`]). On every signal change a
-/// `use_effect` writes the current theme back through
-/// [`crate::client::ui_prefs::save_theme`], so the toggle button and any
-/// future programmatic theme change automatically persist.
+/// First render seeds the theme from `props.initial` (or [`Theme::default`])
+/// — never from `storage` directly, because the SSR `MemoryStore` is empty
+/// and reading `localStorage` synchronously would render a different
+/// `data-theme` attribute on the server vs the browser and crash hydration
+/// (see PURA-129). On mount, a client-only `use_effect` reads the persisted
+/// preference and applies it to the signal so the operator's saved choice
+/// wins as soon as the browser has had a chance to load it. A second
+/// `use_effect` writes every subsequent signal change back through
+/// [`crate::client::ui_prefs::save_theme`] so the toggle button persists.
 #[component]
 pub fn ThemeProvider(props: ThemeProviderProps) -> Element {
-    let storage = props.storage.clone();
-    let hydrated = ui_prefs::load_theme(&*storage)
-        .or(props.initial)
-        .unwrap_or_default();
-    let theme: Signal<Theme> = use_signal(|| hydrated);
+    let initial_render = props.initial.unwrap_or_default();
+    let theme: Signal<Theme> = use_signal(|| initial_render);
     use_context_provider(|| ThemeContext { theme });
 
-    // Persist on every change. The first effect run no-ops because the
-    // hydrated value matches what's already in storage (or harmlessly seeds
-    // the key on a first-ever boot). Subsequent runs catch toggles from the
-    // header button.
+    // PURA-129 — rehydrate after mount, browser-only. Effects do not run
+    // during SSR, so first paint matches across server and client; on the
+    // browser this fires once after mount and upgrades the data-theme
+    // attribute via the normal signal-driven re-render path.
+    let storage_for_load = props.storage.clone();
+    let mut theme_for_load = theme;
+    use_effect(move || {
+        if let Some(loaded) = ui_prefs::load_theme(&*storage_for_load) {
+            theme_for_load.set(loaded);
+        }
+    });
+
+    // Persist on every change. The first effect run on mount with no
+    // pre-existing key harmlessly seeds it; a saved Light/Dark value
+    // produces a no-op write because the load-effect above will already
+    // have set the signal to match storage. Subsequent runs catch toggles
+    // from the header button.
     let storage_for_effect = props.storage.clone();
     use_effect(move || {
         let current = *theme.read();
