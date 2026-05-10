@@ -285,11 +285,7 @@ async fn lifecycle_commands_dispatch_when_bot_exists() {
         .unwrap();
     let bot: wire::MusicBotSummary = read_json(resp).await;
 
-    for path in [
-        "connect",
-        "disconnect",
-        "leave",
-    ] {
+    for path in ["connect", "disconnect", "leave"] {
         let resp = app
             .clone()
             .oneshot(
@@ -393,10 +389,7 @@ async fn library_crud_round_trip() {
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri(format!(
-                    "/api/music-library?bot={}&tag=chill",
-                    bot.id.0
-                ))
+                .uri(format!("/api/music-library?bot={}&tag=chill", bot.id.0))
                 .header("authorization", auth_header(&token))
                 .body(Body::empty())
                 .unwrap(),
@@ -937,7 +930,11 @@ async fn e2e_create_join_enqueue_observes_queue() {
         .await
         .unwrap();
     let detail: wire::MusicBotDetail = read_json(resp).await;
-    assert_eq!(detail.queue.len(), 1, "queue should hold the enqueued track");
+    assert_eq!(
+        detail.queue.len(),
+        1,
+        "queue should hold the enqueued track"
+    );
     assert_eq!(detail.queue[0].title, "Song");
 
     // Request log captured the enqueue.
@@ -954,5 +951,405 @@ async fn e2e_create_join_enqueue_observes_queue() {
         .await
         .unwrap();
     let requests: Vec<wire::MusicRequest> = read_json(resp).await;
-    assert!(!requests.is_empty(), "playlist enqueue must populate the request log");
+    assert!(
+        !requests.is_empty(),
+        "playlist enqueue must populate the request log"
+    );
+}
+
+// ----------------------------------------------------------------------
+// PURA-126 WS-6 follow-up — audio-control + direct-queue dispatch tests.
+//
+// Mirrors the WS-5 coverage: 404 on unknown bot, success path on a
+// spawned bot, request-log row on `enqueue` + `play`. We don't assert
+// audio-stack behaviour (WS-1 logs the audio commands; the audio
+// pipeline itself is WS-2's lifecycle-e2e turf) — these tests only
+// prove the REST → BotSupervisor wiring is correct.
+// ----------------------------------------------------------------------
+
+#[tokio::test]
+async fn audio_control_dispatch_returns_202_for_each_route() {
+    let (app, token, _state) = make_test_app().await;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/music-bots")
+                .header("authorization", auth_header(&token))
+                .header("content-type", "application/json")
+                .body(json_body(&create_bot_body()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bot: wire::MusicBotSummary = read_json(resp).await;
+
+    // No-body audio routes — pause / resume / stop / skip-next / skip-prev.
+    for path in ["pause", "resume", "stop", "skip-next", "skip-prev"] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/music-bots/{}/{}", bot.id.0, path))
+                    .header("authorization", auth_header(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::ACCEPTED,
+            "{path} dispatch should be accepted"
+        );
+    }
+
+    // Volume — body required.
+    let body = wire::SetVolumeRequest { gain: 0.5 };
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/music-bots/{}/volume", bot.id.0))
+                .header("authorization", auth_header(&token))
+                .header("content-type", "application/json")
+                .body(json_body(&body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+}
+
+#[tokio::test]
+async fn audio_control_404s_for_unknown_bot() {
+    let (app, token, _state) = make_test_app().await;
+    for path in ["pause", "resume", "stop", "skip-next", "skip-prev"] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/music-bots/9999/{}", path))
+                    .header("authorization", auth_header(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "{path} should 404 for unknown bot"
+        );
+    }
+}
+
+#[tokio::test]
+async fn audio_play_writes_request_log_row() {
+    let (app, token, _state) = make_test_app().await;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/music-bots")
+                .header("authorization", auth_header(&token))
+                .header("content-type", "application/json")
+                .body(json_body(&create_bot_body()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bot: wire::MusicBotSummary = read_json(resp).await;
+
+    let body = wire::PlayRequest {
+        source: wire::AudioSource::Url {
+            url: "https://example.com/song.mp3".into(),
+        },
+    };
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/music-bots/{}/play", bot.id.0))
+                .header("authorization", auth_header(&token))
+                .header("content-type", "application/json")
+                .body(json_body(&body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+    // Request log row exists, `track_id` is None (queue bypassed),
+    // `title` falls back to the source URL.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/music-requests?bot={}", bot.id.0))
+                .header("authorization", auth_header(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let requests: Vec<wire::MusicRequest> = read_json(resp).await;
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].track_id.is_none());
+    assert_eq!(requests[0].title, "https://example.com/song.mp3");
+}
+
+#[tokio::test]
+async fn queue_dispatch_routes_return_202_and_404() {
+    let (app, token, _state) = make_test_app().await;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/music-bots")
+                .header("authorization", auth_header(&token))
+                .header("content-type", "application/json")
+                .body(json_body(&create_bot_body()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bot: wire::MusicBotSummary = read_json(resp).await;
+
+    // Clear (no body).
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri(format!("/api/music-bots/{}/queue", bot.id.0))
+                .header("authorization", auth_header(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+    // Remove a (non-existent) track id — actor processes it as a no-op,
+    // dispatch surface still returns 202.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri(format!("/api/music-bots/{}/queue/42", bot.id.0))
+                .header("authorization", auth_header(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+    // Advance.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/music-bots/{}/queue/advance", bot.id.0))
+                .header("authorization", auth_header(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+    // 404 path — clear on unknown bot.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri("/api/music-bots/9999/queue")
+                .header("authorization", auth_header(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn queue_enqueue_writes_request_log_row() {
+    let (app, token, _state) = make_test_app().await;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/music-bots")
+                .header("authorization", auth_header(&token))
+                .header("content-type", "application/json")
+                .body(json_body(&create_bot_body()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bot: wire::MusicBotSummary = read_json(resp).await;
+
+    let body = wire::EnqueueTrackRequest {
+        source: wire::AudioSource::Url {
+            url: "https://example.com/track.mp3".into(),
+        },
+        title: "Direct Track".into(),
+        duration_secs: Some(180),
+        requested_by: Some("alice".into()),
+    };
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/music-bots/{}/queue", bot.id.0))
+                .header("authorization", auth_header(&token))
+                .header("content-type", "application/json")
+                .body(json_body(&body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+    // Request log row recorded.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/music-requests?bot={}", bot.id.0))
+                .header("authorization", auth_header(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let requests: Vec<wire::MusicRequest> = read_json(resp).await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].title, "Direct Track");
+    assert_eq!(requests[0].requested_by.as_deref(), Some("alice"));
+
+    // Yield once for the actor to process the dispatched Enqueue, then
+    // verify the queue holds the new track via the bot detail endpoint.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/music-bots/{}", bot.id.0))
+                .header("authorization", auth_header(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let detail: wire::MusicBotDetail = read_json(resp).await;
+    assert_eq!(detail.queue.len(), 1);
+    assert_eq!(detail.queue[0].title, "Direct Track");
+}
+
+#[tokio::test]
+async fn queue_reorder_returns_snapshot() {
+    let (app, token, _state) = make_test_app().await;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/music-bots")
+                .header("authorization", auth_header(&token))
+                .header("content-type", "application/json")
+                .body(json_body(&create_bot_body()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bot: wire::MusicBotSummary = read_json(resp).await;
+
+    // Enqueue two tracks via the new queue route — same dispatch path
+    // the FE uses, so the test exercises the full chain.
+    for (i, title) in [(1, "A"), (2, "B")] {
+        let body = wire::EnqueueTrackRequest {
+            source: wire::AudioSource::Url {
+                url: format!("https://example.com/{i}.mp3"),
+            },
+            title: title.into(),
+            duration_secs: None,
+            requested_by: None,
+        };
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/music-bots/{}/queue", bot.id.0))
+                    .header("authorization", auth_header(&token))
+                    .header("content-type", "application/json")
+                    .body(json_body(&body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    }
+
+    // Wait for both Enqueue dispatches to drain through the actor.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Read the current queue to learn the minted ids, then reverse it.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/music-bots/{}", bot.id.0))
+                .header("authorization", auth_header(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let detail: wire::MusicBotDetail = read_json(resp).await;
+    assert_eq!(detail.queue.len(), 2);
+    let mut reversed: Vec<wire::TrackId> = detail.queue.iter().map(|t| t.id).collect();
+    reversed.reverse();
+
+    let body = wire::ReorderQueueRequest {
+        track_ids: reversed.clone(),
+    };
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/music-bots/{}/queue/reorder", bot.id.0))
+                .header("authorization", auth_header(&token))
+                .header("content-type", "application/json")
+                .body(json_body(&body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let snapshot: Vec<wire::Track> = read_json(resp).await;
+    assert_eq!(snapshot.len(), 2);
+    let ids: Vec<wire::TrackId> = snapshot.iter().map(|t| t.id).collect();
+    assert_eq!(ids, reversed, "reorder should return the new order");
 }

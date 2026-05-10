@@ -18,10 +18,12 @@
 //! §6.4.1). RBAC granularity is "any authenticated user" — multi-tenant
 //! / per-bot ACLs are flagged for follow-up on the parent epic.
 
+mod audio_control;
 mod bots;
 mod convert;
 mod library;
 mod playlists;
+mod queue;
 mod radio_stations;
 mod requests;
 
@@ -42,6 +44,8 @@ use crate::app_state::AppState;
 pub fn router() -> Router<AppState> {
     Router::new()
         .merge(bots::router())
+        .merge(audio_control::router())
+        .merge(queue::router())
         .merge(library::router())
         .merge(playlists::router())
         .merge(radio_stations::router())
@@ -55,11 +59,7 @@ pub(super) fn err(status: StatusCode, message: &str) -> Response {
 }
 
 pub(super) fn err_with_code(status: StatusCode, message: &str, code: &str) -> Response {
-    (
-        status,
-        Json(ErrorBody::new(message).with_code(code)),
-    )
-        .into_response()
+    (status, Json(ErrorBody::new(message).with_code(code))).into_response()
 }
 
 pub(super) fn not_found(what: &str) -> Response {
@@ -83,9 +83,9 @@ pub(super) fn internal(message: &str) -> Response {
 pub(super) fn translate_store_error(err: music_bot::StoreError) -> Response {
     use music_bot::StoreError;
     match err {
-        StoreError::PlaylistNotFound(_) | StoreError::TrackNotFound(_) | StoreError::LibraryEntryNotFound(_) => {
-            not_found(&err.to_string())
-        }
+        StoreError::PlaylistNotFound(_)
+        | StoreError::TrackNotFound(_)
+        | StoreError::LibraryEntryNotFound(_) => not_found(&err.to_string()),
         StoreError::PlaylistExists(_) => conflict(&err.to_string()),
         StoreError::ReorderMismatch { .. } => validation(&err.to_string()),
         StoreError::Snapshot(_) | StoreError::Backend(_) => internal(&err.to_string()),

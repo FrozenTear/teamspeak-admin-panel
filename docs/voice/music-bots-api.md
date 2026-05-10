@@ -42,6 +42,32 @@ Snake-case strings: `"disconnected" | "connecting" | "connected" | "in_channel" 
 | `POST` | `/api/music-bots/{id}/leave` | — | `202` | Dispatches `BotCommand::LeaveChannel`. |
 | `GET` | `/api/music-bots/{id}/events` | — | `text/event-stream` | SSE stream of `BotEventWire` events. Tagged `type` discriminator. 15 s keep-alive. |
 
+### Audio control (PURA-126 WS-6 follow-up)
+
+Each route lowers to a `BotCommand::Audio(...)` dispatch through the bot supervisor. Routes return `202 Accepted` when the dispatch reaches the actor; `404` when the bot id isn't tracked.
+
+| Method | Path | Body | Lowers to | Notes |
+| --- | --- | --- | --- | --- |
+| `POST` | `/api/music-bots/{id}/play` | `PlayRequest` | `Audio(Play{source})` | Bypasses the queue. Writes a `MusicRequest` row (`trackId: null`, `title` falls back to the source URL/path). |
+| `POST` | `/api/music-bots/{id}/pause` | — | `Audio(Pause)` | |
+| `POST` | `/api/music-bots/{id}/resume` | — | `Audio(Resume)` | |
+| `POST` | `/api/music-bots/{id}/stop` | — | `Audio(Stop)` | |
+| `POST` | `/api/music-bots/{id}/skip-next` | — | `Audio(SkipNext)` | |
+| `POST` | `/api/music-bots/{id}/skip-prev` | — | `Audio(SkipPrev)` | |
+| `POST` | `/api/music-bots/{id}/volume` | `SetVolumeRequest` | `Audio(SetVolume(gain))` | `gain` is the same dBFS-ish unit `music_bot::AudioCommand::SetVolume(f32)` uses; WS-2 picks the exact scale. |
+
+### Direct queue mutation (PURA-126 WS-6 follow-up)
+
+Each route lowers to a `BotCommand::Queue(...)` dispatch. The bot actor performs the store mutation and emits `QueueChanged` / `NowPlaying` / `QueueEmpty` events. Returns `202` on dispatch; `200` with the new queue snapshot for `reorder`.
+
+| Method | Path | Body | Lowers to | Notes |
+| --- | --- | --- | --- | --- |
+| `POST` | `/api/music-bots/{id}/queue` | `EnqueueTrackRequest` | `Queue(Enqueue(NewTrack))` | Writes a `MusicRequest` row (`trackId: null`; the actor mints the queue id asynchronously — consumers wanting it pick it off the SSE `QueueChanged` event). |
+| `DELETE` | `/api/music-bots/{id}/queue` | — | `Queue(Clear)` | |
+| `DELETE` | `/api/music-bots/{id}/queue/{trackId}` | — | `Queue(Remove(TrackId))` | |
+| `POST` | `/api/music-bots/{id}/queue/reorder` | `ReorderQueueRequest` | `Queue(Reorder(Vec<TrackId>))` | `200 [Track]` — peeks the store after dispatch. SSE `QueueChanged` is the authoritative live signal; the response body is convenience for the FE's optimistic render. |
+| `POST` | `/api/music-bots/{id}/queue/advance` | — | `Queue(Advance)` | |
+
 Sample — create + join:
 
 ```bash
@@ -109,6 +135,8 @@ Returned newest-first. Rows land here as a side-effect of:
 
 - `POST /playlists/{name}/enqueue` (one row per track)
 - `POST /radio-stations/{id}/play` (one row, `trackId: null`)
+- `POST /music-bots/{id}/play` (one row, `trackId: null`, title falls back to the source URL/path) — PURA-126
+- `POST /music-bots/{id}/queue` (one row, `trackId: null`) — PURA-126
 - WS-4 chat commands (queue / now-playing / playlist enqueue ops)
 
 WS-5 stores the log in-process (cap: 1 000 rows, oldest dropped first); the SurrealDB-backed swap is a follow-up under the parent epic.

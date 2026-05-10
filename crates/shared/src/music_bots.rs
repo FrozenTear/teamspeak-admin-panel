@@ -222,6 +222,46 @@ pub struct PlaylistDetail {
     pub tracks: Vec<Track>,
 }
 
+/// `POST /music-bots/{id}/play` body — dispatches `Audio(Play{source})`
+/// against the bot actor (PURA-126 WS-6 follow-up).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlayRequest {
+    pub source: AudioSource,
+}
+
+/// `POST /music-bots/{id}/volume` body. `gain` is the same dBFS-ish unit
+/// that `music_bot::AudioCommand::SetVolume(f32)` uses (PURA-126 WS-6
+/// follow-up).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetVolumeRequest {
+    pub gain: f32,
+}
+
+/// `POST /music-bots/{id}/queue` body — append a single track to the
+/// bot's queue without going through a playlist (PURA-126 WS-6 follow-up).
+/// Same shape as [`AddTrackRequest`] but renamed for the queue surface so
+/// the FE can splat between the two without naming collisions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnqueueTrackRequest {
+    pub source: AudioSource,
+    pub title: String,
+    #[serde(default)]
+    pub duration_secs: Option<u64>,
+    #[serde(default)]
+    pub requested_by: Option<String>,
+}
+
+/// `POST /music-bots/{id}/queue/reorder` body — replace the queue order
+/// with the given permutation of current ids (PURA-126 WS-6 follow-up).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReorderQueueRequest {
+    pub track_ids: Vec<TrackId>,
+}
+
 /// `POST /radio-stations` body. The server stamps the [`RADIO_TAG`] tag
 /// onto the persisted [`LibraryEntry`] so `/radio-stations` and
 /// `/music-library?tag=radio` agree.
@@ -454,6 +494,45 @@ mod tests {
         let err = err.with_code("not_found");
         let json = serde_json::to_string(&err).unwrap();
         assert!(json.contains(r#""code":"not_found""#));
+    }
+
+    #[test]
+    fn ws6_followup_request_bodies_use_camel_case() {
+        // EnqueueTrackRequest — keys must be camelCase on the wire.
+        let body = EnqueueTrackRequest {
+            source: AudioSource::Url {
+                url: "https://x".into(),
+            },
+            title: "t".into(),
+            duration_secs: Some(10),
+            requested_by: Some("alice".into()),
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        assert!(json.contains("durationSecs"), "got: {json}");
+        assert!(json.contains("requestedBy"), "got: {json}");
+        assert!(!json.contains("duration_secs"));
+
+        // ReorderQueueRequest — `trackIds` on the wire, `Vec<TrackId>` on
+        // the inside, transparent over `u64`.
+        let body = ReorderQueueRequest {
+            track_ids: vec![TrackId(7), TrackId(8)],
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        assert!(json.contains(r#""trackIds":[7,8]"#), "got: {json}");
+
+        // SetVolumeRequest — single `gain` field.
+        let body = SetVolumeRequest { gain: 0.75 };
+        let json = serde_json::to_string(&body).unwrap();
+        assert!(json.contains(r#""gain":0.75"#), "got: {json}");
+
+        // PlayRequest — wraps the externally-tagged AudioSource.
+        let body = PlayRequest {
+            source: AudioSource::LibraryPath {
+                path: "lo-fi/a.mp3".into(),
+            },
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        assert!(json.contains(r#""kind":"libraryPath""#), "got: {json}");
     }
 
     #[test]
