@@ -119,6 +119,17 @@ pub fn Sidebar(props: SidebarProps) -> Element {
     let server_info_active = matches!(props.active, Route::ServerInfoPage {});
     let logs_active = matches!(props.active, Route::LogsPage {});
     let widgets_active = matches!(props.active, Route::WidgetsPage {});
+    // PURA-124 WS-6 — Music bots highlight when the route is the index
+    // OR any of the per-bot detail / library / playlists / radio
+    // surfaces, so the operator stays oriented across the whole flow.
+    let music_bots_active = matches!(
+        props.active,
+        Route::BotsIndexPage {}
+            | Route::BotDetailPage { .. }
+            | Route::MusicLibraryPage { .. }
+            | Route::MusicPlaylistsPage { .. }
+            | Route::RadioStationsPage { .. }
+    );
     rsx! {
         aside { class: "sidebar",
             // Brand sits OUTSIDE `<nav aria-label="Primary">` so the
@@ -153,7 +164,7 @@ pub fn Sidebar(props: SidebarProps) -> Element {
 
                 NavGroup { label: "Automation",
                     PlaceholderItem { icon: "⊕", label: "Bots" }
-                    PlaceholderItem { icon: "♪", label: "Music bots" }
+                    NavItem { icon: "♪", label: "Music bots", to: Route::BotsIndexPage {}, active: music_bots_active }
                     NavItem { icon: "▣", label: "Widgets", to: Route::WidgetsPage {}, active: widgets_active }
                 }
 
@@ -321,22 +332,20 @@ mod tests {
     #[test]
     fn placeholder_items_carry_aria_disabled_and_tabindex_minus_one() {
         let html = render_sidebar_harness();
-        // Phase 2 has converted six placeholders into real routes:
-        // Channels, Clients, Bans, Server info, Logs, and now Widgets
-        // (PURA-92 / Slice G). Remaining placeholders: 1 × Server (Files),
-        // 6 × Moderation (Server groups, Channel groups, Permissions,
-        // Tokens, Complaints, Messages), 2 × Automation (Bots, Music bots),
-        // 2 × Admin (Instance, Settings) = 11. The Server info row uses
-        // the same `⊙` icon that previously belonged to a non-existent
-        // placeholder, so the count check is the authoritative signal.
+        // PURA-124 WS-6 has converted "Music bots" into a real nav item.
+        // Remaining placeholders: 1 × Server (Files), 6 × Moderation
+        // (Server groups, Channel groups, Permissions, Tokens,
+        // Complaints, Messages), 1 × Automation (Bots), 2 × Admin
+        // (Instance, Settings) = 10. The count is the authoritative
+        // signal here — adding/removing a real route should bump it.
         let disabled = html.matches(r#"aria-disabled="true""#).count();
         let tabindex_minus = html.matches(r#"tabindex="-1""#).count();
-        // 11 placeholders + the `<nav>` itself carries `tabindex=-1` for
-        // the skip-link target, so 12 total `tabindex="-1"` attributes.
-        assert_eq!(disabled, 11, "expected 11 aria-disabled placeholders, got {disabled}");
+        // 10 placeholders + the `<nav>` itself carries `tabindex=-1` for
+        // the skip-link target, so 11 total `tabindex="-1"` attributes.
+        assert_eq!(disabled, 10, "expected 10 aria-disabled placeholders, got {disabled}");
         assert_eq!(
-            tabindex_minus, 12,
-            "expected 12 tabindex='-1' (11 placeholders + nav landmark), got {tabindex_minus}"
+            tabindex_minus, 11,
+            "expected 11 tabindex='-1' (10 placeholders + nav landmark), got {tabindex_minus}"
         );
     }
 }

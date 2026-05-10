@@ -18,8 +18,9 @@ use dioxus::prelude::*;
 
 use crate::ui::layout::AppShell;
 use crate::ui::pages::{
-    BansPage, ChannelsPage, ClientsPage, DashboardPlaceholder, Home, LoginPage, LogsPage,
-    PublicWidgetPage, ServerInfoPage, SetupPage, WidgetsPage,
+    BansPage, BotDetailPage, BotsIndexPage, ChannelsPage, ClientsPage, DashboardPlaceholder, Home,
+    LoginPage, LogsPage, MusicLibraryPage, MusicPlaylistsPage, PublicWidgetPage, RadioStationsPage,
+    ServerInfoPage, SetupPage, WidgetsPage,
 };
 
 #[rustfmt::skip]
@@ -63,4 +64,22 @@ pub enum Route {
     // PURA-92 — Slice G operator-facing Widget Manager (Chapter 34).
     #[route("/widgets")]
     WidgetsPage {},
+
+    // PURA-124 WS-6 — music-bots product. Per-bot resources nest under
+    // the bot id so the URLs stay shareable; the index lives at the
+    // bare /music-bots prefix.
+    #[route("/music-bots")]
+    BotsIndexPage {},
+
+    #[route("/music-bots/:bot_id")]
+    BotDetailPage { bot_id: u64 },
+
+    #[route("/music-bots/:bot_id/library")]
+    MusicLibraryPage { bot_id: u64 },
+
+    #[route("/music-bots/:bot_id/playlists")]
+    MusicPlaylistsPage { bot_id: u64 },
+
+    #[route("/music-bots/:bot_id/radio")]
+    RadioStationsPage { bot_id: u64 },
 }
