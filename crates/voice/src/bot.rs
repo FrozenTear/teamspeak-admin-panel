@@ -21,7 +21,8 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 use tsclientlib::{
-    ChannelId as TsChannelId, ClientId, Connection, DisconnectOptions, Reason, StreamItem,
+    events::Event as BookEvent, ChannelId as TsChannelId, ClientId, Connection,
+    DisconnectOptions, MessageTarget, Reason, StreamItem,
 };
 // `OutCommandExt::send` is the dispatch sink for any `Out…Part` message
 // produced by the generated book→messages helpers (`client_move`, etc.).
@@ -31,6 +32,7 @@ use tsclientlib::prelude::*;
 use ts6_voice_fixture::{load_or_create_identity, wait_for_connected};
 
 use crate::backoff::ExponentialBackoff;
+use crate::chat;
 use crate::command::{AudioCommand, AudioSource, BotCommand, ChannelId, QueueCommand};
 use crate::config::{BotConfig, BotId};
 use crate::event::{BotError, BotEvent, DisconnectKind};
@@ -244,12 +246,20 @@ async fn run_connected_loop(
             biased;
             ev = async { con.events().next().await } => match ev {
                 Some(Ok(item)) => {
+                    // PURA-122 WS-4 — pull any in-channel chat messages
+                    // out of `BookEvents` BEFORE the channel-update logic
+                    // consumes the item. Cheap because we only clone the
+                    // event vector when chat is actually present.
+                    let chat_msgs = extract_channel_chat(&item, con);
                     if let Some(channel) = handle_stream_item(item, con) {
                         if Some(channel) != *current_channel {
                             *current_channel = Some(channel);
                             transition(state, BotState::InChannel, events);
                             let _ = events.send(BotEvent::JoinedChannel { channel_id: channel });
                         }
+                    }
+                    for msg in chat_msgs {
+                        dispatch_chat_line(con, bot_id, store, events, &msg).await;
                     }
                 }
                 Some(Err(err)) => {
@@ -650,4 +660,70 @@ fn emit_audio_stub(events: &broadcast::Sender<BotEvent>, cmd: &AudioCommand) {
 #[allow(dead_code)]
 pub(crate) fn arc_for_tests<T>(t: T) -> Arc<T> {
     Arc::new(t)
+}
+
+/// PURA-122 WS-4 — one chat line we'll feed through the parser, paired
+/// with the invoker's name for debug-logging context.
+struct ChatLine {
+    invoker: String,
+    text: String,
+}
+
+/// Pluck out incoming `MessageTarget::Channel` chat lines from a
+/// `BookEvents` `StreamItem`. We deliberately filter:
+/// - **Target**: only `Channel` (server-wide and private chat go elsewhere
+///   — and they aren't what `!`-commands operate on).
+/// - **Invoker**: skip the bot's own client id, otherwise the bot would
+///   parse its own replies if a reply ever started with `!`.
+///
+/// Returns an empty `Vec` for non-`BookEvents` items and for items that
+/// carried no channel chat — the common case stays cheap.
+fn extract_channel_chat(item: &StreamItem, con: &Connection) -> Vec<ChatLine> {
+    let StreamItem::BookEvents(events) = item else {
+        return Vec::new();
+    };
+    let own_client_id = match con.get_state() {
+        Ok(book) => Some(book.own_client),
+        Err(_) => None,
+    };
+    let mut out = Vec::new();
+    for ev in events {
+        if let BookEvent::Message {
+            target: MessageTarget::Channel,
+            invoker,
+            message,
+        } = ev
+        {
+            if Some(invoker.id) == own_client_id {
+                continue;
+            }
+            out.push(ChatLine {
+                invoker: invoker.name.clone(),
+                text: message.clone(),
+            });
+        }
+    }
+    out
+}
+
+/// Parse a chat line, then either dispatch it (real command) or send a
+/// short error reply (parse error with a user-visible cause). Empty /
+/// unknown lines are silently dropped per the issue spec.
+async fn dispatch_chat_line(
+    con: &mut Connection,
+    bot_id: BotId,
+    store: &Arc<dyn MusicBotStore>,
+    events: &broadcast::Sender<BotEvent>,
+    msg: &ChatLine,
+) {
+    match chat::parse(&msg.text) {
+        Ok(parsed) => {
+            debug!(invoker = %msg.invoker, ?parsed, "chat command");
+            chat::dispatch(bot_id, con, store, events, parsed).await;
+        }
+        Err(err) => {
+            debug!(invoker = %msg.invoker, line = %msg.text, ?err, "chat parse outcome");
+            chat::reply_for_parse_error(con, &err);
+        }
+    }
 }

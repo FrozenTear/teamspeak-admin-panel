@@ -11,6 +11,7 @@
 
 mod backoff;
 mod bot;
+mod chat;
 mod command;
 mod config;
 mod event;
@@ -19,6 +20,7 @@ mod store;
 mod supervisor;
 
 pub use backoff::{BackoffConfig, ExponentialBackoff};
+pub use chat::{parse as parse_chat_command, ParseError as ChatParseError, ParsedCommand};
 pub use command::{AudioCommand, AudioSource, BotCommand, ChannelId, QueueCommand};
 pub use config::{BotConfig, BotId};
 pub use event::{BotError, BotEvent, DisconnectKind};
