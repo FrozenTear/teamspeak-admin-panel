@@ -25,6 +25,8 @@ mod db;
 #[cfg(feature = "server")]
 mod logging;
 #[cfg(feature = "server")]
+mod music_bots;
+#[cfg(feature = "server")]
 mod repos;
 #[cfg(feature = "server")]
 mod routes;
@@ -201,6 +203,12 @@ mod server_entry {
         // PURA-82 — `/metrics` Prometheus exposition for the WS hub.
         // Admin-JWT gated; see the route module for the auth-gate rationale.
         let metrics_router = routes::metrics::router().with_state(state.clone());
+        // PURA-123 WS-5 — music-bot REST surface (`/api/music-bots`,
+        // `/api/music-library`, `/api/playlists`, `/api/radio-stations`,
+        // `/api/music-requests`). Auth via the same `RequireAuth`
+        // extractor as the rest of the panel.
+        let music_bots_router =
+            routes::music_bots::router().with_state(state.clone());
         // PURA-72 (Slice A) — public widget JSON endpoint
         // (`/api/widget/{token}/data`). No authentication.
         //
@@ -253,6 +261,8 @@ mod server_entry {
             .merge(control_router)
             // PURA-82 — Prometheus metrics endpoint for the WS hub.
             .merge(metrics_router)
+            // PURA-123 — music-bot REST surface.
+            .merge(music_bots_router)
             // PURA-72 — public widget endpoints (`/api/widget/{token}/...`).
             .merge(widget_router)
             // PURA-72 Slice D ([PURA-89]) — operator widget CRUD `/api/widgets`.

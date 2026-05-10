@@ -5,6 +5,7 @@
 //! tokens without re-reading env vars on every request. Future workstreams
 //! (REST, WS, FLOW) extend this struct in their own slices.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,6 +14,7 @@ use tokio::sync::Mutex;
 use crate::config::Config;
 use crate::control::ControlBackendPool;
 use crate::db::Database;
+use crate::music_bots::MusicBotService;
 use crate::webquery::WebQueryPool;
 use crate::widgets::WidgetCache;
 use crate::ws::Hub;
@@ -55,6 +57,11 @@ pub struct AppState {
     /// widget JSON / SVG / PNG endpoints all read through this cache so
     /// the upstream WebQuery client sees one fan-out per TTL window.
     pub widget_cache: WidgetCache,
+    /// PURA-123 WS-5: music-bot supervisor + per-bot store + request log.
+    /// One process-wide instance; the route layer in
+    /// [`crate::routes::music_bots`] is the only consumer. Persistence
+    /// is in-memory for WS-5; the SurrealDB-backed swap is a follow-up.
+    pub music_bots: MusicBotService,
 }
 
 impl AppState {
@@ -72,6 +79,13 @@ impl AppState {
         let control = ControlBackendPool::new(cfg.ts_allow_self_signed, db.clone())
             .with_known_hosts(cfg.ssh_known_hosts_path.clone())
             .with_tofu(tofu_sink);
+        // PURA-123 — bots without an explicit `identityPath` get a file
+        // under `<config-dir>/music-bots/`. Default uses the system temp
+        // dir so unit tests don't collide on a shared on-disk file; the
+        // real binary swap-points to `~/.config/ts6-manager/music-bots`
+        // can land alongside the SurrealDB persistence ticket.
+        let music_bot_identity_dir: PathBuf =
+            std::env::temp_dir().join("ts6-manager-music-bots");
         Self {
             db,
             jwt_secret: Arc::new(cfg.jwt_secret.as_bytes().to_vec()),
@@ -82,6 +96,7 @@ impl AppState {
             control,
             ws_hub: Hub::new(),
             widget_cache: WidgetCache::new(),
+            music_bots: MusicBotService::new(music_bot_identity_dir),
         }
     }
 }

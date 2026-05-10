@@ -52,6 +52,8 @@ server = [
     "dep:resvg",
     "dep:usvg",
     "dep:tiny-skia",
+    "dep:music-bot",
+    "dep:tokio-stream",
 ]
 web = ["dioxus/web"]
 # PURA-72 Slice C (PURA-88) — verification feature flag. When enabled,
@@ -126,6 +128,19 @@ zeroize = { workspace = true, optional = true }
 resvg = { workspace = true, optional = true }
 usvg = { workspace = true, optional = true }
 tiny-skia = { workspace = true, optional = true }
+
+# PURA-123 WS-5 — music-bot REST surface. The `music-bot` crate carries
+# the supervisor + per-bot store, AND its `BotEvent` / `BotState` /
+# `MusicBotStore` types we project onto the wire. Pulling it in
+# transitively brings `tsclientlib` (master pin @ 04aa249) and
+# `ts6-voice-fixture` — both are already in the lock file via the voice
+# product crates, so the marginal compile cost on the manager-server
+# build stays small.
+music-bot = { path = "../voice", optional = true }
+# `tokio-stream` wraps the bot's `broadcast::Receiver` into a `Stream`
+# the axum SSE response can consume directly. Server-only — no WASM
+# build path opens an SSE listener.
+tokio-stream = { version = "0.1", default-features = false, features = ["sync"], optional = true }
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }

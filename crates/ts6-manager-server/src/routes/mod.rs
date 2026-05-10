@@ -10,6 +10,7 @@
 
 pub mod control;
 pub mod metrics;
+pub mod music_bots;
 pub mod servers;
 pub mod setup;
 

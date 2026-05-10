@@ -240,6 +240,7 @@ async fn fresh_state() -> AppState {
         control,
         ws_hub: Hub::new(),
         widget_cache: crate::widgets::WidgetCache::new(),
+        music_bots: crate::music_bots::MusicBotService::default_for_tests(),
     }
 }
 
