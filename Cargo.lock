@@ -5056,6 +5056,7 @@ name = "music-bot"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "async-trait",
  "futures",
  "serde",
  "serde_json",

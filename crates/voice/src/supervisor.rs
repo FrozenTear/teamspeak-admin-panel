@@ -16,6 +16,10 @@ use crate::bot::run_bot;
 use crate::command::BotCommand;
 use crate::config::{BotConfig, BotId};
 use crate::event::BotEvent;
+use crate::store::{
+    InMemoryMusicBotStore, LibraryEntry, LibraryEntryId, MusicBotStore, NewLibraryEntry,
+    PlaylistName, StoreResult, Track,
+};
 
 /// Capacity of each bot's command queue. The dispatcher only ever has
 /// one in-flight command, but a small buffer absorbs UI jitter without
@@ -25,13 +29,25 @@ const COMMAND_BUFFER: usize = 16;
 /// Spawn a bot actor without a supervisor. The caller owns the returned
 /// `BotHandle` directly. The supervisor uses this same constructor under
 /// the hood so behaviour stays identical.
-pub fn spawn_bot(id: BotId, config: BotConfig) -> BotHandle {
+///
+/// `store` is the `MusicBotStore` the actor uses for queue / playlist /
+/// library state — see [`InMemoryMusicBotStore`] for a default; WS-5
+/// will ship the SurrealDB-backed impl in `ts6-manager-server`.
+pub fn spawn_bot(id: BotId, config: BotConfig, store: Arc<dyn MusicBotStore>) -> BotHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_BUFFER);
     let (event_tx, _) = broadcast::channel(config.event_buffer.max(1));
     let event_tx_for_actor = event_tx.clone();
     let cfg_for_actor = config.clone();
+    let store_for_actor = Arc::clone(&store);
     let join = tokio::spawn(async move {
-        run_bot(id, cfg_for_actor, cmd_rx, event_tx_for_actor).await;
+        run_bot(
+            id,
+            cfg_for_actor,
+            store_for_actor,
+            cmd_rx,
+            event_tx_for_actor,
+        )
+        .await;
     });
     BotHandle {
         id,
@@ -116,20 +132,41 @@ pub enum SendError {
 pub struct BotSupervisor {
     next_id: AtomicU64,
     bots: Arc<Mutex<HashMap<BotId, BotHandle>>>,
+    store: Arc<dyn MusicBotStore>,
 }
 
 impl Default for BotSupervisor {
+    /// Default supervisor uses an in-memory store. Production wiring
+    /// (`ts6-manager-server` in WS-5) will pass a SurrealDB-backed
+    /// store via [`BotSupervisor::with_store`].
     fn default() -> Self {
-        Self::new()
+        Self::with_store(Arc::new(InMemoryMusicBotStore::new()))
     }
 }
 
 impl BotSupervisor {
+    /// Convenience — `BotSupervisor::default()` plus a fresh in-memory
+    /// store. Used by tests + the WS-1 prototype where persistence
+    /// across process restarts isn't a requirement.
     pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Build a supervisor backed by the supplied store. WS-5 wires the
+    /// SurrealDB impl in here.
+    pub fn with_store(store: Arc<dyn MusicBotStore>) -> Self {
         Self {
             next_id: AtomicU64::new(1),
             bots: Arc::new(Mutex::new(HashMap::new())),
+            store,
         }
+    }
+
+    /// Borrow the store. Tests + WS-5 REST handlers reach for this when
+    /// they need to mutate playlist/library state outside the bot's
+    /// command dispatch.
+    pub fn store(&self) -> &Arc<dyn MusicBotStore> {
+        &self.store
     }
 
     /// Spawn a fresh bot actor. The returned id is also looked up via
@@ -142,7 +179,7 @@ impl BotSupervisor {
     pub async fn spawn(&self, config: BotConfig) -> BotId {
         let id = BotId(self.next_id.fetch_add(1, Ordering::Relaxed));
         let name = config.name.clone();
-        let handle = spawn_bot(id, config);
+        let handle = spawn_bot(id, config, Arc::clone(&self.store));
         self.bots.lock().await.insert(id, handle);
         info!(%id, %name, "spawned bot");
         id
@@ -181,6 +218,124 @@ impl BotSupervisor {
         match handle {
             Some(h) => h.shutdown().await,
             None => Err(SendError::ActorGone),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // PURA-121 WS-3 — playlist + library CRUD.
+    //
+    // These don't go through `BotCommand` because they aren't lifecycle
+    // ops — REST + chat surfaces shouldn't have to round-trip through
+    // the actor's mpsc to add a playlist entry. Each method also emits
+    // a `BotEvent` on the bot's broadcast channel so subscribers can
+    // refetch without polling.
+    // -----------------------------------------------------------------
+
+    pub async fn playlist_create(&self, bot: BotId, name: PlaylistName) -> StoreResult<()> {
+        self.store.playlist_create(bot, name.clone()).await?;
+        self.notify(bot, BotEvent::PlaylistChanged(name)).await;
+        Ok(())
+    }
+
+    pub async fn playlist_rename(
+        &self,
+        bot: BotId,
+        old: PlaylistName,
+        new: PlaylistName,
+    ) -> StoreResult<()> {
+        self.store
+            .playlist_rename(bot, old, new.clone())
+            .await?;
+        self.notify(bot, BotEvent::PlaylistChanged(new)).await;
+        Ok(())
+    }
+
+    pub async fn playlist_delete(&self, bot: BotId, name: PlaylistName) -> StoreResult<()> {
+        self.store.playlist_delete(bot, name.clone()).await?;
+        self.notify(bot, BotEvent::PlaylistChanged(name)).await;
+        Ok(())
+    }
+
+    pub async fn playlist_add_track(
+        &self,
+        bot: BotId,
+        name: &PlaylistName,
+        track: crate::store::NewTrack,
+    ) -> StoreResult<Track> {
+        let stored = self.store.playlist_add_track(bot, name, track).await?;
+        self.notify(bot, BotEvent::PlaylistChanged(name.clone())).await;
+        Ok(stored)
+    }
+
+    pub async fn playlist_remove_track(
+        &self,
+        bot: BotId,
+        name: &PlaylistName,
+        id: crate::store::TrackId,
+    ) -> StoreResult<bool> {
+        let changed = self
+            .store
+            .playlist_remove_track(bot, name, id)
+            .await?;
+        if changed {
+            self.notify(bot, BotEvent::PlaylistChanged(name.clone())).await;
+        }
+        Ok(changed)
+    }
+
+    pub async fn playlist_list(&self, bot: BotId) -> StoreResult<Vec<PlaylistName>> {
+        self.store.playlist_list(bot).await
+    }
+
+    pub async fn playlist_list_tracks(
+        &self,
+        bot: BotId,
+        name: &PlaylistName,
+    ) -> StoreResult<Vec<Track>> {
+        self.store.playlist_list_tracks(bot, name).await
+    }
+
+    pub async fn library_add(
+        &self,
+        bot: BotId,
+        entry: NewLibraryEntry,
+    ) -> StoreResult<LibraryEntry> {
+        let stored = self.store.library_add(bot, entry).await?;
+        self.notify(bot, BotEvent::LibraryChanged).await;
+        Ok(stored)
+    }
+
+    pub async fn library_remove(&self, bot: BotId, id: LibraryEntryId) -> StoreResult<bool> {
+        let removed = self.store.library_remove(bot, id).await?;
+        if removed {
+            self.notify(bot, BotEvent::LibraryChanged).await;
+        }
+        Ok(removed)
+    }
+
+    pub async fn library_lookup(
+        &self,
+        bot: BotId,
+        id: LibraryEntryId,
+    ) -> StoreResult<Option<LibraryEntry>> {
+        self.store.library_lookup(bot, id).await
+    }
+
+    pub async fn library_list(
+        &self,
+        bot: BotId,
+        tag: Option<&str>,
+    ) -> StoreResult<Vec<LibraryEntry>> {
+        self.store.library_list(bot, tag).await
+    }
+
+    /// Best-effort emit on a tracked bot's broadcast channel. If the bot
+    /// isn't tracked (already shut down) we drop the event silently —
+    /// every WS-3 caller is OK with that since the persisted state is
+    /// authoritative for late-coming subscribers.
+    async fn notify(&self, bot: BotId, event: BotEvent) {
+        if let Some(handle) = self.bots.lock().await.get(&bot) {
+            let _ = handle.events.send(event);
         }
     }
 

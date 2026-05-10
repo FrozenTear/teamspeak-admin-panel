@@ -34,6 +34,15 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
+# PURA-121 WS-3 — `MusicBotStore` is async (the WS-5 SurrealDB impl
+# needs `async fn` on the trait); `async-trait` keeps the dispatch
+# surface object-safe so the supervisor + bot actor share an
+# `Arc<dyn MusicBotStore>`.
+async-trait = { workspace = true }
+# PURA-121 WS-3 — snapshot/load round-trip the in-memory store as JSON.
+# Already a workspace dep (used by the lifecycle E2E test), so this is a
+# free pull.
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync", "test-util"] }

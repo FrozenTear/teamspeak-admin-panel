@@ -31,16 +31,18 @@ use tsclientlib::prelude::*;
 use ts6_voice_fixture::{load_or_create_identity, wait_for_connected};
 
 use crate::backoff::ExponentialBackoff;
-use crate::command::{AudioCommand, AudioSource, BotCommand, ChannelId};
+use crate::command::{AudioCommand, AudioSource, BotCommand, ChannelId, QueueCommand};
 use crate::config::{BotConfig, BotId};
 use crate::event::{BotError, BotEvent, DisconnectKind};
 use crate::state::BotState;
+use crate::store::{MusicBotStore, StoreError, Track};
 
 /// Run the bot actor to completion. Exits when a `Shutdown` command has
 /// been processed and the disconnect has flushed.
 pub(crate) async fn run_bot(
     bot_id: BotId,
     config: BotConfig,
+    store: Arc<dyn MusicBotStore>,
     mut rx: mpsc::Receiver<BotCommand>,
     events: broadcast::Sender<BotEvent>,
 ) {
@@ -89,6 +91,12 @@ pub(crate) async fn run_bot(
                     BotCommand::Disconnect => {
                         debug!("Disconnect ignored — already Disconnected");
                     }
+                    BotCommand::Queue(qc) => {
+                        // Queue ops are state-agnostic — staging a queue
+                        // before connecting is a supported flow (chat
+                        // bridge / REST in WS-4 / WS-5 will rely on it).
+                        handle_queue_command(bot_id, &store, qc, &events).await;
+                    }
                     other => emit_rejected(&events, &other, state),
                 }
             }
@@ -106,9 +114,16 @@ pub(crate) async fn run_bot(
                             channel_id: default_channel,
                         });
                         // Drive the connected loop until disconnected.
-                        let outcome =
-                            run_connected_loop(&mut con, &mut state, &mut current_channel, &mut rx, &events)
-                                .await;
+                        let outcome = run_connected_loop(
+                            &mut con,
+                            &mut state,
+                            &mut current_channel,
+                            &mut rx,
+                            &events,
+                            bot_id,
+                            &store,
+                        )
+                        .await;
                         match outcome {
                             ConnectedExit::Shutdown => {
                                 shutdown_requested = true;
@@ -221,6 +236,8 @@ async fn run_connected_loop(
     current_channel: &mut Option<ChannelId>,
     rx: &mut mpsc::Receiver<BotCommand>,
     events: &broadcast::Sender<BotEvent>,
+    bot_id: BotId,
+    store: &Arc<dyn MusicBotStore>,
 ) -> ConnectedExit {
     loop {
         tokio::select! {
@@ -265,7 +282,20 @@ async fn run_connected_loop(
                         debug!(channel_id = id, "LeaveChannel — staying in current channel until WS-3 default-channel tracking lands");
                     }
                 }
-                Some(BotCommand::Audio(audio)) => emit_audio_stub(events, &audio),
+                Some(BotCommand::Audio(audio)) => {
+                    // PURA-121 WS-3 — `SkipNext` is a queue advance even
+                    // before WS-2 wires the audio task. Lower it here so
+                    // the chat bridge (WS-4) and REST surface (WS-5) can
+                    // exercise the auto-advance contract today.
+                    if matches!(audio, AudioCommand::SkipNext) {
+                        handle_queue_command(bot_id, store, QueueCommand::Advance, events).await;
+                    } else {
+                        emit_audio_stub(events, &audio);
+                    }
+                }
+                Some(BotCommand::Queue(qc)) => {
+                    handle_queue_command(bot_id, store, qc, events).await;
+                }
                 None => return ConnectedExit::Dropped("command channel closed".into()),
             },
         }
@@ -449,11 +479,151 @@ fn emit_rejected(events: &broadcast::Sender<BotEvent>, cmd: &BotCommand, state: 
         BotCommand::LeaveChannel => "LeaveChannel",
         BotCommand::Shutdown => "Shutdown",
         BotCommand::Audio(_) => "Audio",
+        BotCommand::Queue(_) => "Queue",
     };
     warn!(command = label, ?state, "command rejected for current state");
     let _ = events.send(BotEvent::Error(BotError::CommandRejected {
         command: label.into(),
         state,
+    }));
+}
+
+/// PURA-121 WS-3 — translate a `QueueCommand` into store mutations and
+/// post-mutation `BotEvent`s. Shared by the `Disconnected` branch (for
+/// pre-connect queue staging) and the connected loop (for in-session
+/// mutations + auto-advance).
+async fn handle_queue_command(
+    bot_id: BotId,
+    store: &Arc<dyn MusicBotStore>,
+    cmd: QueueCommand,
+    events: &broadcast::Sender<BotEvent>,
+) {
+    match cmd {
+        QueueCommand::Enqueue(track) => {
+            let was_empty = store.queue_peek(bot_id).await.map(|q| q.is_empty()).unwrap_or(false);
+            match store.queue_enqueue(bot_id, track).await {
+                Ok(track) => {
+                    emit_queue_changed(store, bot_id, events).await;
+                    if was_empty {
+                        let _ = events.send(BotEvent::NowPlaying(track));
+                    }
+                }
+                Err(err) => emit_store_error(events, "queue_enqueue", err),
+            }
+        }
+        QueueCommand::EnqueuePlaylist(name) => {
+            let was_empty = store.queue_peek(bot_id).await.map(|q| q.is_empty()).unwrap_or(false);
+            match store.enqueue_playlist(bot_id, &name).await {
+                Ok(stamped) => {
+                    emit_queue_changed(store, bot_id, events).await;
+                    if let Some(first) = stamped.into_iter().next().filter(|_| was_empty) {
+                        let _ = events.send(BotEvent::NowPlaying(first));
+                    }
+                }
+                Err(err) => emit_store_error(events, "enqueue_playlist", err),
+            }
+        }
+        QueueCommand::Remove(id) => {
+            let head_before = store.queue_current(bot_id).await.ok().flatten();
+            let removed_head = head_before.as_ref().map(|t| t.id) == Some(id);
+            match store.queue_remove(bot_id, id).await {
+                Ok(true) => {
+                    emit_queue_changed(store, bot_id, events).await;
+                    if removed_head {
+                        emit_head_change(store, bot_id, events).await;
+                    }
+                }
+                Ok(false) => {
+                    debug!(?id, "queue_remove no-op — id not in queue");
+                }
+                Err(err) => emit_store_error(events, "queue_remove", err),
+            }
+        }
+        QueueCommand::Reorder(order) => {
+            let head_before = store.queue_current(bot_id).await.ok().flatten().map(|t| t.id);
+            match store.queue_reorder(bot_id, order).await {
+                Ok(()) => {
+                    emit_queue_changed(store, bot_id, events).await;
+                    let head_after = store.queue_current(bot_id).await.ok().flatten();
+                    if head_after.as_ref().map(|t| t.id) != head_before {
+                        if let Some(track) = head_after {
+                            let _ = events.send(BotEvent::NowPlaying(track));
+                        } else {
+                            let _ = events.send(BotEvent::QueueEmpty);
+                        }
+                    }
+                }
+                Err(err) => emit_store_error(events, "queue_reorder", err),
+            }
+        }
+        QueueCommand::Clear => {
+            let was_non_empty = store
+                .queue_peek(bot_id)
+                .await
+                .map(|q| !q.is_empty())
+                .unwrap_or(false);
+            match store.queue_clear(bot_id).await {
+                Ok(()) => {
+                    emit_queue_changed(store, bot_id, events).await;
+                    if was_non_empty {
+                        let _ = events.send(BotEvent::QueueEmpty);
+                    }
+                }
+                Err(err) => emit_store_error(events, "queue_clear", err),
+            }
+        }
+        QueueCommand::Advance => {
+            match store.queue_dequeue_head(bot_id).await {
+                Ok(_popped) => {
+                    emit_queue_changed(store, bot_id, events).await;
+                    emit_head_change(store, bot_id, events).await;
+                }
+                Err(err) => emit_store_error(events, "queue_dequeue_head", err),
+            }
+        }
+    }
+}
+
+async fn emit_queue_changed(
+    store: &Arc<dyn MusicBotStore>,
+    bot_id: BotId,
+    events: &broadcast::Sender<BotEvent>,
+) {
+    let queue: Vec<Track> = store.queue_peek(bot_id).await.unwrap_or_default();
+    let current = queue.first().cloned();
+    let _ = events.send(BotEvent::QueueChanged {
+        len: queue.len(),
+        current,
+    });
+}
+
+/// Emit `NowPlaying(new_head)` if the queue still has a head, else
+/// `QueueEmpty`. Called after every op that may have changed the head.
+async fn emit_head_change(
+    store: &Arc<dyn MusicBotStore>,
+    bot_id: BotId,
+    events: &broadcast::Sender<BotEvent>,
+) {
+    match store.queue_current(bot_id).await {
+        Ok(Some(track)) => {
+            let _ = events.send(BotEvent::NowPlaying(track));
+        }
+        Ok(None) => {
+            let _ = events.send(BotEvent::QueueEmpty);
+        }
+        Err(err) => emit_store_error(events, "queue_current", err),
+    }
+}
+
+fn emit_store_error(
+    events: &broadcast::Sender<BotEvent>,
+    op: &str,
+    err: StoreError,
+) {
+    warn!(op, ?err, "store op failed");
+    let _ = events.send(BotEvent::Error(BotError::Store {
+        op: op.into(),
+        message: err.to_string(),
     }));
 }
 

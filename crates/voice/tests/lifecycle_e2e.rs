@@ -33,11 +33,13 @@
 extern crate music_bot as bot_lib;
 
 use std::env;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use bot_lib::{
     spawn_bot, BotCommand, BotConfig, BotEvent, BotId, BotState, DisconnectKind,
+    InMemoryMusicBotStore, MusicBotStore,
 };
 use tokio::sync::broadcast;
 use tokio::time::{timeout, Instant};
@@ -92,7 +94,8 @@ async fn run() -> Result<()> {
         .with_handshake_timeout(HANDSHAKE_TIMEOUT)
         .with_auto_connect(true);
 
-    let handle = spawn_bot(BotId(1), config);
+    let store: Arc<dyn MusicBotStore> = Arc::new(InMemoryMusicBotStore::new());
+    let handle = spawn_bot(BotId(1), config, store);
     let mut events = handle.subscribe();
 
     // 1. Connected event fires with the default channel.

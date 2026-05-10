@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::command::ChannelId;
 use crate::state::BotState;
+use crate::store::{PlaylistName, Track};
 
 /// Events emitted by a bot actor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,6 +37,32 @@ pub enum BotEvent {
     JoinedChannel { channel_id: ChannelId },
     /// Bot is no longer in a specific channel (left to the default).
     LeftChannel,
+    /// PURA-121 WS-3 — queue mutated. `len` is the upcoming queue length
+    /// (head included); `current` is the head if any. Fires after every
+    /// successful `BotCommand::Queue(...)` op AND after auto-advance
+    /// (`AudioCommand::SkipNext` / WS-2 EndOfStream wiring).
+    QueueChanged {
+        len: usize,
+        current: Option<Track>,
+    },
+    /// PURA-121 WS-3 — a fresh track is now at the head of the queue
+    /// (about to play / playing). Fires when `queue_dequeue_head` exposes
+    /// a new head, or when `enqueue` lands a track into a previously
+    /// empty queue. The full track is included so subscribers don't need
+    /// a separate `queue_current` round-trip.
+    NowPlaying(Track),
+    /// PURA-121 WS-3 — the queue drained. Fires when the last track
+    /// finishes (auto-advance returns `None`) or `queue_clear` empties
+    /// a non-empty queue.
+    QueueEmpty,
+    /// PURA-121 WS-3 — a playlist was created / renamed / deleted, or
+    /// its contents changed. Subscribers refetch via
+    /// `MusicBotStore::playlist_list_tracks`. `name` is the post-mutation
+    /// name (after a rename, this is the new name).
+    PlaylistChanged(PlaylistName),
+    /// PURA-121 WS-3 — the library was mutated. Coarse-grained because
+    /// most consumers refetch the whole list on change.
+    LibraryChanged,
     /// Recoverable error during dispatch — illegal command for current
     /// state, transient send failure, audio-not-implemented stub, etc.
     Error(BotError),
@@ -70,6 +97,11 @@ pub enum BotError {
     /// up yet. WS-2 removes this branch.
     #[error("audio command {0} not implemented in WS-1")]
     AudioNotImplemented(String),
+
+    /// PURA-121 WS-3 — a queue / playlist / library command failed at
+    /// the store layer. The leaf message is the `StoreError`'s display.
+    #[error("store error in {op}: {message}")]
+    Store { op: String, message: String },
 
     /// tsclientlib returned an error during connect / channel-switch /
     /// disconnect. We surface the leaf message; the full chain is logged

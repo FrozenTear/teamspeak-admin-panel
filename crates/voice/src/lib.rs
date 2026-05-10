@@ -15,11 +15,16 @@ mod command;
 mod config;
 mod event;
 mod state;
+mod store;
 mod supervisor;
 
 pub use backoff::{BackoffConfig, ExponentialBackoff};
-pub use command::{AudioCommand, AudioSource, BotCommand, ChannelId};
+pub use command::{AudioCommand, AudioSource, BotCommand, ChannelId, QueueCommand};
 pub use config::{BotConfig, BotId};
 pub use event::{BotError, BotEvent, DisconnectKind};
 pub use state::{BotState, IllegalTransition};
+pub use store::{
+    InMemoryMusicBotStore, LibraryEntry, LibraryEntryId, MusicBotStore, NewLibraryEntry,
+    NewTrack, PlaylistName, StoreError, StoreResult, Track, TrackId, SNAPSHOT_VERSION,
+};
 pub use supervisor::{spawn_bot, BotHandle, BotInfo, BotSupervisor, SendError};

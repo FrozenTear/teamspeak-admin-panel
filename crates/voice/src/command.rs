@@ -9,6 +9,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::store::{NewTrack, PlaylistName, TrackId};
+
 /// Channel ID on the TS6 server. Mirrors `tsclientlib::ChannelId`'s newtype
 /// over `u64` but we keep the public surface plain so callers don't need a
 /// `tsclientlib` dep just to enqueue a `JoinChannel`.
@@ -34,6 +36,12 @@ pub enum BotCommand {
     /// Audio sub-command. WS-2 fills these in; WS-1 acknowledges and logs
     /// only.
     Audio(AudioCommand),
+    /// PURA-121 WS-3 — queue mutation. The dispatcher mutates the
+    /// `MusicBotStore` and emits `QueueChanged` / `NowPlaying` /
+    /// `QueueEmpty` accordingly. Valid in every lifecycle state — you
+    /// can stage a queue while the bot is `Disconnected` and the audio
+    /// task will pick it up on connect.
+    Queue(QueueCommand),
 }
 
 /// Audio sub-commands. Stubbed for WS-1 — the bot actor logs them and
@@ -64,13 +72,43 @@ pub enum AudioCommand {
 
 /// Where to fetch audio from. WS-2 will widen this; WS-1 only needs the
 /// shape so command dispatch compiles end-to-end.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum AudioSource {
     /// Anything yt-dlp can resolve — YouTube, SoundCloud, Vimeo, etc.
     Url(String),
     /// Local file inside the music library (path is relative to the
     /// configured library root in WS-3).
     LibraryPath(PathBuf),
+}
+
+/// PURA-121 WS-3 — queue-mutation sub-commands the dispatcher routes
+/// into the `MusicBotStore`. Playlist + library CRUD goes through
+/// `BotSupervisor` direct methods rather than the dispatcher (browser /
+/// chat surfaces don't need lifecycle-state coupling for those).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum QueueCommand {
+    /// Append a track to the bot's queue. Emits `QueueChanged`. If the
+    /// queue was empty, also emits `NowPlaying(track)` so subscribers
+    /// can wire UI off "playback started" without polling.
+    Enqueue(NewTrack),
+    /// Append every track in the named playlist to the bot's queue.
+    /// Emits `QueueChanged`. If the queue was empty before, also emits
+    /// `NowPlaying(first_appended)`.
+    EnqueuePlaylist(PlaylistName),
+    /// Remove a track by id. Emits `QueueChanged`. If the removed track
+    /// WAS the head, also emits `NowPlaying(new_head)` or `QueueEmpty`.
+    Remove(TrackId),
+    /// Replace the queue order with a permutation of the current ids.
+    /// Emits `QueueChanged`. If the head changed as a result, also emits
+    /// `NowPlaying(new_head)`.
+    Reorder(Vec<TrackId>),
+    /// Drop every track. Emits `QueueChanged` and `QueueEmpty`.
+    Clear,
+    /// Pop the head of the queue. WS-2's audio task will send this on
+    /// EndOfStream once it's wired into the dispatcher; for now it's
+    /// also what `AudioCommand::SkipNext` lowers to. Emits
+    /// `QueueChanged` plus either `NowPlaying(new_head)` or `QueueEmpty`.
+    Advance,
 }
 
 #[cfg(test)]
@@ -93,6 +131,15 @@ mod tests {
             }),
             BotCommand::Audio(AudioCommand::Stop),
             BotCommand::Audio(AudioCommand::SetVolume(0.5)),
+            BotCommand::Queue(QueueCommand::Enqueue(NewTrack::url(
+                "demo",
+                "https://example.com/demo.mp3",
+            ))),
+            BotCommand::Queue(QueueCommand::EnqueuePlaylist("lo-fi".into())),
+            BotCommand::Queue(QueueCommand::Remove(TrackId(7))),
+            BotCommand::Queue(QueueCommand::Reorder(vec![TrackId(7), TrackId(8)])),
+            BotCommand::Queue(QueueCommand::Clear),
+            BotCommand::Queue(QueueCommand::Advance),
         ];
         for cmd in cmds {
             let json = serde_json::to_string(&cmd).unwrap();
