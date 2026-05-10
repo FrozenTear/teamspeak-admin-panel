@@ -236,6 +236,13 @@ pub fn use_ws_hub() -> WsHub {
 /// from anonymous to authenticated. Token refreshes do NOT re-arm — the
 /// WS handshake authenticates once on connect and a JWT rotation alone
 /// doesn't invalidate the open connection.
+///
+/// `last_authed` is read with `peek()` (no subscription) and only written
+/// when the value actually flips. Reading it via `read()` would subscribe
+/// the effect to the same signal it writes to, and `Signal::set` notifies
+/// subscribers even when the value is unchanged — that combination becomes
+/// a self-retriggering loop that pegs the renderer's main thread on every
+/// render. PURA-132 traced the headless deadlock to this loop.
 pub fn use_ws_lifecycle(hub: WsHub) {
     let session = use_session();
     let mut last_authed: Signal<bool> = use_signal(|| false);
@@ -244,7 +251,10 @@ pub fn use_ws_lifecycle(hub: WsHub) {
             AuthState::Authenticated { access, .. } => (true, Some(access.clone())),
             AuthState::Anonymous => (false, None),
         };
-        let prev = *last_authed.read();
+        let prev = *last_authed.peek();
+        if prev == now_authed {
+            return;
+        }
         if !prev && now_authed {
             if let Some(t) = access {
                 hub.rearm(t);
