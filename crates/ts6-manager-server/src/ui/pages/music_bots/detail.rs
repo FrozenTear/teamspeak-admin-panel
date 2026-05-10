@@ -5,11 +5,10 @@
 //! land without polling — the underlying [`web_sys::EventSource`] also
 //! handles reconnect + last-event-id for free.
 //!
-//! Playback control buttons (play / pause / skip / stop / volume) ship
-//! disabled in v1 because the WS-5 REST surface only exposes lifecycle
-//! + library + playlist routes. The audio-control endpoints are tracked
-//! as a follow-up under PURA-124 — when they land, flip the disabled
-//! flag and wire them to the existing handler stubs.
+//! Playback control buttons (resume / pause / skip / stop) dispatch to
+//! the audio-control REST surface (PURA-126). Buttons disable
+//! themselves when the bot isn't `InChannel`/`Playing` — the backend
+//! would 404 anyway, but disabling client-side keeps the chrome honest.
 
 use dioxus::prelude::*;
 use ts6_manager_shared::music_bots as wire;
@@ -303,7 +302,11 @@ pub fn BotDetailPage(bot_id: u64) -> Element {
                     } else {
                         p { class: "muted", "Nothing is playing." }
                     }
-                    PlaybackControls {}
+                    PlaybackControls {
+                        bot_id,
+                        state: d.state,
+                        has_track: d.now_playing.is_some(),
+                    }
                 }
 
                 div { class: "card",
@@ -327,47 +330,140 @@ pub fn BotDetailPage(bot_id: u64) -> Element {
 }
 
 #[component]
-fn PlaybackControls() -> Element {
-    // Disabled in v1 — the audio-control endpoints (`/play`, `/pause`,
-    // `/skip-next`, `/skip-prev`, `/stop`, `/volume`) are not exposed by
-    // WS-5 yet. Rendering them disabled keeps the chrome stable so the
-    // rebind is purely additive once the REST surface lands.
-    let title = "Audio control endpoints are landing in a follow-up to WS-5.";
+fn PlaybackControls(bot_id: u64, state: wire::BotState, has_track: bool) -> Element {
+    let bot = wire::BotId(bot_id);
+    let gate = use_auth_gate();
+    let toaster = use_toaster();
+
+    // Audio commands are meaningless when the bot isn't on a server — the
+    // backend would 404 the dispatch with `bot not found` (translated by
+    // `translate_send_error` for an `ActorGone` actor). Disable the row
+    // wholesale so the chrome reflects what the operator can actually do.
+    let in_channel = matches!(state, wire::BotState::InChannel | wire::BotState::Playing);
+
+    let dispatch = {
+        let gate = gate.clone();
+        move |kind: AudioAction| {
+            let gate = gate.clone();
+            let toaster = toaster;
+            spawn(async move {
+                let res = match kind {
+                    AudioAction::SkipPrev => mb::skip_prev(gate, bot).await,
+                    AudioAction::Resume => mb::resume_bot(gate, bot).await,
+                    AudioAction::Pause => mb::pause_bot(gate, bot).await,
+                    AudioAction::SkipNext => mb::skip_next(gate, bot).await,
+                    AudioAction::Stop => mb::stop_bot(gate, bot).await,
+                };
+                match res {
+                    Ok(()) => {
+                        toaster.push(ToastVariant::Success, kind.success_label(), None);
+                    }
+                    Err(e) => {
+                        toaster.push(
+                            ToastVariant::Danger,
+                            kind.failure_label(),
+                            Some(format_error(&e)),
+                        );
+                    }
+                }
+            });
+        }
+    };
+
+    let on_skip_prev = {
+        let dispatch = dispatch.clone();
+        move |_| dispatch(AudioAction::SkipPrev)
+    };
+    let on_resume = {
+        let dispatch = dispatch.clone();
+        move |_| dispatch(AudioAction::Resume)
+    };
+    let on_pause = {
+        let dispatch = dispatch.clone();
+        move |_| dispatch(AudioAction::Pause)
+    };
+    let on_skip_next = {
+        let dispatch = dispatch.clone();
+        move |_| dispatch(AudioAction::SkipNext)
+    };
+    let on_stop = {
+        let dispatch = dispatch;
+        move |_| dispatch(AudioAction::Stop)
+    };
+
     rsx! {
-        div { class: "playback-controls", title: title, "aria-disabled": "true",
+        div { class: "playback-controls",
             Button {
                 variant: ButtonVariant::Ghost,
                 size: ButtonSize::Small,
-                disabled: true,
+                disabled: !in_channel,
+                onclick: on_skip_prev,
                 "« Prev"
             }
             Button {
                 variant: ButtonVariant::Primary,
                 size: ButtonSize::Small,
-                disabled: true,
+                disabled: !in_channel || !has_track,
+                onclick: on_resume,
                 "Play"
             }
             Button {
                 variant: ButtonVariant::Secondary,
                 size: ButtonSize::Small,
-                disabled: true,
+                disabled: !in_channel || !has_track,
+                onclick: on_pause,
                 "Pause"
             }
             Button {
                 variant: ButtonVariant::Ghost,
                 size: ButtonSize::Small,
-                disabled: true,
+                disabled: !in_channel,
+                onclick: on_skip_next,
                 "Skip »"
             }
             Button {
                 variant: ButtonVariant::Danger,
                 size: ButtonSize::Small,
-                disabled: true,
+                disabled: !in_channel || !has_track,
+                onclick: on_stop,
                 "Stop"
             }
         }
-        p { class: "muted small",
-            "Playback controls land alongside the WS-5 audio endpoints. Until then, use Playlists → Enqueue or Radio → Play to drive playback."
+        if !in_channel {
+            p { class: "muted small",
+                "Bot must be in a channel to control playback. Connect and join a channel first."
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum AudioAction {
+    SkipPrev,
+    Resume,
+    Pause,
+    SkipNext,
+    Stop,
+}
+
+impl AudioAction {
+    fn success_label(self) -> &'static str {
+        match self {
+            AudioAction::SkipPrev => "Skipping back",
+            AudioAction::Resume => "Resuming",
+            AudioAction::Pause => "Paused",
+            AudioAction::SkipNext => "Skipping",
+            AudioAction::Stop => "Stopped",
+        }
+    }
+
+    fn failure_label(self) -> &'static str {
+        match self {
+            AudioAction::SkipPrev => "Skip back failed",
+            AudioAction::Resume => "Resume failed",
+            AudioAction::Pause => "Pause failed",
+            AudioAction::SkipNext => "Skip failed",
+            AudioAction::Stop => "Stop failed",
         }
     }
 }

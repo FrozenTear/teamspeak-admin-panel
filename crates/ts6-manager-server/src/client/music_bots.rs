@@ -306,6 +306,109 @@ pub async fn play_radio_station(
     api::authorized_post_json::<(), ()>(&gate, &api::api_base(), &path, None).await
 }
 
+// ---- Audio control (PURA-126 WS-6 follow-up) ----------------------------
+
+pub async fn play_source(
+    gate: Arc<RefreshGate>,
+    bot: wire::BotId,
+    source: wire::AudioSource,
+) -> Result<(), ApiError> {
+    let path = format!("/api/music-bots/{}/play", bot.0);
+    let body = wire::PlayRequest { source };
+    api::authorized_post_json::<_, ()>(&gate, &api::api_base(), &path, Some(&body)).await
+}
+
+pub async fn pause_bot(gate: Arc<RefreshGate>, bot: wire::BotId) -> Result<(), ApiError> {
+    let path = format!("/api/music-bots/{}/pause", bot.0);
+    api::authorized_post_json::<(), ()>(&gate, &api::api_base(), &path, None).await
+}
+
+pub async fn resume_bot(gate: Arc<RefreshGate>, bot: wire::BotId) -> Result<(), ApiError> {
+    let path = format!("/api/music-bots/{}/resume", bot.0);
+    api::authorized_post_json::<(), ()>(&gate, &api::api_base(), &path, None).await
+}
+
+pub async fn stop_bot(gate: Arc<RefreshGate>, bot: wire::BotId) -> Result<(), ApiError> {
+    let path = format!("/api/music-bots/{}/stop", bot.0);
+    api::authorized_post_json::<(), ()>(&gate, &api::api_base(), &path, None).await
+}
+
+pub async fn skip_next(gate: Arc<RefreshGate>, bot: wire::BotId) -> Result<(), ApiError> {
+    let path = format!("/api/music-bots/{}/skip-next", bot.0);
+    api::authorized_post_json::<(), ()>(&gate, &api::api_base(), &path, None).await
+}
+
+pub async fn skip_prev(gate: Arc<RefreshGate>, bot: wire::BotId) -> Result<(), ApiError> {
+    let path = format!("/api/music-bots/{}/skip-prev", bot.0);
+    api::authorized_post_json::<(), ()>(&gate, &api::api_base(), &path, None).await
+}
+
+pub async fn set_volume(
+    gate: Arc<RefreshGate>,
+    bot: wire::BotId,
+    gain: f32,
+) -> Result<(), ApiError> {
+    let path = format!("/api/music-bots/{}/volume", bot.0);
+    let body = wire::SetVolumeRequest { gain };
+    api::authorized_post_json::<_, ()>(&gate, &api::api_base(), &path, Some(&body)).await
+}
+
+// ---- Direct queue mutation (PURA-126 WS-6 follow-up) --------------------
+//
+// `enqueue_track` / `clear_queue` / `remove_queue_track` / `advance_queue`
+// fire-and-forget — the actor minted track id arrives via the SSE
+// `QueueChanged` event. `reorder_queue` returns the post-reorder snapshot
+// for optimistic rendering after a drag gesture (the SSE event is still
+// the authoritative live signal).
+
+pub async fn enqueue_track(
+    gate: Arc<RefreshGate>,
+    bot: wire::BotId,
+    source: wire::AudioSource,
+    title: String,
+    duration_secs: Option<u64>,
+    requested_by: Option<String>,
+) -> Result<(), ApiError> {
+    let path = format!("/api/music-bots/{}/queue", bot.0);
+    let body = wire::EnqueueTrackRequest {
+        source,
+        title,
+        duration_secs,
+        requested_by,
+    };
+    api::authorized_post_json::<_, ()>(&gate, &api::api_base(), &path, Some(&body)).await
+}
+
+pub async fn clear_queue(gate: Arc<RefreshGate>, bot: wire::BotId) -> Result<(), ApiError> {
+    let path = format!("/api/music-bots/{}/queue", bot.0);
+    api::authorized_delete(&gate, &api::api_base(), &path).await
+}
+
+pub async fn remove_queue_track(
+    gate: Arc<RefreshGate>,
+    bot: wire::BotId,
+    track: wire::TrackId,
+) -> Result<(), ApiError> {
+    let path = format!("/api/music-bots/{}/queue/{}", bot.0, track.0);
+    api::authorized_delete(&gate, &api::api_base(), &path).await
+}
+
+pub async fn reorder_queue(
+    gate: Arc<RefreshGate>,
+    bot: wire::BotId,
+    track_ids: Vec<wire::TrackId>,
+) -> Result<Vec<wire::Track>, ApiError> {
+    let path = format!("/api/music-bots/{}/queue/reorder", bot.0);
+    let body = wire::ReorderQueueRequest { track_ids };
+    api::authorized_post_json::<_, Vec<wire::Track>>(&gate, &api::api_base(), &path, Some(&body))
+        .await
+}
+
+pub async fn advance_queue(gate: Arc<RefreshGate>, bot: wire::BotId) -> Result<(), ApiError> {
+    let path = format!("/api/music-bots/{}/queue/advance", bot.0);
+    api::authorized_post_json::<(), ()>(&gate, &api::api_base(), &path, None).await
+}
+
 // ---- SSE event stream ---------------------------------------------------
 
 /// Subscribe to `/api/music-bots/{id}/events` and call `on_event` for
