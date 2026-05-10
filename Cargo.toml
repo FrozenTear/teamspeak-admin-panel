@@ -45,6 +45,14 @@ web-sys = { version = "0.3", features = [
     "Location",
     "Navigator",
     "Clipboard",
+    # PURA-124 WS-6 — `EventSource` + `MessageEvent` power the bot detail
+    # page's SSE subscription against `/api/music-bots/{id}/events`. The
+    # browser's native `EventSource` handles reconnect + last-event-id,
+    # so the FE only consumes a stream of typed `BotEventWire` payloads.
+    "EventSource",
+    "MessageEvent",
+    "Event",
+    "EventTarget",
 ] }
 urlencoding = "2"
 
