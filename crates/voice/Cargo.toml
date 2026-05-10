@@ -1,0 +1,41 @@
+[package]
+name = "music-bot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+description = "Music-bot product crate (PURA-117 / PURA-118 WS-1) — bot lifecycle, supervisor, and BotCommand/BotEvent surface for the TS6-native voice bot stack. Audio pipeline lands in WS-2."
+
+[lib]
+name = "music_bot"
+path = "src/lib.rs"
+
+[features]
+default = []
+# PURA-118 — gates the live integration test in `tests/lifecycle_e2e.rs`
+# the same way `ts6-voice-fixture::audio_e2e` is gated. Pulls nothing
+# extra into the default build; the test itself uses only the `tokio`
+# test runner that the dev-dep already provides.
+lifecycle-e2e = []
+
+[dependencies]
+# PURA-118 reuses the existing voice-fixture helpers (load_or_create_identity,
+# wait_for_connected) so we don't fork the connect path. The fixture crate
+# already pins tsclientlib to upstream master @ 04aa249 (see
+# `crates/ts6-voice-fixture/Cargo.toml` for the pin justification — published
+# 0.2.0 fails the TS6 license-chain).
+ts6-voice-fixture = { path = "../ts6-voice-fixture" }
+tsclientlib = { git = "https://github.com/ReSpeak/tsclientlib", rev = "04aa24917abbf6a0c8442a79742d6d2d40ecf71e", default-features = false }
+
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync", "fs", "io-util"] }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync", "test-util"] }
+tracing-subscriber = { workspace = true }
+serde_json = { workspace = true }

@@ -5052,6 +5052,40 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
 
 [[package]]
+name = "music-bot"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "futures",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "ts6-voice-fixture",
+ "tsclientlib",
+]
+
+[[package]]
+name = "music-bot-audio"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "audiopus",
+ "bytes",
+ "clap",
+ "futures",
+ "hound",
+ "reqwest 0.12.28",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "ndarray"
 version = "0.17.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
