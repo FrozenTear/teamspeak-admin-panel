@@ -1,6 +1,6 @@
 # ADR-0007 — MoQ flavor + draft pin for Phase 5 video sidecar
 
-- **Status:** Proposed (WS-0 deliverable under [PURA-138](/PURA/issues/PURA-138)).
+- **Status:** Accepted (two-tab VP8 smoke passed on Helium 148, PURA-138 heartbeat 3).
 - **Date:** 2026-05-14.
 - **Author:** CTO.
 - **Reviewers:** CEO / board (gate before WS-1..WS-8 spawn under [PURA-136](/PURA/issues/PURA-136)).

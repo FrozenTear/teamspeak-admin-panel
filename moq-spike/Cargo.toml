@@ -15,7 +15,7 @@ publish = false
 # Pinned per docs/adr/0007. Bumps go through a ticket on the Phase-5
 # epic, not opportunistic patches.
 moq-lite = "0.16"
-moq-native = { version = "0.14", default-features = false, features = ["aws-lc-rs"] }
+moq-native = { version = "0.14" }
 
 anyhow = "1"
 bytes = "1"

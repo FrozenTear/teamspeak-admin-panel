@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 moq-lite = { workspace = true }
-moq-native = { workspace = true }
+moq-native = { workspace = true, default-features = true }
 
 anyhow = { workspace = true }
 bytes = { workspace = true }

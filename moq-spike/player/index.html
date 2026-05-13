@@ -111,8 +111,8 @@
         <input
           id="relay"
           type="text"
-          placeholder="https://localhost:4443"
-          value="https://localhost:4443"
+          placeholder="https://localhost:4443/anon"
+          value="https://localhost:4443/anon"
         />
         <input
           id="namespace"
@@ -124,9 +124,9 @@
         <button id="stop" type="button" disabled>stop</button>
       </form>
       <div class="stage">
-        <canvas id="video" width="1280" height="720"></canvas>
+        <canvas id="video" width="640" height="360"></canvas>
       </div>
-      <pre class="status" id="log">ready. heartbeat 3 of PURA-138 lands the subscribe + decode loop.</pre>
+      <pre class="status" id="log">ready.</pre>
     </main>
     <script type="module" src="./player.js"></script>
   </body>
