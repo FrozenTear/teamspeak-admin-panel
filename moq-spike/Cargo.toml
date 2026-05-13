@@ -1,0 +1,26 @@
+[workspace]
+members = ["sidecar"]
+resolver = "3"
+
+# moq-spike is intentionally not part of the main repo's Cargo
+# workspace. See moq-spike/README.md and docs/adr/0007 for context.
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+# Pinned per docs/adr/0007. Bumps go through a ticket on the Phase-5
+# epic, not opportunistic patches.
+moq-lite = "0.16"
+moq-native = { version = "0.14", default-features = false, features = ["aws-lc-rs"] }
+
+anyhow = "1"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "fs", "io-util", "sync", "time", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
