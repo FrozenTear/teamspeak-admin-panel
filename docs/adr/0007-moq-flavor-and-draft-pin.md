@@ -150,6 +150,33 @@ Concretely:
   moq-transport-14+ to -17+): treat as a Phase-5 architecture review,
   not a routine bump. Re-run this ADR's survey before adopting.
 
+## Workspace isolation note (PURA-139, 2026-05-14)
+
+`moq-native@0.14` enables `parking_lot/deadlock_detection`;
+`dioxus-server@0.7` (the entire frontend stack via
+`crates/ts6-manager-server`) enables `parking_lot/send_guard`;
+parking_lot itself rejects that combination at compile time
+(`#[cfg(all(send_guard, deadlock_detection))] compile_error!`). One Cargo
+dependency graph cannot satisfy both today.
+
+Containment: `crates/ts6-media-sidecar/` (PURA-139, WS-1) lives as its
+own Cargo workspace, sibling to `moq-spike/`. Both pin `moq-lite`,
+`moq-native`, `hang` to the versions in this ADR. Drift control is
+by-policy: any bump lands in a single PR touching every Cargo.toml that
+mentions the affected crate.
+
+Future de-isolation paths, ranked by least invasive:
+
+1. moq-native@0.15+ marks the `parking_lot/deadlock_detection` feature
+   optional behind its own Cargo feature → we just drop it from our
+   features list and collapse back into the main workspace.
+2. parking_lot@0.13 relaxes the mutual exclusion → both upstreams can
+   coexist without action on our side.
+3. We vendor moq-native locally with the deadlock detector removed
+   (≈3.7K lines of source, manageable but ongoing maintenance).
+
+Re-evaluate at every moq-native and dioxus-server minor-version bump.
+
 ## Alternatives considered
 
 - **`cloudflare/moq-rs`**: rejected — three drafts behind upstream

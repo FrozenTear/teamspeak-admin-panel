@@ -9,6 +9,22 @@ members = [
     "crates/ts6-voice-translator",
     "crates/voice",
 ]
+# `crates/ts6-media-sidecar/` is its OWN workspace, not a member of the
+# main `teamspeak-admin-panel` workspace. PURA-139 (WS-1) attempted
+# main-workspace integration first per the ticket's "Workspace
+# integration" step, but `moq-native@0.14` enables `parking_lot/deadlock_detection`
+# while `dioxus-server@0.7` enables `parking_lot/send_guard`, and parking_lot
+# itself rejects that combination at compile time
+# (`#[cfg(all(send_guard, deadlock_detection))] compile_error!`). The two
+# upstreams cannot coexist in one Cargo dependency graph today; sibling-
+# workspace isolation is the same containment trick `moq-spike/` uses.
+# Drift control comes from re-pinning moq-lite/moq-native/hang to the
+# same versions in both `moq-spike/Cargo.toml` and
+# `crates/ts6-media-sidecar/Cargo.toml`. Bumping is a single-PR change
+# touching both files. See ADR-0007 + crates/ts6-media-sidecar/README.md.
+exclude = [
+    "crates/ts6-media-sidecar",
+]
 
 [workspace.package]
 version = "0.0.1"
