@@ -11,6 +11,7 @@
 
 pub mod control;
 pub mod http;
+pub mod http_pin;
 pub mod origin;
 pub mod pipeline;
 pub mod preset;
@@ -29,6 +30,7 @@ use ts6_ssrf::Resolver;
 
 pub use crate::control::PipelineRegistry;
 pub use crate::http::HttpServer;
+pub use crate::http_pin::{PinProxy, PinRegistry, PinnedTarget as PinProxyTarget};
 pub use crate::origin::SidecarOrigin;
 pub use crate::pipeline::{Pipeline, PipelineConfig, PipelineMetrics, SourceInput};
 pub use crate::preset::{ParseQualityPresetError, QualityPreset};
@@ -72,6 +74,10 @@ pub struct Sidecar {
     pub fingerprint: String,
     pub origin: Arc<SidecarOrigin>,
     pub registry: PipelineRegistry,
+    /// PURA-172 — Host-preserving IP-pin proxy for plaintext-HTTP FFmpeg
+    /// fetches. Bound on `127.0.0.1:0` (loopback only). Tests can inspect
+    /// `pin_proxy.local_addr` + `pin_proxy.registry` directly.
+    pub pin_proxy: Arc<PinProxy>,
     transport_task: JoinHandle<anyhow::Result<()>>,
     http_task: JoinHandle<anyhow::Result<()>>,
 }
@@ -93,6 +99,14 @@ impl Sidecar {
             .primary_fingerprint()
             .context("no TLS fingerprint exposed by moq-native (configure --tls-cert/--tls-key or --tls-generate)")?;
 
+        // PURA-172 — start the IP-pin proxy BEFORE the control plane so
+        // every `POST /source` has a live proxy to register tokens against.
+        let pin_proxy = Arc::new(
+            PinProxy::start()
+                .await
+                .context("start PinProxy (PURA-172)")?,
+        );
+
         let http = http::HttpServer::bind(
             config.http_listen,
             origin.clone(),
@@ -101,6 +115,7 @@ impl Sidecar {
             config.resolver,
             registry.clone(),
             config.ffmpeg_path,
+            pin_proxy.clone(),
         )
         .await
         .context("bind control-plane HTTP listener")?;
@@ -115,6 +130,7 @@ impl Sidecar {
             fingerprint,
             origin,
             registry,
+            pin_proxy,
             transport_task,
             http_task,
         })
@@ -129,10 +145,12 @@ impl Sidecar {
         }
     }
 
-    /// Abort both background tasks.
+    /// Abort all background tasks (transport accept loop, control-plane
+    /// HTTP, and the PURA-172 IP-pin proxy).
     pub fn shutdown(self) {
         self.transport_task.abort();
         self.http_task.abort();
+        self.pin_proxy.shutdown();
     }
 }
 

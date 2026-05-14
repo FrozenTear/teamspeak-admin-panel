@@ -75,9 +75,14 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
+# PURA-172 (WS-Security-R6) — Host-preserving IP-pin loopback proxy needs an
+# outbound HTTP client whose `resolve_to_addrs` pins the upstream socket to
+# the SSRF-validated IP without re-resolving DNS. rustls-tls so the same
+# client can extend to HTTPS upstream in v2 without rebuilding. `stream` so
+# the proxy can stream large media bodies instead of buffering.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
 
 [dev-dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 moq-lite = { workspace = true }
 moq-native = { workspace = true }
 url = "2"

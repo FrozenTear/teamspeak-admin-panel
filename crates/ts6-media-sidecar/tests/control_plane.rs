@@ -419,6 +419,90 @@ fn ffmpeg_argv_reflects_preset() {
     }
 }
 
+/// PURA-172 — assert the control plane registers an IP-pin token for
+/// plaintext-HTTP sources, leaves HTTPS sources untouched (TLS already pins
+/// to the cert SAN), and burns the token on `POST /source/stop`.
+#[tokio::test]
+async fn http_source_routes_through_pin_proxy_and_burns_on_stop() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("warn,ts6_media_sidecar=debug")
+        .with_test_writer()
+        .try_init();
+
+    let resolver = MockResolver::new()
+        .with("plain.test", vec![ip("203.0.113.20")])
+        .with("secure.test", vec![ip("203.0.113.21")]);
+    let sidecar = boot(Arc::new(resolver) as Arc<dyn Resolver>).await;
+    let base = format!("http://{}", sidecar.http_addr);
+    let client = reqwest::Client::new();
+
+    assert_eq!(
+        sidecar.pin_proxy.registry.len().await,
+        0,
+        "PinProxy registry must start empty",
+    );
+
+    // --- Plaintext HTTP — must register exactly one proxy token. -----------
+    let resp = client
+        .post(format!("{base}/source"))
+        .json(&serde_json::json!({"url": "http://plain.test/clip.mp4"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let body: Value = resp.json().await.unwrap();
+    let http_source_id = body["source_id"].as_str().unwrap().to_string();
+
+    assert_eq!(
+        sidecar.pin_proxy.registry.len().await,
+        1,
+        "HTTP source must register one PinProxy token (PURA-172)",
+    );
+
+    // --- HTTPS — must NOT register a token (TLS already pins). -------------
+    let resp = client
+        .post(format!("{base}/source"))
+        .json(&serde_json::json!({"url": "https://secure.test/clip.mp4"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let body: Value = resp.json().await.unwrap();
+    let https_source_id = body["source_id"].as_str().unwrap().to_string();
+
+    assert_eq!(
+        sidecar.pin_proxy.registry.len().await,
+        1,
+        "HTTPS source must NOT register a PinProxy token \
+         (TLS hostname validation already pins to cert SAN — PURA-172 scope)",
+    );
+
+    // --- Stop the HTTP source — token must be burned. ----------------------
+    let resp = client
+        .post(format!("{base}/source/stop"))
+        .json(&serde_json::json!({"source_id": http_source_id}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+    assert_eq!(
+        sidecar.pin_proxy.registry.len().await,
+        0,
+        "POST /source/stop must burn the proxy token (PURA-172 single-use AC)",
+    );
+
+    // --- Stop HTTPS — already 0, must stay 0. ------------------------------
+    let resp = client
+        .post(format!("{base}/source/stop"))
+        .json(&serde_json::json!({"source_id": https_source_id}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+
+    sidecar.shutdown();
+}
+
 async fn boot(resolver: Arc<dyn Resolver>) -> Sidecar {
     let config = SidecarConfig {
         transport: TransportConfig {

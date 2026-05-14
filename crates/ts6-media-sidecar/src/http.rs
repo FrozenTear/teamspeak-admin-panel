@@ -25,6 +25,7 @@ use ts6_ssrf::Resolver;
 
 use crate::SidecarStats;
 use crate::control::{self, ControlPlaneState, PipelineRegistry, SourceStatsSnapshot};
+use crate::http_pin::PinProxy;
 use crate::origin::SidecarOrigin;
 
 #[derive(Clone)]
@@ -42,6 +43,7 @@ pub struct HttpServer {
 }
 
 impl HttpServer {
+    #[allow(clippy::too_many_arguments)]
     pub async fn bind(
         bind: SocketAddr,
         origin: Arc<SidecarOrigin>,
@@ -50,6 +52,7 @@ impl HttpServer {
         resolver: Arc<dyn Resolver>,
         registry: PipelineRegistry,
         ffmpeg_path: PathBuf,
+        pin_proxy: Arc<PinProxy>,
     ) -> Result<Self> {
         let listener = TcpListener::bind(bind)
             .await
@@ -60,6 +63,7 @@ impl HttpServer {
             registry,
             resolver,
             ffmpeg_path,
+            pin_proxy,
         };
 
         let state = AppState {

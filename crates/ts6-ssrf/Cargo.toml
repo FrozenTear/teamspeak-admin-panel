@@ -30,4 +30,9 @@ url = { workspace = true }
 hickory-resolver = { workspace = true, optional = true }
 
 [dev-dependencies]
+# PURA-172 / WS-Security-R6 — proptest pins the R6 blocklist contract over
+# every IPv4/IPv6 spoof representation (octal, hex, integer-encoded,
+# 2/3-part BSD, IPv4-mapped IPv6, link-local, ULA) so silent regressions
+# in `ipnorm` or `ranges` get caught.
+proptest = { workspace = true }
 tokio = { workspace = true }

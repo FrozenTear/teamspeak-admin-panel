@@ -28,6 +28,7 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 use ts6_ssrf::{Resolver, SsrfError, is_url_allowed};
 
+use crate::http_pin::{PinProxy, PinnedTarget as PinProxyTarget};
 use crate::origin::SidecarOrigin;
 use crate::pipeline::{
     Pipeline, PipelineConfig, PipelineMetrics, SourceInput, TRACK_AUDIO, TRACK_VIDEO,
@@ -42,14 +43,32 @@ pub struct ControlPlaneState {
     pub registry: PipelineRegistry,
     pub resolver: Arc<dyn Resolver>,
     pub ffmpeg_path: std::path::PathBuf,
+    /// PURA-172 — IP-pin proxy for plaintext-HTTP FFmpeg fetches. The
+    /// control plane registers one token per HTTP source against this proxy
+    /// and rewrites the FFmpeg-facing URL to `http://127.0.0.1:<port>/<token>`.
+    /// On `POST /source/stop` the token is burned so a leaked proxy URL
+    /// can't replay past the pipeline's lifetime.
+    pub pin_proxy: Arc<PinProxy>,
 }
 
-/// In-memory pipeline registry. `source_id → Pipeline`. The `source_id`
-/// is also the broadcast name registered against [`SidecarOrigin`], so
-/// the same key works on both sides of the system.
+/// In-memory pipeline registry. `source_id → PipelineEntry`. The
+/// `source_id` is also the broadcast name registered against
+/// [`SidecarOrigin`], so the same key works on both sides of the system.
+///
+/// The entry carries an optional `pin_token` so `POST /source/stop` can
+/// burn the proxy registration (PURA-172) without a separate map.
 #[derive(Clone, Default)]
 pub struct PipelineRegistry {
-    inner: Arc<RwLock<HashMap<String, Pipeline>>>,
+    inner: Arc<RwLock<HashMap<String, PipelineEntry>>>,
+}
+
+/// One row in the [`PipelineRegistry`]. Carries the live pipeline + an
+/// optional PURA-172 proxy token. The token is `Some` for plaintext-HTTP
+/// sources that were routed through the IP-pin proxy, `None` for HTTPS
+/// (no proxy needed — TLS already pins) and synthetic lavfi sources.
+pub(crate) struct PipelineEntry {
+    pub(crate) pipeline: Pipeline,
+    pub(crate) pin_token: Option<String>,
 }
 
 impl PipelineRegistry {
@@ -61,7 +80,13 @@ impl PipelineRegistry {
         let guard = self.inner.read().await;
         let mut out: Vec<SourceStatsSnapshot> = guard
             .iter()
-            .map(|(id, p)| SourceStatsSnapshot::from_pipeline(id, p.preset(), &p.metrics()))
+            .map(|(id, entry)| {
+                SourceStatsSnapshot::from_pipeline(
+                    id,
+                    entry.pipeline.preset(),
+                    &entry.pipeline.metrics(),
+                )
+            })
             .collect();
         out.sort_by(|a, b| a.source_id.cmp(&b.source_id));
         out
@@ -265,29 +290,36 @@ pub async fn post_source(
         .await
         .map_err(ApiError::SsrfBlocked)?;
 
-    // PURA-149: we used to rewrite the URL host to `pinned.resolved_ip`
-    // here to defeat DNS rebinding (ts6-ssrf's documented contract for
-    // outbound clients). For FFmpeg-driven outbound that's actively
-    // harmful — every virtual-hosted CDN (Cloudflare, googleapis,
-    // samplelib's nginx) needs the original hostname in TLS SNI and the
-    // `Host:` header, and IP-literal SNI is undefined / always wrong.
+    // PURA-149 → PURA-172: closing the rebinding window for plaintext HTTP.
     //
-    // What replaces the URL-level pin for v1:
-    //   - HTTPS: TLS hostname validation binds the connection to the
-    //     certificate, which is a stronger guarantee than IP-pinning
-    //     (a DNS rebinder substituting a private-range IP gets a TLS
-    //     handshake failure on the cert's SAN check).
-    //   - HTTP: we accept a small TOCTTOU window between SSRF resolve
-    //     and FFmpeg connect. `ts6-ssrf` has already rejected the
-    //     metadata-host list and any answer that lands in a private
-    //     range, so the rebinder needs a moving public→private answer
-    //     in that window. A future iteration can route plaintext HTTP
-    //     through a Rust-side reqwest proxy that pins the IP while
-    //     preserving the Host header.
-    let pinned_url = pinned.url.to_string();
+    // PURA-149 reverted "rewrite URL host to IP literal" because FFmpeg's
+    // own DNS at fetch time can diverge from the IP `ts6-ssrf` validated
+    // (the DNS rebinding window R6 names), AND because IP-literal SNI /
+    // `Host:` breaks every virtual-hosted CDN.
+    //
+    // For HTTPS we leave the URL alone: TLS hostname validation already
+    // binds the connection to the cert SAN, which is a stronger guarantee
+    // than IP-pinning.
+    //
+    // For plaintext HTTP we route FFmpeg through the sidecar-internal
+    // IP-pin proxy (`crate::http_pin::PinProxy`): the proxy's reqwest
+    // client uses `resolve_to_addrs` to force the upstream socket to
+    // `pinned.resolved_ip` while preserving the original `Host:` header.
+    // FFmpeg receives `http://127.0.0.1:<port>/<token>` and never speaks
+    // to the outside resolver again. The token is single-use across the
+    // pipeline lifetime — `POST /source/stop` burns it.
+    let (ffmpeg_url, pin_token) = match pin_token_for(&pinned, &state.pin_proxy).await {
+        Some((url, tok)) => (url, Some(tok)),
+        None => (pinned.url.to_string(), None),
+    };
 
     let mut guard = state.registry.inner.write().await;
     if guard.contains_key(&source_id) {
+        // Burn the token we just registered — the pipeline isn't going to
+        // start, so the proxy must not hold a stale entry.
+        if let Some(tok) = pin_token {
+            state.pin_proxy.registry.deregister(&tok).await;
+        }
         return Err(ApiError::AlreadyRunning);
     }
 
@@ -296,22 +328,45 @@ pub async fn post_source(
     // error model, not Axum's default JSON-rejection shape.
     let preset = match req.preset.as_deref() {
         None => QualityPreset::DEFAULT,
-        Some(s) => s
-            .parse::<QualityPreset>()
-            .map_err(|e| ApiError::InvalidRequest(e.to_string()))?,
+        Some(s) => s.parse::<QualityPreset>().map_err(|e| {
+            // Same cleanup as AlreadyRunning — we eagerly registered
+            // the token before validating the preset.
+            let tok = pin_token.clone();
+            let proxy = state.pin_proxy.clone();
+            if let Some(t) = tok {
+                tokio::spawn(async move {
+                    proxy.registry.deregister(&t).await;
+                });
+            }
+            ApiError::InvalidRequest(e.to_string())
+        })?,
     };
-    let cfg = PipelineConfig::new(source_id.clone(), SourceInput::Url(pinned_url))
+    let cfg = PipelineConfig::new(source_id.clone(), SourceInput::Url(ffmpeg_url.clone()))
         .with_ffmpeg_path(state.ffmpeg_path.clone())
         .with_preset(preset);
 
-    let pipeline = Pipeline::start(cfg, state.origin.clone())
-        .await
-        .map_err(ApiError::Internal)?;
+    let pipeline = match Pipeline::start(cfg, state.origin.clone()).await {
+        Ok(p) => p,
+        Err(err) => {
+            if let Some(tok) = pin_token.as_deref() {
+                state.pin_proxy.registry.deregister(tok).await;
+            }
+            return Err(ApiError::Internal(err));
+        }
+    };
 
-    guard.insert(source_id.clone(), pipeline);
+    guard.insert(
+        source_id.clone(),
+        PipelineEntry {
+            pipeline,
+            pin_token: pin_token.clone(),
+        },
+    );
     info!(
         %source_id,
         url = %req.url,
+        ffmpeg_url = %ffmpeg_url,
+        proxied = %pin_token.is_some(),
         %preset,
         "pipeline registered"
     );
@@ -334,14 +389,22 @@ pub async fn post_source_stop(
         return Err(ApiError::InvalidRequest("source_id is required".into()));
     }
 
-    let pipeline = {
+    let entry = {
         let mut guard = state.registry.inner.write().await;
         guard.remove(&source_id)
     };
 
-    match pipeline {
-        Some(p) => {
-            p.stop().await;
+    match entry {
+        Some(entry) => {
+            // PURA-172 — burn the proxy token before stopping the
+            // pipeline so a leaked `http://127.0.0.1:<port>/<token>` URL
+            // cannot replay after the pipeline ends (the single-use AC).
+            // Done first so even if `Pipeline::stop` panics or wedges, the
+            // token is already invalidated.
+            if let Some(tok) = entry.pin_token.as_deref() {
+                state.pin_proxy.registry.deregister(tok).await;
+            }
+            entry.pipeline.stop().await;
             info!(%source_id, "pipeline stopped");
             Ok(StatusCode::NO_CONTENT)
         }
@@ -350,6 +413,35 @@ pub async fn post_source_stop(
             Err(ApiError::UnknownSource)
         }
     }
+}
+
+/// Decide whether `pinned` should be routed through the IP-pin proxy and
+/// return the FFmpeg-facing URL + the proxy token, or `None` if the
+/// caller should use `pinned.url` directly.
+///
+/// HTTPS sources are passed through unchanged — TLS hostname validation
+/// already binds the connection to the cert SAN, which is a stronger
+/// guarantee than IP-pinning. Plaintext HTTP sources with a `resolved_ip`
+/// from `ts6-ssrf` are proxied. HTTP sources whose host could not be
+/// resolved (`resolved_ip` is `None` — spec §9.3 NXDOMAIN passthrough)
+/// also fall back to the direct URL because there is no IP to pin to.
+async fn pin_token_for(
+    pinned: &ts6_ssrf::PinnedTarget,
+    proxy: &PinProxy,
+) -> Option<(String, String)> {
+    if pinned.url.scheme() != "http" {
+        return None;
+    }
+    let resolved_ip = pinned.resolved_ip?;
+    let target = PinProxyTarget {
+        upstream_url: pinned.url.clone(),
+        host: pinned.host.clone(),
+        resolved_ip,
+        port: pinned.port,
+    };
+    let token = proxy.registry.register(target).await;
+    let url = proxy.proxy_url(&token);
+    Some((url, token))
 }
 
 pub async fn get_track(

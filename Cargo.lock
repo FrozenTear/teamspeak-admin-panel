@@ -9188,6 +9188,7 @@ version = "0.0.1"
 dependencies = [
  "async-trait",
  "hickory-resolver 0.24.4",
+ "proptest",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
