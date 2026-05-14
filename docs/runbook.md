@@ -149,7 +149,7 @@ For all three shapes the external smoke is the same: `curl -fsS http://127.0.0.1
 | Shape | Start | Stop | Restart |
 | --- | --- | --- | --- |
 | Quadlet | `systemctl --user start ts6-manager-pod.service` | `systemctl --user stop ts6-manager-pod.service` | `systemctl --user restart ts6-manager-pod.service` |
-| Kube | `podman kube play deploy/kube/secrets.yaml deploy/kube/ts6-manager.yaml` | `podman kube down deploy/kube/ts6-manager.yaml` | `podman kube down …` then `podman kube play …` |
+| Kube | `cat deploy/kube/secrets.yaml deploy/kube/ts6-manager.yaml > /tmp/ts6-manager.kube.yaml && podman kube play /tmp/ts6-manager.kube.yaml` | `podman kube down deploy/kube/ts6-manager.yaml` | `podman kube down …` then `podman kube play …` (re-concat the kube file too if you re-edited a source manifest) |
 | Compose | `podman-compose up -d fullstack` | `podman-compose down` | `podman-compose restart fullstack` |
 
 Kube `kube down` removes the pod and containers but leaves the named

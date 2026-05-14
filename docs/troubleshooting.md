@@ -99,7 +99,9 @@ systemctl --user restart ts6-manager-pod.service
 # Kube:
 $EDITOR deploy/kube/secrets.yaml         # populate JWT_SECRET
 podman kube down deploy/kube/ts6-manager.yaml
-podman kube play deploy/kube/secrets.yaml deploy/kube/ts6-manager.yaml
+cat deploy/kube/secrets.yaml deploy/kube/ts6-manager.yaml \
+  > /tmp/ts6-manager.kube.yaml
+podman kube play /tmp/ts6-manager.kube.yaml
 ```
 
 **Cross-link.** Canonical env list with comments:

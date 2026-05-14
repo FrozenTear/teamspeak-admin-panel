@@ -22,8 +22,11 @@ cp deploy/kube/secrets.example.yaml deploy/kube/secrets.yaml
 
 # 2. Pull or build the image (see "Image source" below).
 
-# 3. Play the manifest.
-podman kube play deploy/kube/secrets.yaml deploy/kube/ts6-manager.yaml
+# 3. Play the manifest. `podman kube play` accepts a single kube file
+#    (multi-file args need Podman 5.0+), so concat the Secret + Pod
+#    manifest first.
+cat deploy/kube/secrets.yaml deploy/kube/ts6-manager.yaml > /tmp/ts6-manager.kube.yaml
+podman kube play /tmp/ts6-manager.kube.yaml
 
 # 4. Verify.
 curl http://localhost:3001/health
@@ -71,10 +74,14 @@ published by the `WS-OPS-Images` workstream — see `Containerfile.fullstack`.
 ```bash
 podman build -t localhost/ts6-manager-fullstack:dev -f Containerfile.fullstack .
 
-# One-liner override using sed → podman kube play piping:
+# Override the image, concat with secrets, then play. `podman kube
+# play` accepts a single kube file on Podman 4.4–4.x; multi-file is
+# 5.0+.
 sed 's|image: ghcr.io/.*ts6-manager-fullstack:.*|image: localhost/ts6-manager-fullstack:dev|; s|imagePullPolicy: IfNotPresent|imagePullPolicy: Never|' \
-  deploy/kube/ts6-manager.yaml \
-  | podman kube play deploy/kube/secrets.yaml -
+  deploy/kube/ts6-manager.yaml > /tmp/ts6-manager.kube.override.yaml
+cat deploy/kube/secrets.yaml /tmp/ts6-manager.kube.override.yaml \
+  > /tmp/ts6-manager.kube.yaml
+podman kube play /tmp/ts6-manager.kube.yaml
 ```
 
 `imagePullPolicy: Never` prevents Podman from trying to pull the
@@ -150,7 +157,7 @@ publishes — at that point, append a second container entry alongside
 
 ## Definition of done check
 
-- `podman kube play deploy/kube/secrets.yaml deploy/kube/ts6-manager.yaml` succeeds on a clean rootless Podman ≥ 4.4 host with only the published image (`ghcr.io/frozentear/ts6-manager-fullstack:latest`) available.
+- `cat deploy/kube/secrets.yaml deploy/kube/ts6-manager.yaml > /tmp/ts6-manager.kube.yaml && podman kube play /tmp/ts6-manager.kube.yaml` succeeds on a clean rootless Podman ≥ 4.4 host with only the published image (`ghcr.io/frozentear/ts6-manager-fullstack:latest`) available.
 - `curl http://localhost:3001/health` returns 200.
 - `podman kube down deploy/kube/ts6-manager.yaml` cleans up the pod.
 - Data on PVCs `ts6-db` and `ts6-music` survives `kube down` and is reachable on the next `kube play`.

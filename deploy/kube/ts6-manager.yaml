@@ -1,7 +1,12 @@
 # TS6 Manager — Kubernetes-flavoured manifest for `podman kube play`.
 #
 # Brings up the manager stack rootless on a clean Podman >= 4.4 host.
-#   podman kube play deploy/kube/secrets.example.yaml deploy/kube/ts6-manager.yaml
+# `podman kube play` takes a single kube file (multi-file args need
+# Podman 5.0+), so concat the Secret + Pod manifest first:
+#
+#   cat deploy/kube/secrets.example.yaml deploy/kube/ts6-manager.yaml \
+#     > /tmp/ts6-manager.kube.yaml
+#   podman kube play /tmp/ts6-manager.kube.yaml
 #   podman kube down deploy/kube/ts6-manager.yaml
 #
 # See deploy/kube/README.md for env setup, image overrides, and the
