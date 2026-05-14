@@ -20,7 +20,8 @@ use crate::client::store::AuthState;
 use crate::ui::components::toast::{ToastVariant, use_toaster};
 use crate::ui::components::{Banner, BannerVariant, Button, ButtonSize, ButtonType, ButtonVariant};
 use crate::ui::pages::music_bots::shared::{
-    audio_source_summary, format_duration, format_error, state_badge_class, state_label,
+    audio_source_summary, format_duration, format_error, parse_audio_source, state_badge_class,
+    state_label,
 };
 use crate::ui::routes::Route;
 
@@ -276,6 +277,8 @@ pub fn BotDetailPage(bot_id: u64) -> Element {
                     }
                 }
 
+                PlayNowComposer { bot_id, state: d.state }
+
                 div { class: "card",
                     h3 { "Now playing" }
                     if let Some(track) = d.now_playing.as_ref() {
@@ -422,6 +425,103 @@ fn PlaybackControls(bot_id: u64, state: wire::BotState, has_track: bool) -> Elem
         if !in_channel {
             p { class: "muted small",
                 "Bot must be in a channel to control playback. Connect and join a channel first."
+            }
+        }
+    }
+}
+
+#[component]
+fn PlayNowComposer(bot_id: u64, state: wire::BotState) -> Element {
+    let bot = wire::BotId(bot_id);
+    let gate = use_auth_gate();
+    let toaster = use_toaster();
+
+    let mut url_input: Signal<String> = use_signal(String::new);
+    let mut inline_error: Signal<Option<String>> = use_signal(|| None::<String>);
+    let mut submitting: Signal<bool> = use_signal(|| false);
+
+    // Audio dispatch only reaches the actor when the bot is on the
+    // server. Mirrors the `PlaybackControls` predicate at the wider end
+    // — the route layer enforces the in-channel requirement and the
+    // inline error surfaces that to the operator.
+    let on_server = matches!(
+        state,
+        wire::BotState::Connected | wire::BotState::InChannel | wire::BotState::Playing
+    );
+
+    let on_submit = {
+        let gate = gate.clone();
+        move |evt: FormEvent| {
+            evt.prevent_default();
+            if *submitting.read() {
+                return;
+            }
+            let raw = url_input.read().clone();
+            let Some(source) = parse_audio_source(&raw) else {
+                inline_error.set(Some(
+                    "Paste a URL, or a library:relative/path.mp3 source.".into(),
+                ));
+                return;
+            };
+            inline_error.set(None);
+            submitting.set(true);
+            let gate = gate.clone();
+            spawn(async move {
+                let res = mb::play_source(gate, bot, source).await;
+                submitting.set(false);
+                match res {
+                    Ok(()) => {
+                        toaster.push(ToastVariant::Success, "Playing", None);
+                        url_input.set(String::new());
+                    }
+                    Err(e) => {
+                        let msg = format_error(&e);
+                        toaster.push(
+                            ToastVariant::Danger,
+                            "Play failed",
+                            Some(msg.clone()),
+                        );
+                        inline_error.set(Some(msg));
+                    }
+                }
+            });
+        }
+    };
+
+    rsx! {
+        div { class: "card",
+            h3 { "Play now" }
+            form { class: "card-row", onsubmit: on_submit,
+                label { class: "sr-only", r#for: "bot-play-source-input", "Audio source" }
+                input {
+                    id: "bot-play-source-input",
+                    class: "input",
+                    placeholder: "Paste a YouTube link, stream URL, or library:path/to.mp3",
+                    value: "{url_input.read()}",
+                    oninput: move |e| url_input.set(e.value()),
+                }
+                Button {
+                    variant: ButtonVariant::Primary,
+                    kind: ButtonType::Submit,
+                    disabled: !on_server,
+                    loading: *submitting.read(),
+                    "Play"
+                }
+            }
+            p { class: "muted small",
+                "YouTube, SoundCloud, direct streams (Icecast), and any URL yt-dlp resolves are supported. Prefix a library entry with "
+                code { "library:" }
+                "."
+            }
+            if !on_server {
+                p { class: "muted small",
+                    "Bot must be connected to play. Connect (and join a channel) first."
+                }
+            }
+            if let Some(msg) = inline_error.read().as_ref() {
+                Banner { variant: BannerVariant::Danger, title: "Could not start playback".to_string(),
+                    "{msg}"
+                }
             }
         }
     }

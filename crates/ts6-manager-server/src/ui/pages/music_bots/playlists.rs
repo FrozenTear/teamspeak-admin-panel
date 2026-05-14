@@ -402,7 +402,7 @@ fn PlaylistDetailPane(props: PlaylistDetailPaneProps) -> Element {
                 }
                 input {
                     class: "input",
-                    placeholder: "URL or library:relative/path.mp3",
+                    placeholder: "https://www.youtube.com/watch?v=… or library:relative/path.mp3",
                     value: "{new_url.read()}",
                     oninput: move |e| new_url.set(e.value()),
                 }

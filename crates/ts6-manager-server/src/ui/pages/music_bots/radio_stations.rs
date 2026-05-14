@@ -187,7 +187,7 @@ pub fn RadioStationsPage(bot_id: u64) -> Element {
                     }
                     input {
                         class: "input",
-                        placeholder: "URL or library:path",
+                        placeholder: "https://stream.example/live.ogg or library:path",
                         value: "{new_url.read()}",
                         oninput: move |e| new_url.set(e.value()),
                     }
