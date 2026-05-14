@@ -149,6 +149,8 @@ Operator notes: [`docs/voice-prototype.md`](docs/voice-prototype.md).
 
 | Topic | Path |
 | --- | --- |
+| Operator runbook | [`docs/runbook.md`](docs/runbook.md) |
+| Operator troubleshooting | [`docs/troubleshooting.md`](docs/troubleshooting.md) |
 | Architecture decisions | [`docs/adr/`](docs/adr/) |
 | Phase 6 readiness audit | [`docs/phase6/readiness-audit.md`](docs/phase6/readiness-audit.md) |
 | Image build, sign, publish | [`docs/ops/images.md`](docs/ops/images.md) |
