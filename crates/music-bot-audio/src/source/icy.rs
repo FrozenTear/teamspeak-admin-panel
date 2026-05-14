@@ -88,19 +88,19 @@ impl IcyRadioSource {
                             }
                         }
                         icy::IcyPiece::Metadata(bs) => {
-                            if let Some(title) = icy::parse_stream_title(&bs) {
-                                if title != last_title {
-                                    last_title = title.clone();
-                                    if event_tx
-                                        .send(PipelineEvent::NowPlaying {
-                                            title,
-                                            source: url_owned.clone(),
-                                        })
-                                        .await
-                                        .is_err()
-                                    {
-                                        return;
-                                    }
+                            if let Some(title) = icy::parse_stream_title(&bs)
+                                && title != last_title
+                            {
+                                last_title = title.clone();
+                                if event_tx
+                                    .send(PipelineEvent::NowPlaying {
+                                        title,
+                                        source: url_owned.clone(),
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
                                 }
                             }
                         }
@@ -138,11 +138,8 @@ impl PcmSource for IcyRadioSource {
     fn try_drain_events(&mut self) -> Vec<PipelineEvent> {
         let mut out = std::mem::take(&mut self.pending_warnings);
         // Drain anything the fetcher pushed since last call.
-        loop {
-            match self.events.try_recv() {
-                Ok(ev) => out.push(ev),
-                Err(_) => break,
-            }
+        while let Ok(ev) = self.events.try_recv() {
+            out.push(ev);
         }
         out.extend(self.inner.try_drain_events());
         out

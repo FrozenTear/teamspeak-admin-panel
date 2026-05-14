@@ -247,14 +247,9 @@ fn spawn_sibling(
         // Pipeline drained cleanly — drain any final events without
         // blocking, then send Finished. Best-effort; the bot may have
         // already torn us down.
-        loop {
-            match events_rx.try_recv() {
-                Ok(e) => {
-                    if tx.send(AudioMsg::PipelineEvent(e)).await.is_err() {
-                        return;
-                    }
-                }
-                Err(_) => break,
+        while let Ok(e) = events_rx.try_recv() {
+            if tx.send(AudioMsg::PipelineEvent(e)).await.is_err() {
+                return;
             }
         }
         let _ = tx.send(AudioMsg::Finished).await;
@@ -265,6 +260,10 @@ fn spawn_sibling(
 /// `OutAudio` shape the prototype proved against TS6 (codec = OpusVoice,
 /// voice-id = 0). Errors are surfaced to the caller so the connected
 /// loop can decide whether to keep the bot online.
+// `tsclientlib::Error` is 136 B — over clippy's 128 B threshold for
+// `result_large_err`. Boxing the upstream error type just to please the
+// lint isn't worth the API churn for a single in-crate caller.
+#[allow(clippy::result_large_err)]
 pub(crate) fn send_opus_frame(con: &mut Connection, opus: &[u8]) -> Result<(), tsclientlib::Error> {
     let pkt = OutAudio::new(&AudioData::C2S {
         id: 0,

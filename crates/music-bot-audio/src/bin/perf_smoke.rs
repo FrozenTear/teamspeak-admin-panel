@@ -292,7 +292,7 @@ async fn main() -> Result<()> {
         };
         drift_ms.push(d);
         received += 1;
-        if received % (FRAMES_PER_SECOND * 60) == 0 {
+        if received.is_multiple_of(FRAMES_PER_SECOND * 60) {
             info!(
                 received,
                 last_drift_ms = d,

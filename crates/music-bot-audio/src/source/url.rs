@@ -81,10 +81,10 @@ impl Drop for YtDlpSource {
         if let Some(handle) = self.bridge.take() {
             handle.abort();
         }
-        if let Some(mut child) = self.yt_dlp.take() {
-            if let Err(e) = child.start_kill() {
-                tracing::debug!(?e, "yt-dlp child kill failed (likely already exited)");
-            }
+        if let Some(mut child) = self.yt_dlp.take()
+            && let Err(e) = child.start_kill()
+        {
+            tracing::debug!(?e, "yt-dlp child kill failed (likely already exited)");
         }
     }
 }

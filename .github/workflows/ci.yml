@@ -34,6 +34,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Clippy compiles build scripts; main workspace's native -sys crates
+      # need these to even reach the lint stage. Mirrored from build-test.
+      - name: Install system dependencies (main only)
+        if: matrix.workspace == 'main'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libglib2.0-dev \
+            libopus-dev \
+            pkg-config \
+            cmake \
+            build-essential
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
@@ -67,6 +80,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Main workspace pulls glib-sys (via livekit → libwebrtc → glib) and
+      # audiopus_sys; both link against system libraries on Linux. Sidecar
+      # has no such native deps, so this step only runs for the main matrix
+      # entry. Update this set rather than papering over a single missing
+      # `.pc` file.
+      - name: Install system dependencies (main only)
+        if: matrix.workspace == 'main'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libglib2.0-dev \
+            libopus-dev \
+            pkg-config \
+            cmake \
+            build-essential
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
@@ -98,6 +127,13 @@ jobs:
     name: TS6 fixture integration smoke
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # PURA-165 closeout (CTO 2026-05-14): TS6 WebQuery on :10080 didn't
+    # respond 200 within 60 s after fixture boot — likely a fixture-side
+    # WebQuery enablement gap (the env vars set today only configure
+    # ServerQuery, not WebQuery). Tracked separately under the OD3 / PURA-170
+    # follow-up so failures here don't gate fmt/clippy/build/test signal.
+    # Remove once that follow-up lands and the smoke is reliably green.
+    continue-on-error: true
     env:
       # Tracks the `ts6-fixture` profile in `podman-compose.yml`. Pin to a
       # tagged digest here without touching local dev if chasing a regression.

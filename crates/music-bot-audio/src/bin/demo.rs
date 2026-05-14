@@ -165,7 +165,7 @@ async fn main() -> Result<()> {
                 max_jitter_ms = drift_ms;
             }
         }
-        if received % 50 == 0 {
+        if received.is_multiple_of(50) {
             let elapsed = started.elapsed();
             info!(
                 frame = received,
