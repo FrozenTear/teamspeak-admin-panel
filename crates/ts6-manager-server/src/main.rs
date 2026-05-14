@@ -51,6 +51,7 @@ fn main() {
 
 #[cfg(feature = "server")]
 mod server_entry {
+    use anyhow::Context;
     use axum::{Json, Router, routing::get};
     use dioxus_server::{DioxusRouterExt, ServeConfig};
     use std::net::SocketAddr;
@@ -304,7 +305,14 @@ mod server_entry {
             web::widget_response_headers,
         ));
 
-        let addr: SocketAddr = format!("0.0.0.0:{}", cfg.port).parse()?;
+        let addr: SocketAddr = format!("{}:{}", cfg.host, cfg.port)
+            .parse()
+            .with_context(|| {
+                format!(
+                    "HOST/PORT does not form a valid socket address: {}:{}",
+                    cfg.host, cfg.port
+                )
+            })?;
         tracing::info!(
             %addr,
             trusted_proxy_hops = cfg.trusted_proxy_hops,

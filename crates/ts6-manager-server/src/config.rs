@@ -7,6 +7,13 @@ use anyhow::{Context, Result, anyhow, bail};
 const DEV_JWT_PLACEHOLDER: &str = "dev-secret-change-me-in-production";
 const DEFAULT_LOG_LEVEL: &str = "info";
 const DEFAULT_PORT: u16 = 3001;
+// PURA-197 — fullstack listener bind address. Defaults to `0.0.0.0` so the
+// kube manifest (`hostNetwork: true`) and Containerfile-only deployments
+// keep working unchanged. Operators on the Quadlet path who flip the pod to
+// `Network=host` set `HOST=127.0.0.1` in `ts6-manager.env` so the listener
+// stays on loopback while still avoiding the passt/PURA-105 wedge for
+// WebQuery egress against a co-located TS6 fixture.
+const DEFAULT_HOST: &str = "0.0.0.0";
 // PURA-10 / D8 deviation: SurrealDB v3 embedded with the SurrealKV backend.
 // `surrealkv://./data/db` resolves relative to the process working directory;
 // operators can override with `surrealkv:///var/lib/...` for absolute paths or
@@ -51,6 +58,11 @@ impl NodeEnv {
 #[allow(dead_code)] // populated for downstream streams (SECURITY, DATA, WEBQUERY)
 pub struct Config {
     pub node_env: NodeEnv,
+    /// PURA-197 — fullstack listener bind address. Defaults to `0.0.0.0`.
+    /// Operators on the Quadlet path who flip the pod to `Network=host`
+    /// set `HOST=127.0.0.1` so the listener stays on loopback only and
+    /// fronts behind a reverse proxy.
+    pub host: String,
     pub port: u16,
     pub database_url: String,
     pub jwt_secret: String,
@@ -133,6 +145,7 @@ impl Config {
             _ => (jwt_secret.clone(), true),
         };
 
+        let host = env_or("HOST", DEFAULT_HOST);
         let port = parse_env_u16("PORT", DEFAULT_PORT)?;
         let database_url =
             env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_DATABASE_URL.to_string());
@@ -174,6 +187,7 @@ impl Config {
 
         Ok(Self {
             node_env,
+            host,
             port,
             database_url,
             jwt_secret,
@@ -205,6 +219,7 @@ impl Config {
     pub fn log_hardening_summary(&self) {
         tracing::info!(
             node_env = self.node_env.as_str(),
+            host = %self.host,
             port = self.port,
             database_url = %self.database_url,
             frontend_url = %self.frontend_url,

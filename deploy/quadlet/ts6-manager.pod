@@ -23,16 +23,21 @@ PodName=ts6-manager
 # in front of the manager — drop the address (e.g. `PublishPort=3001:3001`)
 # to expose the pod directly on the LAN.
 #
-# Known issue: when an operator points the manager at a TS6 server
-# reachable via loopback (e.g. the local ts6-fixture, or a TS6 server
-# colocated on this host), the WebQuery egress goes through passt and
-# trips the PURA-105 wedge after ~5 requests. The kube-manifest
-# sibling (deploy/kube/ts6-manager.yaml) sets `hostNetwork: true` to
-# work around this, but flipping the Quadlet pod to `Network=host`
-# would expose the fullstack listener on every host interface (the
-# server binds 0.0.0.0:$PORT) which regresses this PublishPort default.
-# Operators with a localhost TS6 target should track the follow-up
-# ticket — see the README.
+# Loopback TS6 targets (e.g. the local ts6-fixture, or a TS6 server
+# colocated on this host): WebQuery egress through passt trips the
+# PURA-105 wedge after ~5 requests. The kube-manifest sibling
+# (deploy/kube/ts6-manager.yaml) uses `hostNetwork: true` to bypass
+# passt. PURA-197 added a `HOST` env var to the server so this pod
+# can do the same safely:
+#
+#   1. Drop the PublishPort= line below.
+#   2. Add `Network=host` to this [Pod] section.
+#   3. Set `HOST=127.0.0.1` in ts6-manager.env so the fullstack
+#      listener binds loopback-only instead of 0.0.0.0:$PORT.
+#
+# Leave the line below in place for the documented reverse-proxy
+# default (server binds 0.0.0.0:$PORT inside the pod's netns, passt
+# publishes loopback-only on the host).
 PublishPort=127.0.0.1:3001:3001
 
 [Install]
