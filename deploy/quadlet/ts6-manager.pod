@@ -10,7 +10,7 @@
 
 [Unit]
 Description=TS6 Manager pod
-Documentation=https://github.com/teamspeak-heaven/teamspeak-admin-panel
+Documentation=https://github.com/FrozenTear/teamspeak-admin-panel
 # The pod brings up its members; bind them so a failed container does
 # not silently leave the pod half-running.
 Wants=network-online.target

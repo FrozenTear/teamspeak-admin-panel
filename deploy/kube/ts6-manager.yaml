@@ -51,7 +51,7 @@ spec:
     fsGroup: 10001
   containers:
     - name: fullstack
-      image: ghcr.io/teamspeak-heaven/ts6-manager-fullstack:latest
+      image: ghcr.io/frozentear/ts6-manager-fullstack:latest
       imagePullPolicy: IfNotPresent
       ports:
         - name: http

@@ -48,7 +48,7 @@ podman volume rm ts6-db ts6-music
 ## Image source
 
 The committed manifest pins
-`ghcr.io/teamspeak-heaven/ts6-manager-fullstack:latest`. That image is
+`ghcr.io/frozentear/ts6-manager-fullstack:latest`. That image is
 published by the `WS-OPS-Images` workstream — see `Containerfile.fullstack`.
 
 ### Override to a local build (pre-publish smoke)
@@ -112,7 +112,7 @@ publishes — at that point, append a second container entry alongside
 
 ## Definition of done check
 
-- `podman kube play deploy/kube/secrets.yaml deploy/kube/ts6-manager.yaml` succeeds on a clean rootless Podman ≥ 4.4 host with only the published image (`ghcr.io/teamspeak-heaven/ts6-manager-fullstack:latest`) available.
+- `podman kube play deploy/kube/secrets.yaml deploy/kube/ts6-manager.yaml` succeeds on a clean rootless Podman ≥ 4.4 host with only the published image (`ghcr.io/frozentear/ts6-manager-fullstack:latest`) available.
 - `curl http://localhost:3001/health` returns 200.
 - `podman kube down deploy/kube/ts6-manager.yaml` cleans up the pod.
 - Data on PVCs `ts6-db` and `ts6-music` survives `kube down` and is reachable on the next `kube play`.

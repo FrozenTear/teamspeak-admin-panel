@@ -22,15 +22,17 @@ Decided in coordination with CTO. Sibling tracks must match these names.
 ### Registry path
 
 ```
-ghcr.io/<owner>/ts6-manager-fullstack
-ghcr.io/<owner>/ts6-manager-sidecar
+ghcr.io/frozentear/ts6-manager-fullstack
+ghcr.io/frozentear/ts6-manager-sidecar
 ```
 
-`<owner>` is the GitHub org/user the published binaries are attached to.
-**Pending CTO confirmation** before the first push — the working
-assumption is `teamspeak-heaven`, but no GitHub remote is configured in
-the repo yet (`git remote -v` is empty), so this is one of the things
-the release procedure has to resolve before the first publish.
+Settled via the [PURA-160](/PURA/issues/PURA-160) `ask_user_questions`
+interaction (operator picked `pivot_frozentear` 2026-05-14T12:51Z). Repo
+provisioned by [PURA-167](/PURA/issues/PURA-167) at
+`github.com/FrozenTear/teamspeak-admin-panel` — **private** during the
+board's manual verification window, board flips to public after testing.
+ghcr.io image visibility follows the repo (private repo → private image)
+until the board makes the flip. See §4 for the full publish procedure.
 
 ### Tags
 
@@ -121,14 +123,14 @@ Operators verifying a release:
 
 ```sh
 # Image: verify the manifest list.
-cosign verify ghcr.io/<owner>/ts6-manager-fullstack:v1.0.0 \
-    --certificate-identity-regexp 'https://github.com/<owner>/ts6-manager/.+' \
+cosign verify ghcr.io/frozentear/ts6-manager-fullstack:v1.0.0 \
+    --certificate-identity-regexp 'https://github.com/FrozenTear/teamspeak-admin-panel/.+' \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com
 
 # Sidecar binary: blob verification.
 cosign verify-blob \
     --signature ts6-manager-sidecar-v1.0.0-linux-amd64.tar.gz.sig \
-    --certificate-identity-regexp 'https://github.com/<owner>/ts6-manager/.+' \
+    --certificate-identity-regexp 'https://github.com/FrozenTear/teamspeak-admin-panel/.+' \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
     ts6-manager-sidecar-v1.0.0-linux-amd64.tar.gz
 ```
@@ -149,32 +151,41 @@ build helper.
 1. **Local build verification.** Run
    `IMAGE_VERSION=vX.Y.Z PLATFORMS=linux/amd64,linux/arm64 scripts/build-images.sh all`
    and capture `podman image inspect` digests.
-2. **GitHub repo / org confirmed.** CTO confirms the `<owner>` placeholder
-   resolves to a real org with `packages: write` and `id-token: write`
-   permissions on the release workflow.
-3. **OIDC + Fulcio identity locked.** SecurityEngineer pairs with CTO to
-   confirm the certificate-identity regex that WS-Gate will pin against.
-4. **Push manifest lists.**
+2. **Operator: refresh GitHub token scope.** The host gh token currently
+   has `gist, read:org, repo, workflow` — `write:packages` is needed for
+   ghcr.io push. Operator runs `gh auth refresh -h github.com -s write:packages`
+   in a browser flow and confirms via `gh auth status`.
+3. **Operator: flip repo to public.** Per [PURA-167](/PURA/issues/PURA-167)
+   the repo is private during board verification. ghcr.io image visibility
+   inherits from the linked repo, so the "Pull works from a clean host
+   with no auth (public)" line of PURA-160's DoD requires the repo to be
+   public at publish time. Operator flips
+   `github.com/FrozenTear/teamspeak-admin-panel` → public when verification
+   completes.
+4. **OIDC + Fulcio identity locked.** SecurityEngineer pairs with CTO to
+   confirm the certificate-identity regex that WS-Gate will pin against
+   (default proposal: `https://github.com/FrozenTear/teamspeak-admin-panel/.+`).
+5. **Push manifest lists.**
    ```sh
-   podman manifest push ghcr.io/<owner>/ts6-manager-fullstack:vX.Y.Z \
-       docker://ghcr.io/<owner>/ts6-manager-fullstack:vX.Y.Z
-   podman manifest push ghcr.io/<owner>/ts6-manager-sidecar:vX.Y.Z \
-       docker://ghcr.io/<owner>/ts6-manager-sidecar:vX.Y.Z
+   podman manifest push ghcr.io/frozentear/ts6-manager-fullstack:vX.Y.Z \
+       docker://ghcr.io/frozentear/ts6-manager-fullstack:vX.Y.Z
+   podman manifest push ghcr.io/frozentear/ts6-manager-sidecar:vX.Y.Z \
+       docker://ghcr.io/frozentear/ts6-manager-sidecar:vX.Y.Z
    ```
-5. **Sign images.**
+6. **Sign images.**
    ```sh
-   cosign sign --yes ghcr.io/<owner>/ts6-manager-fullstack:vX.Y.Z
-   cosign sign --yes ghcr.io/<owner>/ts6-manager-sidecar:vX.Y.Z
+   cosign sign --yes ghcr.io/frozentear/ts6-manager-fullstack:vX.Y.Z
+   cosign sign --yes ghcr.io/frozentear/ts6-manager-sidecar:vX.Y.Z
    ```
-6. **Bundle + sign sidecar binaries.** Per-arch tar.gz of the
+7. **Bundle + sign sidecar binaries.** Per-arch tar.gz of the
    release-stripped `ts6-media-sidecar` binary (the crate's bin name),
    archive named `ts6-manager-sidecar-vX.Y.Z-linux-<arch>.tar.gz` for
    product-family consistency, with sha256 + cosign blob signature next
    to each.
-7. **Create GitHub Release `vX.Y.Z`** with the binary archives,
+8. **Create GitHub Release `vX.Y.Z`** with the binary archives,
    sha256 files, and `.sig` files attached. Body cites the manifest
-   digests pushed in step 4.
-8. **Hand off to WS-Gate.** Comment on the WS-Gate tracking issue with
+   digests pushed in step 5.
+9. **Hand off to WS-Gate.** Comment on the WS-Gate tracking issue with
    the published refs and signatures so the rootless-deploy validation
    can pin against them.
 
@@ -184,7 +195,7 @@ build helper.
   builder base, matching `rust-toolchain.toml` (channel `1.95.0`).
 * The fullstack image pins `dioxus-cli` to `0.7.7` exactly (matches the
   `dioxus` crate version — see
-  [project_dx_cli_version_pin.md](https://github.com/teamspeak-heaven/ts6-manager)
+  [project_dx_cli_version_pin.md](https://github.com/FrozenTear/teamspeak-admin-panel)
   for the rationale).
 * Sidecar `Cargo.lock` ships in-tree (`crates/ts6-media-sidecar/Cargo.lock`
   — crate path is named after the bin) and the build uses

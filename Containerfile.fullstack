@@ -79,7 +79,7 @@ COPY --from=builder /build/target/dx/ts6-manager-server/release/web/public /usr/
 # `--build-arg`. Defaults keep the image self-describing even on local builds.
 ARG IMAGE_VERSION=dev
 ARG IMAGE_REVISION=unknown
-ARG IMAGE_SOURCE="https://github.com/teamspeak-heaven/ts6-manager"
+ARG IMAGE_SOURCE="https://github.com/FrozenTear/teamspeak-admin-panel"
 LABEL org.opencontainers.image.title="ts6-manager-fullstack" \
       org.opencontainers.image.description="TS6 Manager — Dioxus fullstack server (HTTP + WS + REST + SSR/WASM client)" \
       org.opencontainers.image.licenses="MIT" \

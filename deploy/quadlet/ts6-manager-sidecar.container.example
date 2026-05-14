@@ -23,13 +23,13 @@
 
 [Unit]
 Description=TS6 Manager MoQ video sidecar
-Documentation=https://github.com/teamspeak-heaven/teamspeak-admin-panel
+Documentation=https://github.com/FrozenTear/teamspeak-admin-panel
 After=ts6-manager-fullstack.service
 Wants=ts6-manager-fullstack.service
 
 [Container]
 ContainerName=ts6-manager-sidecar
-Image=ghcr.io/teamspeak-heaven/ts6-manager-sidecar:latest
+Image=ghcr.io/frozentear/ts6-manager-sidecar:latest
 Pod=ts6-manager.pod
 AutoUpdate=registry
 

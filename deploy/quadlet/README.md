@@ -135,7 +135,7 @@ terminator (Caddy / nginx / Traefik) on the host and proxy_pass to
 ## Image source
 
 The `ts6-manager-fullstack.container` unit currently points at
-`ghcr.io/teamspeak-heaven/ts6-manager-fullstack:latest`. The actual
+`ghcr.io/frozentear/ts6-manager-fullstack:latest`. The actual
 signed-release image is owned by **WS-OPS-Images
 ([PURA-160](/PURA/issues/PURA-160))**; until that ships, two options:
 

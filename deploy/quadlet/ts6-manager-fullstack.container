@@ -7,7 +7,7 @@
 
 [Unit]
 Description=TS6 Manager fullstack (Dioxus server + WASM UI)
-Documentation=https://github.com/teamspeak-heaven/teamspeak-admin-panel
+Documentation=https://github.com/FrozenTear/teamspeak-admin-panel
 After=network-online.target
 Wants=network-online.target
 
@@ -18,7 +18,7 @@ ContainerName=ts6-manager-fullstack
 # build (`podman build -t localhost/ts6-manager-fullstack:dev -f
 # Containerfile.fullstack .`) or a registry pull. Override at install
 # time by setting `Image=` in a drop-in.
-Image=ghcr.io/teamspeak-heaven/ts6-manager-fullstack:latest
+Image=ghcr.io/frozentear/ts6-manager-fullstack:latest
 Pod=ts6-manager.pod
 AutoUpdate=registry
 
