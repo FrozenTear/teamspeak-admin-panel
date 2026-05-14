@@ -22,8 +22,8 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use axum::routing::{get, post};
-use serde::{Deserialize, Serialize};
 use serde_json::json;
+use ts6_manager_shared::video_sources as wire;
 use ts6_ssrf::{SsrfError, is_url_allowed};
 
 use crate::app_state::AppState;
@@ -37,6 +37,14 @@ use crate::ws::topic::{Topic, TopicKind};
 use super::access;
 use super::{ErrorBody, err, err_body};
 
+/// Re-export the canonical wire row so callers inside the server crate keep
+/// the existing `VideoSourceView` import path while the type definition
+/// lives in `ts6_manager_shared::video_sources`. The FE imports
+/// `ts6_manager_shared` directly.
+pub use ts6_manager_shared::video_sources::{
+    CreateVideoSourceRequest as CreateRequest, VideoSourceView,
+};
+
 /// Mount the video-source sub-router.
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -45,65 +53,35 @@ pub fn router() -> Router<AppState> {
 }
 
 // ---------------------------------------------------------------------------
-// Wire DTOs
+// Wire DTOs — types live in `ts6_manager_shared::video_sources` (re-exported
+// above so callers inside this crate keep their existing import paths). The
+// Dioxus FE consumes the same shapes through `ts6_manager_shared` directly,
+// keeping the WS-6 wire contract in lock-step.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
-pub struct CreateRequest {
-    pub url: String,
-    pub label: String,
-    #[serde(default)]
-    pub preset: Option<String>,
-    /// Optional. When omitted the request resolves to the operator's
-    /// single enabled server if exactly one exists; otherwise 400.
-    #[serde(default)]
-    pub server_id: Option<i64>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct VideoSourceView {
-    pub id: i64,
-    pub source_id: String,
-    pub label: String,
-    pub url: String,
-    pub preset: String,
-    pub server_id: i64,
-    pub status: String,
-    pub track: TrackDescriptorView,
-    pub created_by_user_id: Option<i64>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct TrackDescriptorView {
-    pub namespace: String,
-    pub video: String,
-    pub audio: String,
-}
-
-impl VideoSourceView {
-    fn from_row(row: video_sources::VideoSource) -> Self {
-        // The sidecar's TrackDescriptor uses the source_id as the
-        // moq-lite namespace; the video / audio track names are
-        // hardcoded by `pipeline.rs` so the reference player works
-        // without configuration.
-        let track = TrackDescriptorView {
-            namespace: row.sourceId.clone(),
-            video: "video".to_string(),
-            audio: "audio".to_string(),
-        };
-        Self {
-            id: row.id,
-            source_id: row.sourceId,
-            label: row.label,
-            url: row.url,
-            preset: row.preset,
-            server_id: row.serverConfigId,
-            status: row.status,
-            track,
-            created_by_user_id: row.createdByUserId,
-            created_at: row.createdAt,
-        }
+/// Convert a sqlx-backed [`video_sources::VideoSource`] into the wire row.
+/// Lives in the server crate because the source `VideoSource` carries
+/// `sqlx`/`chrono` flavour the shared crate intentionally doesn't depend on.
+fn view_from_row(row: video_sources::VideoSource) -> VideoSourceView {
+    // The sidecar's TrackDescriptor uses the source_id as the moq-lite
+    // namespace; the video / audio track names are hardcoded by
+    // `pipeline.rs` so the reference player works without configuration.
+    let track = wire::TrackDescriptorView {
+        namespace: row.sourceId.clone(),
+        video: "video".to_string(),
+        audio: "audio".to_string(),
+    };
+    VideoSourceView {
+        id: row.id,
+        source_id: row.sourceId,
+        label: row.label,
+        url: row.url,
+        preset: row.preset,
+        server_id: row.serverConfigId,
+        status: row.status,
+        track,
+        created_by_user_id: row.createdByUserId,
+        created_at: row.createdAt,
     }
 }
 
@@ -189,7 +167,7 @@ async fn create(
         err(StatusCode::INTERNAL_SERVER_ERROR, "Failed to persist video source")
     })?;
 
-    let view = VideoSourceView::from_row(row);
+    let view = view_from_row(row);
 
     // 6. WS push — immediate `starting` event so any subscribed FE tab
     // sees the new row without a refetch.
@@ -229,7 +207,7 @@ async fn list(
                 .is_ok()
         };
         if allowed {
-            out.push(VideoSourceView::from_row(row));
+            out.push(view_from_row(row));
         }
     }
     Ok(Json(out))
@@ -249,7 +227,7 @@ async fn detail(
         })?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "Not found"))?;
     access::check_read(&state, &auth, row.serverConfigId).await?;
-    Ok(Json(VideoSourceView::from_row(row)))
+    Ok(Json(view_from_row(row)))
 }
 
 /// `DELETE /api/video-sources/{id}` — stop the pipeline on the sidecar,
@@ -532,6 +510,7 @@ mod tests {
             // SSRF lookups never hit DNS, but the resolver field is
             // mandatory on AppState.
             ssrf_resolver: Arc::new(ts6_ssrf::MockResolver::new()),
+            moq_public_url: None,
         };
         (state, mock)
     }
@@ -897,6 +876,7 @@ mod tests {
             music_bots: crate::music_bots::MusicBotService::default_for_tests(),
             sidecar: None,
             ssrf_resolver: Arc::new(ts6_ssrf::MockResolver::new()),
+            moq_public_url: None,
         };
         let token = seed_admin_token(&state).await;
         let server = seed_server(&state).await;

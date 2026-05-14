@@ -75,6 +75,13 @@ pub struct AppState {
     /// `Arc<dyn Resolver>` shape matches the ts6-ssrf API and keeps the
     /// resolver cheap to clone into the polling task.
     pub ssrf_resolver: Arc<dyn Resolver>,
+    /// PURA-146 (WS-8): publicly-reachable WebTransport endpoint of the
+    /// sidecar (e.g. `https://stream.example.com:4443/anon`). The public
+    /// widget viewer's `/api/widget/{token}/video-sources` route surfaces
+    /// this so embedded iframes can subscribe. `None` means the operator
+    /// did not configure a public relay URL — the viewer falls back to
+    /// "No live video".
+    pub moq_public_url: Option<String>,
 }
 
 impl AppState {
@@ -129,6 +136,7 @@ impl AppState {
             music_bots: MusicBotService::new(music_bot_identity_dir),
             sidecar,
             ssrf_resolver,
+            moq_public_url: cfg.moq_public_url.clone(),
         }
     }
 }

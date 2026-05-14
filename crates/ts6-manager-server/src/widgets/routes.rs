@@ -247,6 +247,21 @@ pub struct PublicTrack {
     pub audio: String,
 }
 
+/// Wire shape returned by `GET /api/widget/{token}/video-sources`. The
+/// `relay_url` field is the public WebTransport endpoint of the sidecar
+/// (sourced from `MOQ_PUBLIC_URL`) — without it the embedded viewer has
+/// no way to dial the moq-lite relay. `None` when the operator has not
+/// configured a public relay URL; the public viewer falls back to
+/// "No live video" in that case.
+#[derive(Debug, Serialize)]
+pub struct PublicVideoSourcesResponse {
+    /// Public WebTransport URL for the moq-lite-04 relay
+    /// (e.g. `https://stream.example.com:4443/anon`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay_url: Option<String>,
+    pub sources: Vec<PublicVideoSource>,
+}
+
 /// `GET /api/widget/{token}/video-sources`. No auth — the widget token
 /// is the only credential, exactly like `/data` and `/image.*`. Returns
 /// an empty list when the token resolves but no sources are configured
@@ -311,7 +326,11 @@ async fn video_sources_handler(
         })
         .collect();
 
-    let body = serde_json::to_vec(&public).map_err(|e| {
+    let response_body = PublicVideoSourcesResponse {
+        relay_url: state.moq_public_url.clone(),
+        sources: public,
+    };
+    let body = serde_json::to_vec(&response_body).map_err(|e| {
         error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             ErrorBody {
@@ -448,3 +467,80 @@ pub async fn resolve_widget_data(state: &AppState, token: &str) -> Result<Widget
 // `short_token` lives in [`crate::web::widget_security`] (Slice F) and is
 // reused here for INFO/WARN log lines. Tests for the helper itself live
 // alongside the implementation.
+
+#[cfg(test)]
+mod tests {
+    //! PURA-146 (WS-8) — assert that the public video-sources surface
+    //! never leaks management metadata. The internal `/api/video-sources`
+    //! shape (`VideoSourceView`) carries `url`, `created_by_user_id`, and
+    //! `created_at`; the public wrapper here must drop all three.
+    use super::*;
+
+    #[test]
+    fn public_video_source_serialisation_omits_url_and_management_fields() {
+        let row = PublicVideoSource {
+            source_id: "src-42".into(),
+            label: "Lobby cam".into(),
+            preset: "720p".into(),
+            status: "live".into(),
+            track: PublicTrack {
+                namespace: "src-42".into(),
+                video: "video".into(),
+                audio: "audio".into(),
+            },
+        };
+        let response = PublicVideoSourcesResponse {
+            relay_url: Some("https://stream.example.com:4443/anon".into()),
+            sources: vec![row],
+        };
+        let json = serde_json::to_string(&response).expect("serialise");
+        // None of the operator-side fields may appear in the wire shape.
+        for forbidden in [
+            "\"url\":",
+            "\"createdByUserId\":",
+            "\"created_by_user_id\":",
+            "\"createdAt\":",
+            "\"created_at\":",
+            // The internal numeric PK never leaks either — public callers
+            // identify a stream by `source_id`, not by `id`.
+            "\"id\":",
+        ] {
+            assert!(
+                !json.contains(forbidden),
+                "public JSON unexpectedly contains `{forbidden}` field: {json}"
+            );
+        }
+        // Spot-check the fields that MUST be present.
+        for required in [
+            "\"relay_url\":",
+            "\"sources\":",
+            "\"source_id\":\"src-42\"",
+            "\"label\":\"Lobby cam\"",
+            "\"track\":",
+            "\"namespace\":\"src-42\"",
+            "\"video\":\"video\"",
+            "\"audio\":\"audio\"",
+        ] {
+            assert!(
+                json.contains(required),
+                "public JSON missing expected `{required}`: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn relay_url_is_omitted_when_none() {
+        let response = PublicVideoSourcesResponse {
+            relay_url: None,
+            sources: vec![],
+        };
+        let json = serde_json::to_string(&response).expect("serialise");
+        // `serde(skip_serializing_if = "Option::is_none")` — the key must
+        // not appear at all so the FE can default to "No live video".
+        assert!(
+            !json.contains("relay_url"),
+            "relay_url must be elided when None (got `{json}`)"
+        );
+        assert!(json.contains("\"sources\":[]"));
+    }
+}

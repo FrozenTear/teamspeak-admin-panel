@@ -63,6 +63,13 @@ pub fn VideoPlayer(
     relay_url: String,
     namespace: String,
     #[props(default = false)] autoplay: bool,
+    /// Start muted — public widget viewer (PURA-146 WS-8) needs this so
+    /// browser autoplay policy doesn't block the canvas paint. The audio
+    /// pipeline is configured at mount time, so flipping `muted` after
+    /// the fact only takes effect on the next mount. The public viewer
+    /// remounts the component when the user taps to unmute.
+    #[props(default = false)]
+    muted: bool,
 ) -> Element {
     let state: Signal<PlayerState> = use_signal(|| PlayerState::Idle);
 
@@ -92,11 +99,19 @@ pub fn VideoPlayer(
         let namespace = namespace.clone();
         let state_for_hook = state;
         let _guard = use_hook(move || {
-            wt::start(relay_url, namespace, canvas_id, autoplay, state_for_hook)
+            wt::start(
+                relay_url,
+                namespace,
+                canvas_id,
+                autoplay,
+                muted,
+                state_for_hook,
+            )
         });
     }
 
     let _ = autoplay; // silence unused on non-wasm
+    let _ = muted;
 
     let status_text = state.read().describe();
     let unsupported = matches!(*state.read(), PlayerState::Unsupported);
@@ -198,6 +213,7 @@ mod wt {
         namespace: String,
         canvas_id: String,
         autoplay: bool,
+        muted: bool,
         mut state: Signal<PlayerState>,
     ) -> Rc<SessionGuard> {
         let stop = Rc::new(Cell::new(false));
@@ -226,6 +242,7 @@ mod wt {
                 &relay_url,
                 &namespace,
                 &canvas_id,
+                muted,
                 state_for_task,
                 stop_for_task.clone(),
                 wt_for_task.clone(),
@@ -268,6 +285,7 @@ mod wt {
         relay_url: &str,
         namespace: &str,
         canvas_id: &str,
+        muted: bool,
         state: Signal<PlayerState>,
         stop: Rc<Cell<bool>>,
         wt_slot: Rc<RefCell<Option<WebTransport>>>,
@@ -309,9 +327,16 @@ mod wt {
             .await
             .map_err(|e| format!("WebTransport.ready: {}", js_err(&e)))?;
 
-        // ── Subscribe to video + audio.
+        // ── Subscribe to video; subscribe to audio only when not muted.
+        //    Skipping the audio SUBSCRIBE entirely on muted mounts saves a
+        //    pointless round-trip on public embeds whose autoplay policy
+        //    will block the AudioContext anyway. The public viewer
+        //    remounts the component with `muted=false` once the user
+        //    clicks the tap-to-unmute overlay.
         subscribe(&wt, SUBSCRIBE_VIDEO, namespace, "video").await?;
-        subscribe(&wt, SUBSCRIBE_AUDIO, namespace, "audio").await?;
+        if !muted {
+            subscribe(&wt, SUBSCRIBE_AUDIO, namespace, "audio").await?;
+        }
 
         // ── Build decoders + sinks.
         let canvas = get_canvas(canvas_id)?;
@@ -324,8 +349,13 @@ mod wt {
         let ctx = Rc::new(ctx);
 
         let video_decoder = build_video_decoder(ctx.clone(), state)?;
-        let audio_pipeline = AudioPipeline::new()?;
-        let audio_decoder = build_audio_decoder(audio_pipeline.clone())?;
+        // Build the audio decoder lazily; muted mounts never feed it.
+        let audio_decoder: Option<Rc<AudioDecoderHandle>> = if muted {
+            None
+        } else {
+            let audio_pipeline = AudioPipeline::new()?;
+            Some(build_audio_decoder(audio_pipeline.clone())?)
+        };
 
         // ── Drain incoming unidirectional streams (group data).
         let uni_streams = wt.incoming_unidirectional_streams();
@@ -463,7 +493,7 @@ mod wt {
     async fn drain_group(
         stream: ReadableStream,
         video_decoder: Rc<VideoDecoderHandle>,
-        audio_decoder: Rc<AudioDecoderHandle>,
+        audio_decoder: Option<Rc<AudioDecoderHandle>>,
         mut state: Signal<PlayerState>,
         stop: Rc<Cell<bool>>,
     ) -> Result<(), String> {
@@ -503,7 +533,11 @@ mod wt {
                     }
                 }
                 SUBSCRIBE_AUDIO => {
-                    audio_decoder.feed(bytes)?;
+                    // `None` when the component is muted (WS-8 public
+                    // viewer pre-unmute); drop the frame silently.
+                    if let Some(decoder) = audio_decoder.as_ref() {
+                        decoder.feed(bytes)?;
+                    }
                 }
                 other => {
                     tracing::debug!(subscribe_id = other, "unknown subscribe id; dropping frame");

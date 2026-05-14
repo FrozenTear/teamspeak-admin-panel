@@ -41,11 +41,53 @@
 #![allow(dead_code)] // `WsState` variants are observed via the banner.
 
 use dioxus::prelude::*;
+use serde::Deserialize;
 use ts6_manager_shared::widgets::{
     SpacerType, WidgetChannelNode, WidgetData, WidgetThemeName, WidgetThemePalette,
 };
 
 use crate::client::api::ApiError;
+use crate::ui::components::VideoPlayer;
+
+// ── PURA-146 (WS-8) — public video-source view.
+//
+// Mirrors the wire shape returned by `widgets::routes::video_sources_handler`.
+// Defined here (rather than in `ts6-manager-shared`) because the public
+// widget page is the only consumer in the SPA — the operator-facing
+// `/video-sources` route owns its own richer DTO in
+// `routes::control::video_sources`.
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+struct PublicVideoSourcesPayload {
+    #[serde(default)]
+    relay_url: Option<String>,
+    #[serde(default)]
+    sources: Vec<PublicVideoSource>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+struct PublicVideoSource {
+    source_id: String,
+    label: String,
+    #[serde(default)]
+    status: String,
+    track: PublicTrack,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+struct PublicTrack {
+    namespace: String,
+}
+
+impl PublicVideoSource {
+    /// A source is mountable when the sidecar reports an active pipeline
+    /// (`starting` or `live`). `failed` / `stopped` rows are listed but
+    /// not auto-selected — the operator restarting the pipeline will move
+    /// them back to `live` and the next refetch picks them up.
+    fn is_active(&self) -> bool {
+        matches!(self.status.as_str(), "starting" | "live")
+    }
+}
 
 /// Initial reconnect back-off. Mirrors the operator hub
 /// (`crate::client::ws::INITIAL_BACKOFF_MS`) so the public surface follows
@@ -87,6 +129,20 @@ pub fn PublicWidgetPage(token: String) -> Element {
         })
     };
 
+    // PURA-146 (WS-8) — public video-sources fetch. Refetches on every
+    // WS push that bumps `refresh_token`, so newly-started sources
+    // appear in the tab strip without a manual reload. A failure here is
+    // intentionally non-fatal: the channel tree must still render even
+    // when the sidecar is offline.
+    let video_sources = {
+        let token = token.clone();
+        use_resource(move || {
+            let _bump = *refresh_token.read();
+            let token = token.clone();
+            async move { fetch_public_video_sources(&token).await }
+        })
+    };
+
     // Spawn the WS subscriber once the first JSON snapshot arrives (we need
     // its `serverConfigId` to derive the topic). The subscriber drives
     // refetches by bumping `refresh_token` whenever the hub publishes.
@@ -106,6 +162,14 @@ pub fn PublicWidgetPage(token: String) -> Element {
 
     let _ = token_signal; // silence unused warning on native targets
 
+    // Snapshot the latest video payload (or None while loading / on
+    // error). The surface treats `None` and `Some(empty sources)`
+    // identically — both render "No live video".
+    let video_payload: Option<PublicVideoSourcesPayload> = match &*video_sources.read_unchecked() {
+        Some(Ok(p)) => Some(p.clone()),
+        _ => None,
+    };
+
     rsx! {
         WidgetStyleBlock {}
         match &*data.read_unchecked() {
@@ -114,6 +178,7 @@ pub fn PublicWidgetPage(token: String) -> Element {
                 WidgetSurface {
                     data: data.clone(),
                     ws_state: *ws_state.read(),
+                    video: video_payload.clone(),
                     on_retry: EventHandler::new(move |_| {
                         let v = *refresh_token.read();
                         refresh_token.set(v.wrapping_add(1));
@@ -152,6 +217,118 @@ fn WidgetStyleBlock() -> Element {
                 max-width: 100%;
                 box-sizing: border-box;
                 overflow: hidden;
+            }}
+            /* WS-8 — wider footprint when the video pane is visible. The
+               16:9 canvas + tab strip needs ~440 px to feel comfortable;
+               the tree pane sits beside it at the original 400 px wide. */
+            .pw-root--with-video {{
+                width: 880px;
+            }}
+            .pw-panes {{
+                display: flex;
+                flex-direction: row;
+                align-items: stretch;
+                gap: 0;
+            }}
+            .pw-root--with-video .pw-tree-pane {{
+                flex: 0 0 400px;
+                min-width: 0;
+                border-left: 1px solid var(--pw-border);
+            }}
+            .pw-root:not(.pw-root--with-video) .pw-tree-pane {{
+                flex: 1 1 auto;
+            }}
+            /* Mobile / narrow viewports — stack panes vertically so the
+               canvas isn't squashed. Matches the 390 px iPhone-13 width
+               called out in the FE-PAGES QA viewport set. */
+            @media (max-width: 720px) {{
+                .pw-root--with-video {{ width: 400px; }}
+                .pw-panes {{ flex-direction: column; }}
+                .pw-root--with-video .pw-tree-pane {{
+                    flex: 1 1 auto;
+                    border-left: none;
+                    border-top: 1px solid var(--pw-border);
+                }}
+            }}
+            .pw-video-pane {{
+                flex: 1 1 auto;
+                min-width: 0;
+                background: #000;
+                display: flex;
+                flex-direction: column;
+            }}
+            .pw-video-tabs {{
+                display: flex;
+                flex-wrap: wrap;
+                gap: 4px;
+                padding: 6px 8px;
+                background: var(--pw-header-bg);
+                border-bottom: 1px solid var(--pw-border);
+            }}
+            .pw-video-tab {{
+                font-size: 11px;
+                font-weight: 600;
+                padding: 4px 10px;
+                border-radius: 12px;
+                border: 1px solid var(--pw-border);
+                background: var(--pw-background-secondary);
+                color: var(--pw-text-primary);
+                cursor: pointer;
+            }}
+            .pw-video-tab.is-active {{
+                background: var(--pw-accent);
+                color: #fff;
+                border-color: var(--pw-accent);
+            }}
+            .pw-video-tab:disabled {{
+                opacity: 0.55;
+                cursor: not-allowed;
+            }}
+            .pw-video-tab-dead {{
+                color: var(--pw-text-secondary);
+                font-weight: 400;
+            }}
+            .pw-video-stage {{
+                position: relative;
+                flex: 1 1 auto;
+                background: #000;
+                min-height: 240px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            }}
+            .pw-video-empty {{
+                color: var(--pw-text-secondary);
+                font-size: 12px;
+                padding: 24px;
+                text-align: center;
+            }}
+            .pw-video-stage .video-player {{
+                width: 100%;
+            }}
+            .pw-video-unmute {{
+                position: absolute;
+                inset: 0;
+                margin: auto;
+                width: max-content;
+                height: max-content;
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                padding: 10px 16px;
+                border-radius: 999px;
+                border: 1px solid rgba(255, 255, 255, 0.4);
+                background: rgba(0, 0, 0, 0.55);
+                color: #fff;
+                font-size: 13px;
+                font-weight: 600;
+                cursor: pointer;
+            }}
+            .pw-video-unmute:hover {{
+                background: rgba(0, 0, 0, 0.7);
+            }}
+            .pw-video-unmute-icon {{
+                font-size: 16px;
             }}
             .pw-header {{
                 background: var(--pw-header-bg);
@@ -306,6 +483,12 @@ fn WidgetStyleBlock() -> Element {
 struct WidgetSurfaceProps {
     data: WidgetData,
     ws_state: WsState,
+    /// PURA-146 (WS-8) — live video sources for the widget's server.
+    /// `None` while the public REST surface is still loading; the panel
+    /// renders "No live video" on either `None` or an empty sources
+    /// vector once `relay_url` is missing.
+    #[props(default)]
+    video: Option<PublicVideoSourcesPayload>,
     on_retry: EventHandler<()>,
 }
 
@@ -313,8 +496,18 @@ struct WidgetSurfaceProps {
 fn WidgetSurface(props: WidgetSurfaceProps) -> Element {
     let theme = WidgetThemeName::parse_or_default(&props.data.theme).palette();
     let style = palette_css_vars(&theme);
+    // The root expands to `pw-root--with-video` when we have any source
+    // payload to render — the wider layout makes room for the 16:9 canvas
+    // beside the channel tree. The CSS media query in `WidgetStyleBlock`
+    // collapses it back to a column on mobile viewports.
+    let has_any_video = matches!(&props.video, Some(p) if !p.sources.is_empty());
+    let root_class = if has_any_video {
+        "pw-root pw-root--with-video"
+    } else {
+        "pw-root"
+    };
     rsx! {
-        div { class: "pw-root", style: "{style}",
+        div { class: "{root_class}", style: "{style}",
             WidgetHeader { server: props.data.server.clone() }
             // Reconnect banner — non-blocking, hidden on `Connected` per spec
             // §28.4 ("hide on recovery"). On `Unauthorized` we render the
@@ -337,12 +530,192 @@ fn WidgetSurface(props: WidgetSurfaceProps) -> Element {
                     }
                 },
             }
-            WidgetTree {
-                channels: props.data.channels.clone(),
-                show_clients: props.data.show_clients,
-                show_channel_tree: props.data.show_channel_tree,
+            div { class: "pw-panes",
+                // Video pane is omitted entirely when there are zero sources
+                // AND no payload at all — keeps the original PURA-72 layout
+                // intact when video is unconfigured.
+                if has_any_video {
+                    {
+                        let payload = props.video.clone().unwrap_or_else(|| PublicVideoSourcesPayload {
+                            relay_url: None,
+                            sources: Vec::new(),
+                        });
+                        rsx! { WidgetVideoPane { payload: payload } }
+                    }
+                }
+                section { class: "pw-tree-pane",
+                    WidgetTree {
+                        channels: props.data.channels.clone(),
+                        show_clients: props.data.show_clients,
+                        show_channel_tree: props.data.show_channel_tree,
+                    }
+                }
             }
             div { class: "pw-footer", "TS6 WebUI Widget" }
+        }
+    }
+}
+
+#[derive(Props, Clone, PartialEq)]
+struct WidgetVideoPaneProps {
+    payload: PublicVideoSourcesPayload,
+}
+
+/// PURA-146 (WS-8) — video pane beside the channel tree. Renders the
+/// most-recently-added active source by default; a tab strip lets the
+/// viewer switch between sources when more than one is streaming.
+/// Audio is muted until the viewer taps the unmute overlay (browser
+/// autoplay policy on third-party embeds).
+#[component]
+fn WidgetVideoPane(props: WidgetVideoPaneProps) -> Element {
+    let payload = props.payload.clone();
+    let sources = payload.sources.clone();
+    let relay_url = payload.relay_url.clone();
+
+    // Prefer the most-recently-added active source. The REST surface
+    // returns rows sorted by `id ASC` (see
+    // `repos::video_sources::list_for_server`), so the last active row
+    // is the most recent.
+    let default_index: usize = sources
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, s)| s.is_active())
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+
+    let mut selected: Signal<usize> = use_signal(|| default_index);
+    let mut unmuted: Signal<bool> = use_signal(|| false);
+
+    // Clamp `selected` if the source list shrank since the last render
+    // (e.g. operator deleted the row). `peek` avoids the read+set
+    // deadlock pattern from PURA-132.
+    let max_idx = sources.len().saturating_sub(1);
+    if *selected.peek() > max_idx {
+        selected.set(max_idx);
+        unmuted.set(false);
+    }
+
+    if sources.is_empty() {
+        return rsx! {
+            section { class: "pw-video-pane",
+                div { class: "pw-video-empty",
+                    role: "status",
+                    "aria-live": "polite",
+                    "No live video"
+                }
+            }
+        };
+    }
+
+    let Some(active) = sources.get(*selected.read()) else {
+        return rsx! {
+            section { class: "pw-video-pane",
+                div { class: "pw-video-empty",
+                    role: "status",
+                    "aria-live": "polite",
+                    "No live video"
+                }
+            }
+        };
+    };
+
+    let multi_source = sources.len() > 1;
+    let active_label = active.label.clone();
+    let active_status = active.status.clone();
+    let active_namespace = active.track.namespace.clone();
+
+    rsx! {
+        section { class: "pw-video-pane",
+            if multi_source {
+                div { class: "pw-video-tabs",
+                    "role": "tablist",
+                    "aria-label": "Live video sources",
+                    for (idx, src) in sources.iter().enumerate() {
+                        {
+                            let label = src.label.clone();
+                            let is_active = idx == *selected.read();
+                            let tab_class = if is_active {
+                                "pw-video-tab is-active"
+                            } else {
+                                "pw-video-tab"
+                            };
+                            let dead = !src.is_active();
+                            rsx! {
+                                button {
+                                    key: "{src.source_id}",
+                                    class: "{tab_class}",
+                                    r#type: "button",
+                                    "role": "tab",
+                                    "aria-selected": if is_active { "true" } else { "false" },
+                                    disabled: dead,
+                                    onclick: move |_| {
+                                        // Switching source remounts VideoPlayer with a
+                                        // different namespace; the audio handshake is
+                                        // tied to the new mount, so reset to muted to
+                                        // preserve autoplay-policy compatibility.
+                                        selected.set(idx);
+                                        unmuted.set(false);
+                                    },
+                                    "{label}"
+                                    if dead {
+                                        span { class: "pw-video-tab-dead", " (offline)" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            div { class: "pw-video-stage", "aria-label": "{active_label}",
+                match relay_url.clone() {
+                    Some(url) if active.is_active() => {
+                        let muted = !*unmuted.read();
+                        // Re-key on (source_id, muted) so Dioxus mounts a
+                        // fresh `VideoPlayer` whenever either changes —
+                        // tab switch OR unmute toggle both need the
+                        // session loop to restart with new params.
+                        let player_key = format!("{}|{}", active_namespace, muted);
+                        rsx! {
+                            VideoPlayer {
+                                key: "{player_key}",
+                                relay_url: url,
+                                namespace: active_namespace.clone(),
+                                autoplay: true,
+                                muted: muted,
+                            }
+                            if !*unmuted.read() {
+                                button {
+                                    class: "pw-video-unmute",
+                                    r#type: "button",
+                                    "aria-label": "Unmute audio",
+                                    onclick: move |_| unmuted.set(true),
+                                    span { class: "pw-video-unmute-icon", "🔊" }
+                                    span { class: "pw-video-unmute-text", "Tap to unmute" }
+                                }
+                            }
+                        }
+                    }
+                    Some(_) => rsx! {
+                        // Source is listed but `failed` / `stopped` — show
+                        // the label + status without trying to subscribe.
+                        div { class: "pw-video-empty",
+                            role: "status",
+                            "aria-live": "polite",
+                            "Stream {active_status}"
+                        }
+                    },
+                    None => rsx! {
+                        // `relay_url` missing → operator hasn't configured
+                        // `MOQ_PUBLIC_URL`. The channel tree still renders.
+                        div { class: "pw-video-empty",
+                            role: "status",
+                            "aria-live": "polite",
+                            "No live video"
+                        }
+                    },
+                }
+            }
         }
     }
 }
@@ -633,6 +1006,36 @@ fn format_uptime(secs: u64) -> String {
 
 // ── Networking — separate WASM/native impls so the page type-checks
 //    against both the SSR-snapshot harness and the dx-CLI WASM build.
+
+// PURA-146 (WS-8) — fetch the public video-sources view. Errors are
+// non-fatal at the call site: the channel tree still renders when the
+// sidecar is unreachable or the operator has not configured a public
+// relay URL.
+#[cfg(target_arch = "wasm32")]
+async fn fetch_public_video_sources(
+    token: &str,
+) -> Result<PublicVideoSourcesPayload, ApiError> {
+    use crate::client::api::classify_response;
+    use gloo_net::http::Request;
+    let url = format!("/api/widget/{token}/video-sources");
+    let resp = Request::get(&url)
+        .send()
+        .await
+        .map_err(|e| ApiError::Transport(e.to_string()))?;
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| ApiError::Transport(e.to_string()))?;
+    classify_response(status, &body)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn fetch_public_video_sources(
+    _token: &str,
+) -> Result<PublicVideoSourcesPayload, ApiError> {
+    Err(ApiError::UnsupportedTarget)
+}
 
 #[cfg(target_arch = "wasm32")]
 async fn fetch_widget_data(token: &str) -> Result<WidgetData, ApiError> {

@@ -293,7 +293,16 @@ mod server_entry {
         // OUTSIDE the nonce-CSP middleware so its CSP rewrite (`frame-ancestors *`
         // on `/api/widget/*` and `/widget/*`) and `X-Frame-Options` removal
         // run last on the response path and win over the strict defaults.
-        let router = router.layer(axum::middleware::from_fn(web::widget_response_headers));
+        // PURA-146 WS-8 — the state carries the public MoQ relay origin so
+        // the widget CSP can extend `connect-src` to allow WebTransport
+        // dialing from the embedded viewer.
+        let widget_csp_state = web::widget_security::WidgetCspState::from_moq_public_url(
+            cfg.moq_public_url.as_deref(),
+        );
+        let router = router.layer(axum::middleware::from_fn_with_state(
+            widget_csp_state,
+            web::widget_response_headers,
+        ));
 
         let addr: SocketAddr = format!("0.0.0.0:{}", cfg.port).parse()?;
         tracing::info!(

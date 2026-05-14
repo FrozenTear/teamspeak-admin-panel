@@ -43,6 +43,7 @@ async fn fresh_state() -> AppState {
         music_bots: MusicBotService::default_for_tests(),
         sidecar: None,
         ssrf_resolver: Arc::new(ts6_ssrf::MockResolver::new()),
+        moq_public_url: None,
     }
 }
 

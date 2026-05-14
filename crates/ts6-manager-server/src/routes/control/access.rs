@@ -106,6 +106,7 @@ mod tests {
             music_bots: crate::music_bots::MusicBotService::default_for_tests(),
             sidecar: None,
             ssrf_resolver: Arc::new(ts6_ssrf::MockResolver::new()),
+            moq_public_url: None,
         }
     }
 

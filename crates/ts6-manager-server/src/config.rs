@@ -66,6 +66,14 @@ pub struct Config {
     pub music_dir: PathBuf,
     pub sidecar_url: Option<String>,
     pub sidecar_binary_path: Option<PathBuf>,
+    /// PURA-146 (WS-8) — publicly-reachable WebTransport endpoint of the
+    /// sidecar's moq-lite-04 listener. Surfaced to the public widget viewer
+    /// via `GET /api/widget/{token}/video-sources` so an embedded iframe on
+    /// a third-party site knows where to subscribe. Distinct from
+    /// `sidecar_url` (manager → sidecar HTTP control plane); when unset the
+    /// public viewer shows "No live video" instead of attempting a
+    /// connection.
+    pub moq_public_url: Option<String>,
     pub yt_cookie_file: Option<PathBuf>,
     pub ts_allow_self_signed: bool,
     /// PURA-100 — opt-in trust-on-first-use for SSHBridge host keys.
@@ -144,6 +152,7 @@ impl Config {
 
         let sidecar_url = optional_env("SIDECAR_URL");
         let sidecar_binary_path = optional_env("SIDECAR_BINARY_PATH").map(PathBuf::from);
+        let moq_public_url = optional_env("MOQ_PUBLIC_URL");
         let yt_cookie_file = optional_env("YT_COOKIE_FILE").map(PathBuf::from);
 
         let ts_allow_self_signed = parse_bool_flag("TS_ALLOW_SELF_SIGNED");
@@ -178,6 +187,7 @@ impl Config {
             music_dir,
             sidecar_url,
             sidecar_binary_path,
+            moq_public_url,
             yt_cookie_file,
             ts_allow_self_signed,
             ssh_tofu,
@@ -207,6 +217,7 @@ impl Config {
             ssh_known_hosts_set = self.ssh_known_hosts_path.is_some(),
             sidecar_url_set = self.sidecar_url.is_some(),
             sidecar_binary_path_set = self.sidecar_binary_path.is_some(),
+            moq_public_url_set = self.moq_public_url.is_some(),
             yt_cookie_file_set = self.yt_cookie_file.is_some(),
             "ts6-manager configuration loaded"
         );
