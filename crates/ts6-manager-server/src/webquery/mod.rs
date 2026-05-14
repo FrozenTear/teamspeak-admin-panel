@@ -322,12 +322,12 @@ impl WebQueryClient {
 
             let latency_ms = started.elapsed().as_millis() as u64;
 
-            let envelope: Envelope<T> = serde_json::from_slice(&bytes).map_err(|e| {
+            let envelope: Envelope = serde_json::from_slice(&bytes).map_err(|e| {
                 tracing::warn!(latency_ms, outcome = "invalid_response", error = %e);
                 WebQueryError::InvalidResponse(format!("envelope parse failed: {e}"))
             })?;
 
-            match envelope.into_body() {
+            match envelope.into_body::<T>() {
                 Ok(body) => {
                     tracing::debug!(latency_ms, outcome = "ok");
                     Ok(body)
@@ -694,8 +694,10 @@ impl WebQueryClient {
 }
 
 /// Sentinel for write commands that only carry a `status` envelope. TS
-/// returns `body: {}` (or sometimes `body: []`) on these; we accept either
-/// because [`Envelope::into_body`] only inspects `status.code`.
+/// returns `body: {}`, `body: []`, or `body: null` on these; we accept any
+/// of them because [`Envelope::into_body`] forwards `null` as
+/// [`serde_json::Value::Null`] and `Object(Value)` here is the identity
+/// deserializer, while `Tuple(())` covers historical empty-array fixtures.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum UnitBody {
@@ -766,9 +768,17 @@ fn unwrap_singleton_body(body: serde_json::Value) -> WebQueryResult<serde_json::
 }
 
 /// Spec §10.5 envelope. Always parsed, regardless of HTTP status.
+///
+/// `body` is captured as raw [`serde_json::Value`] so the target type's
+/// deserializer decides whether `null` (the empty-body success shape used
+/// by no-return mutations — `clientkick`, `clientmove`, `clientedit`,
+/// `bandel`/`bandelall`, `servernotifyregister`/`servernotifyunregister`,
+/// some `sendtextmessage` variants) is acceptable. [`UnitBody`] accepts it;
+/// list/struct models reject and surface as [`WebQueryError::InvalidResponse`].
 #[derive(Debug, Deserialize)]
-struct Envelope<T> {
-    body: Option<T>,
+struct Envelope {
+    #[serde(default)]
+    body: Option<serde_json::Value>,
     status: EnvelopeStatus,
 }
 
@@ -778,16 +788,20 @@ struct EnvelopeStatus {
     message: String,
 }
 
-impl<T> Envelope<T> {
-    fn into_body(self) -> WebQueryResult<T> {
+impl Envelope {
+    fn into_body<T>(self) -> WebQueryResult<T>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
         if self.status.code != 0 {
             return Err(WebQueryError::Upstream {
                 code: self.status.code,
                 message: self.status.message,
             });
         }
-        self.body
-            .ok_or_else(|| WebQueryError::InvalidResponse("status.code=0 but body is null".into()))
+        let value = self.body.unwrap_or(serde_json::Value::Null);
+        serde_json::from_value(value)
+            .map_err(|e| WebQueryError::InvalidResponse(format!("body decode failed: {e}")))
     }
 }
 

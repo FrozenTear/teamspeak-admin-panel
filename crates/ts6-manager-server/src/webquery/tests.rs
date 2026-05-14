@@ -756,8 +756,11 @@ async fn handler_clientkick(
         params.get("clid").cloned().unwrap_or_default(),
         params.get("reasonid").cloned().unwrap_or_default(),
     ));
+    // PURA-193 regression: real TS6 `6.0.0-beta9` returns `body: null` for
+    // no-return mutations. Keep the rest of the write-path handlers on
+    // `body: {}` so both wire shapes stay covered.
     Json(json!({
-        "body": {},
+        "body": null,
         "status": {"code": 0, "message": "ok"},
     }))
     .into_response()
@@ -796,8 +799,11 @@ async fn handler_clientmove(
         params.get("clid").cloned().unwrap_or_default(),
         params.get("cid").cloned().unwrap_or_default(),
     ));
+    // PURA-193 — second no-return mutation exercising the `body: null`
+    // success branch through the full client. `clientkick`/`clientmove`/
+    // `clientedit`/`bandel*` all share the parser path under audit.
     Json(json!({
-        "body": {},
+        "body": null,
         "status": {"code": 0, "message": "ok"},
     }))
     .into_response()
@@ -1188,5 +1194,65 @@ async fn integration_against_local_ts6_host_when_env_configured() {
             .clientlist_with_flags(first.virtualserver_id, &["uid", "away"])
             .await;
         let _ = client.banlist(first.virtualserver_id).await;
+    }
+}
+
+// =========================================================================
+// PURA-193 — envelope decode: `status.code=0 && body=null` is success for
+// no-return mutations (`clientkick`, `clientmove`, `clientedit`, `bandel*`,
+// `servernotifyregister`/`servernotifyunregister`, empty `sendtextmessage`).
+// Direct unit tests on the parser so the regression can't come back via a
+// targeted refactor of the request path.
+// =========================================================================
+
+#[test]
+fn envelope_null_body_is_success_for_unit_body() {
+    let raw = r#"{"body": null, "status": {"code": 0, "message": "ok"}}"#;
+    let envelope: Envelope = serde_json::from_str(raw).expect("envelope parses");
+    let decoded: UnitBody = envelope.into_body().expect("null body decodes as UnitBody");
+    match decoded {
+        UnitBody::Object(serde_json::Value::Null) => {}
+        other => panic!("expected UnitBody::Object(Null), got {other:?}"),
+    }
+}
+
+#[test]
+fn envelope_missing_body_is_success_for_unit_body() {
+    // Some upstreams elide the field entirely instead of emitting `null`.
+    let raw = r#"{"status": {"code": 0, "message": "ok"}}"#;
+    let envelope: Envelope = serde_json::from_str(raw).expect("envelope parses");
+    envelope
+        .into_body::<UnitBody>()
+        .expect("missing body decodes as UnitBody");
+}
+
+#[test]
+fn envelope_null_body_still_rejected_for_list_models() {
+    let raw = r#"{"body": null, "status": {"code": 0, "message": "ok"}}"#;
+    let envelope: Envelope = serde_json::from_str(raw).expect("envelope parses");
+    let err = envelope
+        .into_body::<Vec<ClientEntry>>()
+        .expect_err("list shape must reject null body");
+    assert!(
+        matches!(err, WebQueryError::InvalidResponse(_)),
+        "expected InvalidResponse, got {err:?}"
+    );
+}
+
+#[test]
+fn envelope_null_body_does_not_mask_upstream_error() {
+    // Real upstreams send `body: null` alongside non-zero status codes — the
+    // upstream error must win regardless of body shape.
+    let raw = r#"{"body": null, "status": {"code": 1283, "message": "client_query_login_failed"}}"#;
+    let envelope: Envelope = serde_json::from_str(raw).expect("envelope parses");
+    let err = envelope
+        .into_body::<UnitBody>()
+        .expect_err("non-zero status must surface");
+    match err {
+        WebQueryError::Upstream { code, message } => {
+            assert_eq!(code, 1283);
+            assert_eq!(message, "client_query_login_failed");
+        }
+        other => panic!("expected Upstream, got {other:?}"),
     }
 }
