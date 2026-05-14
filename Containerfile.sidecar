@@ -1,0 +1,100 @@
+# TS6 Manager — Phase 5 MoQ + WebTransport media sidecar
+# Multi-stage OCI Containerfile (Podman-native; works with any OCI runtime).
+#
+# Architecture: `crates/ts6-media-sidecar/` is a self-contained Cargo workspace
+# sibling to the main one (ADR-0007 §"Workspace isolation note") — we copy only
+# the sidecar workspace plus `crates/ts6-ssrf/` (path-referenced shared SSRF
+# validator) into the builder. Runtime carries an ffmpeg subprocess for the
+# media pipeline.
+
+# -----------------------------------------------------------------------------
+# Stage 1 — build
+# -----------------------------------------------------------------------------
+FROM docker.io/rust:1.95-slim-bookworm AS builder
+
+WORKDIR /build
+
+# `pkg-config`/`libssl-dev` aren't strictly required by the sidecar today
+# (rustls), but `build-essential` is needed for the linker step and a handful
+# of transitive build scripts. `git` shows up in moq-native's build deps.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        build-essential \
+        pkg-config \
+        ca-certificates \
+        git \
+ && rm -rf /var/lib/apt/lists/*
+
+# The sidecar workspace is self-contained, BUT `ts6-ssrf` is a member of the
+# main `teamspeak-admin-panel` workspace and uses `version.workspace = true` /
+# `workspace.dependencies` inheritance — so the root `Cargo.toml` (and all of
+# `crates/`) must be present for cargo to resolve those fields when ts6-ssrf
+# is consumed as a `path = "../ts6-ssrf"` dependency. This mirrors what
+# Containerfile.fullstack does and is the simplest way to keep build inputs
+# in lock-step with the dev tree.
+COPY Cargo.toml          /build/Cargo.toml
+COPY rust-toolchain.toml /build/rust-toolchain.toml
+COPY crates              /build/crates
+
+# Tolerate the root workspace lock being absent on fresh checkouts.
+COPY Cargo.loc[k] /build/
+
+WORKDIR /build/crates/ts6-media-sidecar
+
+# Release build of the sidecar binary. The sidecar workspace ships its own
+# `Cargo.lock` (`crates/ts6-media-sidecar/Cargo.lock`) which was copied above,
+# so the build is reproducible across hosts.
+RUN cargo build --release --locked --bin ts6-media-sidecar
+
+# -----------------------------------------------------------------------------
+# Stage 2 — runtime (non-root, slim, ffmpeg-equipped)
+# -----------------------------------------------------------------------------
+FROM docker.io/debian:bookworm-slim
+
+# Runtime deps:
+#   * `ffmpeg`            — subprocess invoked by the pipeline (FFmpeg → VP8/Opus
+#                            → MoQ tracks).
+#   * `ca-certificates`   — for outbound HTTPS source URLs.
+#   * `libssl3`           — pulled by some transitive deps even on rustls
+#                            builds; small enough to keep.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        ffmpeg \
+        libssl3 \
+ && rm -rf /var/lib/apt/lists/* \
+ && groupadd --system --gid 10002 sidecar \
+ && useradd --system --uid 10002 --gid sidecar --shell /usr/sbin/nologin --home-dir /var/lib/ts6-manager-sidecar sidecar \
+ && mkdir -p /var/lib/ts6-manager-sidecar /etc/ts6-manager-sidecar \
+ && chown -R sidecar:sidecar /var/lib/ts6-manager-sidecar
+
+COPY --from=builder /build/crates/ts6-media-sidecar/target/release/ts6-media-sidecar /usr/local/bin/ts6-media-sidecar
+
+ARG IMAGE_VERSION=dev
+ARG IMAGE_REVISION=unknown
+ARG IMAGE_SOURCE="https://github.com/teamspeak-heaven/ts6-manager"
+LABEL org.opencontainers.image.title="ts6-manager-sidecar" \
+      org.opencontainers.image.description="TS6 Manager — Phase 5 MoQ + WebTransport media sidecar (FFmpeg → VP8/Opus → MoQ tracks). Binary inside the image is `ts6-media-sidecar` (crate name)." \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.source="${IMAGE_SOURCE}" \
+      org.opencontainers.image.version="${IMAGE_VERSION}" \
+      org.opencontainers.image.revision="${IMAGE_REVISION}"
+
+USER sidecar:sidecar
+WORKDIR /var/lib/ts6-manager-sidecar
+
+# Defaults match the binary's clap defaults (see crates/ts6-media-sidecar/src/main.rs):
+#   --listen        [::]:4443       (UDP/QUIC + WebTransport)
+#   --http-listen   127.0.0.1:7080  (control plane — operator-only)
+#
+# The control listener is intentionally loopback by default. Operators who run
+# the sidecar as a sibling container in the same pod (Quadlet / kube YAML) keep
+# the loopback default and reach it over the pod-shared loopback. Operators
+# running it standalone override with `--http-listen 0.0.0.0:7080` and front it
+# with their own auth.
+EXPOSE 4443/udp
+EXPOSE 7080/tcp
+
+ENTRYPOINT ["/usr/local/bin/ts6-media-sidecar"]
+# No CMD — operator-provided flags select cert source (`--cert`/`--key` for
+# production, `--tls-generate <hostname>` for dev/smoke).
