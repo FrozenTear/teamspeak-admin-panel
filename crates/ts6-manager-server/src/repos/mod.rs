@@ -31,6 +31,7 @@ pub mod songs;
 pub mod ssh_audit_log;
 pub mod stream_sessions;
 pub mod users;
+pub mod video_sources;
 pub mod widgets;
 
 #[cfg(test)]

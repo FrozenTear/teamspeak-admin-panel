@@ -248,6 +248,8 @@ mod tests {
             ws_hub: crate::ws::Hub::new(),
             widget_cache: crate::widgets::WidgetCache::new(),
             music_bots: crate::music_bots::MusicBotService::default_for_tests(),
+            sidecar: None,
+            ssrf_resolver: Arc::new(ts6_ssrf::MockResolver::new()),
         }
     }
 
@@ -691,9 +693,11 @@ mod tests {
                 .header("content-type", "application/json")
                 .body(body())
                 .unwrap();
-            req.extensions_mut().insert(axum::extract::ConnectInfo(
-                std::net::SocketAddr::from(([198, 51, 100, 5], 50_000)),
-            ));
+            req.extensions_mut()
+                .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                    [198, 51, 100, 5],
+                    50_000,
+                ))));
             let resp = app.clone().oneshot(req).await.unwrap();
             assert_ne!(
                 resp.status(),
@@ -710,9 +714,11 @@ mod tests {
             .header("content-type", "application/json")
             .body(body())
             .unwrap();
-        req.extensions_mut().insert(axum::extract::ConnectInfo(
-            std::net::SocketAddr::from(([198, 51, 100, 5], 50_000)),
-        ));
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                [198, 51, 100, 5],
+                50_000,
+            ))));
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(

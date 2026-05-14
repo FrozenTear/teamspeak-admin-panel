@@ -202,7 +202,6 @@ async fn handler_dispatch(
     capture_and_dispatch(&state, &headers, path_for_capture, params, body).await
 }
 
-
 /// Boot the mock TS WebQuery server. Returns the bound port and the
 /// shared `MockState` so tests can assert on captured paths/queries.
 async fn boot_mock_webquery(api_key: &str) -> (u16, MockState) {
@@ -241,14 +240,12 @@ async fn fresh_state() -> AppState {
         ws_hub: Hub::new(),
         widget_cache: crate::widgets::WidgetCache::new(),
         music_bots: crate::music_bots::MusicBotService::default_for_tests(),
+        sidecar: None,
+        ssrf_resolver: Arc::new(ts6_ssrf::MockResolver::new()),
     }
 }
 
-async fn seed_user_with_token(
-    state: &AppState,
-    name: &str,
-    role: &str,
-) -> (AuthUser, String) {
+async fn seed_user_with_token(state: &AppState, name: &str, role: &str) -> (AuthUser, String) {
     let pw = "Hunter2!ok".to_string();
     let hash = tokio::task::spawn_blocking(move || password::hash_new(&pw))
         .await
@@ -324,7 +321,10 @@ fn json_body<T: serde::Serialize>(value: &T) -> Body {
 async fn read_json<T: serde::de::DeserializeOwned>(resp: axum::http::Response<Body>) -> T {
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-        panic!("expected JSON, got {:?}: {e}", String::from_utf8_lossy(&bytes))
+        panic!(
+            "expected JSON, got {:?}: {e}",
+            String::from_utf8_lossy(&bytes)
+        )
     })
 }
 
@@ -669,8 +669,14 @@ async fn mute_default_body_mutes_both_directions() {
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     let q = mock.captured_queries.lock().unwrap();
     let last = q.last().unwrap();
-    assert_eq!(last.get("CLIENT_INPUT_MUTED").map(|s| s.as_str()), Some("1"));
-    assert_eq!(last.get("CLIENT_OUTPUT_MUTED").map(|s| s.as_str()), Some("1"));
+    assert_eq!(
+        last.get("CLIENT_INPUT_MUTED").map(|s| s.as_str()),
+        Some("1")
+    );
+    assert_eq!(
+        last.get("CLIENT_OUTPUT_MUTED").map(|s| s.as_str()),
+        Some("1")
+    );
 }
 
 #[tokio::test]
@@ -694,8 +700,14 @@ async fn unmute_resets_both_directions() {
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     let q = mock.captured_queries.lock().unwrap();
     let last = q.last().unwrap();
-    assert_eq!(last.get("CLIENT_INPUT_MUTED").map(|s| s.as_str()), Some("0"));
-    assert_eq!(last.get("CLIENT_OUTPUT_MUTED").map(|s| s.as_str()), Some("0"));
+    assert_eq!(
+        last.get("CLIENT_INPUT_MUTED").map(|s| s.as_str()),
+        Some("0")
+    );
+    assert_eq!(
+        last.get("CLIENT_OUTPUT_MUTED").map(|s| s.as_str()),
+        Some("0")
+    );
 }
 
 #[tokio::test]
@@ -788,7 +800,8 @@ async fn ban_create_rejects_empty_body() {
 #[tokio::test]
 async fn upstream_error_translates_to_502_with_code() {
     let (port, mock) = boot_mock_webquery("API-KEY").await;
-    *mock.behavior.force_upstream_error.lock().unwrap() = Some((2568, "insufficient client permissions".into()));
+    *mock.behavior.force_upstream_error.lock().unwrap() =
+        Some((2568, "insufficient client permissions".into()));
     let state = fresh_state().await;
     let server = seed_server(&state, port, "API-KEY").await;
     let (_admin, atoken) = seed_user_with_token(&state, "alice", "admin").await;

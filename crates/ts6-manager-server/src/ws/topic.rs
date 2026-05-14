@@ -20,14 +20,19 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 /// All recognised topic kinds. The wire string is the lower-case variant
-/// name (`clients`, `channels`, `logs`, `widget`).
+/// name (`clients`, `channels`, `logs`, `widget`, `video_sources`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum TopicKind {
     Clients,
     Channels,
     Logs,
     Widget,
+    /// PURA-144 (WS-6) — operator-facing live status of video sources
+    /// published through the MoQ sidecar. Auth = JWT user; per-server
+    /// fan-out keyed on the same `serverConfigId` the rest of the
+    /// operator topics use.
+    VideoSources,
 }
 
 impl TopicKind {
@@ -37,14 +42,16 @@ impl TopicKind {
             TopicKind::Channels => "channels",
             TopicKind::Logs => "logs",
             TopicKind::Widget => "widget",
+            TopicKind::VideoSources => "video_sources",
         }
     }
 
     pub fn auth_requirement(self) -> AuthRequirement {
         match self {
-            TopicKind::Clients | TopicKind::Channels | TopicKind::Logs => {
-                AuthRequirement::JwtUser
-            }
+            TopicKind::Clients
+            | TopicKind::Channels
+            | TopicKind::Logs
+            | TopicKind::VideoSources => AuthRequirement::JwtUser,
             TopicKind::Widget => AuthRequirement::WidgetToken,
         }
     }
@@ -130,6 +137,7 @@ impl FromStr for Topic {
             "channels" => TopicKind::Channels,
             "logs" => TopicKind::Logs,
             "widget" => TopicKind::Widget,
+            "video_sources" => TopicKind::VideoSources,
             _ => return Err(TopicParseError::UnknownKind),
         };
         Ok(Topic { server_id, kind })
@@ -147,6 +155,7 @@ mod tests {
             TopicKind::Channels,
             TopicKind::Logs,
             TopicKind::Widget,
+            TopicKind::VideoSources,
         ] {
             let t = Topic::new(7, kind);
             let s = t.to_string();
@@ -194,10 +203,7 @@ mod tests {
             TopicKind::Channels.auth_requirement(),
             AuthRequirement::JwtUser
         );
-        assert_eq!(
-            TopicKind::Logs.auth_requirement(),
-            AuthRequirement::JwtUser
-        );
+        assert_eq!(TopicKind::Logs.auth_requirement(), AuthRequirement::JwtUser);
         assert_eq!(
             TopicKind::Widget.auth_requirement(),
             AuthRequirement::WidgetToken

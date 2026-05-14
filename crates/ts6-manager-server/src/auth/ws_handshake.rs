@@ -83,17 +83,12 @@ pub async fn ws_upgrade(
         match state.ws_hub.try_acquire_widget_slot(w.widget_id).await {
             Some(g) => Some(g),
             None => {
-                tracing::warn!(
-                    widget_id = w.widget_id,
-                    "widget WS connection cap exceeded"
-                );
+                tracing::warn!(widget_id = w.widget_id, "widget WS connection cap exceeded");
                 return ws.on_upgrade(|mut socket| async move {
                     let _ = socket
                         .send(Message::Close(Some(CloseFrame {
                             code: close_code::AGAIN,
-                            reason: Utf8Bytes::from_static(
-                                "widget connection cap exceeded",
-                            ),
+                            reason: Utf8Bytes::from_static("widget connection cap exceeded"),
                         })))
                         .await;
                 });
@@ -167,6 +162,8 @@ mod tests {
             ws_hub: crate::ws::Hub::new(),
             widget_cache: crate::widgets::WidgetCache::new(),
             music_bots: crate::music_bots::MusicBotService::default_for_tests(),
+            sidecar: None,
+            ssrf_resolver: Arc::new(ts6_ssrf::MockResolver::new()),
         }
     }
 

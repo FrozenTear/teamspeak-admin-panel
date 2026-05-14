@@ -31,6 +31,7 @@ pub mod hub;
 pub mod server_notify;
 pub mod session;
 pub mod topic;
+pub mod video_source_tick;
 
 // Re-export the hub itself because [`crate::app_state::AppState`] holds
 // it directly. Other types are reached via the fully-qualified paths

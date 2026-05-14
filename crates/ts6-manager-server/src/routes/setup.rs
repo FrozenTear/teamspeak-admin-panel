@@ -35,9 +35,7 @@ use axum::middleware::from_fn_with_state;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use ts6_manager_shared::auth::{ErrorResponse, UserInfo};
-use ts6_manager_shared::setup::{
-    SetupInitRequest, SetupInitResponse, SetupStatusResponse,
-};
+use ts6_manager_shared::setup::{SetupInitRequest, SetupInitResponse, SetupStatusResponse};
 
 use crate::app_state::AppState;
 use crate::auth::{complexity, password};
@@ -79,7 +77,9 @@ async fn status(State(state): State<AppState>) -> Result<Json<SetupStatusRespons
         tracing::error!(err = %e, "setup_status: user count query failed");
         internal()
     })?;
-    Ok(Json(SetupStatusResponse { needs_setup: n == 0 }))
+    Ok(Json(SetupStatusResponse {
+        needs_setup: n == 0,
+    }))
 }
 
 async fn init(
@@ -167,11 +167,7 @@ async fn init(
         apiKey: sealed_api_key,
         useHttps: req.server.use_https.unwrap_or(false),
         sshPort: req.server.ssh_port.unwrap_or(DEFAULT_SSH_PORT),
-        sshUsername: req
-            .server
-            .ssh_username
-            .clone()
-            .filter(|s| !s.is_empty()),
+        sshUsername: req.server.ssh_username.clone().filter(|s| !s.is_empty()),
         sshPassword: sealed_ssh_password,
         queryBotChannel: None,
         queryBotNickname: None,
@@ -247,6 +243,8 @@ mod tests {
             ws_hub: crate::ws::Hub::new(),
             widget_cache: crate::widgets::WidgetCache::new(),
             music_bots: crate::music_bots::MusicBotService::default_for_tests(),
+            sidecar: None,
+            ssrf_resolver: std::sync::Arc::new(ts6_ssrf::MockResolver::new()),
         }
     }
 
@@ -543,9 +541,8 @@ mod tests {
         let mut body = valid_init_body();
         body.server.control_path = Some("ssh".into());
         body.server.ssh_auth_method = Some("password".into());
-        body.server.ssh_host_key_fingerprint = Some(
-            "SHA256:0123456789abcdef0123456789abcdef0123456789abcdef0".into(),
-        );
+        body.server.ssh_host_key_fingerprint =
+            Some("SHA256:0123456789abcdef0123456789abcdef0123456789abcdef0".into());
 
         let resp = app
             .oneshot(

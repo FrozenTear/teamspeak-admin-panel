@@ -38,6 +38,7 @@ pub mod channels;
 pub mod clients;
 pub mod info;
 pub mod logs;
+pub mod video_sources;
 
 #[cfg(test)]
 mod tests;
@@ -64,7 +65,10 @@ pub fn router() -> Router<AppState> {
             get(info::server_info),
         )
         .route("/api/servers/{configId}/vs/{sid}/logs", get(logs::tail))
-        .route("/api/servers/{configId}/vs/{sid}/bans", get(bans::list).post(bans::create))
+        .route(
+            "/api/servers/{configId}/vs/{sid}/bans",
+            get(bans::list).post(bans::create),
+        )
         .route(
             "/api/servers/{configId}/vs/{sid}/bans/{banid}",
             delete(bans::delete),

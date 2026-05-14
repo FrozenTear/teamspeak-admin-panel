@@ -41,6 +41,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0006_ssh_audit_log",
         include_str!("../../migrations/0006_ssh_audit_log.surql"),
     ),
+    (
+        "0007_video_source",
+        include_str!("../../migrations/0007_video_source.surql"),
+    ),
 ];
 
 #[derive(Debug, Deserialize, SurrealValue)]
@@ -73,8 +77,7 @@ pub async fn run(db: &Database) -> Result<MigrationReport> {
         .context("failed to read _migration table")?
         .take(0)
         .context("failed to deserialise _migration rows")?;
-    let already: std::collections::HashSet<String> =
-        applied.into_iter().map(|r| r.name).collect();
+    let already: std::collections::HashSet<String> = applied.into_iter().map(|r| r.name).collect();
 
     let mut applied_now = Vec::new();
     let mut skipped = Vec::new();

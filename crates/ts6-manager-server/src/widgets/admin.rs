@@ -49,8 +49,7 @@ use crate::repos::widgets::{self as widget_repo, NewWidget, Widget, WidgetUpdate
 /// [`crate::auth::refresh::generate_family_id`] (which we deliberately
 /// don't depend on so the widget surface doesn't reach into the auth crate's
 /// internals).
-const TOKEN_ALPHABET: &[u8] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-";
+const TOKEN_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-";
 const TOKEN_LENGTH: usize = 21;
 
 /// Build the operator widgets sub-router.
@@ -420,6 +419,8 @@ mod tests {
             ws_hub: crate::ws::Hub::new(),
             widget_cache: crate::widgets::WidgetCache::new(),
             music_bots: crate::music_bots::MusicBotService::default_for_tests(),
+            sidecar: None,
+            ssrf_resolver: Arc::new(ts6_ssrf::MockResolver::new()),
         }
     }
 
@@ -500,7 +501,10 @@ mod tests {
     async fn read_json<T: serde::de::DeserializeOwned>(resp: axum::http::Response<Body>) -> T {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-            panic!("expected JSON, got {:?}: {e}", String::from_utf8_lossy(&bytes))
+            panic!(
+                "expected JSON, got {:?}: {e}",
+                String::from_utf8_lossy(&bytes)
+            )
         })
     }
 
@@ -610,11 +614,7 @@ mod tests {
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::OK, "role={role} must list");
             let visible: Vec<WidgetSummary> = read_json(resp).await;
-            assert_eq!(
-                visible.len(),
-                1,
-                "role={role} must see the granted widget"
-            );
+            assert_eq!(visible.len(), 1, "role={role} must see the granted widget");
             assert_eq!(visible[0].id, widget.id);
         }
     }
@@ -655,7 +655,11 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(resp.status(), StatusCode::CREATED, "role={role} must create");
+            assert_eq!(
+                resp.status(),
+                StatusCode::CREATED,
+                "role={role} must create"
+            );
         }
     }
 
@@ -690,10 +694,22 @@ mod tests {
         // Token shape is on the wire as 21 URL-safe chars.
         assert_eq!(created.token.chars().count(), 21);
         // Embed URLs name the token verbatim.
-        assert_eq!(created.embed_urls.data_url, format!("/api/widget/{}/data", created.token));
-        assert_eq!(created.embed_urls.svg_url, format!("/api/widget/{}/image.svg", created.token));
-        assert_eq!(created.embed_urls.png_url, format!("/api/widget/{}/image.png", created.token));
-        assert_eq!(created.embed_urls.page_url, format!("/widget/{}", created.token));
+        assert_eq!(
+            created.embed_urls.data_url,
+            format!("/api/widget/{}/data", created.token)
+        );
+        assert_eq!(
+            created.embed_urls.svg_url,
+            format!("/api/widget/{}/image.svg", created.token)
+        );
+        assert_eq!(
+            created.embed_urls.png_url,
+            format!("/api/widget/{}/image.png", created.token)
+        );
+        assert_eq!(
+            created.embed_urls.page_url,
+            format!("/widget/{}", created.token)
+        );
         // Server join made it onto the response.
         assert_eq!(created.server_name.as_deref(), Some("Primary"));
         // Visibility flags survived the round-trip.
@@ -792,7 +808,10 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let updated: WidgetSummary = read_json(resp).await;
         assert_eq!(updated.theme, "neon");
-        assert_eq!(updated.token, created.token, "PATCH must not rotate the token");
+        assert_eq!(
+            updated.token, created.token,
+            "PATCH must not rotate the token"
+        );
 
         // Cache MUST be cold after PATCH (spec §7.29 / §26.4).
         assert!(
@@ -844,7 +863,10 @@ mod tests {
             "DELETE must invalidate cache"
         );
         assert!(
-            widget_repo::find_by_id(&state.db, created.id).await.unwrap().is_none(),
+            widget_repo::find_by_id(&state.db, created.id)
+                .await
+                .unwrap()
+                .is_none(),
             "row must be gone"
         );
     }
@@ -904,7 +926,10 @@ mod tests {
         // Old token is no longer resolvable from the repo — i.e. the public
         // route's `find_by_token` will return None and emit 404.
         assert!(
-            widget_repo::find_by_token(&state.db, &old_token).await.unwrap().is_none(),
+            widget_repo::find_by_token(&state.db, &old_token)
+                .await
+                .unwrap()
+                .is_none(),
             "old token must not resolve any row → public route 404s"
         );
         // New token resolves to the same row.
@@ -1065,7 +1090,11 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let visible: Vec<WidgetSummary> = read_json(resp).await;
-        assert_eq!(visible.len(), 1, "viewer must only see granted server's widget");
+        assert_eq!(
+            visible.len(),
+            1,
+            "viewer must only see granted server's widget"
+        );
         assert_eq!(visible[0].id, w_a.id);
         assert_eq!(visible[0].server_config_id, server_a);
     }
@@ -1117,7 +1146,11 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let visible: Vec<WidgetSummary> = read_json(resp).await;
-        assert_eq!(visible.len(), 2, "admin must see every widget across servers");
+        assert_eq!(
+            visible.len(),
+            2,
+            "admin must see every widget across servers"
+        );
     }
 
     #[tokio::test]

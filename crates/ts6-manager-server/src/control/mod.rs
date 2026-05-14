@@ -41,6 +41,8 @@
 
 #![allow(dead_code)] // trait surface + pool helpers consumed by routes / future Phase 2 hooks.
 
+pub mod sidecar;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -53,21 +55,21 @@ use tokio::sync::RwLock;
 use crate::db::Database;
 use crate::repos::server_connections::ServerConnection;
 use crate::sshbridge::{
+    SshBridgeError,
     control_client::SshControlClient,
     hostkey::{HostKeyConfigError, HostKeyVerifier},
-    russh_channel::{connect as ssh_connect, RusshAuth, RusshConnectParams},
+    russh_channel::{RusshAuth, RusshConnectParams, connect as ssh_connect},
     tofu::TofuCaptureSink,
-    transport::{spawn_with_db as spawn_transport_with_db, TransportConfig, TransportHandle},
-    SshBridgeError,
+    transport::{TransportConfig, TransportHandle, spawn_with_db as spawn_transport_with_db},
 };
-use zeroize::Zeroizing;
 use crate::webquery::{
+    BanAddParams, WebQueryClient, WebQueryError,
     models::{
         BanEntry, ChannelEntry, ClientDbEntry, ClientEntry, ClientInfo, ConnectionInfo, LogEntry,
         ServerInfo, VersionInfo, VirtualServerEntry,
     },
-    BanAddParams, WebQueryClient, WebQueryError,
 };
+use zeroize::Zeroizing;
 
 /// Errors returned by [`ControlBackend`] methods. Variants are
 /// shape-aligned with both [`WebQueryError`] and [`SshBridgeError`] so
@@ -181,9 +183,7 @@ impl From<SshBridgeError> for ControlBackendError {
                 message: source.to_string(),
             },
             SshBridgeError::AuthRejected { config_id } => Self::AuthRejected { config_id },
-            SshBridgeError::HostKeyMismatch { config_id } => {
-                Self::HostKeyMismatch { config_id }
-            }
+            SshBridgeError::HostKeyMismatch { config_id } => Self::HostKeyMismatch { config_id },
         }
     }
 }
@@ -349,7 +349,9 @@ impl ControlBackend for WebQueryClient {
         sid: i64,
         flags: &[&str],
     ) -> ControlResult<Vec<ClientEntry>> {
-        self.clientlist_with_flags(sid, flags).await.map_err(Into::into)
+        self.clientlist_with_flags(sid, flags)
+            .await
+            .map_err(Into::into)
     }
 
     async fn clientinfo(&self, sid: i64, clid: i64) -> ControlResult<ClientInfo> {
@@ -365,7 +367,9 @@ impl ControlBackend for WebQueryClient {
         sid: i64,
         flags: &[&str],
     ) -> ControlResult<Vec<ChannelEntry>> {
-        self.channellist_with_flags(sid, flags).await.map_err(Into::into)
+        self.channellist_with_flags(sid, flags)
+            .await
+            .map_err(Into::into)
     }
 
     async fn banlist(&self, sid: i64) -> ControlResult<Vec<BanEntry>> {
@@ -404,7 +408,9 @@ impl ControlBackend for WebQueryClient {
         cid: i64,
         cpw: Option<&str>,
     ) -> ControlResult<()> {
-        self.clientmove(sid, clid, cid, cpw).await.map_err(Into::into)
+        self.clientmove(sid, clid, cid, cpw)
+            .await
+            .map_err(Into::into)
     }
 
     async fn client_set_muted(
@@ -520,10 +526,7 @@ impl ControlBackendPool {
             ))
         })?;
         let backend = self.build_backend(connection).await?;
-        self.inner
-            .write()
-            .await
-            .insert(config_id, backend.clone());
+        self.inner.write().await.insert(config_id, backend.clone());
         Ok(backend)
     }
 
@@ -538,11 +541,7 @@ impl ControlBackendPool {
     /// builders and exercise the supervisor + worker logic against a
     /// hand-rolled [`ControlBackend`] fake.
     #[cfg(test)]
-    pub(crate) async fn insert_for_test(
-        &self,
-        config_id: i64,
-        backend: Arc<dyn ControlBackend>,
-    ) {
+    pub(crate) async fn insert_for_test(&self, config_id: i64, backend: Arc<dyn ControlBackend>) {
         self.inner.write().await.insert(config_id, backend);
     }
 
@@ -676,11 +675,10 @@ fn unseal_for(
             connection.id
         ))
     })?;
-    let cleartext =
-        crate::crypto::unseal(ct).map_err(|e| ControlBackendError::Decrypt {
-            config_id: connection.id,
-            message: e.to_string(),
-        })?;
+    let cleartext = crate::crypto::unseal(ct).map_err(|e| ControlBackendError::Decrypt {
+        config_id: connection.id,
+        message: e.to_string(),
+    })?;
     Ok(Zeroizing::new(cleartext))
 }
 
@@ -715,7 +713,10 @@ mod tests {
             message: "empty".into(),
         };
         let ce: ControlBackendError = we.into();
-        assert!(matches!(ce, ControlBackendError::Upstream { code: 1281, .. }));
+        assert!(matches!(
+            ce,
+            ControlBackendError::Upstream { code: 1281, .. }
+        ));
 
         let we = WebQueryError::Transport("dns".into());
         let ce: ControlBackendError = we.into();
@@ -736,7 +737,10 @@ mod tests {
             message: "permissions".into(),
         };
         let ce: ControlBackendError = se.into();
-        assert!(matches!(ce, ControlBackendError::Upstream { code: 2568, .. }));
+        assert!(matches!(
+            ce,
+            ControlBackendError::Upstream { code: 2568, .. }
+        ));
 
         // PURA-86: HostKeyMismatch round-trips with config-id preserved
         // and the §7.0.2 envelope carries the operator remediation hint.

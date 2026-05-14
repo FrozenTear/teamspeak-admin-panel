@@ -185,12 +185,7 @@ impl Hub {
             if cur >= WIDGET_MAX_CONCURRENT_CONNECTIONS {
                 return None;
             }
-            match counter.compare_exchange_weak(
-                cur,
-                cur + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
+            match counter.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => return Some(WidgetConnGuard { counter }),
                 Err(actual) => cur = actual,
             }
@@ -217,16 +212,21 @@ impl Hub {
     ) -> Result<Subscription, AuthorizeError> {
         self.authorize(db, principal, &topic).await?;
         let mut servers = self.inner.servers.lock().await;
-        let slot = servers.entry(topic.server_id).or_insert_with(|| ServerSlot {
-            sender: broadcast::channel(BROADCAST_CAPACITY).0,
-            ring: RingBuffer::new(RING_CAPACITY),
-        });
+        let slot = servers
+            .entry(topic.server_id)
+            .or_insert_with(|| ServerSlot {
+                sender: broadcast::channel(BROADCAST_CAPACITY).0,
+                ring: RingBuffer::new(RING_CAPACITY),
+            });
         let receiver = slot.sender.subscribe();
         let replay = match last_event_id {
             Some(id) => slot.ring.replay_for(&topic.to_string(), id),
             None => Vec::new(),
         };
-        self.inner.metrics.subscribe_ok.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .metrics
+            .subscribe_ok
+            .fetch_add(1, Ordering::Relaxed);
         Ok(Subscription { receiver, replay })
     }
 
@@ -255,7 +255,7 @@ impl Hub {
                         self.deny()
                     }
                 }
-                TopicKind::Clients | TopicKind::Channels => {
+                TopicKind::Clients | TopicKind::Channels | TopicKind::VideoSources => {
                     if u.is_admin {
                         Ok(())
                     } else {
@@ -294,15 +294,22 @@ impl Hub {
     /// No-op (returns the stamped envelope but doesn't fan out) if no
     /// subscribers exist — broadcast::Sender::send returns Err in that
     /// case, which is fine.
-    pub async fn publish(&self, topic: Topic, kind: impl Into<String>, data: serde_json::Value) -> Envelope {
+    pub async fn publish(
+        &self,
+        topic: Topic,
+        kind: impl Into<String>,
+        data: serde_json::Value,
+    ) -> Envelope {
         let id = self.inner.next_event_id.fetch_add(1, Ordering::Relaxed);
         let ts = chrono::Utc::now().timestamp_millis();
         let env = Envelope::new(id, &topic, kind, data, ts);
         let mut servers = self.inner.servers.lock().await;
-        let slot = servers.entry(topic.server_id).or_insert_with(|| ServerSlot {
-            sender: broadcast::channel(BROADCAST_CAPACITY).0,
-            ring: RingBuffer::new(RING_CAPACITY),
-        });
+        let slot = servers
+            .entry(topic.server_id)
+            .or_insert_with(|| ServerSlot {
+                sender: broadcast::channel(BROADCAST_CAPACITY).0,
+                ring: RingBuffer::new(RING_CAPACITY),
+            });
         slot.ring.push(env.clone());
         // Best-effort fan-out. `send` errors when there are zero active
         // receivers — that's fine, the ring buffer captures the event
@@ -316,11 +323,17 @@ impl Hub {
     }
 
     pub fn record_dropped(&self) {
-        self.inner.metrics.events_dropped.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .metrics
+            .events_dropped
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_connection_open(&self) {
-        self.inner.metrics.connections.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .metrics
+            .connections
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_connection_close(&self) {
@@ -514,14 +527,15 @@ mod tests {
         let hub = Hub::new();
         let admin = user_principal(1, "admin");
         let topic = Topic::new(1, TopicKind::Clients);
-        let e1 = hub.publish(topic, "ts:client:connected", json!({"clid": 1})).await;
-        let e2 = hub.publish(topic, "ts:client:connected", json!({"clid": 2})).await;
+        let e1 = hub
+            .publish(topic, "ts:client:connected", json!({"clid": 1}))
+            .await;
+        let e2 = hub
+            .publish(topic, "ts:client:connected", json!({"clid": 2}))
+            .await;
         assert_eq!(e2.id, e1.id + 1, "ids are monotonic");
 
-        let sub = hub
-            .subscribe(&db, &admin, topic, Some(0))
-            .await
-            .unwrap();
+        let sub = hub.subscribe(&db, &admin, topic, Some(0)).await.unwrap();
         let ids: Vec<u64> = sub.replay.iter().map(|e| e.id).collect();
         assert_eq!(ids, vec![e1.id, e2.id]);
     }
@@ -544,7 +558,9 @@ mod tests {
         let admin = user_principal(1, "admin");
         let topic = Topic::new(1, TopicKind::Clients);
         let mut sub = hub.subscribe(&db, &admin, topic, None).await.unwrap();
-        let e = hub.publish(topic, "ts:client:connected", json!({"clid": 5})).await;
+        let e = hub
+            .publish(topic, "ts:client:connected", json!({"clid": 5}))
+            .await;
         let received = sub.receiver.recv().await.expect("must receive");
         assert_eq!(received.id, e.id);
         assert_eq!(received.kind, "ts:client:connected");

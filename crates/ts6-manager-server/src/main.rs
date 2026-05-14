@@ -136,13 +136,12 @@ mod server_entry {
         // handle is held in a `_`-prefixed binding so it lives for
         // the lifetime of `run_serve` — a future graceful-shutdown
         // path can take ownership and call `.shutdown().await`.
-        let _dashboard_ticks = crate::ws::dashboard_tick::spawn(
-            crate::ws::dashboard_tick::TickerDeps {
+        let _dashboard_ticks =
+            crate::ws::dashboard_tick::spawn(crate::ws::dashboard_tick::TickerDeps {
                 db: database.clone(),
                 hub: state.ws_hub.clone(),
                 control: state.control.clone(),
-            },
-        );
+            });
 
         // PURA-80 — TS server-notify event source. Spawns one worker
         // per enabled SSH-controlled `server_connection`; each
@@ -150,13 +149,25 @@ mod server_entry {
         // registers for server/channel/textserver/textchannel events,
         // and re-publishes them onto the matching WS hub topic. Held
         // as a drop-guard alongside the dashboard tick.
-        let _server_notify = crate::ws::server_notify::spawn(
-            crate::ws::server_notify::EventSourceDeps {
+        let _server_notify =
+            crate::ws::server_notify::spawn(crate::ws::server_notify::EventSourceDeps {
                 db: database.clone(),
                 hub: state.ws_hub.clone(),
                 control: state.control.clone(),
-            },
-        );
+            });
+
+        // PURA-144 (WS-6) — sidecar `/stats` poller + per-server
+        // `video_sources` WS topic. Only spawned when SIDECAR_URL is
+        // configured; the rest of the manager still boots when no
+        // sidecar is wired up so operators can adopt video streaming
+        // incrementally.
+        let _video_tick = state.sidecar.as_ref().map(|sidecar| {
+            crate::ws::video_source_tick::spawn(crate::ws::video_source_tick::VideoTickDeps {
+                db: database.clone(),
+                hub: state.ws_hub.clone(),
+                sidecar: sidecar.clone(),
+            })
+        });
 
         // Phase 1 SECURITY (slice 4b): per-IP rate limit on the auth
         // surface. One bucket shared across `/login` and `/refresh` per
@@ -186,8 +197,7 @@ mod server_entry {
         // sub-routers live under `crate::routes`; auth + RBAC checks happen
         // inside the handlers via the `RequireAuth` / `RequireAdmin`
         // extractors so we don't need a separate middleware layer here.
-        let setup_router =
-            routes::setup::router(setup_rate_limit_state).with_state(state.clone());
+        let setup_router = routes::setup::router(setup_rate_limit_state).with_state(state.clone());
         let servers_router = routes::servers::router().with_state(state.clone());
         // PURA-23 — Phase 1 dashboard route. Lives at an absolute path under
         // `/api/servers/:configId/vs/:sid/dashboard` (spec §7.19); the rest of
@@ -198,6 +208,12 @@ mod server_entry {
         // Mounts every `/api/servers/:configId/vs/:sid/...` action route; auth
         // and per-server access checks live inside each handler.
         let control_router = routes::control::router().with_state(state.clone());
+        // PURA-144 (WS-6) — `/api/video-sources` CRUD for the MoQ sidecar
+        // integration. Mounted at top-level paths (not under
+        // `/api/servers/.../vs/...`) so the FE-PAGES (WS-7) can list
+        // every video source the operator owns in a single request.
+        let video_sources_router =
+            routes::control::video_sources::router().with_state(state.clone());
         // PURA-82 — `/metrics` Prometheus exposition for the WS hub.
         // Admin-JWT gated; see the route module for the auth-gate rationale.
         let metrics_router = routes::metrics::router().with_state(state.clone());
@@ -205,8 +221,7 @@ mod server_entry {
         // `/api/music-library`, `/api/playlists`, `/api/radio-stations`,
         // `/api/music-requests`). Auth via the same `RequireAuth`
         // extractor as the rest of the panel.
-        let music_bots_router =
-            routes::music_bots::router().with_state(state.clone());
+        let music_bots_router = routes::music_bots::router().with_state(state.clone());
         // PURA-72 (Slice A) — public widget JSON endpoint
         // (`/api/widget/{token}/data`). No authentication.
         //
@@ -220,12 +235,9 @@ mod server_entry {
             cfg.widget_rate_limit_per_ip_rpm,
             cfg.trusted_proxy_hops,
         );
-        let widget_router = widgets::routes::router()
-            .with_state(state.clone())
-            .layer(axum::middleware::from_fn_with_state(
-                widget_rl_state,
-                web::widget_rate_limit,
-            ));
+        let widget_router = widgets::routes::router().with_state(state.clone()).layer(
+            axum::middleware::from_fn_with_state(widget_rl_state, web::widget_rate_limit),
+        );
         // PURA-72 Slice D ([PURA-89]) — operator widget CRUD `/api/widgets`.
         // RequireAuth for reads; RequireModerator (admin OR moderator) for
         // writes. PATCH / DELETE / regenerate-token invalidate the public
@@ -257,6 +269,8 @@ mod server_entry {
             .merge(dashboard_router)
             // PURA-71 — Phase 2 control surface.
             .merge(control_router)
+            // PURA-144 (WS-6) — video-source CRUD.
+            .merge(video_sources_router)
             // PURA-82 — Prometheus metrics endpoint for the WS hub.
             .merge(metrics_router)
             // PURA-123 — music-bot REST surface.
