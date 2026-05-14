@@ -22,7 +22,7 @@ use crate::ui::pages::DevVideoPlayerPage;
 use crate::ui::pages::{
     BansPage, BotDetailPage, BotsIndexPage, ChannelsPage, ClientsPage, DashboardPlaceholder, Home,
     LoginPage, LogsPage, MusicLibraryPage, MusicPlaylistsPage, PublicWidgetPage, RadioStationsPage,
-    ServerInfoPage, SetupPage, WidgetsPage,
+    ServerInfoPage, SetupPage, VideoSourcesPage, WidgetsPage,
 };
 
 #[rustfmt::skip]
@@ -74,6 +74,13 @@ pub enum Route {
     // PURA-92 — Slice G operator-facing Widget Manager (Chapter 34).
     #[route("/widgets")]
     WidgetsPage {},
+
+    // PURA-145 WS-7 — operator video-source surface (MoQ sidecar pipeline
+    // management). Lives at the bare `/video-sources` prefix; per-server
+    // scoping comes from the global server selector, same as Clients/
+    // Channels/Bans.
+    #[route("/video-sources")]
+    VideoSourcesPage {},
 
     // PURA-124 WS-6 — music-bots product. Per-bot resources nest under
     // the bot id so the URLs stay shareable; the index lives at the

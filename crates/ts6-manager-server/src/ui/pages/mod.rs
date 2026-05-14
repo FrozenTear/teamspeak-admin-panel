@@ -19,6 +19,7 @@ mod music_bots;
 mod public_widget;
 mod server_info;
 mod setup;
+mod video_sources;
 mod widgets;
 
 pub use bans::BansPage;
@@ -36,4 +37,5 @@ pub use music_bots::{
 pub use public_widget::PublicWidgetPage;
 pub use server_info::ServerInfoPage;
 pub use setup::SetupPage;
+pub use video_sources::VideoSourcesPage;
 pub use widgets::WidgetsPage;

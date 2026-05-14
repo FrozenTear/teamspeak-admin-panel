@@ -17,6 +17,7 @@ pub mod health;
 pub mod music_bots;
 pub mod servers;
 pub mod setup;
+pub mod video_sources;
 pub mod widgets;
 
 pub use dashboard::{BandwidthSnapshot, DashboardData};
