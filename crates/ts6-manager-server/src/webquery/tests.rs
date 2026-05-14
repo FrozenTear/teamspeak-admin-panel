@@ -38,10 +38,7 @@ struct MockState {
     request_count: Arc<AtomicU64>,
 }
 
-async fn handler_version(
-    State(state): State<MockState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+async fn handler_version(State(state): State<MockState>, headers: HeaderMap) -> impl IntoResponse {
     state.request_count.fetch_add(1, Ordering::SeqCst);
     if !key_matches(&headers, &state.expected_api_key) {
         return upstream_error(1283, "client_query_login_failed");
@@ -226,7 +223,9 @@ impl MockServer {
             )
             .with_state(state.clone());
 
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         tokio::spawn(async move {
@@ -349,7 +348,9 @@ async fn serverlist_returns_all_virtualservers() {
 #[tokio::test]
 async fn malformed_envelope_surfaces_invalid_response() {
     // Custom one-off mock that returns a non-envelope body.
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     let app = Router::new().route(
         "/version",
@@ -383,7 +384,9 @@ async fn malformed_envelope_surfaces_invalid_response() {
 #[tokio::test]
 async fn transport_error_when_target_refuses_connection() {
     // Bind, capture port, drop the listener so the port is closed.
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);
 
@@ -398,10 +401,7 @@ async fn transport_error_when_target_refuses_connection() {
     .unwrap();
 
     let err = client.version().await.unwrap_err();
-    assert!(
-        matches!(err, WebQueryError::Transport(_)),
-        "got {err:?}"
-    );
+    assert!(matches!(err, WebQueryError::Transport(_)), "got {err:?}");
     assert_eq!(err.http_status(), StatusCode::BAD_GATEWAY);
     assert_eq!(err.upstream_code(), -1);
 }
@@ -438,7 +438,10 @@ async fn pool_caches_clients_per_config_id() {
 
     let a = pool.get_or_build(7, Some(&conn)).await.unwrap();
     let b = pool.get_or_build(7, None).await.unwrap();
-    assert!(Arc::ptr_eq(&a, &b), "second lookup must reuse the cached client");
+    assert!(
+        Arc::ptr_eq(&a, &b),
+        "second lookup must reuse the cached client"
+    );
 }
 
 #[tokio::test]
@@ -490,10 +493,7 @@ fn escape_module_is_reachable_from_module_root() {
 // Phase 2 (PURA-68) — handlers + tests for the full command surface
 // =========================================================================
 
-async fn handler_hostinfo(
-    State(state): State<MockState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+async fn handler_hostinfo(State(state): State<MockState>, headers: HeaderMap) -> impl IntoResponse {
     if !key_matches(&headers, &state.expected_api_key) {
         return upstream_error(1283, "client_query_login_failed");
     }

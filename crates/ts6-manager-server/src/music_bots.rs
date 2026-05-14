@@ -152,9 +152,7 @@ impl LivenessTracker {
             // pair with a QueueEmpty or NowPlaying event that does.
             BotEvent::AudioFinished { .. } => {}
             // The remaining variants don't contribute to the snapshot.
-            BotEvent::PlaylistChanged(_)
-            | BotEvent::LibraryChanged
-            | BotEvent::Error(_) => {}
+            BotEvent::PlaylistChanged(_) | BotEvent::LibraryChanged | BotEvent::Error(_) => {}
         }
     }
 }

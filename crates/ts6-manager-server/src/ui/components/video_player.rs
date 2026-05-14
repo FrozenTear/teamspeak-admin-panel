@@ -221,16 +221,10 @@ mod wt {
 
         if !webtransport_supported() {
             state.set(PlayerState::Unsupported);
-            return Rc::new(SessionGuard {
-                stop,
-                wt: wt_slot,
-            });
+            return Rc::new(SessionGuard { stop, wt: wt_slot });
         }
         if !autoplay {
-            return Rc::new(SessionGuard {
-                stop,
-                wt: wt_slot,
-            });
+            return Rc::new(SessionGuard { stop, wt: wt_slot });
         }
 
         state.set(PlayerState::Connecting);
@@ -262,10 +256,7 @@ mod wt {
             }
         });
 
-        Rc::new(SessionGuard {
-            stop,
-            wt: wt_slot,
-        })
+        Rc::new(SessionGuard { stop, wt: wt_slot })
     }
 
     fn webtransport_supported() -> bool {
@@ -425,11 +416,12 @@ mod wt {
         broadcast: &str,
         track: &str,
     ) -> Result<(), String> {
-        let bidi: WebTransportBidirectionalStream = JsFuture::from(wt.create_bidirectional_stream())
-            .await
-            .map_err(|e| format!("createBidirectionalStream: {}", js_err(&e)))?
-            .dyn_into()
-            .map_err(|_| "bidi stream cast".to_string())?;
+        let bidi: WebTransportBidirectionalStream =
+            JsFuture::from(wt.create_bidirectional_stream())
+                .await
+                .map_err(|e| format!("createBidirectionalStream: {}", js_err(&e)))?
+                .dyn_into()
+                .map_err(|_| "bidi stream cast".to_string())?;
 
         let writer: WritableStreamDefaultWriter = bidi
             .writable()
@@ -608,8 +600,8 @@ mod wt {
             error.as_ref().unchecked_ref(),
             output.as_ref().unchecked_ref(),
         );
-        let decoder = VideoDecoder::new(&init)
-            .map_err(|e| format!("VideoDecoder::new: {}", js_err(&e)))?;
+        let decoder =
+            VideoDecoder::new(&init).map_err(|e| format!("VideoDecoder::new: {}", js_err(&e)))?;
         // VP8 codec string — same as the reference player. The fixture
         // emits 1280×720 30fps VP8 keyframed groups (PURA-140 WS-2).
         let config = VideoDecoderConfig::new("vp8");
@@ -672,8 +664,8 @@ mod wt {
 
     impl AudioPipeline {
         fn new() -> Result<Self, String> {
-            let ctx = AudioContext::new()
-                .map_err(|e| format!("AudioContext::new: {}", js_err(&e)))?;
+            let ctx =
+                AudioContext::new().map_err(|e| format!("AudioContext::new: {}", js_err(&e)))?;
             Ok(Self {
                 inner: Rc::new(AudioPipelineInner {
                     ctx,
@@ -772,8 +764,8 @@ mod wt {
             error.as_ref().unchecked_ref(),
             output.as_ref().unchecked_ref(),
         );
-        let decoder = AudioDecoder::new(&init)
-            .map_err(|e| format!("AudioDecoder::new: {}", js_err(&e)))?;
+        let decoder =
+            AudioDecoder::new(&init).map_err(|e| format!("AudioDecoder::new: {}", js_err(&e)))?;
 
         // ts6-media-sidecar/pipeline.rs encodes audio as mono Opus @ 48 kHz
         // with 20 ms framing (libopus, application=voip). Mirror those
@@ -807,8 +799,7 @@ mod wt {
             let buf = Uint8Array::new_with_length(data.len() as u32);
             buf.copy_from(&data);
 
-            let init =
-                EncodedAudioChunkInit::new(buf.as_ref(), ts_ms, EncodedAudioChunkType::Key);
+            let init = EncodedAudioChunkInit::new(buf.as_ref(), ts_ms, EncodedAudioChunkType::Key);
             let chunk = EncodedAudioChunk::new(&init)
                 .map_err(|e| format!("EncodedAudioChunk: {}", js_err(&e)))?;
             self.decoder
@@ -852,10 +843,7 @@ mod wt {
         buf.extend_from_slice(bytes);
     }
 
-    async fn write_chunk(
-        writer: &WritableStreamDefaultWriter,
-        bytes: &[u8],
-    ) -> Result<(), String> {
+    async fn write_chunk(writer: &WritableStreamDefaultWriter, bytes: &[u8]) -> Result<(), String> {
         let buf = Uint8Array::new_with_length(bytes.len() as u32);
         buf.copy_from(bytes);
         JsFuture::from(writer.write_with_chunk(buf.as_ref()))
@@ -1026,7 +1014,9 @@ mod wt {
             format!("http://{host}:{port}/certificate.sha256")
         };
         let window = web_sys::window()?;
-        let resp_js = JsFuture::from(window.fetch_with_str(&cert_url)).await.ok()?;
+        let resp_js = JsFuture::from(window.fetch_with_str(&cert_url))
+            .await
+            .ok()?;
         let resp: web_sys::Response = resp_js.dyn_into().ok()?;
         if !resp.ok() {
             return None;
@@ -1044,5 +1034,4 @@ mod wt {
         }
         Some(out)
     }
-
 }

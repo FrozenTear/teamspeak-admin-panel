@@ -14,9 +14,7 @@ use crate::client::dioxus::{use_auth_gate, use_session};
 use crate::client::music_bots as mb;
 use crate::client::store::AuthState;
 use crate::ui::components::toast::{ToastVariant, use_toaster};
-use crate::ui::components::{
-    Banner, BannerVariant, Button, ButtonSize, ButtonType, ButtonVariant,
-};
+use crate::ui::components::{Banner, BannerVariant, Button, ButtonSize, ButtonType, ButtonVariant};
 use crate::ui::pages::music_bots::shared::{
     audio_source_summary, format_error, parse_audio_source,
 };
@@ -94,16 +92,18 @@ pub fn MusicLibraryPage(bot_id: u64) -> Element {
             spawn(async move {
                 match mb::add_library_entry(gate, bot, &source, &title, &[]).await {
                     Ok(_) => {
-                        toaster.push(ToastVariant::Success, format!("Added \u{201C}{title}\u{201D}"), None);
+                        toaster.push(
+                            ToastVariant::Success,
+                            format!("Added \u{201C}{title}\u{201D}"),
+                            None,
+                        );
                         new_url.set(String::new());
                         new_title.set(String::new());
                         bump();
                     }
-                    Err(e) => toaster.push(
-                        ToastVariant::Danger,
-                        "Add failed",
-                        Some(format_error(&e)),
-                    ),
+                    Err(e) => {
+                        toaster.push(ToastVariant::Danger, "Add failed", Some(format_error(&e)))
+                    }
                 }
                 adding.set(false);
             });
@@ -141,7 +141,9 @@ pub fn MusicLibraryPage(bot_id: u64) -> Element {
                     return true;
                 }
                 e.title.to_lowercase().contains(&needle)
-                    || audio_source_summary(&e.source).to_lowercase().contains(&needle)
+                    || audio_source_summary(&e.source)
+                        .to_lowercase()
+                        .contains(&needle)
             })
             .cloned()
             .collect()

@@ -22,9 +22,9 @@
 //! (browser). We avoid `tokio::sync::Mutex` so this module compiles on the
 //! `wasm32-unknown-unknown` target the dx-CLI builds for the SPA bundle.
 
+use futures::lock::Mutex;
 use std::future::Future;
 use std::sync::Arc;
-use futures::lock::Mutex;
 
 use ts6_manager_shared::auth::{RefreshRequest, TokenPairResponse, UserInfo};
 
@@ -231,8 +231,11 @@ fn translate_refresh_error(e: AuthError) -> AuthError {
         AuthError::Unauthorized(m) => AuthError::Unauthorized(m),
         AuthError::Transport(m) => AuthError::Transport(m),
         AuthError::Deserialise(m) => AuthError::Deserialise(m),
-        AuthError::Client { status, message }
-        | AuthError::Server { status, message } if status >= 500 => AuthError::Server { status, message },
+        AuthError::Client { status, message } | AuthError::Server { status, message }
+            if status >= 500 =>
+        {
+            AuthError::Server { status, message }
+        }
         AuthError::Client { .. } | AuthError::Server { .. } => {
             AuthError::Unauthorized(msg::INVALID_TOKEN.into())
         }
@@ -324,9 +327,7 @@ mod tests {
     /// how many refreshes ran during a concurrent burst.
     struct StubRefresh {
         count: AtomicU32,
-        responder: Box<
-            dyn Fn(u32) -> Result<TokenPairResponse, AuthError> + Send + Sync,
-        >,
+        responder: Box<dyn Fn(u32) -> Result<TokenPairResponse, AuthError> + Send + Sync>,
     }
 
     impl StubRefresh {
@@ -361,10 +362,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn first_call_succeeds_without_refresh() {
         let storage = arc_storage(MemoryStore::new());
-        let session: Arc<dyn SessionHandle> = Arc::new(InMemorySession::new(
-            authed("ax", "rx"),
-            storage.clone(),
-        ));
+        let session: Arc<dyn SessionHandle> =
+            Arc::new(InMemorySession::new(authed("ax", "rx"), storage.clone()));
         let stub = StubRefresh::new(|_| panic!("must not refresh"));
         let gate = RefreshGate::new(session, stub.clone());
 
@@ -476,16 +475,18 @@ mod tests {
         assert_eq!(req_calls.load(Ordering::SeqCst), 1);
         // Session is wiped + storage cleared.
         assert_eq!(session.read(), AuthState::Anonymous);
-        assert!(storage.get(crate::client::store::SESSION_STORAGE_KEY).is_none());
+        assert!(
+            storage
+                .get(crate::client::store::SESSION_STORAGE_KEY)
+                .is_none()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn other_errors_do_not_trigger_refresh_or_invalidate() {
         let storage = arc_storage(MemoryStore::new());
-        let session: Arc<dyn SessionHandle> = Arc::new(InMemorySession::new(
-            authed("ax", "rx"),
-            storage.clone(),
-        ));
+        let session: Arc<dyn SessionHandle> =
+            Arc::new(InMemorySession::new(authed("ax", "rx"), storage.clone()));
         let stub = StubRefresh::new(|_| panic!("must not refresh"));
         let gate = RefreshGate::new(session.clone(), stub.clone());
 

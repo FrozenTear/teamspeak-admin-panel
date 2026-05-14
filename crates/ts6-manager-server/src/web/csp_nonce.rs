@@ -171,7 +171,8 @@ pub async fn nonce_csp_middleware(mut req: Request, next: Next) -> Response {
                 // 500 surfaces the issue immediately instead of silently
                 // shipping a broken page.
                 tracing::error!(%err, "nonce-csp: failed to buffer HTML response for rewrite");
-                let mut error_resp = Response::from_parts(parts, Body::from("Internal Server Error"));
+                let mut error_resp =
+                    Response::from_parts(parts, Body::from("Internal Server Error"));
                 *error_resp.status_mut() = axum::http::StatusCode::INTERNAL_SERVER_ERROR;
                 resp = error_resp;
             }
@@ -355,7 +356,9 @@ mod tests {
         let body = String::from_utf8(body).unwrap();
         let expected_attr = format!("<script nonce=\"{nonce}\">");
         assert!(
-            body.contains(&format!("{expected_attr}window.initial_dioxus_hydration_data")),
+            body.contains(&format!(
+                "{expected_attr}window.initial_dioxus_hydration_data"
+            )),
             "render_after_main script must carry the nonce. Body: {body}"
         );
         assert!(
@@ -401,7 +404,9 @@ mod tests {
         let resp = fetch("/json").await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(
-            resp.headers().get(header::CONTENT_SECURITY_POLICY).is_some(),
+            resp.headers()
+                .get(header::CONTENT_SECURITY_POLICY)
+                .is_some(),
             "JSON responses still need CSP set"
         );
         let body = resp
@@ -673,10 +678,7 @@ mod tests {
                 .serve_api_application(serve_cfg, Trivial)
                 .layer(from_fn(nonce_csp_middleware));
 
-            let req = HttpRequest::builder()
-                .uri("/")
-                .body(Body::empty())
-                .unwrap();
+            let req = HttpRequest::builder().uri("/").body(Body::empty()).unwrap();
             let resp = router.oneshot(req).await.expect("dx render must not error");
             assert_eq!(resp.status(), StatusCode::OK, "dx render must return 200");
 
@@ -749,10 +751,8 @@ mod tests {
             // Pull the per-request nonce out of the CSP header so we can
             // assert that each inline script carries the *same* token.
             let nonce_needle = "'nonce-";
-            let start = csp
-                .find(nonce_needle)
-                .expect("CSP must contain a nonce")
-                + nonce_needle.len();
+            let start =
+                csp.find(nonce_needle).expect("CSP must contain a nonce") + nonce_needle.len();
             let end = csp[start..]
                 .find('\'')
                 .expect("CSP nonce must be quote-terminated")

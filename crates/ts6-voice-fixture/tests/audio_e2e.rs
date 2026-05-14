@@ -32,8 +32,8 @@ extern crate ts6_voice_fixture as voice_lib;
 use std::env;
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
-use audiopus::{coder::Encoder, Application, Channels, SampleRate};
+use anyhow::{Context, Result, bail};
+use audiopus::{Application, Channels, SampleRate, coder::Encoder};
 use futures::{StreamExt, TryStreamExt};
 use tokio::sync::oneshot;
 use tokio::time::interval;
@@ -195,11 +195,7 @@ async fn run_audio_e2e() -> Result<()> {
         .iter()
         .filter(|f| !f.is_stop)
         .count();
-    let stops = receiver_outcome
-        .frames
-        .iter()
-        .filter(|f| f.is_stop)
-        .count();
+    let stops = receiver_outcome.frames.iter().filter(|f| f.is_stop).count();
     let codec_mismatches: Vec<&ReceivedFrame> = receiver_outcome
         .frames
         .iter()
@@ -454,11 +450,17 @@ fn env_flag(name: &str) -> bool {
 }
 
 fn env_u32(name: &str, default: u32) -> u32 {
-    env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn env_f64(name: &str, default: f64) -> f64 {
-    env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn wedged_fixture_bail(what: &str, addr: &str) -> Result<()> {
@@ -471,4 +473,3 @@ fn wedged_fixture_bail(what: &str, addr: &str) -> Result<()> {
         HANDSHAKE_TIMEOUT.as_secs(),
     )
 }
-

@@ -103,11 +103,7 @@ enum NavStep {
 
 /// Compute the next focused item id given the current focus + a step.
 /// Skips `disabled` items; wraps at boundaries.
-fn next_active_id(
-    items: &[MenuItemMeta],
-    current: Option<&str>,
-    step: NavStep,
-) -> Option<String> {
+fn next_active_id(items: &[MenuItemMeta], current: Option<&str>, step: NavStep) -> Option<String> {
     let candidates: Vec<&MenuItemMeta> = items.iter().filter(|m| !m.disabled).collect();
     if candidates.is_empty() {
         return None;
@@ -132,11 +128,7 @@ fn next_active_id(
 /// Type-ahead jump: find the first non-disabled item whose label
 /// (case-insensitive) starts with `prefix`, searching forward from the
 /// position after the current active item (wraps).
-fn typeahead_match(
-    items: &[MenuItemMeta],
-    current: Option<&str>,
-    prefix: &str,
-) -> Option<String> {
+fn typeahead_match(items: &[MenuItemMeta], current: Option<&str>, prefix: &str) -> Option<String> {
     if prefix.is_empty() {
         return None;
     }
@@ -160,14 +152,24 @@ fn typeahead_match(
 
 #[cfg(target_arch = "wasm32")]
 fn collect_menu_items(menu_id: &str) -> Vec<MenuItemMeta> {
-    let Some(window) = web_sys::window() else { return Vec::new() };
-    let Some(document) = window.document() else { return Vec::new() };
-    let Some(menu) = document.get_element_by_id(menu_id) else { return Vec::new() };
-    let Ok(nodes) = menu.query_selector_all(".menu-item") else { return Vec::new() };
+    let Some(window) = web_sys::window() else {
+        return Vec::new();
+    };
+    let Some(document) = window.document() else {
+        return Vec::new();
+    };
+    let Some(menu) = document.get_element_by_id(menu_id) else {
+        return Vec::new();
+    };
+    let Ok(nodes) = menu.query_selector_all(".menu-item") else {
+        return Vec::new();
+    };
     let mut out = Vec::with_capacity(nodes.length() as usize);
     for i in 0..nodes.length() {
         let Some(node) = nodes.item(i) else { continue };
-        let Some(elem) = node.dyn_ref::<web_sys::Element>() else { continue };
+        let Some(elem) = node.dyn_ref::<web_sys::Element>() else {
+            continue;
+        };
         let id = elem.id();
         if id.is_empty() {
             continue;
@@ -182,7 +184,11 @@ fn collect_menu_items(menu_id: &str) -> Vec<MenuItemMeta> {
             .unwrap_or_default()
             .trim()
             .to_string();
-        out.push(MenuItemMeta { id, label, disabled });
+        out.push(MenuItemMeta {
+            id,
+            label,
+            disabled,
+        });
     }
     out
 }
@@ -276,8 +282,12 @@ pub fn Dropdown(
                     return;
                 }
                 let Some(target) = evt.target() else { return };
-                let Some(node) = target.dyn_ref::<web_sys::Node>() else { return };
-                let Some(document) = web_sys::window().and_then(|w| w.document()) else { return };
+                let Some(node) = target.dyn_ref::<web_sys::Node>() else {
+                    return;
+                };
+                let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+                    return;
+                };
                 let menu = document.get_element_by_id(&menu_id_outside);
                 let trigger = document.get_element_by_id(&trigger_id_outside);
                 let inside = menu.as_ref().map_or(false, |m| m.contains(Some(node)))
@@ -287,10 +297,8 @@ pub fn Dropdown(
                 }
             });
             if let Some(document) = web_sys::window().and_then(|w| w.document()) {
-                let _ = document.add_event_listener_with_callback(
-                    "mousedown",
-                    cb.as_ref().unchecked_ref(),
-                );
+                let _ = document
+                    .add_event_listener_with_callback("mousedown", cb.as_ref().unchecked_ref());
             }
             // Phase 1 simplification: the listener is leaked for the lifetime
             // of the page. The Dropdown lives as long as the authenticated
@@ -456,7 +464,10 @@ pub fn MenuItem(
     let active_id = ctx.as_ref().map(|c| c.active_id);
     let open_signal = ctx.as_ref().map(|c| c.open);
     let close_on_select = ctx.as_ref().map(|c| c.close_on_select).unwrap_or(true);
-    let trigger_id = ctx.as_ref().map(|c| c.trigger_id.clone()).unwrap_or_default();
+    let trigger_id = ctx
+        .as_ref()
+        .map(|c| c.trigger_id.clone())
+        .unwrap_or_default();
 
     let is_active = active_id
         .as_ref()
@@ -545,7 +556,8 @@ pub fn MenuFilter(
     #[props(default)] placeholder: Option<String>,
     /// Optional `aria-label` override; defaults to the placeholder so the
     /// input still announces a name when the placeholder is empty.
-    #[props(default)] aria_label: Option<String>,
+    #[props(default)]
+    aria_label: Option<String>,
 ) -> Element {
     let placeholder_text = placeholder.clone().unwrap_or_default();
     let label = aria_label
@@ -677,10 +689,7 @@ mod tests {
 
     #[test]
     fn arrow_nav_returns_none_when_all_disabled() {
-        let items = vec![
-            meta("a", "Alpha", true),
-            meta("b", "Bravo", true),
-        ];
+        let items = vec![meta("a", "Alpha", true), meta("b", "Bravo", true)];
         assert!(next_active_id(&items, None, NavStep::First).is_none());
         assert!(next_active_id(&items, Some("a"), NavStep::Next).is_none());
     }
@@ -707,23 +716,14 @@ mod tests {
             meta("b", "Bravo", false),
         ];
         // Sitting on "a1", pressing "a" → land on "a2", not "a1".
-        assert_eq!(
-            typeahead_match(&items, Some("a1"), "a"),
-            Some("a2".into())
-        );
+        assert_eq!(typeahead_match(&items, Some("a1"), "a"), Some("a2".into()));
         // Sitting on "a2", "a" wraps back to "a1".
-        assert_eq!(
-            typeahead_match(&items, Some("a2"), "a"),
-            Some("a1".into())
-        );
+        assert_eq!(typeahead_match(&items, Some("a2"), "a"), Some("a1".into()));
     }
 
     #[test]
     fn typeahead_skips_disabled() {
-        let items = vec![
-            meta("a", "Alpha", true),
-            meta("b", "Beta", false),
-        ];
+        let items = vec![meta("a", "Alpha", true), meta("b", "Beta", false)];
         // Disabled "Alpha" must not be a typeahead target even though it
         // is a prefix match for "a".
         assert!(typeahead_match(&items, None, "a").is_none());
@@ -822,7 +822,10 @@ mod tests {
         let html = render_static_menu();
         // The action item must carry `role="menuitem"`; we look for the id
         // first to anchor on the right element.
-        assert!(html.contains(r#"id="snap-item-2""#), "action item id missing: {html}");
+        assert!(
+            html.contains(r#"id="snap-item-2""#),
+            "action item id missing: {html}"
+        );
         assert!(
             html.contains(r#"role="menuitem""#),
             "action item missing role='menuitem': {html}"

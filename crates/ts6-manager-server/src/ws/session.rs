@@ -124,8 +124,8 @@ impl SessionLoop {
         // Subscribe to widget revocations only for widget principals.
         // For JWT users this stays None and the select! arm pends
         // forever, so it has zero runtime cost on the operator path.
-        let widgets_revoked_rx = matches!(principal, Principal::Widget(_))
-            .then(|| hub.subscribe_widget_revocations());
+        let widgets_revoked_rx =
+            matches!(principal, Principal::Widget(_)).then(|| hub.subscribe_widget_revocations());
         Self {
             socket,
             principal,
@@ -289,7 +289,10 @@ impl SessionLoop {
             }
         };
         match frame {
-            ClientFrame::Subscribe { topic, last_event_id } => {
+            ClientFrame::Subscribe {
+                topic,
+                last_event_id,
+            } => {
                 let parsed = match Topic::from_str(&topic) {
                     Ok(t) => t,
                     Err(_) => {
@@ -327,12 +330,8 @@ impl SessionLoop {
                 for env in sub.replay {
                     self.send_envelope(env).await?;
                 }
-                let handle = spawn_forwarder(
-                    self.hub.clone(),
-                    parsed,
-                    self.out_tx.clone(),
-                    sub.receiver,
-                );
+                let handle =
+                    spawn_forwarder(self.hub.clone(), parsed, self.out_tx.clone(), sub.receiver);
                 self.subscriptions.insert(parsed, handle);
                 self.send_ack("subscribed", &topic).await?;
             }
@@ -500,11 +499,15 @@ mod tests {
 
     #[test]
     fn parses_subscribe_with_last_event_id() {
-        let f: ClientFrame =
-            serde_json::from_str(r#"{"kind":"subscribe","topic":"server:1:clients","lastEventId":42}"#)
-                .unwrap();
+        let f: ClientFrame = serde_json::from_str(
+            r#"{"kind":"subscribe","topic":"server:1:clients","lastEventId":42}"#,
+        )
+        .unwrap();
         match f {
-            ClientFrame::Subscribe { topic, last_event_id } => {
+            ClientFrame::Subscribe {
+                topic,
+                last_event_id,
+            } => {
                 assert_eq!(topic, "server:1:clients");
                 assert_eq!(last_event_id, Some(42));
             }

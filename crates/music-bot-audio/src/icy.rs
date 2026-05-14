@@ -21,10 +21,7 @@ enum State {
     MetaLength,
     /// Reading `remaining` more metadata bytes. Once collected, decoded and
     /// emitted as a single `Metadata` piece.
-    Meta {
-        remaining: usize,
-        buf: Vec<u8>,
-    },
+    Meta { remaining: usize, buf: Vec<u8> },
 }
 
 pub struct IcyStreamSplitter {
@@ -57,7 +54,8 @@ impl IcyStreamSplitter {
                 State::Audio { audio_remaining } => {
                     if *audio_remaining == usize::MAX {
                         // No metaint — just pass everything through as audio.
-                        self.out.push_back(IcyPiece::Audio(Bytes::copy_from_slice(input)));
+                        self.out
+                            .push_back(IcyPiece::Audio(Bytes::copy_from_slice(input)));
                         input = &[];
                     } else {
                         let n = (*audio_remaining).min(input.len());
@@ -131,10 +129,7 @@ mod tests {
     #[test]
     fn parse_title() {
         let raw = b"StreamTitle='Artist - Track';StreamUrl='';\0\0\0\0";
-        assert_eq!(
-            parse_stream_title(raw).as_deref(),
-            Some("Artist - Track")
-        );
+        assert_eq!(parse_stream_title(raw).as_deref(), Some("Artist - Track"));
     }
 
     #[test]

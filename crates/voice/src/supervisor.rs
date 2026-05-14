@@ -5,10 +5,10 @@
 //! caller. WS-3+ may grow it (per-bot persistence, restart policy, etc).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
@@ -243,9 +243,7 @@ impl BotSupervisor {
         old: PlaylistName,
         new: PlaylistName,
     ) -> StoreResult<()> {
-        self.store
-            .playlist_rename(bot, old, new.clone())
-            .await?;
+        self.store.playlist_rename(bot, old, new.clone()).await?;
         self.notify(bot, BotEvent::PlaylistChanged(new)).await;
         Ok(())
     }
@@ -263,7 +261,8 @@ impl BotSupervisor {
         track: crate::store::NewTrack,
     ) -> StoreResult<Track> {
         let stored = self.store.playlist_add_track(bot, name, track).await?;
-        self.notify(bot, BotEvent::PlaylistChanged(name.clone())).await;
+        self.notify(bot, BotEvent::PlaylistChanged(name.clone()))
+            .await;
         Ok(stored)
     }
 
@@ -273,12 +272,10 @@ impl BotSupervisor {
         name: &PlaylistName,
         id: crate::store::TrackId,
     ) -> StoreResult<bool> {
-        let changed = self
-            .store
-            .playlist_remove_track(bot, name, id)
-            .await?;
+        let changed = self.store.playlist_remove_track(bot, name, id).await?;
         if changed {
-            self.notify(bot, BotEvent::PlaylistChanged(name.clone())).await;
+            self.notify(bot, BotEvent::PlaylistChanged(name.clone()))
+                .await;
         }
         Ok(changed)
     }

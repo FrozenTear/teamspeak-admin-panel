@@ -108,10 +108,7 @@ fn source_to_spec(source: &AudioSource) -> (AudioSourceSpec, String) {
                 format!("synthetic({hz:.0}Hz)"),
             )
         }
-        AudioSource::Url(u) => (
-            AudioSourceSpec::YtDlp { url: u.clone() },
-            u.clone(),
-        ),
+        AudioSource::Url(u) => (AudioSourceSpec::YtDlp { url: u.clone() }, u.clone()),
         AudioSource::LibraryPath(p) => {
             let input = p.to_string_lossy().into_owned();
             let label = format!("library:{input}");
@@ -268,10 +265,7 @@ fn spawn_sibling(
 /// `OutAudio` shape the prototype proved against TS6 (codec = OpusVoice,
 /// voice-id = 0). Errors are surfaced to the caller so the connected
 /// loop can decide whether to keep the bot online.
-pub(crate) fn send_opus_frame(
-    con: &mut Connection,
-    opus: &[u8],
-) -> Result<(), tsclientlib::Error> {
+pub(crate) fn send_opus_frame(con: &mut Connection, opus: &[u8]) -> Result<(), tsclientlib::Error> {
     let pkt = OutAudio::new(&AudioData::C2S {
         id: 0,
         codec: CodecType::OpusVoice,

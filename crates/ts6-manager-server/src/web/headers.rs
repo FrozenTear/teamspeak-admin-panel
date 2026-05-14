@@ -338,7 +338,10 @@ mod tests {
                       object-src 'none'; base-uri 'self'; \
                       frame-ancestors 'none'; form-action 'self'";
         let r = std::panic::catch_unwind(|| assert_csp_runs_dx_spa("regression", broken));
-        assert!(r.is_err(), "predicate must reject CSP missing wasm-unsafe-eval");
+        assert!(
+            r.is_err(),
+            "predicate must reject CSP missing wasm-unsafe-eval"
+        );
     }
 
     #[test]

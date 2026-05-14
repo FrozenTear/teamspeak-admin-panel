@@ -18,9 +18,7 @@ use crate::client::dioxus::{use_auth_gate, use_session};
 use crate::client::music_bots as mb;
 use crate::client::store::AuthState;
 use crate::ui::components::toast::{ToastVariant, use_toaster};
-use crate::ui::components::{
-    Banner, BannerVariant, Button, ButtonSize, ButtonType, ButtonVariant,
-};
+use crate::ui::components::{Banner, BannerVariant, Button, ButtonSize, ButtonType, ButtonVariant};
 use crate::ui::pages::music_bots::shared::{
     audio_source_summary, format_duration, format_error, state_badge_class, state_label,
 };
@@ -153,11 +151,9 @@ pub fn BotDetailPage(bot_id: u64) -> Element {
                         format!("Joining channel {channel_id}"),
                         None,
                     ),
-                    Err(e) => toaster.push(
-                        ToastVariant::Danger,
-                        "Join failed",
-                        Some(format_error(&e)),
-                    ),
+                    Err(e) => {
+                        toaster.push(ToastVariant::Danger, "Join failed", Some(format_error(&e)))
+                    }
                 }
                 bump();
             });
@@ -174,11 +170,9 @@ pub fn BotDetailPage(bot_id: u64) -> Element {
             spawn(async move {
                 match mb::leave_channel(gate, bot).await {
                     Ok(()) => toaster.push(ToastVariant::Success, "Leaving channel", None),
-                    Err(e) => toaster.push(
-                        ToastVariant::Danger,
-                        "Leave failed",
-                        Some(format_error(&e)),
-                    ),
+                    Err(e) => {
+                        toaster.push(ToastVariant::Danger, "Leave failed", Some(format_error(&e)))
+                    }
                 }
                 bump();
             });
@@ -504,12 +498,17 @@ fn apply_event(d: &mut wire::MusicBotDetail, ev: &wire::BotEventWire) {
     match ev {
         wire::BotEventWire::StateChanged { to, .. } => {
             d.state = *to;
-            if matches!(to, wire::BotState::Disconnected | wire::BotState::Disconnecting) {
+            if matches!(
+                to,
+                wire::BotState::Disconnected | wire::BotState::Disconnecting
+            ) {
                 d.channel_id = None;
                 d.now_playing = None;
             }
         }
-        wire::BotEventWire::Connected { default_channel, .. } => {
+        wire::BotEventWire::Connected {
+            default_channel, ..
+        } => {
             d.channel_id = Some(*default_channel);
         }
         wire::BotEventWire::Disconnected { .. } => {
@@ -589,14 +588,23 @@ mod tests {
             },
         );
         assert_eq!(d.state, wire::BotState::Disconnecting);
-        assert!(d.channel_id.is_none(), "channel_id should clear on disconnecting");
-        assert!(d.now_playing.is_none(), "now_playing should clear on disconnecting");
+        assert!(
+            d.channel_id.is_none(),
+            "channel_id should clear on disconnecting"
+        );
+        assert!(
+            d.now_playing.is_none(),
+            "now_playing should clear on disconnecting"
+        );
     }
 
     #[test]
     fn joined_channel_updates_channel_id() {
         let mut d = fixture(wire::BotState::Connected);
-        apply_event(&mut d, &wire::BotEventWire::JoinedChannel { channel_id: 21 });
+        apply_event(
+            &mut d,
+            &wire::BotEventWire::JoinedChannel { channel_id: 21 },
+        );
         assert_eq!(d.channel_id, Some(21));
     }
 

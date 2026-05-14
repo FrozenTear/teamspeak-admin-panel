@@ -112,10 +112,13 @@ pub async fn find_by_token(db: &Database, token: &str) -> Result<Option<Widget>>
 }
 
 pub async fn list_for_server(db: &Database, server_config_id: i64) -> Result<Vec<Widget>> {
-    let sql = format!(
-        "SELECT {PROJECTION} FROM widget WHERE serverConfigId = $sid ORDER BY id ASC;"
-    );
-    let mut resp = db.query(sql).bind(("sid", server_config_id)).await?.check()?;
+    let sql =
+        format!("SELECT {PROJECTION} FROM widget WHERE serverConfigId = $sid ORDER BY id ASC;");
+    let mut resp = db
+        .query(sql)
+        .bind(("sid", server_config_id))
+        .await?
+        .check()?;
     Ok(resp.take(0)?)
 }
 
@@ -157,14 +160,15 @@ pub async fn update(db: &Database, id: i64, patch: WidgetUpdate) -> Result<Optio
         merge.insert("hideEmptyChannels".into(), serde_json::Value::Bool(v));
     }
     if let Some(v) = patch.maxChannelDepth {
-        merge.insert("maxChannelDepth".into(), serde_json::Value::Number(v.into()));
+        merge.insert(
+            "maxChannelDepth".into(),
+            serde_json::Value::Number(v.into()),
+        );
     }
     if merge.is_empty() {
         return find_by_id(db, id).await;
     }
-    let sql = format!(
-        "UPDATE type::record('widget', $id) MERGE $patch RETURN {PROJECTION};"
-    );
+    let sql = format!("UPDATE type::record('widget', $id) MERGE $patch RETURN {PROJECTION};");
     let mut resp = db
         .query(sql)
         .bind(("id", id))
@@ -178,9 +182,8 @@ pub async fn update(db: &Database, id: i64, patch: WidgetUpdate) -> Result<Optio
 /// (spec §7.27). The repo doesn't invalidate the public-data cache — the
 /// route handler does that under the *old* token before calling `set_token`.
 pub async fn set_token(db: &Database, id: i64, new_token: &str) -> Result<Option<Widget>> {
-    let sql = format!(
-        "UPDATE type::record('widget', $id) MERGE {{ token: $tok }} RETURN {PROJECTION};"
-    );
+    let sql =
+        format!("UPDATE type::record('widget', $id) MERGE {{ token: $tok }} RETURN {PROJECTION};");
     let mut resp = db
         .query(sql)
         .bind(("id", id))

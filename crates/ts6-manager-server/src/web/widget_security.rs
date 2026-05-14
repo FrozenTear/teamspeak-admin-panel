@@ -50,8 +50,7 @@ use super::proxy;
 
 /// Per-token rate limiter. Token strings are widget-token / `player:botId`
 /// keys extracted from the URL path.
-pub type WidgetTokenRateLimiter =
-    RateLimiter<String, DefaultKeyedStateStore<String>, DefaultClock>;
+pub type WidgetTokenRateLimiter = RateLimiter<String, DefaultKeyedStateStore<String>, DefaultClock>;
 /// Per-source-IP rate limiter, source resolution per the `trusted_hops`
 /// policy in [`super::proxy`].
 pub type WidgetIpRateLimiter = RateLimiter<IpAddr, DefaultKeyedStateStore<IpAddr>, DefaultClock>;
@@ -176,8 +175,8 @@ pub async fn widget_rate_limit(
 
 fn rate_limit_response(wait: Duration) -> Response {
     let secs = wait.as_secs().max(1);
-    let retry_after = HeaderValue::from_str(&secs.to_string())
-        .unwrap_or_else(|_| HeaderValue::from_static("60"));
+    let retry_after =
+        HeaderValue::from_str(&secs.to_string()).unwrap_or_else(|_| HeaderValue::from_static("60"));
     let body = serde_json::json!({"error": "Widget rate limit exceeded"}).to_string();
     let mut resp = (
         StatusCode::TOO_MANY_REQUESTS,
@@ -281,10 +280,7 @@ pub async fn widget_response_headers(
         .get(header::CONTENT_SECURITY_POLICY)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let widget_csp = relax_widget_csp(
-        upstream_csp.as_deref(),
-        state.moq_public_origin.as_deref(),
-    );
+    let widget_csp = relax_widget_csp(upstream_csp.as_deref(), state.moq_public_origin.as_deref());
     let widget_csp_value = HeaderValue::from_str(&widget_csp).unwrap_or_else(|_| {
         // CSP values are always ASCII by construction in this codebase
         // (`csp_nonce::csp_header` builds them from static directives +
@@ -357,7 +353,11 @@ fn extend_connect_src(csp: &str, origin: &str) -> String {
         return format!("{before}connect-src{trimmed} {origin}{tail}");
     }
     // No connect-src directive — append a fresh one.
-    let sep = if csp.trim_end().ends_with(';') { "" } else { ";" };
+    let sep = if csp.trim_end().ends_with(';') {
+        ""
+    } else {
+        ";"
+    };
     format!("{csp}{sep} connect-src 'self' {origin}")
 }
 
@@ -370,7 +370,10 @@ fn is_safe_csp_source(s: &str) -> bool {
         return false;
     }
     s.chars().all(|c| {
-        c.is_ascii() && !c.is_ascii_control() && !c.is_ascii_whitespace() && !matches!(c, ';' | '\'' | '"')
+        c.is_ascii()
+            && !c.is_ascii_control()
+            && !c.is_ascii_whitespace()
+            && !matches!(c, ';' | '\'' | '"')
     })
 }
 
@@ -483,7 +486,11 @@ mod tests {
         let app = rate_limit_app(state);
         let path = "/api/widget/sometoken/data";
         for n in 1..=30 {
-            let resp = app.clone().oneshot(req_to(path, "203.0.113.5")).await.unwrap();
+            let resp = app
+                .clone()
+                .oneshot(req_to(path, "203.0.113.5"))
+                .await
+                .unwrap();
             assert_eq!(resp.status(), StatusCode::OK, "request {n} should pass");
         }
         let resp = app.oneshot(req_to(path, "203.0.113.5")).await.unwrap();
@@ -654,10 +661,7 @@ mod tests {
         // `default-src 'self'; frame-ancestors 'none'`. The widget
         // middleware must keep `default-src 'self'` and turn
         // `frame-ancestors 'none'` into `frame-ancestors *`.
-        for required in [
-            "default-src 'self'",
-            "frame-ancestors *",
-        ] {
+        for required in ["default-src 'self'", "frame-ancestors *"] {
             assert!(
                 csp.contains(required),
                 "widget CSP missing `{required}`. Got: {csp}"
@@ -796,7 +800,8 @@ mod tests {
 
     #[test]
     fn relax_widget_csp_swaps_none_for_wildcard() {
-        let strict = "default-src 'self'; script-src 'self'; frame-ancestors 'none'; form-action 'self'";
+        let strict =
+            "default-src 'self'; script-src 'self'; frame-ancestors 'none'; form-action 'self'";
         let widget = relax_widget_csp(Some(strict), None);
         assert!(widget.contains("default-src 'self'"));
         assert!(widget.contains("script-src 'self'"));

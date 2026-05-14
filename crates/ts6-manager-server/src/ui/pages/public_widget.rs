@@ -923,10 +923,9 @@ fn describe_error(err: &ApiError) -> (&'static str, String) {
             "Widget not found",
             "We couldn't find a widget for this URL.".into(),
         ),
-        ApiError::Client { status, message } => (
-            "Couldn't load widget",
-            format!("{status}: {message}"),
-        ),
+        ApiError::Client { status, message } => {
+            ("Couldn't load widget", format!("{status}: {message}"))
+        }
         ApiError::Server { .. } => (
             "Couldn't load widget",
             "The panel returned an unexpected error. Try again in a moment.".into(),
@@ -1012,9 +1011,7 @@ fn format_uptime(secs: u64) -> String {
 // sidecar is unreachable or the operator has not configured a public
 // relay URL.
 #[cfg(target_arch = "wasm32")]
-async fn fetch_public_video_sources(
-    token: &str,
-) -> Result<PublicVideoSourcesPayload, ApiError> {
+async fn fetch_public_video_sources(token: &str) -> Result<PublicVideoSourcesPayload, ApiError> {
     use crate::client::api::classify_response;
     use gloo_net::http::Request;
     let url = format!("/api/widget/{token}/video-sources");
@@ -1031,9 +1028,7 @@ async fn fetch_public_video_sources(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-async fn fetch_public_video_sources(
-    _token: &str,
-) -> Result<PublicVideoSourcesPayload, ApiError> {
+async fn fetch_public_video_sources(_token: &str) -> Result<PublicVideoSourcesPayload, ApiError> {
     Err(ApiError::UnsupportedTarget)
 }
 
@@ -1141,11 +1136,7 @@ async fn drive_socket(
         "topic": topic,
         "lastEventId": last_event_id,
     });
-    if socket
-        .send(Message::Text(frame.to_string()))
-        .await
-        .is_err()
-    {
+    if socket.send(Message::Text(frame.to_string())).await.is_err() {
         return DriveExit::Reconnect;
     }
     while let Some(msg) = socket.next().await {

@@ -13,7 +13,10 @@ use surrealdb::engine::any::Any;
 
 use crate::config::{Config, DEFAULT_DB_NAME, DEFAULT_DB_NAMESPACE};
 
+pub mod error;
 pub mod migrations;
+
+pub use error::{ClassifyDbResult, DbBoundary, DbError, classify, classify_surrealdb};
 
 #[cfg(test)]
 mod tests;
@@ -29,9 +32,8 @@ pub type Database = Surreal<Any>;
 /// to invoke [`migrations::run`] before serving traffic.
 pub async fn connect(cfg: &Config) -> Result<Arc<Database>> {
     if let Some(dir) = surrealkv_dir(&cfg.database_url) {
-        std::fs::create_dir_all(&dir).with_context(|| {
-            format!("failed to create SurrealKV directory `{}`", dir.display())
-        })?;
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("failed to create SurrealKV directory `{}`", dir.display()))?;
     }
     let db = surrealdb::engine::any::connect(&cfg.database_url)
         .await

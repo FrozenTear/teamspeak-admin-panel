@@ -168,7 +168,11 @@ fn format_uptime(secs: i64) -> String {
 
 fn format_error(err: &ApiError) -> String {
     match err {
-        ApiError::BadGateway { error, code, details } => {
+        ApiError::BadGateway {
+            error,
+            code,
+            details,
+        } => {
             let mut s = error.clone();
             if let Some(d) = details.as_deref().filter(|v| !v.is_empty()) {
                 s.push_str(": ");

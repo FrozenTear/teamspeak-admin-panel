@@ -16,7 +16,9 @@ use crate::client::auth as auth_client;
 use crate::client::dioxus::use_session;
 use crate::client::session::SessionHandle;
 use crate::client::store::AuthState;
-use crate::ui::components::{Button, ButtonSize, ButtonVariant, ServerSelector, ServerSelectorVariant};
+use crate::ui::components::{
+    Button, ButtonSize, ButtonVariant, ServerSelector, ServerSelectorVariant,
+};
 use crate::ui::routes::Route;
 use crate::ui::theme::{Theme, use_theme};
 use ts6_manager_shared::auth::LogoutRequest;

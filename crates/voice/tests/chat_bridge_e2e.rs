@@ -32,18 +32,16 @@ use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
-use bot_lib::{
-    spawn_bot, BotConfig, BotEvent, BotId, InMemoryMusicBotStore, MusicBotStore,
-};
+use anyhow::{Context, Result, bail};
+use bot_lib::{BotConfig, BotEvent, BotId, InMemoryMusicBotStore, MusicBotStore, spawn_bot};
 use futures::StreamExt;
 use tokio::sync::broadcast;
-use tokio::time::{timeout, Instant};
-use tsclientlib::{
-    events::Event as BookEvent, ChannelId as TsChannelId, Connection, DisconnectOptions,
-    MessageTarget, Reason, StreamItem,
-};
+use tokio::time::{Instant, timeout};
 use tsclientlib::prelude::*;
+use tsclientlib::{
+    ChannelId as TsChannelId, Connection, DisconnectOptions, MessageTarget, Reason, StreamItem,
+    events::Event as BookEvent,
+};
 
 use ts6_voice_fixture::{load_or_create_identity, wait_for_connected};
 
@@ -67,10 +65,9 @@ mod music_bot {
 
         let _ = tracing_subscriber::fmt()
             .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| {
-                        "info,music_bot=debug,tsclientlib=warn,tsproto=warn".into()
-                    }),
+                tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                    "info,music_bot=debug,tsclientlib=warn,tsproto=warn".into()
+                }),
             )
             .with_test_writer()
             .try_init();
@@ -87,8 +84,7 @@ mod music_bot {
 }
 
 async fn run() -> Result<()> {
-    let addr =
-        env::var("TS6_VOICE_FIXTURE_ADDR").unwrap_or_else(|_| "127.0.0.1:9987".to_string());
+    let addr = env::var("TS6_VOICE_FIXTURE_ADDR").unwrap_or_else(|_| "127.0.0.1:9987".to_string());
     let workdir = std::env::temp_dir().join("music-bot-chat-bridge-e2e");
     let bot_identity = workdir.join("bot-identity.json");
     let op_identity = workdir.join("operator-identity.json");
@@ -103,17 +99,16 @@ async fn run() -> Result<()> {
     let mut bot_events = bot.subscribe();
 
     // 2. Wait for the bot's `Connected` event so we know the default channel.
-    let (bot_client_id, bot_channel) =
-        wait_for_event(&mut bot_events, |ev| match ev {
-            BotEvent::Connected {
-                client_id,
-                default_channel,
-            } => Some((*client_id, *default_channel)),
-            _ => None,
-        })
-        .await
-        .context("waiting for bot Connected")?
-        .ok_or_else(|| anyhow::anyhow!("bot event stream ended before Connected"))?;
+    let (bot_client_id, bot_channel) = wait_for_event(&mut bot_events, |ev| match ev {
+        BotEvent::Connected {
+            client_id,
+            default_channel,
+        } => Some((*client_id, *default_channel)),
+        _ => None,
+    })
+    .await
+    .context("waiting for bot Connected")?
+    .ok_or_else(|| anyhow::anyhow!("bot event stream ended before Connected"))?;
     eprintln!("bot connected: client={bot_client_id} channel={bot_channel}");
 
     // 3. Spin up the operator connection.
@@ -138,8 +133,7 @@ async fn run() -> Result<()> {
     drain_for(&mut operator, Duration::from_millis(500)).await;
 
     // 4. Move the operator into the bot's channel.
-    move_to_channel(&mut operator, bot_channel)
-        .context("operator channel-move")?;
+    move_to_channel(&mut operator, bot_channel).context("operator channel-move")?;
     // Wait until the operator's book confirms it's in the right channel
     // AND the bot is visible to the operator in that channel — otherwise
     // channel chat won't propagate yet.
@@ -158,8 +152,7 @@ async fn run() -> Result<()> {
     eprintln!("!np reply: {np_reply}");
 
     // 6. `!play <url>` enqueues + fires NowPlaying + bot replies with playing:
-    send_chat(&mut operator, "!play https://example.com/test.mp3")
-        .context("send !play")?;
+    send_chat(&mut operator, "!play https://example.com/test.mp3").context("send !play")?;
 
     // bot side: QueueChanged then NowPlaying.
     let queue_evt = wait_for_event(&mut bot_events, |ev| match ev {
@@ -170,7 +163,11 @@ async fn run() -> Result<()> {
     .context("waiting for QueueChanged after !play")?
     .ok_or_else(|| anyhow::anyhow!("bot stream ended before QueueChanged"))?;
     if queue_evt != (1, true) {
-        bail!("unexpected QueueChanged after !play: len={} has_current={}", queue_evt.0, queue_evt.1);
+        bail!(
+            "unexpected QueueChanged after !play: len={} has_current={}",
+            queue_evt.0,
+            queue_evt.1
+        );
     }
     let now_playing = wait_for_event(&mut bot_events, |ev| match ev {
         BotEvent::NowPlaying(t) => Some(t.title.clone()),
@@ -193,7 +190,10 @@ async fn run() -> Result<()> {
     // 7. `!stop` → queue cleared + reply "stopped".
     send_chat(&mut operator, "!stop").context("send !stop")?;
     let stop_evt = wait_for_event(&mut bot_events, |ev| match ev {
-        BotEvent::QueueChanged { len: 0, current: None } => Some(()),
+        BotEvent::QueueChanged {
+            len: 0,
+            current: None,
+        } => Some(()),
         _ => None,
     })
     .await
@@ -300,10 +300,7 @@ async fn drain_for(con: &mut Connection, dur: Duration) {
 /// Filters out chat from the operator itself (defensive — we shouldn't
 /// receive our own send-back, but TS6 echo behaviour varies by version).
 async fn wait_for_chat_reply(con: &mut Connection) -> Result<String> {
-    let own_id = con
-        .get_state()
-        .context("operator book")?
-        .own_client;
+    let own_id = con.get_state().context("operator book")?.own_client;
     let deadline = Instant::now() + EVENT_TIMEOUT;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());

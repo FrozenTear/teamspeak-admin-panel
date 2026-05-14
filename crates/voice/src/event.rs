@@ -41,10 +41,7 @@ pub enum BotEvent {
     /// (head included); `current` is the head if any. Fires after every
     /// successful `BotCommand::Queue(...)` op AND after auto-advance
     /// (`AudioCommand::SkipNext` / WS-2 EndOfStream wiring).
-    QueueChanged {
-        len: usize,
-        current: Option<Track>,
-    },
+    QueueChanged { len: usize, current: Option<Track> },
     /// PURA-121 WS-3 — a fresh track is now at the head of the queue
     /// (about to play / playing). Fires when `queue_dequeue_head` exposes
     /// a new head, or when `enqueue` lands a track into a previously

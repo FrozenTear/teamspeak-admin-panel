@@ -25,8 +25,12 @@ use crate::client::session::RefreshGate;
 // ---- Bots ---------------------------------------------------------------
 
 pub async fn list_bots(gate: Arc<RefreshGate>) -> Result<Vec<wire::MusicBotSummary>, ApiError> {
-    api::authorized_get_json::<Vec<wire::MusicBotSummary>>(&gate, &api::api_base(), "/api/music-bots")
-        .await
+    api::authorized_get_json::<Vec<wire::MusicBotSummary>>(
+        &gate,
+        &api::api_base(),
+        "/api/music-bots",
+    )
+    .await
 }
 
 pub async fn get_bot(
@@ -168,11 +172,7 @@ pub async fn get_playlist(
     bot: wire::BotId,
     name: &str,
 ) -> Result<wire::PlaylistDetail, ApiError> {
-    let path = format!(
-        "/api/playlists/{}?bot={}",
-        urlencoding::encode(name),
-        bot.0
-    );
+    let path = format!("/api/playlists/{}?bot={}", urlencoding::encode(name), bot.0);
     api::authorized_get_json::<wire::PlaylistDetail>(&gate, &api::api_base(), &path).await
 }
 
@@ -181,11 +181,7 @@ pub async fn delete_playlist(
     bot: wire::BotId,
     name: &str,
 ) -> Result<(), ApiError> {
-    let path = format!(
-        "/api/playlists/{}?bot={}",
-        urlencoding::encode(name),
-        bot.0
-    );
+    let path = format!("/api/playlists/{}?bot={}", urlencoding::encode(name), bot.0);
     api::authorized_delete(&gate, &api::api_base(), &path).await
 }
 
@@ -208,10 +204,7 @@ pub async fn add_playlist_track(
     source: &wire::AudioSource,
     title: &str,
 ) -> Result<wire::Track, ApiError> {
-    let path = format!(
-        "/api/playlists/{}/tracks",
-        urlencoding::encode(playlist)
-    );
+    let path = format!("/api/playlists/{}/tracks", urlencoding::encode(playlist));
     let body = AddTrackBody {
         bot,
         source,
@@ -247,13 +240,8 @@ pub async fn enqueue_playlist(
         urlencoding::encode(playlist),
         bot.0
     );
-    api::authorized_post_json::<(), wire::PlaylistDetail>(
-        &gate,
-        &api::api_base(),
-        &path,
-        None,
-    )
-    .await
+    api::authorized_post_json::<(), wire::PlaylistDetail>(&gate, &api::api_base(), &path, None)
+        .await
 }
 
 // ---- Radio stations -----------------------------------------------------
@@ -429,17 +417,15 @@ where
     use wasm_bindgen::closure::Closure;
     use web_sys::{EventSource, MessageEvent};
 
-    let url = format!(
-        "{}/api/music-bots/{}/events",
-        api::api_base(),
-        bot.0
-    );
+    let url = format!("{}/api/music-bots/{}/events", api::api_base(), bot.0);
     let source = match EventSource::new(&url) {
         Ok(es) => es,
         Err(_) => return BotEventStream::default(),
     };
     let cb = Closure::<dyn FnMut(MessageEvent)>::new(move |evt: MessageEvent| {
-        let Ok(text) = evt.data().dyn_into::<js_sys::JsString>() else { return };
+        let Ok(text) = evt.data().dyn_into::<js_sys::JsString>() else {
+            return;
+        };
         let raw: String = text.into();
         if let Ok(parsed) = serde_json::from_str::<wire::BotEventWire>(&raw) {
             on_event(parsed);

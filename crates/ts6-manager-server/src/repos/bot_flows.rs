@@ -95,10 +95,13 @@ pub async fn list(db: &Database) -> Result<Vec<BotFlow>> {
 }
 
 pub async fn list_for_server(db: &Database, server_config_id: i64) -> Result<Vec<BotFlow>> {
-    let sql = format!(
-        "SELECT {PROJECTION} FROM bot_flow WHERE serverConfigId = $sid ORDER BY id ASC;"
-    );
-    let mut resp = db.query(sql).bind(("sid", server_config_id)).await?.check()?;
+    let sql =
+        format!("SELECT {PROJECTION} FROM bot_flow WHERE serverConfigId = $sid ORDER BY id ASC;");
+    let mut resp = db
+        .query(sql)
+        .bind(("sid", server_config_id))
+        .await?
+        .check()?;
     Ok(resp.take(0)?)
 }
 
@@ -118,7 +121,10 @@ pub async fn update(db: &Database, id: i64, patch: BotFlowUpdate) -> Result<Opti
         merge.insert("flowData".into(), serde_json::Value::String(v));
     }
     if let Some(v) = patch.virtualServerId {
-        merge.insert("virtualServerId".into(), serde_json::Value::Number(v.into()));
+        merge.insert(
+            "virtualServerId".into(),
+            serde_json::Value::Number(v.into()),
+        );
     }
     if let Some(v) = patch.enabled {
         merge.insert("enabled".into(), serde_json::Value::Bool(v));
@@ -126,9 +132,7 @@ pub async fn update(db: &Database, id: i64, patch: BotFlowUpdate) -> Result<Opti
     if merge.is_empty() {
         return find_by_id(db, id).await;
     }
-    let sql = format!(
-        "UPDATE type::record('bot_flow', $id) MERGE $patch RETURN {PROJECTION};"
-    );
+    let sql = format!("UPDATE type::record('bot_flow', $id) MERGE $patch RETURN {PROJECTION};");
     let mut resp = db
         .query(sql)
         .bind(("id", id))

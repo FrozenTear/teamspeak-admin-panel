@@ -170,17 +170,13 @@ pub async fn insert(db: &Database, new: NewServerConnection) -> Result<ServerCon
 }
 
 pub async fn find_by_id(db: &Database, id: i64) -> Result<Option<ServerConnection>> {
-    let sql = format!(
-        "SELECT {PROJECTION} FROM type::record('server_connection', $id);"
-    );
+    let sql = format!("SELECT {PROJECTION} FROM type::record('server_connection', $id);");
     let mut resp = db.query(sql).bind(("id", id)).await?.check()?;
     Ok(resp.take(0)?)
 }
 
 pub async fn list(db: &Database) -> Result<Vec<ServerConnection>> {
-    let sql = format!(
-        "SELECT {PROJECTION} FROM server_connection ORDER BY id ASC;"
-    );
+    let sql = format!("SELECT {PROJECTION} FROM server_connection ORDER BY id ASC;");
     let mut resp = db.query(sql).await?.check()?;
     Ok(resp.take(0)?)
 }

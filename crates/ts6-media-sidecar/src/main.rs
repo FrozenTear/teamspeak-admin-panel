@@ -16,7 +16,10 @@ use ts6_media_sidecar::{
 };
 
 #[derive(Parser, Debug)]
-#[command(name = "ts6-media-sidecar", about = "Phase-5 MoQ + WebTransport sidecar")]
+#[command(
+    name = "ts6-media-sidecar",
+    about = "Phase-5 MoQ + WebTransport sidecar"
+)]
 struct Args {
     /// UDP socket for QUIC / WebTransport (e.g. `[::]:4443`).
     #[arg(long, default_value = "[::]:4443")]

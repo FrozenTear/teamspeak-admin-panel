@@ -286,8 +286,9 @@ impl WebQueryClient {
             let url = format!("{}{}", self.base_url, path);
 
             let mut headers = HeaderMap::new();
-            let key = HeaderValue::from_str(&self.api_key)
-                .map_err(|_| WebQueryError::Transport("apiKey is not a valid HTTP header".into()))?;
+            let key = HeaderValue::from_str(&self.api_key).map_err(|_| {
+                WebQueryError::Transport("apiKey is not a valid HTTP header".into())
+            })?;
             headers.insert(API_KEY_HEADER, key);
 
             let started = Instant::now();
@@ -378,7 +379,8 @@ impl WebQueryClient {
     /// `serverlist` (instance scope) — drives `vs:sid` enumeration in the
     /// virtual-server selector.
     pub async fn serverlist(&self) -> WebQueryResult<Vec<VirtualServerEntry>> {
-        self.get::<Vec<VirtualServerEntry>>("/serverlist", &[]).await
+        self.get::<Vec<VirtualServerEntry>>("/serverlist", &[])
+            .await
     }
 
     /// `serverinfo` (sid scope).
@@ -401,11 +403,8 @@ impl WebQueryClient {
 
     /// `serverrequestconnectioninfo` (sid scope).
     pub async fn server_connection_info(&self, sid: i64) -> WebQueryResult<ConnectionInfo> {
-        self.get_one::<ConnectionInfo>(
-            &format!("/{sid}/serverrequestconnectioninfo"),
-            &[],
-        )
-        .await
+        self.get_one::<ConnectionInfo>(&format!("/{sid}/serverrequestconnectioninfo"), &[])
+            .await
     }
 
     // =====================================================================
@@ -429,11 +428,8 @@ impl WebQueryClient {
     /// `clientinfo` (sid scope).
     pub async fn clientinfo(&self, sid: i64, clid: i64) -> WebQueryResult<ClientInfo> {
         let clid_s = clid.to_string();
-        self.get_one::<ClientInfo>(
-            &format!("/{sid}/clientinfo"),
-            &[("clid", clid_s.as_str())],
-        )
-        .await
+        self.get_one::<ClientInfo>(&format!("/{sid}/clientinfo"), &[("clid", clid_s.as_str())])
+            .await
     }
 
     /// `clientdblist` (sid scope) — paginated. Defaults per §7.8: `start=0`,
@@ -478,19 +474,12 @@ impl WebQueryClient {
     /// `channelinfo` (sid scope).
     pub async fn channelinfo(&self, sid: i64, cid: i64) -> WebQueryResult<ChannelInfo> {
         let cid_s = cid.to_string();
-        self.get_one::<ChannelInfo>(
-            &format!("/{sid}/channelinfo"),
-            &[("cid", cid_s.as_str())],
-        )
-        .await
+        self.get_one::<ChannelInfo>(&format!("/{sid}/channelinfo"), &[("cid", cid_s.as_str())])
+            .await
     }
 
     /// `channelclientlist` — clients in a specific channel.
-    pub async fn channelclientlist(
-        &self,
-        sid: i64,
-        cid: i64,
-    ) -> WebQueryResult<Vec<ClientEntry>> {
+    pub async fn channelclientlist(&self, sid: i64, cid: i64) -> WebQueryResult<Vec<ClientEntry>> {
         let cid_s = cid.to_string();
         self.get::<Vec<ClientEntry>>(
             &format!("/{sid}/channelclientlist"),
@@ -544,10 +533,8 @@ impl WebQueryClient {
     ) -> WebQueryResult<()> {
         let clid_s = clid.to_string();
         let reasonid_s = reasonid.to_string();
-        let mut params: Vec<(&str, &str)> = vec![
-            ("clid", clid_s.as_str()),
-            ("reasonid", reasonid_s.as_str()),
-        ];
+        let mut params: Vec<(&str, &str)> =
+            vec![("clid", clid_s.as_str()), ("reasonid", reasonid_s.as_str())];
         if let Some(msg) = reasonmsg {
             params.push(("reasonmsg", msg));
         }
@@ -578,10 +565,8 @@ impl WebQueryClient {
     ) -> WebQueryResult<()> {
         let clid_s = clid.to_string();
         let cid_s = cid.to_string();
-        let mut params: Vec<(&str, &str)> = vec![
-            ("clid", clid_s.as_str()),
-            ("cid", cid_s.as_str()),
-        ];
+        let mut params: Vec<(&str, &str)> =
+            vec![("clid", clid_s.as_str()), ("cid", cid_s.as_str())];
         if let Some(pw) = cpw {
             params.push(("cpw", pw));
         }
@@ -674,11 +659,8 @@ impl WebQueryClient {
     /// `bandel` (sid scope) — drop a single ban by id.
     pub async fn bandel(&self, sid: i64, banid: i64) -> WebQueryResult<()> {
         let banid_s = banid.to_string();
-        self.get::<UnitBody>(
-            &format!("/{sid}/bandel"),
-            &[("banid", banid_s.as_str())],
-        )
-        .await?;
+        self.get::<UnitBody>(&format!("/{sid}/bandel"), &[("banid", banid_s.as_str())])
+            .await?;
         Ok(())
     }
 
@@ -840,12 +822,18 @@ impl WebQueryPool {
 
     /// Insert or replace the client for `connection`. Used by Phase 2 boot
     /// pre-population and by `PUT /servers/:configId` once that route lands.
-    pub async fn upsert(&self, connection: &ServerConnection) -> WebQueryResult<Arc<WebQueryClient>> {
+    pub async fn upsert(
+        &self,
+        connection: &ServerConnection,
+    ) -> WebQueryResult<Arc<WebQueryClient>> {
         let client = Arc::new(WebQueryClient::from_connection(
             connection,
             self.allow_self_signed,
         )?);
-        self.inner.write().await.insert(connection.id, client.clone());
+        self.inner
+            .write()
+            .await
+            .insert(connection.id, client.clone());
         Ok(client)
     }
 

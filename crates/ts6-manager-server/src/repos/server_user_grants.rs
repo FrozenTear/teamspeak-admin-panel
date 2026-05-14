@@ -62,9 +62,8 @@ pub async fn exists(db: &Database, user_id: i64, server_config_id: i64) -> Resul
 }
 
 pub async fn list_for_user(db: &Database, user_id: i64) -> Result<Vec<ServerUserGrant>> {
-    let sql = format!(
-        "SELECT {PROJECTION} FROM server_user_grant WHERE userId = $uid ORDER BY id ASC;"
-    );
+    let sql =
+        format!("SELECT {PROJECTION} FROM server_user_grant WHERE userId = $uid ORDER BY id ASC;");
     let mut resp = db.query(sql).bind(("uid", user_id)).await?.check()?;
     Ok(resp.take(0)?)
 }

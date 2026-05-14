@@ -69,9 +69,8 @@ pub async fn find_by_id(db: &Database, id: i64) -> Result<Option<BotExecution>> 
 }
 
 pub async fn list_for_flow(db: &Database, flow_id: i64) -> Result<Vec<BotExecution>> {
-    let sql = format!(
-        "SELECT {PROJECTION} FROM bot_execution WHERE flowId = $fid ORDER BY id ASC;"
-    );
+    let sql =
+        format!("SELECT {PROJECTION} FROM bot_execution WHERE flowId = $fid ORDER BY id ASC;");
     let mut resp = db.query(sql).bind(("fid", flow_id)).await?.check()?;
     Ok(resp.take(0)?)
 }

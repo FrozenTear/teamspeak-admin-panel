@@ -26,8 +26,8 @@
 //! issue spec only.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -222,19 +222,11 @@ pub trait MusicBotStore: Send + Sync {
     /// Append every track in `name` to the bot's queue, preserving order.
     /// Returns the freshly-stamped `Track` clones so callers don't have
     /// to round-trip through `queue_peek` to learn the new ids.
-    async fn enqueue_playlist(
-        &self,
-        bot: BotId,
-        name: &PlaylistName,
-    ) -> StoreResult<Vec<Track>>;
+    async fn enqueue_playlist(&self, bot: BotId, name: &PlaylistName) -> StoreResult<Vec<Track>>;
 
     // ---- Library ------------------------------------------------------
 
-    async fn library_add(
-        &self,
-        bot: BotId,
-        entry: NewLibraryEntry,
-    ) -> StoreResult<LibraryEntry>;
+    async fn library_add(&self, bot: BotId, entry: NewLibraryEntry) -> StoreResult<LibraryEntry>;
     async fn library_remove(&self, bot: BotId, id: LibraryEntryId) -> StoreResult<bool>;
     async fn library_lookup(
         &self,
@@ -243,11 +235,7 @@ pub trait MusicBotStore: Send + Sync {
     ) -> StoreResult<Option<LibraryEntry>>;
 
     /// List library entries, optionally filtered by tag (exact match).
-    async fn library_list(
-        &self,
-        bot: BotId,
-        tag: Option<&str>,
-    ) -> StoreResult<Vec<LibraryEntry>>;
+    async fn library_list(&self, bot: BotId, tag: Option<&str>) -> StoreResult<Vec<LibraryEntry>>;
 }
 
 // =====================================================================
@@ -335,16 +323,15 @@ impl InMemoryMusicBotStore {
             next_library_id: self.next_library_id.load(Ordering::Relaxed),
             bots: inner.bots.clone(),
         };
-        serde_json::to_vec_pretty(&snapshot)
-            .map_err(|err| StoreError::Snapshot(err.to_string()))
+        serde_json::to_vec_pretty(&snapshot).map_err(|err| StoreError::Snapshot(err.to_string()))
     }
 
     /// Replace this store's state with the contents of a snapshot. The
     /// monotonic id counters are reseeded so freshly-issued ids never
     /// collide with persisted ones.
     pub async fn load_from_json(&self, bytes: &[u8]) -> StoreResult<()> {
-        let snapshot: StoreSnapshot = serde_json::from_slice(bytes)
-            .map_err(|err| StoreError::Snapshot(err.to_string()))?;
+        let snapshot: StoreSnapshot =
+            serde_json::from_slice(bytes).map_err(|err| StoreError::Snapshot(err.to_string()))?;
         if snapshot.version != SNAPSHOT_VERSION {
             return Err(StoreError::Snapshot(format!(
                 "unsupported snapshot version {}: this build expects {}",
@@ -418,8 +405,7 @@ impl MusicBotStore for InMemoryMusicBotStore {
                 ),
             });
         }
-        let existing_ids: std::collections::HashSet<TrackId> =
-            queue.iter().map(|t| t.id).collect();
+        let existing_ids: std::collections::HashSet<TrackId> = queue.iter().map(|t| t.id).collect();
         for id in &order {
             if !existing_ids.contains(id) {
                 return Err(StoreError::ReorderMismatch {
@@ -430,8 +416,7 @@ impl MusicBotStore for InMemoryMusicBotStore {
         // Reorder by removing each id from `queue` in `order`. O(n²) but
         // music-bot queues are small (UI typical: <50 tracks); not worth
         // a more involved structure.
-        let mut by_id: HashMap<TrackId, Track> =
-            queue.drain(..).map(|t| (t.id, t)).collect();
+        let mut by_id: HashMap<TrackId, Track> = queue.drain(..).map(|t| (t.id, t)).collect();
         for id in order {
             // `existing_ids` check above guarantees the id is here, so
             // the `unwrap` is sound. Defensive `expect` for the
@@ -455,10 +440,7 @@ impl MusicBotStore for InMemoryMusicBotStore {
 
     async fn queue_current(&self, bot: BotId) -> StoreResult<Option<Track>> {
         let inner = self.inner.read().await;
-        Ok(inner
-            .bots
-            .get(&bot)
-            .and_then(|s| s.queue.first().cloned()))
+        Ok(inner.bots.get(&bot).and_then(|s| s.queue.first().cloned()))
     }
 
     // ---- Playlists ----------------------------------------------------
@@ -565,11 +547,7 @@ impl MusicBotStore for InMemoryMusicBotStore {
         Ok(names)
     }
 
-    async fn enqueue_playlist(
-        &self,
-        bot: BotId,
-        name: &PlaylistName,
-    ) -> StoreResult<Vec<Track>> {
+    async fn enqueue_playlist(&self, bot: BotId, name: &PlaylistName) -> StoreResult<Vec<Track>> {
         // Read playlist source under a read lock first, then re-stamp
         // ids and append under a write lock. The two-phase shape is
         // intentional — playlist tracks have stable ids inside the
@@ -599,11 +577,7 @@ impl MusicBotStore for InMemoryMusicBotStore {
 
     // ---- Library ------------------------------------------------------
 
-    async fn library_add(
-        &self,
-        bot: BotId,
-        entry: NewLibraryEntry,
-    ) -> StoreResult<LibraryEntry> {
+    async fn library_add(&self, bot: BotId, entry: NewLibraryEntry) -> StoreResult<LibraryEntry> {
         let id = self.next_library_id();
         let stored = LibraryEntry {
             id,
@@ -641,11 +615,7 @@ impl MusicBotStore for InMemoryMusicBotStore {
             .and_then(|s| s.library.iter().find(|e| e.id == id).cloned()))
     }
 
-    async fn library_list(
-        &self,
-        bot: BotId,
-        tag: Option<&str>,
-    ) -> StoreResult<Vec<LibraryEntry>> {
+    async fn library_list(&self, bot: BotId, tag: Option<&str>) -> StoreResult<Vec<LibraryEntry>> {
         let inner = self.inner.read().await;
         let entries = inner
             .bots
@@ -684,7 +654,10 @@ mod tests {
         assert_ne!(t1.id, t2.id);
         assert_ne!(t2.id, t3.id);
         let peeked = store.queue_peek(bot()).await.unwrap();
-        assert_eq!(peeked.iter().map(|t| t.id).collect::<Vec<_>>(), vec![t1.id, t2.id, t3.id]);
+        assert_eq!(
+            peeked.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![t1.id, t2.id, t3.id]
+        );
 
         // Current = head.
         let current = store.queue_current(bot()).await.unwrap();
@@ -727,7 +700,10 @@ mod tests {
         );
 
         // reorder swaps the two remaining tracks.
-        store.queue_reorder(bot(), vec![t3.id, t1.id]).await.unwrap();
+        store
+            .queue_reorder(bot(), vec![t3.id, t1.id])
+            .await
+            .unwrap();
         assert_eq!(
             store
                 .queue_peek(bot())
@@ -740,10 +716,7 @@ mod tests {
         );
 
         // reorder rejects mismatched lengths.
-        let err = store
-            .queue_reorder(bot(), vec![t3.id])
-            .await
-            .unwrap_err();
+        let err = store.queue_reorder(bot(), vec![t3.id]).await.unwrap_err();
         assert!(matches!(err, StoreError::ReorderMismatch { .. }));
 
         // reorder rejects unknown ids.
@@ -764,10 +737,7 @@ mod tests {
         let pl: PlaylistName = "lo-fi-radio".into();
         store.playlist_create(bot(), pl.clone()).await.unwrap();
         // Duplicate create is rejected.
-        let err = store
-            .playlist_create(bot(), pl.clone())
-            .await
-            .unwrap_err();
+        let err = store.playlist_create(bot(), pl.clone()).await.unwrap_err();
         assert!(matches!(err, StoreError::PlaylistExists(_)));
 
         let pt1 = store
@@ -779,26 +749,33 @@ mod tests {
             .await
             .unwrap();
         let listed = store.playlist_list_tracks(bot(), &pl).await.unwrap();
-        assert_eq!(listed.iter().map(|t| t.id).collect::<Vec<_>>(), vec![pt1.id, pt2.id]);
+        assert_eq!(
+            listed.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![pt1.id, pt2.id]
+        );
 
         // remove returns true/false; absent id is false, not an error.
-        assert!(store
-            .playlist_remove_track(bot(), &pl, pt1.id)
-            .await
-            .unwrap());
-        assert!(!store
-            .playlist_remove_track(bot(), &pl, TrackId(9_999))
-            .await
-            .unwrap());
+        assert!(
+            store
+                .playlist_remove_track(bot(), &pl, pt1.id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .playlist_remove_track(bot(), &pl, TrackId(9_999))
+                .await
+                .unwrap()
+        );
 
         // rename succeeds; rename-onto-existing rejects.
         let pl2: PlaylistName = "renamed".into();
-        store.playlist_rename(bot(), pl.clone(), pl2.clone()).await.unwrap();
-        // Original name no longer exists → list_tracks errors.
-        let err = store
-            .playlist_list_tracks(bot(), &pl)
+        store
+            .playlist_rename(bot(), pl.clone(), pl2.clone())
             .await
-            .unwrap_err();
+            .unwrap();
+        // Original name no longer exists → list_tracks errors.
+        let err = store.playlist_list_tracks(bot(), &pl).await.unwrap_err();
         assert!(matches!(err, StoreError::PlaylistNotFound(_)));
 
         // enqueue_playlist appends every playlist track with fresh ids.
@@ -849,21 +826,25 @@ mod tests {
 
         // lookup hits.
         assert_eq!(
-            store.library_lookup(bot(), e1.id).await.unwrap().unwrap().id,
+            store
+                .library_lookup(bot(), e1.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
             e1.id
         );
         // unknown id is None, not an error.
-        assert!(store
-            .library_lookup(bot(), LibraryEntryId(99_999))
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .library_lookup(bot(), LibraryEntryId(99_999))
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         // tag filter narrows.
-        let chill = store
-            .library_list(bot(), Some("chill"))
-            .await
-            .unwrap();
+        let chill = store.library_list(bot(), Some("chill")).await.unwrap();
         assert_eq!(chill.len(), 1);
         assert_eq!(chill[0].id, e1.id);
 

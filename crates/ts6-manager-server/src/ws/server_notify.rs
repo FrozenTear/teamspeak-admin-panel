@@ -57,9 +57,9 @@ use tokio::time::MissedTickBehavior;
 use crate::control::ControlBackendPool;
 use crate::db::Database;
 use crate::repos::server_connections::{self, ServerConnection};
+use crate::sshbridge::SshBridgeError;
 use crate::sshbridge::transport::TransportHandle;
 use crate::sshbridge::wire::NotifyFrame;
-use crate::sshbridge::SshBridgeError;
 use crate::ws::Hub;
 use crate::ws::topic::{Topic, TopicKind};
 
@@ -203,7 +203,11 @@ async fn run_worker(
 ) {
     let config_id = connection.id;
 
-    let backend = match deps.control.get_or_build(config_id, Some(&connection)).await {
+    let backend = match deps
+        .control
+        .get_or_build(config_id, Some(&connection))
+        .await
+    {
         Ok(b) => b,
         Err(e) => {
             tracing::warn!(
@@ -622,11 +626,8 @@ mod tests {
         // the per-server broadcast). Find the widget one.
         let mut widget_env = None;
         for _ in 0..2 {
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(100),
-                sub.receiver.recv(),
-            )
-            .await
+            match tokio::time::timeout(std::time::Duration::from_millis(100), sub.receiver.recv())
+                .await
             {
                 Ok(Ok(env)) => {
                     if env.topic == "server:7:widget" {
@@ -716,11 +717,8 @@ mod tests {
         };
         publish_notify(&hub, 7, &frame).await;
 
-        let observed = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            sub.receiver.recv(),
-        )
-        .await;
+        let observed =
+            tokio::time::timeout(std::time::Duration::from_millis(50), sub.receiver.recv()).await;
         assert!(observed.is_err(), "unknown event must not publish");
     }
 }

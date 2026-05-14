@@ -287,7 +287,8 @@ mod tests {
     #[test]
     fn line_buffer_yields_complete_lines_only() {
         let mut buf = LineBuffer::new();
-        buf.push(b"error id=0 msg=ok\r\nnotifycliententer ").unwrap();
+        buf.push(b"error id=0 msg=ok\r\nnotifycliententer ")
+            .unwrap();
         let lines = buf.drain_lines();
         assert_eq!(lines, vec!["error id=0 msg=ok"]);
         // partial line stays in the buffer

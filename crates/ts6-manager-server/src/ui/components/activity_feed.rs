@@ -104,7 +104,9 @@ pub fn ActivityFeedSubscription() -> Element {
             let Some(sid) = server_id else { return };
             let topic = format!("server:{sid}:clients");
             let mut handle = hub.subscribe(topic.clone()).await;
-            let Some(mut rx) = handle.take_receiver() else { return };
+            let Some(mut rx) = handle.take_receiver() else {
+                return;
+            };
             // Hold the handle for the lifetime of the subscription so the
             // Drop on it (in turn) issues an unsubscribe when this future
             // is cancelled by Dioxus on the next selection change.

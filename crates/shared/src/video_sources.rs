@@ -157,6 +157,9 @@ mod tests {
         };
         let s = serde_json::to_string(&req).unwrap();
         assert!(!s.contains("preset"), "None preset must be omitted: {s}");
-        assert!(!s.contains("server_id"), "None server_id must be omitted: {s}");
+        assert!(
+            !s.contains("server_id"),
+            "None server_id must be omitted: {s}"
+        );
     }
 }

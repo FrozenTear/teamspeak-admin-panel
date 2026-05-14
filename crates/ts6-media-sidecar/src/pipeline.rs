@@ -297,7 +297,9 @@ fn spawn_video_supervisor(
                 }
             };
             metrics.video.ffmpeg_alive.store(false, Ordering::Relaxed);
-            state.finish_iteration(child, mux_result, &mut stop_rx).await;
+            state
+                .finish_iteration(child, mux_result, &mut stop_rx)
+                .await;
             if state.stop_requested {
                 return;
             }
@@ -335,7 +337,9 @@ fn spawn_audio_supervisor(
                 }
             };
             metrics.audio.ffmpeg_alive.store(false, Ordering::Relaxed);
-            state.finish_iteration(child, mux_result, &mut stop_rx).await;
+            state
+                .finish_iteration(child, mux_result, &mut stop_rx)
+                .await;
             if state.stop_requested {
                 return;
             }
@@ -636,7 +640,10 @@ async fn mux_video(
             bail!("IVF: implausible frame size {frame_size}");
         }
         frame_buf.resize(frame_size, 0);
-        if read_exact_or_eof(&mut reader, &mut frame_buf).await?.is_err() {
+        if read_exact_or_eof(&mut reader, &mut frame_buf)
+            .await?
+            .is_err()
+        {
             bail!("IVF: short read mid-frame ({frame_size} bytes)");
         }
 
@@ -645,9 +652,7 @@ async fn mux_video(
         // supervisor restart-safe (continuing the same TrackProducer
         // produces strictly increasing sequence numbers without us
         // tracking state across restarts).
-        let mut group = track
-            .append_group()
-            .context("append video group")?;
+        let mut group = track.append_group().context("append video group")?;
         group
             .write_frame(Bytes::copy_from_slice(&frame_buf))
             .context("write video frame")?;
@@ -710,9 +715,7 @@ async fn mux_audio(
             let group = match current_group {
                 Some(ref mut g) => g,
                 None => {
-                    let g = track
-                        .append_group()
-                        .context("append audio group")?;
+                    let g = track.append_group().context("append audio group")?;
                     current_group = Some(g);
                     current_group.as_mut().unwrap()
                 }
@@ -815,7 +818,7 @@ impl OggParser {
                 }
             }
 
-            if completed.is_some() {
+            if let Some(pkt) = completed {
                 // We finished a packet partway through this page. Trim
                 // the consumed bytes (= page header + body up to the last
                 // consumed segment) and remember the rest of this page is
@@ -850,12 +853,10 @@ impl OggParser {
 
                     // Replace the old page with the rewritten one.
                     let old_page_size = header_size + body_size;
-                    self.bytes.splice(
-                        abs..abs + old_page_size,
-                        new_page.iter().copied(),
-                    );
+                    self.bytes
+                        .splice(abs..abs + old_page_size, new_page.iter().copied());
                 }
-                return Ok(Some(completed.unwrap()));
+                return Ok(Some(pkt));
             } else {
                 // No packet completed on this page — partial_packet
                 // carries over into the next page.
@@ -998,7 +999,10 @@ mod tests {
                 frame_header[3],
             ]) as usize;
             frame_buf.resize(frame_size, 0);
-            if read_exact_or_eof(&mut reader, &mut frame_buf).await?.is_err() {
+            if read_exact_or_eof(&mut reader, &mut frame_buf)
+                .await?
+                .is_err()
+            {
                 return Ok(());
             }
             let mut group = track.append_group()?;
@@ -1022,7 +1026,7 @@ mod tests {
         page1.extend_from_slice(&0u32.to_le_bytes()); // crc
         page1.push(3); // segment_count
         page1.extend_from_slice(&[255, 255, 100]);
-        page1.extend(std::iter::repeat(b'A').take(610));
+        page1.extend(std::iter::repeat_n(b'A', 610));
 
         let mut page2 = Vec::new();
         page2.extend_from_slice(b"OggS");
@@ -1034,7 +1038,7 @@ mod tests {
         page2.extend_from_slice(&0u32.to_le_bytes());
         page2.push(1);
         page2.push(40);
-        page2.extend(std::iter::repeat(b'B').take(40));
+        page2.extend(std::iter::repeat_n(b'B', 40));
 
         let mut parser = OggParser::new();
         parser.feed(&page1);
@@ -1064,8 +1068,8 @@ mod tests {
         page.extend_from_slice(&0u32.to_le_bytes());
         page.push(2);
         page.extend_from_slice(&[10, 20]);
-        page.extend(std::iter::repeat(b'X').take(10));
-        page.extend(std::iter::repeat(b'Y').take(20));
+        page.extend(std::iter::repeat_n(b'X', 10));
+        page.extend(std::iter::repeat_n(b'Y', 20));
 
         let mut parser = OggParser::new();
         parser.feed(&page);

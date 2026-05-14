@@ -79,9 +79,7 @@ pub async fn find_by_flow_name_scope(
 }
 
 pub async fn list_for_flow(db: &Database, flow_id: i64) -> Result<Vec<BotVariable>> {
-    let sql = format!(
-        "SELECT {PROJECTION} FROM bot_variable WHERE flowId = $fid ORDER BY id ASC;"
-    );
+    let sql = format!("SELECT {PROJECTION} FROM bot_variable WHERE flowId = $fid ORDER BY id ASC;");
     let mut resp = db.query(sql).bind(("fid", flow_id)).await?.check()?;
     Ok(resp.take(0)?)
 }

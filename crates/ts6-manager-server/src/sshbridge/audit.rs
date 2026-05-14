@@ -346,7 +346,13 @@ mod tests {
 
     #[test]
     fn success_entry_zero_exit_code_no_error_msg() {
-        let e = AuditEntry::success(7, Some(3), Some(42), "clientlist -uid", Duration::from_millis(15));
+        let e = AuditEntry::success(
+            7,
+            Some(3),
+            Some(42),
+            "clientlist -uid",
+            Duration::from_millis(15),
+        );
         assert_eq!(e.server_config_id, 7);
         assert_eq!(e.virtual_server_id, Some(3));
         assert_eq!(e.user_id, Some(42));
@@ -481,7 +487,10 @@ mod tests {
         );
         assert!(e.command_line.contains("<redacted>"));
         assert!(!e.command_line.contains("hunter2"));
-        assert_eq!(e.command_line, "clientupdate client_login_password=<redacted>");
+        assert_eq!(
+            e.command_line,
+            "clientupdate client_login_password=<redacted>"
+        );
     }
 
     #[test]

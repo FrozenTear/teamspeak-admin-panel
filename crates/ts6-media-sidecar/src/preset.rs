@@ -146,8 +146,14 @@ mod tests {
 
     #[test]
     fn parse_lowercase() {
-        assert_eq!("480p".parse::<QualityPreset>().unwrap(), QualityPreset::P480);
-        assert_eq!("720p".parse::<QualityPreset>().unwrap(), QualityPreset::P720);
+        assert_eq!(
+            "480p".parse::<QualityPreset>().unwrap(),
+            QualityPreset::P480
+        );
+        assert_eq!(
+            "720p".parse::<QualityPreset>().unwrap(),
+            QualityPreset::P720
+        );
         assert_eq!(
             "1080p".parse::<QualityPreset>().unwrap(),
             QualityPreset::P1080
@@ -156,7 +162,10 @@ mod tests {
 
     #[test]
     fn parse_case_insensitive() {
-        assert_eq!("720P".parse::<QualityPreset>().unwrap(), QualityPreset::P720);
+        assert_eq!(
+            "720P".parse::<QualityPreset>().unwrap(),
+            QualityPreset::P720
+        );
         assert_eq!(
             "1080P".parse::<QualityPreset>().unwrap(),
             QualityPreset::P1080
@@ -165,7 +174,10 @@ mod tests {
 
     #[test]
     fn parse_trims_whitespace() {
-        assert_eq!(" 720p ".parse::<QualityPreset>().unwrap(), QualityPreset::P720);
+        assert_eq!(
+            " 720p ".parse::<QualityPreset>().unwrap(),
+            QualityPreset::P720
+        );
     }
 
     #[test]
@@ -186,7 +198,11 @@ mod tests {
 
     #[test]
     fn serde_roundtrip() {
-        for preset in [QualityPreset::P480, QualityPreset::P720, QualityPreset::P1080] {
+        for preset in [
+            QualityPreset::P480,
+            QualityPreset::P720,
+            QualityPreset::P1080,
+        ] {
             let s = serde_json::to_string(&preset).unwrap();
             let back: QualityPreset = serde_json::from_str(&s).unwrap();
             assert_eq!(back, preset);
@@ -210,15 +226,30 @@ mod tests {
     fn spec_table_values() {
         // Spec §23.4 — verbatim values guarded against accidental edits.
         assert_eq!(
-            (QualityPreset::P480.width(), QualityPreset::P480.height(), QualityPreset::P480.framerate(), QualityPreset::P480.video_bitrate()),
+            (
+                QualityPreset::P480.width(),
+                QualityPreset::P480.height(),
+                QualityPreset::P480.framerate(),
+                QualityPreset::P480.video_bitrate()
+            ),
             (854, 480, 24, "1000k")
         );
         assert_eq!(
-            (QualityPreset::P720.width(), QualityPreset::P720.height(), QualityPreset::P720.framerate(), QualityPreset::P720.video_bitrate()),
+            (
+                QualityPreset::P720.width(),
+                QualityPreset::P720.height(),
+                QualityPreset::P720.framerate(),
+                QualityPreset::P720.video_bitrate()
+            ),
             (1280, 720, 30, "2500k")
         );
         assert_eq!(
-            (QualityPreset::P1080.width(), QualityPreset::P1080.height(), QualityPreset::P1080.framerate(), QualityPreset::P1080.video_bitrate()),
+            (
+                QualityPreset::P1080.width(),
+                QualityPreset::P1080.height(),
+                QualityPreset::P1080.framerate(),
+                QualityPreset::P1080.video_bitrate()
+            ),
             (1920, 1080, 30, "4500k")
         );
     }

@@ -62,10 +62,7 @@ pub(crate) async fn fetch_dashboard(
 /// Build the dashboard sub-router. Caller mounts it at
 /// `/api/servers/{configId}/vs/{sid}/dashboard`.
 pub fn router() -> Router<AppState> {
-    Router::new().route(
-        "/api/servers/{configId}/vs/{sid}/dashboard",
-        get(handler),
-    )
+    Router::new().route("/api/servers/{configId}/vs/{sid}/dashboard", get(handler))
 }
 
 /// `{ "error": ..., "details"?: ..., "code"?: ... }` — spec §7.0.2 wire shape.
@@ -174,10 +171,7 @@ fn aggregate(
         platform: info.virtualserver_platform,
         version: info.virtualserver_version,
         online_users,
-        max_clients: info
-            .virtualserver_maxclients
-            .try_into()
-            .unwrap_or(u32::MAX),
+        max_clients: info.virtualserver_maxclients.try_into().unwrap_or(u32::MAX),
         uptime: info.virtualserver_uptime.try_into().unwrap_or(0),
         channel_count: channels.len().try_into().unwrap_or(u32::MAX),
         bandwidth: BandwidthSnapshot {

@@ -108,7 +108,9 @@ pub fn LogsPage() -> Element {
                 use gloo_timers::future::TimeoutFuture;
                 loop {
                     TimeoutFuture::new(POLL_INTERVAL_MS).await;
-                    if *paused.read() { continue; }
+                    if *paused.read() {
+                        continue;
+                    }
                     let after = *last_pos.read();
                     let sev = severity.read().trim().to_string();
                     let q = LogTailQuery {
@@ -117,7 +119,9 @@ pub fn LogsPage() -> Element {
                         severity: if sev.is_empty() { None } else { Some(sev) },
                     };
                     if let Ok(r) = fetch_logs(gate.clone(), server_id, sid, &q).await {
-                        if let Some(np) = r.last_pos { last_pos.set(Some(np)); }
+                        if let Some(np) = r.last_pos {
+                            last_pos.set(Some(np));
+                        }
                         if !r.lines.is_empty() {
                             let mut buf = lines.write();
                             for l in r.lines {
@@ -206,17 +210,27 @@ async fn fetch_logs(
         path.push_str(&urlencoding::encode(&v));
         first = false;
     };
-    if let Some(a) = query.after { push("after", a.to_string()); }
-    if let Some(n) = query.lines { push("lines", n.to_string()); }
+    if let Some(a) = query.after {
+        push("after", a.to_string());
+    }
+    if let Some(n) = query.lines {
+        push("lines", n.to_string());
+    }
     if let Some(s) = query.severity.as_deref() {
-        if !s.is_empty() { push("severity", s.to_string()); }
+        if !s.is_empty() {
+            push("severity", s.to_string());
+        }
     }
     api::authorized_get_json::<LogTailResponse>(&gate, &api::api_base(), &path).await
 }
 
 fn format_error(err: &ApiError) -> String {
     match err {
-        ApiError::BadGateway { error, code, details } => {
+        ApiError::BadGateway {
+            error,
+            code,
+            details,
+        } => {
             let mut s = error.clone();
             if let Some(d) = details.as_deref().filter(|v| !v.is_empty()) {
                 s.push_str(": ");

@@ -89,7 +89,9 @@ mod tests {
     #[test]
     fn doubles_until_cap() {
         let mut b = ExponentialBackoff::new(cfg(100, 1, 2.0, None));
-        let seq: Vec<u128> = (0..6).map(|_| b.next_delay().unwrap().as_millis()).collect();
+        let seq: Vec<u128> = (0..6)
+            .map(|_| b.next_delay().unwrap().as_millis())
+            .collect();
         // 100, 200, 400, 800, 1000 (cap), 1000 (cap).
         assert_eq!(seq, vec![100, 200, 400, 800, 1000, 1000]);
     }

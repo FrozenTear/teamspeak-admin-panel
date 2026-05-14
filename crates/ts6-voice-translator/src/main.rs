@@ -309,8 +309,12 @@ fn extract_inbound_opus(item: &StreamItem) -> Option<(u16, &[u8])> {
         _ => return None,
     };
     let (from, codec, data): (u16, CodecType, &[u8]) = match buf.data().data() {
-        AudioData::S2C { from, codec, data, .. } => (*from, *codec, *data),
-        AudioData::S2CWhisper { from, codec, data, .. } => (*from, *codec, *data),
+        AudioData::S2C {
+            from, codec, data, ..
+        } => (*from, *codec, *data),
+        AudioData::S2CWhisper {
+            from, codec, data, ..
+        } => (*from, *codec, *data),
         _ => return None,
     };
     if !matches!(codec, CodecType::OpusVoice | CodecType::OpusMusic) {

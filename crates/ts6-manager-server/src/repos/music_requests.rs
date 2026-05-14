@@ -93,7 +93,11 @@ pub async fn list_for_server(db: &Database, server_config_id: i64) -> Result<Vec
         "SELECT {PROJECTION} FROM music_request
             WHERE serverConfigId = $sid ORDER BY requestedAt DESC;"
     );
-    let mut resp = db.query(sql).bind(("sid", server_config_id)).await?.check()?;
+    let mut resp = db
+        .query(sql)
+        .bind(("sid", server_config_id))
+        .await?
+        .check()?;
     Ok(resp.take(0)?)
 }
 

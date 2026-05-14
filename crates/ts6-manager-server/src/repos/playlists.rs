@@ -69,9 +69,7 @@ pub async fn list(db: &Database) -> Result<Vec<Playlist>> {
 }
 
 pub async fn list_for_music_bot(db: &Database, music_bot_id: i64) -> Result<Vec<Playlist>> {
-    let sql = format!(
-        "SELECT {PROJECTION} FROM playlist WHERE musicBotId = $mid ORDER BY id ASC;"
-    );
+    let sql = format!("SELECT {PROJECTION} FROM playlist WHERE musicBotId = $mid ORDER BY id ASC;");
     let mut resp = db.query(sql).bind(("mid", music_bot_id)).await?.check()?;
     Ok(resp.take(0)?)
 }

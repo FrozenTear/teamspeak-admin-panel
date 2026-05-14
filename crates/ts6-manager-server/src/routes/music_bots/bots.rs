@@ -8,8 +8,8 @@ use axum::Json;
 use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::Response;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{get, post};
 use futures::stream::{Stream, StreamExt};
 use music_bot::{
@@ -22,9 +22,7 @@ use ts6_manager_shared::music_bots as wire;
 
 use crate::app_state::AppState;
 use crate::auth::extractors::RequireAuth;
-use crate::routes::music_bots::convert::{
-    bot_id_to_wire, bot_state_to_wire, track_to_wire,
-};
+use crate::routes::music_bots::convert::{bot_id_to_wire, bot_state_to_wire, track_to_wire};
 use crate::routes::music_bots::{not_found, translate_send_error, validation};
 
 pub(super) fn router() -> Router<AppState> {
@@ -116,7 +114,10 @@ async fn create(
         // first connect attempt surfaces the I/O error via
         // `BotEvent::Error::Connection` — no need to abort the create.
         let _ = std::fs::create_dir_all(dir);
-        dir.join(format!("bot-{}.identity", supervisor_next_hint(supervisor).await))
+        dir.join(format!(
+            "bot-{}.identity",
+            supervisor_next_hint(supervisor).await
+        ))
     };
 
     let mut config = BotConfig::new(req.name.clone(), identity_path);
@@ -321,4 +322,3 @@ fn state_simple(state: DomainBotState) -> wire::BotState {
         DomainBotState::Disconnecting => wire::BotState::Disconnecting,
     }
 }
-

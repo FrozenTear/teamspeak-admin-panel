@@ -14,8 +14,8 @@ pub mod video_player;
 pub mod ws_banner;
 
 pub use activity_feed::{
-    ActivityEntry, ActivityFeed, ActivityFeedList, ActivityFeedSubscription,
-    provide_activity_feed, use_activity_feed,
+    ActivityEntry, ActivityFeed, ActivityFeedList, ActivityFeedSubscription, provide_activity_feed,
+    use_activity_feed,
 };
 pub use banner::{Banner, BannerVariant};
 pub use button::{Button, ButtonSize, ButtonType, ButtonVariant};

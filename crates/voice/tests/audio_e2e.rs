@@ -88,8 +88,7 @@ mod music_bot {
 }
 
 async fn run() -> Result<()> {
-    let addr =
-        env::var("TS6_VOICE_FIXTURE_ADDR").unwrap_or_else(|_| "127.0.0.1:9987".to_string());
+    let addr = env::var("TS6_VOICE_FIXTURE_ADDR").unwrap_or_else(|_| "127.0.0.1:9987".to_string());
     let workdir = std::env::temp_dir().join("music-bot-audio-e2e");
     let rx_dir = workdir.join("rx");
     let bot_dir = workdir.join("bot");
@@ -174,21 +173,11 @@ async fn run() -> Result<()> {
         .await
         .context("receiver task panicked")?
         .context("receiver task returned error")?;
-    let nonempty = recv_outcome
-        .frames
-        .iter()
-        .filter(|f| !f.is_stop)
-        .count();
-    let stops = recv_outcome
-        .frames
-        .iter()
-        .filter(|f| f.is_stop)
-        .count();
+    let nonempty = recv_outcome.frames.iter().filter(|f| !f.is_stop).count();
+    let stops = recv_outcome.frames.iter().filter(|f| f.is_stop).count();
     info!(
         total = recv_outcome.frames.len(),
-        nonempty,
-        stops,
-        "receiver summary"
+        nonempty, stops, "receiver summary"
     );
 
     if nonempty < EXPECTED_MIN_FRAMES {
@@ -207,10 +196,7 @@ async fn run() -> Result<()> {
     }
 
     // 5. Clean shutdown.
-    handle
-        .shutdown()
-        .await
-        .context("BotHandle::shutdown")?;
+    handle.shutdown().await.context("BotHandle::shutdown")?;
     info!("audio_e2e passed");
     Ok(())
 }

@@ -31,8 +31,8 @@ use crate::client::dioxus::{use_auth_gate, use_session};
 use crate::client::session::RefreshGate;
 use crate::client::store::AuthState;
 use crate::client::ws::{WsEvent, use_ws_hub};
-use crate::ui::components::{Banner, BannerVariant, Button, ButtonSize, ButtonVariant};
 use crate::ui::components::toast::{ToastVariant, use_toaster};
+use crate::ui::components::{Banner, BannerVariant, Button, ButtonSize, ButtonVariant};
 use crate::ui::layout::use_servers_context;
 use crate::ui::pages::active_server;
 
@@ -104,10 +104,14 @@ pub fn ClientsPage() -> Element {
             let hub = hub.clone();
             let cur_server = *server_changed_marker.read();
             async move {
-                if cur_server == 0 { return; }
+                if cur_server == 0 {
+                    return;
+                }
                 let topic = format!("server:{cur_server}:clients");
                 let mut handle = hub.subscribe(topic).await;
-                let Some(mut rx) = handle.take_receiver() else { return };
+                let Some(mut rx) = handle.take_receiver() else {
+                    return;
+                };
                 let _drop_guard = handle;
                 use futures::stream::StreamExt;
                 while let Some(env) = rx.next().await {
@@ -124,22 +128,24 @@ pub fn ClientsPage() -> Element {
         move |clid: i64, kind: KickKind| {
             let gate = gate.clone();
             spawn(async move {
-                let body = KickRequest { kind, reason: Some(default_reason(kind)) };
+                let body = KickRequest {
+                    kind,
+                    reason: Some(default_reason(kind)),
+                };
                 let path = format!("/api/servers/{server_id}/vs/{sid}/clients/{clid}/kick");
-                match api::authorized_post_json::<_, ()>(&gate, &api::api_base(), &path, Some(&body)).await {
+                match api::authorized_post_json::<_, ()>(
+                    &gate,
+                    &api::api_base(),
+                    &path,
+                    Some(&body),
+                )
+                .await
+                {
                     Ok(()) => {
-                        toaster.push(
-                            ToastVariant::Success,
-                            format!("Kicked client {clid}"),
-                            None,
-                        );
+                        toaster.push(ToastVariant::Success, format!("Kicked client {clid}"), None);
                     }
                     Err(e) => {
-                        toaster.push(
-                            ToastVariant::Danger,
-                            "Kick failed",
-                            Some(format_error(&e)),
-                        );
+                        toaster.push(ToastVariant::Danger, "Kick failed", Some(format_error(&e)));
                     }
                 }
             });
@@ -157,10 +163,21 @@ pub fn ClientsPage() -> Element {
                     output_muted: Some(on),
                 };
                 let path = format!("/api/servers/{server_id}/vs/{sid}/clients/{clid}/mute");
-                match api::authorized_post_json::<_, ()>(&gate, &api::api_base(), &path, Some(&body)).await {
+                match api::authorized_post_json::<_, ()>(
+                    &gate,
+                    &api::api_base(),
+                    &path,
+                    Some(&body),
+                )
+                .await
+                {
                     Ok(()) => toaster.push(
                         ToastVariant::Success,
-                        if on { format!("Muted client {clid}") } else { format!("Unmuted client {clid}") },
+                        if on {
+                            format!("Muted client {clid}")
+                        } else {
+                            format!("Unmuted client {clid}")
+                        },
                         None,
                     ),
                     Err(e) => toaster.push(
@@ -179,19 +196,25 @@ pub fn ClientsPage() -> Element {
         move |clid: i64, target_cid: i64| {
             let gate = gate.clone();
             spawn(async move {
-                let body = MoveRequest { cid: target_cid, channel_password: None };
+                let body = MoveRequest {
+                    cid: target_cid,
+                    channel_password: None,
+                };
                 let path = format!("/api/servers/{server_id}/vs/{sid}/clients/{clid}/move");
-                match api::authorized_post_json::<_, ()>(&gate, &api::api_base(), &path, Some(&body)).await {
-                    Ok(()) => toaster.push(
-                        ToastVariant::Success,
-                        format!("Moved client {clid}"),
-                        None,
-                    ),
-                    Err(e) => toaster.push(
-                        ToastVariant::Danger,
-                        "Move failed",
-                        Some(format_error(&e)),
-                    ),
+                match api::authorized_post_json::<_, ()>(
+                    &gate,
+                    &api::api_base(),
+                    &path,
+                    Some(&body),
+                )
+                .await
+                {
+                    Ok(()) => {
+                        toaster.push(ToastVariant::Success, format!("Moved client {clid}"), None)
+                    }
+                    Err(e) => {
+                        toaster.push(ToastVariant::Danger, "Move failed", Some(format_error(&e)))
+                    }
                 }
             });
         }
@@ -444,7 +467,11 @@ fn default_reason(kind: KickKind) -> String {
 
 fn format_error(err: &ApiError) -> String {
     match err {
-        ApiError::BadGateway { error, code, details } => {
+        ApiError::BadGateway {
+            error,
+            code,
+            details,
+        } => {
             let mut s = error.clone();
             if let Some(d) = details.as_deref().filter(|v| !v.is_empty()) {
                 s.push_str(": ");
@@ -493,7 +520,10 @@ mod tests {
     #[test]
     fn kick_from_server_drops_row() {
         let mut rows = vec![row(1), row(2)];
-        apply_event(&mut rows, &evt("ts:client:kicked_from_server", json!({"clid": 1})));
+        apply_event(
+            &mut rows,
+            &evt("ts:client:kicked_from_server", json!({"clid": 1})),
+        );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].clid, 2);
     }
@@ -501,7 +531,10 @@ mod tests {
     #[test]
     fn move_updates_cid() {
         let mut rows = vec![row(7)];
-        apply_event(&mut rows, &evt("ts:client:moved", json!({"clid": 7, "cid": 42})));
+        apply_event(
+            &mut rows,
+            &evt("ts:client:moved", json!({"clid": 7, "cid": 42})),
+        );
         assert_eq!(rows[0].cid, 42);
     }
 
@@ -510,7 +543,10 @@ mod tests {
         let mut rows = vec![row(3)];
         apply_event(
             &mut rows,
-            &evt("ts:client:muted", json!({"clid": 3, "inputMuted": true, "outputMuted": false})),
+            &evt(
+                "ts:client:muted",
+                json!({"clid": 3, "inputMuted": true, "outputMuted": false}),
+            ),
         );
         assert_eq!(rows[0].client_input_muted, 1);
         assert_eq!(rows[0].client_output_muted, 0);

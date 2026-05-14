@@ -126,10 +126,13 @@ pub async fn list(db: &Database) -> Result<Vec<MusicBot>> {
 }
 
 pub async fn list_for_server(db: &Database, server_config_id: i64) -> Result<Vec<MusicBot>> {
-    let sql = format!(
-        "SELECT {PROJECTION} FROM music_bot WHERE serverConfigId = $sid ORDER BY id ASC;"
-    );
-    let mut resp = db.query(sql).bind(("sid", server_config_id)).await?.check()?;
+    let sql =
+        format!("SELECT {PROJECTION} FROM music_bot WHERE serverConfigId = $sid ORDER BY id ASC;");
+    let mut resp = db
+        .query(sql)
+        .bind(("sid", server_config_id))
+        .await?
+        .check()?;
     Ok(resp.take(0)?)
 }
 

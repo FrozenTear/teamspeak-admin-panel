@@ -62,8 +62,8 @@ pub async fn insert(db: &Database, new: NewRefreshToken) -> Result<RefreshToken>
     let mut resp = db
         .query(sql)
         // SurrealDB v3 reserves `$token` as an internal variable; use `$tok`
-// at the bind layer and reference it that way in the SurrealQL.
-.bind(("tok", new.token))
+        // at the bind layer and reference it that way in the SurrealQL.
+        .bind(("tok", new.token))
         .bind(("userId", new.userId))
         .bind(("expiresAt", new.expiresAt))
         .bind(("family", new.family))
@@ -75,9 +75,7 @@ pub async fn insert(db: &Database, new: NewRefreshToken) -> Result<RefreshToken>
 }
 
 pub async fn find_by_token(db: &Database, token: &str) -> Result<Option<RefreshToken>> {
-    let sql = format!(
-        "SELECT {PROJECTION} FROM refresh_token WHERE token = $tok LIMIT 1;"
-    );
+    let sql = format!("SELECT {PROJECTION} FROM refresh_token WHERE token = $tok LIMIT 1;");
     let mut resp = db
         .query(sql)
         .bind(("tok", token.to_string()))
@@ -93,9 +91,7 @@ pub async fn find_predecessor_by_replaced_by(
     db: &Database,
     successor_token: &str,
 ) -> Result<Option<RefreshToken>> {
-    let sql = format!(
-        "SELECT {PROJECTION} FROM refresh_token WHERE replacedBy = $tok LIMIT 1;"
-    );
+    let sql = format!("SELECT {PROJECTION} FROM refresh_token WHERE replacedBy = $tok LIMIT 1;");
     let mut resp = db
         .query(sql)
         .bind(("tok", successor_token.to_string()))
@@ -105,17 +101,15 @@ pub async fn find_predecessor_by_replaced_by(
 }
 
 pub async fn list_for_user(db: &Database, user_id: i64) -> Result<Vec<RefreshToken>> {
-    let sql = format!(
-        "SELECT {PROJECTION} FROM refresh_token WHERE userId = $uid ORDER BY id ASC;"
-    );
+    let sql =
+        format!("SELECT {PROJECTION} FROM refresh_token WHERE userId = $uid ORDER BY id ASC;");
     let mut resp = db.query(sql).bind(("uid", user_id)).await?.check()?;
     Ok(resp.take(0)?)
 }
 
 pub async fn list_for_family(db: &Database, family: &str) -> Result<Vec<RefreshToken>> {
-    let sql = format!(
-        "SELECT {PROJECTION} FROM refresh_token WHERE family = $fam ORDER BY id ASC;"
-    );
+    let sql =
+        format!("SELECT {PROJECTION} FROM refresh_token WHERE family = $fam ORDER BY id ASC;");
     let mut resp = db
         .query(sql)
         .bind(("fam", family.to_string()))

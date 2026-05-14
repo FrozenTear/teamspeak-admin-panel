@@ -125,9 +125,7 @@ async fn run_smoke() -> Result<()> {
     Ok(())
 }
 
-async fn flatten<T>(
-    handle: tokio::task::JoinHandle<Result<T>>,
-) -> Result<T> {
+async fn flatten<T>(handle: tokio::task::JoinHandle<Result<T>>) -> Result<T> {
     match handle.await {
         Ok(Ok(v)) => Ok(v),
         Ok(Err(err)) => Err(err),

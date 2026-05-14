@@ -158,8 +158,8 @@ fn rate_limit_response(wait: Duration) -> Response {
     // sub-second wait still surfaces as `Retry-After: 1` (the client
     // should not retry immediately).
     let secs = wait.as_secs().max(1);
-    let retry_after = HeaderValue::from_str(&secs.to_string())
-        .unwrap_or_else(|_| HeaderValue::from_static("60"));
+    let retry_after =
+        HeaderValue::from_str(&secs.to_string()).unwrap_or_else(|_| HeaderValue::from_static("60"));
     let mut resp = (
         StatusCode::TOO_MANY_REQUESTS,
         Json(ErrorResponse::new(msg::RATE_LIMIT_AUTH)),
@@ -172,11 +172,11 @@ fn rate_limit_response(wait: Duration) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::Router;
     use axum::body::Body;
     use axum::http::{HeaderMap, HeaderValue, Method, Request};
     use axum::middleware::from_fn_with_state;
     use axum::routing::post;
-    use axum::Router;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
@@ -203,10 +203,8 @@ mod tests {
 
     fn req_from_with_xff(addr: &str, xff: &str) -> Request<Body> {
         let mut req = req_from(addr);
-        req.headers_mut().insert(
-            "x-forwarded-for",
-            HeaderValue::from_str(xff).unwrap(),
-        );
+        req.headers_mut()
+            .insert("x-forwarded-for", HeaderValue::from_str(xff).unwrap());
         req
     }
 
@@ -235,8 +233,7 @@ mod tests {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(
-            body["error"],
-            "Too many attempts, please try again later",
+            body["error"], "Too many attempts, please try again later",
             "spec §6.8 mandates this exact body"
         );
     }

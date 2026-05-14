@@ -52,8 +52,7 @@ use crate::repos::{refresh_tokens, users};
 /// nanoid-equivalent URL-safe alphabet (64 symbols, 6 bits per char). Spec
 /// §6.5.2 calls out nanoid by reference; using the same alphabet matches the
 /// reference's collision-resistance properties without pulling a new crate.
-const FAMILY_ALPHABET: &[u8] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-";
+const FAMILY_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-";
 const FAMILY_LENGTH: usize = 21;
 const REFRESH_TOKEN_BYTES: usize = 64;
 
@@ -138,11 +137,7 @@ pub async fn issue_for_login(
 ///   referenced by a `replacedBy`, or token's own `replacedBy` already set),
 ///   the user's entire refresh-token set has been deleted before the error
 ///   is returned.
-pub async fn rotate(
-    db: &Database,
-    supplied: &str,
-    lifetime: Duration,
-) -> Result<Rotated, Error> {
+pub async fn rotate(db: &Database, supplied: &str, lifetime: Duration) -> Result<Rotated, Error> {
     let row = refresh_tokens::find_by_token(db, supplied).await?;
 
     let Some(row) = row else {
@@ -200,8 +195,7 @@ pub async fn rotate(
 /// Spec §6.5.4 — supplied token does not exist; check `replacedBy` and, if
 /// found, revoke the user's entire refresh-token set.
 async fn reuse_check_or_invalid(db: &Database, supplied: &str) -> Result<(), Error> {
-    if let Some(predecessor) =
-        refresh_tokens::find_predecessor_by_replaced_by(db, supplied).await?
+    if let Some(predecessor) = refresh_tokens::find_predecessor_by_replaced_by(db, supplied).await?
     {
         revoke_user_and_warn(db, predecessor.userId, "replacedBy match").await;
     }

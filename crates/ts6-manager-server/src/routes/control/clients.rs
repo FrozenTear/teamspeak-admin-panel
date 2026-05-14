@@ -37,9 +37,7 @@ use super::{access, audit, bad_request, translate_control_error};
 
 /// Spec §7.8 — read flag set the FE always wants for the active list.
 /// `-ip` is admin-only and is appended in [`list`] when the caller is admin.
-const BASE_CLIENT_FLAGS: &[&str] = &[
-    "uid", "away", "voice", "times", "groups", "info", "country",
-];
+const BASE_CLIENT_FLAGS: &[&str] = &["uid", "away", "voice", "times", "groups", "info", "country"];
 
 pub async fn list(
     State(state): State<AppState>,
@@ -145,7 +143,14 @@ pub async fn kick(
     {
         Ok(()) => {
             emit_success(
-                &state, &user, &connection, sid, action, Some(clid), &details, started,
+                &state,
+                &user,
+                &connection,
+                sid,
+                action,
+                Some(clid),
+                &details,
+                started,
             )
             .await;
             publish_client_event(
@@ -162,7 +167,15 @@ pub async fn kick(
             Ok(StatusCode::NO_CONTENT)
         }
         Err(e) => Err(emit_failure_and_translate(
-            &state, &user, &connection, sid, action, Some(clid), &details, e, started,
+            &state,
+            &user,
+            &connection,
+            sid,
+            action,
+            Some(clid),
+            &details,
+            e,
+            started,
         )
         .await),
     }
@@ -198,7 +211,14 @@ pub async fn mute(
     {
         Ok(()) => {
             emit_success(
-                &state, &user, &connection, sid, action, Some(clid), &details, started,
+                &state,
+                &user,
+                &connection,
+                sid,
+                action,
+                Some(clid),
+                &details,
+                started,
             )
             .await;
             publish_client_event(
@@ -215,7 +235,15 @@ pub async fn mute(
             Ok(StatusCode::NO_CONTENT)
         }
         Err(e) => Err(emit_failure_and_translate(
-            &state, &user, &connection, sid, action, Some(clid), &details, e, started,
+            &state,
+            &user,
+            &connection,
+            sid,
+            action,
+            Some(clid),
+            &details,
+            e,
+            started,
         )
         .await),
     }
@@ -237,7 +265,14 @@ pub async fn unmute(
     {
         Ok(()) => {
             emit_success(
-                &state, &user, &connection, sid, action, Some(clid), &details, started,
+                &state,
+                &user,
+                &connection,
+                sid,
+                action,
+                Some(clid),
+                &details,
+                started,
             )
             .await;
             publish_client_event(
@@ -250,7 +285,15 @@ pub async fn unmute(
             Ok(StatusCode::NO_CONTENT)
         }
         Err(e) => Err(emit_failure_and_translate(
-            &state, &user, &connection, sid, action, Some(clid), &details, e, started,
+            &state,
+            &user,
+            &connection,
+            sid,
+            action,
+            Some(clid),
+            &details,
+            e,
+            started,
         )
         .await),
     }
@@ -273,7 +316,14 @@ pub async fn move_to(
     {
         Ok(()) => {
             emit_success(
-                &state, &user, &connection, sid, action, Some(clid), &details, started,
+                &state,
+                &user,
+                &connection,
+                sid,
+                action,
+                Some(clid),
+                &details,
+                started,
             )
             .await;
             publish_client_event(
@@ -289,7 +339,15 @@ pub async fn move_to(
             Ok(StatusCode::NO_CONTENT)
         }
         Err(e) => Err(emit_failure_and_translate(
-            &state, &user, &connection, sid, action, Some(clid), &details, e, started,
+            &state,
+            &user,
+            &connection,
+            sid,
+            action,
+            Some(clid),
+            &details,
+            e,
+            started,
         )
         .await),
     }

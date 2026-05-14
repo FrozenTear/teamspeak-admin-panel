@@ -39,10 +39,7 @@ enum Row {
     /// dotline/dashline, `None` for solid `line`.
     SpacerLine { dasharray: Option<&'static str> },
     /// Spacer — text (left/center/right anchored).
-    SpacerText {
-        text: String,
-        anchor: TextAnchor,
-    },
+    SpacerText { text: String, anchor: TextAnchor },
     /// Real channel row.
     Channel {
         depth: u32,
@@ -306,7 +303,15 @@ fn emit_row(out: &mut String, theme: &WidgetTheme, row: &Row, top_y: u32) {
             name,
             has_password,
             client_count,
-        } => emit_channel_row(out, theme, top_y, *depth, name, *has_password, *client_count),
+        } => emit_channel_row(
+            out,
+            theme,
+            top_y,
+            *depth,
+            name,
+            *has_password,
+            *client_count,
+        ),
         Row::Client {
             depth,
             nickname,
@@ -561,7 +566,12 @@ mod tests {
         }
     }
 
-    fn channel(cid: i64, name: &str, password: bool, clients: Vec<WidgetClient>) -> WidgetChannelNode {
+    fn channel(
+        cid: i64,
+        name: &str,
+        password: bool,
+        clients: Vec<WidgetClient>,
+    ) -> WidgetChannelNode {
         WidgetChannelNode {
             cid,
             name: name.into(),
@@ -598,12 +608,7 @@ mod tests {
 
     fn fixture() -> WidgetData {
         let lobby = channel(1, "Lobby", true, vec![]);
-        let voice = channel(
-            2,
-            "Voice",
-            false,
-            vec![client("Alice"), client("Bob")],
-        );
+        let voice = channel(2, "Voice", false, vec![client("Alice"), client("Bob")]);
         let sp = spacer("Hello", SpacerType::Center);
         WidgetData {
             name: "Test Widget".into(),
@@ -640,7 +645,10 @@ mod tests {
     fn password_channel_emits_lock_emoji() {
         let svg = render(&fixture(), &WIDGET_THEME_DARK);
         // 🔒 is U+1F512 — survives as the literal char in the SVG body.
-        assert!(svg.contains("🔒"), "expected lock emoji on password channel");
+        assert!(
+            svg.contains("🔒"),
+            "expected lock emoji on password channel"
+        );
     }
 
     #[test]

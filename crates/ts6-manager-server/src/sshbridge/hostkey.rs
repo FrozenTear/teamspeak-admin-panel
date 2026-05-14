@@ -96,12 +96,7 @@ pub struct HostKeyVerifier {
 }
 
 impl HostKeyVerifier {
-    pub fn new(
-        policy: HostKeyPolicy,
-        config_id: i64,
-        host: impl Into<String>,
-        port: u16,
-    ) -> Self {
+    pub fn new(policy: HostKeyPolicy, config_id: i64, host: impl Into<String>, port: u16) -> Self {
         Self {
             policy,
             config_id,
@@ -198,10 +193,7 @@ impl HostKeyVerifier {
             }
             HostKeyPolicy::KnownHostsFile { path } => {
                 let res = russh::keys::known_hosts::check_known_hosts_path(
-                    &self.host,
-                    self.port,
-                    server_key,
-                    path,
+                    &self.host, self.port, server_key, path,
                 );
                 let observed = server_key.fingerprint(HashAlg::Sha256);
                 match res {
@@ -356,8 +348,8 @@ pub enum HostKeyConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use russh::keys::ssh_key::private::Ed25519Keypair;
     use russh::keys::ssh_key::PrivateKey;
+    use russh::keys::ssh_key::private::Ed25519Keypair;
     use std::sync::atomic::{AtomicU8, Ordering};
 
     /// Build a deterministic test key from a 32-byte seed. The seed
@@ -433,8 +425,7 @@ mod tests {
     fn from_config_with_fp_yields_strict() {
         let (_, fp) = fresh_key();
         let s = fp.to_string(); // SHA256:base64
-        let v =
-            HostKeyVerifier::from_config(7, "ts.example", 10022, Some(&s), None, None).unwrap();
+        let v = HostKeyVerifier::from_config(7, "ts.example", 10022, Some(&s), None, None).unwrap();
         match v.policy {
             HostKeyPolicy::StrictFingerprint(_) => {}
             other => panic!("expected StrictFingerprint, got {other:?}"),
@@ -498,7 +489,10 @@ mod tests {
     // succeeded.
     // -----------------------------------------------------------------
 
-    fn tofu_sink() -> (TofuCaptureSink, tokio::sync::mpsc::Receiver<TofuCaptureRequest>) {
+    fn tofu_sink() -> (
+        TofuCaptureSink,
+        tokio::sync::mpsc::Receiver<TofuCaptureRequest>,
+    ) {
         TofuCaptureSink::for_test()
     }
 
@@ -520,15 +514,8 @@ mod tests {
         let (_, fp) = fresh_key();
         let s = fp.to_string();
         let (sink, _rx) = tofu_sink();
-        let v = HostKeyVerifier::from_config(
-            7,
-            "ts.example",
-            10022,
-            Some(&s),
-            None,
-            Some(sink),
-        )
-        .unwrap();
+        let v = HostKeyVerifier::from_config(7, "ts.example", 10022, Some(&s), None, Some(sink))
+            .unwrap();
         assert!(matches!(v.policy, HostKeyPolicy::StrictFingerprint(_)));
     }
 

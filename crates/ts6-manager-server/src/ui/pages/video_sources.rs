@@ -144,11 +144,7 @@ pub fn VideoSourcesPage() -> Element {
             spawn(async move {
                 match api::delete_source(gate, id).await {
                     Ok(()) => {
-                        toaster.push(
-                            ToastVariant::Success,
-                            format!("Stopped source #{id}"),
-                            None,
-                        );
+                        toaster.push(ToastVariant::Success, format!("Stopped source #{id}"), None);
                     }
                     Err(e) => {
                         if let Some(restore) = removed {
@@ -156,11 +152,7 @@ pub fn VideoSourcesPage() -> Element {
                                 r.insert(id, restore);
                             });
                         }
-                        toaster.push(
-                            ToastVariant::Danger,
-                            "Stop failed",
-                            Some(format_error(&e)),
-                        );
+                        toaster.push(ToastVariant::Danger, "Stop failed", Some(format_error(&e)));
                     }
                 }
             });
@@ -175,11 +167,7 @@ pub fn VideoSourcesPage() -> Element {
     // reduction so a transition from `starting → live` reaches a
     // non-sighted operator without depending on a row-level diff.
     let row_count = rows.read().len();
-    let live_count = rows
-        .read()
-        .values()
-        .filter(|r| r.status == "live")
-        .count();
+    let live_count = rows.read().values().filter(|r| r.status == "live").count();
     let live_summary = format!("{row_count} video source(s), {live_count} live.");
 
     rsx! {
@@ -855,7 +843,10 @@ mod tests {
         );
         apply_event(
             &mut rows,
-            &env("video_source:deleted", json!({"id": 7, "source_id": "src-7"})),
+            &env(
+                "video_source:deleted",
+                json!({"id": 7, "source_id": "src-7"}),
+            ),
             1,
         );
         assert!(rows.is_empty(), "row should be gone after delete");

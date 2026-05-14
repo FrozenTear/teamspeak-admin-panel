@@ -1219,7 +1219,10 @@ async fn seed_user(db: &crate::db::Database) -> i64 {
     users::insert(
         db,
         users::NewUser {
-            username: format!("op-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)),
+            username: format!(
+                "op-{}",
+                chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+            ),
             passwordHash: "$argon2id$v=19$m=64,t=1,p=1$YWFhYWFhYWE$ZmFrZQ".into(),
             displayName: "Operator".into(),
             role: "admin".into(),
@@ -1289,8 +1292,7 @@ async fn ssh_audit_log_insert_caps_errormsg_at_4kib_with_sentinel() {
         row.errorMsg.len()
     );
     assert!(
-        row.errorMsg
-            .contains("[truncated, original 10000 bytes]"),
+        row.errorMsg.contains("[truncated, original 10000 bytes]"),
         "truncation sentinel must record the original byte length"
     );
 }

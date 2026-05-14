@@ -11,9 +11,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use music_bot_audio::AudioPipeline;
 use music_bot_audio::source::AudioSourceSpec;
 use music_bot_audio::types::{OpusApplication, PipelineConfig, PipelineEvent};
-use music_bot_audio::AudioPipeline;
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{info, warn};
 
@@ -111,7 +111,13 @@ async fn main() -> Result<()> {
         SourceCmd::Icy { url } => AudioSourceSpec::IcyRadio { url },
     };
 
-    info!(?spec, channels = cli.channels, bitrate = cli.bitrate, pace = cli.pace, "starting pipeline");
+    info!(
+        ?spec,
+        channels = cli.channels,
+        bitrate = cli.bitrate,
+        pace = cli.pace,
+        "starting pipeline"
+    );
     let mut pipeline = AudioPipeline::spawn(spec, cfg)
         .await
         .context("AudioPipeline::spawn")?;
@@ -195,8 +201,7 @@ async fn main() -> Result<()> {
         let actual_ms = elapsed.as_millis() as i64;
         info!(
             expected_ms,
-            actual_ms,
-            "wall-clock vs paced frame count: |delta| should be tiny"
+            actual_ms, "wall-clock vs paced frame count: |delta| should be tiny"
         );
     }
 

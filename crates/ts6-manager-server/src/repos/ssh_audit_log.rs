@@ -379,7 +379,11 @@ mod tests {
         assert!(truncated.is_char_boundary(truncated.len()));
         // Cheaper: ensure the prefix parses as valid UTF-8 (it always does
         // because it's already a String, but the assertion documents intent).
-        assert!(truncated.chars().all(|c| c == '🎵' || c == '…' || c.is_ascii()));
+        assert!(
+            truncated
+                .chars()
+                .all(|c| c == '🎵' || c == '…' || c.is_ascii())
+        );
     }
 
     #[test]

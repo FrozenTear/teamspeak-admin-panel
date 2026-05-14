@@ -11,9 +11,7 @@ use crate::client::session::RefreshGate;
 use crate::client::store::AuthState;
 use crate::client::ws::use_ws_hub;
 use crate::ui::components::toast::{ToastVariant, use_toaster};
-use crate::ui::components::{
-    Banner, BannerVariant, Button, ButtonSize, ButtonType, ButtonVariant,
-};
+use crate::ui::components::{Banner, BannerVariant, Button, ButtonSize, ButtonType, ButtonVariant};
 use crate::ui::layout::use_servers_context;
 use crate::ui::pages::active_server;
 
@@ -74,7 +72,9 @@ pub fn BansPage() -> Element {
             async move {
                 let topic = format!("server:{server_id}:clients");
                 let mut handle = hub.subscribe(topic).await;
-                let Some(mut rx) = handle.take_receiver() else { return };
+                let Some(mut rx) = handle.take_receiver() else {
+                    return;
+                };
                 let _drop_guard = handle;
                 use futures::stream::StreamExt;
                 while let Some(env) = rx.next().await {
@@ -97,7 +97,9 @@ pub fn BansPage() -> Element {
         let gate = gate.clone();
         let toaster = toaster;
         move |_| {
-            if *form_busy.read() { return; }
+            if *form_busy.read() {
+                return;
+            }
             let ip = trim_to_option(&form_ip.read());
             let uid = trim_to_option(&form_uid.read());
             let name = trim_to_option(&form_name.read());
@@ -129,7 +131,13 @@ pub fn BansPage() -> Element {
             form_busy.set(true);
             spawn(async move {
                 let path = format!("/api/servers/{server_id}/vs/{sid}/bans");
-                let res = api::authorized_post_json::<_, BanCreated>(&gate, &api::api_base(), &path, Some(&req)).await;
+                let res = api::authorized_post_json::<_, BanCreated>(
+                    &gate,
+                    &api::api_base(),
+                    &path,
+                    Some(&req),
+                )
+                .await;
                 form_busy.set(false);
                 match res {
                     Ok(BanCreated { banid }) => {
@@ -142,7 +150,11 @@ pub fn BansPage() -> Element {
                         bans_resource.restart();
                     }
                     Err(e) => {
-                        toaster.push(ToastVariant::Danger, "Could not add ban", Some(format_error(&e)));
+                        toaster.push(
+                            ToastVariant::Danger,
+                            "Could not add ban",
+                            Some(format_error(&e)),
+                        );
                     }
                 }
             });
@@ -163,7 +175,11 @@ pub fn BansPage() -> Element {
                         bans_resource.restart();
                     }
                     Err(e) => {
-                        toaster.push(ToastVariant::Danger, "Could not remove ban", Some(format_error(&e)));
+                        toaster.push(
+                            ToastVariant::Danger,
+                            "Could not remove ban",
+                            Some(format_error(&e)),
+                        );
                     }
                 }
             });
@@ -299,7 +315,11 @@ fn BansTable(props: BansTableProps) -> Element {
 
 fn trim_to_option(s: &str) -> Option<String> {
     let t = s.trim();
-    if t.is_empty() { None } else { Some(t.to_string()) }
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
 }
 
 async fn fetch_bans(
@@ -313,7 +333,11 @@ async fn fetch_bans(
 
 fn format_error(err: &ApiError) -> String {
     match err {
-        ApiError::BadGateway { error, code, details } => {
+        ApiError::BadGateway {
+            error,
+            code,
+            details,
+        } => {
             let mut s = error.clone();
             if let Some(d) = details.as_deref().filter(|v| !v.is_empty()) {
                 s.push_str(": ");

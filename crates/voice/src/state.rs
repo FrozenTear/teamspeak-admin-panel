@@ -30,7 +30,10 @@ impl BotState {
     /// of this state. `Connecting` and `Disconnecting` are transient and
     /// owned by the bot actor itself — external commands queue.
     pub fn accepts_external_commands(self) -> bool {
-        matches!(self, BotState::Disconnected | BotState::Connected | BotState::InChannel)
+        matches!(
+            self,
+            BotState::Disconnected | BotState::Connected | BotState::InChannel
+        )
     }
 
     /// True when a connection-level event (handshake done / lost) is

@@ -51,23 +51,17 @@ pub fn build_widget_data(widget: &Widget, inputs: WidgetInputs) -> WidgetData {
     } = inputs;
 
     let max_depth = widget.maxChannelDepth.max(0) as u32;
-    let human_clients: Vec<&ClientEntry> = clients
-        .iter()
-        .filter(|c| c.client_type == 0)
-        .collect();
+    let human_clients: Vec<&ClientEntry> = clients.iter().filter(|c| c.client_type == 0).collect();
     let clients_online = human_clients.len() as u32;
     let mut clients_by_cid: std::collections::HashMap<i64, Vec<WidgetClient>> =
         std::collections::HashMap::new();
     for c in &human_clients {
-        clients_by_cid
-            .entry(c.cid)
-            .or_default()
-            .push(WidgetClient {
-                clid: c.clid,
-                nickname: c.client_nickname.clone(),
-                is_away: c.client_away != 0,
-                is_muted: c.client_input_muted != 0 || c.client_output_muted != 0,
-            });
+        clients_by_cid.entry(c.cid).or_default().push(WidgetClient {
+            clid: c.clid,
+            nickname: c.client_nickname.clone(),
+            is_away: c.client_away != 0,
+            is_muted: c.client_input_muted != 0 || c.client_output_muted != 0,
+        });
     }
 
     let mut nodes: Vec<WidgetChannelNode> = channels

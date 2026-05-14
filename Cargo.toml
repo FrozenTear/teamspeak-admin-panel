@@ -138,6 +138,12 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "set-header"] }
 url = "2"
 
+# Phase 6 SECURITY (PURA-161 / R5, R7) — property-based test framework.
+# `proptest` powers the ServerQuery escaper roundtrip + injection-safety
+# properties and the refresh-token rotation defense-in-depth check. Dev-only;
+# never enters production builds.
+proptest = "1"
+
 # Phase 1 DATA (PURA-10) — SurrealDB v3 embedded (D8 ratified deviation 2026-05-07).
 # `kv-surrealkv` is the production embedded backend; `kv-mem` powers unit tests
 # without spinning up a server. The `protocol-*` features stay off so the binary

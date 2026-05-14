@@ -161,7 +161,13 @@ mod tests {
     #[test]
     fn envelope_serialises_with_spec_keys() {
         let t = Topic::new(7, TopicKind::Clients);
-        let e = Envelope::new(42, &t, "ts:client:connected", json!({"clid": 5}), 1_715_000_000_000);
+        let e = Envelope::new(
+            42,
+            &t,
+            "ts:client:connected",
+            json!({"clid": 5}),
+            1_715_000_000_000,
+        );
         let v: Value = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
         assert_eq!(v["id"], 42);
         assert_eq!(v["topic"], "server:7:clients");

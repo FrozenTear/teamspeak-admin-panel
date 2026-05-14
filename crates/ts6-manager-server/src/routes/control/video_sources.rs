@@ -31,6 +31,7 @@ use crate::auth::extractors::RequireAuth;
 use crate::control::sidecar::{
     KNOWN_PRESETS, SidecarClient, SidecarClientError, StartSourceRequest, StopSourceRequest,
 };
+use crate::db::ClassifyDbResult;
 use crate::repos::{server_connections, video_sources};
 use crate::ws::topic::{Topic, TopicKind};
 
@@ -149,6 +150,15 @@ async fn create(
         .map_err(translate_sidecar_error)?;
 
     // 5. Persist.
+    //
+    // R8 boundary — `classify_db()` maps any underlying `surrealdb::Error`
+    // onto the three named storage-full boundaries (write-failure /
+    // transaction-conflict / capacity-pressure). Transaction conflicts
+    // surface as `409 Conflict` with a retry-positive body; capacity
+    // pressure surfaces as `507 Insufficient Storage`; everything else
+    // ends up as `500 Internal Server Error` with a static body. The
+    // underlying SurrealDB message text never crosses the wire — only the
+    // tracing log on the IntoResponse impl preserves it for operators.
     let row = video_sources::insert(
         &state.db,
         video_sources::NewVideoSource {
@@ -162,9 +172,15 @@ async fn create(
         },
     )
     .await
+    .classify_db()
     .map_err(|e| {
-        tracing::warn!(error = %e, source_id = %started.source_id, "video_source insert failed; orphaning sidecar pipeline");
-        err(StatusCode::INTERNAL_SERVER_ERROR, "Failed to persist video source")
+        tracing::warn!(
+            boundary = ?e.boundary,
+            source_id = %started.source_id,
+            error = %e.source,
+            "video_source insert failed; orphaning sidecar pipeline"
+        );
+        e.into_response()
     })?;
 
     let view = view_from_row(row);

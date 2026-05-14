@@ -103,9 +103,7 @@ pub async fn find_by_id(db: &Database, id: i64) -> Result<Option<User>> {
 }
 
 pub async fn find_by_username(db: &Database, username: &str) -> Result<Option<User>> {
-    let sql = format!(
-        "SELECT {PROJECTION} FROM user WHERE username = $username LIMIT 1;"
-    );
+    let sql = format!("SELECT {PROJECTION} FROM user WHERE username = $username LIMIT 1;");
     let mut resp = db
         .query(sql)
         .bind(("username", username.to_string()))
@@ -132,9 +130,7 @@ pub async fn count(db: &Database) -> Result<i64> {
         .await
         .context("user count query failed")?
         .check()?;
-    let n: Option<i64> = resp
-        .take(0)
-        .context("user count: deserialise failed")?;
+    let n: Option<i64> = resp.take(0).context("user count: deserialise failed")?;
     Ok(n.unwrap_or(0))
 }
 
@@ -156,9 +152,7 @@ pub async fn update(db: &Database, id: i64, patch: UserUpdate) -> Result<Option<
         return find_by_id(db, id).await;
     }
 
-    let sql = format!(
-        "UPDATE type::record('user', $id) MERGE $patch RETURN {PROJECTION};"
-    );
+    let sql = format!("UPDATE type::record('user', $id) MERGE $patch RETURN {PROJECTION};");
     let mut resp = db
         .query(sql)
         .bind(("id", id))

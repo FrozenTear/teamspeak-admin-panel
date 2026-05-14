@@ -57,9 +57,8 @@ impl TransportConfig {
         // Pin ALPN to moq-lite-04 only. moq-native's `versions` field
         // empty = "all"; we want the strict opposite — reject anything
         // that doesn't speak the wire we just shipped through WS-0.
-        cfg.version = vec![
-            Version::from_str("moq-lite-04").expect("hard-coded valid version string"),
-        ];
+        cfg.version =
+            vec![Version::from_str("moq-lite-04").expect("hard-coded valid version string")];
         Ok(cfg)
     }
 }
@@ -88,7 +87,9 @@ impl Transport {
 
     /// UDP socket the QUIC endpoint is listening on.
     pub fn local_addr(&self) -> Result<SocketAddr> {
-        self.server.local_addr().context("read transport local_addr")
+        self.server
+            .local_addr()
+            .context("read transport local_addr")
     }
 
     /// SHA256 hex of the (first) configured certificate, suitable for the

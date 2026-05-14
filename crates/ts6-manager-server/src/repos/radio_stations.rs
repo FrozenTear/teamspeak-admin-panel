@@ -79,7 +79,11 @@ pub async fn list_for_server(db: &Database, server_config_id: i64) -> Result<Vec
     let sql = format!(
         "SELECT {PROJECTION} FROM radio_station WHERE serverConfigId = $sid ORDER BY id ASC;"
     );
-    let mut resp = db.query(sql).bind(("sid", server_config_id)).await?.check()?;
+    let mut resp = db
+        .query(sql)
+        .bind(("sid", server_config_id))
+        .await?
+        .check()?;
     Ok(resp.take(0)?)
 }
 

@@ -471,9 +471,7 @@ async fn server_connection_ssh_bridge_auth_explicit_values_round_trip() {
             sshAuthMethod: Some("agent".into()),
             sshPrivateKey: None,
             sshKeyAgentSocket: Some("/run/user/1000/ssh-agent.socket".into()),
-            sshHostKeyFingerprint: Some(
-                "SHA256:abcd1234abcd1234abcd1234abcd1234abcd1234ab".into(),
-            ),
+            sshHostKeyFingerprint: Some("SHA256:abcd1234abcd1234abcd1234abcd1234abcd1234ab".into()),
         },
     )
     .await
@@ -510,7 +508,8 @@ async fn server_connection_ssh_private_key_seals_and_unseals_through_row() {
     crate::crypto::init("test-seed-pura-77-key-roundtrip");
     let db = setup().await;
 
-    let plaintext_key = "-----BEGIN OPENSSH PRIVATE KEY-----\nfake-key-bytes\n-----END OPENSSH PRIVATE KEY-----\n";
+    let plaintext_key =
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nfake-key-bytes\n-----END OPENSSH PRIVATE KEY-----\n";
     let sealed = crate::crypto::seal(plaintext_key).expect("seal private key");
     assert!(
         sealed.starts_with("enc:"),
@@ -550,8 +549,14 @@ async fn server_connection_ssh_private_key_seals_and_unseals_through_row() {
         stored_ciphertext.starts_with("enc:"),
         "stored value must remain in the spec §6.3.2 envelope, never plaintext"
     );
-    assert_eq!(stored_ciphertext, sealed, "ciphertext must round-trip verbatim");
+    assert_eq!(
+        stored_ciphertext, sealed,
+        "ciphertext must round-trip verbatim"
+    );
 
     let unsealed = crate::crypto::unseal(stored_ciphertext).expect("unseal");
-    assert_eq!(unsealed, plaintext_key, "unsealed text must equal the operator's key");
+    assert_eq!(
+        unsealed, plaintext_key,
+        "unsealed text must equal the operator's key"
+    );
 }

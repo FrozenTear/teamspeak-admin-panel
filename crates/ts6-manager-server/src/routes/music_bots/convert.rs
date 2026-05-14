@@ -60,7 +60,9 @@ pub fn audio_source_to_wire(src: &DomainAudioSource) -> wire::AudioSource {
 pub fn audio_source_from_wire(src: wire::AudioSource) -> DomainAudioSource {
     match src {
         wire::AudioSource::Url { url } => DomainAudioSource::Url(url),
-        wire::AudioSource::LibraryPath { path } => DomainAudioSource::LibraryPath(PathBuf::from(path)),
+        wire::AudioSource::LibraryPath { path } => {
+            DomainAudioSource::LibraryPath(PathBuf::from(path))
+        }
     }
 }
 
@@ -119,9 +121,7 @@ pub fn bot_state_to_wire(state: DomainBotState, has_now_playing: bool) -> wire::
     // The route layer surfaces the synthesised `Playing` state when the
     // bot is online AND has a head-of-queue track. Internal FSM stays
     // unchanged — see `wire::BotState::Playing` doc.
-    if has_now_playing
-        && matches!(state, DomainBotState::Connected | DomainBotState::InChannel)
-    {
+    if has_now_playing && matches!(state, DomainBotState::Connected | DomainBotState::InChannel) {
         return wire::BotState::Playing;
     }
     match state {

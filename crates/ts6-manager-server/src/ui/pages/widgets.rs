@@ -51,10 +51,8 @@ use crate::client::dioxus::{use_auth_gate, use_session};
 use crate::client::session::RefreshGate;
 use crate::client::store::AuthState;
 use crate::ui::components::toast::{ToastVariant, use_toaster};
-use crate::ui::components::{
-    Banner, BannerVariant, Button, ButtonSize, ButtonType, ButtonVariant,
-};
-use crate::ui::layout::{use_servers_context, ServersData};
+use crate::ui::components::{Banner, BannerVariant, Button, ButtonSize, ButtonType, ButtonVariant};
+use crate::ui::layout::{ServersData, use_servers_context};
 use crate::ui::pages::active_server;
 
 // ---------------------------------------------------------------------------
@@ -106,20 +104,18 @@ pub fn WidgetsPage() -> Element {
     });
 
     {
-        use_effect(move || {
-            match &*snapshot.read_unchecked() {
-                Some(Ok(list)) => {
-                    rows.set(list.clone());
-                    last_error.set(None);
-                    loading.set(false);
-                }
-                Some(Err(e)) => {
-                    last_error.set(Some(e.clone()));
-                    loading.set(false);
-                }
-                None => {
-                    loading.set(true);
-                }
+        use_effect(move || match &*snapshot.read_unchecked() {
+            Some(Ok(list)) => {
+                rows.set(list.clone());
+                last_error.set(None);
+                loading.set(false);
+            }
+            Some(Err(e)) => {
+                last_error.set(Some(e.clone()));
+                loading.set(false);
+            }
+            None => {
+                loading.set(true);
             }
         });
     }
@@ -476,9 +472,13 @@ fn CreateWidgetModal(props: CreateWidgetModalProps) -> Element {
         };
         let gate = gate.clone();
         spawn(async move {
-            let res =
-                api::authorized_post_json::<_, WidgetSummary>(&gate, &api::api_base(), "/api/widgets", Some(&body))
-                    .await;
+            let res = api::authorized_post_json::<_, WidgetSummary>(
+                &gate,
+                &api::api_base(),
+                "/api/widgets",
+                Some(&body),
+            )
+            .await;
             submitting.set(false);
             match res {
                 Ok(w) => on_created.call(w),
@@ -609,7 +609,8 @@ fn EditWidgetDrawer(props: EditWidgetDrawerProps) -> Element {
     let initial = props.widget.clone();
 
     let mut name: Signal<String> = use_signal(|| initial.name.clone());
-    let mut theme: Signal<WidgetThemeName> = use_signal(|| WidgetThemeName::parse_or_default(&initial.theme));
+    let mut theme: Signal<WidgetThemeName> =
+        use_signal(|| WidgetThemeName::parse_or_default(&initial.theme));
     let mut show_channel_tree: Signal<bool> = use_signal(|| initial.show_channel_tree);
     let mut show_clients: Signal<bool> = use_signal(|| initial.show_clients);
     let mut hide_empty_channels: Signal<bool> = use_signal(|| initial.hide_empty_channels);
@@ -1249,7 +1250,11 @@ async fn fetch_widgets(gate: Arc<RefreshGate>) -> Result<Vec<WidgetSummary>, Api
 
 fn format_error(err: &ApiError) -> String {
     match err {
-        ApiError::BadGateway { error, code, details } => {
+        ApiError::BadGateway {
+            error,
+            code,
+            details,
+        } => {
             let mut s = error.clone();
             if let Some(d) = details.as_deref().filter(|v| !v.is_empty()) {
                 s.push_str(": ");

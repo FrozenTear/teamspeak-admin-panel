@@ -16,8 +16,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use super::ffmpeg::FfmpegSource;
 use super::PcmSource;
+use super::ffmpeg::FfmpegSource;
 use crate::icy;
 use crate::types::PipelineEvent;
 

@@ -88,8 +88,8 @@ pub fn SetupPage() -> Element {
     // password fields must match. Disabling the button is the cheap-and-
     // friendly UX for "you can't submit yet" — the explicit mismatch
     // message lives below the confirm field.
-    let passwords_match = !password.read().is_empty()
-        && password.read().as_str() == password_confirm.read().as_str();
+    let passwords_match =
+        !password.read().is_empty() && password.read().as_str() == password_confirm.read().as_str();
     let required_filled = !username.read().is_empty()
         && !password.read().is_empty()
         && !server_name.read().is_empty()
@@ -167,8 +167,7 @@ pub fn SetupPage() -> Element {
 
     let banner_msg = form_error.read().clone();
     let pwd_err = password_error.read().clone();
-    let confirm_mismatch_visible =
-        !password_confirm.read().is_empty() && !passwords_match;
+    let confirm_mismatch_visible = !password_confirm.read().is_empty() && !passwords_match;
 
     rsx! {
         div { class: "app-root setup-page",
@@ -402,7 +401,10 @@ mod tests {
             "ts.example.com".into(),
             "K".into(),
         );
-        assert!(req.display_name.is_none(), "empty displayName must serialise as null/missing");
+        assert!(
+            req.display_name.is_none(),
+            "empty displayName must serialise as null/missing"
+        );
     }
 
     #[test]

@@ -22,8 +22,8 @@
 //! 5. Wrap the channel in [`RusshChannel`] and return it.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use russh::client::{self, Handler};
@@ -32,7 +32,7 @@ use russh::keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg};
 use russh::{ChannelMsg, Disconnect};
 use zeroize::Zeroizing;
 
-use super::channel::{looks_like_auth_failure, SshChannel, TransportError};
+use super::channel::{SshChannel, TransportError, looks_like_auth_failure};
 use super::hostkey::HostKeyVerifier;
 
 /// Auth credential supplied with [`RusshConnectParams`]. Variants map
@@ -320,9 +320,7 @@ async fn open_shell_channel(
 /// `params.auth` is not [`RusshAuth::Password`] (shouldn't happen —
 /// [`connect`] dispatches by variant, but the explicit check keeps the
 /// entrypoint safe to call directly).
-pub async fn connect_password(
-    params: RusshConnectParams,
-) -> Result<RusshChannel, TransportError> {
+pub async fn connect_password(params: RusshConnectParams) -> Result<RusshChannel, TransportError> {
     let RusshAuth::Password(ref password) = params.auth else {
         return Err(TransportError::Io(
             "connect_password called with non-password auth variant".into(),
@@ -380,7 +378,7 @@ pub async fn connect_key(params: RusshConnectParams) -> Result<RusshChannel, Tra
         Err(e) => {
             return Err(TransportError::Io(format!(
                 "ssh private key parse failed: {e}"
-            )))
+            )));
         }
     };
     if private_key.is_encrypted() {
@@ -453,7 +451,7 @@ pub async fn connect_agent(params: RusshConnectParams) -> Result<RusshChannel, T
                 return Err(TransportError::Io(format!(
                     "ssh-agent connect to {} failed: {e}",
                     socket_path.display()
-                )))
+                )));
             }
         };
 
@@ -462,7 +460,7 @@ pub async fn connect_agent(params: RusshConnectParams) -> Result<RusshChannel, T
         Err(e) => {
             return Err(TransportError::Io(format!(
                 "ssh-agent request_identities failed: {e}"
-            )))
+            )));
         }
     };
     if identities.is_empty() {

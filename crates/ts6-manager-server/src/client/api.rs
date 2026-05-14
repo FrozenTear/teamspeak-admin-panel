@@ -204,11 +204,7 @@ where
 }
 
 /// `DELETE {base}{path}` with refresh-gating. 204 → `Ok(())`.
-pub async fn authorized_delete(
-    gate: &RefreshGate,
-    base: &str,
-    path: &str,
-) -> Result<(), ApiError> {
+pub async fn authorized_delete(gate: &RefreshGate, base: &str, path: &str) -> Result<(), ApiError> {
     let (status, body) = gate
         .run(|snap| {
             let base = base.to_owned();
@@ -235,8 +231,8 @@ where
     B: serde::Serialize + ?Sized,
     T: DeserializeOwned,
 {
-    let body_string = serde_json::to_string(body)
-        .map_err(|e| ApiError::Deserialise(e.to_string()))?;
+    let body_string =
+        serde_json::to_string(body).map_err(|e| ApiError::Deserialise(e.to_string()))?;
     let (status, body) = gate
         .run(|snap| {
             let base = base.to_owned();
@@ -257,14 +253,16 @@ where
 /// success when `T = ()`, and any 2xx body is parsed as JSON otherwise.
 /// Non-2xx responses go through [`classify_response`] for the spec §7.0.2
 /// error-envelope handling.
-pub(crate) fn classify_maybe_empty<T: DeserializeOwned>(status: u16, body: &str) -> Result<T, ApiError> {
+pub(crate) fn classify_maybe_empty<T: DeserializeOwned>(
+    status: u16,
+    body: &str,
+) -> Result<T, ApiError> {
     if (200..300).contains(&status) {
         if status == 204 || body.trim().is_empty() {
             // For T = () this resolves to Ok(()). For typed payloads this
             // is a programmer error — the route should have returned a
             // body — so a deserialise failure here is the right surface.
-            return serde_json::from_str("null")
-                .map_err(|e| ApiError::Deserialise(e.to_string()));
+            return serde_json::from_str("null").map_err(|e| ApiError::Deserialise(e.to_string()));
         }
         return serde_json::from_str(body).map_err(|e| ApiError::Deserialise(e.to_string()));
     }
@@ -275,7 +273,10 @@ pub(crate) fn classify_maybe_empty<T: DeserializeOwned>(status: u16, body: &str)
 /// envelope rules. Pulled out as a free function so it can be unit-tested
 /// without touching `gloo-net`, and reused by the unauth setup module which
 /// inherits the same `{error}`-envelope contract for non-2xx responses.
-pub(crate) fn classify_response<T: DeserializeOwned>(status: u16, body: &str) -> Result<T, ApiError> {
+pub(crate) fn classify_response<T: DeserializeOwned>(
+    status: u16,
+    body: &str,
+) -> Result<T, ApiError> {
     if (200..300).contains(&status) {
         return serde_json::from_str(body).map_err(|e| ApiError::Deserialise(e.to_string()));
     }
@@ -481,8 +482,8 @@ mod tests {
 
     #[test]
     fn classify_5xx_lands_in_server_variant() {
-        let err = classify_response::<Demo>(500, r#"{"error":"Internal server error"}"#)
-            .unwrap_err();
+        let err =
+            classify_response::<Demo>(500, r#"{"error":"Internal server error"}"#).unwrap_err();
         match err {
             ApiError::Server { status, message } => {
                 assert_eq!(status, 500);

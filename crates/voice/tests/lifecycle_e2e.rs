@@ -36,13 +36,13 @@ use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use bot_lib::{
-    spawn_bot, BotCommand, BotConfig, BotEvent, BotId, BotState, DisconnectKind,
-    InMemoryMusicBotStore, MusicBotStore,
+    BotCommand, BotConfig, BotEvent, BotId, BotState, DisconnectKind, InMemoryMusicBotStore,
+    MusicBotStore, spawn_bot,
 };
 use tokio::sync::broadcast;
-use tokio::time::{timeout, Instant};
+use tokio::time::{Instant, timeout};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 const EVENT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -64,10 +64,9 @@ mod music_bot {
 
         let _ = tracing_subscriber::fmt()
             .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| {
-                        "info,music_bot=debug,tsclientlib=warn,tsproto=warn".into()
-                    }),
+                tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                    "info,music_bot=debug,tsclientlib=warn,tsproto=warn".into()
+                }),
             )
             .with_test_writer()
             .try_init();
@@ -84,8 +83,7 @@ mod music_bot {
 }
 
 async fn run() -> Result<()> {
-    let addr =
-        env::var("TS6_VOICE_FIXTURE_ADDR").unwrap_or_else(|_| "127.0.0.1:9987".to_string());
+    let addr = env::var("TS6_VOICE_FIXTURE_ADDR").unwrap_or_else(|_| "127.0.0.1:9987".to_string());
     let workdir = std::env::temp_dir().join("music-bot-lifecycle-e2e");
     let identity_path = workdir.join("identity.json");
 
@@ -130,9 +128,7 @@ async fn run() -> Result<()> {
         None => bail!("event stream ended before JoinedChannel"),
     };
     if first_channel != default_channel {
-        bail!(
-            "first JoinedChannel reports {first_channel}, expected default {default_channel}"
-        );
+        bail!("first JoinedChannel reports {first_channel}, expected default {default_channel}");
     }
 
     // 3. Drive a JoinChannel(default) — server treats this as a no-op
@@ -172,15 +168,15 @@ async fn run() -> Result<()> {
     .await
     .context("waiting for Disconnected")?;
     let kind = observed_disconnect.context("event stream ended before Disconnected")?;
-    if !matches!(kind, DisconnectKind::ShutdownRequested | DisconnectKind::Clean) {
+    if !matches!(
+        kind,
+        DisconnectKind::ShutdownRequested | DisconnectKind::Clean
+    ) {
         bail!("unexpected disconnect kind on shutdown: {kind:?}");
     }
 
     // 6. Actor task exits cleanly — `shutdown` joins it.
-    handle
-        .shutdown()
-        .await
-        .context("BotHandle::shutdown")?;
+    handle.shutdown().await.context("BotHandle::shutdown")?;
 
     Ok(())
 }
@@ -189,10 +185,7 @@ async fn run() -> Result<()> {
 /// `Some(t)` (success) or the stream ends. A bounded outer timeout
 /// prevents stalls; per-call wait timeout converts `RecvError::Lagged`
 /// to a continued wait so a slow predicate doesn't tank the run.
-async fn wait_for<T, F>(
-    rx: &mut broadcast::Receiver<BotEvent>,
-    mut pred: F,
-) -> Result<Option<T>>
+async fn wait_for<T, F>(rx: &mut broadcast::Receiver<BotEvent>, mut pred: F) -> Result<Option<T>>
 where
     F: FnMut(&BotEvent) -> Option<T>,
 {

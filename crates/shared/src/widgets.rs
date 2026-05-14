@@ -28,13 +28,29 @@ pub struct CreateWidgetRequest {
     pub virtual_server_id: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
-    #[serde(rename = "showChannelTree", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "showChannelTree",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub show_channel_tree: Option<bool>,
-    #[serde(rename = "showClients", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "showClients",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub show_clients: Option<bool>,
-    #[serde(rename = "hideEmptyChannels", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "hideEmptyChannels",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub hide_empty_channels: Option<bool>,
-    #[serde(rename = "maxChannelDepth", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "maxChannelDepth",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub max_channel_depth: Option<i64>,
 }
 
@@ -48,13 +64,29 @@ pub struct UpdateWidgetRequest {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
-    #[serde(rename = "showChannelTree", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "showChannelTree",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub show_channel_tree: Option<bool>,
-    #[serde(rename = "showClients", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "showClients",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub show_clients: Option<bool>,
-    #[serde(rename = "hideEmptyChannels", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "hideEmptyChannels",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub hide_empty_channels: Option<bool>,
-    #[serde(rename = "maxChannelDepth", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "maxChannelDepth",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub max_channel_depth: Option<i64>,
 }
 

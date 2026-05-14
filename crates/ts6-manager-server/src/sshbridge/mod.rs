@@ -79,11 +79,11 @@ pub use channel::{SshChannel, TransportError};
 #[allow(unused_imports)]
 pub use hostkey::{HostKeyConfigError, HostKeyPolicy, HostKeyVerifier};
 #[allow(unused_imports)]
-pub use russh_channel::{connect_password, RusshChannel, RusshConnectParams};
+pub use russh_channel::{RusshChannel, RusshConnectParams, connect_password};
 #[allow(unused_imports)]
 pub use transport::{
-    next_backoff, spawn as spawn_transport, spawn_with_db as spawn_transport_with_db,
-    CommandOutcome, SessionResult, TransportConfig, TransportHandle,
+    CommandOutcome, SessionResult, TransportConfig, TransportHandle, next_backoff,
+    spawn as spawn_transport, spawn_with_db as spawn_transport_with_db,
 };
 
 use reqwest::StatusCode;

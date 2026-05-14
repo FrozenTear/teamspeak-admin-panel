@@ -76,7 +76,10 @@ async fn add(
     let stored = state
         .music_bots
         .supervisor
-        .library_add(bot_id_from_wire(body.bot), new_library_entry_from_wire(body.entry))
+        .library_add(
+            bot_id_from_wire(body.bot),
+            new_library_entry_from_wire(body.entry),
+        )
         .await
         .map_err(translate_store_error)?;
     Ok((StatusCode::CREATED, Json(library_entry_to_wire(&stored))))

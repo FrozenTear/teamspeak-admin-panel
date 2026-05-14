@@ -198,7 +198,10 @@ mod tests {
     /// silently leave Dashboard highlighted on a different page.
     #[test]
     fn active_derivation_only_matches_dashboard_route() {
-        let active = matches!(Route::DashboardPlaceholder {}, Route::DashboardPlaceholder {});
+        let active = matches!(
+            Route::DashboardPlaceholder {},
+            Route::DashboardPlaceholder {}
+        );
         assert!(active);
         let other = matches!(
             Route::LoginPage { next: None },
@@ -309,7 +312,10 @@ mod tests {
         // the SSR output — multiple would mean two nav items (or the brand)
         // are claiming current-page state, which confuses screen readers.
         let count = html.matches(r#"aria-current="page""#).count();
-        assert_eq!(count, 1, "expected aria-current='page' once, got {count} in {html}");
+        assert_eq!(
+            count, 1,
+            "expected aria-current='page' once, got {count} in {html}"
+        );
     }
 
     #[test]
@@ -345,7 +351,10 @@ mod tests {
         let tabindex_minus = html.matches(r#"tabindex="-1""#).count();
         // 10 placeholders + the `<nav>` itself carries `tabindex=-1` for
         // the skip-link target, so 11 total `tabindex="-1"` attributes.
-        assert_eq!(disabled, 10, "expected 10 aria-disabled placeholders, got {disabled}");
+        assert_eq!(
+            disabled, 10,
+            "expected 10 aria-disabled placeholders, got {disabled}"
+        );
         assert_eq!(
             tabindex_minus, 11,
             "expected 11 tabindex='-1' (10 placeholders + nav landmark), got {tabindex_minus}"

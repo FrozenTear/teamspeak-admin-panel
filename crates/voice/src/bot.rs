@@ -27,8 +27,8 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 use tsclientlib::{
-    events::Event as BookEvent, ChannelId as TsChannelId, ClientId, Connection,
-    DisconnectOptions, MessageTarget, Reason, StreamItem,
+    ChannelId as TsChannelId, ClientId, Connection, DisconnectOptions, MessageTarget, Reason,
+    StreamItem, events::Event as BookEvent,
 };
 // `OutCommandExt::send` is the dispatch sink for any `Out…Part` message
 // produced by the generated book→messages helpers (`client_move`, etc.).
@@ -188,11 +188,14 @@ pub(crate) async fn run_bot(
                     }
                     Err(err) => {
                         error!(?err, "handshake failed");
-                        let _ = events.send(BotEvent::Error(BotError::Connection(format!(
-                            "{err:#}"
-                        ))));
+                        let _ =
+                            events.send(BotEvent::Error(BotError::Connection(format!("{err:#}"))));
                         if let Some(delay) = backoff.next_delay() {
-                            info!(?delay, attempt = backoff.attempts(), "handshake retry sleep");
+                            info!(
+                                ?delay,
+                                attempt = backoff.attempts(),
+                                "handshake retry sleep"
+                            );
                             tokio::time::sleep(delay).await;
                             // Stay in Connecting.
                             continue 'outer;
@@ -597,9 +600,7 @@ fn send_channel_move(con: &mut Connection, target: ChannelId) -> Result<()> {
 /// Run the handshake. On success returns the live connection plus the
 /// initial channel ID and the bot's own client ID for the
 /// `BotEvent::Connected` payload.
-async fn attempt_connect(
-    config: &BotConfig,
-) -> Result<(Connection, ClientId, ChannelId)> {
+async fn attempt_connect(config: &BotConfig) -> Result<(Connection, ClientId, ChannelId)> {
     let identity = load_or_create_identity(&config.identity_path)
         .await
         .context("load_or_create_identity")?;
@@ -629,8 +630,7 @@ async fn attempt_connect(
     // `InitServer`. Drive the event stream briefly until the entry
     // shows up so callers always get an authoritative `default_channel`
     // (`channeltree.rs` upstream sleeps 1 s for the same reason).
-    let (own_id, default_channel) =
-        wait_for_own_client(&mut con, Duration::from_secs(2)).await?;
+    let (own_id, default_channel) = wait_for_own_client(&mut con, Duration::from_secs(2)).await?;
 
     Ok((con, own_id, default_channel))
 }
@@ -728,7 +728,11 @@ fn emit_rejected(events: &broadcast::Sender<BotEvent>, cmd: &BotCommand, state: 
         BotCommand::Audio(_) => "Audio",
         BotCommand::Queue(_) => "Queue",
     };
-    warn!(command = label, ?state, "command rejected for current state");
+    warn!(
+        command = label,
+        ?state,
+        "command rejected for current state"
+    );
     let _ = events.send(BotEvent::Error(BotError::CommandRejected {
         command: label.into(),
         state,
@@ -747,7 +751,11 @@ async fn handle_queue_command(
 ) {
     match cmd {
         QueueCommand::Enqueue(track) => {
-            let was_empty = store.queue_peek(bot_id).await.map(|q| q.is_empty()).unwrap_or(false);
+            let was_empty = store
+                .queue_peek(bot_id)
+                .await
+                .map(|q| q.is_empty())
+                .unwrap_or(false);
             match store.queue_enqueue(bot_id, track).await {
                 Ok(track) => {
                     emit_queue_changed(store, bot_id, events).await;
@@ -759,7 +767,11 @@ async fn handle_queue_command(
             }
         }
         QueueCommand::EnqueuePlaylist(name) => {
-            let was_empty = store.queue_peek(bot_id).await.map(|q| q.is_empty()).unwrap_or(false);
+            let was_empty = store
+                .queue_peek(bot_id)
+                .await
+                .map(|q| q.is_empty())
+                .unwrap_or(false);
             match store.enqueue_playlist(bot_id, &name).await {
                 Ok(stamped) => {
                     emit_queue_changed(store, bot_id, events).await;
@@ -787,7 +799,12 @@ async fn handle_queue_command(
             }
         }
         QueueCommand::Reorder(order) => {
-            let head_before = store.queue_current(bot_id).await.ok().flatten().map(|t| t.id);
+            let head_before = store
+                .queue_current(bot_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|t| t.id);
             match store.queue_reorder(bot_id, order).await {
                 Ok(()) => {
                     emit_queue_changed(store, bot_id, events).await;
@@ -819,15 +836,13 @@ async fn handle_queue_command(
                 Err(err) => emit_store_error(events, "queue_clear", err),
             }
         }
-        QueueCommand::Advance => {
-            match store.queue_dequeue_head(bot_id).await {
-                Ok(_popped) => {
-                    emit_queue_changed(store, bot_id, events).await;
-                    emit_head_change(store, bot_id, events).await;
-                }
-                Err(err) => emit_store_error(events, "queue_dequeue_head", err),
+        QueueCommand::Advance => match store.queue_dequeue_head(bot_id).await {
+            Ok(_popped) => {
+                emit_queue_changed(store, bot_id, events).await;
+                emit_head_change(store, bot_id, events).await;
             }
-        }
+            Err(err) => emit_store_error(events, "queue_dequeue_head", err),
+        },
     }
 }
 
@@ -862,11 +877,7 @@ async fn emit_head_change(
     }
 }
 
-fn emit_store_error(
-    events: &broadcast::Sender<BotEvent>,
-    op: &str,
-    err: StoreError,
-) {
+fn emit_store_error(events: &broadcast::Sender<BotEvent>, op: &str, err: StoreError) {
     warn!(op, ?err, "store op failed");
     let _ = events.send(BotEvent::Error(BotError::Store {
         op: op.into(),
@@ -886,7 +897,10 @@ fn emit_audio_stub(events: &broadcast::Sender<BotEvent>, cmd: &AudioCommand) {
         // The wired-up commands should never land here; if they do,
         // it's a routing bug — log loudly.
         other => {
-            error!(?other, "emit_audio_stub reached for a wired audio command — routing bug");
+            error!(
+                ?other,
+                "emit_audio_stub reached for a wired audio command — routing bug"
+            );
             format!("{other:?}")
         }
     };

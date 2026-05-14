@@ -109,14 +109,18 @@ pub fn parse(line: &str) -> Result<ParsedCommand, ParseError> {
             if rest.is_empty() {
                 Err(ParseError::MissingArg { verb: "radio" })
             } else {
-                Ok(ParsedCommand::Radio { arg: rest.to_string() })
+                Ok(ParsedCommand::Radio {
+                    arg: rest.to_string(),
+                })
             }
         }
         "play" => {
             if rest.is_empty() {
                 Err(ParseError::MissingArg { verb: "play" })
             } else {
-                Ok(ParsedCommand::Play { arg: rest.to_string() })
+                Ok(ParsedCommand::Play {
+                    arg: rest.to_string(),
+                })
             }
         }
         "stop" => Ok(ParsedCommand::Stop),
@@ -127,16 +131,15 @@ pub fn parse(line: &str) -> Result<ParsedCommand, ParseError> {
             if rest.is_empty() {
                 return Err(ParseError::MissingArg { verb: "vol" });
             }
-            let parsed: Option<u8> = rest.parse::<u32>().ok().and_then(|n| {
-                if n <= 100 {
-                    Some(n as u8)
-                } else {
-                    None
-                }
-            });
+            let parsed: Option<u8> = rest
+                .parse::<u32>()
+                .ok()
+                .and_then(|n| if n <= 100 { Some(n as u8) } else { None });
             match parsed {
                 Some(v) => Ok(ParsedCommand::Volume(v)),
-                None => Err(ParseError::BadVolume { got: rest.to_string() }),
+                None => Err(ParseError::BadVolume {
+                    got: rest.to_string(),
+                }),
             }
         }
         "np" => Ok(ParsedCommand::NowPlaying),
@@ -214,7 +217,10 @@ async fn handle_radio(
         warn!(?err, "queue_clear during !radio");
         return format!("radio failed: {err}");
     }
-    let _ = events.send(BotEvent::QueueChanged { len: 0, current: None });
+    let _ = events.send(BotEvent::QueueChanged {
+        len: 0,
+        current: None,
+    });
     let _ = events.send(BotEvent::QueueEmpty);
     match store.queue_enqueue(bot_id, track).await {
         Ok(stored) => {
@@ -283,7 +289,10 @@ async fn handle_stop(
         .unwrap_or(false);
     match store.queue_clear(bot_id).await {
         Ok(()) => {
-            let _ = events.send(BotEvent::QueueChanged { len: 0, current: None });
+            let _ = events.send(BotEvent::QueueChanged {
+                len: 0,
+                current: None,
+            });
             if was_non_empty {
                 let _ = events.send(BotEvent::QueueEmpty);
             }
@@ -361,7 +370,9 @@ async fn resolve_source(
         match store.library_list(bot_id, None).await {
             Ok(entries) => {
                 let lc = arg.to_ascii_lowercase();
-                let hit = entries.into_iter().find(|e| e.title.to_ascii_lowercase() == lc);
+                let hit = entries
+                    .into_iter()
+                    .find(|e| e.title.to_ascii_lowercase() == lc);
                 match hit {
                     Some(entry) => {
                         let source = match &entry.source {
@@ -419,9 +430,9 @@ fn send_reply(con: &mut Connection, line: &str) {
 /// `emit_audio_stub` so REST/UI subscribers see the same surface whether
 /// the command was dispatched from chat or from the supervisor.
 fn emit_audio_stub_event(events: &broadcast::Sender<BotEvent>, label: &str) {
-    let _ = events.send(BotEvent::Error(crate::event::BotError::AudioNotImplemented(
-        label.to_string(),
-    )));
+    let _ = events.send(BotEvent::Error(
+        crate::event::BotError::AudioNotImplemented(label.to_string()),
+    ));
 }
 
 #[cfg(test)]
@@ -456,10 +467,16 @@ mod parser_tests {
 
     #[test]
     fn radio_play_missing_arg() {
-        assert_eq!(parse("!radio"), Err(ParseError::MissingArg { verb: "radio" }));
+        assert_eq!(
+            parse("!radio"),
+            Err(ParseError::MissingArg { verb: "radio" })
+        );
         assert_eq!(parse("!play"), Err(ParseError::MissingArg { verb: "play" }));
         // Bare verb with trailing spaces is also a missing-arg.
-        assert_eq!(parse("!radio   "), Err(ParseError::MissingArg { verb: "radio" }));
+        assert_eq!(
+            parse("!radio   "),
+            Err(ParseError::MissingArg { verb: "radio" })
+        );
     }
 
     #[test]
@@ -467,9 +484,18 @@ mod parser_tests {
         assert_eq!(parse("!vol 0"), Ok(ParsedCommand::Volume(0)));
         assert_eq!(parse("!vol 50"), Ok(ParsedCommand::Volume(50)));
         assert_eq!(parse("!vol 100"), Ok(ParsedCommand::Volume(100)));
-        assert_eq!(parse("!vol 101"), Err(ParseError::BadVolume { got: "101".into() }));
-        assert_eq!(parse("!vol abc"), Err(ParseError::BadVolume { got: "abc".into() }));
-        assert_eq!(parse("!vol -5"), Err(ParseError::BadVolume { got: "-5".into() }));
+        assert_eq!(
+            parse("!vol 101"),
+            Err(ParseError::BadVolume { got: "101".into() })
+        );
+        assert_eq!(
+            parse("!vol abc"),
+            Err(ParseError::BadVolume { got: "abc".into() })
+        );
+        assert_eq!(
+            parse("!vol -5"),
+            Err(ParseError::BadVolume { got: "-5".into() })
+        );
         assert_eq!(parse("!vol"), Err(ParseError::MissingArg { verb: "vol" }));
     }
 

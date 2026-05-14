@@ -81,11 +81,7 @@ pub async fn list_for_music_bot(db: &Database, music_bot_id: i64) -> Result<Vec<
 
 /// Stamp the closing fields. `endedAt` is set to now(); `peakViewers`
 /// records the high-water mark observed during the session.
-pub async fn finish(
-    db: &Database,
-    id: i64,
-    peak_viewers: i64,
-) -> Result<Option<StreamSession>> {
+pub async fn finish(db: &Database, id: i64, peak_viewers: i64) -> Result<Option<StreamSession>> {
     let sql = format!(
         "UPDATE type::record('stream_session', $id) MERGE {{
             endedAt: time::now(),

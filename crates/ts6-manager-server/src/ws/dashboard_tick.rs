@@ -304,11 +304,11 @@ mod tests {
     use crate::control::{ControlBackend, ControlBackendError, ControlResult};
     use crate::db::{connect_in_memory, migrations};
     use crate::repos::server_connections::NewServerConnection;
+    use crate::webquery::BanAddParams;
     use crate::webquery::models::{
         BanEntry, ChannelEntry, ClientDbEntry, ClientEntry, ClientInfo, ConnectionInfo, LogEntry,
         ServerInfo, VersionInfo, VirtualServerEntry,
     };
-    use crate::webquery::BanAddParams;
     use crate::ws::auth::{Principal, UserPrincipal};
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -358,7 +358,8 @@ mod tests {
             unimplemented!("not used by dashboard fetch")
         }
         async fn serverinfo(&self, _sid: i64) -> ControlResult<ServerInfo> {
-            let n = self.fail_calls.load(Ordering::SeqCst) + self.success_calls.load(Ordering::SeqCst);
+            let n =
+                self.fail_calls.load(Ordering::SeqCst) + self.success_calls.load(Ordering::SeqCst);
             if n < self.fail_first_n {
                 self.fail_calls.fetch_add(1, Ordering::SeqCst);
                 return Err(ControlBackendError::Upstream {
@@ -494,9 +495,7 @@ mod tests {
     }
 
     async fn boot(deps: TickerDeps, fake: Arc<FakeBackend>, config_id: i64) -> DashboardTickHandle {
-        deps.control
-            .insert_for_test(config_id, fake.clone())
-            .await;
+        deps.control.insert_for_test(config_id, fake.clone()).await;
         spawn(deps)
     }
 
@@ -670,16 +669,11 @@ mod tests {
         let hub = Hub::new();
         let control = ControlBackendPool::new(false, db.clone());
         let fake = Arc::new(FakeBackend::default());
-        control
-            .insert_for_test(connection.id, fake.clone())
-            .await;
+        control.insert_for_test(connection.id, fake.clone()).await;
 
         let admin = admin_principal();
         let topic = Topic::new(connection.id, TopicKind::Clients);
-        let mut sub = hub
-            .subscribe(&db, &admin, topic, None)
-            .await
-            .unwrap();
+        let mut sub = hub.subscribe(&db, &admin, topic, None).await.unwrap();
 
         let handle = spawn(TickerDeps {
             db: db.clone(),

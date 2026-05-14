@@ -167,8 +167,8 @@ const USER_PROJECTION: &str = "
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::{server_connections, users};
+    use super::*;
     use crate::db::{connect_in_memory, migrations};
 
     fn user_input(name: &str) -> NewUser {
@@ -208,11 +208,13 @@ mod tests {
     /// below so we can exercise the second-statement-fails branch without
     /// reaching for runtime fault-injection scaffolding.
     async fn add_unique_host_index(db: &Database) {
-        db.query("DEFINE INDEX server_connection_host_unique ON server_connection FIELDS host UNIQUE;")
-            .await
-            .unwrap()
-            .check()
-            .unwrap();
+        db.query(
+            "DEFINE INDEX server_connection_host_unique ON server_connection FIELDS host UNIQUE;",
+        )
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
     }
 
     #[tokio::test]
@@ -279,10 +281,7 @@ mod tests {
             .unwrap();
         assert_eq!(server.controlPath, "ssh");
         assert_eq!(server.sshAuthMethod, "key");
-        assert_eq!(
-            server.sshPrivateKey.as_deref(),
-            Some("enc:ignored:sshkey")
-        );
+        assert_eq!(server.sshPrivateKey.as_deref(), Some("enc:ignored:sshkey"));
         assert_eq!(
             server.sshHostKeyFingerprint.as_deref(),
             Some("SHA256:examplebase64")
@@ -293,10 +292,7 @@ mod tests {
             .unwrap()
             .expect("server row must be readable after init");
         assert_eq!(stored.sshAuthMethod, "key");
-        assert_eq!(
-            stored.sshPrivateKey.as_deref(),
-            Some("enc:ignored:sshkey")
-        );
+        assert_eq!(stored.sshPrivateKey.as_deref(), Some("enc:ignored:sshkey"));
     }
 
     /// PURA-99 — when the wizard omits the new fields the row falls
@@ -361,12 +357,9 @@ mod tests {
 
         // Seed the conflicting host so the second CREATE inside the
         // transaction fails on the unique index.
-        server_connections::insert(
-            &db,
-            server_input("PreExisting", "ts.example.com"),
-        )
-        .await
-        .unwrap();
+        server_connections::insert(&db, server_input("PreExisting", "ts.example.com"))
+            .await
+            .unwrap();
 
         let res = init_admin_and_first_server(
             &db,
@@ -403,12 +396,9 @@ mod tests {
         migrations::run(&db).await.unwrap();
         add_unique_host_index(&db).await;
 
-        server_connections::insert(
-            &db,
-            server_input("PreExisting", "ts.example.com"),
-        )
-        .await
-        .unwrap();
+        server_connections::insert(&db, server_input("PreExisting", "ts.example.com"))
+            .await
+            .unwrap();
 
         // First attempt fails on the duplicate host.
         let first = init_admin_and_first_server(

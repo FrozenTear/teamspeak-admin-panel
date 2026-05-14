@@ -14,9 +14,7 @@ use crate::client::api::{self, ApiError};
 use crate::client::session::RefreshGate;
 
 /// `GET /api/video-sources` — the caller-visible row list.
-pub async fn list_sources(
-    gate: Arc<RefreshGate>,
-) -> Result<Vec<wire::VideoSourceView>, ApiError> {
+pub async fn list_sources(gate: Arc<RefreshGate>) -> Result<Vec<wire::VideoSourceView>, ApiError> {
     api::authorized_get_json::<Vec<wire::VideoSourceView>>(
         &gate,
         &api::api_base(),

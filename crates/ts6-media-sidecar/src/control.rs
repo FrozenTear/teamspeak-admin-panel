@@ -28,10 +28,10 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 use ts6_ssrf::{Resolver, SsrfError, is_url_allowed};
 
+use crate::origin::SidecarOrigin;
 use crate::pipeline::{
     Pipeline, PipelineConfig, PipelineMetrics, SourceInput, TRACK_AUDIO, TRACK_VIDEO,
 };
-use crate::origin::SidecarOrigin;
 use crate::preset::QualityPreset;
 
 /// HTTP-side shared state for the WS-3 mutating endpoints. Cheap to
@@ -69,7 +69,9 @@ impl PipelineRegistry {
 
     pub async fn lookup_track(&self, source_id: &str) -> Option<TrackDescriptor> {
         let guard = self.inner.read().await;
-        guard.get(source_id).map(|_| TrackDescriptor::for_source(source_id))
+        guard
+            .get(source_id)
+            .map(|_| TrackDescriptor::for_source(source_id))
     }
 }
 
@@ -152,11 +154,7 @@ pub struct TrackStatsSnapshot {
 }
 
 impl SourceStatsSnapshot {
-    fn from_pipeline(
-        source_id: &str,
-        preset: QualityPreset,
-        metrics: &PipelineMetrics,
-    ) -> Self {
+    fn from_pipeline(source_id: &str, preset: QualityPreset, metrics: &PipelineMetrics) -> Self {
         Self {
             source_id: source_id.to_string(),
             preset,
@@ -382,8 +380,7 @@ fn invalid_source_id(id: &str) -> Option<String> {
         c == '/' || c == '\\' || c == '?' || c == '#' || c.is_whitespace() || c.is_control()
     }) {
         return Some(
-            "source_id may not contain slashes, '?', '#', whitespace, or control characters"
-                .into(),
+            "source_id may not contain slashes, '?', '#', whitespace, or control characters".into(),
         );
     }
     if id == "." || id == ".." {
@@ -440,8 +437,8 @@ mod tests {
     // immediately exit with "IVF stream EOF before header".
     #[tokio::test]
     async fn pinned_url_preserves_https_hostname_for_cdn_sources() {
-        let resolver = MockResolver::new()
-            .with("download.samplelib.com", vec![ip("188.227.84.172")]);
+        let resolver =
+            MockResolver::new().with("download.samplelib.com", vec![ip("188.227.84.172")]);
         let pinned = is_url_allowed(
             "https://download.samplelib.com/mp4/sample-5s.mp4",
             &resolver,

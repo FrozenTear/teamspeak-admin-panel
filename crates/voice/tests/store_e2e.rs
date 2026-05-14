@@ -21,8 +21,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use music_bot::{
-    spawn_bot, BotCommand, BotConfig, BotEvent, BotId, InMemoryMusicBotStore, MusicBotStore,
-    NewTrack, QueueCommand,
+    BotCommand, BotConfig, BotEvent, BotId, InMemoryMusicBotStore, MusicBotStore, NewTrack,
+    QueueCommand, spawn_bot,
 };
 use tokio::sync::broadcast;
 use tokio::time::timeout;
@@ -108,12 +108,21 @@ async fn enqueue_three_advance_head_restart_restore() {
     // Assertion: the queue has 2 tracks with title "b" as the head
     // (next-up), title "c" as the tail.
     let queue = store_b.queue_peek(id).await.unwrap();
-    assert_eq!(queue.len(), 2, "expected queue len 2 after restart, got {}", queue.len());
+    assert_eq!(
+        queue.len(),
+        2,
+        "expected queue len 2 after restart, got {}",
+        queue.len()
+    );
     assert_eq!(queue[0].title, "b", "head should be track b post-advance");
     assert_eq!(queue[1].title, "c", "tail should be track c");
 
     let current = store_b.queue_current(id).await.unwrap();
-    assert_eq!(current.unwrap().title, "b", "next-up still pointed at track b");
+    assert_eq!(
+        current.unwrap().title,
+        "b",
+        "next-up still pointed at track b"
+    );
 }
 
 #[tokio::test]
@@ -136,7 +145,10 @@ async fn enqueue_emits_queue_changed_and_now_playing_on_first_track() {
 
     let len = next_match(&mut events, |ev| match ev {
         BotEvent::QueueChanged { len, current } => {
-            assert!(current.is_some(), "current should be Some after first enqueue");
+            assert!(
+                current.is_some(),
+                "current should be Some after first enqueue"
+            );
             Some(*len)
         }
         _ => None,
@@ -213,8 +225,10 @@ async fn advance_emits_now_playing_then_queue_empty_on_drain() {
     .expect("QueueChanged after Advance");
     assert_eq!(len, 0);
 
-    let drained = next_match(&mut events, |ev| matches!(ev, BotEvent::QueueEmpty).then_some(()))
-        .await;
+    let drained = next_match(&mut events, |ev| {
+        matches!(ev, BotEvent::QueueEmpty).then_some(())
+    })
+    .await;
     assert!(drained.is_some(), "expected QueueEmpty");
 
     handle.shutdown().await.unwrap();

@@ -15,9 +15,7 @@
 //!    inline `Banner` with a spec-verbatim error string.
 
 use dioxus::prelude::*;
-use ts6_manager_shared::auth::{
-    LoginRequest, UserInfo, auth_error_strings as msg,
-};
+use ts6_manager_shared::auth::{LoginRequest, UserInfo, auth_error_strings as msg};
 
 use crate::client::auth::{self, AuthError};
 use crate::client::dioxus::use_session;

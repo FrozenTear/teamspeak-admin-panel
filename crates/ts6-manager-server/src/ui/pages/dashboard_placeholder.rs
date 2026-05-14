@@ -452,7 +452,10 @@ mod tests {
             details: Some("".into()),
         };
         let (_, body) = error_copy(&err);
-        assert!(!body.contains(": "), "empty details slipped into body: {body}");
+        assert!(
+            !body.contains(": "),
+            "empty details slipped into body: {body}"
+        );
     }
 
     #[test]

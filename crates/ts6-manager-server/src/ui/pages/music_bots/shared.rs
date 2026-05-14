@@ -147,8 +147,17 @@ mod tests {
         // Connected + InChannel share an "idle" badge — the bot is on
         // the server but not yet pumping audio. Playing is its own
         // class so the row pops once playback is live.
-        assert_eq!(state_badge_class(wire::BotState::Connected), state_badge_class(wire::BotState::InChannel));
-        assert_ne!(state_badge_class(wire::BotState::Playing), state_badge_class(wire::BotState::Connected));
-        assert_ne!(state_badge_class(wire::BotState::Disconnected), state_badge_class(wire::BotState::Connecting));
+        assert_eq!(
+            state_badge_class(wire::BotState::Connected),
+            state_badge_class(wire::BotState::InChannel)
+        );
+        assert_ne!(
+            state_badge_class(wire::BotState::Playing),
+            state_badge_class(wire::BotState::Connected)
+        );
+        assert_ne!(
+            state_badge_class(wire::BotState::Disconnected),
+            state_badge_class(wire::BotState::Connecting)
+        );
     }
 }

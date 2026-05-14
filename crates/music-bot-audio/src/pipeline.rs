@@ -24,10 +24,7 @@ pub struct AudioPipeline {
 impl AudioPipeline {
     /// Spawn the pipeline. The frame receiver is taken once via
     /// [`take_frames`]; events can be subscribed to repeatedly.
-    pub async fn spawn(
-        spec: AudioSourceSpec,
-        cfg: PipelineConfig,
-    ) -> Result<Self, PipelineError> {
+    pub async fn spawn(spec: AudioSourceSpec, cfg: PipelineConfig) -> Result<Self, PipelineError> {
         let source = build_source(spec, &cfg).await?;
         Self::spawn_with_source(source, cfg)
     }
@@ -90,8 +87,7 @@ impl AudioPipeline {
                 let opus = match encoder.encode_frame(&frame_pcm) {
                     Ok(b) => b,
                     Err(e) => {
-                        let _ = events_pub
-                            .send(PipelineEvent::Warning(format!("encode: {e}")));
+                        let _ = events_pub.send(PipelineEvent::Warning(format!("encode: {e}")));
                         continue;
                     }
                 };

@@ -14,9 +14,7 @@ use crate::client::music_bots as mb;
 use crate::client::store::AuthState;
 use crate::ui::components::toast::{ToastVariant, use_toaster};
 use crate::ui::components::{Banner, BannerVariant, Button, ButtonSize, ButtonType, ButtonVariant};
-use crate::ui::pages::music_bots::shared::{
-    format_error, state_badge_class, state_label,
-};
+use crate::ui::pages::music_bots::shared::{format_error, state_badge_class, state_label};
 use crate::ui::routes::Route;
 
 #[component]

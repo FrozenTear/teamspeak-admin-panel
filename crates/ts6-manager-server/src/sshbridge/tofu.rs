@@ -248,7 +248,9 @@ mod tests {
         let db = crate::db::connect_in_memory()
             .await
             .expect("in-memory connect");
-        crate::db::migrations::run(&db).await.expect("migrations run");
+        crate::db::migrations::run(&db)
+            .await
+            .expect("migrations run");
 
         let new = crate::repos::server_connections::NewServerConnection {
             name: "tofu-row".into(),
@@ -305,7 +307,9 @@ mod tests {
         let db = crate::db::connect_in_memory()
             .await
             .expect("in-memory connect");
-        crate::db::migrations::run(&db).await.expect("migrations run");
+        crate::db::migrations::run(&db)
+            .await
+            .expect("migrations run");
 
         let pinned = fresh_fp(7).to_string();
         let new = crate::repos::server_connections::NewServerConnection {

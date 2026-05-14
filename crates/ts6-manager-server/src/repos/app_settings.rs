@@ -70,6 +70,9 @@ pub async fn put(db: &Database, key: &str, value: &str) -> Result<AppSetting> {
 
 pub async fn delete(db: &Database, key: &str) -> Result<()> {
     let sql = "DELETE type::record('app_setting', $key);";
-    db.query(sql).bind(("key", key.to_string())).await?.check()?;
+    db.query(sql)
+        .bind(("key", key.to_string()))
+        .await?
+        .check()?;
     Ok(())
 }

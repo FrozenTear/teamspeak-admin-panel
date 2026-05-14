@@ -44,9 +44,7 @@ fn ffmpeg_available() -> bool {
 #[ignore = "shells out to ffmpeg; run with `cargo test -p music-bot-audio --test fixture_pacing -- --ignored --nocapture`"]
 async fn ffmpeg_fixture_paces_within_tolerance() {
     if !ffmpeg_available() {
-        panic!(
-            "ffmpeg not on PATH — install ffmpeg and re-run. See docs/voice/audio-pipeline.md."
-        );
+        panic!("ffmpeg not on PATH — install ffmpeg and re-run. See docs/voice/audio-pipeline.md.");
     }
 
     let cfg = PipelineConfig {
@@ -96,7 +94,10 @@ async fn ffmpeg_fixture_paces_within_tolerance() {
         assert_eq!(*idx as usize, i, "frame index drift at {i}");
         let expected = Duration::from_millis(20) * i as u32;
         let got = scheduled.duration_since(anchor);
-        assert_eq!(got, expected, "scheduled_at drifted at frame {i}: {got:?} vs {expected:?}");
+        assert_eq!(
+            got, expected,
+            "scheduled_at drifted at frame {i}: {got:?} vs {expected:?}"
+        );
     }
 
     // Per-frame tolerance: actual - scheduled within ±2 ms, ignoring the
@@ -179,7 +180,10 @@ async fn ffmpeg_subprocess_cleanup_on_cancel() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let after = pgrep_fixture();
-    let leaked: Vec<u32> = after.into_iter().filter(|p| !baseline.contains(p)).collect();
+    let leaked: Vec<u32> = after
+        .into_iter()
+        .filter(|p| !baseline.contains(p))
+        .collect();
     assert!(
         leaked.is_empty(),
         "orphan ffmpeg subprocess after cancel: pids {leaked:?}"

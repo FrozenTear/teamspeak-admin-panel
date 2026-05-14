@@ -56,21 +56,20 @@ pub async fn status(base: &str) -> Result<SetupStatusResponse, ApiError> {
 
 /// `POST /api/setup/init` — one-shot admin + first-server creation.
 /// Returns the freshly-created [`SetupInitResponse`] on success.
-pub async fn init(
-    base: &str,
-    req: &SetupInitRequest,
-) -> Result<SetupInitResponse, SetupInitError> {
+pub async fn init(base: &str, req: &SetupInitRequest) -> Result<SetupInitResponse, SetupInitError> {
     match unauth_request_json(base, "POST", "/api/setup/init", Some(req)).await {
         Ok(body) => Ok(body),
-        Err(ApiError::Client { status: 409, message }) if message == ALREADY_INITIALIZED => {
-            Err(SetupInitError::AlreadyInitialized)
-        }
+        Err(ApiError::Client {
+            status: 409,
+            message,
+        }) if message == ALREADY_INITIALIZED => Err(SetupInitError::AlreadyInitialized),
         // 400 from this endpoint is the §6.2.2 weak-password branch — the
         // server returns the spec-verbatim rule message in `error`. Anything
         // else (missing field, malformed JSON) bubbles through as Other.
-        Err(ApiError::Client { status: 400, message }) => {
-            Err(SetupInitError::WeakPassword(message))
-        }
+        Err(ApiError::Client {
+            status: 400,
+            message,
+        }) => Err(SetupInitError::WeakPassword(message)),
         Err(other) => Err(SetupInitError::Other(other)),
     }
 }
@@ -147,7 +146,10 @@ mod tests {
             "already_initialized"
         );
         assert_eq!(
-            format!("{}", SetupInitError::WeakPassword("Password too short".into())),
+            format!(
+                "{}",
+                SetupInitError::WeakPassword("Password too short".into())
+            ),
             "Password too short"
         );
     }
@@ -163,9 +165,10 @@ mod tests {
             message: ALREADY_INITIALIZED.into(),
         };
         let mapped = match raw_409 {
-            ApiError::Client { status: 409, message } if message == ALREADY_INITIALIZED => {
-                SetupInitError::AlreadyInitialized
-            }
+            ApiError::Client {
+                status: 409,
+                message,
+            } if message == ALREADY_INITIALIZED => SetupInitError::AlreadyInitialized,
             other => SetupInitError::Other(other),
         };
         assert!(matches!(mapped, SetupInitError::AlreadyInitialized));
@@ -178,7 +181,10 @@ mod tests {
             message: "Password must be at least 12 characters".into(),
         };
         let mapped = match raw_400 {
-            ApiError::Client { status: 400, message } => SetupInitError::WeakPassword(message),
+            ApiError::Client {
+                status: 400,
+                message,
+            } => SetupInitError::WeakPassword(message),
             other => SetupInitError::Other(other),
         };
         match mapped {
@@ -196,9 +202,10 @@ mod tests {
             message: "something else".into(),
         };
         let mapped = match other_409 {
-            ApiError::Client { status: 409, message } if message == ALREADY_INITIALIZED => {
-                SetupInitError::AlreadyInitialized
-            }
+            ApiError::Client {
+                status: 409,
+                message,
+            } if message == ALREADY_INITIALIZED => SetupInitError::AlreadyInitialized,
             other => SetupInitError::Other(other),
         };
         assert!(matches!(mapped, SetupInitError::Other(_)));

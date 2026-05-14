@@ -38,6 +38,10 @@ impl SidecarOrigin {
         self.broadcasts.read().await.len()
     }
 
+    pub async fn is_empty(&self) -> bool {
+        self.broadcasts.read().await.is_empty()
+    }
+
     /// Snapshot of registered broadcast names. Order is unspecified.
     pub async fn names(&self) -> Vec<String> {
         let mut names: Vec<String> = self.broadcasts.read().await.keys().cloned().collect();
@@ -59,9 +63,7 @@ impl SidecarOrigin {
         }
 
         let producer = Broadcast::new().produce();
-        let published = self
-            .producer
-            .publish_broadcast(name, producer.consume());
+        let published = self.producer.publish_broadcast(name, producer.consume());
         if !published {
             return Err(anyhow!("origin refused to publish '{name}'"));
         }
@@ -123,8 +125,7 @@ mod tests {
         let err = origin
             .unregister_broadcast("ghost")
             .await
-            .err()
-            .expect("unknown must error");
+            .expect_err("unknown must error");
         assert!(err.to_string().contains("not registered"));
     }
 }

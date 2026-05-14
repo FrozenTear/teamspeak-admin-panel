@@ -1,5 +1,9 @@
 # TS6 Manager — Dioxus fullstack server
 # Multi-stage OCI Containerfile (Podman-native; works with any OCI runtime).
+#
+# Multi-arch: builds cleanly under `podman build --platform linux/amd64` and
+# `--platform linux/arm64`; we publish a manifest list spanning both at release
+# time. See docs/ops/images.md for the release procedure.
 
 # -----------------------------------------------------------------------------
 # Stage 1 — build
@@ -8,15 +12,20 @@ FROM docker.io/rust:1.95-slim-bookworm AS builder
 
 WORKDIR /build
 
-# `gcc` / `libc6-dev` come in via `build-essential` and are required for the
-# dioxus-cli build scripts (link step on the wasm bundler). `git` is needed
-# by some transitive build scripts that read the worktree state.
+# Build-time deps:
+#   * `build-essential` — gcc / libc6-dev for the dx bundle link step.
+#   * `pkg-config` / `libssl-dev` — transitive native build.
+#   * `git` — some build scripts read worktree state.
+#   * `cmake` — required by `audiopus_sys` (PURA-154 wired the music-bot
+#                 audio pipeline into ts6-manager-server, which pulls
+#                 audiopus → audiopus_sys → libopus C build via cmake).
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         build-essential \
         pkg-config \
         libssl-dev \
         ca-certificates \
+        cmake \
         git \
  && rm -rf /var/lib/apt/lists/*
 
@@ -65,6 +74,18 @@ RUN apt-get update \
 # `serve_dioxus_application` registered static assets).
 COPY --from=builder /build/target/dx/ts6-manager-server/release/web/server /usr/local/bin/ts6-manager-server
 COPY --from=builder /build/target/dx/ts6-manager-server/release/web/public /usr/local/bin/public
+
+# OCI labels — populated by the release helper (scripts/build-images.sh) via
+# `--build-arg`. Defaults keep the image self-describing even on local builds.
+ARG IMAGE_VERSION=dev
+ARG IMAGE_REVISION=unknown
+ARG IMAGE_SOURCE="https://github.com/teamspeak-heaven/ts6-manager"
+LABEL org.opencontainers.image.title="ts6-manager-fullstack" \
+      org.opencontainers.image.description="TS6 Manager — Dioxus fullstack server (HTTP + WS + REST + SSR/WASM client)" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.source="${IMAGE_SOURCE}" \
+      org.opencontainers.image.version="${IMAGE_VERSION}" \
+      org.opencontainers.image.revision="${IMAGE_REVISION}"
 
 USER ts6:ts6
 WORKDIR /var/lib/ts6-manager

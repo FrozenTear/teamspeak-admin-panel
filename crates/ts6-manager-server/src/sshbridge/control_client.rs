@@ -36,12 +36,12 @@ use serde_json::{Map, Value};
 use tokio::sync::Mutex;
 
 use crate::control::{ControlBackend, ControlBackendError, ControlResult};
+use crate::webquery::BanAddParams;
 use crate::webquery::escape::escape;
 use crate::webquery::models::{
     BanEntry, ChannelEntry, ClientDbEntry, ClientEntry, ClientInfo, ConnectionInfo, LogEntry,
     ServerInfo, VersionInfo, VirtualServerEntry,
 };
-use crate::webquery::BanAddParams;
 
 use super::transport::{CommandOutcome, TransportHandle};
 use super::wire::parse_records;
@@ -142,9 +142,7 @@ impl SshControlClient {
     /// First record (scalar response) — `version`, `serverinfo`,
     /// `serverrequestconnectioninfo`. Empty body yields
     /// `InvalidResponse`.
-    fn parse_first<T: for<'de> serde::Deserialize<'de>>(
-        body_lines: &[String],
-    ) -> ControlResult<T> {
+    fn parse_first<T: for<'de> serde::Deserialize<'de>>(body_lines: &[String]) -> ControlResult<T> {
         let mut records = Self::collect_records(body_lines);
         if records.is_empty() {
             return Err(ControlBackendError::InvalidResponse(
@@ -200,9 +198,7 @@ impl ControlBackend for SshControlClient {
     }
 
     async fn server_connection_info(&self, sid: i64) -> ControlResult<ConnectionInfo> {
-        let outcome = self
-            .run_scoped(sid, "serverrequestconnectioninfo")
-            .await?;
+        let outcome = self.run_scoped(sid, "serverrequestconnectioninfo").await?;
         Self::parse_first(&outcome.body_lines)
     }
 
@@ -315,16 +311,10 @@ impl ControlBackend for SshControlClient {
         }
         let mut line = format!("clientedit clid={clid}");
         if let Some(v) = input_muted {
-            line.push_str(&format!(
-                " CLIENT_INPUT_MUTED={}",
-                if v { 1 } else { 0 }
-            ));
+            line.push_str(&format!(" CLIENT_INPUT_MUTED={}", if v { 1 } else { 0 }));
         }
         if let Some(v) = output_muted {
-            line.push_str(&format!(
-                " CLIENT_OUTPUT_MUTED={}",
-                if v { 1 } else { 0 }
-            ));
+            line.push_str(&format!(" CLIENT_OUTPUT_MUTED={}", if v { 1 } else { 0 }));
         }
         self.run_scoped(sid, &line).await?;
         Ok(())
@@ -406,12 +396,19 @@ mod tests {
     use super::*;
 
     fn record(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(k, v)| ((*k).into(), (*v).into())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).into(), (*v).into()))
+            .collect()
     }
 
     #[test]
     fn parse_record_round_trips_versioninfo() {
-        let r = record(&[("version", "3.13.7"), ("build", "1689000"), ("platform", "Linux")]);
+        let r = record(&[
+            ("version", "3.13.7"),
+            ("build", "1689000"),
+            ("platform", "Linux"),
+        ]);
         let v: VersionInfo = SshControlClient::parse_record(r).unwrap();
         assert_eq!(v.version, "3.13.7");
         assert_eq!(v.build, "1689000");
@@ -524,8 +521,8 @@ mod tests {
         use std::time::Duration;
 
         use crate::sshbridge::hostkey::{HostKeyPolicy, HostKeyVerifier};
-        use crate::sshbridge::russh_channel::{connect_password, RusshConnectParams};
-        use crate::sshbridge::transport::{spawn as spawn_transport, TransportConfig};
+        use crate::sshbridge::russh_channel::{RusshConnectParams, connect_password};
+        use crate::sshbridge::transport::{TransportConfig, spawn as spawn_transport};
 
         let host = std::env::var("TS6_SSH_HOST").unwrap_or_else(|_| "127.0.0.1".into());
         let port: u16 = std::env::var("TS6_SSH_PORT")
@@ -599,9 +596,7 @@ mod tests {
             let u = user_owned.clone();
             let p = pw_owned.clone();
             let v = verifier_clone.clone();
-            async move {
-                connect_password(RusshConnectParams::new_password(42, h, port, u, p, v)).await
-            }
+            async move { connect_password(RusshConnectParams::new_password(42, h, port, u, p, v)).await }
         };
 
         let _ = tracing_subscriber::fmt()

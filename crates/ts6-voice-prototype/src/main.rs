@@ -254,7 +254,10 @@ async fn main() -> Result<()> {
     }
 
     let frames_recv: u64 = summary.iter().map(|(_, n, _)| *n).sum();
-    info!(frames_sent, frames_recv, "ts6-voice-prototype exited cleanly");
+    info!(
+        frames_sent,
+        frames_recv, "ts6-voice-prototype exited cleanly"
+    );
 
     Ok(())
 }
@@ -290,19 +293,12 @@ impl RecvSink {
 
 fn derive_wav_path(stem: &Path, client_id: u16) -> PathBuf {
     let parent = stem.parent().unwrap_or_else(|| Path::new("."));
-    let stem_name = stem
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("voice");
+    let stem_name = stem.file_stem().and_then(|s| s.to_str()).unwrap_or("voice");
     let ext = stem.extension().and_then(|s| s.to_str()).unwrap_or("wav");
     parent.join(format!("{stem_name}.from-{client_id}.{ext}"))
 }
 
-fn handle_event(
-    item: StreamItem,
-    stem: &Path,
-    sinks: &mut HashMap<u16, RecvSink>,
-) -> Result<()> {
+fn handle_event(item: StreamItem, stem: &Path, sinks: &mut HashMap<u16, RecvSink>) -> Result<()> {
     match item {
         StreamItem::Audio(buf) => {
             let audio = buf.data().data();

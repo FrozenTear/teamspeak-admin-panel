@@ -17,7 +17,9 @@ use crate::routes::music_bots::convert::{
     audio_source_to_wire, bot_id_from_wire, new_track_from_wire, playlist_name_from_str,
     track_id_from_wire, track_to_wire,
 };
-use crate::routes::music_bots::{not_found, translate_send_error, translate_store_error, validation};
+use crate::routes::music_bots::{
+    not_found, translate_send_error, translate_store_error, validation,
+};
 
 pub(super) fn router() -> Router<AppState> {
     Router::new()
@@ -26,18 +28,12 @@ pub(super) fn router() -> Router<AppState> {
             "/api/playlists/{name}",
             get(detail).patch(rename).delete(remove),
         )
-        .route(
-            "/api/playlists/{name}/tracks",
-            post(add_track),
-        )
+        .route("/api/playlists/{name}/tracks", post(add_track))
         .route(
             "/api/playlists/{name}/tracks/{trackId}",
             delete(remove_track),
         )
-        .route(
-            "/api/playlists/{name}/enqueue",
-            post(enqueue),
-        )
+        .route("/api/playlists/{name}/enqueue", post(enqueue))
 }
 
 #[derive(Debug, Deserialize)]
@@ -140,7 +136,11 @@ async fn rename(
     state
         .music_bots
         .supervisor
-        .playlist_rename(bot, PlaylistName(name.clone()), PlaylistName(new_name.clone()))
+        .playlist_rename(
+            bot,
+            PlaylistName(name.clone()),
+            PlaylistName(new_name.clone()),
+        )
         .await
         .map_err(translate_store_error)?;
     let tracks = state

@@ -159,12 +159,8 @@ impl LiveKitBridge {
         // path (queue_size_ms = 0) requires exactly 10 ms frames per
         // `NativeAudioSource::new` semantics, which would force us to split
         // each TS6 frame in half before publishing.
-        let audio_source = NativeAudioSource::new(
-            AudioSourceOptions::default(),
-            SAMPLE_RATE_HZ,
-            1,
-            20,
-        );
+        let audio_source =
+            NativeAudioSource::new(AudioSourceOptions::default(), SAMPLE_RATE_HZ, 1, 20);
         let track = LocalAudioTrack::create_audio_track(
             "ts6-bridge",
             RtcAudioSource::Native(audio_source.clone()),
@@ -231,13 +227,15 @@ impl LiveKitBridge {
             std::collections::hash_map::Entry::Vacant(v) => {
                 let d = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono)
                     .map_err(|e| anyhow!("OpusDecoder::new for client {from}: {e}"))?;
-                info!(from, "first Opus frame from this TS6 client — opening decoder");
+                info!(
+                    from,
+                    "first Opus frame from this TS6 client — opening decoder"
+                );
                 v.insert(d)
             }
         };
 
-        let pkt = Packet::try_from(opus)
-            .map_err(|e| anyhow!("audiopus Packet::try_from: {e}"))?;
+        let pkt = Packet::try_from(opus).map_err(|e| anyhow!("audiopus Packet::try_from: {e}"))?;
         let signals = MutSignals::try_from(&mut self.decode_buf[..])
             .map_err(|e| anyhow!("audiopus MutSignals::try_from: {e}"))?;
         let n = decoder
@@ -284,7 +282,9 @@ fn spawn_event_pump(
                 RoomEvent::ParticipantDisconnected(p) => {
                     info!(identity = %p.identity(), "LiveKit participant disconnected");
                 }
-                RoomEvent::TrackSubscribed { track, participant, .. } => {
+                RoomEvent::TrackSubscribed {
+                    track, participant, ..
+                } => {
                     let identity = participant.identity().to_string();
                     match track {
                         RemoteTrack::Audio(audio) => {
@@ -331,17 +331,10 @@ fn spawn_audio_subscriber(
         // num_channels). Backpressure is handled inside the SDK; if the
         // consumer falls behind, the SDK drops the oldest queued frames
         // (live-voice-friendly behaviour).
-        let mut stream = NativeAudioStream::new(
-            audio.rtc_track(),
-            SAMPLE_RATE_HZ as i32,
-            1,
-        );
+        let mut stream = NativeAudioStream::new(audio.rtc_track(), SAMPLE_RATE_HZ as i32, 1);
 
-        let encoder = match OpusEncoder::new(
-            SampleRate::Hz48000,
-            Channels::Mono,
-            Application::Voip,
-        ) {
+        let encoder = match OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip)
+        {
             Ok(e) => e,
             Err(err) => {
                 warn!(?err, identity = %identity, "OpusEncoder::new failed; track abandoned");

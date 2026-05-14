@@ -14,7 +14,9 @@ mod servers_context;
 mod sidebar;
 
 pub use header::Header;
-pub use servers_context::{ServersContext, ServersData, mount_servers_context, use_servers_context};
+pub use servers_context::{
+    ServersContext, ServersData, mount_servers_context, use_servers_context,
+};
 pub use sidebar::{NAV_LANDMARK_ID, Sidebar};
 
 use dioxus::prelude::*;
@@ -180,8 +182,14 @@ mod tests {
         // Belt-and-braces against an AppShell refactor that hides the
         // sidebar or header — the chrome contract is "always both" for the
         // authenticated layout.
-        assert!(html.contains(r#"<aside class="sidebar""#), "missing sidebar landmark: {html}");
-        assert!(html.contains(r#"role="banner""#), "missing header banner role: {html}");
+        assert!(
+            html.contains(r#"<aside class="sidebar""#),
+            "missing sidebar landmark: {html}"
+        );
+        assert!(
+            html.contains(r#"role="banner""#),
+            "missing header banner role: {html}"
+        );
     }
 
     /// PURA-61 → PURA-63: `<main>` must carry `tabindex="0"` so axe's

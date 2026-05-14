@@ -149,6 +149,10 @@ tokio-stream = { version = "0.1", default-features = false, features = ["sync"],
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
 http-body-util = "0.1"
+# PURA-161 (R5, R7, R8) — property-based test framework for the escaper
+# property tests, refresh-token rotation defense-in-depth pass, and the
+# SurrealDB error-boundary classifier. Dev-only.
+proptest = { workspace = true }
 # PURA-30 — chrome-snapshot tests render layout components via
 # `dioxus_ssr::render_element(rsx!{...})` to pin the aria attribute
 # contract. Dev-only — must NOT enter production builds.

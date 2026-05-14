@@ -74,15 +74,13 @@ pub fn ChannelsPage() -> Element {
     let mut clients: Signal<Vec<ClientListItem>> = use_signal(Vec::new);
 
     {
-        use_effect(move || {
-            match &*channels_resource.read_unchecked() {
-                Some(Ok(rows)) => {
-                    channels.set(rows.clone());
-                    error.set(None);
-                }
-                Some(Err(e)) => error.set(Some(e.clone())),
-                None => {}
+        use_effect(move || match &*channels_resource.read_unchecked() {
+            Some(Ok(rows)) => {
+                channels.set(rows.clone());
+                error.set(None);
             }
+            Some(Err(e)) => error.set(Some(e.clone())),
+            None => {}
         });
     }
     {
@@ -104,7 +102,9 @@ pub fn ChannelsPage() -> Element {
             async move {
                 let topic = format!("server:{server_id}:channels");
                 let mut handle = hub.subscribe(topic).await;
-                let Some(mut rx) = handle.take_receiver() else { return };
+                let Some(mut rx) = handle.take_receiver() else {
+                    return;
+                };
                 let _drop_guard = handle;
                 use futures::stream::StreamExt;
                 while let Some(_env) = rx.next().await {
@@ -120,7 +120,9 @@ pub fn ChannelsPage() -> Element {
             async move {
                 let topic = format!("server:{server_id}:clients");
                 let mut handle = hub.subscribe(topic).await;
-                let Some(mut rx) = handle.take_receiver() else { return };
+                let Some(mut rx) = handle.take_receiver() else {
+                    return;
+                };
                 let _drop_guard = handle;
                 use futures::stream::StreamExt;
                 while let Some(env) = rx.next().await {
@@ -306,10 +308,7 @@ fn is_spacer(name: &str) -> bool {
     if name.starts_with("[*spacer") {
         return true;
     }
-    if name.starts_with("[*l")
-        || name.starts_with("[*r")
-        || name.starts_with("[*c")
-    {
+    if name.starts_with("[*l") || name.starts_with("[*r") || name.starts_with("[*c") {
         return true;
     }
     // All-glyph spacers: fewer than 3 chars or all of "─=*-—_.·".
@@ -343,7 +342,11 @@ async fn fetch_clients(
 
 fn format_error(err: &ApiError) -> String {
     match err {
-        ApiError::BadGateway { error, code, details } => {
+        ApiError::BadGateway {
+            error,
+            code,
+            details,
+        } => {
             let mut s = error.clone();
             if let Some(d) = details.as_deref().filter(|v| !v.is_empty()) {
                 s.push_str(": ");
@@ -371,9 +374,27 @@ mod tests {
     #[test]
     fn group_by_parent_preserves_channel_order() {
         let rows = vec![
-            ChannelTreeNode { cid: 2, pid: 0, channel_order: 5, channel_name: "B".into(), ..Default::default() },
-            ChannelTreeNode { cid: 1, pid: 0, channel_order: 1, channel_name: "A".into(), ..Default::default() },
-            ChannelTreeNode { cid: 3, pid: 1, channel_order: 1, channel_name: "A.1".into(), ..Default::default() },
+            ChannelTreeNode {
+                cid: 2,
+                pid: 0,
+                channel_order: 5,
+                channel_name: "B".into(),
+                ..Default::default()
+            },
+            ChannelTreeNode {
+                cid: 1,
+                pid: 0,
+                channel_order: 1,
+                channel_name: "A".into(),
+                ..Default::default()
+            },
+            ChannelTreeNode {
+                cid: 3,
+                pid: 1,
+                channel_order: 1,
+                channel_name: "A.1".into(),
+                ..Default::default()
+            },
         ];
         let groups = group_by_parent(&rows);
         let roots: Vec<i64> = groups.get(&0).unwrap().iter().map(|c| c.cid).collect();
@@ -396,11 +417,25 @@ mod tests {
     #[test]
     fn group_clients_skips_server_query_type() {
         let rows = vec![
-            ClientListItem { clid: 1, cid: 7, client_type: 0, ..Default::default() },
-            ClientListItem { clid: 2, cid: 7, client_type: 1, ..Default::default() },
+            ClientListItem {
+                clid: 1,
+                cid: 7,
+                client_type: 0,
+                ..Default::default()
+            },
+            ClientListItem {
+                clid: 2,
+                cid: 7,
+                client_type: 1,
+                ..Default::default()
+            },
         ];
         let g = group_clients(&rows);
-        assert_eq!(g.get(&7).unwrap().len(), 1, "ServerQuery client must be hidden");
+        assert_eq!(
+            g.get(&7).unwrap().len(),
+            1,
+            "ServerQuery client must be hidden"
+        );
         assert_eq!(g.get(&7).unwrap()[0].clid, 1);
     }
 }

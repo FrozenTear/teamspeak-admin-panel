@@ -38,11 +38,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rand::Rng;
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
+use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use tokio::time::Instant;
 
 use super::audit::AuditEntry;
-use super::channel::{looks_like_auth_failure, SshChannel, TransportError};
+use super::channel::{SshChannel, TransportError, looks_like_auth_failure};
 use super::wire::{ErrorFrame, Frame, LineBuffer, NotifyFrame};
 use super::{SshBridgeError, SshBridgeResult};
 use crate::db::Database;
@@ -415,9 +415,7 @@ async fn execute_one<C: SshChannel>(
             Err(_) => return Err(TransportError::Timeout),
             Ok(Ok(Some(bytes))) => bytes,
             Ok(Ok(None)) => {
-                return Err(TransportError::Closed(
-                    "channel closed mid-command".into(),
-                ));
+                return Err(TransportError::Closed("channel closed mid-command".into()));
             }
             Ok(Err(e)) => return Err(e),
         };
@@ -674,8 +672,7 @@ async fn run_with_reconnect<C, F, Fut>(
     auth_rejected_flag: Arc<Mutex<bool>>,
     host_key_mismatch_flag: Arc<Mutex<bool>>,
     db: Option<Arc<Database>>,
-)
-where
+) where
     C: SshChannel,
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<C, TransportError>>,
@@ -687,18 +684,14 @@ where
         // slow-loris peer parks the supervisor task forever — the
         // supervisor never reaches `read_banner`, so `banner_timeout`
         // never fires and the operator sees no failure event.
-        let connect_attempt = match tokio::time::timeout(
-            cfg.connect_timeout,
-            connect_factory(),
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(_) => Err(TransportError::Io(format!(
-                "connect timeout after {:?}",
-                cfg.connect_timeout
-            ))),
-        };
+        let connect_attempt =
+            match tokio::time::timeout(cfg.connect_timeout, connect_factory()).await {
+                Ok(r) => r,
+                Err(_) => Err(TransportError::Io(format!(
+                    "connect timeout after {:?}",
+                    cfg.connect_timeout
+                ))),
+            };
         let mut channel = match connect_attempt {
             Ok(c) => c,
             Err(TransportError::AuthRejected) => {
@@ -912,10 +905,7 @@ async fn drain_with_auth_rejected(rx: &mut mpsc::Receiver<CommandRequest>, confi
     }
 }
 
-async fn drain_with_host_key_mismatch(
-    rx: &mut mpsc::Receiver<CommandRequest>,
-    config_id: i64,
-) {
+async fn drain_with_host_key_mismatch(rx: &mut mpsc::Receiver<CommandRequest>, config_id: i64) {
     while let Ok(cmd) = rx.try_recv() {
         let _ = cmd
             .reply
@@ -1023,7 +1013,11 @@ mod tests {
     }
 
     impl StubChannel {
-        fn new() -> (Self, tmpsc::Sender<ScriptedRead>, tmpsc::UnboundedReceiver<Vec<u8>>) {
+        fn new() -> (
+            Self,
+            tmpsc::Sender<ScriptedRead>,
+            tmpsc::UnboundedReceiver<Vec<u8>>,
+        ) {
             let (read_tx, read_rx) = tmpsc::channel(64);
             let (write_tx, write_rx) = tmpsc::unbounded_channel();
             (
@@ -1139,8 +1133,7 @@ mod tests {
             "mean {mean} not within 2% of base {base_ms}",
         );
 
-        let variance: f64 =
-            samples.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n as f64;
+        let variance: f64 = samples.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n as f64;
         let stddev = variance.sqrt();
         assert!(
             stddev > 0.0,
@@ -1157,14 +1150,19 @@ mod tests {
         // Spec §11.3: TS3 / Welcome / virtualserver_status / error id=0 msg=ok
         read_tx.send(Ok(Some(b"TS3\r\n".to_vec()))).await.unwrap();
         read_tx
-            .send(Ok(Some(b"Welcome to the TeamSpeak 6 ServerQuery interface\r\n".to_vec())))
+            .send(Ok(Some(
+                b"Welcome to the TeamSpeak 6 ServerQuery interface\r\n".to_vec(),
+            )))
             .await
             .unwrap();
         read_tx
             .send(Ok(Some(b"virtualserver_status=online\r\n".to_vec())))
             .await
             .unwrap();
-        read_tx.send(Ok(Some(b"error id=0 msg=ok\r\n".to_vec()))).await.unwrap();
+        read_tx
+            .send(Ok(Some(b"error id=0 msg=ok\r\n".to_vec())))
+            .await
+            .unwrap();
 
         let lines = read_banner(&mut channel, &mut parser, &cfg).await.unwrap();
         assert_eq!(lines.len(), 3);
@@ -1208,7 +1206,11 @@ mod tests {
             .await
             .expect("lazy TS6 banner must settle on idle window, not timeout");
         let elapsed = started.elapsed();
-        assert_eq!(lines.len(), 2, "expected TS3 + Welcome lines, got {lines:?}");
+        assert_eq!(
+            lines.len(),
+            2,
+            "expected TS3 + Welcome lines, got {lines:?}"
+        );
         assert_eq!(lines[0], "TS3");
         assert!(lines[1].contains("ServerQuery interface"));
         // Sanity: settled via the 50ms idle window, well under the
@@ -1539,9 +1541,11 @@ mod tests {
             if let Some(tx) = read_txs.lock().await.first().cloned() {
                 // Cycle 1 banner — canonical CR-LF form so the test
                 // exercises the `error id=0` banner-detect path.
-                tx.send(Ok(Some(b"TS3\r\nWelcome\r\nerror id=0 msg=ok\r\n".to_vec())))
-                    .await
-                    .unwrap();
+                tx.send(Ok(Some(
+                    b"TS3\r\nWelcome\r\nerror id=0 msg=ok\r\n".to_vec(),
+                )))
+                .await
+                .unwrap();
                 break;
             }
             tokio::task::yield_now().await;
@@ -1570,7 +1574,9 @@ mod tests {
             guard[1].clone()
         };
         second_tx
-            .send(Ok(Some(b"TS3\r\nWelcome\r\nerror id=0 msg=ok\r\n".to_vec())))
+            .send(Ok(Some(
+                b"TS3\r\nWelcome\r\nerror id=0 msg=ok\r\n".to_vec(),
+            )))
             .await
             .unwrap();
 
@@ -1738,7 +1744,10 @@ mod tests {
             .unwrap();
 
         let r = reply_rx.await.unwrap();
-        assert!(matches!(r, Err(SshBridgeError::AuthRejected { config_id: 7 })));
+        assert!(matches!(
+            r,
+            Err(SshBridgeError::AuthRejected { config_id: 7 })
+        ));
         let session = dispatch.await.unwrap();
         assert!(matches!(session, SessionResult::AuthRejected));
         drop(cmd_tx);
@@ -1874,9 +1883,7 @@ mod tests {
     /// neither of which lets the REST layer surface the typed code.
     #[tokio::test]
     async fn handle_short_circuits_after_host_key_mismatch() {
-        let factory = || async {
-            Err::<StubChannel, _>(TransportError::HostKeyMismatch)
-        };
+        let factory = || async { Err::<StubChannel, _>(TransportError::HostKeyMismatch) };
         let cfg = test_cfg();
         let handle = spawn(cfg, factory);
 
@@ -1985,7 +1992,9 @@ mod tests {
         let db = crate::db::connect_in_memory()
             .await
             .expect("in-memory connect");
-        crate::db::migrations::run(&db).await.expect("migrations run");
+        crate::db::migrations::run(&db)
+            .await
+            .expect("migrations run");
 
         let (channel, read_tx, _writes_rx) = StubChannel::new();
         let cfg = test_cfg();
@@ -2036,9 +2045,7 @@ mod tests {
         let mut rows: Vec<Row> = Vec::new();
         while std::time::Instant::now() < deadline {
             let mut resp = db
-                .query(
-                    "SELECT record::id(id) AS id, commandLine FROM ssh_audit_log;",
-                )
+                .query("SELECT record::id(id) AS id, commandLine FROM ssh_audit_log;")
                 .await
                 .unwrap()
                 .check()

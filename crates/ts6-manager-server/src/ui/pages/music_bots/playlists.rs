@@ -14,9 +14,7 @@ use crate::client::dioxus::{use_auth_gate, use_session};
 use crate::client::music_bots as mb;
 use crate::client::store::AuthState;
 use crate::ui::components::toast::{ToastVariant, use_toaster};
-use crate::ui::components::{
-    Banner, BannerVariant, Button, ButtonSize, ButtonType, ButtonVariant,
-};
+use crate::ui::components::{Banner, BannerVariant, Button, ButtonSize, ButtonType, ButtonVariant};
 use crate::ui::pages::music_bots::shared::{
     audio_source_summary, format_duration, format_error, parse_audio_source,
 };
@@ -323,11 +321,9 @@ fn PlaylistDetailPane(props: PlaylistDetailPaneProps) -> Element {
                         bump_local();
                         on_changed.call(());
                     }
-                    Err(e) => toaster.push(
-                        ToastVariant::Danger,
-                        "Add failed",
-                        Some(format_error(&e)),
-                    ),
+                    Err(e) => {
+                        toaster.push(ToastVariant::Danger, "Add failed", Some(format_error(&e)))
+                    }
                 }
                 adding.set(false);
             });

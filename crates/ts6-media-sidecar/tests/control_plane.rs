@@ -86,11 +86,13 @@ async fn control_plane_start_lookup_stats_stop() {
     );
     assert!(sources[0]["video"]["ffmpeg_alive"].is_boolean());
     assert!(sources[0]["video"]["frames_published"].is_number());
-    assert!(stats["registered_broadcasts"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|v| v.as_str() == Some(&source_id)));
+    assert!(
+        stats["registered_broadcasts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str() == Some(&source_id))
+    );
 
     // --- POST /source — duplicate source_id rejects 409. ---------------------
     let dup_body = serde_json::json!({
@@ -223,8 +225,9 @@ async fn control_plane_health_stays_cheap_with_pipelines() {
     assert_eq!(resp.status(), 200);
     assert!(
         elapsed < Duration::from_millis(250),
-        "/health took {:?} — must stay cheap"
-    , elapsed);
+        "/health took {:?} — must stay cheap",
+        elapsed
+    );
 
     sidecar.shutdown();
 }
@@ -289,9 +292,7 @@ async fn preset_roundtrip_and_validation() {
     }
 
     // (1) Each valid preset.
-    for (preset_in, preset_out) in
-        [("480p", "480p"), ("720p", "720p"), ("1080p", "1080p")]
-    {
+    for (preset_in, preset_out) in [("480p", "480p"), ("720p", "720p"), ("1080p", "1080p")] {
         let (status, posted) = start(
             &client,
             &base,
@@ -369,12 +370,12 @@ async fn preset_roundtrip_and_validation() {
 /// public API surface the sidecar exposes to its callers.
 #[test]
 fn ffmpeg_argv_reflects_preset() {
-    use ts6_media_sidecar::pipeline::{ffmpeg_video_args, PipelineConfig};
+    use ts6_media_sidecar::pipeline::{PipelineConfig, ffmpeg_video_args};
     use ts6_media_sidecar::{QualityPreset, SourceInput};
 
     fn argv_for(preset: QualityPreset) -> Vec<String> {
-        let cfg = PipelineConfig::new("test", SourceInput::Url("http://x/".into()))
-            .with_preset(preset);
+        let cfg =
+            PipelineConfig::new("test", SourceInput::Url("http://x/".into())).with_preset(preset);
         ffmpeg_video_args(&cfg)
     }
 

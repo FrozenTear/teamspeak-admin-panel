@@ -37,10 +37,7 @@ pub async fn list(
         .get_or_build(connection.id, Some(&connection))
         .await
         .map_err(translate_control_error)?;
-    let rows = client
-        .banlist(sid)
-        .await
-        .map_err(translate_control_error)?;
+    let rows = client.banlist(sid).await.map_err(translate_control_error)?;
     let projected: Vec<BanListItem> = rows
         .into_iter()
         .map(|b| BanListItem {
@@ -125,7 +122,14 @@ pub async fn create(
             Ok((StatusCode::CREATED, Json(BanCreated { banid })))
         }
         Err(e) => Err(emit_failure(
-            &user, &connection, sid, action, None, &details, e, started,
+            &user,
+            &connection,
+            sid,
+            action,
+            None,
+            &details,
+            e,
+            started,
         )),
     }
 }
@@ -157,7 +161,13 @@ pub async fn delete(
                 started.elapsed(),
             )
             .emit();
-            publish(&state, config_id, "ts:ban:deleted", json!({ "banid": banid })).await;
+            publish(
+                &state,
+                config_id,
+                "ts:ban:deleted",
+                json!({ "banid": banid }),
+            )
+            .await;
             Ok(StatusCode::NO_CONTENT)
         }
         Err(e) => Err(emit_failure(
@@ -238,12 +248,7 @@ fn emit_failure(
     translate_control_error(err)
 }
 
-async fn publish(
-    state: &AppState,
-    config_id: i64,
-    kind: &'static str,
-    data: serde_json::Value,
-) {
+async fn publish(state: &AppState, config_id: i64, kind: &'static str, data: serde_json::Value) {
     let topic = Topic::new(config_id, TopicKind::Clients);
     let _ = state.ws_hub.publish(topic, kind, data).await;
 }
