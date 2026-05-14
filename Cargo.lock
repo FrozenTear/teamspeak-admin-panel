@@ -9076,7 +9076,6 @@ dependencies = [
  "gloo-timers",
  "governor",
  "hex",
- "hickory-resolver 0.24.4",
  "http-body-util",
  "js-sys",
  "jsonwebtoken 9.3.1",
@@ -9098,6 +9097,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ts6-manager-shared",
+ "ts6-ssrf",
  "url",
  "urlencoding",
  "usvg",
@@ -9114,6 +9114,18 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "ts6-ssrf"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "hickory-resolver 0.24.4",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
 ]
 
 [[package]]

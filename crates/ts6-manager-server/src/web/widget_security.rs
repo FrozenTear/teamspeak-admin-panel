@@ -192,6 +192,48 @@ fn rate_limit_response(wait: Duration) -> Response {
     resp
 }
 
+/// State for [`widget_response_headers`]. Carries the public MoQ relay
+/// URL so the widget CSP can be relaxed to allow WebTransport to that
+/// origin (PURA-146 WS-8). `None` means the operator has not configured
+/// a public MoQ relay; the CSP keeps the strict `connect-src 'self'`.
+#[derive(Clone, Default)]
+pub struct WidgetCspState {
+    /// Public WebTransport origin (e.g. `https://stream.example.com:4443`).
+    /// Derived once at boot from `moq_public_url` so the runtime check
+    /// stays cheap.
+    pub moq_public_origin: Option<String>,
+}
+
+impl WidgetCspState {
+    /// Build from the raw `MOQ_PUBLIC_URL`. Extracts the scheme + host +
+    /// port, drops the path/query/fragment. Returns `Self { None }` when
+    /// the URL is malformed — the public widget viewer then renders the
+    /// stream-status fallback rather than a CSP-blocked WebTransport
+    /// error.
+    pub fn from_moq_public_url(url: Option<&str>) -> Self {
+        let origin = url.and_then(parse_origin);
+        Self {
+            moq_public_origin: origin,
+        }
+    }
+}
+
+/// Strip a `<scheme>://<host>[:<port>]` origin from a full URL. Returns
+/// `None` for malformed inputs (no `://`, empty host, etc.). The widget
+/// CSP middleware uses the result verbatim as a `connect-src` source —
+/// trailing path or query bytes would make the directive invalid.
+fn parse_origin(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    if scheme.is_empty() {
+        return None;
+    }
+    let host_part = rest.split(['/', '?', '#']).next()?;
+    if host_part.is_empty() {
+        return None;
+    }
+    Some(format!("{scheme}://{host_part}"))
+}
+
 /// Response-side middleware that overrides CORS / frame headers on the
 /// widget surface. Layered globally; a no-op on every other path.
 ///
@@ -204,7 +246,17 @@ fn rate_limit_response(wait: Duration) -> Response {
 /// [`super::csp_nonce::nonce_csp_middleware`] and only rewrite
 /// `frame-ancestors 'none'` → `frame-ancestors *` so the iframe embed
 /// contract still works.
-pub async fn widget_response_headers(req: Request, next: Next) -> Response {
+///
+/// PURA-146 WS-8: when `state.moq_public_origin` is set, also extend
+/// `connect-src` with the MoQ relay origin so the public viewer can
+/// open a WebTransport session to the sidecar. The extension is
+/// scoped to widget paths only — operator-facing routes keep the
+/// strict `connect-src 'self'`.
+pub async fn widget_response_headers(
+    State(state): State<WidgetCspState>,
+    req: Request,
+    next: Next,
+) -> Response {
     let path_is_widget = is_widget_path(req.uri().path());
     let mut resp = next.run(req).await;
     if !path_is_widget {
@@ -225,9 +277,13 @@ pub async fn widget_response_headers(req: Request, next: Next) -> Response {
     // any operator-controlled string still gets caught by CSP inside
     // the iframe.
     h.remove(header::X_FRAME_OPTIONS);
-    let widget_csp = relax_frame_ancestors(
-        h.get(header::CONTENT_SECURITY_POLICY)
-            .and_then(|v| v.to_str().ok()),
+    let upstream_csp = h
+        .get(header::CONTENT_SECURITY_POLICY)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let widget_csp = relax_widget_csp(
+        upstream_csp.as_deref(),
+        state.moq_public_origin.as_deref(),
     );
     let widget_csp_value = HeaderValue::from_str(&widget_csp).unwrap_or_else(|_| {
         // CSP values are always ASCII by construction in this codebase
@@ -246,36 +302,76 @@ pub async fn widget_response_headers(req: Request, next: Next) -> Response {
 
 /// Take the upstream strict CSP and produce a widget-friendly variant.
 ///
-/// - If the input contains `frame-ancestors 'none'`, swap that token
-///   for `frame-ancestors *`. Everything else is byte-for-byte
-///   preserved.
-/// - If the input lacks any `frame-ancestors` directive, append
-///   `; frame-ancestors *`. Browsers apply the most-restrictive of
-///   duplicate directives, so we must NOT just append when the input
-///   already has a stricter `frame-ancestors`.
-/// - If there is no upstream CSP at all (the nonce middleware did not
-///   run for this response), emit a minimal but defensive CSP rather
-///   than a header that opens script execution wide.
-fn relax_frame_ancestors(upstream: Option<&str>) -> String {
-    match upstream {
+/// Two relaxations are applied:
+///
+/// 1. **Frame embedding** — swap `frame-ancestors 'none'` for
+///    `frame-ancestors *`. The widget is embedded in third-party
+///    iframes by design.
+/// 2. **WebTransport connect** — when `moq_origin` is `Some`, append
+///    that origin to `connect-src` so the public viewer (PURA-146 WS-8)
+///    can open a WebTransport session to the sidecar. Without this the
+///    page-level CSP blocks the dial-out with a "violates the
+///    document's Content Security Policy" error.
+///
+/// Edge cases mirror the original behaviour: an absent upstream CSP
+/// emits a minimal-but-defensive baseline rather than nothing.
+fn relax_widget_csp(upstream: Option<&str>, moq_origin: Option<&str>) -> String {
+    let base = match upstream {
         Some(strict) if strict.contains("frame-ancestors 'none'") => {
             strict.replace("frame-ancestors 'none'", "frame-ancestors *")
         }
-        Some(strict) if strict.contains("frame-ancestors") => {
-            // Some other `frame-ancestors` value (eg `'self'`) — leave
-            // it alone. The widget contract still needs `*` though, so
-            // append a duplicate; browsers will apply the stricter of
-            // the two, which is the same effective behaviour as not
-            // touching the header. This case is unreachable today
-            // (the only producer is `csp_nonce::csp_header`, which sets
-            // `'none'`), but is a no-op rather than a regression.
-            strict.to_string()
-        }
+        Some(strict) if strict.contains("frame-ancestors") => strict.to_string(),
         Some(strict) => format!("{strict}; frame-ancestors *"),
         None => "default-src 'self'; object-src 'none'; base-uri 'self'; \
                  form-action 'self'; frame-ancestors *"
             .to_string(),
+    };
+    let Some(origin) = moq_origin else {
+        return base;
+    };
+    // Reject anything that isn't an HTTPS/HTTP origin shape we just
+    // built ourselves — defence in depth against operator-misconfigured
+    // values that could open the CSP wider than intended.
+    if !is_safe_csp_source(origin) {
+        return base;
     }
+    extend_connect_src(&base, origin)
+}
+
+/// Append `origin` to the `connect-src` directive, or add a new
+/// `connect-src` directive if the upstream CSP didn't carry one.
+fn extend_connect_src(csp: &str, origin: &str) -> String {
+    // Locate the `connect-src` directive (semicolon-separated). CSP
+    // directive names are case-insensitive but the producer in
+    // `csp_nonce::csp_header` always emits lowercase, so a literal
+    // match is correct here.
+    if let Some((before, rest)) = csp.split_once("connect-src") {
+        // `rest` starts with the directive's value plus the
+        // delimiting semicolon (or end-of-string for the final
+        // directive).
+        let (value, tail) = match rest.split_once(';') {
+            Some((v, t)) => (v, format!(";{t}")),
+            None => (rest, String::new()),
+        };
+        let trimmed = value.trim_end();
+        return format!("{before}connect-src{trimmed} {origin}{tail}");
+    }
+    // No connect-src directive — append a fresh one.
+    let sep = if csp.trim_end().ends_with(';') { "" } else { ";" };
+    format!("{csp}{sep} connect-src 'self' {origin}")
+}
+
+/// Cheap safety check: `<scheme>://<authority>` with no whitespace, no
+/// semicolons (would terminate the directive), no quotes (would close
+/// the directive prematurely), only printable ASCII. Belt-and-suspenders
+/// with `parse_origin` which already strips path/query/fragment bytes.
+fn is_safe_csp_source(s: &str) -> bool {
+    if !s.contains("://") {
+        return false;
+    }
+    s.chars().all(|c| {
+        c.is_ascii() && !c.is_ascii_control() && !c.is_ascii_whitespace() && !matches!(c, ';' | '\'' | '"')
+    })
 }
 
 /// Spec §26.1 — render a token as `first 4 chars + …` so tracing fields
@@ -295,7 +391,7 @@ mod tests {
     use axum::Router;
     use axum::body::Body;
     use axum::http::{HeaderValue, Method, Request as HttpRequest, StatusCode, header};
-    use axum::middleware::{from_fn, from_fn_with_state};
+    use axum::middleware::from_fn_with_state;
     use axum::routing::get;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
@@ -542,7 +638,10 @@ mod tests {
                         .unwrap()
                 }),
             )
-            .layer(from_fn(widget_response_headers))
+            .layer(from_fn_with_state(
+                WidgetCspState::default(),
+                widget_response_headers,
+            ))
     }
 
     /// Assert the widget CSP keeps every defence-in-depth directive
@@ -654,7 +753,10 @@ mod tests {
                     }
                 }),
             )
-            .layer(from_fn(widget_response_headers));
+            .layer(from_fn_with_state(
+                WidgetCspState::default(),
+                widget_response_headers,
+            ));
 
         let resp = app
             .oneshot(req_to("/api/widget/abc/data", "203.0.113.9"))
@@ -693,9 +795,9 @@ mod tests {
     }
 
     #[test]
-    fn relax_frame_ancestors_swaps_none_for_wildcard() {
+    fn relax_widget_csp_swaps_none_for_wildcard() {
         let strict = "default-src 'self'; script-src 'self'; frame-ancestors 'none'; form-action 'self'";
-        let widget = relax_frame_ancestors(Some(strict));
+        let widget = relax_widget_csp(Some(strict), None);
         assert!(widget.contains("default-src 'self'"));
         assert!(widget.contains("script-src 'self'"));
         assert!(widget.contains("frame-ancestors *"));
@@ -704,15 +806,15 @@ mod tests {
     }
 
     #[test]
-    fn relax_frame_ancestors_appends_when_directive_missing() {
-        let widget = relax_frame_ancestors(Some("default-src 'self'"));
+    fn relax_widget_csp_appends_when_directive_missing() {
+        let widget = relax_widget_csp(Some("default-src 'self'"), None);
         assert!(widget.contains("default-src 'self'"));
         assert!(widget.contains("frame-ancestors *"));
     }
 
     #[test]
-    fn relax_frame_ancestors_falls_back_to_defensive_baseline_when_missing() {
-        let widget = relax_frame_ancestors(None);
+    fn relax_widget_csp_falls_back_to_defensive_baseline_when_missing() {
+        let widget = relax_widget_csp(None, None);
         // No upstream CSP — must still emit a defensive policy with
         // `object-src 'none'` and `base-uri 'self'`, not a bare
         // `frame-ancestors *` that opens script execution wide.
@@ -728,6 +830,70 @@ mod tests {
                 "fallback CSP missing `{required}`. Got: {widget}"
             );
         }
+    }
+
+    // PURA-146 WS-8 — MoQ origin gets appended to connect-src so the
+    // public viewer can open a WebTransport session to the sidecar.
+    #[test]
+    fn relax_widget_csp_appends_moq_origin_to_existing_connect_src() {
+        let strict = "default-src 'self'; \
+                      connect-src 'self'; \
+                      script-src 'self'; \
+                      frame-ancestors 'none'";
+        let widget = relax_widget_csp(Some(strict), Some("https://stream.example.com:4443"));
+        assert!(
+            widget.contains("connect-src 'self' https://stream.example.com:4443"),
+            "MoQ origin must be appended to connect-src. Got: {widget}"
+        );
+        assert!(widget.contains("frame-ancestors *"));
+        // Other directives stay intact.
+        assert!(widget.contains("script-src 'self'"));
+    }
+
+    #[test]
+    fn relax_widget_csp_adds_connect_src_when_upstream_omits_it() {
+        let widget = relax_widget_csp(
+            Some("default-src 'self'; frame-ancestors 'none'"),
+            Some("https://stream.example.com:4443"),
+        );
+        assert!(
+            widget.contains("connect-src 'self' https://stream.example.com:4443"),
+            "connect-src must be added when missing. Got: {widget}"
+        );
+    }
+
+    #[test]
+    fn relax_widget_csp_rejects_unsafe_origin_strings() {
+        // Spaces / quotes / semicolons in the operator-supplied value
+        // would break the CSP directive — drop them silently.
+        for bad in [
+            "https://attacker; script-src *",
+            "https://attacker 'unsafe-inline'",
+            "javascript:alert(1)",
+            "not-a-url",
+            "https:// host", // embedded space
+        ] {
+            let widget =
+                relax_widget_csp(Some("default-src 'self'; connect-src 'self'"), Some(bad));
+            assert!(
+                !widget.contains(bad),
+                "unsafe origin `{bad}` must not appear in CSP. Got: {widget}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_origin_strips_path_and_query() {
+        assert_eq!(
+            parse_origin("https://stream.example.com:4443/anon").as_deref(),
+            Some("https://stream.example.com:4443")
+        );
+        assert_eq!(
+            parse_origin("https://stream.example.com/anon?foo=1").as_deref(),
+            Some("https://stream.example.com")
+        );
+        assert_eq!(parse_origin("not a url"), None);
+        assert_eq!(parse_origin("://nohost"), None);
     }
 
     #[tokio::test]

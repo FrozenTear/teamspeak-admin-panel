@@ -104,6 +104,9 @@ mod tests {
             ws_hub: Hub::new(),
             widget_cache: crate::widgets::WidgetCache::new(),
             music_bots: crate::music_bots::MusicBotService::default_for_tests(),
+            sidecar: None,
+            ssrf_resolver: Arc::new(ts6_ssrf::MockResolver::new()),
+            moq_public_url: None,
         }
     }
 

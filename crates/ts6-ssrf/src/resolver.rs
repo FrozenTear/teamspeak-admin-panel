@@ -10,7 +10,6 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::Arc;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ResolveError {
@@ -31,15 +30,21 @@ pub trait Resolver: Send + Sync {
 ///
 /// Holds a `TokioAsyncResolver` and reuses it across calls. Cheap to clone
 /// (it's `Arc`-internally in hickory).
+///
+/// Feature-gated behind `hickory` so consumers with their own resolver (the
+/// sibling-workspace `ts6-media-sidecar` uses `tokio::net::lookup_host`) can
+/// drop the dep entirely.
+#[cfg(feature = "hickory")]
 pub struct HickoryResolver {
-    inner: Arc<hickory_resolver::TokioAsyncResolver>,
+    inner: std::sync::Arc<hickory_resolver::TokioAsyncResolver>,
 }
 
+#[cfg(feature = "hickory")]
 impl HickoryResolver {
     /// Build a resolver from the system's `/etc/resolv.conf` (or the platform
     /// equivalent). Falls back to `from_default_options` if system config is
     /// not readable, so this is safe inside containers that omit resolv.conf.
-    pub fn from_system() -> anyhow::Result<Self> {
+    pub fn from_system() -> Result<Self, ResolveError> {
         let resolver = match hickory_resolver::TokioAsyncResolver::tokio_from_system_conf() {
             Ok(r) => r,
             Err(_) => hickory_resolver::TokioAsyncResolver::tokio(
@@ -48,11 +53,12 @@ impl HickoryResolver {
             ),
         };
         Ok(Self {
-            inner: Arc::new(resolver),
+            inner: std::sync::Arc::new(resolver),
         })
     }
 }
 
+#[cfg(feature = "hickory")]
 #[async_trait::async_trait]
 impl Resolver for HickoryResolver {
     async fn resolve(&self, host: &str) -> Result<Vec<IpAddr>, ResolveError> {

@@ -10,6 +10,7 @@ mod field;
 mod input;
 mod server_selector;
 pub mod toast;
+pub mod video_player;
 pub mod ws_banner;
 
 pub use activity_feed::{
@@ -26,4 +27,5 @@ pub use field::Field;
 pub use input::{PasswordInput, TextInput};
 pub use server_selector::{ServerSelector, ServerSelectorVariant};
 pub use toast::{Toaster, ToasterRegion, provide_toaster, use_toaster};
+pub use video_player::{PlayerState, VideoPlayer};
 pub use ws_banner::WsReconnectBanner;

@@ -119,6 +119,7 @@ pub fn Sidebar(props: SidebarProps) -> Element {
     let server_info_active = matches!(props.active, Route::ServerInfoPage {});
     let logs_active = matches!(props.active, Route::LogsPage {});
     let widgets_active = matches!(props.active, Route::WidgetsPage {});
+    let video_sources_active = matches!(props.active, Route::VideoSourcesPage {});
     // PURA-124 WS-6 — Music bots highlight when the route is the index
     // OR any of the per-bot detail / library / playlists / radio
     // surfaces, so the operator stays oriented across the whole flow.
@@ -149,6 +150,8 @@ pub fn Sidebar(props: SidebarProps) -> Element {
                     NavItem { icon: "#", label: "Channels", to: Route::ChannelsPage {}, active: channels_active }
                     NavItem { icon: "◆", label: "Clients", to: Route::ClientsPage {}, active: clients_active }
                     NavItem { icon: "⊙", label: "Server info", to: Route::ServerInfoPage {}, active: server_info_active }
+                    // PURA-145 WS-7 — operator-facing MoQ pipeline manager.
+                    NavItem { icon: "▶", label: "Video sources", to: Route::VideoSourcesPage {}, active: video_sources_active }
                     PlaceholderItem { icon: "▤", label: "Files" }
                 }
 

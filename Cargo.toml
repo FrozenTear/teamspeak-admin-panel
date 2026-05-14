@@ -4,10 +4,27 @@ members = [
     "crates/music-bot-audio",
     "crates/shared",
     "crates/ts6-manager-server",
+    "crates/ts6-ssrf",
     "crates/ts6-voice-fixture",
     "crates/ts6-voice-prototype",
     "crates/ts6-voice-translator",
     "crates/voice",
+]
+# `crates/ts6-media-sidecar/` is its OWN workspace, not a member of the
+# main `teamspeak-admin-panel` workspace. PURA-139 (WS-1) attempted
+# main-workspace integration first per the ticket's "Workspace
+# integration" step, but `moq-native@0.14` enables `parking_lot/deadlock_detection`
+# while `dioxus-server@0.7` enables `parking_lot/send_guard`, and parking_lot
+# itself rejects that combination at compile time
+# (`#[cfg(all(send_guard, deadlock_detection))] compile_error!`). The two
+# upstreams cannot coexist in one Cargo dependency graph today; sibling-
+# workspace isolation is the same containment trick `moq-spike/` uses.
+# Drift control comes from re-pinning moq-lite/moq-native/hang to the
+# same versions in both `moq-spike/Cargo.toml` and
+# `crates/ts6-media-sidecar/Cargo.toml`. Bumping is a single-PR change
+# touching both files. See ADR-0007 + crates/ts6-media-sidecar/README.md.
+exclude = [
+    "crates/ts6-media-sidecar",
 ]
 
 [workspace.package]
@@ -27,6 +44,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 ts6-manager-shared = { path = "crates/shared" }
+ts6-ssrf = { path = "crates/ts6-ssrf" }
 
 # PURA-14 — auth client slice. `gloo-net` and `web-sys` are wasm-only; they
 # are gated behind `cfg(target_arch = "wasm32")` in source, but the deps must
@@ -53,6 +71,54 @@ web-sys = { version = "0.3", features = [
     "MessageEvent",
     "Event",
     "EventTarget",
+    # PURA-143 WS-5 — Dioxus video player (WebTransport + WebCodecs + WebAudio).
+    # The widget opens a WT session against the sidecar's QUIC listener,
+    # subscribes to `<source-id>/video|audio` via moq-lite-04, decodes VP8 to a
+    # `<canvas>` and Opus into the page's `AudioContext`. The Streams + Codecs
+    # surface needs every reader/writer + frame/data type that mirrors the
+    # WS-0 reference player (`moq-spike/player/player.js`).
+    "Document",
+    "Element",
+    "HtmlCanvasElement",
+    "CanvasRenderingContext2d",
+    "WebTransport",
+    "WebTransportOptions",
+    "WebTransportHash",
+    "WebTransportBidirectionalStream",
+    "WebTransportReceiveStream",
+    "WebTransportSendStream",
+    "ReadableStream",
+    "ReadableStreamDefaultReader",
+    "ReadableStreamReadResult",
+    "WritableStream",
+    "WritableStreamDefaultWriter",
+    "VideoDecoder",
+    "VideoDecoderConfig",
+    "VideoDecoderInit",
+    "VideoFrame",
+    "EncodedVideoChunk",
+    "EncodedVideoChunkInit",
+    "EncodedVideoChunkType",
+    "AudioDecoder",
+    "AudioDecoderConfig",
+    "AudioDecoderInit",
+    "AudioData",
+    "AudioDataCopyToOptions",
+    "EncodedAudioChunk",
+    "EncodedAudioChunkInit",
+    "EncodedAudioChunkType",
+    "AudioContext",
+    "AudioContextOptions",
+    "AudioBuffer",
+    "AudioBufferSourceNode",
+    "AudioDestinationNode",
+    "AudioNode",
+    "Request",
+    "RequestInit",
+    "Response",
+    "Performance",
+    "AudioSampleFormat",
+    "Url",
 ] }
 urlencoding = "2"
 

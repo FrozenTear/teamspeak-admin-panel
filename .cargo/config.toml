@@ -1,0 +1,7 @@
+# PURA-143 WS-5 — web-sys's `WebTransport`, `VideoDecoder`, `AudioDecoder`,
+# and friends ship behind `cfg(web_sys_unstable_apis)` because the upstream
+# specs are still in flux. The Dioxus video player widget needs them, so
+# every `wasm32-unknown-unknown` build in this workspace passes the cfg.
+# Native targets are unaffected.
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg=web_sys_unstable_apis"]

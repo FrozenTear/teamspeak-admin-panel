@@ -66,7 +66,9 @@ async fn list(
                 internal()
             })?
     };
-    Ok(Json(rows.into_iter().map(server_summary_from_row).collect()))
+    Ok(Json(
+        rows.into_iter().map(server_summary_from_row).collect(),
+    ))
 }
 
 async fn create(
@@ -114,10 +116,12 @@ async fn create(
         sshHostKeyFingerprint: None,
     };
 
-    let row = server_connections::insert(&state.db, new).await.map_err(|e| {
-        tracing::error!(err = %e, "create_server: insert failed");
-        internal()
-    })?;
+    let row = server_connections::insert(&state.db, new)
+        .await
+        .map_err(|e| {
+            tracing::error!(err = %e, "create_server: insert failed");
+            internal()
+        })?;
     Ok((StatusCode::CREATED, Json(server_summary_from_row(row))))
 }
 
@@ -158,6 +162,9 @@ mod tests {
             ws_hub: crate::ws::Hub::new(),
             widget_cache: crate::widgets::WidgetCache::new(),
             music_bots: crate::music_bots::MusicBotService::default_for_tests(),
+            sidecar: None,
+            ssrf_resolver: Arc::new(ts6_ssrf::MockResolver::new()),
+            moq_public_url: None,
         }
     }
 
@@ -315,7 +322,10 @@ mod tests {
 
         // No row was written — RBAC kicked in before the seal+insert path.
         let rows = server_connections::list(&state.db).await.unwrap();
-        assert!(rows.is_empty(), "moderator/viewer must not be able to create server rows");
+        assert!(
+            rows.is_empty(),
+            "moderator/viewer must not be able to create server rows"
+        );
     }
 
     #[tokio::test]

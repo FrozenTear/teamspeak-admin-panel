@@ -13,11 +13,13 @@ use tokio::sync::Mutex;
 
 use crate::config::Config;
 use crate::control::ControlBackendPool;
+use crate::control::sidecar::SidecarClient;
 use crate::db::Database;
 use crate::music_bots::MusicBotService;
 use crate::webquery::WebQueryPool;
 use crate::widgets::WidgetCache;
 use crate::ws::Hub;
+use ts6_ssrf::{HickoryResolver, Resolver};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -62,6 +64,24 @@ pub struct AppState {
     /// [`crate::routes::music_bots`] is the only consumer. Persistence
     /// is in-memory for WS-5; the SurrealDB-backed swap is a follow-up.
     pub music_bots: MusicBotService,
+    /// PURA-144 (WS-6): HTTP client for `ts6-media-sidecar`. `None` when
+    /// the operator has not set `SIDECAR_URL` — the `/api/video-sources`
+    /// route returns 503 in that case so the FE can surface a sensible
+    /// "configure sidecar first" error.
+    pub sidecar: Option<SidecarClient>,
+    /// PURA-144 (WS-6): shared SSRF DNS resolver. Reused for the
+    /// pre-flight check on operator-supplied video stream URLs (defence
+    /// in depth — the sidecar runs its own validator too). The
+    /// `Arc<dyn Resolver>` shape matches the ts6-ssrf API and keeps the
+    /// resolver cheap to clone into the polling task.
+    pub ssrf_resolver: Arc<dyn Resolver>,
+    /// PURA-146 (WS-8): publicly-reachable WebTransport endpoint of the
+    /// sidecar (e.g. `https://stream.example.com:4443/anon`). The public
+    /// widget viewer's `/api/widget/{token}/video-sources` route surfaces
+    /// this so embedded iframes can subscribe. `None` means the operator
+    /// did not configure a public relay URL — the viewer falls back to
+    /// "No live video".
+    pub moq_public_url: Option<String>,
 }
 
 impl AppState {
@@ -84,8 +104,25 @@ impl AppState {
         // dir so unit tests don't collide on a shared on-disk file; the
         // real binary swap-points to `~/.config/ts6-manager/music-bots`
         // can land alongside the SurrealDB persistence ticket.
-        let music_bot_identity_dir: PathBuf =
-            std::env::temp_dir().join("ts6-manager-music-bots");
+        let music_bot_identity_dir: PathBuf = std::env::temp_dir().join("ts6-manager-music-bots");
+        let sidecar = cfg
+            .sidecar_url
+            .as_deref()
+            .map(|u| SidecarClient::new(u.to_string()));
+        // PURA-144 — production resolver uses hickory (already enabled
+        // via the `ts6-ssrf = { features = ["hickory"] }` feature flag
+        // in this crate's Cargo.toml). Construction is fallible — fall
+        // back to a no-op resolver that returns an empty IP set on
+        // error so the manager still boots; ts6-ssrf's spec §9.3 path
+        // allows the request when resolution fails, which keeps the
+        // sidecar's own SSRF validator as the source of truth.
+        let ssrf_resolver: Arc<dyn Resolver> = match HickoryResolver::from_system() {
+            Ok(r) => Arc::new(r),
+            Err(e) => {
+                tracing::warn!(error = %e, "ssrf hickory resolver init failed; falling back to no-op");
+                Arc::new(ts6_ssrf::MockResolver::new())
+            }
+        };
         Self {
             db,
             jwt_secret: Arc::new(cfg.jwt_secret.as_bytes().to_vec()),
@@ -97,6 +134,9 @@ impl AppState {
             ws_hub: Hub::new(),
             widget_cache: WidgetCache::new(),
             music_bots: MusicBotService::new(music_bot_identity_dir),
+            sidecar,
+            ssrf_resolver,
+            moq_public_url: cfg.moq_public_url.clone(),
         }
     }
 }

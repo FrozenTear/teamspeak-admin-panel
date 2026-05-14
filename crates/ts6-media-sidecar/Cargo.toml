@@ -1,0 +1,83 @@
+# Self-contained workspace, NOT a member of the main `teamspeak-admin-panel`
+# workspace. PURA-139 (WS-1) tried main-workspace integration first as the
+# ticket asked, but `moq-native@0.14` enables `parking_lot/deadlock_detection`
+# while `dioxus-server@0.7` (used by `crates/ts6-manager-server`) enables
+# `parking_lot/send_guard`, and parking_lot itself rejects that combination
+# at compile time. Same containment trick `moq-spike/` uses. Drift control
+# is by-policy: keep `moq-lite` / `moq-native` / `hang` versions identical
+# in `moq-spike/Cargo.toml` and this file. Bumps land in one PR touching
+# both.
+[workspace]
+resolver = "3"
+members = ["."]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+# Phase 5 / ADR-0007 — pin moq-dev/moq stack. MUST stay in lock-step with
+# `moq-spike/Cargo.toml` until both workspaces collapse into one (parking_lot
+# upstream fix or a deliberate vendor of moq-native).
+moq-lite = "0.16"
+moq-native = { version = "0.14", default-features = true }
+hang = "0.16"
+
+[package]
+name = "ts6-media-sidecar"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# Gates `pipeline_two_tab_smoke` integration test which actually
+# spawns ffmpeg. CI without ffmpeg installed can `cargo test` without
+# this feature; the smoke is opted into via `--features ffmpeg-smoke`
+# or `cargo test -- --include-ignored`.
+ffmpeg-smoke = []
+
+[lib]
+name = "ts6_media_sidecar"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ts6-media-sidecar"
+path = "src/main.rs"
+
+[dependencies]
+moq-lite = { workspace = true }
+moq-native = { workspace = true }
+
+# Shared SSRF validator (PURA-141). Lives in the main workspace under
+# `crates/ts6-ssrf` and is path-referenced from here so the validator
+# code is the same bytes both binaries compile. We DON'T enable the
+# `hickory` feature — the sidecar's `GaiResolver` uses
+# `tokio::net::lookup_host` instead, which keeps the sidecar's already-
+# locked parking_lot graph (moq-native pins `deadlock_detection`)
+# clear of hickory-resolver's own parking_lot pull-in.
+ts6-ssrf = { path = "../ts6-ssrf" }
+
+anyhow = "1"
+async-trait = "0.1"
+axum = "0.8"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+futures = { version = "0.3", default-features = false, features = ["std"] }
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "sync", "time", "fs", "process", "io-util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+url = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+moq-lite = { workspace = true }
+moq-native = { workspace = true }
+url = "2"

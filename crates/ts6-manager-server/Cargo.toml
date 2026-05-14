@@ -37,13 +37,13 @@ server = [
     "dep:bcrypt",
     "dep:governor",
     "dep:hex",
-    "dep:hickory-resolver",
     "dep:jsonwebtoken",
     "dep:rand",
     "dep:scrypt",
     "dep:thiserror",
     "dep:tower",
     "dep:tower-http",
+    "dep:ts6-ssrf",
     "dep:url",
     "dep:surrealdb",
     "dep:reqwest",
@@ -98,13 +98,17 @@ async-trait = { workspace = true, optional = true }
 bcrypt = { workspace = true, optional = true }
 governor = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
-hickory-resolver = { workspace = true, optional = true }
 jsonwebtoken = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 scrypt = { workspace = true, optional = true }
 thiserror = { workspace = true, optional = true }
 tower = { workspace = true, optional = true }
 tower-http = { workspace = true, optional = true }
+# Shared SSRF validator. Extracted to its own crate so the sibling-workspace
+# `ts6-media-sidecar` (PURA-141) can reuse the identical logic. The
+# `hickory` feature picks up the production DNS resolver here; the sidecar
+# opts out and uses `tokio::net::lookup_host` for its own resolver impl.
+ts6-ssrf = { workspace = true, optional = true, features = ["hickory"] }
 url = { workspace = true, optional = true }
 
 # Phase 1 DATA (PURA-10) — server-only.

@@ -55,12 +55,7 @@ pub fn router() -> Router<AppState> {
 async fn metrics(_admin: RequireAdmin, State(state): State<AppState>) -> Response {
     let snapshot = state.ws_hub.metrics().snapshot();
     let body = render(&snapshot);
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, CONTENT_TYPE)],
-        body,
-    )
-        .into_response()
+    (StatusCode::OK, [(header::CONTENT_TYPE, CONTENT_TYPE)], body).into_response()
 }
 
 /// Render a [`MetricsSnapshot`] as Prometheus text format.
@@ -70,19 +65,34 @@ async fn metrics(_admin: RequireAdmin, State(state): State<AppState>) -> Respons
 fn render(s: &MetricsSnapshot) -> String {
     use std::fmt::Write;
     let mut out = String::with_capacity(768);
-    let _ = writeln!(out, "# HELP ts6_ws_connections Currently-open WebSocket sessions on the hub.");
+    let _ = writeln!(
+        out,
+        "# HELP ts6_ws_connections Currently-open WebSocket sessions on the hub."
+    );
     let _ = writeln!(out, "# TYPE ts6_ws_connections gauge");
     let _ = writeln!(out, "ts6_ws_connections {}", s.connections);
-    let _ = writeln!(out, "# HELP ts6_ws_subscribe_ok_total Total successful WS topic subscriptions since process start.");
+    let _ = writeln!(
+        out,
+        "# HELP ts6_ws_subscribe_ok_total Total successful WS topic subscriptions since process start."
+    );
     let _ = writeln!(out, "# TYPE ts6_ws_subscribe_ok_total counter");
     let _ = writeln!(out, "ts6_ws_subscribe_ok_total {}", s.subscribe_ok);
-    let _ = writeln!(out, "# HELP ts6_ws_subscribe_denied_total Total denied WS topic subscriptions since process start.");
+    let _ = writeln!(
+        out,
+        "# HELP ts6_ws_subscribe_denied_total Total denied WS topic subscriptions since process start."
+    );
     let _ = writeln!(out, "# TYPE ts6_ws_subscribe_denied_total counter");
     let _ = writeln!(out, "ts6_ws_subscribe_denied_total {}", s.subscribe_denied);
-    let _ = writeln!(out, "# HELP ts6_ws_events_published_total Total events published through the WS hub since process start.");
+    let _ = writeln!(
+        out,
+        "# HELP ts6_ws_events_published_total Total events published through the WS hub since process start."
+    );
     let _ = writeln!(out, "# TYPE ts6_ws_events_published_total counter");
     let _ = writeln!(out, "ts6_ws_events_published_total {}", s.events_published);
-    let _ = writeln!(out, "# HELP ts6_ws_events_dropped_total Total events dropped to slow consumers since process start.");
+    let _ = writeln!(
+        out,
+        "# HELP ts6_ws_events_dropped_total Total events dropped to slow consumers since process start."
+    );
     let _ = writeln!(out, "# TYPE ts6_ws_events_dropped_total counter");
     let _ = writeln!(out, "ts6_ws_events_dropped_total {}", s.events_dropped);
     out
@@ -245,6 +255,9 @@ mod route_tests {
             ws_hub: Hub::new(),
             widget_cache: crate::widgets::WidgetCache::new(),
             music_bots: crate::music_bots::MusicBotService::default_for_tests(),
+            sidecar: None,
+            ssrf_resolver: Arc::new(ts6_ssrf::MockResolver::new()),
+            moq_public_url: None,
         }
     }
 

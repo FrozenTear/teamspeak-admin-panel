@@ -10,6 +10,8 @@ mod bans;
 mod channels;
 mod clients;
 mod dashboard_placeholder;
+#[cfg(debug_assertions)]
+mod dev_video_player;
 mod home;
 mod login;
 mod logs;
@@ -17,12 +19,15 @@ mod music_bots;
 mod public_widget;
 mod server_info;
 mod setup;
+mod video_sources;
 mod widgets;
 
 pub use bans::BansPage;
 pub use channels::ChannelsPage;
 pub use clients::ClientsPage;
 pub use dashboard_placeholder::DashboardPlaceholder;
+#[cfg(debug_assertions)]
+pub use dev_video_player::DevVideoPlayerPage;
 pub use home::Home;
 pub use login::LoginPage;
 pub use logs::LogsPage;
@@ -32,4 +37,5 @@ pub use music_bots::{
 pub use public_widget::PublicWidgetPage;
 pub use server_info::ServerInfoPage;
 pub use setup::SetupPage;
+pub use video_sources::VideoSourcesPage;
 pub use widgets::WidgetsPage;

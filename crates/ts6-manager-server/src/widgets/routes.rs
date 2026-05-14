@@ -28,7 +28,7 @@ use ts6_manager_shared::widgets::{WidgetData, WidgetThemeName};
 
 use crate::app_state::AppState;
 use crate::control::ControlBackendError;
-use crate::repos::{server_connections, widgets as widget_repo};
+use crate::repos::{server_connections, video_sources, widgets as widget_repo};
 
 use super::cache::CACHE_TTL;
 use super::png;
@@ -45,6 +45,16 @@ pub fn router() -> Router<AppState> {
         .route("/api/widget/{token}/data", get(data_handler))
         .route("/api/widget/{token}/image.svg", get(svg_handler))
         .route("/api/widget/{token}/image.png", get(png_handler))
+        // PURA-144 (WS-6) — derived read-only video-source view. WS-8
+        // (public viewer mount) consumes this to render `<video>`
+        // players for whichever sources are live on this widget's
+        // server. Management fields (`url`, `created_by_user_id`,
+        // `created_at`) are stripped — only the streaming-relevant
+        // metadata is exposed.
+        .route(
+            "/api/widget/{token}/video-sources",
+            get(video_sources_handler),
+        )
 }
 
 #[derive(Debug, Serialize)]
@@ -166,10 +176,7 @@ async fn png_handler(
         Ok(Ok(bytes)) => {
             let mut response = (
                 StatusCode::OK,
-                [(
-                    header::CONTENT_TYPE,
-                    HeaderValue::from_static("image/png"),
-                )],
+                [(header::CONTENT_TYPE, HeaderValue::from_static("image/png"))],
                 bytes,
             )
                 .into_response();
@@ -216,14 +223,144 @@ async fn png_handler(
     }
 }
 
+// ---------------------------------------------------------------------
+// PURA-144 (WS-6) — derived public video-sources view.
+// ---------------------------------------------------------------------
+
+/// One entry in the public video-sources list. Strips every management
+/// field — operators consume the rich shape via `/api/video-sources`,
+/// public viewers only need enough metadata to wire up a MoQ subscribe
+/// and render a label.
+#[derive(Debug, Serialize)]
+pub struct PublicVideoSource {
+    pub source_id: String,
+    pub label: String,
+    pub preset: String,
+    pub status: String,
+    pub track: PublicTrack,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PublicTrack {
+    pub namespace: String,
+    pub video: String,
+    pub audio: String,
+}
+
+/// Wire shape returned by `GET /api/widget/{token}/video-sources`. The
+/// `relay_url` field is the public WebTransport endpoint of the sidecar
+/// (sourced from `MOQ_PUBLIC_URL`) — without it the embedded viewer has
+/// no way to dial the moq-lite relay. `None` when the operator has not
+/// configured a public relay URL; the public viewer falls back to
+/// "No live video" in that case.
+#[derive(Debug, Serialize)]
+pub struct PublicVideoSourcesResponse {
+    /// Public WebTransport URL for the moq-lite-04 relay
+    /// (e.g. `https://stream.example.com:4443/anon`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay_url: Option<String>,
+    pub sources: Vec<PublicVideoSource>,
+}
+
+/// `GET /api/widget/{token}/video-sources`. No auth — the widget token
+/// is the only credential, exactly like `/data` and `/image.*`. Returns
+/// an empty list when the token resolves but no sources are configured
+/// for the underlying server; 404 only when the token itself is
+/// unknown / revoked.
+async fn video_sources_handler(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+) -> Result<Response, Response> {
+    let widget = match widget_repo::find_by_token(&state.db, &token).await {
+        Ok(Some(w)) => w,
+        Ok(None) => {
+            tracing::debug!(token_prefix = %short_token(&token), "widget token miss");
+            return Err(error_response(
+                StatusCode::NOT_FOUND,
+                ErrorBody {
+                    error: "Not found".into(),
+                    code: None,
+                    details: None,
+                },
+            ));
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "widget repo lookup failed");
+            return Err(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorBody {
+                    error: "Internal server error".into(),
+                    code: None,
+                    details: None,
+                },
+            ));
+        }
+    };
+
+    let rows = video_sources::list_for_server(&state.db, widget.serverConfigId)
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, server_id = widget.serverConfigId, "video_sources list failed");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorBody {
+                    error: "Internal server error".into(),
+                    code: None,
+                    details: None,
+                },
+            )
+        })?;
+
+    let public: Vec<PublicVideoSource> = rows
+        .into_iter()
+        .map(|r| PublicVideoSource {
+            track: PublicTrack {
+                namespace: r.sourceId.clone(),
+                video: "video".into(),
+                audio: "audio".into(),
+            },
+            source_id: r.sourceId,
+            label: r.label,
+            preset: r.preset,
+            status: r.status,
+        })
+        .collect();
+
+    let response_body = PublicVideoSourcesResponse {
+        relay_url: state.moq_public_url.clone(),
+        sources: public,
+    };
+    let body = serde_json::to_vec(&response_body).map_err(|e| {
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorBody {
+                error: "Internal server error".into(),
+                code: None,
+                details: Some(format!("video_sources serialise failed: {e}")),
+            },
+        )
+    })?;
+    let mut response = (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        )],
+        body,
+    )
+        .into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(CACHE_CONTROL_VALUE),
+    );
+    Ok(response)
+}
+
 /// Shared cache+upstream lookup driver. Slice B (`image.svg`) and Slice C
 /// (`image.png`) consume the same path so all three formats render from
 /// one snapshot — and a single 45 s TTL covers the JSON view, the SVG, and
 /// the rasterised PNG together.
-pub async fn resolve_widget_data(
-    state: &AppState,
-    token: &str,
-) -> Result<WidgetData, Response> {
+pub async fn resolve_widget_data(state: &AppState, token: &str) -> Result<WidgetData, Response> {
     if let Some(cached) = state.widget_cache.get(token).await {
         return Ok(cached);
     }
@@ -314,7 +451,10 @@ pub async fn resolve_widget_data(
     // 4. Cache for [`CACHE_TTL`] (45 s) keyed by the widget's *current* token.
     //    A regenerate-token call invalidates this entry by the old token, so
     //    the new token starts cold (correct — different URL, fresh state).
-    state.widget_cache.insert(widget.token.clone(), data.clone()).await;
+    state
+        .widget_cache
+        .insert(widget.token.clone(), data.clone())
+        .await;
 
     // Reference `CACHE_TTL` so a future tweak forces this module to be
     // re-checked alongside the constant.
@@ -327,3 +467,80 @@ pub async fn resolve_widget_data(
 // `short_token` lives in [`crate::web::widget_security`] (Slice F) and is
 // reused here for INFO/WARN log lines. Tests for the helper itself live
 // alongside the implementation.
+
+#[cfg(test)]
+mod tests {
+    //! PURA-146 (WS-8) — assert that the public video-sources surface
+    //! never leaks management metadata. The internal `/api/video-sources`
+    //! shape (`VideoSourceView`) carries `url`, `created_by_user_id`, and
+    //! `created_at`; the public wrapper here must drop all three.
+    use super::*;
+
+    #[test]
+    fn public_video_source_serialisation_omits_url_and_management_fields() {
+        let row = PublicVideoSource {
+            source_id: "src-42".into(),
+            label: "Lobby cam".into(),
+            preset: "720p".into(),
+            status: "live".into(),
+            track: PublicTrack {
+                namespace: "src-42".into(),
+                video: "video".into(),
+                audio: "audio".into(),
+            },
+        };
+        let response = PublicVideoSourcesResponse {
+            relay_url: Some("https://stream.example.com:4443/anon".into()),
+            sources: vec![row],
+        };
+        let json = serde_json::to_string(&response).expect("serialise");
+        // None of the operator-side fields may appear in the wire shape.
+        for forbidden in [
+            "\"url\":",
+            "\"createdByUserId\":",
+            "\"created_by_user_id\":",
+            "\"createdAt\":",
+            "\"created_at\":",
+            // The internal numeric PK never leaks either — public callers
+            // identify a stream by `source_id`, not by `id`.
+            "\"id\":",
+        ] {
+            assert!(
+                !json.contains(forbidden),
+                "public JSON unexpectedly contains `{forbidden}` field: {json}"
+            );
+        }
+        // Spot-check the fields that MUST be present.
+        for required in [
+            "\"relay_url\":",
+            "\"sources\":",
+            "\"source_id\":\"src-42\"",
+            "\"label\":\"Lobby cam\"",
+            "\"track\":",
+            "\"namespace\":\"src-42\"",
+            "\"video\":\"video\"",
+            "\"audio\":\"audio\"",
+        ] {
+            assert!(
+                json.contains(required),
+                "public JSON missing expected `{required}`: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn relay_url_is_omitted_when_none() {
+        let response = PublicVideoSourcesResponse {
+            relay_url: None,
+            sources: vec![],
+        };
+        let json = serde_json::to_string(&response).expect("serialise");
+        // `serde(skip_serializing_if = "Option::is_none")` — the key must
+        // not appear at all so the FE can default to "No live video".
+        assert!(
+            !json.contains("relay_url"),
+            "relay_url must be elided when None (got `{json}`)"
+        );
+        assert!(json.contains("\"sources\":[]"));
+    }
+}
