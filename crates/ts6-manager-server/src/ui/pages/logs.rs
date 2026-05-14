@@ -216,10 +216,10 @@ async fn fetch_logs(
     if let Some(n) = query.lines {
         push("lines", n.to_string());
     }
-    if let Some(s) = query.severity.as_deref() {
-        if !s.is_empty() {
-            push("severity", s.to_string());
-        }
+    if let Some(s) = query.severity.as_deref()
+        && !s.is_empty()
+    {
+        push("severity", s.to_string());
     }
     api::authorized_get_json::<LogTailResponse>(&gate, &api::api_base(), &path).await
 }

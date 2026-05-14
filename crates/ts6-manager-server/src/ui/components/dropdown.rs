@@ -515,6 +515,10 @@ pub fn MenuItem(
         onselect.call(());
         // Checkbox items keep the menu open on toggle so the user can
         // multi-select; everything else closes when `close_on_select` is on.
+        // Clippy's `collapsible_if` autofix would merge the outer guard with
+        // the `if let` and silently drop the `#[cfg(wasm32)] if` block out of
+        // scope — see PURA-176. Keep the explicit outer block.
+        #[allow(clippy::collapsible_if)]
         if close_on_select && !matches!(kind, MenuItemKind::Checkbox { .. }) {
             if let Some(sig) = open_for_click.as_mut() {
                 sig.set(false);

@@ -116,7 +116,7 @@ async fn create(
     }
     let preset = match req.preset.as_deref() {
         None | Some("") => "720p".to_string(),
-        Some(p) if KNOWN_PRESETS.iter().any(|k| *k == p) => p.to_string(),
+        Some(p) if KNOWN_PRESETS.contains(&p) => p.to_string(),
         Some(p) => {
             return Err(err(
                 StatusCode::BAD_REQUEST,
@@ -305,6 +305,10 @@ async fn delete(
 // Helpers
 // ---------------------------------------------------------------------------
 
+// The `Err` variant is an axum `Response` (~136 B). Every handler in this
+// module already propagates `Result<_, Response>` via `?`, so boxing here
+// would force unwrapping at every caller. Match the established pattern.
+#[allow(clippy::result_large_err)]
 fn sidecar_or_503(state: &AppState) -> Result<&SidecarClient, Response> {
     state.sidecar.as_ref().ok_or_else(|| {
         err(
@@ -638,12 +642,14 @@ mod tests {
         assert_eq!(view.track.namespace, "mock-src-1");
         assert_eq!(view.track.video, "video");
         assert_eq!(view.track.audio, "audio");
-        // Sidecar saw the start call.
-        let starts = mock.start_calls.lock().unwrap();
-        assert_eq!(starts.len(), 1);
-        assert_eq!(starts[0]["url"], "http://93.184.216.34/stream.m3u8");
-        assert_eq!(starts[0]["preset"], "720p");
-        drop(starts);
+        // Sidecar saw the start call. Scope the std::sync::MutexGuard
+        // explicitly so it can never be held across the awaits that follow.
+        {
+            let starts = mock.start_calls.lock().unwrap();
+            assert_eq!(starts.len(), 1);
+            assert_eq!(starts[0]["url"], "http://93.184.216.34/stream.m3u8");
+            assert_eq!(starts[0]["preset"], "720p");
+        }
 
         // GET /api/video-sources (list)
         let resp = app(state.clone())

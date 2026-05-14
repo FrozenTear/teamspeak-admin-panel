@@ -89,7 +89,6 @@ pub fn BotDetailPage(bot_id: u64) -> Element {
 
     let on_connect = {
         let gate = gate.clone();
-        let toaster = toaster;
         let mut bump = bump;
         move |_| {
             let gate = gate.clone();
@@ -109,7 +108,6 @@ pub fn BotDetailPage(bot_id: u64) -> Element {
 
     let on_disconnect = {
         let gate = gate.clone();
-        let toaster = toaster;
         let mut bump = bump;
         move |_| {
             let gate = gate.clone();
@@ -130,7 +128,6 @@ pub fn BotDetailPage(bot_id: u64) -> Element {
     let mut join_input: Signal<String> = use_signal(String::new);
     let on_join = {
         let gate = gate.clone();
-        let toaster = toaster;
         let mut bump = bump;
         move |evt: FormEvent| {
             evt.prevent_default();
@@ -163,7 +160,6 @@ pub fn BotDetailPage(bot_id: u64) -> Element {
 
     let on_leave = {
         let gate = gate.clone();
-        let toaster = toaster;
         let mut bump = bump;
         move |_| {
             let gate = gate.clone();

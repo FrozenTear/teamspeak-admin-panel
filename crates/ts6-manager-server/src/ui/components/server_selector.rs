@@ -129,11 +129,11 @@ pub fn ServerSelector(
         let storage_for_effect = storage.clone();
         use_effect(move || {
             let cur = *selected.read();
-            if let Some(id) = cur {
-                if !rows_for_effect.iter().any(|s| s.id == id) {
-                    selected.set(None);
-                    clear_selected_server_id(&*storage_for_effect);
-                }
+            if let Some(id) = cur
+                && !rows_for_effect.iter().any(|s| s.id == id)
+            {
+                selected.set(None);
+                clear_selected_server_id(&*storage_for_effect);
             }
         });
     }

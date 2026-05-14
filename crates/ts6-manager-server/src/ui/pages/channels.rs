@@ -97,7 +97,7 @@ pub fn ChannelsPage() -> Element {
     // point this can drop to a targeted update.
     {
         let hub = hub.clone();
-        let _ = use_resource(move || {
+        let _resource = use_resource(move || {
             let hub = hub.clone();
             async move {
                 let topic = format!("server:{server_id}:channels");
@@ -115,7 +115,7 @@ pub fn ChannelsPage() -> Element {
     }
     {
         let hub = hub.clone();
-        let _ = use_resource(move || {
+        let _resource = use_resource(move || {
             let hub = hub.clone();
             async move {
                 let topic = format!("server:{server_id}:clients");

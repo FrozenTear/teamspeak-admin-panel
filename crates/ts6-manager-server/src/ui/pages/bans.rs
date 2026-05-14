@@ -67,7 +67,7 @@ pub fn BansPage() -> Element {
     // routes/control/bans.rs.
     {
         let hub = hub.clone();
-        let _ = use_resource(move || {
+        let _resource = use_resource(move || {
             let hub = hub.clone();
             async move {
                 let topic = format!("server:{server_id}:clients");
@@ -95,7 +95,6 @@ pub fn BansPage() -> Element {
 
     let on_create = {
         let gate = gate.clone();
-        let toaster = toaster;
         move |_| {
             if *form_busy.read() {
                 return;
@@ -163,7 +162,6 @@ pub fn BansPage() -> Element {
 
     let make_delete = {
         let gate = gate.clone();
-        let toaster = toaster;
         move |banid: i64| {
             let gate = gate.clone();
             let toaster = toaster;

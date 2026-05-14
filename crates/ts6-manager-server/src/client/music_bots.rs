@@ -443,7 +443,7 @@ pub fn open_bot_event_source<F>(_bot: wire::BotId, _on_event: F) -> BotEventStre
 where
     F: FnMut(wire::BotEventWire) + 'static,
 {
-    BotEventStream::default()
+    BotEventStream
 }
 
 /// Owns the live `EventSource` + the JS callback closure for the lifetime

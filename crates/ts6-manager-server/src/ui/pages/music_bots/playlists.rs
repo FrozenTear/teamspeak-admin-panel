@@ -51,10 +51,10 @@ pub fn MusicPlaylistsPage(bot_id: u64) -> Element {
             error.set(None);
             loading.set(false);
             // Default-select the first playlist when nothing was picked.
-            if selected.read().is_none() {
-                if let Some(first) = list.first() {
-                    selected.set(Some(first.name.clone()));
-                }
+            if selected.read().is_none()
+                && let Some(first) = list.first()
+            {
+                selected.set(Some(first.name.clone()));
             }
         }
         Some(Err(e)) => {
@@ -71,7 +71,6 @@ pub fn MusicPlaylistsPage(bot_id: u64) -> Element {
 
     let on_create = {
         let gate = gate.clone();
-        let toaster = toaster;
         let mut bump = bump;
         move |evt: FormEvent| {
             evt.prevent_default();
@@ -110,7 +109,6 @@ pub fn MusicPlaylistsPage(bot_id: u64) -> Element {
 
     let on_delete = {
         let gate = gate.clone();
-        let toaster = toaster;
         let mut bump = bump;
         move |name: String| {
             let gate = gate.clone();
@@ -286,9 +284,7 @@ fn PlaylistDetailPane(props: PlaylistDetailPaneProps) -> Element {
 
     let on_add = {
         let gate = gate.clone();
-        let toaster = toaster;
         let name_for_add = name.clone();
-        let on_changed = on_changed;
         let mut bump_local = bump_local;
         move |evt: FormEvent| {
             evt.prevent_default();
@@ -332,9 +328,7 @@ fn PlaylistDetailPane(props: PlaylistDetailPaneProps) -> Element {
 
     let on_remove_track = {
         let gate = gate.clone();
-        let toaster = toaster;
         let name_for_remove = name.clone();
-        let on_changed = on_changed;
         let mut bump_local = bump_local;
         move |track: wire::TrackId| {
             let gate = gate.clone();
@@ -358,7 +352,6 @@ fn PlaylistDetailPane(props: PlaylistDetailPaneProps) -> Element {
 
     let on_enqueue = {
         let gate = gate.clone();
-        let toaster = toaster;
         let name_for_enqueue = name.clone();
         move |_| {
             let gate = gate.clone();

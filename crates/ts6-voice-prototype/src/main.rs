@@ -95,12 +95,12 @@ async fn main() -> Result<()> {
     tokio::fs::create_dir_all(&cli.identity_dir)
         .await
         .with_context(|| format!("create identity dir {}", cli.identity_dir.display()))?;
-    if let Some(parent) = cli.out_wav.parent() {
-        if !parent.as_os_str().is_empty() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("create wav parent dir {}", parent.display()))?;
-        }
+    if let Some(parent) = cli.out_wav.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("create wav parent dir {}", parent.display()))?;
     }
 
     let identity_path = cli.identity_dir.join("identity.json");

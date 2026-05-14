@@ -58,6 +58,12 @@ pub struct AuditEntry {
     pub latency: Duration,
 }
 
+// Each constructor takes the audit-row fields by value; bundling them into a
+// "common context" struct would just push the same surface to every call
+// site (handlers spread `server_config_id`/`virtual_server_id`/… into these
+// directly from request state). Allow per-fn rather than refactoring the
+// call sites in this lint-only pass.
+#[allow(clippy::too_many_arguments)]
 impl AuditEntry {
     pub fn success(
         server_config_id: i64,

@@ -269,13 +269,12 @@ async fn run_connected_loop(
                     // consumes the item. Cheap because we only clone the
                     // event vector when chat is actually present.
                     let chat_msgs = extract_channel_chat(&item, con);
-                    if let Some(channel) = handle_stream_item(item, con) {
-                        if Some(channel) != *current_channel {
+                    if let Some(channel) = handle_stream_item(item, con)
+                        && Some(channel) != *current_channel {
                             *current_channel = Some(channel);
                             transition(state, BotState::InChannel, events);
                             let _ = events.send(BotEvent::JoinedChannel { channel_id: channel });
                         }
-                    }
                     for msg in chat_msgs {
                         dispatch_chat_line(con, bot_id, store, events, &msg).await;
                     }

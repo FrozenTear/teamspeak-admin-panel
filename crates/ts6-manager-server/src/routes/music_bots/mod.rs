@@ -11,7 +11,7 @@
 //! - `library`         — `/music-library`.
 //! - `playlists`       — `/playlists[/{name}/...]`, query-scoped by `bot`.
 //! - `radio_stations`  — `/radio-stations`, library entries marked with
-//!                       the [`wire::RADIO_TAG`] tag.
+//!   the [`wire::RADIO_TAG`] tag.
 //! - `requests`        — `/music-requests` log.
 //!
 //! Auth: a fresh `RequireAuth` lookup runs on every handler (per spec

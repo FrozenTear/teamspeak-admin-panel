@@ -1476,7 +1476,7 @@ async fn audit_entry_persist_round_trips_through_table() {
         StdDuration::from_millis(42),
     );
     entry.emit();
-    entry.persist(&*db).await;
+    entry.persist(&db).await;
 
     let mut resp = db
         .query(

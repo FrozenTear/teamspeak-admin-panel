@@ -110,10 +110,10 @@ pub const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x
 
 #[cfg(not(feature = "widget-png-disabled"))]
 fn build_options() -> usvg::Options<'static> {
-    let fontdb = system_fontdb();
-    let mut opts = usvg::Options::default();
-    opts.fontdb = fontdb;
-    opts
+    usvg::Options {
+        fontdb: system_fontdb(),
+        ..usvg::Options::default()
+    }
 }
 
 #[cfg(not(feature = "widget-png-disabled"))]

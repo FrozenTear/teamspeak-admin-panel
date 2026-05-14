@@ -169,7 +169,7 @@ impl HostKeyVerifier {
             }
             HostKeyPolicy::StrictFingerprint(fps) => {
                 let observed = server_key.fingerprint(HashAlg::Sha256);
-                let ok = fps.iter().any(|fp| *fp == observed);
+                let ok = fps.contains(&observed);
                 if ok {
                     tracing::info!(
                         target: "sshbridge::hostkey",

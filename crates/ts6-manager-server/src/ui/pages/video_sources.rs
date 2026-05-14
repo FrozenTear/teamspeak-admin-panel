@@ -113,7 +113,7 @@ pub fn VideoSourcesPage() -> Element {
     // page; the WS hub keeps the receiver wired across reconnects.
     {
         let hub = hub.clone();
-        let _ = use_resource(move || {
+        let _resource = use_resource(move || {
             let hub = hub.clone();
             let cur = server_id;
             async move {
@@ -136,7 +136,6 @@ pub fn VideoSourcesPage() -> Element {
 
     let on_stop = {
         let gate = gate.clone();
-        let toaster = toaster;
         move |id: i64| {
             // Optimistic remove — WS push reconciles if the DELETE fails.
             let removed = rows.with_mut(|r| r.remove(&id));
@@ -245,7 +244,6 @@ pub fn VideoSourcesPage() -> Element {
                 server_id: server_id,
                 on_close: EventHandler::new(move |_: ()| show_create.set(false)),
                 on_created: EventHandler::new({
-                    let toaster = toaster;
                     move |v: wire::VideoSourceView| {
                         toaster.push(
                             ToastVariant::Success,
@@ -320,28 +318,27 @@ impl RowState {
 fn apply_event(rows: &mut BTreeMap<i64, RowState>, env: &WsEvent, expected_server: i64) {
     match env.kind.as_str() {
         "video_source:created" => {
-            if let Ok(view) = serde_json::from_value::<wire::VideoSourceView>(env.data.clone()) {
-                if view.server_id == expected_server {
-                    rows.entry(view.id)
-                        .and_modify(|r| {
-                            // Keep current live stats on re-emit.
-                            r.label = view.label.clone();
-                            r.status = view.status.clone();
-                            r.preset = view.preset.clone();
-                            r.url = view.url.clone();
-                            r.source_id = view.source_id.clone();
-                        })
-                        .or_insert_with(|| RowState::from_view(view));
-                }
+            if let Ok(view) = serde_json::from_value::<wire::VideoSourceView>(env.data.clone())
+                && view.server_id == expected_server
+            {
+                rows.entry(view.id)
+                    .and_modify(|r| {
+                        // Keep current live stats on re-emit.
+                        r.label = view.label.clone();
+                        r.status = view.status.clone();
+                        r.preset = view.preset.clone();
+                        r.url = view.url.clone();
+                        r.source_id = view.source_id.clone();
+                    })
+                    .or_insert_with(|| RowState::from_view(view));
             }
         }
         "video_source:update" => {
-            if let Ok(u) = serde_json::from_value::<wire::VideoSourceUpdate>(env.data.clone()) {
-                if u.server_id == expected_server {
-                    if let Some(row) = rows.get_mut(&u.id) {
-                        row.apply_update(&u);
-                    }
-                }
+            if let Ok(u) = serde_json::from_value::<wire::VideoSourceUpdate>(env.data.clone())
+                && u.server_id == expected_server
+                && let Some(row) = rows.get_mut(&u.id)
+            {
+                row.apply_update(&u);
             }
         }
         "video_source:deleted" => {

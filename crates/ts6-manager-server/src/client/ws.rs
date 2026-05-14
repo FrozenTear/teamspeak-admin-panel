@@ -255,10 +255,11 @@ pub fn use_ws_lifecycle(hub: WsHub) {
         if prev == now_authed {
             return;
         }
-        if !prev && now_authed {
-            if let Some(t) = access {
-                hub.rearm(t);
-            }
+        if !prev
+            && now_authed
+            && let Some(t) = access
+        {
+            hub.rearm(t);
         }
         last_authed.set(now_authed);
     });

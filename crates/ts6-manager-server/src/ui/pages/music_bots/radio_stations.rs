@@ -66,7 +66,6 @@ pub fn RadioStationsPage(bot_id: u64) -> Element {
 
     let on_create = {
         let gate = gate.clone();
-        let toaster = toaster;
         let mut bump = bump;
         move |evt: FormEvent| {
             evt.prevent_default();
@@ -122,7 +121,6 @@ pub fn RadioStationsPage(bot_id: u64) -> Element {
 
     let on_play = {
         let gate = gate.clone();
-        let toaster = toaster;
         move |id: wire::LibraryEntryId| {
             let gate = gate.clone();
             spawn(async move {
@@ -138,7 +136,6 @@ pub fn RadioStationsPage(bot_id: u64) -> Element {
 
     let on_delete = {
         let gate = gate.clone();
-        let toaster = toaster;
         let mut bump = bump;
         move |id: wire::LibraryEntryId| {
             let gate = gate.clone();

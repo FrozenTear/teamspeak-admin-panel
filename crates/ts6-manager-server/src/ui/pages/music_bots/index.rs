@@ -58,7 +58,6 @@ pub fn BotsIndexPage() -> Element {
 
     let on_connect = {
         let gate = gate.clone();
-        let toaster = toaster;
         move |bot: wire::BotId| {
             let gate = gate.clone();
             spawn(async move {
@@ -80,7 +79,6 @@ pub fn BotsIndexPage() -> Element {
 
     let on_disconnect = {
         let gate = gate.clone();
-        let toaster = toaster;
         move |bot: wire::BotId| {
             let gate = gate.clone();
             spawn(async move {
@@ -102,7 +100,6 @@ pub fn BotsIndexPage() -> Element {
 
     let on_delete = {
         let gate = gate.clone();
-        let toaster = toaster;
         let mut bump = bump;
         move |bot: wire::BotId| {
             let gate = gate.clone();
@@ -193,7 +190,6 @@ pub fn BotsIndexPage() -> Element {
             CreateBotModal {
                 on_close: EventHandler::new(move |_: ()| show_create.set(false)),
                 on_created: EventHandler::new({
-                    let toaster = toaster;
                     let mut show_create = show_create;
                     let mut bump = bump;
                     move |s: wire::MusicBotSummary| {

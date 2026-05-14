@@ -57,7 +57,6 @@ pub fn SetupPage() -> Element {
     // /login. We do this in a one-shot effect so the SPA doesn't render the
     // form at all when an operator already exists.
     {
-        let nav = nav.clone();
         use_future(move || async move {
             let base = api_base();
             match setup::status(&base).await {
@@ -114,7 +113,7 @@ pub fn SetupPage() -> Element {
         let username_for_login = req.username.clone();
         let password_for_login = req.password.clone();
         let session = session_for_submit.clone();
-        let nav = nav.clone();
+        let nav = nav;
         submitting.set(true);
         password_error.set(None);
         form_error.set(None);

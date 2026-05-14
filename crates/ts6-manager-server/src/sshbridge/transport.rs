@@ -355,12 +355,12 @@ pub(crate) async fn read_banner<C: SshChannel>(
                 });
             }
             Ok(Err(e)) => {
-                if let TransportError::Closed(s) | TransportError::Io(s) = &e {
-                    if looks_like_auth_failure(s) {
-                        return Err(SshBridgeError::AuthRejected {
-                            config_id: cfg.config_id,
-                        });
-                    }
+                if let TransportError::Closed(s) | TransportError::Io(s) = &e
+                    && looks_like_auth_failure(s)
+                {
+                    return Err(SshBridgeError::AuthRejected {
+                        config_id: cfg.config_id,
+                    });
                 }
                 return Err(SshBridgeError::Transport(e.to_string()));
             }
@@ -663,6 +663,7 @@ async fn dispatch_loop<C: SshChannel>(
 /// formula `min(backoff_initial * 2^attempts, backoff_max)` and loops.
 /// `SessionResult::AuthRejected` returns immediately without retry —
 /// spec §11.5 fatal-on-auth.
+#[allow(clippy::too_many_arguments)]
 async fn run_with_reconnect<C, F, Fut>(
     cfg: TransportConfig,
     mut connect_factory: F,

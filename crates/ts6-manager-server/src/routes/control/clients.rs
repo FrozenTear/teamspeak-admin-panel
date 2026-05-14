@@ -375,6 +375,10 @@ async fn backend(
         .map_err(translate_control_error)
 }
 
+// Forwards every AuditEntry::success field; refactoring would require a
+// context struct shared with `audit.rs` and the failure path below. Out of
+// scope for the lint-cleanup pass.
+#[allow(clippy::too_many_arguments)]
 async fn emit_success(
     _state: &AppState,
     user: &crate::auth::extractors::AuthUser,
@@ -398,6 +402,7 @@ async fn emit_success(
     .emit();
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn emit_failure_and_translate(
     _state: &AppState,
     user: &crate::auth::extractors::AuthUser,

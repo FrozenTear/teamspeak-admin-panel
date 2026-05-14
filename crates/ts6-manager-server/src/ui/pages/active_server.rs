@@ -25,10 +25,10 @@ pub const DEFAULT_VIRTUAL_SERVER_ID: i64 = 1;
 /// row in the live list). `None` iff the list is empty / loading / errored.
 pub fn resolve(servers: &ServersData, storage: &dyn Storage) -> Option<ServerSummary> {
     let rows = servers.rows();
-    if let Some(id) = load_selected_server_id(storage) {
-        if let Some(s) = rows.iter().find(|s| s.id == id).cloned() {
-            return Some(s);
-        }
+    if let Some(id) = load_selected_server_id(storage)
+        && let Some(s) = rows.iter().find(|s| s.id == id).cloned()
+    {
+        return Some(s);
     }
     rows.first().cloned()
 }

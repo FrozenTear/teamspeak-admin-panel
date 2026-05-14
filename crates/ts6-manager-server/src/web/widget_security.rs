@@ -157,17 +157,17 @@ pub async fn widget_rate_limit(
         return rate_limit_response(wait);
     }
 
-    if let Some(t) = &token_key {
-        if let Err(not_until) = state.by_token.check_key(t) {
-            let wait = not_until.wait_time_from(now);
-            tracing::info!(
-                client_ip = %ip,
-                token_prefix = %short_token(t),
-                retry_after_secs = wait.as_secs(),
-                "rate-limit denied widget request (per-token)"
-            );
-            return rate_limit_response(wait);
-        }
+    if let Some(t) = &token_key
+        && let Err(not_until) = state.by_token.check_key(t)
+    {
+        let wait = not_until.wait_time_from(now);
+        tracing::info!(
+            client_ip = %ip,
+            token_prefix = %short_token(t),
+            retry_after_secs = wait.as_secs(),
+            "rate-limit denied widget request (per-token)"
+        );
+        return rate_limit_response(wait);
     }
 
     next.run(req).await

@@ -66,7 +66,6 @@ pub fn MusicLibraryPage(bot_id: u64) -> Element {
 
     let on_add = {
         let gate = gate.clone();
-        let toaster = toaster;
         let mut bump = bump;
         move |evt: FormEvent| {
             evt.prevent_default();
@@ -112,7 +111,6 @@ pub fn MusicLibraryPage(bot_id: u64) -> Element {
 
     let on_delete = {
         let gate = gate.clone();
-        let toaster = toaster;
         let mut bump = bump;
         move |id: wire::LibraryEntryId| {
             let gate = gate.clone();

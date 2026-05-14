@@ -100,7 +100,7 @@ pub fn ClientsPage() -> Element {
     // WS subscription — reduce envelopes into the working copy.
     {
         let hub = hub.clone();
-        let _ = use_resource(move || {
+        let _resource = use_resource(move || {
             let hub = hub.clone();
             let cur_server = *server_changed_marker.read();
             async move {
@@ -124,7 +124,6 @@ pub fn ClientsPage() -> Element {
     // Action helpers reused by every row.
     let make_kick = {
         let gate = gate.clone();
-        let toaster = toaster;
         move |clid: i64, kind: KickKind| {
             let gate = gate.clone();
             spawn(async move {
@@ -154,7 +153,6 @@ pub fn ClientsPage() -> Element {
 
     let make_mute = {
         let gate = gate.clone();
-        let toaster = toaster;
         move |clid: i64, on: bool| {
             let gate = gate.clone();
             spawn(async move {
@@ -192,7 +190,6 @@ pub fn ClientsPage() -> Element {
 
     let make_move = {
         let gate = gate.clone();
-        let toaster = toaster;
         move |clid: i64, target_cid: i64| {
             let gate = gate.clone();
             spawn(async move {
@@ -410,39 +407,39 @@ fn apply_event(rows: &mut Vec<ClientListItem>, env: &WsEvent) {
             // server's default channel. We don't know that id without a
             // refetch; clear `cid` to 0 so the row clearly shows it
             // moved, and the next snapshot reconciles.
-            if let Some(clid) = env.data.get("clid").and_then(Value::as_i64) {
-                if let Some(row) = rows.iter_mut().find(|r| r.clid == clid) {
-                    row.cid = 0;
-                }
+            if let Some(clid) = env.data.get("clid").and_then(Value::as_i64)
+                && let Some(row) = rows.iter_mut().find(|r| r.clid == clid)
+            {
+                row.cid = 0;
             }
         }
         "ts:client:moved" => {
             let clid = env.data.get("clid").and_then(Value::as_i64);
             let cid = env.data.get("cid").and_then(Value::as_i64);
-            if let (Some(clid), Some(cid)) = (clid, cid) {
-                if let Some(row) = rows.iter_mut().find(|r| r.clid == clid) {
-                    row.cid = cid;
-                }
+            if let (Some(clid), Some(cid)) = (clid, cid)
+                && let Some(row) = rows.iter_mut().find(|r| r.clid == clid)
+            {
+                row.cid = cid;
             }
         }
         "ts:client:muted" => {
-            if let Some(clid) = env.data.get("clid").and_then(Value::as_i64) {
-                if let Some(row) = rows.iter_mut().find(|r| r.clid == clid) {
-                    if let Some(b) = env.data.get("inputMuted").and_then(Value::as_bool) {
-                        row.client_input_muted = if b { 1 } else { 0 };
-                    }
-                    if let Some(b) = env.data.get("outputMuted").and_then(Value::as_bool) {
-                        row.client_output_muted = if b { 1 } else { 0 };
-                    }
+            if let Some(clid) = env.data.get("clid").and_then(Value::as_i64)
+                && let Some(row) = rows.iter_mut().find(|r| r.clid == clid)
+            {
+                if let Some(b) = env.data.get("inputMuted").and_then(Value::as_bool) {
+                    row.client_input_muted = if b { 1 } else { 0 };
+                }
+                if let Some(b) = env.data.get("outputMuted").and_then(Value::as_bool) {
+                    row.client_output_muted = if b { 1 } else { 0 };
                 }
             }
         }
         "ts:client:unmuted" => {
-            if let Some(clid) = env.data.get("clid").and_then(Value::as_i64) {
-                if let Some(row) = rows.iter_mut().find(|r| r.clid == clid) {
-                    row.client_input_muted = 0;
-                    row.client_output_muted = 0;
-                }
+            if let Some(clid) = env.data.get("clid").and_then(Value::as_i64)
+                && let Some(row) = rows.iter_mut().find(|r| r.clid == clid)
+            {
+                row.client_input_muted = 0;
+                row.client_output_muted = 0;
             }
         }
         _ => {}

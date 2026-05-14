@@ -43,11 +43,11 @@ fn escape_byte(b: u8) -> Option<&'static str> {
 pub fn escape(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
-        if let Some(byte) = ascii_byte(ch) {
-            if let Some(seq) = escape_byte(byte) {
-                out.push_str(seq);
-                continue;
-            }
+        if let Some(byte) = ascii_byte(ch)
+            && let Some(seq) = escape_byte(byte)
+        {
+            out.push_str(seq);
+            continue;
         }
         out.push(ch);
     }

@@ -108,33 +108,31 @@ async fn handler_dispatch(
     let path_for_capture = format!("/{sid}/{cmd}");
     let base = cmd.split('-').next().unwrap_or("").to_string();
     let body = match base.as_str() {
-        "clientlist" => match params.get("clid") {
-            // Detail-route's lookup; the route falls back to a clientlist
-            // scan for the live-clid resolution. Same payload as the bulk
-            // fetch — keeps the mock simple.
-            _ => json!([
-                {
-                    "clid": "10",
-                    "cid": "1",
-                    "client_database_id": "100",
-                    "client_type": "0",
-                    "client_nickname": "Alice",
-                    "client_unique_identifier": "uid-A=",
-                    "client_input_muted": "0",
-                    "client_output_muted": "0",
-                    "client_country": "DE",
-                    "connection_client_ip": "203.0.113.10",
-                },
-                {
-                    "clid": "11",
-                    "cid": "1",
-                    "client_database_id": "101",
-                    "client_type": "1",
-                    "client_nickname": "serveradmin",
-                    "client_unique_identifier": "uid-Q=",
-                }
-            ]),
-        },
+        // Detail-route's lookup ignores the `clid` query param: the route
+        // falls back to a clientlist scan for live-clid resolution, so the
+        // mock returns the same payload as the bulk fetch regardless.
+        "clientlist" => json!([
+            {
+                "clid": "10",
+                "cid": "1",
+                "client_database_id": "100",
+                "client_type": "0",
+                "client_nickname": "Alice",
+                "client_unique_identifier": "uid-A=",
+                "client_input_muted": "0",
+                "client_output_muted": "0",
+                "client_country": "DE",
+                "connection_client_ip": "203.0.113.10",
+            },
+            {
+                "clid": "11",
+                "cid": "1",
+                "client_database_id": "101",
+                "client_type": "1",
+                "client_nickname": "serveradmin",
+                "client_unique_identifier": "uid-Q=",
+            }
+        ]),
         "channellist" => json!([
             { "cid": "1", "pid": "0", "channel_order": "0", "channel_name": "Lobby", "channel_topic": "Welcome" },
             { "cid": "2", "pid": "1", "channel_order": "1", "channel_name": "Voice", "channel_topic": "" }

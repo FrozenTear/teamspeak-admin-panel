@@ -95,7 +95,7 @@ pub fn ActivityFeedSubscription() -> Element {
         });
     }
 
-    let _ = use_resource(move || {
+    let _resource = use_resource(move || {
         let hub = hub.clone();
         let feed = feed;
         let toaster = toaster;

@@ -121,7 +121,6 @@ pub fn ToasterRegion() -> Element {
             for entry in items.read().iter().cloned() {
                 {
                     let id = entry.id;
-                    let toaster = toaster;
                     rsx! {
                         div {
                             key: "{entry.id}",

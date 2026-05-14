@@ -52,16 +52,15 @@ pub fn LoginPage(next: Option<String>) -> Element {
     // as a fallback; they'll get a friendly auth error if there's truly no
     // admin to log in as).
     {
-        let nav = nav.clone();
         use_future(move || async move {
             if already {
                 return;
             }
             let base = api_base();
-            if let Ok(status) = setup_client::status(&base).await {
-                if status.needs_setup {
-                    nav.replace(Route::SetupPage {});
-                }
+            if let Ok(status) = setup_client::status(&base).await
+                && status.needs_setup
+            {
+                nav.replace(Route::SetupPage {});
             }
         });
     }

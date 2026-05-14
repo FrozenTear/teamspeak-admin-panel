@@ -185,15 +185,15 @@ impl RequestLog {
         let inner = self.inner.read().await;
         let mut out: Vec<wire::MusicRequest> = inner
             .iter()
-            .filter(|r| filter.bot.map_or(true, |b| r.bot == b))
+            .filter(|r| filter.bot.is_none_or(|b| r.bot == b))
             .filter(|r| {
                 filter
                     .requested_by
                     .as_deref()
-                    .map_or(true, |q| r.requested_by.as_deref() == Some(q))
+                    .is_none_or(|q| r.requested_by.as_deref() == Some(q))
             })
-            .filter(|r| filter.since.map_or(true, |t| r.requested_at >= t))
-            .filter(|r| filter.until.map_or(true, |t| r.requested_at <= t))
+            .filter(|r| filter.since.is_none_or(|t| r.requested_at >= t))
+            .filter(|r| filter.until.is_none_or(|t| r.requested_at <= t))
             .cloned()
             .collect();
         // Newest-first for the API view.

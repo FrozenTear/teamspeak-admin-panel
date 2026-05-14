@@ -208,6 +208,11 @@ fn ban_create_details(req: &BanCreateRequest) -> String {
     parts.join(" ")
 }
 
+// Mirrors the field set of `AuditEntry::upstream_error` / `::transport`;
+// bundling these would just shift identical arguments to the call sites in
+// `audit.rs`. Allow rather than thread a context struct through every
+// handler in this lint-only pass.
+#[allow(clippy::too_many_arguments)]
 fn emit_failure(
     user: &crate::auth::extractors::AuthUser,
     connection: &ServerConnection,

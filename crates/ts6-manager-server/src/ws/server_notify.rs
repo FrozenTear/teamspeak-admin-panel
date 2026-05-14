@@ -314,7 +314,7 @@ async fn run_worker(
 }
 
 /// The four event classes the WS topics consume. `id=0` on the channel
-/// + textchannel registers means "every channel" — the upstream
+/// and textchannel registers means "every channel" — the upstream
 /// requires an explicit cid/0 sentinel for those two events.
 const REGISTER_LINES: [&str; 4] = [
     "servernotifyregister event=server",

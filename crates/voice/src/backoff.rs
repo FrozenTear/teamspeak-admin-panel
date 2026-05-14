@@ -59,10 +59,10 @@ impl ExponentialBackoff {
     /// configured `max_attempts` has been reached. Caller is expected to
     /// emit a `BotEvent::Error` and stop retrying when `None` comes back.
     pub fn next_delay(&mut self) -> Option<Duration> {
-        if let Some(max) = self.config.max_attempts {
-            if self.attempt >= max {
-                return None;
-            }
+        if let Some(max) = self.config.max_attempts
+            && self.attempt >= max
+        {
+            return None;
         }
         // attempt 0 → initial; attempt 1 → initial * mult; clamp to max.
         let scale = self.config.multiplier.powi(self.attempt as i32);

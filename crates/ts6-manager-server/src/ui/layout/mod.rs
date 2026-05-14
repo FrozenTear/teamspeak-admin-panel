@@ -5,9 +5,9 @@
 //! selector, websocket indicator, theme toggle, user menu, and logout.
 //!
 //! [`AppShell`] is wired into the `Routable` enum via `#[layout(AppShell)]`,
-//! so every route nested under it renders inside `.app > .sidebar + .header
-//! + .main` automatically. The login route stays outside the layout because
-//! the spec puts it on its own surface.
+//! so every route nested under it renders inside
+//! `.app > .sidebar + .header + .main` automatically. The login route stays
+//! outside the layout because the spec puts it on its own surface.
 
 mod header;
 mod servers_context;
@@ -28,6 +28,31 @@ use crate::ui::components::{
     WsReconnectBanner,
 };
 use crate::ui::routes::Route;
+
+/// Pull the current location path from the SPA URL. On the server (SSR)
+/// the navigator's serialised representation is used directly. The
+/// returned string is always a leading-slash path; `LoginPage::is_safe_internal_path`
+/// gate-keeps it before honouring `?next=`.
+fn current_path() -> String {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(window) = web_sys::window() {
+            let loc = window.location();
+            let mut out = loc.pathname().unwrap_or_else(|_| "/".into());
+            if let Ok(search) = loc.search() {
+                if !search.is_empty() {
+                    out.push_str(&search);
+                }
+            }
+            return out;
+        }
+        "/".into()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        "/".into()
+    }
+}
 
 /// Authenticated layout. Dioxus mounts an `Outlet<Route>` for the matched
 /// child route inside `<main class="main">`.
@@ -207,30 +232,5 @@ mod tests {
                 || html.contains(r#"<main tabindex="0" class="main""#),
             "missing tabindex='0' on <main>: {html}"
         );
-    }
-}
-
-/// Pull the current location path from the SPA URL. On the server (SSR)
-/// the navigator's serialised representation is used directly. The
-/// returned string is always a leading-slash path; `LoginPage::is_safe_internal_path`
-/// gate-keeps it before honouring `?next=`.
-fn current_path() -> String {
-    #[cfg(target_arch = "wasm32")]
-    {
-        if let Some(window) = web_sys::window() {
-            let loc = window.location();
-            let mut out = loc.pathname().unwrap_or_else(|_| "/".into());
-            if let Ok(search) = loc.search() {
-                if !search.is_empty() {
-                    out.push_str(&search);
-                }
-            }
-            return out;
-        }
-        "/".into()
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        "/".into()
     }
 }

@@ -199,7 +199,6 @@ pub fn WidgetsPage() -> Element {
                         EventHandler::new(move |id: i64| panel.set(PanelState::Delete(id)))
                     },
                     on_copy: {
-                        let toaster = toaster;
                         EventHandler::new(move |label: String| {
                             toaster.push(ToastVariant::Success, format!("Copied {label}"), None);
                         })
@@ -213,10 +212,9 @@ pub fn WidgetsPage() -> Element {
             PanelState::Create => rsx! {
                 CreateWidgetModal {
                     servers: servers_ctx.data.read().clone(),
-                    on_close: on_close_panel.clone(),
+                    on_close: on_close_panel,
                     on_created: {
-                        let mut after = make_after_mutation.clone();
-                        let toaster = toaster;
+                        let mut after = make_after_mutation;
                         EventHandler::new(move |w: WidgetSummary| {
                             toaster.push(ToastVariant::Success, format!("Created widget “{}”", w.name), None);
                             after();
@@ -228,10 +226,9 @@ pub fn WidgetsPage() -> Element {
                 Some(row) => rsx! {
                     EditWidgetDrawer {
                         widget: row,
-                        on_close: on_close_panel.clone(),
+                        on_close: on_close_panel,
                         on_saved: {
-                            let mut after = make_after_mutation.clone();
-                            let toaster = toaster;
+                            let mut after = make_after_mutation;
                             EventHandler::new(move |w: WidgetSummary| {
                                 toaster.push(ToastVariant::Success, format!("Saved “{}”", w.name), None);
                                 after();
@@ -245,10 +242,9 @@ pub fn WidgetsPage() -> Element {
                 Some(row) => rsx! {
                     RegenerateConfirmModal {
                         widget: row,
-                        on_close: on_close_panel.clone(),
+                        on_close: on_close_panel,
                         on_done: {
-                            let mut after = make_after_mutation.clone();
-                            let toaster = toaster;
+                            let mut after = make_after_mutation;
                             EventHandler::new(move |w: WidgetSummary| {
                                 toaster.push(
                                     ToastVariant::Success,
@@ -266,10 +262,9 @@ pub fn WidgetsPage() -> Element {
                 Some(row) => rsx! {
                     DeleteConfirmModal {
                         widget: row,
-                        on_close: on_close_panel.clone(),
+                        on_close: on_close_panel,
                         on_done: {
-                            let mut after = make_after_mutation.clone();
-                            let toaster = toaster;
+                            let mut after = make_after_mutation;
                             EventHandler::new(move |name: String| {
                                 toaster.push(ToastVariant::Success, format!("Deleted “{name}”"), None);
                                 after();
