@@ -68,9 +68,13 @@ spec:
         runAsUser: 10001
         runAsGroup: 10001
       ports:
+        # Under `hostNetwork: true` the container shares the host's net
+        # namespace, so `containerPort` IS the host port — `hostPort:`
+        # would be both redundant and rejected by Podman with
+        # "PortMappings can only be used with Bridge, slirp4netns, or
+        # pasta networking".
         - name: http
           containerPort: 3001
-          hostPort: 3001
           protocol: TCP
       env:
         - name: NODE_ENV
@@ -126,13 +130,14 @@ spec:
         - "--tls-generate"
         - "localhost"
       ports:
+        # Same constraint as the fullstack container above: under
+        # `hostNetwork: true` the `containerPort` is reachable directly
+        # on the host; `hostPort` is rejected.
         - name: control
           containerPort: 7080
-          hostPort: 7080
           protocol: TCP
         - name: webtransport
           containerPort: 4443
-          hostPort: 4443
           protocol: UDP
       readinessProbe:
         httpGet:
