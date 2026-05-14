@@ -43,6 +43,18 @@ COPY crates ./crates
 # Cargo.lock may not exist on a fresh checkout; tolerate either case.
 COPY Cargo.loc[k] ./
 
+# PURA-187 — `.cargo/config.toml` carries the
+# `--cfg=web_sys_unstable_apis` rustflag (PURA-143 WS-5). Without it the
+# in-container `wasm32-unknown-unknown` build can't see web-sys's
+# `WebTransport`, `VideoDecoder`, `AudioDecoder`, `AudioData`,
+# `AudioSampleFormat`, etc., and the video_player widget fails to
+# compile — turning PURA-185's `--platform web` switch into a hard
+# stage-1 build failure instead of a silent CSS-only release. The
+# v0.1.0-rc1 image hid the missing flag because its "client" was being
+# built as `BundleFormat::Server`, so this code never type-checked for
+# wasm at all.
+COPY .cargo ./.cargo
+
 # Build both the wasm client and the patched native server binary in one pass.
 # Output layout (impl-plan §10) — written under the workspace target dir:
 #   target/dx/ts6-manager-server/release/web/server
