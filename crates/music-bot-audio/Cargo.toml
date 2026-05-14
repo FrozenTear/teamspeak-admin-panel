@@ -13,6 +13,14 @@ path = "src/lib.rs"
 name = "music-bot-audio-demo"
 path = "src/bin/demo.rs"
 
+# PURA-162 WS-Perf — sustained-load + latency smoke harness. Lives in the
+# crate so it links the same pipeline/encoder code the published music-bot
+# ships with. Runnable as `cargo run -p music-bot-audio --bin perf-smoke`,
+# or baked into the published OCI image once WS-OPS-Images lands.
+[[bin]]
+name = "perf-smoke"
+path = "src/bin/perf_smoke.rs"
+
 [dependencies]
 # PURA-117 WS-2 (PURA-119) — music-bot audio pipeline.
 #
@@ -36,6 +44,8 @@ tracing-subscriber = { workspace = true }
 futures = { workspace = true }
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 hound = "3.5"
