@@ -121,9 +121,10 @@ jobs:
           set -euo pipefail
           API_KEY=""
           for _ in $(seq 1 90); do
-            if docker logs ts6-fixture 2>&1 | grep -qE 'apikey=[A-Za-z0-9_-]+'; then
+            if docker logs ts6-fixture 2>&1 | grep -qE 'apikey='; then
               API_KEY=$(docker logs ts6-fixture 2>&1 \
-                | grep -oE 'apikey=[A-Za-z0-9_-]+' | head -1 | cut -d= -f2)
+                | grep -oE 'apikey=[ ]*"?[A-Za-z0-9_-]+' | head -1 \
+                | sed 's/apikey=[ ]*"*//')
               break
             fi
             sleep 2

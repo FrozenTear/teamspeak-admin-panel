@@ -656,8 +656,7 @@ mod tests {
                     // wipe alice's set if it has been rotated, or (b)
                     // succeed/fail without touching bob's set. Bob's set
                     // must survive both branches untouched.
-                    let bob_rows_before =
-                        refresh_tokens::list_for_user(&db, bob).await.unwrap();
+                    let bob_rows_before = refresh_tokens::list_for_user(&db, bob).await.unwrap();
 
                     let pred_before = refresh_tokens::find_by_token(&db, &alice_t1.token)
                         .await
@@ -669,8 +668,7 @@ mod tests {
 
                     let result = rotate(&db, &alice_t1.token, ONE_DAY).await;
 
-                    let bob_rows_after =
-                        refresh_tokens::list_for_user(&db, bob).await.unwrap();
+                    let bob_rows_after = refresh_tokens::list_for_user(&db, bob).await.unwrap();
                     assert_eq!(
                         bob_rows_before.len(),
                         bob_rows_after.len(),
@@ -678,12 +676,8 @@ mod tests {
                     );
 
                     if alice_t1_was_rotated {
-                        assert!(
-                            result.is_err(),
-                            "replay of a rotated token must error"
-                        );
-                        let alice_rows =
-                            refresh_tokens::list_for_user(&db, alice).await.unwrap();
+                        assert!(result.is_err(), "replay of a rotated token must error");
+                        let alice_rows = refresh_tokens::list_for_user(&db, alice).await.unwrap();
                         assert!(
                             alice_rows.is_empty(),
                             "I2 violated: replay of rotated token did not wipe alice's set"

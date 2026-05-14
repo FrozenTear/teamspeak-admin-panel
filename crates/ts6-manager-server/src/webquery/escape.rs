@@ -92,7 +92,11 @@ pub fn unescape(value: &str) -> String {
 /// `None`. Anything `< 0x80` fits in a `u8` and corresponds to a
 /// single-byte UTF-8 codepoint that the escape table can match against.
 fn ascii_byte(ch: char) -> Option<u8> {
-    if (ch as u32) < 0x80 { Some(ch as u8) } else { None }
+    if (ch as u32) < 0x80 {
+        Some(ch as u8)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
