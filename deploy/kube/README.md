@@ -39,7 +39,22 @@ podman kube down deploy/kube/ts6-manager.yaml
 
 `kube down` stops and removes the pod + containers, but leaves the
 PVC-backed named volumes (`ts6-db`, `ts6-music`) intact so data
-survives. To wipe data too:
+survives. `--force` is the opt-in flag for wiping volumes — do not
+pass it during normal redeploys.
+
+> Note: podman's `kube down` output **always** prints a literal
+> `Volumes removed:` header, even when no volumes were removed. Read
+> the lines *after* that header — if there are none (the next line is
+> shell or your next command), no volumes were removed. Confirm with:
+>
+> ```bash
+> podman volume ls --filter name=^ts6-
+> ```
+>
+> Both `ts6-db` and `ts6-music` should still be listed after `kube
+> down`. (Verified on Podman 5.8.2 rootless.)
+
+To wipe data too:
 
 ```bash
 podman volume rm ts6-db ts6-music
