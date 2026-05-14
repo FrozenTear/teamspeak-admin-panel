@@ -134,9 +134,13 @@ jobs:
           fi
 
       - name: Install cosign
+        # cosign v3.x dropped the per-binary `.sig` files in favour of
+        # bundles, which the installer's bootstrap-verify step can't
+        # consume yet. Pin to the last v2.x release (still keyless-OIDC
+        # capable) until cosign-installer ships v3 bundle support.
         uses: sigstore/cosign-installer@v3
         with:
-          cosign-release: 'v3.0.6'
+          cosign-release: 'v2.5.2'
 
       - name: Sign manifest list (keyless OIDC)
         env:
@@ -206,7 +210,7 @@ jobs:
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
         with:
-          cosign-release: 'v3.0.6'
+          cosign-release: 'v2.5.2'
 
       - name: Sign archive (cosign blob, keyless OIDC)
         env:
