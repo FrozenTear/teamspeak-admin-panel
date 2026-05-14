@@ -29,10 +29,24 @@ ghcr.io/frozentear/ts6-manager-sidecar
 Settled via the [PURA-160](/PURA/issues/PURA-160) `ask_user_questions`
 interaction (operator picked `pivot_frozentear` 2026-05-14T12:51Z). Repo
 provisioned by [PURA-167](/PURA/issues/PURA-167) at
-`github.com/FrozenTear/teamspeak-admin-panel` — **private** during the
-board's manual verification window, board flips to public after testing.
-ghcr.io image visibility follows the repo (private repo → private image)
-until the board makes the flip. See §4 for the full publish procedure.
+`github.com/FrozenTear/teamspeak-admin-panel` — kept **private** during the
+board's manual verification window.
+
+### Source-repo visibility vs. package visibility
+
+On GitHub, **OCI package visibility on ghcr.io is independent from the
+linked source repo's visibility.** A private source repo can publish
+publicly-pullable container images, and vice-versa. This means the
+PURA-160 DoD's "Pull works from a clean host with no auth (public)"
+line is satisfied by flipping just the *package* to public — the source
+repo can stay private indefinitely if the board prefers.
+
+The first push of a package inherits the linked repo's visibility (so a
+private repo creates a private package by default). Operator then flips
+each package to public via
+`github.com/users/FrozenTear/packages/container/{ts6-manager-fullstack,ts6-manager-sidecar}/settings`
+→ "Change package visibility" → Public. One click per package, one-time.
+See §4 for where this fits in the publish procedure.
 
 ### Tags
 
@@ -155,13 +169,15 @@ build helper.
    has `gist, read:org, repo, workflow` — `write:packages` is needed for
    ghcr.io push. Operator runs `gh auth refresh -h github.com -s write:packages`
    in a browser flow and confirms via `gh auth status`.
-3. **Operator: flip repo to public.** Per [PURA-167](/PURA/issues/PURA-167)
-   the repo is private during board verification. ghcr.io image visibility
-   inherits from the linked repo, so the "Pull works from a clean host
-   with no auth (public)" line of PURA-160's DoD requires the repo to be
-   public at publish time. Operator flips
-   `github.com/FrozenTear/teamspeak-admin-panel` → public when verification
-   completes.
+3. **Operator: flip package visibility to public (post-first-push).**
+   The first push creates each package with visibility inherited from
+   the linked repo, so a private source repo creates private packages.
+   The DoD requires public-pullable images, but the source repo can stay
+   private — see §1 "Source-repo visibility vs. package visibility".
+   After step 5 lands the first push, operator opens
+   `github.com/users/FrozenTear/packages/container/ts6-manager-fullstack/settings`
+   (and the sidecar package) → "Change package visibility" → Public.
+   One click per package, one-time.
 4. **OIDC + Fulcio identity locked.** SecurityEngineer pairs with CTO to
    confirm the certificate-identity regex that WS-Gate will pin against
    (default proposal: `https://github.com/FrozenTear/teamspeak-admin-panel/.+`).
