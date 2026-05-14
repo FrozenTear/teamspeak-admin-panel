@@ -475,3 +475,5 @@ cargo test  -p ts6-manager-server
 `dx serve` is the canonical loop because it patches asset URLs in the binary at link time. Running `cargo run` directly produces a server that *answers* every route but renders unsubstituted placeholder text in the stylesheet hrefs — fine for API smoke tests, not for visual review.
 
 The dx-built artifacts live under `target/dx/ts6-manager-server/debug/web/` (`public/` for the WASM bundle + assets, `server` for the patched native binary). Production bundling/minification is a Phase-5 concern; Phase 1 only needs the dev loop to render `/login` in a browser.
+
+For the release-grade bundle (Phase 6 image build), invoke `dx bundle --release --platform web --fullstack`. The explicit `--platform web` is required — without it dx-CLI 0.7.7 autodetects the client platform from `default = ["server"]` and skips the wasm client build entirely (see PURA-185 + `docs/ops/images.md` §2.1).

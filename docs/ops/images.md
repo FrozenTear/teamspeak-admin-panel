@@ -126,6 +126,45 @@ because the in-container uid maps to a shifted host subuid that does
 not own `./data/*` on the host (the existing dev `podman-compose.yml`
 encodes this).
 
+### 2.1 WASM client bundle assertion (PURA-185)
+
+`Containerfile.fullstack` invokes `dx bundle --release --platform web --fullstack`
+from `crates/ts6-manager-server/`. **`--platform web` is required.** Without
+it, `dx-CLI` 0.7.7 autodetects the client platform from the crate's
+`default = ["server"]` feature (the only default-enabled renderer) and
+falls into the `cli/build.rs:131` fast-path that builds the server only —
+even though `--fullstack` is set. The `asset!()` macros still emit
+hashed CSS into `target/dx/.../web/public/assets/`, but no
+`*.wasm` / `*.js` / `index.html` is produced and the published image
+ships a non-interactive SSR shell (v0.1.0-rc1 regression captured in
+[PURA-185](/PURA/issues/PURA-185)).
+
+Both `Containerfile.fullstack` and any release-build CI job MUST run a
+post-build assertion that fails loudly when the client bundle is
+missing:
+
+```sh
+public="target/dx/ts6-manager-server/release/web/public"
+test -f "$public/index.html" || { echo "missing index.html"; exit 1; }
+find "$public" -name '*.wasm' -print -quit | grep -q . \
+    || { echo "missing wasm bundle"; exit 1; }
+find "$public" -name '*.js' -print -quit | grep -q . \
+    || { echo "missing js loader";  exit 1; }
+grep -q '<script[^>]*\.js' "$public/index.html" \
+    || { echo "index.html has no hydration <script> tag"; exit 1; }
+```
+
+dx 0.7.7 emits the hashed `*_bg.wasm` and the `wasm-bindgen` JS shim
+under `public/assets/`, with `public/index.html` referencing them via a
+`<script type="module" async src="…">` tag — assert all three plus the
+script reference so the next regression cannot ship a public dir that
+*has* the bundle files but an `index.html` that never loads them.
+
+This is the simplest path that pins the WS-Gate browser-smoke
+precondition: hydrating the Dioxus SPA requires `index.html` +
+`*_bg.wasm` + the `wasm-bindgen` JS shim to all be present next to the
+server binary.
+
 ## 3. Signing
 
 We sign images with **cosign keyless OIDC** when an external CI identity
