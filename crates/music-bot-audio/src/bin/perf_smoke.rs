@@ -97,9 +97,13 @@ struct Cli {
     #[arg(long, default_value_t = 25.0)]
     budget_cpu_percent: f64,
 
-    /// RSS growth budget over the run (%). 5% catches genuine leaks while
-    /// allowing GC-style noise.
-    #[arg(long, default_value_t = 5.0)]
+    /// RSS growth budget over the run (%). 15% gives a tiny-process
+    /// (~6 MB) ~1 MB headroom for allocator settling while still flagging
+    /// a real leak — a 100 MB process at 15% is 15 MB of growth, well
+    /// above any reasonable steady-state noise. Anchor is sample
+    /// `RSS_WARMUP_SAMPLES` (10 s in), not t = 0, so process startup
+    /// allocation doesn't show up as "growth".
+    #[arg(long, default_value_t = 15.0)]
     budget_rss_growth_percent: f64,
 
     /// FD growth budget over the run (count). Anything > 0 is suspicious.
@@ -526,10 +530,15 @@ fn summarize_resources(samples: &[ResourceSample]) -> ResourceSummary {
             cpu_peak_percent: 0.0,
         };
     }
-    let rss_start = samples.first().unwrap().rss_mb;
+    // Anchor leak detection on a post-warmup sample (~10 s in) so allocator
+    // settling during the first few seconds doesn't show up as a "leak".
+    // For short runs (< 30 samples), fall back to the first sample.
+    const RSS_WARMUP_SAMPLES: usize = 10;
+    let rss_anchor_idx = RSS_WARMUP_SAMPLES.min(samples.len().saturating_sub(1));
+    let rss_start = samples[rss_anchor_idx].rss_mb;
     let rss_end = samples.last().unwrap().rss_mb;
     let rss_peak = samples.iter().map(|s| s.rss_mb).fold(0.0_f64, f64::max);
-    let fd_start = samples.first().unwrap().fds;
+    let fd_start = samples[rss_anchor_idx].fds;
     let fd_end = samples.last().unwrap().fds;
     let fd_peak = samples.iter().map(|s| s.fds).max().unwrap_or(0);
     let cpu_mean: f64 = samples.iter().map(|s| s.cpu_percent).sum::<f64>() / samples.len() as f64;

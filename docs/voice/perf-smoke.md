@@ -89,7 +89,7 @@ Default budgets (override via `--budget-*` flags):
 | Pacer drift p99 (steady-state) | ≤ 15 ms | 2–3× regression alarm over the 1–5 ms typical floor on a contended dev host |
 | Pacer drift max (steady-state) | ≤ 50 ms | Large-spike alarm; clean release host should sit < 10 ms |
 | CPU mean (single core) | ≤ 25 % | Music-bot pipeline on a modern x86 core, ample headroom for libopus + tokio |
-| RSS growth over the run | ≤ 5 % | Standard leak-canary threshold |
+| RSS growth over the run | ≤ 15 % | Tiny-process headroom for allocator settling; still flags a real leak on larger processes (15 % of 100 MB = 15 MB) |
 | FD growth over the run | ≤ 0 | No FD should be left open by a steady-state worker |
 
 These are not the absolute floors the pipeline hits — they are the **gate
