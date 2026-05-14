@@ -55,6 +55,13 @@ pub enum BotEvent {
     /// finishes (auto-advance returns `None`) or `queue_clear` empties
     /// a non-empty queue.
     QueueEmpty,
+    /// PURA-154 — the audio pipeline drained for the active source.
+    /// Fires after the worker's `EndOfStream` AND the bot has stopped
+    /// streaming frames. If the queue still has tracks, the next track's
+    /// `NowPlaying` follows; if the queue is empty, this is paired with
+    /// a `QueueEmpty`. `reason` is `end_of_stream` for a clean source
+    /// EOF, `stopped` for a `Stop` command, and `skipped` for `SkipNext`.
+    AudioFinished { reason: String },
     /// PURA-121 WS-3 — a playlist was created / renamed / deleted, or
     /// its contents changed. Subscribers refetch via
     /// `MusicBotStore::playlist_list_tracks`. `name` is the post-mutation

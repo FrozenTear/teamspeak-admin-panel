@@ -1,12 +1,18 @@
-//! Bot actor — PURA-118 WS-1.
+//! Bot actor — PURA-118 WS-1 / PURA-154 audio integration.
 //!
 //! One actor task per bot. Owns the `Connection`, drives the lifecycle
 //! state machine, dispatches `BotCommand`s, and emits `BotEvent`s onto a
-//! broadcast channel. Audio dispatch is stubbed (`BotError::AudioNotImplemented`).
+//! broadcast channel.
 //!
-//! No `tsclientlib::AudioHandler` here — WS-2 will plug audio in via a
-//! sibling task that shares the same connection handle through a small
-//! mutex / mpsc, decided in WS-2's design pass.
+//! Audio dispatch (PURA-154) is wired through the [`crate::audio`]
+//! sibling task: `BotCommand::Audio(Play { source })` spawns an
+//! `AudioPipeline` (from `crates/music-bot-audio/`), the sibling task
+//! forwards Opus 20 ms frames to this loop over an mpsc, and the
+//! connected loop is the only thread that calls `Connection::send_audio`.
+//! The borrow-checker dance ("events stream borrows `&mut con` for as
+//! long as it lives; build the events future inline as the select arm so
+//! it gets dropped each iteration") is the same one the WS-4 prototype
+//! settled on — see `crates/ts6-voice-prototype/src/main.rs:152`.
 //!
 //! Cleanroom rule applies: this file derives the bot loop from the
 //! `tsclientlib` upstream API and the existing `ts6-voice-prototype`
@@ -31,13 +37,16 @@ use tsclientlib::prelude::*;
 
 use ts6_voice_fixture::{load_or_create_identity, wait_for_connected};
 
+use music_bot_audio::PipelineEvent;
+
+use crate::audio::{self, ActiveAudio, AudioMsg};
 use crate::backoff::ExponentialBackoff;
 use crate::chat;
 use crate::command::{AudioCommand, AudioSource, BotCommand, ChannelId, QueueCommand};
 use crate::config::{BotConfig, BotId};
 use crate::event::{BotError, BotEvent, DisconnectKind};
 use crate::state::BotState;
-use crate::store::{MusicBotStore, StoreError, Track};
+use crate::store::{MusicBotStore, StoreError, Track, TrackId};
 
 /// Run the bot actor to completion. Exits when a `Shutdown` command has
 /// been processed and the disconnect has flushed.
@@ -231,7 +240,7 @@ enum ConnectedExit {
 /// Drive the event stream + command queue while the bot is online.
 /// Mirrors `ts6-voice-prototype`'s borrow-checker dance: build the events
 /// future inline as the select arm so it gets dropped at each iteration,
-/// freeing `&mut con` for command dispatch in the body.
+/// freeing `&mut con` for command dispatch / `send_audio` in the body.
 async fn run_connected_loop(
     con: &mut Connection,
     state: &mut BotState,
@@ -241,6 +250,12 @@ async fn run_connected_loop(
     bot_id: BotId,
     store: &Arc<dyn MusicBotStore>,
 ) -> ConnectedExit {
+    // PURA-154 — `current_audio` is `Some` while a pipeline is spawned.
+    // The connected loop is the sole owner: the actor's lifecycle owns
+    // teardown (drop on shutdown / drop on reconnect), and Stop / Play
+    // commands flip it in place.
+    let mut current_audio: Option<ActiveAudio> = None;
+
     loop {
         tokio::select! {
             biased;
@@ -267,9 +282,42 @@ async fn run_connected_loop(
                 }
                 None => return ConnectedExit::Dropped("stream ended".into()),
             },
+            // PURA-154 — drain the audio sibling task. The `if` guard
+            // makes this arm a no-op when no pipeline is active; that
+            // also keeps `current_audio` from being borrowed when other
+            // arms need to mutate it (Play / Stop / SkipNext).
+            audio_msg = async {
+                // Unwrap is sound because the guard below gates entry.
+                current_audio.as_mut().unwrap().audio_rx.recv().await
+            }, if current_audio.is_some() => {
+                handle_audio_msg(
+                    con,
+                    audio_msg,
+                    &mut current_audio,
+                    bot_id,
+                    store,
+                    events,
+                ).await;
+            },
             cmd = rx.recv() => match cmd {
-                Some(BotCommand::Disconnect) => return ConnectedExit::Disconnect,
-                Some(BotCommand::Shutdown) => return ConnectedExit::Shutdown,
+                Some(BotCommand::Disconnect) => {
+                    if audio::tear_down(&mut current_audio) {
+                        audio::send_voice_stop(con);
+                        let _ = events.send(BotEvent::AudioFinished {
+                            reason: "disconnect".into(),
+                        });
+                    }
+                    return ConnectedExit::Disconnect;
+                }
+                Some(BotCommand::Shutdown) => {
+                    if audio::tear_down(&mut current_audio) {
+                        audio::send_voice_stop(con);
+                        let _ = events.send(BotEvent::AudioFinished {
+                            reason: "shutdown".into(),
+                        });
+                    }
+                    return ConnectedExit::Shutdown;
+                }
                 Some(BotCommand::Connect) => {
                     debug!("Connect ignored — already online");
                 }
@@ -292,16 +340,15 @@ async fn run_connected_loop(
                         debug!(channel_id = id, "LeaveChannel — staying in current channel until WS-3 default-channel tracking lands");
                     }
                 }
-                Some(BotCommand::Audio(audio)) => {
-                    // PURA-121 WS-3 — `SkipNext` is a queue advance even
-                    // before WS-2 wires the audio task. Lower it here so
-                    // the chat bridge (WS-4) and REST surface (WS-5) can
-                    // exercise the auto-advance contract today.
-                    if matches!(audio, AudioCommand::SkipNext) {
-                        handle_queue_command(bot_id, store, QueueCommand::Advance, events).await;
-                    } else {
-                        emit_audio_stub(events, &audio);
-                    }
+                Some(BotCommand::Audio(audio_cmd)) => {
+                    handle_audio_command(
+                        con,
+                        audio_cmd,
+                        &mut current_audio,
+                        bot_id,
+                        store,
+                        events,
+                    ).await;
                 }
                 Some(BotCommand::Queue(qc)) => {
                     handle_queue_command(bot_id, store, qc, events).await;
@@ -310,6 +357,196 @@ async fn run_connected_loop(
             },
         }
     }
+}
+
+/// PURA-154 — drain a message from the audio sibling task.
+async fn handle_audio_msg(
+    con: &mut Connection,
+    msg: Option<AudioMsg>,
+    current_audio: &mut Option<ActiveAudio>,
+    bot_id: BotId,
+    store: &Arc<dyn MusicBotStore>,
+    events: &broadcast::Sender<BotEvent>,
+) {
+    let Some(msg) = msg else {
+        // Sibling closed without sending Finished — treat as a hard stop.
+        // This shouldn't happen in practice; the sibling always sends
+        // Finished before its task body returns.
+        warn!("audio sibling channel closed without Finished — tearing down");
+        if audio::tear_down(current_audio) {
+            audio::send_voice_stop(con);
+            let _ = events.send(BotEvent::AudioFinished {
+                reason: "channel_closed".into(),
+            });
+        }
+        return;
+    };
+    match msg {
+        AudioMsg::Frame(opus) => {
+            if let Err(err) = audio::send_opus_frame(con, &opus) {
+                error!(?err, "send_audio failed — tearing down pipeline");
+                audio::tear_down(current_audio);
+                let _ = events.send(BotEvent::Error(BotError::Connection(format!(
+                    "send_audio: {err}"
+                ))));
+                let _ = events.send(BotEvent::AudioFinished {
+                    reason: "send_audio_failed".into(),
+                });
+            }
+        }
+        AudioMsg::PipelineEvent(PipelineEvent::NowPlaying { title, source }) => {
+            // Synthesize an ephemeral `Track` so the wire surface (which
+            // already accepts `BotEvent::NowPlaying(Track)` from the
+            // queue path) carries the ICY metadata too. id=0 marks this
+            // as "not a queue entry" — subscribers that care can match
+            // on it. WS-7 may swap this for a richer event later.
+            let track = Track {
+                id: TrackId(0),
+                source: AudioSource::Url(source),
+                title,
+                duration_secs: None,
+                requested_by: None,
+            };
+            let _ = events.send(BotEvent::NowPlaying(track));
+        }
+        AudioMsg::PipelineEvent(PipelineEvent::Warning(message)) => {
+            warn!(%message, "audio pipeline warning");
+            let _ = events.send(BotEvent::Error(BotError::Internal(format!(
+                "audio pipeline: {message}"
+            ))));
+        }
+        AudioMsg::PipelineEvent(PipelineEvent::EndOfStream) => {
+            // Informational — the sibling will follow with `Finished`
+            // once the frame channel drains.
+            debug!("audio pipeline end-of-stream");
+        }
+        AudioMsg::Finished => {
+            audio::send_voice_stop(con);
+            // Pipeline drained; advance the queue and auto-start the
+            // next track if the head is non-empty. If not, emit a
+            // single AudioFinished and let the bot sit idle.
+            audio::tear_down(current_audio);
+            handle_queue_command(bot_id, store, QueueCommand::Advance, events).await;
+            if !auto_start_pending_track(current_audio, store, bot_id, events).await {
+                let _ = events.send(BotEvent::AudioFinished {
+                    reason: "end_of_stream".into(),
+                });
+            }
+        }
+    }
+}
+
+/// PURA-154 — dispatch one `AudioCommand`. Returns once the requested
+/// state mutation has happened; the actual streaming continues on the
+/// sibling task.
+async fn handle_audio_command(
+    con: &mut Connection,
+    cmd: AudioCommand,
+    current_audio: &mut Option<ActiveAudio>,
+    bot_id: BotId,
+    store: &Arc<dyn MusicBotStore>,
+    events: &broadcast::Sender<BotEvent>,
+) {
+    match cmd {
+        AudioCommand::Play { source } => {
+            // Direct Play bypasses the queue — the REST surface
+            // (`/api/music-bots/{id}/play`) explicitly logs this case as
+            // `track_id: None` (`audio_control.rs:65`). We tear down
+            // any active pipeline and spawn a fresh one.
+            if let Err(err) = audio::start_pipeline(current_audio, &source).await {
+                warn!(?err, "audio pipeline spawn failed");
+                let _ = events.send(BotEvent::Error(BotError::Internal(format!(
+                    "audio pipeline spawn: {err}"
+                ))));
+                return;
+            }
+            // Emit a NowPlaying so subscribers light up — the pipeline's
+            // own NowPlaying lands later for ICY/yt-dlp metadata.
+            let label = match &source {
+                AudioSource::Url(u) => u.clone(),
+                AudioSource::LibraryPath(p) => p.to_string_lossy().into_owned(),
+            };
+            let track = Track {
+                id: TrackId(0),
+                source,
+                title: label,
+                duration_secs: None,
+                requested_by: None,
+            };
+            let _ = events.send(BotEvent::NowPlaying(track));
+        }
+        AudioCommand::Stop => {
+            if audio::tear_down(current_audio) {
+                audio::send_voice_stop(con);
+                let _ = events.send(BotEvent::AudioFinished {
+                    reason: "stopped".into(),
+                });
+            }
+        }
+        AudioCommand::Pause => {
+            if let Some(active) = current_audio.as_ref() {
+                active.set_paused(true);
+            } else {
+                debug!("Pause ignored — no active pipeline");
+            }
+        }
+        AudioCommand::Resume => {
+            if let Some(active) = current_audio.as_ref() {
+                active.set_paused(false);
+            } else {
+                debug!("Resume ignored — no active pipeline");
+            }
+        }
+        AudioCommand::SkipNext => {
+            // Advance the queue first so the post-advance head is the
+            // next track. Tear down the current pipeline regardless,
+            // then auto-start from the new head if any.
+            let was_active = audio::tear_down(current_audio);
+            if was_active {
+                audio::send_voice_stop(con);
+            }
+            handle_queue_command(bot_id, store, QueueCommand::Advance, events).await;
+            let _ = events.send(BotEvent::AudioFinished {
+                reason: "skipped".into(),
+            });
+            auto_start_pending_track(current_audio, store, bot_id, events).await;
+        }
+        // SkipPrev / SetVolume / NowPlaying don't have pipeline support
+        // yet — leave them on the stub path so REST/UI subscribers see
+        // a dispatched-but-unsupported event. PURA-154 acceptance scoped
+        // only Play / Pause / Resume / Stop / SkipNext.
+        other => emit_audio_stub(events, &other),
+    }
+}
+
+/// PURA-154 — if the queue has a head and no pipeline is currently
+/// spawned, start one for the head track. Returns `true` when a
+/// pipeline was started.
+async fn auto_start_pending_track(
+    current_audio: &mut Option<ActiveAudio>,
+    store: &Arc<dyn MusicBotStore>,
+    bot_id: BotId,
+    events: &broadcast::Sender<BotEvent>,
+) -> bool {
+    if current_audio.is_some() {
+        return false;
+    }
+    let next = match store.queue_current(bot_id).await {
+        Ok(Some(track)) => track,
+        Ok(None) => return false,
+        Err(err) => {
+            emit_store_error(events, "queue_current", err);
+            return false;
+        }
+    };
+    if let Err(err) = audio::start_pipeline(current_audio, &next.source).await {
+        warn!(?err, "auto-start audio pipeline failed");
+        let _ = events.send(BotEvent::Error(BotError::Internal(format!(
+            "audio pipeline spawn: {err}"
+        ))));
+        return false;
+    }
+    true
 }
 
 /// Translate a `StreamItem` into "we are now in channel X if you care".
@@ -637,21 +874,23 @@ fn emit_store_error(
     }));
 }
 
+/// PURA-154 — stub for audio sub-commands the pipeline doesn't cover
+/// today. Only `SkipPrev` / `SetVolume` / `NowPlaying` route through
+/// here; Play / Stop / Pause / Resume / SkipNext flow into the real
+/// pipeline dispatch in `handle_audio_command`.
 fn emit_audio_stub(events: &broadcast::Sender<BotEvent>, cmd: &AudioCommand) {
     let label = match cmd {
-        AudioCommand::Play { source } => match source {
-            AudioSource::Url(u) => format!("Play(url:{u})"),
-            AudioSource::LibraryPath(p) => format!("Play(library:{})", p.display()),
-        },
-        AudioCommand::Stop => "Stop".into(),
-        AudioCommand::Pause => "Pause".into(),
-        AudioCommand::Resume => "Resume".into(),
-        AudioCommand::SkipNext => "SkipNext".into(),
         AudioCommand::SkipPrev => "SkipPrev".into(),
         AudioCommand::SetVolume(v) => format!("SetVolume({v})"),
         AudioCommand::NowPlaying(s) => format!("NowPlaying({s})"),
+        // The wired-up commands should never land here; if they do,
+        // it's a routing bug — log loudly.
+        other => {
+            error!(?other, "emit_audio_stub reached for a wired audio command — routing bug");
+            format!("{other:?}")
+        }
     };
-    debug!(command = %label, "audio command — WS-2 will wire this");
+    debug!(command = %label, "audio command not yet supported");
     let _ = events.send(BotEvent::Error(BotError::AudioNotImplemented(label)));
 }
 

@@ -538,7 +538,11 @@ fn apply_event(d: &mut wire::MusicBotDetail, ev: &wire::BotEventWire) {
         wire::BotEventWire::QueueChanged { current, .. } => {
             d.now_playing = current.clone();
         }
-        wire::BotEventWire::Error { .. }
+        // PURA-154 — audio pipeline drained. The auto-advance flow
+        // pairs this with a NowPlaying (next track) or QueueEmpty, so
+        // we don't need to mutate the snapshot here.
+        wire::BotEventWire::AudioFinished { .. }
+        | wire::BotEventWire::Error { .. }
         | wire::BotEventWire::PlaylistChanged { .. }
         | wire::BotEventWire::LibraryChanged => {}
     }

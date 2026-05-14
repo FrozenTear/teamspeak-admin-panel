@@ -9,6 +9,7 @@
 //! See `docs/voice/music-bot-lifecycle.md` for the state diagram and
 //! command/event tables (renormalised every WS).
 
+mod audio;
 mod backoff;
 mod bot;
 mod chat;

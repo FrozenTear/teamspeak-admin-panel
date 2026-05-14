@@ -145,6 +145,12 @@ impl LivenessTracker {
             BotEvent::QueueChanged { current, .. } => {
                 entry.now_playing = current.clone();
             }
+            // PURA-154 — when the audio pipeline drains, the bot may
+            // still have a queue head (auto-advance fires NowPlaying
+            // for the next track separately); we don't clear the
+            // snapshot's `now_playing` here. SkipNext / Stop already
+            // pair with a QueueEmpty or NowPlaying event that does.
+            BotEvent::AudioFinished { .. } => {}
             // The remaining variants don't contribute to the snapshot.
             BotEvent::PlaylistChanged(_)
             | BotEvent::LibraryChanged

@@ -18,6 +18,13 @@ default = []
 # extra into the default build; the test itself uses only the `tokio`
 # test runner that the dev-dep already provides.
 lifecycle-e2e = []
+# PURA-154 — sibling integration test in `tests/audio_e2e.rs` that
+# proves the music-bot-audio pipeline reaches the wire through
+# `Connection::send_audio`. Same gating discipline as `lifecycle-e2e`:
+# feature + env + `#[ignore]`. The bot's `audio` feature on tsclientlib
+# is permanent (not gated) — `send_audio` is the deliverable, not an
+# opt-in.
+audio-e2e = []
 
 [dependencies]
 # PURA-118 reuses the existing voice-fixture helpers (load_or_create_identity,
@@ -26,7 +33,18 @@ lifecycle-e2e = []
 # `crates/ts6-voice-fixture/Cargo.toml` for the pin justification — published
 # 0.2.0 fails the TS6 license-chain).
 ts6-voice-fixture = { path = "../ts6-voice-fixture" }
-tsclientlib = { git = "https://github.com/ReSpeak/tsclientlib", rev = "04aa24917abbf6a0c8442a79742d6d2d40ecf71e", default-features = false }
+# PURA-154 — the audio pipeline that builds Opus 20 ms frames at 48 kHz.
+# WS-2 (PURA-119) shipped this crate; the bot actor here is the consumer
+# the issue called out as missing.
+music-bot-audio = { path = "../music-bot-audio" }
+# PURA-154 — `audio` feature lights up `Connection::send_audio` upstream
+# (same pin / dance as `crates/ts6-voice-prototype`). We still connect to
+# host:port directly, so `default-tls` stays off.
+tsclientlib = { git = "https://github.com/ReSpeak/tsclientlib", rev = "04aa24917abbf6a0c8442a79742d6d2d40ecf71e", default-features = false, features = ["audio"] }
+# PURA-154 — `OutAudio` / `AudioData` / `CodecType` for the actual wire
+# frame shape. Same git pin as tsclientlib (the two crates ship from the
+# same repo).
+tsproto-packets = { git = "https://github.com/ReSpeak/tsclientlib", rev = "04aa24917abbf6a0c8442a79742d6d2d40ecf71e" }
 
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync", "fs", "io-util"] }
 anyhow = { workspace = true }

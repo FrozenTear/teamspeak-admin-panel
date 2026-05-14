@@ -294,6 +294,9 @@ fn wire_event(ev: &DomainBotEvent) -> Option<wire::BotEventWire> {
             track: track_to_wire(track),
         },
         DomainBotEvent::QueueEmpty => wire::BotEventWire::QueueEmpty,
+        DomainBotEvent::AudioFinished { reason } => wire::BotEventWire::AudioFinished {
+            reason: reason.clone(),
+        },
         DomainBotEvent::PlaylistChanged(name) => wire::BotEventWire::PlaylistChanged {
             name: name.0.clone(),
         },

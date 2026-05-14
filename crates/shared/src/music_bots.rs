@@ -385,6 +385,12 @@ pub enum BotEventWire {
         track: Track,
     },
     QueueEmpty,
+    /// PURA-154 — the audio pipeline drained. Mirrors
+    /// `music_bot::BotEvent::AudioFinished`; subscribers use the
+    /// `reason` to distinguish a clean EOF from a `Stop` / `SkipNext`.
+    AudioFinished {
+        reason: String,
+    },
     PlaylistChanged {
         name: String,
     },
