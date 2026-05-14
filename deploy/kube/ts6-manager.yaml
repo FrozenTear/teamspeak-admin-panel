@@ -1,0 +1,105 @@
+# TS6 Manager — Kubernetes-flavoured manifest for `podman kube play`.
+#
+# Brings up the manager stack rootless on a clean Podman >= 4.4 host.
+#   podman kube play deploy/kube/secrets.example.yaml deploy/kube/ts6-manager.yaml
+#   podman kube down deploy/kube/ts6-manager.yaml
+#
+# See deploy/kube/README.md for env setup, image overrides, and the
+# local-build smoke path. Topology mirrors podman-compose.yml + the
+# Quadlet pod in deploy/quadlet/ (impl-plan §9). Volumes are PVCs so
+# named-volume ownership crosses the rootless userns cleanly
+# (PURA-67).
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ts6-db
+  labels:
+    app: ts6-manager
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ts6-music
+  labels:
+    app: ts6-manager
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ts6-manager
+  labels:
+    app: ts6-manager
+spec:
+  restartPolicy: Always
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    fsGroup: 10001
+  containers:
+    - name: fullstack
+      image: ghcr.io/teamspeak-heaven/ts6-manager-fullstack:latest
+      imagePullPolicy: IfNotPresent
+      ports:
+        - name: http
+          containerPort: 3001
+          hostPort: 3001
+          protocol: TCP
+      env:
+        - name: NODE_ENV
+          value: "production"
+        - name: PORT
+          value: "3001"
+        - name: LOG_LEVEL
+          value: "info"
+        - name: LOG_PRETTY
+          value: ""
+        - name: FRONTEND_URL
+          value: "http://localhost:3000"
+        - name: DATABASE_URL
+          value: "surrealkv:///var/lib/ts6-manager/db"
+        - name: MUSIC_DIR
+          value: "/var/lib/ts6-manager/music"
+      envFrom:
+        - secretRef:
+            name: ts6-manager-secrets
+      volumeMounts:
+        - name: ts6-db
+          mountPath: /var/lib/ts6-manager/db
+        - name: ts6-music
+          mountPath: /var/lib/ts6-manager/music
+      readinessProbe:
+        httpGet:
+          path: /health
+          port: http
+        initialDelaySeconds: 5
+        periodSeconds: 10
+        timeoutSeconds: 3
+      livenessProbe:
+        httpGet:
+          path: /health
+          port: http
+        initialDelaySeconds: 30
+        periodSeconds: 30
+        timeoutSeconds: 5
+        failureThreshold: 3
+  volumes:
+    - name: ts6-db
+      persistentVolumeClaim:
+        claimName: ts6-db
+    - name: ts6-music
+      persistentVolumeClaim:
+        claimName: ts6-music

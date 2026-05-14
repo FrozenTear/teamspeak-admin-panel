@@ -7,3 +7,4 @@ qa-evidence/
 .env.local
 *.swp
 study-documents/.claude/
+deploy/kube/secrets.yaml
