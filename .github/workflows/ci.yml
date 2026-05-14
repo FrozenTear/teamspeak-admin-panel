@@ -1,0 +1,138 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel in-flight runs on the same ref when a new push arrives.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: short
+  # Toolchain matches rust-toolchain.toml. Keep in lock-step.
+  RUST_TOOLCHAIN: "1.95.0"
+
+jobs:
+  fmt-clippy:
+    name: fmt + clippy (${{ matrix.workspace }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - workspace: main
+            path: .
+          - workspace: sidecar
+            path: crates/ts6-media-sidecar
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ matrix.path }}
+          shared-key: ${{ matrix.workspace }}
+
+      - name: cargo fmt --check
+        working-directory: ${{ matrix.path }}
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        working-directory: ${{ matrix.path }}
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  build-test:
+    name: build + test (${{ matrix.workspace }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - workspace: main
+            path: .
+          - workspace: sidecar
+            path: crates/ts6-media-sidecar
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ matrix.path }}
+          shared-key: ${{ matrix.workspace }}
+
+      - name: cargo build
+        working-directory: ${{ matrix.path }}
+        run: cargo build --workspace --all-targets --locked
+
+      - name: cargo test
+        working-directory: ${{ matrix.path }}
+        # ffmpeg-smoke and other heavy integration features stay gated.
+        # Default features cover unit + non-network integration tests.
+        run: cargo test --workspace --locked
+
+  fuzz-short:
+    name: fuzz suite (short)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect fuzz crates
+        id: detect
+        run: |
+          set -euo pipefail
+          mapfile -t fuzz_dirs < <(find . -type f -name 'Cargo.toml' -path '*/fuzz/Cargo.toml' -not -path '*/target/*' -not -path '*/node_modules/*' 2>/dev/null || true)
+          if [ "${#fuzz_dirs[@]}" -eq 0 ]; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "No fuzz crates discovered (looking for **/fuzz/Cargo.toml). Skipping fuzz-short job."
+            echo "When fuzz targets are added (planned under WS-Security R7 — TS ServerQuery escaping fuzz), this job will pick them up automatically."
+          else
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            printf '%s\n' "${fuzz_dirs[@]}" | tee fuzz-dirs.txt
+          fi
+
+      - name: Install Rust toolchain
+        if: steps.detect.outputs.found == 'true'
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.detect.outputs.found == 'true'
+        with:
+          shared-key: fuzz
+
+      - name: Install cargo-fuzz
+        if: steps.detect.outputs.found == 'true'
+        run: cargo install cargo-fuzz --locked
+
+      - name: Run fuzz targets (60s each)
+        if: steps.detect.outputs.found == 'true'
+        run: |
+          set -euo pipefail
+          while IFS= read -r manifest; do
+            crate_dir="$(dirname "$manifest")"
+            parent="$(dirname "$crate_dir")"
+            echo "::group::Fuzz targets in $parent"
+            (cd "$parent" && cargo fuzz list | while read -r target; do
+              echo "Running fuzz target: $target (60s)"
+              cargo fuzz run "$target" -- -max_total_time=60
+            done)
+            echo "::endgroup::"
+          done < fuzz-dirs.txt
