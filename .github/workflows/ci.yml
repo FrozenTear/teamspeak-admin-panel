@@ -32,7 +32,7 @@ jobs:
           - workspace: sidecar
             path: crates/ts6-media-sidecar
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Clippy compiles build scripts; main workspace's native -sys crates
       # need these to even reach the lint stage. Mirrored from build-test.
@@ -78,7 +78,7 @@ jobs:
           - workspace: sidecar
             path: crates/ts6-media-sidecar
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Main workspace pulls glib-sys (via livekit → libwebrtc → glib) and
       # audiopus_sys; both link against system libraries on Linux. Sidecar
@@ -132,7 +132,7 @@ jobs:
       # tagged digest here without touching local dev if chasing a regression.
       TS6_FIXTURE_IMAGE: docker.io/teamspeaksystems/teamspeak6-server:latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Pull TS6 fixture image
         run: docker pull "$TS6_FIXTURE_IMAGE"
@@ -218,7 +218,7 @@ jobs:
     name: fuzz suite (short)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Detect fuzz crates
         id: detect
