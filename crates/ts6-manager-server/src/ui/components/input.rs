@@ -41,6 +41,13 @@ pub fn TextInput(
 /// Password input with optional show/hide toggle (toggle implementation lives
 /// in the surface that owns the visibility state; this control is the raw
 /// secret-entry field per spec §2).
+///
+/// Both `oninput` and `onchange` carry the same signal-setter callback at
+/// every call-site: password managers and Chromium's saved-credential fill
+/// route value commits through `change` only, skipping `input`. Without the
+/// `onchange` mirror, a controlled signal stays empty while the DOM shows
+/// the autofilled value and submit-gates wedge on `is_empty()`. See
+/// PURA-208 for the field report.
 #[component]
 pub fn PasswordInput(
     #[props(default)] value: Option<String>,
@@ -54,6 +61,7 @@ pub fn PasswordInput(
     #[props(default = false)] reveal: bool,
     #[props(default)] aria_describedby: Option<String>,
     #[props(default)] oninput: EventHandler<FormEvent>,
+    #[props(default)] onchange: EventHandler<FormEvent>,
 ) -> Element {
     let class = if error { "input is-error" } else { "input" };
     let input_type = if reveal { "text" } else { "password" };
@@ -71,6 +79,7 @@ pub fn PasswordInput(
             required,
             disabled,
             oninput: move |evt| oninput.call(evt),
+            onchange: move |evt| onchange.call(evt),
         }
     }
 }

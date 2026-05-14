@@ -195,6 +195,7 @@ pub fn SetupPage() -> Element {
                             disabled: submitting(),
                             value: username.read().clone(),
                             oninput: move |evt: FormEvent| username.set(evt.value()),
+                            onchange: move |evt: FormEvent| username.set(evt.value()),
                         }
                     }
 
@@ -210,6 +211,7 @@ pub fn SetupPage() -> Element {
                             disabled: submitting(),
                             value: display_name.read().clone(),
                             oninput: move |evt: FormEvent| display_name.set(evt.value()),
+                            onchange: move |evt: FormEvent| display_name.set(evt.value()),
                         }
                     }
 
@@ -228,6 +230,7 @@ pub fn SetupPage() -> Element {
                             value: password.read().clone(),
                             error: pwd_err.is_some(),
                             oninput: move |evt: FormEvent| password.set(evt.value()),
+                            onchange: move |evt: FormEvent| password.set(evt.value()),
                         }
                     }
 
@@ -245,6 +248,7 @@ pub fn SetupPage() -> Element {
                             value: password_confirm.read().clone(),
                             error: confirm_mismatch_visible,
                             oninput: move |evt: FormEvent| password_confirm.set(evt.value()),
+                            onchange: move |evt: FormEvent| password_confirm.set(evt.value()),
                         }
                     }
 
@@ -262,6 +266,7 @@ pub fn SetupPage() -> Element {
                             disabled: submitting(),
                             value: server_name.read().clone(),
                             oninput: move |evt: FormEvent| server_name.set(evt.value()),
+                            onchange: move |evt: FormEvent| server_name.set(evt.value()),
                         }
                     }
 
@@ -278,6 +283,7 @@ pub fn SetupPage() -> Element {
                             disabled: submitting(),
                             value: server_host.read().clone(),
                             oninput: move |evt: FormEvent| server_host.set(evt.value()),
+                            onchange: move |evt: FormEvent| server_host.set(evt.value()),
                         }
                     }
 
@@ -294,6 +300,7 @@ pub fn SetupPage() -> Element {
                             disabled: submitting(),
                             value: api_key.read().clone(),
                             oninput: move |evt: FormEvent| api_key.set(evt.value()),
+                            onchange: move |evt: FormEvent| api_key.set(evt.value()),
                         }
                     }
 
