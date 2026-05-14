@@ -44,6 +44,19 @@ metadata:
     app: ts6-manager
 spec:
   restartPolicy: Always
+  # Host networking is required, not a perf tweak. The manager's
+  # WebQuery client reaches the TS6 fixture (and any operator-added
+  # production TS6 server colocated on the same host) over the
+  # rootless-podman host. Without hostNetwork the pod sits on the
+  # default pod-bridge and egresses through passt — the same path
+  # that wedges TS6 6.0.0-beta9 WebQuery after ~5 requests
+  # (PURA-105, see docs/ts6-fixture.md "Why --network=host is
+  # mandatory"). The dashboard tick worker fans out 4 reads every
+  # 5 s, so a fresh fixture wedges within ~30 s of operator activity.
+  # hostNetwork drops passt from the call path; manager-side surface
+  # area is unchanged because the pod already advertises its
+  # listeners as hostPort (3001/tcp, 7080/tcp, 4443/udp).
+  hostNetwork: true
   securityContext:
     runAsNonRoot: true
     fsGroup: 10001

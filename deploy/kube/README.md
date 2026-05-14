@@ -82,11 +82,34 @@ documented production layout.
 | Container port | Host port | Notes |
 |----------------|-----------|-------|
 | 3001 | 3001 | HTTP, served by the Dioxus fullstack server |
+| 7080 | 7080 | MoQ sidecar HTTP control |
+| 4443 | 4443 (UDP) | MoQ sidecar WebTransport |
 
-The host-port binding goes through Podman's rootless port-forwarder
-(passt by default). Operators fronting the manager with a reverse
-proxy (Caddy / nginx / Traefik) should drop the host port and route
-through the proxy's network namespace.
+The pod runs with `hostNetwork: true` (see "Network mode" below). All
+listeners are on the host's network namespace directly — operators
+fronting the manager with a reverse proxy (Caddy / nginx / Traefik)
+should bind the proxy to the host and forward to `127.0.0.1:3001`.
+
+## Network mode
+
+The pod runs with `hostNetwork: true`. This is **load-bearing**, not
+a perf tweak.
+
+The manager's WebQuery client reaches the TS6 fixture — and any
+operator-added production TS6 server colocated on the same host —
+over loopback. Without host networking the pod sits on the default
+rootless pod-bridge and its egress goes through passt, which is the
+same path that wedges TS6 6.0.0-beta9 WebQuery after ~5 requests
+(see [`docs/ts6-fixture.md`](../../docs/ts6-fixture.md) "Why
+`--network=host` is mandatory" and PURA-105). The dashboard tick
+worker fans out 4 reads every 5 s, so the wedge fires within ~30 s
+of operator activity.
+
+`hostNetwork: true` drops passt from the call path. The external
+surface area is unchanged from the previous bridged-+-`hostPort`
+layout because the pod already advertised those ports as `hostPort`.
+Operators with a TS6 server reachable on the LAN (not localhost) are
+unaffected — that path was never on passt.
 
 ## Health checks
 
