@@ -1,0 +1,10 @@
+# Named volume for the embedded SurrealKV store. See `ts6-manager-
+# fullstack.container` for the rationale (uid-shift across the rootless
+# userns means host bind-mounts can't be opened by the container's ts6
+# uid). Backups: `podman volume export ts6-db > ts6-db.tar`.
+
+[Unit]
+Description=TS6 Manager SurrealKV database volume
+
+[Volume]
+VolumeName=ts6-db

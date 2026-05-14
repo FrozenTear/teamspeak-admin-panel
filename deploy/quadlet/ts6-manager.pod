@@ -1,0 +1,28 @@
+# Quadlet pod unit for the TS6 Manager.
+#
+# Rootless deployment shape (impl-plan §9). Install into the user's
+# Quadlet directory and start with `systemctl --user`. See the README
+# in this directory for the full install procedure.
+#
+# Generates the systemd service `ts6-manager-pod.service` at
+# `systemctl --user daemon-reload` time. Container units in this
+# directory join the pod via `Pod=ts6-manager.pod`.
+
+[Unit]
+Description=TS6 Manager pod
+Documentation=https://github.com/teamspeak-heaven/teamspeak-admin-panel
+# The pod brings up its members; bind them so a failed container does
+# not silently leave the pod half-running.
+Wants=network-online.target
+After=network-online.target
+
+[Pod]
+PodName=ts6-manager
+# Publish the Dioxus fullstack server's web UI. Bound to 127.0.0.1 by
+# default so a reverse proxy (Caddy / nginx / Traefik) terminates TLS
+# in front of the manager — drop the address (e.g. `PublishPort=3001:3001`)
+# to expose the pod directly on the LAN.
+PublishPort=127.0.0.1:3001:3001
+
+[Install]
+WantedBy=default.target

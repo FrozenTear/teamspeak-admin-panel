@@ -1,0 +1,8 @@
+# Named volume for the music library directory consumed by the music
+# bot (MUSIC_DIR). Backups: `podman volume export ts6-music > music.tar`.
+
+[Unit]
+Description=TS6 Manager music library volume
+
+[Volume]
+VolumeName=ts6-music

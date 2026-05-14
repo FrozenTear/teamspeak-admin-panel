@@ -1,0 +1,72 @@
+# Quadlet container unit for the TS6 Manager Dioxus fullstack server.
+#
+# Generates the systemd service `ts6-manager-fullstack.service` and joins
+# the rootless pod defined in `ts6-manager.pod`. The required secrets
+# (JWT_SECRET, ENCRYPTION_KEY) come from the operator-managed env file at
+# $XDG_CONFIG_HOME/containers/systemd/ts6-manager.env — see the README.
+
+[Unit]
+Description=TS6 Manager fullstack (Dioxus server + WASM UI)
+Documentation=https://github.com/teamspeak-heaven/teamspeak-admin-panel
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+ContainerName=ts6-manager-fullstack
+# Image path is owned by WS-OPS-Images (PURA-160). Until that ships
+# the signed public image, operators bring their own — either a local
+# build (`podman build -t localhost/ts6-manager-fullstack:dev -f
+# Containerfile.fullstack .`) or a registry pull. Override at install
+# time by setting `Image=` in a drop-in.
+Image=ghcr.io/teamspeak-heaven/ts6-manager-fullstack:latest
+Pod=ts6-manager.pod
+AutoUpdate=registry
+
+# Secrets and overrides live in this env file; rotated independently of
+# the unit. The file MUST contain JWT_SECRET at minimum (the server
+# refuses to boot in production without it — see `crates/ts6-manager-
+# server/src/config.rs::Config::load`).
+EnvironmentFile=%h/.config/containers/systemd/ts6-manager.env
+
+Environment=NODE_ENV=production
+Environment=PORT=3001
+Environment=DATABASE_URL=surrealkv:///var/lib/ts6-manager/db
+Environment=MUSIC_DIR=/var/lib/ts6-manager/music
+Environment=LOG_LEVEL=info
+
+# Named-volume backed storage. Rootless podman's uid-shift means the
+# in-container ts6 uid (10001) cannot own host bind-mount paths, so the
+# SurrealKV store opens with `Permission denied` if we point at the
+# host filesystem directly (PURA-67). Named volumes let podman own the
+# chown across the userns boundary. The `Z` flag relabels for SELinux
+# hosts; a no-op elsewhere.
+Volume=ts6-db.volume:/var/lib/ts6-manager/db:Z
+Volume=ts6-music.volume:/var/lib/ts6-manager/music:Z
+
+# In-container liveness probe. Disabled until WS-OPS-Images (PURA-160)
+# ships a runtime image with a probe binary (`curl`/`wget`) or the
+# server grows a `--healthcheck` flag. The current
+# `Containerfile.fullstack` runtime stage installs only ca-certificates
+# + libssl3, so `HealthCmd=curl ...` fails at exec and
+# `HealthOnFailure=kill` then crashloops the container. systemd still
+# restarts on process exit via `Restart=on-failure` below.
+#
+# When enabling, uncomment all five lines and ensure the image ships
+# the chosen probe binary:
+# HealthCmd=curl -fsS http://127.0.0.1:3001/health
+# HealthInterval=30s
+# HealthTimeout=5s
+# HealthRetries=3
+# HealthStartPeriod=20s
+# HealthOnFailure=kill
+
+[Service]
+Restart=on-failure
+RestartSec=10s
+# Cold-start budget: image pull + Surreal store open on first boot can
+# take a while on slow disks. systemd's default 90s start timeout would
+# false-positive a fresh deploy.
+TimeoutStartSec=180s
+
+[Install]
+WantedBy=default.target

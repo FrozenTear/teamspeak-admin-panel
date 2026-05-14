@@ -1,0 +1,52 @@
+# Quadlet container unit for the TS6 Manager MoQ video sidecar.
+#
+# **Inactive template** — rename to `ts6-manager-sidecar.container`
+# once WS-OPS-Images (PURA-160) publishes the sidecar image. Until then
+# the file has the `.example` suffix so the Quadlet generator ignores
+# it on `systemctl --user daemon-reload`.
+#
+# Pod topology (impl-plan §9):
+#   ts6-manager.pod
+#   ├── ts6-manager-fullstack.container   (Dioxus server, :3001)
+#   └── ts6-manager-sidecar.container     (MoQ relay, WebTransport)
+#
+# When you enable this unit:
+#   1. Update `Image=` to the actual signed image path that
+#      WS-OPS-Images publishes.
+#   2. Add the WebTransport UDP port to `ts6-manager.pod`:
+#        PublishPort=443:443/udp
+#      (or whatever public port the deployment lands the moq-lite
+#      listener on; coordinate via PURA-146 / MOQ_PUBLIC_URL).
+#   3. Set SIDECAR_URL in `ts6-manager.env` to
+#      `http://127.0.0.1:<sidecar-control-port>` so the manager can
+#      reach it across the shared pod loopback.
+
+[Unit]
+Description=TS6 Manager MoQ video sidecar
+Documentation=https://github.com/teamspeak-heaven/teamspeak-admin-panel
+After=ts6-manager-fullstack.service
+Wants=ts6-manager-fullstack.service
+
+[Container]
+ContainerName=ts6-manager-sidecar
+Image=ghcr.io/teamspeak-heaven/ts6-manager-sidecar:latest
+Pod=ts6-manager.pod
+AutoUpdate=registry
+
+EnvironmentFile=%h/.config/containers/systemd/ts6-manager.env
+
+# Sidecar liveness — `/health` is the documented sidecar health probe
+# (impl-plan §3.10 deliverables).
+HealthCmd=curl -fsS http://127.0.0.1:9800/health
+HealthInterval=30s
+HealthTimeout=5s
+HealthRetries=3
+HealthStartPeriod=30s
+
+[Service]
+Restart=on-failure
+RestartSec=10s
+TimeoutStartSec=180s
+
+[Install]
+WantedBy=default.target
