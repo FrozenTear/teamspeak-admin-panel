@@ -56,10 +56,25 @@ RUN cd crates/ts6-manager-server && dx bundle --release --fullstack
 # -----------------------------------------------------------------------------
 FROM docker.io/debian:bookworm-slim
 
+# Runtime deps:
+#   * `ca-certificates`   — outbound HTTPS to source URLs (yt-dlp, ICY).
+#   * `libssl3`           — transitive native deps even on rustls builds.
+#   * `ffmpeg`            — subprocess invoked by `crates/music-bot-audio` for
+#                           both the direct-`Ffmpeg` and chained-`YtDlp` source
+#                           paths (PCM s16le decode). PURA-190: without this,
+#                           `Command::new("ffmpeg").spawn()` ENOENTs and the
+#                           music-bot supervisor never advances past
+#                           `Connected` — V5 (audible audio) cannot pass.
+#   * `yt-dlp`            — subprocess invoked by `YtDlpSource::new` for every
+#                           HTTP(S) `AudioSource::Url` (the only path the
+#                           `/api/music-bots/{id}/play` REST surface exercises;
+#                           see `crates/voice/src/audio.rs::source_to_spec`).
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         ca-certificates \
+        ffmpeg \
         libssl3 \
+        yt-dlp \
  && rm -rf /var/lib/apt/lists/* \
  && groupadd --system --gid 10001 ts6 \
  && useradd --system --uid 10001 --gid ts6 --shell /usr/sbin/nologin --home-dir /var/lib/ts6-manager ts6 \

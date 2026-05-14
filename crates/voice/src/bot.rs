@@ -455,6 +455,11 @@ async fn handle_audio_command(
             // (`/api/music-bots/{id}/play`) explicitly logs this case as
             // `track_id: None` (`audio_control.rs:65`). We tear down
             // any active pipeline and spawn a fresh one.
+            //
+            // PURA-190: emit at info-level so operators bisecting "did
+            // Play even reach the supervisor?" can answer it with a
+            // single grep against manager logs without enabling debug.
+            info!(?source, "AudioCommand::Play — spawning pipeline");
             if let Err(err) = audio::start_pipeline(current_audio, &source).await {
                 warn!(?err, "audio pipeline spawn failed");
                 let _ = events.send(BotEvent::Error(BotError::Internal(format!(
