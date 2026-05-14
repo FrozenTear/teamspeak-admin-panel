@@ -1,3 +1,45 @@
+# PURA-170 / OD3 — single-command local bring-up of the upstream TS6 server
+# fixture used by the verification matrix. Thin wrapper over the
+# `ts6-fixture` profile in `podman-compose.yml`; CI runs the same image as
+# a service container (see `.github/workflows/ci.yml ts6-fixture-smoke`).
+# Operator notes: docs/ts6-fixture.md.
+
+.PHONY: ts6-up ts6-down ts6-logs ts6-apikey
+
+ts6-up:
+	@if podman ps --format '{{.Names}}' 2>/dev/null | grep -qx ts6-fixture; then \
+	    echo "==> ts6-fixture already running"; \
+	else \
+	    echo "==> starting ts6-fixture (--profile ts6-fixture, --network=host)"; \
+	    podman-compose --profile ts6-fixture up -d ts6-fixture; \
+	fi
+	@echo "==> waiting up to 90s for the fixture to print its API key…"
+	@for _ in $$(seq 1 45); do \
+	    if podman logs ts6-fixture 2>&1 | grep -qE 'apikey=[A-Za-z0-9_-]+'; then \
+	        break; \
+	    fi; \
+	    sleep 2; \
+	done
+	@KEY=$$(podman logs ts6-fixture 2>&1 | grep -oE 'apikey=[A-Za-z0-9_-]+' | head -1 | cut -d= -f2); \
+	if [ -z "$$KEY" ]; then \
+	    echo "==> fixture is up but no apikey line has been printed yet — run 'make ts6-logs' to inspect"; \
+	else \
+	    echo "==> fixture API key: $$KEY"; \
+	    echo "==> verification env:"; \
+	    echo "      export TS6_INTEGRATION_HOST=127.0.0.1"; \
+	    echo "      export TS6_INTEGRATION_PORT=10080"; \
+	    echo "      export TS6_INTEGRATION_API_KEY=$$KEY"; \
+	fi
+
+ts6-down:
+	podman-compose --profile ts6-fixture down
+
+ts6-logs:
+	podman logs -f ts6-fixture
+
+ts6-apikey:
+	@podman logs ts6-fixture 2>&1 | grep -oE 'apikey=[A-Za-z0-9_-]+' | head -1 | cut -d= -f2
+
 # PURA-108 WS-4 / PURA-112 — "two clients can talk" prototype.
 #
 # Single-command bring-up of the local ts6-fixture + a two-client harness

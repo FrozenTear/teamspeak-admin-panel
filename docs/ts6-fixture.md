@@ -1,7 +1,28 @@
 # TS6 server fixture (dev / QA bring-up)
 
-Operator-facing notes for running the upstream `teamspeak6-server` image
-locally as a target for the manager. Tracks: [PURA-105](/PURA/issues/PURA-105).
+Operator-facing notes for running the upstream
+`docker.io/teamspeaksystems/teamspeak6-server` image locally as a target
+for the manager. Same image is used as a GitHub Actions service container
+under the `ts6-fixture-smoke` CI job (`.github/workflows/ci.yml`); see
+§"CI service container" below.
+
+Tracks: [PURA-105](/PURA/issues/PURA-105) (passt wedge),
+[PURA-170](/PURA/issues/PURA-170) (CI wiring, OD3 ratification).
+
+## Canonical local bring-up: `make ts6-up`
+
+For new engineers / verification runs, the shortest path is:
+
+```bash
+make ts6-up        # starts the fixture, prints API key + env block
+make ts6-apikey    # re-prints the key
+make ts6-logs      # tail container logs
+make ts6-down      # stop + remove
+```
+
+`make ts6-up` is a thin wrapper over the `ts6-fixture` compose profile
+described below — it bakes in `--network=host` and prints the per-run
+API key the verification tests need.
 
 ## Required: `--network=host` (rootless podman)
 
@@ -106,6 +127,53 @@ podman-compose --profile ts6-fixture up -d ts6-fixture
 
 The compose-managed fixture uses a named volume (`ts6-fixture-data`) so
 the API key persists across `podman-compose down`.
+
+## CI service container (PURA-170)
+
+Per OD3 (board-ratified on [PURA-169](/PURA/issues/PURA-169) on 2026-05-14)
+the same upstream image is booted as a CI service container on every
+push / PR in the `ts6-fixture-smoke` job
+(`.github/workflows/ci.yml`). The job:
+
+1. Pulls `docker.io/teamspeaksystems/teamspeak6-server:latest` (tag tracks
+   the `ts6-fixture` profile in `podman-compose.yml`; pin tighter here if
+   chasing a regression — no need to touch the local profile).
+2. Boots the container with `--network=host` and the standard env block
+   (`TSSERVER_LICENSE_ACCEPTED=accept`,
+   `TSSERVER_QUERY_ADMIN_PASSWORD=qa-admin`,
+   `TSSERVER_QUERY_SKIP_BRUTE_FORCE_CHECK=1`).
+3. Tails the container logs for the freshly minted `apikey=…` line, then
+   polls `GET /1/version` until it returns `200` (proves the WebQuery HTTP
+   surface is up).
+4. Exports `TS6_INTEGRATION_{HOST,PORT,API_KEY}` into the workflow env
+   (the API key is masked in workflow logs via `::add-mask::`).
+5. Runs `cargo test -p ts6-manager-server --locked --
+   integration_against_local_ts6_host_when_env_configured --nocapture`
+   — the env-gated WebQuery integration test in
+   `crates/ts6-manager-server/src/webquery/tests.rs`. It exercises
+   `version`, `hostinfo`, `serverlist`, `serverinfo`, `clientlist`, and
+   `banlist` against the live host — Chapter 1 verifications V2 (server
+   credentials accepted) and V3 (live dashboard reads) on the read path.
+6. Dumps `docker logs ts6-fixture` on failure and unconditionally removes
+   the container in a final cleanup step.
+
+The job is intentionally **not** a service-container declaration
+(`services:` block) — TS6's first-boot API key is only available via
+container logs, and we want to fail loudly + with full logs if the boot
+or HTTP handshake regresses. Service-container declarations don't expose
+that ergonomically.
+
+**Out of scope.** Mutating verifications (V4 kick, V5 music-bot
+audio-out) and SSH-bridge integration are not in this smoke. The SSH
+ServerQuery integration test still uses the `teamspeak3-server` image
+under the separate `ssh-integration` compose profile because upstream TS6
+SSH ServerQuery is not yet stable. The TS6 voice-fixture audio E2E
+(`crates/ts6-voice-fixture/tests/audio_e2e.rs`) remains a local-only
+target gated on `TS6_VOICE_FIXTURE=1`.
+
+**No permanent staging instance.** OD3 ratification explicitly defers
+the staging-instance question until Phase 2 OPS and the first
+end-to-end smoke is passing.
 
 ## Audio-E2E assertion (PURA-110)
 

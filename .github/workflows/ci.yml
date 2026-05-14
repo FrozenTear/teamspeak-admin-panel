@@ -87,6 +87,96 @@ jobs:
         # Default features cover unit + non-network integration tests.
         run: cargo test --workspace --locked
 
+  # PURA-170 (OD3 ratified on PURA-169): boot the public
+  # `teamspeaksystems/teamspeak6-server` image and run the env-gated
+  # WebQuery integration test
+  # (`webquery::tests::integration_against_local_ts6_host_when_env_configured`)
+  # against it. This is the Chapter 1 V2/V3 read-path smoke against a real
+  # TS6 host, running automatically on every push/PR. Local invocation:
+  # `make ts6-up` (see docs/ts6-fixture.md §"CI service container").
+  ts6-fixture-smoke:
+    name: TS6 fixture integration smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # Tracks the `ts6-fixture` profile in `podman-compose.yml`. Pin to a
+      # tagged digest here without touching local dev if chasing a regression.
+      TS6_FIXTURE_IMAGE: docker.io/teamspeaksystems/teamspeak6-server:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pull TS6 fixture image
+        run: docker pull "$TS6_FIXTURE_IMAGE"
+
+      - name: Boot TS6 fixture (host networking)
+        run: |
+          docker run -d --name ts6-fixture --network=host \
+            -e TSSERVER_LICENSE_ACCEPTED=accept \
+            -e TSSERVER_QUERY_ADMIN_PASSWORD=qa-admin \
+            -e TSSERVER_QUERY_SKIP_BRUTE_FORCE_CHECK=1 \
+            "$TS6_FIXTURE_IMAGE"
+
+      - name: Wait for fixture & capture API key
+        run: |
+          set -euo pipefail
+          API_KEY=""
+          for _ in $(seq 1 90); do
+            if docker logs ts6-fixture 2>&1 | grep -qE 'apikey=[A-Za-z0-9_-]+'; then
+              API_KEY=$(docker logs ts6-fixture 2>&1 \
+                | grep -oE 'apikey=[A-Za-z0-9_-]+' | head -1 | cut -d= -f2)
+              break
+            fi
+            sleep 2
+          done
+          if [ -z "$API_KEY" ]; then
+            echo "FAIL: fixture did not print an apikey within 180s" >&2
+            docker logs ts6-fixture
+            exit 1
+          fi
+          last_code=""
+          for i in $(seq 1 30); do
+            last_code=$(curl -s -o /dev/null -w '%{http_code}' \
+              -H "x-api-key: $API_KEY" "http://127.0.0.1:10080/1/version" || true)
+            if [ "$last_code" = "200" ]; then
+              echo "Fixture WebQuery reachable on :10080"
+              break
+            fi
+            sleep 2
+            if [ "$i" = "30" ]; then
+              echo "FAIL: WebQuery /1/version did not return 200 within 60s (last_code=$last_code)" >&2
+              docker logs ts6-fixture
+              exit 1
+            fi
+          done
+          echo "::add-mask::$API_KEY"
+          {
+            echo "TS6_INTEGRATION_HOST=127.0.0.1"
+            echo "TS6_INTEGRATION_PORT=10080"
+            echo "TS6_INTEGRATION_API_KEY=$API_KEY"
+          } >> "$GITHUB_ENV"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ts6-fixture-smoke
+
+      - name: Run TS6 WebQuery integration test
+        run: |
+          cargo test -p ts6-manager-server --locked \
+            -- integration_against_local_ts6_host_when_env_configured --nocapture
+
+      - name: Dump fixture logs on failure
+        if: failure()
+        run: docker logs ts6-fixture || true
+
+      - name: Tear down fixture
+        if: always()
+        run: docker rm -f ts6-fixture || true
+
   fuzz-short:
     name: fuzz suite (short)
     runs-on: ubuntu-latest
