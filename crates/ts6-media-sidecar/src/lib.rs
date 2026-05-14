@@ -10,6 +10,7 @@
 
 pub mod http;
 pub mod origin;
+pub mod pipeline;
 pub mod transport;
 
 use std::net::SocketAddr;
@@ -22,6 +23,7 @@ use tokio::task::JoinHandle;
 
 pub use crate::http::HttpServer;
 pub use crate::origin::SidecarOrigin;
+pub use crate::pipeline::{Pipeline, PipelineConfig, SourceInput};
 pub use crate::transport::TransportConfig;
 
 /// Configuration handed to [`Sidecar::start`]. Mirrors the binary's CLI
