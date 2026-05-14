@@ -91,17 +91,29 @@ curl -sSf -XPOST http://127.0.0.1:7080/source \
     -d '{
         "url": "https://example.com/stream.mp4",
         "source_id": "camera-1",
-        "preset": "passthrough"
+        "preset": "720p"
     }' | jq .
 ```
 
 Request:
 
-| Field       | Type   | Required | Notes                                                                                  |
-| ----------- | ------ | -------- | -------------------------------------------------------------------------------------- |
-| `url`       | string | yes      | HTTP or HTTPS source URL. SSRF-blocked for loopback / private / link-local / metadata. |
-| `source_id` | string | no       | Operator-supplied id. Server generates a v4 UUID if omitted.                           |
-| `preset`    | string | no       | Opaque pass-through. WS-4 will wire it to FFmpeg parameter sets; today no-op.          |
+| Field       | Type   | Required | Notes                                                                                                                                                                       |
+| ----------- | ------ | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `url`       | string | yes      | HTTP or HTTPS source URL. SSRF-blocked for loopback / private / link-local / metadata.                                                                                      |
+| `source_id` | string | no       | Operator-supplied id. Server generates a v4 UUID if omitted.                                                                                                                |
+| `preset`    | string | no       | Quality preset (WS-4). One of `"480p"` / `"720p"` / `"1080p"` — case-insensitive. Omit or send `null` for the default `"720p"`. Unknown values return `400 invalid_request`. |
+
+Preset → FFmpeg encoder triple (spec §23.4):
+
+| `preset` | Resolution | Framerate | Video bitrate |
+| -------- | ---------- | --------- | ------------- |
+| `480p`   | 854 × 480  | 24 fps    | 1000 kbps     |
+| `720p`   | 1280 × 720 | 30 fps    | 2500 kbps     |
+| `1080p`  | 1920 × 1080| 30 fps    | 4500 kbps     |
+
+The preset is immutable for the life of a source — switching presets
+requires `POST /source/stop` followed by a fresh `POST /source`. Audio
+encoding (Opus) is not preset-dependent in v1.
 
 Response (`201`):
 
@@ -261,8 +273,9 @@ against the WS-0 reference player.
 
 ## What this crate does NOT do yet
 
-- **No quality presets** (resolution / bitrate / FPS knobs). WS-4.
-  `POST /source` accepts a `preset` field today but only records it.
+- **No on-the-fly preset switching.** WS-4 (PURA-142) wires `preset` into
+  the FFmpeg encoder triple, but switching presets on a live stream is
+  deferred to v1.1 — operators must `POST /source/stop` + `POST /source`.
 - **No Dioxus widget** — the player is the no-build reference subscriber
   in [`moq-spike/player/`](../../moq-spike/player/) until WS-5.
 - **No browser-side audio decode** — the WS-0 reference player only

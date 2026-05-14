@@ -38,6 +38,7 @@ use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
 use crate::origin::SidecarOrigin;
+use crate::preset::QualityPreset;
 
 /// Track name carrying VP8 video frames. Must stay `"video"` so the WS-0
 /// reference player subscribes without configuration.
@@ -70,11 +71,13 @@ pub struct PipelineConfig {
     pub source: SourceInput,
     /// Path to the `ffmpeg` binary. Defaults to `ffmpeg` on PATH.
     pub ffmpeg_path: PathBuf,
-    /// WS-4 quality preset. Opaque pass-through for WS-3 — recorded so
-    /// the operator-facing `/stats` and tracing can surface it, but not
-    /// yet plumbed into the FFmpeg arg sets. Stays `None` for boot-time
-    /// CLI sources.
-    pub preset: Option<String>,
+    /// Quality preset (WS-4 / PURA-142). Drives the video encoder's
+    /// resolution / framerate / bitrate per spec §23.4. Immutable for
+    /// the life of the pipeline — switching presets requires
+    /// `POST /source/stop` + `POST /source`. Defaults to
+    /// [`QualityPreset::DEFAULT`] (= `720p`) when callers don't set
+    /// one explicitly.
+    pub preset: QualityPreset,
 }
 
 /// What FFmpeg should read from.
@@ -124,7 +127,7 @@ impl PipelineConfig {
             name: name.into(),
             source,
             ffmpeg_path: PathBuf::from("ffmpeg"),
-            preset: None,
+            preset: QualityPreset::DEFAULT,
         }
     }
 
@@ -133,8 +136,8 @@ impl PipelineConfig {
         self
     }
 
-    pub fn with_preset(mut self, preset: impl Into<String>) -> Self {
-        self.preset = Some(preset.into());
+    pub fn with_preset(mut self, preset: QualityPreset) -> Self {
+        self.preset = preset;
         self
     }
 }
@@ -164,6 +167,7 @@ impl PipelineMetrics {
 /// Running pipeline. Holds two FFmpeg supervisors; drop to stop both.
 pub struct Pipeline {
     name: String,
+    preset: QualityPreset,
     origin: Arc<SidecarOrigin>,
     metrics: Arc<PipelineMetrics>,
     _broadcast: BroadcastProducer,
@@ -218,11 +222,13 @@ impl Pipeline {
         info!(
             broadcast = %config.name,
             source = %source_display,
+            preset = %config.preset,
             "pipeline started"
         );
 
         Ok(Self {
             name: config.name,
+            preset: config.preset,
             origin,
             metrics,
             _broadcast: broadcast,
@@ -235,6 +241,12 @@ impl Pipeline {
     /// plane).
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Quality preset this pipeline was started with. Immutable for the
+    /// life of the pipeline (see [`QualityPreset`] docs).
+    pub fn preset(&self) -> QualityPreset {
+        self.preset
     }
 
     /// Shared counters touched by the supervisor + mux loops. Cloneable
@@ -479,7 +491,27 @@ fn next_backoff(d: Duration) -> Duration {
 // FFmpeg argument sets
 // -----------------------------------------------------------------------
 
-fn ffmpeg_video_args(config: &PipelineConfig) -> Vec<String> {
+/// Build the FFmpeg argv for the video subprocess. Resolution, framerate
+/// and bitrate come from [`QualityPreset`] (spec §23.4). The filter
+/// chain mirrors the spec's letterbox/pillarbox pattern from §24.1.1 so
+/// non-conforming inputs are scaled-to-fit instead of cropped or
+/// stretched. Keyframe interval (`-g` / `-keyint_min`) is set to one
+/// keyframe per second of source video — same trade-off the current
+/// WS-2 720p path makes (1 s join latency, low overhead).
+///
+/// Public for unit testing (the integration test on `control_plane.rs`
+/// asserts argv contents reflect the requested preset).
+pub fn ffmpeg_video_args(config: &PipelineConfig) -> Vec<String> {
+    let preset = config.preset;
+    let fps = preset.framerate();
+    let bitrate = preset.video_bitrate();
+    let vf = format!(
+        "fps={fps},scale={w}:{h}:force_original_aspect_ratio=decrease,\
+         pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
+        w = preset.width(),
+        h = preset.height(),
+    );
+
     let mut args: Vec<String> = vec![
         "-hide_banner".into(),
         "-loglevel".into(),
@@ -489,18 +521,22 @@ fn ffmpeg_video_args(config: &PipelineConfig) -> Vec<String> {
     args.extend(config.source.args_for(TrackKind::Video));
     args.extend([
         "-an".into(),
+        "-vf".into(),
+        vf,
         "-c:v".into(),
         "libvpx".into(),
         "-b:v".into(),
-        "1500k".into(),
+        bitrate.into(),
+        "-maxrate".into(),
+        bitrate.into(),
         "-deadline".into(),
         "realtime".into(),
         "-cpu-used".into(),
         "5".into(),
         "-g".into(),
-        "30".into(),
+        fps.to_string(),
         "-keyint_min".into(),
-        "30".into(),
+        fps.to_string(),
         "-pix_fmt".into(),
         "yuv420p".into(),
         "-f".into(),

@@ -3,15 +3,17 @@
 //! listener (ALPN-pinned to `moq-lite-04`), exposes an empty broadcast
 //! registry, and serves a small control-plane HTTP surface.
 //!
-//! Real media plumbing (FFmpeg subprocess, REST `/source` plane, SSRF
-//! allow-list, quality presets, Dioxus widget) ship in WS-2..WS-5 under
-//! the [PURA-136](../../docs/adr/0007-moq-flavor-and-draft-pin.md) Phase-5
-//! epic. The pinning rationale lives in ADR-0007.
+//! The media plumbing ships across the Phase-5 workstreams under
+//! [PURA-136](../../docs/adr/0007-moq-flavor-and-draft-pin.md): WS-2
+//! (FFmpeg → MoQ pipeline), WS-3 (REST `/source` plane + SSRF), WS-4
+//! (quality presets — see [`preset::QualityPreset`]). The Dioxus widget
+//! is WS-5. The pinning rationale lives in ADR-0007.
 
 pub mod control;
 pub mod http;
 pub mod origin;
 pub mod pipeline;
+pub mod preset;
 pub mod ssrf_resolver;
 pub mod transport;
 
@@ -29,6 +31,7 @@ pub use crate::control::PipelineRegistry;
 pub use crate::http::HttpServer;
 pub use crate::origin::SidecarOrigin;
 pub use crate::pipeline::{Pipeline, PipelineConfig, PipelineMetrics, SourceInput};
+pub use crate::preset::{ParseQualityPresetError, QualityPreset};
 pub use crate::ssrf_resolver::GaiResolver;
 pub use crate::transport::TransportConfig;
 

@@ -32,6 +32,7 @@ use crate::pipeline::{
     Pipeline, PipelineConfig, PipelineMetrics, SourceInput, TRACK_AUDIO, TRACK_VIDEO,
 };
 use crate::origin::SidecarOrigin;
+use crate::preset::QualityPreset;
 
 /// HTTP-side shared state for the WS-3 mutating endpoints. Cheap to
 /// clone (the inner [`PipelineRegistry`] is an `Arc<RwLock<…>>`).
@@ -60,7 +61,7 @@ impl PipelineRegistry {
         let guard = self.inner.read().await;
         let mut out: Vec<SourceStatsSnapshot> = guard
             .iter()
-            .map(|(id, p)| SourceStatsSnapshot::from_pipeline(id, &p.metrics()))
+            .map(|(id, p)| SourceStatsSnapshot::from_pipeline(id, p.preset(), &p.metrics()))
             .collect();
         out.sort_by(|a, b| a.source_id.cmp(&b.source_id));
         out
@@ -77,8 +78,13 @@ impl PipelineRegistry {
 // ---------------------------------------------------------------------------
 
 /// `POST /source` body. `source_id` is server-generated when absent;
-/// `preset` is opaque pass-through for WS-3 (WS-4 will wire it to real
-/// FFmpeg parameter sets).
+/// `preset` selects an encoding profile (WS-4 / PURA-142). Wire type is
+/// a raw string so an unknown value lands as an [`ApiError::InvalidRequest`]
+/// (HTTP 400 in the WS-3 error model) instead of an Axum
+/// `JsonRejection` wrapped in a different body shape. The handler maps
+/// the string to [`QualityPreset`] via case-insensitive parse, defaulting
+/// to [`QualityPreset::DEFAULT`] (= `"720p"`) when the field is missing
+/// or `null`.
 #[derive(Debug, Deserialize)]
 pub struct StartSourceRequest {
     pub url: String,
@@ -130,6 +136,10 @@ impl TrackDescriptor {
 #[derive(Debug, Clone, Serialize)]
 pub struct SourceStatsSnapshot {
     pub source_id: String,
+    /// Encoding preset this source was started with. Serialises as
+    /// `"480p"`, `"720p"`, or `"1080p"` — same string the operator
+    /// passed (or defaulted into) on `POST /source`.
+    pub preset: QualityPreset,
     pub video: TrackStatsSnapshot,
     pub audio: TrackStatsSnapshot,
 }
@@ -142,9 +152,14 @@ pub struct TrackStatsSnapshot {
 }
 
 impl SourceStatsSnapshot {
-    fn from_pipeline(source_id: &str, metrics: &PipelineMetrics) -> Self {
+    fn from_pipeline(
+        source_id: &str,
+        preset: QualityPreset,
+        metrics: &PipelineMetrics,
+    ) -> Self {
         Self {
             source_id: source_id.to_string(),
+            preset,
             video: TrackStatsSnapshot {
                 frames_published: metrics.video.frames_published.load(Ordering::Relaxed),
                 bytes_published: metrics.video.bytes_published.load(Ordering::Relaxed),
@@ -277,15 +292,18 @@ pub async fn post_source(
         return Err(ApiError::AlreadyRunning);
     }
 
-    let mut cfg = PipelineConfig::new(source_id.clone(), SourceInput::Url(pinned_url))
-        .with_ffmpeg_path(state.ffmpeg_path.clone());
-    // Preset is opaque pass-through for WS-3. WS-4 will plumb it into
-    // FFmpeg arg sets. For now we just trace it so the operator can
-    // confirm the value reached the sidecar.
-    if let Some(preset) = req.preset.as_deref() {
-        cfg = cfg.with_preset(preset);
-    }
-    let preset_logged = cfg.preset.clone();
+    // Default = 720p when the caller omits `preset` or sends `null`
+    // (spec §23.4 / PURA-142 AC). Unknown strings fail with the WS-3
+    // error model, not Axum's default JSON-rejection shape.
+    let preset = match req.preset.as_deref() {
+        None => QualityPreset::DEFAULT,
+        Some(s) => s
+            .parse::<QualityPreset>()
+            .map_err(|e| ApiError::InvalidRequest(e.to_string()))?,
+    };
+    let cfg = PipelineConfig::new(source_id.clone(), SourceInput::Url(pinned_url))
+        .with_ffmpeg_path(state.ffmpeg_path.clone())
+        .with_preset(preset);
 
     let pipeline = Pipeline::start(cfg, state.origin.clone())
         .await
@@ -295,7 +313,7 @@ pub async fn post_source(
     info!(
         %source_id,
         url = %req.url,
-        preset = ?preset_logged,
+        %preset,
         "pipeline registered"
     );
 
