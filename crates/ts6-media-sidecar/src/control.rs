@@ -267,25 +267,26 @@ pub async fn post_source(
         .await
         .map_err(ApiError::SsrfBlocked)?;
 
-    // Per ts6-ssrf docs the caller MUST pin outbound connects to the
-    // validated IP to defeat DNS rebinding. For FFmpeg we can't easily
-    // intercept the resolver, so we substitute the IP into the URL host
-    // when it was a DNS name and the resolve succeeded.
-    let pinned_url = match (pinned.resolved_ip, pinned.url.host()) {
-        (Some(ip), Some(url::Host::Domain(_))) => {
-            let mut u = pinned.url.clone();
-            let host_literal = match ip {
-                std::net::IpAddr::V4(v4) => v4.to_string(),
-                std::net::IpAddr::V6(v6) => format!("[{v6}]"),
-            };
-            if u.set_host(Some(&host_literal)).is_err() {
-                pinned.url.to_string()
-            } else {
-                u.to_string()
-            }
-        }
-        _ => pinned.url.to_string(),
-    };
+    // PURA-149: we used to rewrite the URL host to `pinned.resolved_ip`
+    // here to defeat DNS rebinding (ts6-ssrf's documented contract for
+    // outbound clients). For FFmpeg-driven outbound that's actively
+    // harmful — every virtual-hosted CDN (Cloudflare, googleapis,
+    // samplelib's nginx) needs the original hostname in TLS SNI and the
+    // `Host:` header, and IP-literal SNI is undefined / always wrong.
+    //
+    // What replaces the URL-level pin for v1:
+    //   - HTTPS: TLS hostname validation binds the connection to the
+    //     certificate, which is a stronger guarantee than IP-pinning
+    //     (a DNS rebinder substituting a private-range IP gets a TLS
+    //     handshake failure on the cert's SAN check).
+    //   - HTTP: we accept a small TOCTTOU window between SSRF resolve
+    //     and FFmpeg connect. `ts6-ssrf` has already rejected the
+    //     metadata-host list and any answer that lands in a private
+    //     range, so the rebinder needs a moving public→private answer
+    //     in that window. A future iteration can route plaintext HTTP
+    //     through a Rust-side reqwest proxy that pins the IP while
+    //     preserving the Host header.
+    let pinned_url = pinned.url.to_string();
 
     let mut guard = state.registry.inner.write().await;
     if guard.contains_key(&source_id) {
@@ -430,6 +431,48 @@ mod tests {
             .await
             .expect("public host must be allowed");
         assert_eq!(pinned.resolved_ip, Some(ip("93.184.216.34")));
+    }
+
+    // PURA-149: URL host must round-trip to FFmpeg unchanged. The
+    // previous implementation rewrote the host to the resolved IP,
+    // which broke TLS SNI / HTTP Host header for virtual-hosted CDNs
+    // (Cloudflare, googleapis, samplelib, …) and caused FFmpeg to
+    // immediately exit with "IVF stream EOF before header".
+    #[tokio::test]
+    async fn pinned_url_preserves_https_hostname_for_cdn_sources() {
+        let resolver = MockResolver::new()
+            .with("download.samplelib.com", vec![ip("188.227.84.172")]);
+        let pinned = is_url_allowed(
+            "https://download.samplelib.com/mp4/sample-5s.mp4",
+            &resolver,
+        )
+        .await
+        .expect("public CDN host must pass SSRF");
+
+        let url_for_ffmpeg = pinned.url.to_string();
+        assert!(
+            url_for_ffmpeg.contains("download.samplelib.com"),
+            "https URL passed to ffmpeg lost its hostname: {url_for_ffmpeg}"
+        );
+        assert!(
+            !url_for_ffmpeg.contains("188.227.84.172"),
+            "https URL passed to ffmpeg was rewritten to IP literal — \
+             breaks TLS SNI / Host on virtual-hosted CDNs: {url_for_ffmpeg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_url_preserves_http_hostname() {
+        let resolver = MockResolver::new().with("example.com", vec![ip("93.184.216.34")]);
+        let pinned = is_url_allowed("http://example.com/sample.mp4", &resolver)
+            .await
+            .expect("public host must be allowed");
+
+        let url_for_ffmpeg = pinned.url.to_string();
+        assert!(
+            url_for_ffmpeg.contains("example.com"),
+            "http URL passed to ffmpeg lost its hostname: {url_for_ffmpeg}"
+        );
     }
 
     #[test]

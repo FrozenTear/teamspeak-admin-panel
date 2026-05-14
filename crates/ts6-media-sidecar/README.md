@@ -171,8 +171,21 @@ sidecar's resolver uses `tokio::net::lookup_host` (system getaddrinfo);
 the manager-server uses `hickory-resolver`. Both implement the same
 `Resolver` trait so the validator is identical bytes either side.
 
-DNS-rebinding is closed by re-writing the FFmpeg-input URL to use the
-already-resolved IP literal — see `src/control.rs`'s `pinned_url` step.
+DNS-rebinding defence in v1 splits by scheme:
+
+* **HTTPS**: TLS hostname validation binds the connection to the
+  certificate, which is a stronger guarantee than IP-pinning — a DNS
+  rebinder substituting a private-range answer fails on the SAN check.
+* **HTTP**: a small TOCTTOU window remains between the SSRF resolve
+  and FFmpeg's own DNS lookup. `ts6-ssrf` has already rejected the
+  metadata-host list and any answer in a private range, so a successful
+  rebinder needs a public→private answer flip inside that window. A
+  follow-up will route plaintext HTTP through a Rust-side proxy that
+  pins the IP while preserving the `Host:` header.
+
+The earlier "rewrite the FFmpeg-input URL to the resolved IP literal"
+approach (PURA-149) was reverted because it broke TLS SNI / `Host:`
+on every virtual-hosted CDN.
 
 ## Pointing a `moq-lite-04` browser at it
 
