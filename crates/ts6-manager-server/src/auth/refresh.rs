@@ -564,4 +564,155 @@ mod tests {
         assert!(f.bytes().all(|b| FAMILY_ALPHABET.contains(&b)));
         assert_ne!(f, generate_family_id());
     }
+
+    // ---------------------------------------------------------------
+    // R5 defense-in-depth — PURA-161.
+    //
+    // Goal: randomly compose [`rotate`] / replay / cross-user calls and
+    // verify the two load-bearing R5 invariants hold for every sequence:
+    //
+    //   I1. Any successful `rotate(t)` leaves `t.replacedBy` populated
+    //       (the predecessor-preserved storage policy this module's docs
+    //       call out).
+    //   I2. The first replay of any previously-rotated token wipes the
+    //       owning user's *entire* refresh-token set, and never the
+    //       other user's. (Cross-user isolation — the bug R5 is named
+    //       for.)
+    //
+    // The randomised sequence is short by intent — proptest will shrink
+    // counterexamples down to the minimal failing trace, which is what
+    // makes this useful as a regression net. The token-format invariants
+    // are already covered by the deterministic unit tests above.
+    // ---------------------------------------------------------------
+
+    use proptest::prelude::*;
+
+    #[derive(Debug, Clone)]
+    enum Action {
+        RotateA,
+        RotateB,
+        ReplayAFirst,
+    }
+
+    fn action_strategy() -> impl Strategy<Value = Action> {
+        prop_oneof![
+            Just(Action::RotateA),
+            Just(Action::RotateB),
+            Just(Action::ReplayAFirst),
+        ]
+    }
+
+    async fn run_sequence(seq: Vec<Action>) {
+        let db = setup().await;
+        let alice = make_user(&db, "alice").await;
+        let bob = make_user(&db, "bob").await;
+        let alice_t1 = issue_for_login(&db, alice, ONE_DAY).await.unwrap();
+        let _bob_t1 = issue_for_login(&db, bob, ONE_DAY).await.unwrap();
+
+        let mut alice_live: Option<String> = Some(alice_t1.token.clone());
+        let mut bob_live: Option<String> = Some(_bob_t1.token.clone());
+
+        for action in seq {
+            match action {
+                Action::RotateA => {
+                    if let Some(live) = alice_live.clone() {
+                        if let Ok(rotated) = rotate(&db, &live, ONE_DAY).await {
+                            // I1
+                            let pred = refresh_tokens::find_by_token(&db, &live)
+                                .await
+                                .unwrap()
+                                .expect("predecessor must survive");
+                            assert_eq!(
+                                pred.replacedBy.as_deref(),
+                                Some(rotated.token.as_str()),
+                                "I1 violated: rotated predecessor missing replacedBy"
+                            );
+                            alice_live = Some(rotated.token);
+                        } else {
+                            alice_live = None;
+                        }
+                    }
+                }
+                Action::RotateB => {
+                    if let Some(live) = bob_live.clone() {
+                        if let Ok(rotated) = rotate(&db, &live, ONE_DAY).await {
+                            let pred = refresh_tokens::find_by_token(&db, &live)
+                                .await
+                                .unwrap()
+                                .expect("predecessor must survive");
+                            assert_eq!(
+                                pred.replacedBy.as_deref(),
+                                Some(rotated.token.as_str()),
+                                "I1 violated: rotated predecessor missing replacedBy"
+                            );
+                            bob_live = Some(rotated.token);
+                        } else {
+                            bob_live = None;
+                        }
+                    }
+                }
+                Action::ReplayAFirst => {
+                    // I2: replaying alice_t1 must either (a) error and
+                    // wipe alice's set if it has been rotated, or (b)
+                    // succeed/fail without touching bob's set. Bob's set
+                    // must survive both branches untouched.
+                    let bob_rows_before =
+                        refresh_tokens::list_for_user(&db, bob).await.unwrap();
+
+                    let pred_before = refresh_tokens::find_by_token(&db, &alice_t1.token)
+                        .await
+                        .unwrap();
+                    let alice_t1_was_rotated = pred_before
+                        .as_ref()
+                        .map(|p| p.replacedBy.is_some())
+                        .unwrap_or(false);
+
+                    let result = rotate(&db, &alice_t1.token, ONE_DAY).await;
+
+                    let bob_rows_after =
+                        refresh_tokens::list_for_user(&db, bob).await.unwrap();
+                    assert_eq!(
+                        bob_rows_before.len(),
+                        bob_rows_after.len(),
+                        "I2 violated: alice replay leaked into bob's token set"
+                    );
+
+                    if alice_t1_was_rotated {
+                        assert!(
+                            result.is_err(),
+                            "replay of a rotated token must error"
+                        );
+                        let alice_rows =
+                            refresh_tokens::list_for_user(&db, alice).await.unwrap();
+                        assert!(
+                            alice_rows.is_empty(),
+                            "I2 violated: replay of rotated token did not wipe alice's set"
+                        );
+                        alice_live = None;
+                    }
+                }
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            // Tighten the case count — every case spawns a fresh DB +
+            // migrations, which is the heavy part. 32 cases over short
+            // sequences still shrinks effectively when something breaks.
+            cases: 32,
+            .. ProptestConfig::default()
+        })]
+
+        #[test]
+        fn refresh_token_sequences_preserve_r5_invariants(
+            seq in proptest::collection::vec(action_strategy(), 1..6)
+        ) {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(run_sequence(seq));
+        }
+    }
 }

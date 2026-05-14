@@ -16,7 +16,13 @@ use crate::config::{Config, DEFAULT_DB_NAME, DEFAULT_DB_NAMESPACE};
 pub mod error;
 pub mod migrations;
 
-pub use error::{ClassifyDbResult, DbBoundary, DbError, classify, classify_surrealdb};
+// `ClassifyDbResult` is the canonical entry-point used at route call sites
+// (see `crate::routes::control::video_sources::create`). The remaining
+// items in `error::` (`DbBoundary`, `DbError`, `classify`,
+// `classify_surrealdb`) are reachable through the `crate::db::error`
+// module path — they live one import deeper to keep the top-level `crate::db`
+// surface focused on what the rest of the binary needs day to day.
+pub use error::ClassifyDbResult;
 
 #[cfg(test)]
 mod tests;
