@@ -84,10 +84,12 @@ struct Cli {
     #[arg(long, default_value_t = 15.0)]
     budget_drift_p99_ms: f64,
 
-    /// Pacer drift max budget (ms), post-warmup. 30 ms is a regression
-    /// alarm, not a steady-state target — a single ≥ 30 ms spike on a
-    /// 30-minute run is a real signal worth investigating.
-    #[arg(long, default_value_t = 30.0)]
+    /// Pacer drift max budget (ms), post-warmup. 50 ms is a 2-3×
+    /// regression alarm over the typical ~20 ms outlier observed on a
+    /// contended dev workstation; a clean release host sits well under
+    /// 10 ms. A single ≥ 50 ms spike on a 30-minute run is a real signal
+    /// worth investigating.
+    #[arg(long, default_value_t = 50.0)]
     budget_drift_max_ms: f64,
 
     /// CPU% steady-state budget (single-core %). 5% is generous for the
