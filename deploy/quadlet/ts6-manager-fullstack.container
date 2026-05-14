@@ -43,22 +43,16 @@ Environment=LOG_LEVEL=info
 Volume=ts6-db.volume:/var/lib/ts6-manager/db:Z
 Volume=ts6-music.volume:/var/lib/ts6-manager/music:Z
 
-# In-container liveness probe. Disabled until WS-OPS-Images (PURA-160)
-# ships a runtime image with a probe binary (`curl`/`wget`) or the
-# server grows a `--healthcheck` flag. The current
-# `Containerfile.fullstack` runtime stage installs only ca-certificates
-# + libssl3, so `HealthCmd=curl ...` fails at exec and
-# `HealthOnFailure=kill` then crashloops the container. systemd still
-# restarts on process exit via `Restart=on-failure` below.
-#
-# When enabling, uncomment all five lines and ensure the image ships
-# the chosen probe binary:
-# HealthCmd=curl -fsS http://127.0.0.1:3001/health
-# HealthInterval=30s
-# HealthTimeout=5s
-# HealthRetries=3
-# HealthStartPeriod=20s
-# HealthOnFailure=kill
+# In-container liveness probe. `curl` is shipped in the runtime stage of
+# `Containerfile.fullstack` (PURA-191), so the probe exec resolves and
+# `HealthOnFailure=kill` lets systemd restart the unit on a failing streak.
+# `Restart=on-failure` below still covers raw process exits independently.
+HealthCmd=curl -fsS http://127.0.0.1:3001/health
+HealthInterval=30s
+HealthTimeout=5s
+HealthRetries=3
+HealthStartPeriod=20s
+HealthOnFailure=kill
 
 [Service]
 Restart=on-failure

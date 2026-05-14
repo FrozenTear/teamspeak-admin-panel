@@ -58,6 +58,17 @@ FROM docker.io/debian:bookworm-slim
 
 # Runtime deps:
 #   * `ca-certificates`   — outbound HTTPS to source URLs (yt-dlp, ICY).
+#   * `curl`              — in-container HTTP probe. `podman kube play`
+#                           translates the kube manifest's `httpGet`
+#                           liveness/readiness probes into a CMD-SHELL
+#                           `curl -f http://host:port/path || exit 1`
+#                           healthcheck and runs it *inside* the container —
+#                           not from the kubelet/host. Without curl the
+#                           synthesized healthcheck exits non-zero, podman
+#                           marks the pod unhealthy after 3 streaks, and
+#                           crashloops it every 60-90s (PURA-191). The
+#                           Quadlet `HealthCmd=curl ...` relies on the same
+#                           binary.
 #   * `libssl3`           — transitive native deps even on rustls builds.
 #   * `ffmpeg`            — subprocess invoked by `crates/music-bot-audio` for
 #                           both the direct-`Ffmpeg` and chained-`YtDlp` source
@@ -72,6 +83,7 @@ FROM docker.io/debian:bookworm-slim
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         ca-certificates \
+        curl \
         ffmpeg \
         libssl3 \
         yt-dlp \
