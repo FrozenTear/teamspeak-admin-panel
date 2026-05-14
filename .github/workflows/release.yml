@@ -1,0 +1,299 @@
+name: Release
+
+# Publishes signed multi-arch OCI images to ghcr.io and attaches signed
+# sidecar binary archives to a GitHub Release. Triggered by:
+#
+#   * push of a semver tag matching `v*` (`v1.0.0`, `v1.0.0-rc1`, ...)
+#   * manual `workflow_dispatch` for re-runs
+#
+# Full release procedure (and the operator-side prerequisites — token
+# scope, package visibility flip) lives in `docs/ops/images.md`.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Pre-existing git tag to publish (e.g. v0.1.0-rc1). Required on workflow_dispatch.'
+        required: true
+
+permissions:
+  contents: write   # GitHub Release create + asset upload
+  packages: write   # ghcr.io push
+  id-token: write   # cosign keyless OIDC
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAMESPACE: frozentear
+  RUST_TOOLCHAIN: "1.95.0"
+
+jobs:
+  # Build + push each Containerfile across both arches. We use one job per
+  # (image, arch) so cross-compile failures land precisely. A separate
+  # `merge-manifest-list` job stitches the per-arch refs into the
+  # manifest list operators pull from.
+  build-push:
+    name: build+push (${{ matrix.image }} / ${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: ts6-manager-fullstack
+            containerfile: Containerfile.fullstack
+            arch: amd64
+            runner: ubuntu-latest
+          - image: ts6-manager-fullstack
+            containerfile: Containerfile.fullstack
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          - image: ts6-manager-sidecar
+            containerfile: Containerfile.sidecar
+            arch: amd64
+            runner: ubuntu-latest
+          - image: ts6-manager-sidecar
+            containerfile: Containerfile.sidecar
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Login to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build + push (${{ matrix.arch }})
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.containerfile }}
+          platforms: linux/${{ matrix.arch }}
+          push: true
+          provenance: false   # provenance attestation handled by cosign below
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:${{ steps.tag.outputs.tag }}-${{ matrix.arch }}
+          build-args: |
+            IMAGE_VERSION=${{ steps.tag.outputs.tag }}
+            IMAGE_REVISION=${{ github.sha }}
+
+  # Stitch the per-arch images into a manifest list operators pull from
+  # (the `:vX.Y.Z` and `:latest` tags).
+  manifest-list:
+    name: merge manifest list (${{ matrix.image }})
+    needs: build-push
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [ts6-manager-fullstack, ts6-manager-sidecar]
+    steps:
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Login to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create + push manifest list
+        run: |
+          set -euo pipefail
+          REPO="${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}"
+          TAG="${{ steps.tag.outputs.tag }}"
+          docker buildx imagetools create \
+            --tag "${REPO}:${TAG}" \
+            "${REPO}:${TAG}-amd64" \
+            "${REPO}:${TAG}-arm64"
+          # `latest` floats; only set on non-prerelease semver tags. RC/pre/beta
+          # tags do not get `latest`.
+          if [[ ! "$TAG" =~ -(rc|alpha|beta|pre) ]]; then
+            docker buildx imagetools create \
+              --tag "${REPO}:latest" \
+              "${REPO}:${TAG}-amd64" \
+              "${REPO}:${TAG}-arm64"
+          fi
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: 'v3.0.6'
+
+      - name: Sign manifest list (keyless OIDC)
+        env:
+          COSIGN_EXPERIMENTAL: '1'
+        run: |
+          set -euo pipefail
+          REPO="${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}"
+          TAG="${{ steps.tag.outputs.tag }}"
+          cosign sign --yes "${REPO}:${TAG}"
+
+  # Build the sidecar binary for each arch, archive, sha256, and sign with
+  # cosign blob-signing. Attach to the GitHub Release on the same tag.
+  sidecar-binaries:
+    name: sidecar binary (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/ts6-media-sidecar
+          shared-key: sidecar-release-${{ matrix.arch }}
+
+      - name: Build release binary
+        working-directory: crates/ts6-media-sidecar
+        run: cargo build --release --locked --bin ts6-media-sidecar --target ${{ matrix.target }}
+
+      - name: Strip + archive
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.tag.outputs.tag }}"
+          ARCH="${{ matrix.arch }}"
+          BIN="crates/ts6-media-sidecar/target/${{ matrix.target }}/release/ts6-media-sidecar"
+          strip "$BIN"
+          mkdir -p dist
+          tar -czf "dist/ts6-manager-sidecar-${TAG}-linux-${ARCH}.tar.gz" \
+            -C "$(dirname "$BIN")" ts6-media-sidecar \
+            -C "${GITHUB_WORKSPACE}" LICENSE
+          ( cd dist && sha256sum "ts6-manager-sidecar-${TAG}-linux-${ARCH}.tar.gz" \
+              > "ts6-manager-sidecar-${TAG}-linux-${ARCH}.tar.gz.sha256" )
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: 'v3.0.6'
+
+      - name: Sign archive (cosign blob, keyless OIDC)
+        env:
+          COSIGN_EXPERIMENTAL: '1'
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.tag.outputs.tag }}"
+          ARCH="${{ matrix.arch }}"
+          ARCHIVE="dist/ts6-manager-sidecar-${TAG}-linux-${ARCH}.tar.gz"
+          cosign sign-blob --yes \
+            --output-signature "${ARCHIVE}.sig" \
+            --output-certificate "${ARCHIVE}.pem" \
+            "${ARCHIVE}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sidecar-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release
+    needs: [manifest-list, sidecar-binaries]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: sidecar-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create / update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.tag.outputs.tag }}"
+          # Pre-release if the tag carries a hyphenated qualifier.
+          PRERELEASE=""
+          if [[ "$TAG" =~ -(rc|alpha|beta|pre) ]]; then
+            PRERELEASE="--prerelease"
+          fi
+          BODY="## ${TAG}
+
+Signed multi-arch OCI images and pre-built sidecar binaries.
+
+### Images (manifest lists, linux/amd64 + linux/arm64)
+
+- \`${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/ts6-manager-fullstack:${TAG}\`
+- \`${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/ts6-manager-sidecar:${TAG}\`
+
+Verify with:
+
+\`\`\`
+cosign verify ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/ts6-manager-fullstack:${TAG} \\\\
+  --certificate-identity-regexp 'https://github.com/FrozenTear/teamspeak-admin-panel/.+' \\\\
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+\`\`\`
+
+### Sidecar binary archives
+
+Attached below. Verify each with \`cosign verify-blob --signature <archive>.sig --certificate <archive>.pem <archive>\`.
+
+See \`docs/ops/images.md\` for the full publish + verify procedure.
+"
+          # Create or recreate the release. `gh release create` errors if
+          # the tag already has a release; fall back to edit + upload.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --notes "$BODY" $PRERELEASE
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --notes "$BODY" \
+              $PRERELEASE \
+              dist/*
+          fi
