@@ -1,10 +1,10 @@
 # `ts6-media-sidecar` — Phase-5 MoQ + WebTransport video sidecar
 
-WS-1 scaffold + WS-2 FFmpeg pipeline under
+WS-1 scaffold + WS-2 FFmpeg pipeline + WS-3 control plane under
 [PURA-136](/PURA/issues/PURA-136). Boots a QUIC/WebTransport listener
 (ALPN-pinned to `moq-lite-04`), an axum control-plane HTTP surface, and
-— when configured — a per-source FFmpeg pipeline that publishes VP8 +
-Opus into MoQ tracks. The mutating `/source` REST plane is WS-3.
+— per [`POST /source`](#control-plane) call — a per-source FFmpeg
+pipeline that publishes VP8 + Opus into MoQ tracks.
 
 Pinning rationale lives in
 [ADR-0007](../../docs/adr/0007-moq-flavor-and-draft-pin.md). The WS-0
@@ -59,21 +59,108 @@ cargo run --release -- \
     --key  /etc/ts6-media-sidecar/privkey.pem
 ```
 
-## Control-plane endpoints (WS-1)
+## Control plane
 
-| Method | Path                  | Body                                                                                                |
-| ------ | --------------------- | --------------------------------------------------------------------------------------------------- |
-| GET    | `/health`             | `{ "status": "ok", "uptime_s": N, "sessions": N, "broadcasts": N }`                                 |
-| GET    | `/stats`              | `{ "uptime_s": N, "active_sessions": N, "lifetime_sessions": N, "registered_broadcasts": [...] }`   |
-| GET    | `/certificate.sha256` | `text/plain` SHA-256 hex digest of the configured cert (matches `serverCertificateHashes` in WS-0). |
+The sidecar serves an axum HTTP surface on `--http-listen` (default
+`127.0.0.1:7080`) — operator-only, distinct from the QUIC listener.
+
+| Method | Path                       | Purpose                                                                                              |
+| ------ | -------------------------- | ---------------------------------------------------------------------------------------------------- |
+| GET    | `/health`                  | Cheap liveness probe. JSON: `{ status, uptime_s, sessions, broadcasts }`.                            |
+| GET    | `/stats`                   | Process + per-source counters. JSON: `{ uptime_s, active_sessions, lifetime_sessions, registered_broadcasts, sources[] }`. |
+| GET    | `/certificate.sha256`      | `text/plain` SHA-256 hex digest of the cert (matches `serverCertificateHashes` in WS-0).             |
+| POST   | `/source`                  | **WS-3** — start a pipeline for the given source URL. SSRF-checked. Returns `201` + `{ source_id, track }`. |
+| POST   | `/source/stop`             | **WS-3** — stop a pipeline by id. Returns `204` on success, `404` if the id is unknown.              |
+| GET    | `/track/{source_id}`       | **WS-3** — look up the MoQ track descriptor for a registered source. `404` if unknown.               |
 
 All other routes return `404`.
+
+### Read-only probes
 
 ```sh
 curl -sf http://127.0.0.1:7080/health   | jq .
 curl -sf http://127.0.0.1:7080/stats    | jq .
 curl -sf http://127.0.0.1:7080/certificate.sha256
 ```
+
+### `POST /source`
+
+```sh
+curl -sSf -XPOST http://127.0.0.1:7080/source \
+    -H 'content-type: application/json' \
+    -d '{
+        "url": "https://example.com/stream.mp4",
+        "source_id": "camera-1",
+        "preset": "passthrough"
+    }' | jq .
+```
+
+Request:
+
+| Field       | Type   | Required | Notes                                                                                  |
+| ----------- | ------ | -------- | -------------------------------------------------------------------------------------- |
+| `url`       | string | yes      | HTTP or HTTPS source URL. SSRF-blocked for loopback / private / link-local / metadata. |
+| `source_id` | string | no       | Operator-supplied id. Server generates a v4 UUID if omitted.                           |
+| `preset`    | string | no       | Opaque pass-through. WS-4 will wire it to FFmpeg parameter sets; today no-op.          |
+
+Response (`201`):
+
+```json
+{
+  "source_id": "camera-1",
+  "track": {
+    "namespace": "camera-1",
+    "video": "video",
+    "audio": "audio"
+  }
+}
+```
+
+`track.namespace` is the moq-lite broadcast path; `video` / `audio` are
+the track names inside that broadcast (`pipeline.rs` hardcodes them so
+the WS-0 reference player subscribes without configuration).
+
+### `POST /source/stop`
+
+```sh
+curl -sSf -XPOST http://127.0.0.1:7080/source/stop \
+    -H 'content-type: application/json' \
+    -d '{"source_id": "camera-1"}'
+```
+
+Returns `204 No Content` on success.
+
+### `GET /track/{source_id}`
+
+```sh
+curl -sf http://127.0.0.1:7080/track/camera-1 | jq .
+```
+
+Same shape as `POST /source`'s response.
+
+### Error model
+
+All `4xx` / `5xx` responses are JSON `{ error, detail? }` with these
+codes:
+
+| HTTP | `error`                       | When                                                              |
+| ---- | ----------------------------- | ----------------------------------------------------------------- |
+| 400  | `ssrf_blocked`                | URL fails the shared `ts6-ssrf` validator (loopback, private, …). |
+| 400  | `invalid_request`             | Missing/empty `url`, bad characters in `source_id`, …             |
+| 404  | `unknown_source_id`           | `/source/stop` or `/track/{id}` for a source not in the registry. |
+| 409  | `source_id_already_running`   | `POST /source` with a `source_id` that's already live.            |
+| 500  | `internal`                    | Pipeline boot, broadcast registration, or track creation failed.  |
+
+### SSRF posture
+
+The sidecar reuses the shared `ts6-ssrf` validator (extracted under
+PURA-141 from `ts6-manager-server`) for every `POST /source` URL. The
+sidecar's resolver uses `tokio::net::lookup_host` (system getaddrinfo);
+the manager-server uses `hickory-resolver`. Both implement the same
+`Resolver` trait so the validator is identical bytes either side.
+
+DNS-rebinding is closed by re-writing the FFmpeg-input URL to use the
+already-resolved IP literal — see `src/control.rs`'s `pinned_url` step.
 
 ## Pointing a `moq-lite-04` browser at it
 
@@ -118,8 +205,10 @@ cargo run --release -- \
     --source-lavfi-audio 'sine=frequency=440:sample_rate=48000'
 ```
 
-The mutating `POST /source` / `POST /source/stop` REST plane is WS-3 —
-until then, sources are boot-time CLI flags only.
+Boot-time CLI flags and the WS-3 [`POST /source`](#control-plane) REST
+plane both create the same kind of `Pipeline`; pick whichever fits the
+operator's workflow. WS-3 sources can be stopped on demand without a
+restart; boot-time CLI sources only stop on process exit.
 
 ## Self-signed cert + Helium / Chromium
 
@@ -138,6 +227,17 @@ broadcast through `SidecarOrigin::register_broadcast`, and re-checks
 ```sh
 cd crates/ts6-media-sidecar
 cargo test --test smoke
+```
+
+`tests/control_plane.rs` (WS-3) boots the sidecar with a deterministic
+`MockResolver`, walks
+`POST /source → GET /track/{id} → GET /stats → POST /source/stop` end-to-end,
+and asserts SSRF rejection for both private-range DNS rebinders and
+loopback IP literals. ffmpeg-free (`ffmpeg_path = /bin/true`):
+
+```sh
+cd crates/ts6-media-sidecar
+cargo test --test control_plane
 ```
 
 `tests/pipeline_two_tab_smoke.rs` (WS-2) boots the sidecar, starts a
@@ -161,10 +261,8 @@ against the WS-0 reference player.
 
 ## What this crate does NOT do yet
 
-- **No `/source` REST plane** — control-plane HTTP is read-only at
-  this stage. Pipelines are CLI-only. WS-3.
-- **No SSRF allow-list** for source URLs. WS-3.
 - **No quality presets** (resolution / bitrate / FPS knobs). WS-4.
+  `POST /source` accepts a `preset` field today but only records it.
 - **No Dioxus widget** — the player is the no-build reference subscriber
   in [`moq-spike/player/`](../../moq-spike/player/) until WS-5.
 - **No browser-side audio decode** — the WS-0 reference player only

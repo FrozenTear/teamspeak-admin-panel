@@ -11,8 +11,14 @@
 //! intended pattern.
 //!
 //! Risk owned: R6 (SSRF gaps).
-
-#![allow(dead_code)] // consumed by future workstreams (FLOW, VOICE, VIDEO, REST)
+//!
+//! ## Crate boundary
+//!
+//! Extracted from `ts6-manager-server` so the sibling-workspace
+//! `ts6-media-sidecar` (PURA-141) can reuse the identical validator. The
+//! production [`Resolver`] backed by `hickory-resolver` is feature-gated
+//! (`hickory`); consumers that don't want the dep ship their own resolver
+//! impl against the [`Resolver`] trait.
 
 mod ipnorm;
 mod ranges;
@@ -23,9 +29,9 @@ mod tests;
 
 use std::net::IpAddr;
 
-#[allow(unused_imports)]
-// re-exported for future call sites; tests use MockResolver/Resolver only
-pub use resolver::{HickoryResolver, MockResolver, ResolveError, Resolver};
+#[cfg(feature = "hickory")]
+pub use resolver::HickoryResolver;
+pub use resolver::{MockResolver, ResolveError, Resolver};
 
 /// Spec §6.7.1: hostname literals that MUST be rejected even when DNS would
 /// have resolved them somewhere benign.

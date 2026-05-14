@@ -8,9 +8,11 @@
 //! port discovery.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde_json::Value;
-use ts6_media_sidecar::{Sidecar, SidecarConfig, TransportConfig};
+use ts6_media_sidecar::{GaiResolver, Sidecar, SidecarConfig, TransportConfig};
 
 #[tokio::test]
 async fn smoke_health_stats_certificate_endpoints() {
@@ -27,6 +29,8 @@ async fn smoke_health_stats_certificate_endpoints() {
             tls_generate: vec!["localhost".to_string()],
         },
         http_listen: "127.0.0.1:0".parse().unwrap(),
+        resolver: Arc::new(GaiResolver::new()),
+        ffmpeg_path: PathBuf::from("ffmpeg"),
     };
 
     let sidecar = Sidecar::start(config).await.expect("sidecar boots");
@@ -99,8 +103,9 @@ async fn smoke_health_stats_certificate_endpoints() {
     let body = resp.text().await.unwrap();
     assert_eq!(body.trim(), expected_fp);
 
-    // Unknown route → 404.
-    let resp = reqwest::get(format!("http://{}/source", http_addr))
+    // Unknown route → 404. (`/source` is owned by the WS-3 control plane
+    // now, so we use a path the router doesn't know at all.)
+    let resp = reqwest::get(format!("http://{}/definitely-not-a-route", http_addr))
         .await
         .expect("404 GET");
     assert_eq!(resp.status(), 404, "unknown routes must 404");

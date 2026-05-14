@@ -1,0 +1,33 @@
+# Shared SSRF validator. Lives in its own crate so the main workspace
+# (`ts6-manager-server`) AND the sibling-workspace `ts6-media-sidecar`
+# (separate workspace because of the moq-native / dioxus-server
+# parking_lot feature conflict — see crates/ts6-media-sidecar/Cargo.toml)
+# both consume the same code without duplicating logic.
+#
+# `hickory` is feature-gated so the sidecar workspace can opt out of
+# pulling hickory-resolver into its build graph. The validator's core
+# (URL parse, IP range checks, BSD-IPv4 normalisation, Resolver trait,
+# MockResolver) is dependency-light and always available.
+[package]
+name = "ts6-ssrf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# Default keeps the crate dep-light. Consumers that want the production
+# `HickoryResolver` opt into it explicitly.
+default = []
+hickory = ["dep:hickory-resolver"]
+
+[dependencies]
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+
+hickory-resolver = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

@@ -4,6 +4,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -11,7 +12,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use ts6_media_sidecar::{
-    Pipeline, PipelineConfig, Sidecar, SidecarConfig, SourceInput, TransportConfig,
+    GaiResolver, Pipeline, PipelineConfig, Sidecar, SidecarConfig, SourceInput, TransportConfig,
 };
 
 #[derive(Parser, Debug)]
@@ -81,6 +82,8 @@ async fn main() -> Result<()> {
             tls_generate: args.tls_generate,
         },
         http_listen: args.http_listen,
+        resolver: Arc::new(GaiResolver::new()),
+        ffmpeg_path: args.ffmpeg_path.clone(),
     };
 
     let sidecar = Sidecar::start(config).await.context("start sidecar")?;

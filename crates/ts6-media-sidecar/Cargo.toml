@@ -51,7 +51,17 @@ path = "src/main.rs"
 moq-lite = { workspace = true }
 moq-native = { workspace = true }
 
+# Shared SSRF validator (PURA-141). Lives in the main workspace under
+# `crates/ts6-ssrf` and is path-referenced from here so the validator
+# code is the same bytes both binaries compile. We DON'T enable the
+# `hickory` feature — the sidecar's `GaiResolver` uses
+# `tokio::net::lookup_host` instead, which keeps the sidecar's already-
+# locked parking_lot graph (moq-native pins `deadlock_detection`)
+# clear of hickory-resolver's own parking_lot pull-in.
+ts6-ssrf = { path = "../ts6-ssrf" }
+
 anyhow = "1"
+async-trait = "0.1"
 axum = "0.8"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
@@ -59,10 +69,12 @@ futures = { version = "0.3", default-features = false, features = ["std"] }
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "sync", "time", "fs", "process", "io-util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }

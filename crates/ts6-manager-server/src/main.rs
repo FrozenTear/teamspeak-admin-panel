@@ -31,8 +31,6 @@ mod repos;
 #[cfg(feature = "server")]
 mod routes;
 #[cfg(feature = "server")]
-mod ssrf;
-#[cfg(feature = "server")]
 mod sshbridge;
 mod ui;
 #[cfg(feature = "server")]

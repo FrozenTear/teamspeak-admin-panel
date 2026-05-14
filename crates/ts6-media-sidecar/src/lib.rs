@@ -8,30 +8,56 @@
 //! the [PURA-136](../../docs/adr/0007-moq-flavor-and-draft-pin.md) Phase-5
 //! epic. The pinning rationale lives in ADR-0007.
 
+pub mod control;
 pub mod http;
 pub mod origin;
 pub mod pipeline;
+pub mod ssrf_resolver;
 pub mod transport;
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Context;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
+use ts6_ssrf::Resolver;
 
+pub use crate::control::PipelineRegistry;
 pub use crate::http::HttpServer;
 pub use crate::origin::SidecarOrigin;
-pub use crate::pipeline::{Pipeline, PipelineConfig, SourceInput};
+pub use crate::pipeline::{Pipeline, PipelineConfig, PipelineMetrics, SourceInput};
+pub use crate::ssrf_resolver::GaiResolver;
 pub use crate::transport::TransportConfig;
 
 /// Configuration handed to [`Sidecar::start`]. Mirrors the binary's CLI
 /// surface but is pure data so the smoke test can build one inline.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SidecarConfig {
     pub transport: TransportConfig,
     pub http_listen: SocketAddr,
+    /// Resolver passed into the SSRF validator on every `POST /source`.
+    /// Production hands [`GaiResolver`]; tests hand a `MockResolver` so
+    /// SSRF rejection is deterministic.
+    pub resolver: Arc<dyn Resolver>,
+    /// Path to the `ffmpeg` binary used by every `Pipeline` started via
+    /// the WS-3 control plane. Defaults to `ffmpeg` on `PATH`.
+    pub ffmpeg_path: PathBuf,
+}
+
+impl SidecarConfig {
+    /// Helper used by the smoke test + the binary's main: default
+    /// resolver is [`GaiResolver`], default ffmpeg is `ffmpeg` on PATH.
+    pub fn with_defaults(transport: TransportConfig, http_listen: SocketAddr) -> Self {
+        Self {
+            transport,
+            http_listen,
+            resolver: Arc::new(GaiResolver::new()),
+            ffmpeg_path: PathBuf::from("ffmpeg"),
+        }
+    }
 }
 
 /// Handle to a running sidecar. Holds the bound addresses + TLS fingerprint
@@ -42,6 +68,7 @@ pub struct Sidecar {
     pub transport_addr: SocketAddr,
     pub fingerprint: String,
     pub origin: Arc<SidecarOrigin>,
+    pub registry: PipelineRegistry,
     transport_task: JoinHandle<anyhow::Result<()>>,
     http_task: JoinHandle<anyhow::Result<()>>,
 }
@@ -54,6 +81,7 @@ impl Sidecar {
         let started_at = Instant::now();
         let stats = Arc::new(SidecarStats::new(started_at));
         let origin = Arc::new(SidecarOrigin::new());
+        let registry = PipelineRegistry::new();
 
         let transport = transport::Transport::bind(config.transport, origin.clone(), stats.clone())
             .context("bind QUIC/WebTransport listener")?;
@@ -67,6 +95,9 @@ impl Sidecar {
             origin.clone(),
             stats.clone(),
             fingerprint.clone(),
+            config.resolver,
+            registry.clone(),
+            config.ffmpeg_path,
         )
         .await
         .context("bind control-plane HTTP listener")?;
@@ -80,6 +111,7 @@ impl Sidecar {
             transport_addr,
             fingerprint,
             origin,
+            registry,
             transport_task,
             http_task,
         })

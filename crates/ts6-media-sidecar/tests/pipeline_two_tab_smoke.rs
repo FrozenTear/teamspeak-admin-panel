@@ -17,6 +17,7 @@
 //! itself runs under `cargo test -p ts6-media-sidecar -- --include-ignored`
 //! or `cargo test --features ffmpeg-smoke`.
 
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,7 +27,7 @@ use moq_lite::{Origin, OriginConsumer, Track};
 use moq_native::ClientConfig;
 use tokio::time::timeout;
 use ts6_media_sidecar::{
-    Pipeline, PipelineConfig, Sidecar, SidecarConfig, SourceInput, TransportConfig,
+    GaiResolver, Pipeline, PipelineConfig, Sidecar, SidecarConfig, SourceInput, TransportConfig,
 };
 use url::Url;
 
@@ -67,6 +68,8 @@ async fn run_smoke() -> Result<()> {
             tls_generate: vec!["localhost".to_string()],
         },
         http_listen: "127.0.0.1:0".parse().unwrap(),
+        resolver: Arc::new(GaiResolver::new()),
+        ffmpeg_path: PathBuf::from("ffmpeg"),
     })
     .await
     .context("start sidecar")?;

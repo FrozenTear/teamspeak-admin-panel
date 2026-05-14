@@ -24,6 +24,7 @@
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -64,10 +65,16 @@ pub struct PipelineConfig {
     pub name: String,
     /// Source URL/path passed to `ffmpeg -i`. Anything `ffmpeg` accepts
     /// (file path, RTSP/HTTP URL, `-f lavfi -i …`-style inputs, …).
-    /// SSRF allow/deny is WS-3 — this struct just forwards the string.
+    /// SSRF allow/deny lands in WS-3 (`POST /source`) — this struct just
+    /// forwards the string.
     pub source: SourceInput,
     /// Path to the `ffmpeg` binary. Defaults to `ffmpeg` on PATH.
     pub ffmpeg_path: PathBuf,
+    /// WS-4 quality preset. Opaque pass-through for WS-3 — recorded so
+    /// the operator-facing `/stats` and tracing can surface it, but not
+    /// yet plumbed into the FFmpeg arg sets. Stays `None` for boot-time
+    /// CLI sources.
+    pub preset: Option<String>,
 }
 
 /// What FFmpeg should read from.
@@ -117,6 +124,7 @@ impl PipelineConfig {
             name: name.into(),
             source,
             ffmpeg_path: PathBuf::from("ffmpeg"),
+            preset: None,
         }
     }
 
@@ -124,12 +132,40 @@ impl PipelineConfig {
         self.ffmpeg_path = path.into();
         self
     }
+
+    pub fn with_preset(mut self, preset: impl Into<String>) -> Self {
+        self.preset = Some(preset.into());
+        self
+    }
+}
+
+/// Per-track counters exported via the control-plane `/stats` endpoint
+/// (WS-3). Frames + bytes are bumped from the mux loop; `ffmpeg_alive`
+/// flips inside the supervisor as the FFmpeg child spawns / exits.
+#[derive(Debug, Default)]
+pub struct TrackMetrics {
+    pub frames_published: AtomicU64,
+    pub bytes_published: AtomicU64,
+    pub ffmpeg_alive: AtomicBool,
+}
+
+#[derive(Debug, Default)]
+pub struct PipelineMetrics {
+    pub video: TrackMetrics,
+    pub audio: TrackMetrics,
+}
+
+impl PipelineMetrics {
+    fn arc() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
 }
 
 /// Running pipeline. Holds two FFmpeg supervisors; drop to stop both.
 pub struct Pipeline {
     name: String,
     origin: Arc<SidecarOrigin>,
+    metrics: Arc<PipelineMetrics>,
     _broadcast: BroadcastProducer,
     video: SupervisedTask,
     audio: SupervisedTask,
@@ -174,8 +210,9 @@ impl Pipeline {
             .create_track(Track::new(TRACK_AUDIO))
             .with_context(|| format!("create '{}' track on '{}'", TRACK_AUDIO, config.name))?;
 
-        let video = spawn_video_supervisor(config.clone(), video_track);
-        let audio = spawn_audio_supervisor(config.clone(), audio_track);
+        let metrics = PipelineMetrics::arc();
+        let video = spawn_video_supervisor(config.clone(), video_track, metrics.clone());
+        let audio = spawn_audio_supervisor(config.clone(), audio_track, metrics.clone());
 
         let source_display = config.source.display();
         info!(
@@ -187,10 +224,24 @@ impl Pipeline {
         Ok(Self {
             name: config.name,
             origin,
+            metrics,
             _broadcast: broadcast,
             video,
             audio,
         })
+    }
+
+    /// Operator-visible broadcast name (= `source_id` in the WS-3 control
+    /// plane).
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Shared counters touched by the supervisor + mux loops. Cloneable
+    /// `Arc` so the control-plane `/stats` handler can read without
+    /// taking any of the pipeline's locks.
+    pub fn metrics(&self) -> Arc<PipelineMetrics> {
+        self.metrics.clone()
     }
 
     /// Stop both supervisors and unregister the broadcast.
@@ -208,7 +259,11 @@ impl Pipeline {
 // FFmpeg supervisor — spawn, watch, restart with backoff
 // -----------------------------------------------------------------------
 
-fn spawn_video_supervisor(config: PipelineConfig, mut track: TrackProducer) -> SupervisedTask {
+fn spawn_video_supervisor(
+    config: PipelineConfig,
+    mut track: TrackProducer,
+    metrics: Arc<PipelineMetrics>,
+) -> SupervisedTask {
     let (stop_tx, mut stop_rx) = oneshot::channel();
     let handle = tokio::spawn(async move {
         let mut state = SupervisorState::new("video", config);
@@ -219,14 +274,17 @@ fn spawn_video_supervisor(config: PipelineConfig, mut track: TrackProducer) -> S
             let Some((stdout, mut child)) = state.prepare(child, &mut stop_rx).await else {
                 continue;
             };
+            metrics.video.ffmpeg_alive.store(true, Ordering::Relaxed);
             let mux_result = tokio::select! {
-                r = mux_video(stdout, &mut track) => r,
+                r = mux_video(stdout, &mut track, &metrics.video) => r,
                 _ = &mut stop_rx => {
                     debug!(broadcast = %state.name, role = state.role, "stop signalled");
                     let _ = child.kill().await;
+                    metrics.video.ffmpeg_alive.store(false, Ordering::Relaxed);
                     return;
                 }
             };
+            metrics.video.ffmpeg_alive.store(false, Ordering::Relaxed);
             state.finish_iteration(child, mux_result, &mut stop_rx).await;
             if state.stop_requested {
                 return;
@@ -239,7 +297,11 @@ fn spawn_video_supervisor(config: PipelineConfig, mut track: TrackProducer) -> S
     }
 }
 
-fn spawn_audio_supervisor(config: PipelineConfig, mut track: TrackProducer) -> SupervisedTask {
+fn spawn_audio_supervisor(
+    config: PipelineConfig,
+    mut track: TrackProducer,
+    metrics: Arc<PipelineMetrics>,
+) -> SupervisedTask {
     let (stop_tx, mut stop_rx) = oneshot::channel();
     let handle = tokio::spawn(async move {
         let mut state = SupervisorState::new("audio", config);
@@ -250,14 +312,17 @@ fn spawn_audio_supervisor(config: PipelineConfig, mut track: TrackProducer) -> S
             let Some((stdout, mut child)) = state.prepare(child, &mut stop_rx).await else {
                 continue;
             };
+            metrics.audio.ffmpeg_alive.store(true, Ordering::Relaxed);
             let mux_result = tokio::select! {
-                r = mux_audio(stdout, &mut track) => r,
+                r = mux_audio(stdout, &mut track, &metrics.audio) => r,
                 _ = &mut stop_rx => {
                     debug!(broadcast = %state.name, role = state.role, "stop signalled");
                     let _ = child.kill().await;
+                    metrics.audio.ffmpeg_alive.store(false, Ordering::Relaxed);
                     return;
                 }
             };
+            metrics.audio.ffmpeg_alive.store(false, Ordering::Relaxed);
             state.finish_iteration(child, mux_result, &mut stop_rx).await;
             if state.stop_requested {
                 return;
@@ -483,6 +548,7 @@ fn ffmpeg_audio_args(config: &PipelineConfig) -> Vec<String> {
 async fn mux_video(
     mut reader: BufReader<tokio::process::ChildStdout>,
     track: &mut TrackProducer,
+    metrics: &TrackMetrics,
 ) -> Result<()> {
     // IVF header is 32 bytes; the size at offset 4..6 is the header size
     // (almost always 32). We tolerate larger headers (skip the extra).
@@ -550,6 +616,10 @@ async fn mux_video(
             .write_frame(Bytes::copy_from_slice(&frame_buf))
             .context("write video frame")?;
         group.finish().context("finish video group")?;
+        metrics.frames_published.fetch_add(1, Ordering::Relaxed);
+        metrics
+            .bytes_published
+            .fetch_add(frame_size as u64, Ordering::Relaxed);
     }
 }
 
@@ -568,6 +638,7 @@ async fn mux_video(
 async fn mux_audio(
     mut reader: BufReader<tokio::process::ChildStdout>,
     track: &mut TrackProducer,
+    metrics: &TrackMetrics,
 ) -> Result<()> {
     let mut parser = OggParser::new();
     let mut buf = [0u8; 8192];
@@ -610,9 +681,14 @@ async fn mux_audio(
                     current_group.as_mut().unwrap()
                 }
             };
+            let packet_len = packet.len();
             group
                 .write_frame(Bytes::from(packet))
                 .context("write audio frame")?;
+            metrics.frames_published.fetch_add(1, Ordering::Relaxed);
+            metrics
+                .bytes_published
+                .fetch_add(packet_len as u64, Ordering::Relaxed);
             packets_in_group += 1;
 
             if packets_in_group >= AUDIO_PACKETS_PER_GROUP {
