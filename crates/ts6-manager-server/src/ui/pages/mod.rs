@@ -10,6 +10,8 @@ mod bans;
 mod channels;
 mod clients;
 mod dashboard_placeholder;
+#[cfg(debug_assertions)]
+mod dev_video_player;
 mod home;
 mod login;
 mod logs;
@@ -23,6 +25,8 @@ pub use bans::BansPage;
 pub use channels::ChannelsPage;
 pub use clients::ClientsPage;
 pub use dashboard_placeholder::DashboardPlaceholder;
+#[cfg(debug_assertions)]
+pub use dev_video_player::DevVideoPlayerPage;
 pub use home::Home;
 pub use login::LoginPage;
 pub use logs::LogsPage;

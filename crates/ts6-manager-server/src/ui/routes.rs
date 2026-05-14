@@ -17,6 +17,8 @@
 use dioxus::prelude::*;
 
 use crate::ui::layout::AppShell;
+#[cfg(debug_assertions)]
+use crate::ui::pages::DevVideoPlayerPage;
 use crate::ui::pages::{
     BansPage, BotDetailPage, BotsIndexPage, ChannelsPage, ClientsPage, DashboardPlaceholder, Home,
     LoginPage, LogsPage, MusicLibraryPage, MusicPlaylistsPage, PublicWidgetPage, RadioStationsPage,
@@ -37,6 +39,14 @@ pub enum Route {
     // The token in the URL is the only credential.
     #[route("/widget/:token")]
     PublicWidgetPage { token: String },
+
+    // PURA-143 WS-5 — dev-only mount for the moq-lite video player. Lives
+    // outside `AppShell` so the operator can two-tab the smoke without an
+    // auth bounce. Gated by `cfg(debug_assertions)` so `dx serve --release`
+    // bundles do not expose it.
+    #[cfg(debug_assertions)]
+    #[route("/dev/video-player?:relay&:ns")]
+    DevVideoPlayerPage { relay: Option<String>, ns: Option<String> },
 
     #[layout(AppShell)]
     #[route("/")]
