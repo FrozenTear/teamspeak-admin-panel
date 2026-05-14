@@ -254,6 +254,8 @@ jobs:
       - name: Create / update GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REGISTRY: ${{ env.REGISTRY }}
+          IMAGE_NAMESPACE: ${{ env.IMAGE_NAMESPACE }}
         run: |
           set -euo pipefail
           TAG="${{ steps.tag.outputs.tag }}"
@@ -262,38 +264,44 @@ jobs:
           if [[ "$TAG" =~ -(rc|alpha|beta|pre) ]]; then
             PRERELEASE="--prerelease"
           fi
-          BODY="## ${TAG}
-
-Signed multi-arch OCI images and pre-built sidecar binaries.
-
-### Images (manifest lists, linux/amd64 + linux/arm64)
-
-- \`${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/ts6-manager-fullstack:${TAG}\`
-- \`${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/ts6-manager-sidecar:${TAG}\`
-
-Verify with:
-
-\`\`\`
-cosign verify ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/ts6-manager-fullstack:${TAG} \\\\
-  --certificate-identity-regexp 'https://github.com/FrozenTear/teamspeak-admin-panel/.+' \\\\
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com
-\`\`\`
-
-### Sidecar binary archives
-
-Attached below. Verify each with \`cosign verify-blob --signature <archive>.sig --certificate <archive>.pem <archive>\`.
-
-See \`docs/ops/images.md\` for the full publish + verify procedure.
-"
+          # Build the release body via echo lines so the markdown content
+          # stays inside the YAML literal block scalar (every line indented
+          # to column 10). Building the body inline as a multi-line string
+          # would force column-0 content lines and break YAML parsing.
+          BODY_FILE="$RUNNER_TEMP/release-body.md"
+          {
+            echo "## ${TAG}"
+            echo
+            echo "Signed multi-arch OCI images and pre-built sidecar binaries."
+            echo
+            echo "### Images (manifest lists, linux/amd64 + linux/arm64)"
+            echo
+            echo "- \`${REGISTRY}/${IMAGE_NAMESPACE}/ts6-manager-fullstack:${TAG}\`"
+            echo "- \`${REGISTRY}/${IMAGE_NAMESPACE}/ts6-manager-sidecar:${TAG}\`"
+            echo
+            echo "Verify with:"
+            echo
+            echo '```'
+            echo "cosign verify ${REGISTRY}/${IMAGE_NAMESPACE}/ts6-manager-fullstack:${TAG} \\"
+            echo "  --certificate-identity-regexp 'https://github.com/FrozenTear/teamspeak-admin-panel/.+' \\"
+            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com"
+            echo '```'
+            echo
+            echo "### Sidecar binary archives"
+            echo
+            echo "Attached below. Verify each with \`cosign verify-blob --signature <archive>.sig --certificate <archive>.pem <archive>\`."
+            echo
+            echo "See \`docs/ops/images.md\` for the full publish + verify procedure."
+          } > "$BODY_FILE"
           # Create or recreate the release. `gh release create` errors if
           # the tag already has a release; fall back to edit + upload.
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release edit "$TAG" --notes "$BODY" $PRERELEASE
+            gh release edit "$TAG" --notes-file "$BODY_FILE" $PRERELEASE
             gh release upload "$TAG" dist/* --clobber
           else
             gh release create "$TAG" \
               --title "$TAG" \
-              --notes "$BODY" \
+              --notes-file "$BODY_FILE" \
               $PRERELEASE \
               dist/*
           fi
