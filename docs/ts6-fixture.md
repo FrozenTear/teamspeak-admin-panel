@@ -35,9 +35,18 @@ podman run -d --name ts6-fixture \
   -e TSSERVER_LICENSE_ACCEPTED=accept \
   -e TSSERVER_QUERY_ADMIN_PASSWORD=qa-admin \
   -e TSSERVER_QUERY_SKIP_BRUTE_FORCE_CHECK=1 \
+  -e TSSERVER_QUERY_HTTP_ENABLED=1 \
+  -e TSSERVER_QUERY_SSH_ENABLED=1 \
   -v ts6-fixture-data:/var/tsserver \
   docker.io/teamspeaksystems/teamspeak6-server:latest
 ```
+
+> `TSSERVER_QUERY_HTTP_ENABLED=1` and `TSSERVER_QUERY_SSH_ENABLED=1` are
+> mandatory (PURA-177). Both flags default to `0` in `tsserver --help` —
+> without them the image only starts the legacy telnet ServerQuery, no
+> 10080/tcp WebQuery and no 10022/tcp SSH ServerQuery. The upstream image's
+> `EXPOSE` list reflects this (only `10022/tcp`, `30033/tcp`, `9987/udp`
+> are exposed by default).
 
 The fixture now exposes:
 

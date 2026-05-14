@@ -127,13 +127,6 @@ jobs:
     name: TS6 fixture integration smoke
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    # PURA-165 closeout (CTO 2026-05-14): TS6 WebQuery on :10080 didn't
-    # respond 200 within 60 s after fixture boot — likely a fixture-side
-    # WebQuery enablement gap (the env vars set today only configure
-    # ServerQuery, not WebQuery). Tracked separately under the OD3 / PURA-170
-    # follow-up so failures here don't gate fmt/clippy/build/test signal.
-    # Remove once that follow-up lands and the smoke is reliably green.
-    continue-on-error: true
     env:
       # Tracks the `ts6-fixture` profile in `podman-compose.yml`. Pin to a
       # tagged digest here without touching local dev if chasing a regression.
@@ -144,12 +137,19 @@ jobs:
       - name: Pull TS6 fixture image
         run: docker pull "$TS6_FIXTURE_IMAGE"
 
+      # PURA-177: `TSSERVER_QUERY_HTTP_ENABLED=1` (and the SSH twin) are
+      # required — `tsserver --help` shows both flags default to `0`, so the
+      # PURA-170 env block only got ServerQuery's telnet path running and
+      # `/version` on :10080 never bound. Image exposes only 9987/udp,
+      # 10022/tcp, 30033/tcp by default; WebQuery (10080/tcp) is opt-in.
       - name: Boot TS6 fixture (host networking)
         run: |
           docker run -d --name ts6-fixture --network=host \
             -e TSSERVER_LICENSE_ACCEPTED=accept \
             -e TSSERVER_QUERY_ADMIN_PASSWORD=qa-admin \
             -e TSSERVER_QUERY_SKIP_BRUTE_FORCE_CHECK=1 \
+            -e TSSERVER_QUERY_HTTP_ENABLED=1 \
+            -e TSSERVER_QUERY_SSH_ENABLED=1 \
             "$TS6_FIXTURE_IMAGE"
 
       - name: Wait for fixture & capture API key

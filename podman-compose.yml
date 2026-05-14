@@ -83,6 +83,13 @@ services:
       TSSERVER_LICENSE_ACCEPTED: accept
       TSSERVER_QUERY_ADMIN_PASSWORD: ${TS6_FIXTURE_ADMIN_PASSWORD:-qa-admin}
       TSSERVER_QUERY_SKIP_BRUTE_FORCE_CHECK: "1"
+      # PURA-177: both query interfaces default to disabled in the upstream
+      # image (`tsserver --help` → `query-http-enable [0]`,
+      # `query-ssh-enable [0]`). Without these flags the manager only sees
+      # the legacy telnet ServerQuery and the WebQuery integration test
+      # never gets a 200 on :10080.
+      TSSERVER_QUERY_HTTP_ENABLED: "1"
+      TSSERVER_QUERY_SSH_ENABLED: "1"
     volumes:
       - ts6-fixture-data:/var/tsserver
     restart: "no"
