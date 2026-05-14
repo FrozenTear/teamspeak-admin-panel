@@ -137,14 +137,14 @@ jobs:
           last_code=""
           for i in $(seq 1 30); do
             last_code=$(curl -s -o /dev/null -w '%{http_code}' \
-              -H "x-api-key: $API_KEY" "http://127.0.0.1:10080/1/version" || true)
+              -H "x-api-key: $API_KEY" "http://127.0.0.1:10080/version" || true)
             if [ "$last_code" = "200" ]; then
               echo "Fixture WebQuery reachable on :10080"
               break
             fi
             sleep 2
             if [ "$i" = "30" ]; then
-              echo "FAIL: WebQuery /1/version did not return 200 within 60s (last_code=$last_code)" >&2
+              echo "FAIL: WebQuery /version did not return 200 within 60s (last_code=$last_code)" >&2
               docker logs ts6-fixture
               exit 1
             fi
