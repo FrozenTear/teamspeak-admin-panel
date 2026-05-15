@@ -1177,3 +1177,79 @@
 }
 
 .muted { color: var(--text-muted); }
+
+/* ─── Admin user management (PURA-237) ───────────────────────────────── */
+/* Icon glyph paired with the colour + text label on every role / status
+ * badge — colour is never the sole differentiator (ui-brief §6). */
+.tag-icn {
+  font-size: var(--text-2xs);
+  line-height: 1;
+}
+/* Monospace cell for usernames + session family ids. */
+.user-username {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+}
+.user-ts {
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+/* Per-row action cluster — small ghost buttons, trailing-aligned. */
+.row-actions {
+  display: flex;
+  gap: var(--space-2);
+  justify-content: flex-end;
+}
+.row-actions .btn[disabled] {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.row-action-danger:not([disabled]):hover {
+  color: var(--danger-fg);
+}
+/* Password field: input + reveal / suggest / regenerate buttons in a row. */
+.password-row {
+  display: flex;
+  gap: var(--space-3);
+  align-items: center;
+}
+.password-row .input {
+  flex: 1 1 auto;
+  font-family: var(--font-mono);
+}
+.password-warning {
+  margin-top: var(--space-2);
+}
+/* Role radio group — one capability summary line per option. */
+.role-fieldset {
+  border: 0;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.role-option {
+  display: flex;
+  gap: var(--space-3);
+  align-items: flex-start;
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+}
+.role-option:hover {
+  background: var(--bg-hover);
+}
+.role-option-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.role-option-label {
+  font-weight: var(--weight-medium);
+}
+.role-option-summary {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+}

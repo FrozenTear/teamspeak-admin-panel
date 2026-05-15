@@ -20,10 +20,10 @@ use crate::ui::layout::AppShell;
 #[cfg(debug_assertions)]
 use crate::ui::pages::DevVideoPlayerPage;
 use crate::ui::pages::{
-    BansPage, BotDetailPage, BotsIndexPage, ChannelsPage, ClientsPage, DashboardPlaceholder, Home,
-    LoginPage, LogsPage, MusicLibraryPage, MusicPlaylistsPage, NotFoundPage, PublicWidgetPage,
-    RadioStationsPage, ServerEditPage, ServerInfoPage, ServersIndexPage, SettingsPage, SetupPage,
-    VideoSourcesPage, WidgetsPage,
+    AdminUsersPage, BansPage, BotDetailPage, BotsIndexPage, ChannelsPage, ClientsPage,
+    DashboardPlaceholder, Home, LoginPage, LogsPage, MusicLibraryPage, MusicPlaylistsPage,
+    NotFoundPage, PublicWidgetPage, RadioStationsPage, ServerEditPage, ServerInfoPage,
+    ServersIndexPage, SettingsPage, SetupPage, VideoSourcesPage, WidgetsPage,
 };
 
 #[rustfmt::skip]
@@ -116,6 +116,14 @@ pub enum Route {
     // the same `/settings` route.
     #[route("/settings")]
     SettingsPage {},
+
+    // PURA-237 — admin user management (list + create/edit modal + sessions
+    // pane). The sidebar hides this entry for non-admin sessions and the
+    // `/api/users` routes enforce `RequireAdmin` server-side; the page also
+    // renders an "Insufficient permissions" guard so a forged URL lands on
+    // a 403 surface rather than a doomed fetch loop.
+    #[route("/admin/users")]
+    AdminUsersPage {},
 
     // PURA-213 — catch-all NotFound. Lives outside `AppShell` so the page
     // renders for both authed and anon visitors without an auth bounce
