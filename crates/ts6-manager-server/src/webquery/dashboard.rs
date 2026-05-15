@@ -147,6 +147,18 @@ async fn handler(
         .await
         .map_err(translate_control_error)?;
 
+    // PURA-222 — bump `lastSeenAt` so the `/servers` index renders the
+    // operator's "last successful WebQuery probe" column truthfully. Fire-
+    // and-forget: the dashboard response shouldn't fail just because the
+    // bookkeeping write hiccuped, and we already hold a successful
+    // `dashboard` value so the operator-facing 200 is committed.
+    let db = state.db.clone();
+    tokio::spawn(async move {
+        if let Err(e) = server_connections::touch_last_seen(&db, config_id).await {
+            tracing::warn!(err = %e, config_id, "dashboard: touch_last_seen failed");
+        }
+    });
+
     Ok(Json(dashboard))
 }
 

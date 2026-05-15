@@ -46,7 +46,10 @@ const DEFAULT_SSH_PORT: i64 = 10022;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/servers", get(list).post(create))
-        .route("/api/servers/{id}", axum::routing::patch(patch_server))
+        .route(
+            "/api/servers/{id}",
+            axum::routing::patch(patch_server).delete(delete_server),
+        )
 }
 
 async fn list(
@@ -190,6 +193,45 @@ async fn patch_server(
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "server not found"))?;
 
     Ok(Json(server_summary_from_row(row)))
+}
+
+/// PURA-222 — `DELETE /api/servers/{id}`. Admin-only. Returns `204 No
+/// Content` on success, `404` when the row is missing. The
+/// `server_connection_cascade` event in `0001_baseline.surql` (and the
+/// `*_chapter4` / `*_video_source` follow-on events) wipe dependent rows;
+/// this handler also evicts the cached pool clients so the dashboard route
+/// surfaces "not found" immediately rather than continuing to dial the
+/// just-deleted upstream from a stale [`crate::webquery::WebQueryClient`] /
+/// [`crate::control::ControlBackend`].
+async fn delete_server(
+    State(state): State<AppState>,
+    RequireAdmin(_admin): RequireAdmin,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, Response> {
+    // Confirm the row exists first so we can return 404 truthfully — a bare
+    // DELETE on a missing record id silently no-ops on SurrealDB.
+    let existing = server_connections::find_by_id(&state.db, id)
+        .await
+        .map_err(|e| {
+            tracing::error!(err = %e, id, "delete_server: pre-check find_by_id failed");
+            internal()
+        })?;
+    if existing.is_none() {
+        return Err(err(StatusCode::NOT_FOUND, "server not found"));
+    }
+
+    server_connections::delete(&state.db, id).await.map_err(|e| {
+        tracing::error!(err = %e, id, "delete_server: repo delete failed");
+        internal()
+    })?;
+
+    // Evict the cached upstream clients so the next dashboard fetch (or any
+    // other per-server lookup) sees the row as gone instead of hitting a
+    // stale keep-alive socket against the just-deleted server.
+    state.webquery.remove(id).await;
+    state.control.remove(id).await;
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 fn err(status: StatusCode, body: &str) -> Response {
