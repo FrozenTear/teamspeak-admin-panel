@@ -107,6 +107,8 @@ mod tests {
             sidecar: None,
             ssrf_resolver: Arc::new(ts6_ssrf::MockResolver::new()),
             moq_public_url: None,
+        yt_cookie: std::sync::Arc::new(std::sync::RwLock::new(None)),
+        data_dir: std::path::PathBuf::from("./data"),
         }
     }
 

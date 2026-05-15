@@ -26,6 +26,7 @@ use ts6_manager_shared::servers::ServerSummary;
 use crate::client::api::ApiError;
 use crate::client::dioxus::use_session;
 use crate::client::storage::Storage;
+use crate::client::store::AuthState;
 use crate::client::ui_prefs::{
     clear_selected_server_id, load_selected_server_id, save_selected_server_id,
 };
@@ -34,6 +35,7 @@ use crate::ui::components::dropdown::{
     MenuSection,
 };
 use crate::ui::layout::{ServersContext, ServersData, use_servers_context};
+use crate::ui::routes::Route;
 
 /// Filter is hidden until the list grows past this many entries. Spec
 /// §13.4 ("Filter input (when used)") and §13.11 ("MenuFilter shown only
@@ -250,15 +252,78 @@ pub fn ServerSelector(
 
                     MenuDivider {}
                     MenuFooter {
-                        a {
-                            class: "btn btn-secondary btn-sm",
-                            href: "/servers",
-                            "Manage servers…"
-                        }
+                        { match &data_snap {
+                            // PURA-225 — when the list fetch was an
+                            // Unauthorized envelope the operator has no
+                            // session left, so a link to /servers (which
+                            // would render the same 401 banner) is the
+                            // wrong affordance. Replace the footer with a
+                            // sign-in escape so the dropdown is a usable
+                            // exit from every authed surface, not just
+                            // /servers.
+                            ServersData::Error(err) if err.is_unauthorized() => rsx! {
+                                SignInAgainMenuButton {}
+                            },
+                            _ => rsx! {
+                                a {
+                                    class: "btn btn-secondary btn-sm",
+                                    href: "/servers",
+                                    "Manage servers…"
+                                }
+                            },
+                        } }
                     }
                 }
             }
         }
+    }
+}
+
+/// PURA-225 — sign-in escape rendered inside the server selector's footer
+/// when the `/api/servers` fetch was a 401. Mirrors the `SignInAgainButton`
+/// on the `/servers` page so an operator who hits the trap on any other
+/// authed surface (where the only visible 401 affordance is the dropdown's
+/// "Servers unavailable" pill) still has a one-click path back to `/login`.
+#[allow(non_snake_case)]
+#[component]
+fn SignInAgainMenuButton() -> Element {
+    let session = use_session();
+    let nav = use_navigator();
+    let on_click = move |_| {
+        let next = current_authed_path();
+        session.replace(AuthState::Anonymous);
+        nav.replace(Route::LoginPage { next: Some(next) });
+    };
+    rsx! {
+        button {
+            r#type: "button",
+            class: "btn btn-primary btn-sm",
+            onclick: on_click,
+            "Sign in again"
+        }
+    }
+}
+
+/// Same fallback as the page-level CTA — capture the current path on WASM
+/// so `?next=` round-trips through the login screen.
+fn current_authed_path() -> String {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(window) = web_sys::window() {
+            let loc = window.location();
+            let mut out = loc.pathname().unwrap_or_else(|_| "/".into());
+            if let Ok(search) = loc.search()
+                && !search.is_empty()
+            {
+                out.push_str(&search);
+            }
+            return out;
+        }
+        "/".into()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        "/".into()
     }
 }
 

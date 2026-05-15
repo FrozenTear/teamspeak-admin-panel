@@ -170,7 +170,7 @@ async fn build_source(
             Ok(Box::new(src))
         }
         AudioSourceSpec::YtDlp { url } => {
-            let src = YtDlpSource::new(&url, cfg.channels)
+            let src = YtDlpSource::new(&url, cfg.channels, cfg.yt_cookie_file.as_deref())
                 .await
                 .map_err(|e| PipelineError::Source(format!("yt-dlp spawn: {e}")))?;
             Ok(Box::new(src))

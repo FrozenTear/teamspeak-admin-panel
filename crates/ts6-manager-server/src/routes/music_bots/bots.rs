@@ -126,7 +126,7 @@ async fn create(
         config = config.with_auto_connect(auto);
     }
 
-    let id = supervisor.spawn(config).await;
+    let id = supervisor.spawn(config, state.yt_cookie.clone()).await;
     state.music_bots.watch(id).await;
     info!(bot = %id, name = %req.name, "music-bot created");
 

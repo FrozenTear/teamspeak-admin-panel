@@ -18,7 +18,8 @@
 //! `tsclientlib` upstream API and the existing `ts6-voice-prototype`
 //! event-handling pattern only.
 
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -50,12 +51,17 @@ use crate::store::{MusicBotStore, StoreError, Track, TrackId};
 
 /// Run the bot actor to completion. Exits when a `Shutdown` command has
 /// been processed and the disconnect has flushed.
+///
+/// `yt_cookie` is a live-updated cookie-file path (PURA-223). The actor
+/// reads the current value each time it starts a new yt-dlp pipeline so
+/// a UI-uploaded cookie takes effect on the next track without a restart.
 pub(crate) async fn run_bot(
     bot_id: BotId,
     config: BotConfig,
     store: Arc<dyn MusicBotStore>,
     mut rx: mpsc::Receiver<BotCommand>,
     events: broadcast::Sender<BotEvent>,
+    yt_cookie: Arc<RwLock<Option<PathBuf>>>,
 ) {
     let span = tracing::info_span!("music_bot", bot_id = %bot_id, name = %config.name);
     let _enter = span.enter();
@@ -133,6 +139,7 @@ pub(crate) async fn run_bot(
                             &events,
                             bot_id,
                             &store,
+                            Arc::clone(&yt_cookie),
                         )
                         .await;
                         match outcome {
@@ -252,6 +259,7 @@ async fn run_connected_loop(
     events: &broadcast::Sender<BotEvent>,
     bot_id: BotId,
     store: &Arc<dyn MusicBotStore>,
+    yt_cookie: Arc<RwLock<Option<PathBuf>>>,
 ) -> ConnectedExit {
     // PURA-154 — `current_audio` is `Some` while a pipeline is spawned.
     // The connected loop is the sole owner: the actor's lifecycle owns
@@ -299,6 +307,7 @@ async fn run_connected_loop(
                     bot_id,
                     store,
                     events,
+                    &yt_cookie,
                 ).await;
             },
             cmd = rx.recv() => match cmd {
@@ -350,6 +359,7 @@ async fn run_connected_loop(
                         bot_id,
                         store,
                         events,
+                        &yt_cookie,
                     ).await;
                 }
                 Some(BotCommand::Queue(qc)) => {
@@ -369,6 +379,7 @@ async fn handle_audio_msg(
     bot_id: BotId,
     store: &Arc<dyn MusicBotStore>,
     events: &broadcast::Sender<BotEvent>,
+    yt_cookie: &Arc<RwLock<Option<PathBuf>>>,
 ) {
     let Some(msg) = msg else {
         // Sibling closed without sending Finished — treat as a hard stop.
@@ -441,7 +452,7 @@ async fn handle_audio_msg(
             }
             audio::tear_down(current_audio);
             handle_queue_command(bot_id, store, QueueCommand::Advance, events).await;
-            if !auto_start_pending_track(current_audio, store, bot_id, events).await {
+            if !auto_start_pending_track(current_audio, store, bot_id, events, yt_cookie).await {
                 let _ = events.send(BotEvent::AudioFinished {
                     reason: "end_of_stream".into(),
                 });
@@ -460,6 +471,7 @@ async fn handle_audio_command(
     bot_id: BotId,
     store: &Arc<dyn MusicBotStore>,
     events: &broadcast::Sender<BotEvent>,
+    yt_cookie: &Arc<RwLock<Option<PathBuf>>>,
 ) {
     match cmd {
         AudioCommand::Play { source } => {
@@ -471,8 +483,11 @@ async fn handle_audio_command(
             // PURA-190: emit at info-level so operators bisecting "did
             // Play even reach the supervisor?" can answer it with a
             // single grep against manager logs without enabling debug.
+            // PURA-223 — read the current cookie path at play-time so a
+            // UI-uploaded cookie takes effect without a manager restart.
+            let cookie = yt_cookie.read().unwrap().clone();
             info!(?source, "AudioCommand::Play — spawning pipeline");
-            if let Err(err) = audio::start_pipeline(current_audio, &source).await {
+            if let Err(err) = audio::start_pipeline(current_audio, &source, cookie).await {
                 warn!(?err, "audio pipeline spawn failed");
                 let _ = events.send(BotEvent::Error(BotError::Internal(format!(
                     "audio pipeline spawn: {err}"
@@ -528,7 +543,7 @@ async fn handle_audio_command(
             let _ = events.send(BotEvent::AudioFinished {
                 reason: "skipped".into(),
             });
-            auto_start_pending_track(current_audio, store, bot_id, events).await;
+            auto_start_pending_track(current_audio, store, bot_id, events, yt_cookie).await;
         }
         // SkipPrev / SetVolume / NowPlaying don't have pipeline support
         // yet — leave them on the stub path so REST/UI subscribers see
@@ -546,6 +561,7 @@ async fn auto_start_pending_track(
     store: &Arc<dyn MusicBotStore>,
     bot_id: BotId,
     events: &broadcast::Sender<BotEvent>,
+    yt_cookie: &Arc<RwLock<Option<PathBuf>>>,
 ) -> bool {
     if current_audio.is_some() {
         return false;
@@ -558,7 +574,8 @@ async fn auto_start_pending_track(
             return false;
         }
     };
-    if let Err(err) = audio::start_pipeline(current_audio, &next.source).await {
+    let cookie = yt_cookie.read().unwrap().clone();
+    if let Err(err) = audio::start_pipeline(current_audio, &next.source, cookie).await {
         warn!(?err, "auto-start audio pipeline failed");
         let _ = events.send(BotEvent::Error(BotError::Internal(format!(
             "audio pipeline spawn: {err}"

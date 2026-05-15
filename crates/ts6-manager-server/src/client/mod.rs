@@ -32,6 +32,7 @@ pub mod dioxus;
 pub mod music_bots;
 pub mod servers;
 pub mod session;
+pub mod settings;
 pub mod setup;
 pub mod storage;
 pub mod store;

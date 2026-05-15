@@ -145,7 +145,13 @@ impl RefreshGate {
     ///   us forge a bearer.
     /// - On `Unauthorized(INVALID_TOKEN)` from `f`, take the lock, possibly
     ///   refresh, replay `f` once. Replay failure terminates the session.
-    /// - On any other error, propagate without touching the session.
+    /// - On any other 401 from `f` (`NO_TOKEN` / `USER_DISABLED`), invalidate
+    ///   the session before propagating. A refresh cannot rescue these
+    ///   sub-codes (the user is disabled / the bearer never made it to the
+    ///   server) — leaving the session `Authenticated` strands the operator
+    ///   on a "Session expired" banner with no path back to `/login`
+    ///   ([PURA-225](/PURA/issues/PURA-225)).
+    /// - On any non-401 error, propagate without touching the session.
     pub async fn run<F, Fut, T>(&self, mut f: F) -> Result<T, AuthError>
     where
         F: FnMut(SessionSnapshot) -> Fut,
@@ -165,6 +171,18 @@ impl RefreshGate {
             Err(e) => e,
         };
         if !first_err.is_invalid_or_expired_token() {
+            // PURA-225 — A 401 whose body is not `INVALID_TOKEN`
+            // (`NO_TOKEN`, `USER_DISABLED`, or an empty/unknown body) means
+            // a refresh cannot help: the bearer never reached the
+            // extractor, or the user row is disabled, or the upstream is
+            // emitting a 401 envelope the gate doesn't recognise. In every
+            // such case the session is unrecoverable on this device, so
+            // invalidate immediately. The route layer's auth-gate effect
+            // then bounces to `/login` instead of leaving the operator on
+            // a banner-with-no-CTA. Non-401 errors fall through unchanged.
+            if first_err.is_unauthorized() {
+                self.session.invalidate();
+            }
             return Err(first_err);
         }
 
@@ -182,8 +200,17 @@ impl RefreshGate {
         };
         if after_lock.access != first_access {
             // Another caller already rotated — skip refresh, replay with
-            // the fresh access token.
-            return f(after_lock).await;
+            // the fresh access token. PURA-225 — a 401 on the replay means
+            // even the freshly rotated access token was rejected; that is
+            // a session-killing signal regardless of sub-code, so kill it
+            // before returning so the route layer can bounce.
+            let result = f(after_lock).await;
+            if let Err(e) = &result
+                && e.is_unauthorized()
+            {
+                self.session.invalidate();
+            }
+            return result;
         }
 
         // We are the rotator. Issue the refresh once.
@@ -196,7 +223,19 @@ impl RefreshGate {
                     refresh: pair.refresh_token,
                     user: after_lock.user,
                 };
-                f(replay).await
+                // PURA-225 — same defense-in-depth as the parallel-rotator
+                // branch: if the replay (with a brand-new access token)
+                // still 401s, the session is dead at the server. Invalidate
+                // so AppShell bounces instead of looping `data 401 →
+                // refresh → replay 401 → propagate Unauthorized → stuck
+                // banner` on every render.
+                let result = f(replay).await;
+                if let Err(e) = &result
+                    && e.is_unauthorized()
+                {
+                    self.session.invalidate();
+                }
+                result
             }
             Err(e) => {
                 // PURA-214 — only 401 on the refresh response means the
@@ -660,5 +699,164 @@ mod tests {
             AuthState::Authenticated { access, .. } => assert_eq!(access, "fresh-access"),
             _ => panic!("session should be authenticated after burst"),
         }
+    }
+
+    /// PURA-225 regression — when the data endpoint returns a 401 whose
+    /// body is `USER_DISABLED` or `NO_TOKEN` (anything except the spec
+    /// [`msg::INVALID_TOKEN`] envelope), refresh cannot help: the session
+    /// is unrecoverable on this device. The gate MUST invalidate the
+    /// session before propagating so the route layer's auth-gate effect
+    /// bounces the operator to `/login`.
+    ///
+    /// Before the fix the gate propagated the error verbatim and left the
+    /// session `Authenticated`, stranding the operator on a "Session
+    /// expired" banner with no path forward.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn non_invalid_token_data_401_invalidates_session() {
+        use ts6_manager_shared::auth::auth_error_strings as msg;
+
+        for body in [msg::USER_DISABLED, msg::NO_TOKEN] {
+            let storage = arc_storage(MemoryStore::new());
+            let session: Arc<dyn SessionHandle> =
+                Arc::new(InMemorySession::new(authed("ax", "rx"), storage.clone()));
+            let stub = StubRefresh::new(|_| panic!("must not refresh on non-INVALID_TOKEN 401"));
+            let gate = RefreshGate::new(session.clone(), stub.clone());
+
+            let err = gate
+                .run(|_| {
+                    let body = body.to_owned();
+                    async move { Err::<u32, _>(AuthError::Unauthorized(body)) }
+                })
+                .await
+                .unwrap_err();
+            assert!(err.is_unauthorized());
+            assert!(
+                !err.is_invalid_or_expired_token(),
+                "test contract: body must not be INVALID_TOKEN, got: {err}"
+            );
+            assert_eq!(stub.calls(), 0, "refresh must not fire for {body}");
+            // Critical invariant added by PURA-225 — these sub-codes are
+            // session-killing.
+            assert_eq!(
+                session.read(),
+                AuthState::Anonymous,
+                "401 with body `{body}` must invalidate the session"
+            );
+            assert!(
+                storage
+                    .get(crate::client::store::SESSION_STORAGE_KEY)
+                    .is_none(),
+                "persisted session blob must be cleared on session-killing 401"
+            );
+        }
+    }
+
+    /// PURA-225 — non-401 errors keep the session alive (regression guard
+    /// for the same fix above). A 4xx or 5xx from a data endpoint is not a
+    /// session-killing signal; only `is_unauthorized()` is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn non_401_data_errors_do_not_invalidate_session() {
+        let storage = arc_storage(MemoryStore::new());
+        let session: Arc<dyn SessionHandle> =
+            Arc::new(InMemorySession::new(authed("ax", "rx"), storage.clone()));
+        let stub = StubRefresh::new(|_| panic!("must not refresh on non-401"));
+        let gate = RefreshGate::new(session.clone(), stub.clone());
+
+        for err_fixture in [
+            AuthError::Server {
+                status: 500,
+                message: "boom".into(),
+            },
+            AuthError::Server {
+                status: 502,
+                message: "Bad Gateway".into(),
+            },
+            AuthError::Client {
+                status: 400,
+                message: "bad request".into(),
+            },
+            AuthError::Transport("network down".into()),
+        ] {
+            let err_template = err_fixture.clone();
+            let err = gate
+                .run(|_| {
+                    let err = err_template.clone();
+                    async move { Err::<u32, _>(err) }
+                })
+                .await
+                .unwrap_err();
+            assert!(
+                !err.is_unauthorized(),
+                "fixture must not be a 401: {err_fixture:?}"
+            );
+            assert!(
+                session.read().is_authenticated(),
+                "non-401 error must NOT invalidate the session: {err_fixture:?}"
+            );
+        }
+    }
+
+    /// PURA-225 — after a successful refresh, if the replayed data call
+    /// still returns 401, the session is dead at the server (the refresh
+    /// produced a token the upstream immediately rejects). Invalidate so
+    /// AppShell bounces, instead of looping `data 401 → refresh ok →
+    /// replay 401 → stuck banner` on every subsequent render.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn replay_401_after_successful_refresh_invalidates_session() {
+        use ts6_manager_shared::auth::auth_error_strings as msg;
+
+        let storage = arc_storage(MemoryStore::new());
+        let session: Arc<dyn SessionHandle> = Arc::new(InMemorySession::new(
+            authed("old-access", "old-refresh"),
+            storage.clone(),
+        ));
+        let stub = StubRefresh::new(|n| {
+            assert_eq!(n, 1, "exactly one refresh expected");
+            Ok(TokenPairResponse {
+                access_token: "fresh-access".into(),
+                refresh_token: "fresh-refresh".into(),
+            })
+        });
+        let gate = RefreshGate::new(session.clone(), stub.clone());
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_clone = calls.clone();
+        let err = gate
+            .run(move |snap| {
+                let calls = calls_clone.clone();
+                async move {
+                    let n = calls.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        assert_eq!(snap.access, "old-access");
+                        Err(AuthError::Unauthorized(msg::INVALID_TOKEN.into()))
+                    } else {
+                        // Replay with the rotated token also 401s — even
+                        // INVALID_TOKEN here is a session-killing signal
+                        // because we just rotated; the server rejects the
+                        // fresh token, so the family is dead.
+                        assert_eq!(snap.access, "fresh-access");
+                        Err::<u32, _>(AuthError::Unauthorized(msg::INVALID_TOKEN.into()))
+                    }
+                }
+            })
+            .await
+            .unwrap_err();
+        assert!(err.is_unauthorized());
+        assert_eq!(stub.calls(), 1, "exactly one refresh — never loop");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "initial + one replay, never a second refresh"
+        );
+        assert_eq!(
+            session.read(),
+            AuthState::Anonymous,
+            "post-refresh replay 401 must invalidate the session"
+        );
+        assert!(
+            storage
+                .get(crate::client::store::SESSION_STORAGE_KEY)
+                .is_none(),
+        );
     }
 }

@@ -5,7 +5,8 @@
 //! caller. WS-3+ may grow it (per-bot persistence, restart policy, etc).
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::{Mutex, broadcast, mpsc};
@@ -33,7 +34,16 @@ const COMMAND_BUFFER: usize = 16;
 /// `store` is the `MusicBotStore` the actor uses for queue / playlist /
 /// library state — see [`InMemoryMusicBotStore`] for a default; WS-5
 /// will ship the SurrealDB-backed impl in `ts6-manager-server`.
-pub fn spawn_bot(id: BotId, config: BotConfig, store: Arc<dyn MusicBotStore>) -> BotHandle {
+///
+/// `yt_cookie` is the live-updated cookie-file path (PURA-223). The bot
+/// actor reads it at track-play time so UI uploads take effect without a
+/// manager restart. Pass `Arc::new(RwLock::new(None))` to disable cookies.
+pub fn spawn_bot(
+    id: BotId,
+    config: BotConfig,
+    store: Arc<dyn MusicBotStore>,
+    yt_cookie: Arc<RwLock<Option<PathBuf>>>,
+) -> BotHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_BUFFER);
     let (event_tx, _) = broadcast::channel(config.event_buffer.max(1));
     let event_tx_for_actor = event_tx.clone();
@@ -46,6 +56,7 @@ pub fn spawn_bot(id: BotId, config: BotConfig, store: Arc<dyn MusicBotStore>) ->
             store_for_actor,
             cmd_rx,
             event_tx_for_actor,
+            yt_cookie,
         )
         .await;
     });
@@ -176,10 +187,13 @@ impl BotSupervisor {
     /// the caller dropping its copy, which is what callers want when
     /// the bot is owned by the long-lived service rather than a
     /// request handler.
-    pub async fn spawn(&self, config: BotConfig) -> BotId {
+    ///
+    /// `yt_cookie` is the live-updated cookie-file path (PURA-223).
+    /// The caller typically passes `AppState::yt_cookie.clone()`.
+    pub async fn spawn(&self, config: BotConfig, yt_cookie: Arc<RwLock<Option<PathBuf>>>) -> BotId {
         let id = BotId(self.next_id.fetch_add(1, Ordering::Relaxed));
         let name = config.name.clone();
-        let handle = spawn_bot(id, config, Arc::clone(&self.store));
+        let handle = spawn_bot(id, config, Arc::clone(&self.store), yt_cookie);
         self.bots.lock().await.insert(id, handle);
         info!(%id, %name, "spawned bot");
         id

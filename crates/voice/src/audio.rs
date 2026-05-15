@@ -19,6 +19,7 @@
 //! 4. Dropping [`ActiveAudio`] aborts both the sibling and the pipeline
 //!    worker — clean teardown on `Stop` / `SkipNext` / `Play(replace)`.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use tokio::sync::{broadcast, mpsc, watch};
@@ -175,6 +176,7 @@ fn parse_synthetic_url(url: &str) -> SyntheticParams {
 pub(crate) async fn start_pipeline(
     current: &mut Option<ActiveAudio>,
     source: &AudioSource,
+    yt_cookie_file: Option<PathBuf>,
 ) -> Result<String, PipelineError> {
     // Drop the previous pipeline first. `Option::take` here so the old
     // `ActiveAudio`'s `Drop` runs before we spawn the replacement — the
@@ -183,7 +185,10 @@ pub(crate) async fn start_pipeline(
     *current = None;
 
     let (spec, label) = source_to_spec(source);
-    let cfg = PipelineConfig::default();
+    let cfg = PipelineConfig {
+        yt_cookie_file,
+        ..PipelineConfig::default()
+    };
     debug!(label = %label, ?cfg, "spawning audio pipeline");
     let mut pipeline = AudioPipeline::spawn(spec, cfg).await?;
     let frames_rx = pipeline.take_frames();

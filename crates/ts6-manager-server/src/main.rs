@@ -131,6 +131,18 @@ mod server_entry {
         let serve_cfg = ServeConfig::new();
         let state = app_state::AppState::from_config(&cfg, database.clone());
 
+        // PURA-223 — if a previous run uploaded a cookie via the UI, the
+        // path was persisted to `app_setting:yt_cookie_path`. Prefer that
+        // over the env-var-sourced boot value so UI uploads survive restarts.
+        if let Ok(Some(row)) =
+            crate::repos::app_settings::get(&database, "yt_cookie_path").await
+        {
+            let db_path = std::path::PathBuf::from(&row.value);
+            if db_path.exists() {
+                *state.yt_cookie.write().unwrap() = Some(db_path);
+            }
+        }
+
         // PURA-81 — periodic dashboard tick republisher. Spawns one
         // worker per enabled `server_connection`; each pushes a
         // `dashboard:tick` envelope onto the WS hub every 5 s. The
@@ -218,6 +230,9 @@ mod server_entry {
         // PURA-82 — `/metrics` Prometheus exposition for the WS hub.
         // Admin-JWT gated; see the route module for the auth-gate rationale.
         let metrics_router = routes::metrics::router().with_state(state.clone());
+        // PURA-223 — `/api/settings/youtube-cookies` cookie-file management.
+        // Admin-JWT gated so only operators can upload or delete the file.
+        let settings_router = routes::settings::router().with_state(state.clone());
         // PURA-123 WS-5 — music-bot REST surface (`/api/music-bots`,
         // `/api/music-library`, `/api/playlists`, `/api/radio-stations`,
         // `/api/music-requests`). Auth via the same `RequireAuth`
@@ -274,6 +289,8 @@ mod server_entry {
             .merge(video_sources_router)
             // PURA-82 — Prometheus metrics endpoint for the WS hub.
             .merge(metrics_router)
+            // PURA-223 — YouTube cookie file management.
+            .merge(settings_router)
             // PURA-123 — music-bot REST surface.
             .merge(music_bots_router)
             // PURA-72 — public widget endpoints (`/api/widget/{token}/...`).

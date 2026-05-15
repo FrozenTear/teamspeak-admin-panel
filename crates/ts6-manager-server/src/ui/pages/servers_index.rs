@@ -39,6 +39,7 @@ use crate::client::dioxus::use_session;
 use crate::client::store::AuthState;
 use crate::ui::components::{Banner, BannerVariant};
 use crate::ui::layout::{ServersData, use_servers_context};
+use crate::ui::routes::Route;
 
 #[component]
 pub fn ServersIndexPage() -> Element {
@@ -105,10 +106,69 @@ struct ServersIndexErrorProps {
 #[component]
 fn ServersIndexError(props: ServersIndexErrorProps) -> Element {
     let (title, body) = error_copy(&props.error);
+    let show_signin_cta = props.error.is_unauthorized();
     rsx! {
         Banner { variant: BannerVariant::Danger, title: title.to_string(),
             "{body}"
+            if show_signin_cta {
+                div { class: "banner-actions",
+                    SignInAgainButton {}
+                }
+            }
         }
+    }
+}
+
+/// PURA-225 — escape-hatch CTA rendered next to any 401 banner on an
+/// authenticated surface. Clears the persisted session and navigates to
+/// `/login` so an operator whose access token is expired but whose refresh
+/// path is wedged (transient 5xx / proxy strip / unknown 401 sub-code) has
+/// a one-click path back to a working state instead of being stranded on
+/// "Session expired" with no affordance. AppShell's auth-gate effect will
+/// also fire on the signal flip, but the explicit `nav.replace` removes
+/// the dependency on whether `use_effect` re-runs on the same render.
+#[component]
+fn SignInAgainButton() -> Element {
+    let session = use_session();
+    let nav = use_navigator();
+    let on_click = move |_| {
+        let next = current_authed_path();
+        session.replace(AuthState::Anonymous);
+        nav.replace(Route::LoginPage { next: Some(next) });
+    };
+    rsx! {
+        button {
+            r#type: "button",
+            class: "btn btn-primary",
+            onclick: on_click,
+            "Sign in again"
+        }
+    }
+}
+
+/// Best-effort `?next=` capture for the sign-in-again handler. On WASM we
+/// read `window.location.pathname + search`; on SSR (where this never
+/// actually fires from a user click) we fall back to `/servers`. The
+/// global `current_path()` in `ui::layout` is module-private so this
+/// duplicates the minimal slice we need.
+fn current_authed_path() -> String {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(window) = web_sys::window() {
+            let loc = window.location();
+            let mut out = loc.pathname().unwrap_or_else(|_| "/".into());
+            if let Ok(search) = loc.search()
+                && !search.is_empty()
+            {
+                out.push_str(&search);
+            }
+            return out;
+        }
+        "/".into()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        "/servers".into()
     }
 }
 
@@ -282,32 +342,57 @@ mod tests {
 
     // ── SSR markup contract ────────────────────────────────────────────────
 
-    fn render_with_state(data: ServersData) -> String {
-        #[component]
-        fn Harness(initial: ServersData) -> Element {
-            let session = use_context_provider(|| DioxusSession {
-                state: SyncSignal::new_maybe_sync(AuthState::Authenticated {
-                    access: "stub-access".into(),
-                    refresh: "stub-refresh".into(),
-                    user: UserInfo {
-                        id: 1,
-                        username: "rsoot".into(),
-                        display_name: "Robert Soot".into(),
-                        role: "admin".into(),
-                    },
-                }),
-                storage: Arc::new(MemoryStore::new()),
-            });
-            use_context_provider(|| provide_auth_gate(session));
-            use_context_provider(|| ServersContext {
-                data: Signal::new(initial.clone()),
-            });
-            rsx! { ServersIndexPage {} }
-        }
+    /// Synthetic single-route Router so [`ServersIndexPage`] (and the
+    /// PURA-225 `SignInAgainButton` inside its 401 banner) can call
+    /// `use_navigator()` during SSR without panicking. The production
+    /// `Route::ServersIndexPage` lives under `#[layout(AppShell)]` which
+    /// would pull in the whole chrome; the test only needs the navigator
+    /// context, so we mount a stand-in enum with the same route shape.
+    #[derive(Clone, Routable, Debug, PartialEq)]
+    #[rustfmt::skip]
+    enum ServersIndexTestRoute {
+        #[route("/")]
+        TestHarness {},
+    }
 
-        let mut dom = VirtualDom::new_with_props(Harness, HarnessProps { initial: data });
+    thread_local! {
+        static TEST_DATA: std::cell::RefCell<Option<ServersData>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    #[component]
+    #[allow(non_snake_case)]
+    fn TestHarness() -> Element {
+        let session = use_context_provider(|| DioxusSession {
+            state: SyncSignal::new_maybe_sync(AuthState::Authenticated {
+                access: "stub-access".into(),
+                refresh: "stub-refresh".into(),
+                user: UserInfo {
+                    id: 1,
+                    username: "rsoot".into(),
+                    display_name: "Robert Soot".into(),
+                    role: "admin".into(),
+                },
+            }),
+            storage: Arc::new(MemoryStore::new()),
+        });
+        use_context_provider(|| provide_auth_gate(session));
+        let data = TEST_DATA
+            .with(|d| d.borrow().clone())
+            .unwrap_or(ServersData::Loading);
+        use_context_provider(|| ServersContext {
+            data: Signal::new(data),
+        });
+        rsx! { ServersIndexPage {} }
+    }
+
+    fn render_with_state(data: ServersData) -> String {
+        TEST_DATA.with(|d| *d.borrow_mut() = Some(data));
+        let mut dom = VirtualDom::new(|| rsx! { Router::<ServersIndexTestRoute> {} });
         dom.rebuild_in_place();
-        dioxus_ssr::render(&dom)
+        let html = dioxus_ssr::render(&dom);
+        TEST_DATA.with(|d| *d.borrow_mut() = None);
+        html
     }
 
     #[test]
@@ -363,5 +448,51 @@ mod tests {
             "danger banner expected for error state: {html}"
         );
         assert!(html.contains("connection refused"));
+    }
+
+    /// PURA-225 — when the `/api/servers` fetch is a 401, the danger
+    /// banner MUST surface a primary "Sign in again" CTA so the operator
+    /// has a one-click escape from the stuck-with-banner state. Asserting
+    /// the literal label + a primary-button class pins the affordance so
+    /// a future banner refactor that drops the CTA flags as a regression.
+    #[test]
+    fn unauthorized_error_state_renders_sign_in_again_cta() {
+        let html = render_with_state(ServersData::Error(ApiError::Unauthorized(
+            "Invalid or expired token".into(),
+        )));
+        assert!(
+            html.contains("Sign in again"),
+            "401 banner must include a `Sign in again` CTA: {html}"
+        );
+        assert!(
+            html.contains("btn-primary"),
+            "CTA must render as a primary button so it's the obvious next \
+             action, not an inline link inside the body copy: {html}"
+        );
+    }
+
+    /// PURA-225 — non-401 error states (transport / 5xx / 502) MUST NOT
+    /// render the sign-in CTA. Those are recoverable on retry and showing
+    /// "Sign in again" would mislead the operator into logging out for a
+    /// transient backend hiccup.
+    #[test]
+    fn non_unauthorized_error_state_omits_sign_in_again_cta() {
+        for err in [
+            ApiError::Transport("connection refused".into()),
+            ApiError::Server {
+                status: 502,
+                message: "bad gateway".into(),
+            },
+            ApiError::Server {
+                status: 500,
+                message: "boom".into(),
+            },
+        ] {
+            let html = render_with_state(ServersData::Error(err.clone()));
+            assert!(
+                !html.contains("Sign in again"),
+                "non-401 error {err:?} must NOT render the sign-in CTA: {html}"
+            );
+        }
     }
 }

@@ -23,6 +23,7 @@ const DEFAULT_DATABASE_URL: &str = "surrealkv://./data/db";
 pub const DEFAULT_DB_NAMESPACE: &str = "ts6";
 pub const DEFAULT_DB_NAME: &str = "ts6_manager";
 const DEFAULT_MUSIC_DIR: &str = "/data/music";
+const DEFAULT_DATA_DIR: &str = "./data";
 const DEFAULT_FRONTEND_URL_DEV: &str = "http://localhost:5173";
 const DEFAULT_FRONTEND_URL_PROD: &str = "http://localhost:3000";
 const DEFAULT_ACCESS_EXPIRY: &str = "15m";
@@ -87,6 +88,9 @@ pub struct Config {
     /// connection.
     pub moq_public_url: Option<String>,
     pub yt_cookie_file: Option<PathBuf>,
+    /// PURA-223 — base directory for operator-uploaded files.
+    /// Defaults to `./data`. Cookie file is written as `<data_dir>/yt-cookies.txt`.
+    pub data_dir: PathBuf,
     pub ts_allow_self_signed: bool,
     /// PURA-100 — opt-in trust-on-first-use for SSHBridge host keys.
     /// Default `false`. When `true`, the SSH transport's host-key
@@ -167,6 +171,7 @@ impl Config {
         let sidecar_binary_path = optional_env("SIDECAR_BINARY_PATH").map(PathBuf::from);
         let moq_public_url = optional_env("MOQ_PUBLIC_URL");
         let yt_cookie_file = optional_env("YT_COOKIE_FILE").map(PathBuf::from);
+        let data_dir = PathBuf::from(env_or("DATA_DIR", DEFAULT_DATA_DIR));
 
         let ts_allow_self_signed = parse_bool_flag("TS_ALLOW_SELF_SIGNED");
         let ssh_tofu = parse_bool_flag("TS_SSH_TOFU");
@@ -203,6 +208,7 @@ impl Config {
             sidecar_binary_path,
             moq_public_url,
             yt_cookie_file,
+            data_dir,
             ts_allow_self_signed,
             ssh_tofu,
             ssh_known_hosts_path,
