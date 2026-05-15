@@ -31,10 +31,13 @@
 #![allow(dead_code, unused_imports)]
 
 pub mod engine;
+pub mod routes;
 pub mod trigger;
 
 #[cfg(test)]
 mod engine_tests;
+#[cfg(test)]
+mod routes_tests;
 
 pub use engine::{
     ActionContext, ActionDispatcher, ActionOutcome, BasicDispatcher, EngineDeps, FireError,
