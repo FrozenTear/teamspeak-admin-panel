@@ -1,11 +1,10 @@
 //! Top-level admin-audit writer per `docs/admin/audit-shape.md` §4.
 //!
-//! Eight admin-mutating routes in [`crate::routes::users`] call
-//! [`record`] **after** the mutation has committed. The writer applies
-//! the `requestUserAgent` truncation cap inline (additional `payload`
-//! and `errorMsg` caps happen at the persistence boundary inside
-//! [`crate::repos::admin_audit_log`]) and inserts via
-//! [`crate::repos::admin_audit_log::insert`].
+//! Every admin-mutating route calls [`record`] **after** the mutation
+//! has committed. [`record`] applies the §2.3 credential hard-blocklist
+//! (see [`redaction`]) to the payload, then inserts via
+//! [`crate::repos::admin_audit_log::insert`] — which applies the §2.3
+//! size caps (`payload` 2 KiB, `errorMsg`, `requestUserAgent`).
 //!
 //! Failure posture mirrors the SSH-audit precedent (PURA-79):
 //! `tracing::warn!`-on-failure, never propagate to the caller, never
@@ -13,14 +12,21 @@
 //! user-facing one — the user mutation already committed and the
 //! response is on its way.
 //!
-//! Scope split with PURA-236:
-//! - PURA-235 (this file + [`crate::routes::users`]) — writer + the
-//!   eight v1.1 admin routes that emit events.
-//! - PURA-236 — the same writer extended with the hard-blocklist
-//!   `debug_assert!` (mirroring [`crate::repos::ssh_audit_log`]'s
-//!   credential-token denylist), the retention janitor, and write
-//!   hooks on every *other* mutating route (`/api/auth/password`,
-//!   `/api/setup/init`, server CRUD, etc.).
+//! Scope history (PURA-235 + PURA-236, both A-* siblings of PURA-228):
+//! - PURA-235 — this writer + the eight `/api/users*` routes that emit
+//!   events (`userCreated`/`userPatched`/`userDisabled`/`userEnabled`/
+//!   `userRoleChanged`/`userPasswordReset`/`userDeleted`/`sessionRevoked`).
+//! - PURA-236 — the [`redaction`] credential hard-blocklist wired into
+//!   [`record`], the [`retention`] janitor (§3), and the remaining two
+//!   route hooks: `selfPasswordChanged` (`PUT /api/auth/password`) and
+//!   `setupCompleted` (`POST /api/setup/init`). Server-connection and
+//!   direct-WebQuery audit are explicitly **v1.2** per audit-shape.md
+//!   §2.1 — not wired here.
+
+// PURA-236 submodules: the §2.3 credential hard-blocklist applied inside
+// [`record`], and the retention janitor (§3) spawned at server boot.
+pub mod redaction;
+pub mod retention;
 
 use crate::auth::extractors::{AuthUser, RequestMeta};
 use crate::db::Database;
@@ -131,6 +137,15 @@ pub struct Event {
 /// a hot path that gates the user response — they typically call this
 /// right before returning the success response.
 pub async fn record(db: &Database, event: Event) {
+    // PURA-236 §2.3 hard-blocklist: rewrite any credential-shaped payload
+    // key to the redacted sentinel before the row is built. The §2.3
+    // size caps (payload 2 KiB, errorMsg / userAgent) are applied
+    // separately at the persistence boundary inside
+    // `admin_audit_log::insert`.
+    let payload = event.payload.map(|mut p| {
+        redaction::redact_payload(&mut p);
+        p
+    });
     let new = NewAdminAuditLog {
         actorUserId: Some(event.actor.id),
         actorUsername: event.actor.username,
@@ -138,7 +153,7 @@ pub async fn record(db: &Database, event: Event) {
         targetKind: event.target.as_ref().map(|t| t.kind.clone()),
         targetId: event.target.as_ref().and_then(|t| t.id),
         targetLabel: event.target.and_then(|t| t.label),
-        payload: event.payload,
+        payload,
         outcome: event.outcome.as_str().to_string(),
         errorMsg: event.error_msg,
         requestIp: event.request.ip,
@@ -193,5 +208,85 @@ mod tests {
         assert_eq!(t.kind, "session");
         assert_eq!(t.id, Some(17));
         assert!(t.label.is_none());
+    }
+
+    fn dummy_actor() -> AuthUser {
+        AuthUser {
+            id: 1,
+            username: "alice".into(),
+            display_name: "Alice".into(),
+            role: "admin".into(),
+            enabled: true,
+        }
+    }
+
+    /// PURA-236 §2.3 — `record` runs the credential hard-blocklist before
+    /// the row is persisted. Plant `password`/`apiKey`/`sshKey` in the
+    /// payload and read the row back: the values must be the redacted
+    /// sentinel, never the plaintext.
+    #[tokio::test]
+    async fn record_redacts_credentials_before_persist() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        crate::db::migrations::run(&db).await.unwrap();
+
+        record(
+            &db,
+            Event {
+                actor: dummy_actor(),
+                kind: AuditKind::UserPasswordReset,
+                target: Some(Target::user(2, "bob")),
+                payload: Some(serde_json::json!({
+                    "password": "hunter2",
+                    "apiKey": "k-aaa",
+                    "sshKey": "k-bbb",
+                    "sessionsRevoked": 3,
+                })),
+                outcome: Outcome::Success,
+                error_msg: None,
+                request: RequestMeta::default(),
+            },
+        )
+        .await;
+
+        let (rows, total) =
+            admin_audit_log::list(&db, &admin_audit_log::ListFilter::default(), 10, 0)
+                .await
+                .unwrap();
+        assert_eq!(total, 1);
+        let payload = rows[0].payload.clone().expect("payload present");
+        for key in ["password", "apiKey", "sshKey"] {
+            assert_eq!(
+                payload[key],
+                serde_json::json!(redaction::REDACTED_SENTINEL),
+                "{key} must be redacted before persist"
+            );
+        }
+        assert_eq!(payload["sessionsRevoked"], serde_json::json!(3));
+        let raw = serde_json::to_string(&payload).unwrap();
+        assert!(!raw.contains("hunter2"));
+        assert!(!raw.contains("k-aaa"));
+        assert!(!raw.contains("k-bbb"));
+    }
+
+    /// Best-effort posture — a DB-write failure must not panic or
+    /// propagate. Simulated with an in-memory DB that never ran
+    /// migrations, so the `admin_audit_log` table is missing.
+    #[tokio::test]
+    async fn record_swallows_db_errors_no_panic() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        // No migrations — table absent on purpose.
+        record(
+            &db,
+            Event {
+                actor: dummy_actor(),
+                kind: AuditKind::UserCreated,
+                target: Some(Target::user(2, "bob")),
+                payload: Some(serde_json::json!({"role": "moderator"})),
+                outcome: Outcome::Success,
+                error_msg: None,
+                request: RequestMeta::default(),
+            },
+        )
+        .await;
     }
 }

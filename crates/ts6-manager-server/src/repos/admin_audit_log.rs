@@ -30,6 +30,18 @@ pub const USER_AGENT_MAX_BYTES: usize = 1024;
 /// (`docs/admin/http-api.md` §3.4). Default lives in the route module.
 pub const MAX_LIMIT: i64 = 100;
 
+/// Defence-in-depth global row cap — `docs/admin/audit-shape.md` §3.3.
+/// When the table reaches this count the retention janitor culls the
+/// oldest [`CULL_CHUNK`] rows.
+pub const ROW_CAP: u64 = 100_000;
+
+/// Rows culled per row-cap trim (audit-shape §3.3).
+pub const CULL_CHUNK: u64 = 1_000;
+
+/// Chunk size for the TTL retention sweep — keeps a year-of-audit prune
+/// from parking the runtime.
+const PRUNE_CHUNK: usize = 1000;
+
 #[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
 #[surreal(crate = "surrealdb::types")]
 pub struct AdminAuditLogRow {
@@ -287,6 +299,106 @@ fn truncate_with_sentinel(s: &str, max_bytes: usize) -> String {
     format!("{}…{}", &s[..head_end], suffix)
 }
 
+/// Count rows currently in the table. Used by the retention janitor's
+/// row-cap probe (audit-shape §3.3 / §3.4).
+pub async fn count(db: &Database) -> Result<u64> {
+    #[derive(Debug, Deserialize, SurrealValue)]
+    #[surreal(crate = "surrealdb::types")]
+    struct CountRow {
+        count: i64,
+    }
+    let mut resp = db
+        .query("SELECT count() AS count FROM admin_audit_log GROUP ALL;")
+        .await
+        .context("admin_audit_log count query failed")?
+        .check()?;
+    let rows: Vec<CountRow> = resp.take(0)?;
+    Ok(rows.first().map(|r| r.count.max(0) as u64).unwrap_or(0))
+}
+
+/// Delete every row whose `occurredAt < cutoff`, in chunks of
+/// [`PRUNE_CHUNK`]. Yields between iterations so a year-of-audit sweep
+/// does not park the runtime. Returns the total rows deleted.
+///
+/// This is the one mutation path the module docstring exempts from the
+/// INSERT-only contract — the retention janitor (audit-shape §3.4) is
+/// its only caller.
+pub async fn prune_older_than(db: &Database, cutoff: DateTime<Utc>) -> Result<u64> {
+    #[derive(Debug, Deserialize, SurrealValue)]
+    #[surreal(crate = "surrealdb::types")]
+    struct PruneRow {
+        id: i64,
+    }
+
+    let mut total: u64 = 0;
+    loop {
+        let select_sql = format!(
+            "SELECT record::id(id) AS id FROM admin_audit_log
+                WHERE occurredAt < $cutoff LIMIT {PRUNE_CHUNK};"
+        );
+        let mut resp = db
+            .query(select_sql)
+            .bind(("cutoff", cutoff))
+            .await
+            .context("admin_audit_log prune select failed")?
+            .check()?;
+        let rows: Vec<PruneRow> = resp.take(0)?;
+        if rows.is_empty() {
+            break;
+        }
+        let n = rows.len();
+        let ids: Vec<i64> = rows.into_iter().map(|r| r.id).collect();
+
+        db.query("DELETE admin_audit_log WHERE record::id(id) IN $ids;")
+            .bind(("ids", ids))
+            .await
+            .context("admin_audit_log prune delete failed")?
+            .check()?;
+
+        total += n as u64;
+        if n < PRUNE_CHUNK {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    Ok(total)
+}
+
+/// Delete the oldest `n` rows by `occurredAt`. Backs the row-cap defence
+/// in audit-shape §3.3. Returns the number of rows actually deleted.
+pub async fn cull_oldest(db: &Database, n: u64) -> Result<u64> {
+    #[derive(Debug, Deserialize, SurrealValue)]
+    #[surreal(crate = "surrealdb::types")]
+    struct CullRow {
+        id: i64,
+        // SurrealDB v3 requires the ORDER BY idiom to appear in the
+        // projection; `occurredAt` is selected solely to satisfy that.
+        #[allow(dead_code)]
+        occurredAt: DateTime<Utc>,
+    }
+    let select_sql = format!(
+        "SELECT record::id(id) AS id, occurredAt FROM admin_audit_log
+            ORDER BY occurredAt ASC LIMIT {n};"
+    );
+    let mut resp = db
+        .query(select_sql)
+        .await
+        .context("admin_audit_log cull select failed")?
+        .check()?;
+    let rows: Vec<CullRow> = resp.take(0)?;
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let count = rows.len() as u64;
+    let ids: Vec<i64> = rows.into_iter().map(|r| r.id).collect();
+    db.query("DELETE admin_audit_log WHERE record::id(id) IN $ids;")
+        .bind(("ids", ids))
+        .await
+        .context("admin_audit_log cull delete failed")?
+        .check()?;
+    Ok(count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -470,5 +582,45 @@ mod tests {
         let t = truncate_with_sentinel(&s, ERROR_MSG_MAX_BYTES);
         assert!(t.len() <= ERROR_MSG_MAX_BYTES);
         assert!(t.contains("[truncated, original 10000 bytes]"));
+    }
+
+    #[tokio::test]
+    async fn count_reflects_inserts() {
+        let db = fresh_db().await;
+        assert_eq!(count(&db).await.unwrap(), 0);
+        insert(&db, evt("userCreated", "admin")).await.unwrap();
+        insert(&db, evt("userPatched", "admin")).await.unwrap();
+        assert_eq!(count(&db).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn cull_oldest_trims_in_occurred_order() {
+        let db = fresh_db().await;
+        insert(&db, evt("userCreated", "admin")).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        insert(&db, evt("userPatched", "admin")).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        insert(&db, evt("userDeleted", "admin")).await.unwrap();
+
+        let culled = cull_oldest(&db, 2).await.unwrap();
+        assert_eq!(culled, 2);
+        // The newest row (userDeleted) must be the survivor.
+        let (rows, total) = list(&db, &ListFilter::default(), 50, 0).await.unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(rows[0].kind, "userDeleted");
+    }
+
+    #[tokio::test]
+    async fn prune_older_than_deletes_only_pre_cutoff_rows() {
+        let db = fresh_db().await;
+        insert(&db, evt("userCreated", "admin")).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let cutoff = Utc::now();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        insert(&db, evt("userPatched", "admin")).await.unwrap();
+
+        let pruned = prune_older_than(&db, cutoff).await.unwrap();
+        assert_eq!(pruned, 1, "only the pre-cutoff row should be pruned");
+        assert_eq!(count(&db).await.unwrap(), 1);
     }
 }

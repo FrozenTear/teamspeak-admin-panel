@@ -47,6 +47,8 @@ use ts6_manager_shared::setup::{SetupInitRequest, SetupInitResponse, SetupStatus
 use ts6_manager_shared::test_connection::{TestConnectionRequest, TestConnectionResponse};
 
 use crate::app_state::AppState;
+use crate::audit::{self, AuditKind, Event, Outcome, Target};
+use crate::auth::extractors::{AuthUser, RequestMeta};
 use crate::auth::{complexity, password};
 use crate::crypto;
 use crate::repos::server_connections::NewServerConnection;
@@ -104,6 +106,7 @@ async fn status(State(state): State<AppState>) -> Result<Json<SetupStatusRespons
 
 async fn init(
     State(state): State<AppState>,
+    request_meta: RequestMeta,
     Json(req): Json<SetupInitRequest>,
 ) -> Result<(StatusCode, Json<SetupInitResponse>), Response> {
     // Serialise concurrent calls. The mutex is process-scoped (Phase 1
@@ -211,6 +214,32 @@ async fn init(
                 tracing::error!(err = ?e, "setup_init: atomic insert failed");
                 internal()
             })?;
+
+    // PURA-228 / PURA-236: post-commit audit. This route is
+    // credential-less, so there is no `RequireAuth`-extracted actor — the
+    // actor IS the bootstrap admin we just created. Build a synthetic
+    // `AuthUser` snapshot from the fresh row so the audit entry is
+    // attributed to it (audit-shape.md §2.1 `setupCompleted`).
+    let bootstrap_admin = AuthUser {
+        id: user_row.id,
+        username: user_row.username.clone(),
+        display_name: user_row.displayName.clone(),
+        role: user_row.role.clone(),
+        enabled: true,
+    };
+    audit::record(
+        &state.db,
+        Event {
+            kind: AuditKind::SetupCompleted,
+            target: Some(Target::user(user_row.id, user_row.username.clone())),
+            payload: Some(serde_json::json!({ "role": user_row.role, "via": "setup_init" })),
+            outcome: Outcome::Success,
+            error_msg: None,
+            request: request_meta,
+            actor: bootstrap_admin,
+        },
+    )
+    .await;
 
     let body = SetupInitResponse {
         user: UserInfo {

@@ -34,7 +34,8 @@ use ts6_manager_shared::auth::{
 };
 
 use crate::app_state::AppState;
-use crate::auth::extractors::{AuthUser, RequireAuth};
+use crate::audit::{self, AuditKind, Event, Outcome, Target};
+use crate::auth::extractors::{RequestMeta, RequireAuth};
 use crate::auth::{complexity, jwt, password, refresh};
 use crate::repos::{refresh_tokens, users};
 use crate::web::rate_limit::{RateLimitState, rate_limit_auth};
@@ -218,9 +219,11 @@ async fn me(RequireAuth(user): RequireAuth) -> Json<UserInfo> {
 
 async fn change_password(
     State(state): State<AppState>,
-    RequireAuth(AuthUser { id, .. }): RequireAuth,
+    RequireAuth(actor): RequireAuth,
+    request_meta: RequestMeta,
     Json(req): Json<ChangePasswordRequest>,
 ) -> Result<StatusCode, Response> {
+    let id = actor.id;
     // Re-fetch the user so we have the live passwordHash.
     let user = users::find_by_id(&state.db, id)
         .await
@@ -255,8 +258,29 @@ async fn change_password(
         .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Internal error"))?;
 
     // Spec §6.2.3 step 2: revoke every refresh token for this user — forces
-    // re-login on every other session.
+    // re-login on every other session. Count the live sessions first so
+    // the audit row can report how many were torn down.
+    let sessions_revoked = refresh_tokens::count_active_for_user(&state.db, id)
+        .await
+        .unwrap_or(0);
     let _ = refresh_tokens::delete_all_for_user(&state.db, id).await;
+
+    // PURA-228 / PURA-236: post-commit audit. `selfPasswordChanged` is
+    // kept distinct from the admin-driven `userPasswordReset` so forensics
+    // can tell self-service apart from an admin reset (audit-shape.md §2.1).
+    audit::record(
+        &state.db,
+        Event {
+            actor: actor.clone(),
+            kind: AuditKind::SelfPasswordChanged,
+            target: Some(Target::user(actor.id, actor.username.clone())),
+            payload: Some(serde_json::json!({ "sessionsRevoked": sessions_revoked })),
+            outcome: Outcome::Success,
+            error_msg: None,
+            request: request_meta,
+        },
+    )
+    .await;
 
     Ok(StatusCode::NO_CONTENT)
 }

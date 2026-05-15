@@ -168,6 +168,13 @@ mod server_entry {
         // app so a shutdown of the runtime tears it down with everything else.
         crate::sshbridge::retention::spawn_sweep(database.clone());
 
+        // PURA-228 / PURA-236: companion hourly sweep for `admin_audit_log`
+        // — TTL prune + the 100k row-cap defence (audit-shape.md §3.4). A
+        // distinct task from the SSH sweep for blast-radius isolation.
+        // Spawned after migrations so the seeded
+        // `app_setting:admin_audit_retention_days` row exists.
+        crate::audit::retention::spawn_sweep(database.clone());
+
         let serve_cfg = ServeConfig::new();
         let state = app_state::AppState::from_config(&cfg, database.clone());
 
