@@ -18,6 +18,7 @@ use serde::de::DeserializeOwned;
 use ts6_manager_shared::auth::ErrorResponse;
 
 use crate::client::auth::AuthError;
+use crate::client::debug as auth_debug;
 use crate::client::session::{RefreshGate, SessionSnapshot};
 
 /// Errors surfaced to UI callers.
@@ -166,6 +167,7 @@ pub async fn authorized_get_json<T>(
 where
     T: DeserializeOwned,
 {
+    log_api_call_enter("GET", path);
     let (status, body) = gate
         .run(|snap| {
             let base = base.to_owned();
@@ -175,7 +177,9 @@ where
         .await
         .map_err(ApiError::from)?;
 
-    classify_response(status, &body)
+    let result = classify_response(status, &body);
+    log_api_call_exit("GET", path, status, &result);
+    result
 }
 
 /// `POST {base}{path}` with an optional JSON body and refresh-gating.
@@ -195,6 +199,7 @@ where
     B: serde::Serialize + ?Sized,
     T: DeserializeOwned,
 {
+    log_api_call_enter("POST", path);
     let body_string = body
         .map(serde_json::to_string)
         .transpose()
@@ -218,11 +223,14 @@ where
         .await
         .map_err(ApiError::from)?;
 
-    classify_maybe_empty(status, &body)
+    let result = classify_maybe_empty(status, &body);
+    log_api_call_exit("POST", path, status, &result);
+    result
 }
 
 /// `DELETE {base}{path}` with refresh-gating. 204 → `Ok(())`.
 pub async fn authorized_delete(gate: &RefreshGate, base: &str, path: &str) -> Result<(), ApiError> {
+    log_api_call_enter("DELETE", path);
     let (status, body) = gate
         .run(|snap| {
             let base = base.to_owned();
@@ -232,7 +240,9 @@ pub async fn authorized_delete(gate: &RefreshGate, base: &str, path: &str) -> Re
         .await
         .map_err(ApiError::from)?;
 
-    classify_maybe_empty::<()>(status, &body)
+    let result = classify_maybe_empty::<()>(status, &body);
+    log_api_call_exit("DELETE", path, status, &result);
+    result
 }
 
 /// `PATCH {base}{path}` with a JSON body and refresh-gating. Used by surfaces
@@ -249,6 +259,7 @@ where
     B: serde::Serialize + ?Sized,
     T: DeserializeOwned,
 {
+    log_api_call_enter("PATCH", path);
     let body_string =
         serde_json::to_string(body).map_err(|e| ApiError::Deserialise(e.to_string()))?;
     let (status, body) = gate
@@ -264,7 +275,9 @@ where
         .await
         .map_err(ApiError::from)?;
 
-    classify_maybe_empty(status, &body)
+    let result = classify_maybe_empty(status, &body);
+    log_api_call_exit("PATCH", path, status, &result);
+    result
 }
 
 /// `POST` / `DELETE` body-less variant: `204 No Content` is treated as
@@ -332,6 +345,47 @@ pub(crate) enum HttpMethod {
     Delete,
 }
 
+/// PURA-226 — emit an `api.call.enter` breadcrumb before the gate
+/// dispatches to the transport. Pairs with [`log_api_call_exit`] so a
+/// console capture shows entry, every gate sub-event, and the final
+/// status side-by-side.
+fn log_api_call_enter(method: &str, path: &str) {
+    auth_debug::log(
+        "api.call.enter",
+        auth_debug::fields(&[("method", method.into()), ("path", path.into())]),
+    );
+}
+
+/// PURA-226 — emit an `api.call.exit` breadcrumb tagged with the HTTP
+/// status (post-gate) and a one-line classification of the outcome.
+fn log_api_call_exit<T>(method: &str, path: &str, status: u16, result: &Result<T, ApiError>) {
+    let outcome = match result {
+        Ok(_) => "ok",
+        Err(e) => api_error_tag(e),
+    };
+    auth_debug::log(
+        "api.call.exit",
+        auth_debug::fields(&[
+            ("method", method.into()),
+            ("path", path.into()),
+            ("status", status.into()),
+            ("outcome", outcome.into()),
+        ]),
+    );
+}
+
+fn api_error_tag(err: &ApiError) -> &'static str {
+    match err {
+        ApiError::Unauthorized(_) => "unauthorized",
+        ApiError::BadGateway { .. } => "bad_gateway",
+        ApiError::Client { .. } => "client",
+        ApiError::Server { .. } => "server",
+        ApiError::Transport(_) => "transport",
+        ApiError::Deserialise(_) => "deserialise",
+        ApiError::UnsupportedTarget => "unsupported_target",
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 async fn authorized_get_raw(
     base: &str,
@@ -354,6 +408,7 @@ async fn authorized_get_raw(
         let msg = serde_json::from_str::<ErrorResponse>(&body)
             .map(|e| e.error)
             .unwrap_or_else(|_| body.clone());
+        log_raw_401_subcode(path, &msg);
         return Err(AuthError::Unauthorized(msg));
     }
     Ok((status, body))
@@ -404,9 +459,22 @@ async fn authorized_send_raw(
         let msg = serde_json::from_str::<ErrorResponse>(&body)
             .map(|e| e.error)
             .unwrap_or_else(|_| body.clone());
+        log_raw_401_subcode(path, &msg);
         return Err(AuthError::Unauthorized(msg));
     }
     Ok((status, body))
+}
+
+/// PURA-226 candidate failure #1 — log the exact 401 body before
+/// `RefreshGate::run` classifies it. Tells the operator which sub-code
+/// the server emitted on the *raw* response (vs. what the gate decided
+/// to do with it).
+#[cfg(target_arch = "wasm32")]
+fn log_raw_401_subcode(path: &str, body: &str) {
+    auth_debug::log(
+        "api.raw_401",
+        auth_debug::fields(&[("path", path.into()), ("body", body.into())]),
+    );
 }
 
 #[cfg(not(target_arch = "wasm32"))]

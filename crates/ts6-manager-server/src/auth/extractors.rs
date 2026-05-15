@@ -58,24 +58,69 @@ where
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let app: AppState = AppState::from_ref(state);
+        let path = parts.uri.path().to_owned();
 
         // Spec §6.4.1 step 1: Authorization header MUST start with "Bearer ".
-        let bearer = parts
+        let bearer = match parts
             .headers
             .get(AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.strip_prefix("Bearer "))
-            .ok_or(AuthError::NoToken)?;
+        {
+            Some(b) => b,
+            None => {
+                // PURA-226 — failure mode #1 sub-case: bearer never reached
+                // the extractor. The SPA gate treats this as session-killing,
+                // so trace it with the path so the operator can correlate
+                // FE `gate.401.session_killing` with the BE rejection. `debug`
+                // level keeps the line out of `info` production logs by
+                // default.
+                tracing::debug!(path = %path, sub_code = "no_token", "auth 401");
+                return Err(AuthError::NoToken);
+            }
+        };
 
         // Step 2: HS256 verify.
-        let claims = jwt::verify_access(bearer, &app.jwt_secret).map_err(|_| AuthError::Invalid)?;
+        let claims = match jwt::verify_access(bearer, &app.jwt_secret) {
+            Ok(c) => c,
+            Err(_) => {
+                tracing::debug!(path = %path, sub_code = "invalid_token", "auth 401");
+                return Err(AuthError::Invalid);
+            }
+        };
 
         // Step 3: DB lookup. Disabled or missing → 401 with the spec body.
-        let user = users::find_by_id(&app.db, claims.id)
-            .await
-            .map_err(|_| AuthError::Invalid)?
-            .ok_or(AuthError::Disabled)?;
+        let user = match users::find_by_id(&app.db, claims.id).await {
+            Ok(Some(u)) => u,
+            Ok(None) => {
+                tracing::debug!(
+                    path = %path,
+                    sub_code = "user_disabled",
+                    user_id = claims.id,
+                    reason = "user_row_missing",
+                    "auth 401"
+                );
+                return Err(AuthError::Disabled);
+            }
+            Err(_) => {
+                tracing::debug!(
+                    path = %path,
+                    sub_code = "invalid_token",
+                    user_id = claims.id,
+                    reason = "db_lookup_error",
+                    "auth 401"
+                );
+                return Err(AuthError::Invalid);
+            }
+        };
         if !user.enabled {
+            tracing::debug!(
+                path = %path,
+                sub_code = "user_disabled",
+                user_id = user.id,
+                reason = "user_row_disabled",
+                "auth 401"
+            );
             return Err(AuthError::Disabled);
         }
 

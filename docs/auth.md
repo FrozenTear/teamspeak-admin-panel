@@ -149,6 +149,108 @@ either an attacker replayed a captured token OR (more commonly) a tab
 got resumed from `localStorage` after another tab already rotated past
 it. Both paths are correctly handled — the operator just re-logs in.
 
+### Boot-time refresh-token volume check (PURA-226)
+
+At startup the server emits one of:
+
+- `INFO  refresh-token volume snapshot at boot users=…
+  refresh_tokens=… distinct_users_with_tokens=…` — normal.
+- `WARN  no live refresh tokens at boot — if operators report repeat
+  involuntary sign-outs, suspect ephemeral DB volume; see docs/auth.md
+  §debug-knob` — every operator who was signed in before the restart
+  will bounce to `/login` on their next request. Common cause: the
+  panel container's data volume is not mounted (or got recreated).
+  Mount a persistent volume at `/data` (see `deploy/`); the surrealkv
+  store there carries the refresh-token table across restarts.
+
+## Debug knob — root-causing involuntary logouts (PURA-226)
+
+When operators report repeat involuntary sign-outs in the deployed
+image, the candidate failure modes are:
+
+1. `/api/*` returns a 401 whose body the gate misclassifies.
+2. `POST /api/auth/refresh` fails non-401 and the *data* 401 strands
+   the operator on the [PURA-225](/PURA/issues/PURA-225) escape-CTA
+   banner.
+3. Refresh succeeds but the rotated-pair `localStorage` write is
+   racy / dropped.
+4. Backend rejects the refresh row because the container lost its
+   DB volume on restart.
+
+The SPA and the backend can both emit structured, opt-in breadcrumbs
+that pinpoint exactly which mode fired.
+
+### Turning it on
+
+**Browser (SPA).** Either:
+
+- Append `?debug=auth` to any URL the operator hits (the knob is
+  read once and cached for the page load), or
+- In DevTools console: `localStorage.setItem('ts6-manager.debug',
+  'auth')`, then reload.
+
+Every event the operator copies out of DevTools console looks like:
+
+```
+[ts6-manager:auth] {"ts":1234.5,"tag":"gate.401.session_killing","data":{"body":"401 Unauthorized: User account disabled or deleted","invalidates_session":true}}
+```
+
+Tags emitted on the auth path:
+
+| Tag | Meaning |
+| --- | --- |
+| `api.call.enter` / `api.call.exit` | Wrapper around every `/api/*` call. `exit.outcome` is one of `ok` / `unauthorized` / `bad_gateway` / `client` / `server` / `transport` / `deserialise`. |
+| `api.raw_401` | A 401 came off the wire — `data.body` is the verbatim error string (`Invalid or expired token`, `User account disabled or deleted`, `No token provided`, …). **Mode 1** fingerprint when the body is unfamiliar. |
+| `gate.enter` | `RefreshGate::run` received a request. `data.access` is the first 8 chars of the bearer attached. |
+| `gate.anonymous_short_circuit` | The gate ran with `AuthState::Anonymous` — a request raced a logout / cold-start. |
+| `gate.401.refresh_eligible` | The first call's 401 carried `Invalid or expired token`; the gate is about to single-flight `POST /api/auth/refresh`. |
+| `gate.401.session_killing` | The first call's 401 was `User account disabled or deleted` / `No token provided` / unknown body — the session has been invalidated and the operator will bounce to `/login`. |
+| `gate.non_401_propagate` | A non-401 error surfaced; session stays authenticated. |
+| `gate.refresh.start` / `gate.refresh.ok` / `gate.refresh.fail` | The single-flight refresh attempt + duration. `fail.kept_session_alive` is `true` for PURA-214 transient errors (5xx / 4xx / transport / deserialise) and `false` for an actual 401 on `/api/auth/refresh`. **Mode 2** fingerprint when `kept_session_alive=true` immediately precedes an `api.raw_401` whose body is not `Invalid or expired token`. |
+| `gate.replay_with_peer_rotation` | Another tab rotated while we waited on the lock — replaying with the freshly persisted access token. |
+| `gate.replay_401_invalidate` | The post-refresh replay 401'd, so the family is dead at the server. Invalidated. |
+| `refresh.post.send` / `refresh.post.ok` / `refresh.post.err` | The HTTP transport for `/api/auth/refresh`. `request_id` (e.g. `rfr-3`) pairs `send` with the outcome; `duration_ms` measures the round-trip. |
+| `session.update_pair` | The gate handed a rotated pair off to the in-memory + localStorage session. `data.new_access` is the first 8 chars of the new access token. **Mode 3** fingerprint when this fires but the subsequent `storage.set` shows `err=true` or `bytes` of an empty blob. |
+| `session.update_pair.dropped_on_anonymous` | A rotation was racy with a logout; the gate refused to resurrect a logged-out session. |
+| `session.invalidate` | The session was invalidated. `data.reason` names the branch (`refresh_401`, `post_refresh_replay_401`, `first_err_session_killing`, `peer_rotation_replay_401`). |
+| `session.replace` | A non-gate call (login, logout, escape-CTA) swapped the entire session. `from` / `to` are booleans indicating the authenticated-state transition. |
+| `session.rehydrate` | The post-mount `use_effect` copied the persisted blob into the signal. `hydrated=false` after a fresh page-load means `localStorage` was empty (operator never signed in, or another tab cleared it). |
+| `storage.get` / `storage.set` / `storage.remove` | Filtered to the `ts6-manager.auth.session` key. `err=true` on a `set` is the **Mode 3** smoking gun. |
+
+**Backend.** Set `LOG_LEVEL=ts6_manager_server::auth=debug,info` (the
+default is `info`, which keeps the lines off). The relevant entries:
+
+- `auth 401 sub_code=… path=… user_id=…` — every 401 the `RequireAuth`
+  extractor emits, with the path that produced it. **Mode 1** in the
+  panel logs.
+- `refresh ok user_id=… family=… duration_ms=…` — successful rotation.
+- `refresh 401 reason=… duration_ms=…` — `POST /api/auth/refresh` got
+  rejected. `reason` is `invalid_or_expired` (most likely PURA-225
+  reuse-detection signal *or* **Mode 4** if the row was lost on
+  restart), `user_row_missing_after_rotate`, or `user_disabled_after_rotate`.
+
+### Mapping breadcrumbs back to failure modes
+
+| Mode | Fingerprint in the console + panel logs |
+| --- | --- |
+| 1. 401 body misclassified | `api.raw_401` with an unfamiliar body, followed by `gate.401.session_killing` (not `gate.401.refresh_eligible`). |
+| 2. Non-401 refresh fails, data 401 strands UI | `gate.refresh.fail` with `kept_session_alive=true`, immediately preceded by `api.raw_401` whose body is `Invalid or expired token`. |
+| 3. Storage write dropped | `session.update_pair` with a new prefix, then `storage.set err=true` (or an `update_pair.dropped_on_anonymous` after the lock). |
+| 4. Backend lost refresh row on restart | Panel `WARN no live refresh tokens at boot` at startup, OR backend `refresh 401 reason=invalid_or_expired` for every operator simultaneously after a restart. |
+
+### Turning it off
+
+- URL: drop the `?debug=auth` param. The cache is per-page-load so a
+  navigation that omits the param disables the knob.
+- Storage: `localStorage.removeItem('ts6-manager.debug')`, then
+  reload.
+- Backend: revert `LOG_LEVEL` to `info` (or unset it).
+
+### Default behavior
+
+With no knob set, the SPA emits **zero** console breadcrumbs and the
+backend stays at `info`, so production noise is unchanged.
+
 ## See also
 
 - Refresh-token rotation: `crates/ts6-manager-server/src/auth/refresh.rs`

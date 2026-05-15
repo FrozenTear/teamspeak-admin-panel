@@ -78,7 +78,65 @@ pub async fn login(base: &str, req: &LoginRequest) -> Result<TokenPairResponse, 
 
 /// `POST /api/auth/refresh` — rotate the refresh token, mint a new access.
 pub async fn refresh(base: &str, req: &RefreshRequest) -> Result<TokenPairResponse, AuthError> {
-    request_json(base, "POST", "/api/auth/refresh", None, Some(req)).await
+    use crate::client::debug as auth_debug;
+    let request_id = mint_refresh_request_id();
+    auth_debug::log(
+        "refresh.post.send",
+        auth_debug::fields(&[
+            ("request_id", request_id.as_str().into()),
+            (
+                "refresh_prefix",
+                auth_debug::short_token(&req.refresh_token).into(),
+            ),
+        ]),
+    );
+    let started = auth_debug::now_ms_for_duration();
+    let result: Result<TokenPairResponse, AuthError> =
+        request_json(base, "POST", "/api/auth/refresh", None, Some(req)).await;
+    let (tag, payload) = match &result {
+        Ok(pair) => (
+            "refresh.post.ok",
+            auth_debug::fields(&[
+                ("request_id", request_id.as_str().into()),
+                (
+                    "new_access",
+                    auth_debug::short_token(&pair.access_token).into(),
+                ),
+                ("duration_ms", auth_debug::elapsed_ms(started).into()),
+            ]),
+        ),
+        Err(e) => (
+            "refresh.post.err",
+            auth_debug::fields(&[
+                ("request_id", request_id.as_str().into()),
+                ("err", e.to_string().into()),
+                ("status", refresh_err_status(e)),
+                ("duration_ms", auth_debug::elapsed_ms(started).into()),
+            ]),
+        ),
+    };
+    auth_debug::log(tag, payload);
+    result
+}
+
+/// Short request-id so the operator can pair `refresh.post.send` with the
+/// corresponding `refresh.post.{ok,err}` in a busy console. Uses a
+/// monotonic atomic so the SPA needs no extra deps for the counter.
+fn mint_refresh_request_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("rfr-{n}")
+}
+
+fn refresh_err_status(err: &AuthError) -> serde_json::Value {
+    match err {
+        AuthError::Unauthorized(_) => 401.into(),
+        AuthError::Client { status, .. } | AuthError::Server { status, .. } => (*status).into(),
+        AuthError::Transport(_) | AuthError::Deserialise(_) | AuthError::UnsupportedTarget => {
+            serde_json::Value::Null
+        }
+    }
 }
 
 /// `POST /api/auth/logout` — server returns 204; we collapse to `()`.

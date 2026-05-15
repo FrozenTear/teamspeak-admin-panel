@@ -121,6 +121,44 @@ mod server_entry {
             "migrations applied at boot"
         );
 
+        // PURA-226 — boot-time refresh-token volume sanity check. The board
+        // reports repeat involuntary sign-outs in the deployed image; one
+        // of the four candidate failure modes is "the panel container lost
+        // its DB volume on restart, so every operator's still-valid refresh
+        // row is gone." We can't tell whose refresh rows ought to be alive
+        // (the SPA holds the bearer client-side), but we CAN warn when
+        // enabled users > 0 and live refresh rows = 0 — that combination
+        // means every authenticated operator will bounce to `/login` on
+        // their next call. Best-effort: failure here doesn't gate startup.
+        match crate::repos::refresh_tokens::boot_snapshot(&database).await {
+            Ok(snap) => match crate::repos::users::count(&database).await {
+                Ok(user_count) => {
+                    if user_count > 0 && snap.total == 0 {
+                        tracing::warn!(
+                            enabled_users = user_count,
+                            refresh_tokens = snap.total,
+                            "no live refresh tokens at boot \u{2014} if operators report \
+                             repeat involuntary sign-outs, suspect ephemeral DB volume; \
+                             see docs/auth.md §debug-knob"
+                        );
+                    } else {
+                        tracing::info!(
+                            users = user_count,
+                            refresh_tokens = snap.total,
+                            distinct_users_with_tokens = snap.distinct_users,
+                            "refresh-token volume snapshot at boot"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "boot refresh-token sanity check: user count query failed");
+                }
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, "boot refresh-token sanity check: snapshot query failed");
+            }
+        }
+
         // PURA-79 R1/R6: hourly best-effort sweep that prunes
         // `ssh_audit_log` per the operator-set retention policy. Spawned
         // after migrations so the seeded `app_setting:ssh_audit_retention_days`

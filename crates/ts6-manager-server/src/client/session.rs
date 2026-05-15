@@ -34,6 +34,7 @@ use std::sync::Arc;
 use ts6_manager_shared::auth::{RefreshRequest, TokenPairResponse, UserInfo};
 
 use crate::client::auth::AuthError;
+use crate::client::debug as auth_debug;
 use crate::client::store::AuthState;
 
 /// `BoxFuture` that the gate's trait objects return. On the browser
@@ -160,12 +161,21 @@ impl RefreshGate {
         let first_snapshot = match self.snapshot() {
             Some(s) => s,
             None => {
+                // PURA-226 — emit the same anonymous short-circuit signal
+                // the gate's contract documents. Lets the operator see
+                // when a request rode the gate without a session (race
+                // with a logout, rehydrate that found no blob).
+                auth_debug::log("gate.anonymous_short_circuit", serde_json::Value::Null);
                 return Err(AuthError::Unauthorized(
                     ts6_manager_shared::auth::auth_error_strings::INVALID_TOKEN.into(),
                 ));
             }
         };
         let first_access = first_snapshot.access.clone();
+        auth_debug::log(
+            "gate.enter",
+            auth_debug::fields(&[("access", auth_debug::short_token(&first_access).into())]),
+        );
         let first_err = match f(first_snapshot).await {
             Ok(value) => return Ok(value),
             Err(e) => e,
@@ -180,11 +190,28 @@ impl RefreshGate {
             // invalidate immediately. The route layer's auth-gate effect
             // then bounces to `/login` instead of leaving the operator on
             // a banner-with-no-CTA. Non-401 errors fall through unchanged.
-            if first_err.is_unauthorized() {
-                self.session.invalidate();
+            let session_killing = first_err.is_unauthorized();
+            auth_debug::log(
+                if session_killing {
+                    "gate.401.session_killing"
+                } else {
+                    "gate.non_401_propagate"
+                },
+                auth_debug::fields(&[
+                    ("body", first_err.to_string().into()),
+                    ("invalidates_session", session_killing.into()),
+                ]),
+            );
+            if session_killing {
+                self.invalidate_with_log("first_err_session_killing");
             }
             return Err(first_err);
         }
+
+        auth_debug::log(
+            "gate.401.refresh_eligible",
+            auth_debug::fields(&[("body", first_err.to_string().into())]),
+        );
 
         // 401-with-INVALID_TOKEN path: take the gate.
         let _guard = self.lock.lock().await;
@@ -193,6 +220,7 @@ impl RefreshGate {
         let after_lock = match self.snapshot() {
             Some(s) => s,
             None => {
+                auth_debug::log("gate.session_lost_under_lock", serde_json::Value::Null);
                 return Err(AuthError::Unauthorized(
                     ts6_manager_shared::auth::auth_error_strings::INVALID_TOKEN.into(),
                 ));
@@ -204,20 +232,42 @@ impl RefreshGate {
             // even the freshly rotated access token was rejected; that is
             // a session-killing signal regardless of sub-code, so kill it
             // before returning so the route layer can bounce.
+            auth_debug::log(
+                "gate.replay_with_peer_rotation",
+                auth_debug::fields(&[(
+                    "access",
+                    auth_debug::short_token(&after_lock.access).into(),
+                )]),
+            );
             let result = f(after_lock).await;
             if let Err(e) = &result
                 && e.is_unauthorized()
             {
-                self.session.invalidate();
+                auth_debug::log(
+                    "gate.replay_401_invalidate",
+                    auth_debug::fields(&[("body", e.to_string().into())]),
+                );
+                self.invalidate_with_log("peer_rotation_replay_401");
             }
             return result;
         }
 
         // We are the rotator. Issue the refresh once.
+        auth_debug::log("gate.refresh.start", serde_json::Value::Null);
+        let started = auth_debug::now_ms_for_duration();
         match self.refresh_fn.refresh(after_lock.refresh.clone()).await {
             Ok(pair) => {
-                self.session
-                    .update_pair(pair.access_token.clone(), pair.refresh_token.clone());
+                auth_debug::log(
+                    "gate.refresh.ok",
+                    auth_debug::fields(&[
+                        (
+                            "new_access",
+                            auth_debug::short_token(&pair.access_token).into(),
+                        ),
+                        ("duration_ms", auth_debug::elapsed_ms(started).into()),
+                    ]),
+                );
+                self.update_pair_with_log(pair.access_token.clone(), pair.refresh_token.clone());
                 let replay = SessionSnapshot {
                     access: pair.access_token,
                     refresh: pair.refresh_token,
@@ -233,7 +283,11 @@ impl RefreshGate {
                 if let Err(e) = &result
                     && e.is_unauthorized()
                 {
-                    self.session.invalidate();
+                    auth_debug::log(
+                        "gate.replay_401_invalidate",
+                        auth_debug::fields(&[("body", e.to_string().into())]),
+                    );
+                    self.invalidate_with_log("post_refresh_replay_401");
                 }
                 result
             }
@@ -247,12 +301,50 @@ impl RefreshGate {
                 // token is still valid in the DB. Keep the session
                 // authenticated so the next call retries; propagate the
                 // raw error so the caller can render the right banner.
+                let kept_alive = !e.is_unauthorized();
+                auth_debug::log(
+                    "gate.refresh.fail",
+                    auth_debug::fields(&[
+                        ("err", e.to_string().into()),
+                        ("kept_session_alive", kept_alive.into()),
+                        ("duration_ms", auth_debug::elapsed_ms(started).into()),
+                    ]),
+                );
                 if e.is_unauthorized() {
-                    self.session.invalidate();
+                    self.invalidate_with_log("refresh_401");
                 }
                 Err(e)
             }
         }
+    }
+
+    /// PURA-226 — single-point breadcrumb wrapper around
+    /// [`SessionHandle::invalidate`]. Every gate-driven invalidation
+    /// flows through here so the debug capture lists `session.invalidate`
+    /// with a `reason` field that names the branch (refresh 401,
+    /// post-refresh replay 401, first-error session-killing, peer
+    /// rotation replay 401). The session impl itself stays free of
+    /// instrumentation so both `DioxusSession` (runtime) and
+    /// `InMemorySession` (tests) emit identical breadcrumbs.
+    fn invalidate_with_log(&self, reason: &'static str) {
+        auth_debug::log(
+            "session.invalidate",
+            auth_debug::fields(&[("reason", reason.into())]),
+        );
+        self.session.invalidate();
+    }
+
+    /// PURA-226 — single-point breadcrumb wrapper around
+    /// [`SessionHandle::update_pair`]. Covers PURA-225's candidate
+    /// failure #3 (refresh succeeded but rotation was racy / dropped
+    /// at the storage layer) by surfacing both the new-access prefix
+    /// and the fact the gate handed the rotation off to the session.
+    fn update_pair_with_log(&self, access: String, refresh: String) {
+        auth_debug::log(
+            "session.update_pair",
+            auth_debug::fields(&[("new_access", auth_debug::short_token(&access).into())]),
+        );
+        self.session.update_pair(access, refresh);
     }
 
     fn snapshot(&self) -> Option<SessionSnapshot> {
@@ -858,5 +950,169 @@ mod tests {
                 .get(crate::client::store::SESSION_STORAGE_KEY)
                 .is_none(),
         );
+    }
+
+    // ---------------------------------------------------------------
+    // PURA-226 — debug-knob instrumentation regression tests.
+    //
+    // The default-off contract is the load-bearing invariant: a
+    // production build with the operator's knob un-flipped MUST NOT
+    // emit any auth-path breadcrumbs (no console noise, no log spam,
+    // no test pollution). The "when enabled" tests pin exactly which
+    // tags fire on the canonical failure-mode paths so a future
+    // refactor that drops a breadcrumb is caught at PR time.
+    // ---------------------------------------------------------------
+
+    use crate::client::debug as auth_debug;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn debug_knob_off_emits_no_breadcrumbs_on_happy_path() {
+        auth_debug::test_override::disable();
+        let _ = auth_debug::test_override::drain();
+        let storage = arc_storage(MemoryStore::new());
+        let session: Arc<dyn SessionHandle> =
+            Arc::new(InMemorySession::new(authed("ax", "rx"), storage.clone()));
+        let stub = StubRefresh::new(|_| panic!("must not refresh"));
+        let gate = RefreshGate::new(session, stub.clone());
+
+        gate.run(|_| async { Ok::<u32, AuthError>(42) })
+            .await
+            .unwrap();
+
+        let captured = auth_debug::test_override::drain();
+        assert!(
+            captured.is_empty(),
+            "default-off knob leaked breadcrumbs: {captured:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn debug_knob_on_emits_gate_breadcrumbs_for_session_killing_401() {
+        use ts6_manager_shared::auth::auth_error_strings as msg;
+
+        auth_debug::test_override::enable();
+        let storage = arc_storage(MemoryStore::new());
+        let session: Arc<dyn SessionHandle> =
+            Arc::new(InMemorySession::new(authed("ax", "rx"), storage.clone()));
+        let stub = StubRefresh::new(|_| panic!("must not refresh on USER_DISABLED"));
+        let gate = RefreshGate::new(session, stub.clone());
+
+        let _ = gate
+            .run(|_| async { Err::<u32, _>(AuthError::Unauthorized(msg::USER_DISABLED.into())) })
+            .await;
+        let captured = auth_debug::test_override::drain();
+        auth_debug::test_override::disable();
+
+        let joined = captured.join("\n");
+        assert!(
+            joined.contains(r#""tag":"gate.enter""#),
+            "expected gate.enter:\n{joined}"
+        );
+        assert!(
+            joined.contains(r#""tag":"gate.401.session_killing""#),
+            "expected gate.401.session_killing:\n{joined}"
+        );
+        assert!(
+            joined.contains(r#""tag":"session.invalidate""#),
+            "expected session.invalidate (PURA-225 path):\n{joined}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn debug_knob_on_emits_refresh_breadcrumbs_on_rotation() {
+        use ts6_manager_shared::auth::auth_error_strings as msg;
+
+        auth_debug::test_override::enable();
+        let storage = arc_storage(MemoryStore::new());
+        let session: Arc<dyn SessionHandle> = Arc::new(InMemorySession::new(
+            authed("old-access", "old-refresh"),
+            storage.clone(),
+        ));
+        let stub = StubRefresh::new(|_| {
+            Ok(TokenPairResponse {
+                access_token: "new-access".into(),
+                refresh_token: "new-refresh".into(),
+            })
+        });
+        let gate = RefreshGate::new(session.clone(), stub.clone());
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_clone = calls.clone();
+        gate.run(move |snap| {
+            let calls = calls_clone.clone();
+            async move {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    assert_eq!(snap.access, "old-access");
+                    Err(AuthError::Unauthorized(msg::INVALID_TOKEN.into()))
+                } else {
+                    Ok::<u32, AuthError>(7)
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        let captured = auth_debug::test_override::drain();
+        auth_debug::test_override::disable();
+
+        let joined = captured.join("\n");
+        // Spec §6.5.3 happy-path: refresh-eligible 401 → refresh.start →
+        // refresh.ok → session.update_pair (rotation persisted).
+        assert!(
+            joined.contains(r#""tag":"gate.401.refresh_eligible""#),
+            "missing gate.401.refresh_eligible:\n{joined}"
+        );
+        assert!(
+            joined.contains(r#""tag":"gate.refresh.start""#),
+            "missing gate.refresh.start:\n{joined}"
+        );
+        assert!(
+            joined.contains(r#""tag":"gate.refresh.ok""#),
+            "missing gate.refresh.ok:\n{joined}"
+        );
+        assert!(
+            joined.contains(r#""tag":"session.update_pair""#),
+            "missing session.update_pair (PURA-226 candidate #3 hook):\n{joined}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn debug_knob_on_logs_refresh_failure_with_kept_session_flag() {
+        use ts6_manager_shared::auth::auth_error_strings as msg;
+
+        auth_debug::test_override::enable();
+        let storage = arc_storage(MemoryStore::new());
+        let session: Arc<dyn SessionHandle> = Arc::new(InMemorySession::new(
+            authed("old-access", "old-refresh"),
+            storage.clone(),
+        ));
+        let stub = StubRefresh::new(|_| {
+            Err(AuthError::Server {
+                status: 502,
+                message: "Bad Gateway".into(),
+            })
+        });
+        let gate = RefreshGate::new(session.clone(), stub.clone());
+
+        let _ = gate
+            .run(|_| async { Err::<u32, _>(AuthError::Unauthorized(msg::INVALID_TOKEN.into())) })
+            .await;
+        let captured = auth_debug::test_override::drain();
+        auth_debug::test_override::disable();
+
+        let joined = captured.join("\n");
+        // PURA-214 contract: 5xx refresh failure surfaces with the
+        // "kept_session_alive" flag set, so the operator sees the bug
+        // class on first read (candidate failure #2 in PURA-225's list).
+        assert!(
+            joined.contains(r#""tag":"gate.refresh.fail""#),
+            "missing gate.refresh.fail:\n{joined}"
+        );
+        assert!(
+            joined.contains(r#""kept_session_alive":true"#),
+            "expected kept_session_alive=true on transient refresh fail:\n{joined}"
+        );
+        // Critical paired invariant — the session is still authed.
+        assert!(session.read().is_authenticated());
     }
 }

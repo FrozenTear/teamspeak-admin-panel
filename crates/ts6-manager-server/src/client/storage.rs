@@ -104,22 +104,60 @@ impl LocalStorageStore {
 #[cfg(target_arch = "wasm32")]
 impl Storage for LocalStorageStore {
     fn get(&self, key: &str) -> Option<String> {
-        self.handle()?.get_item(key).ok().flatten()
+        let Some(handle) = self.handle() else {
+            log_session_op(key, "storage.get.no_handle", true, None);
+            return None;
+        };
+        let result = handle.get_item(key).ok().flatten();
+        log_session_op(
+            key,
+            "storage.get",
+            result.is_none(),
+            result.as_ref().map(|v| v.len()),
+        );
+        result
     }
 
     fn set(&self, key: &str, value: &str) {
-        if let Some(s) = self.handle() {
-            // localStorage can throw QuotaExceededError; silently dropping
-            // is fine for a session blob — at worst the user re-logs in.
-            let _ = s.set_item(key, value);
-        }
+        let Some(s) = self.handle() else {
+            log_session_op(key, "storage.set.no_handle", true, Some(value.len()));
+            return;
+        };
+        // localStorage can throw QuotaExceededError; silently dropping
+        // is fine for a session blob — at worst the user re-logs in.
+        let err = s.set_item(key, value).is_err();
+        log_session_op(key, "storage.set", err, Some(value.len()));
     }
 
     fn remove(&self, key: &str) {
-        if let Some(s) = self.handle() {
-            let _ = s.remove_item(key);
-        }
+        let Some(s) = self.handle() else {
+            log_session_op(key, "storage.remove.no_handle", true, None);
+            return;
+        };
+        let err = s.remove_item(key).is_err();
+        log_session_op(key, "storage.remove", err, None);
     }
+}
+
+/// PURA-226 — filtered session-blob breadcrumb for the auth debug knob.
+/// Logging every `localStorage` access would drown the auth signal in
+/// theme / ui-pref / ws-cursor noise, so we only emit when the key is
+/// the persisted session blob (the row that actually carries the
+/// access + refresh pair).
+#[cfg(target_arch = "wasm32")]
+fn log_session_op(key: &str, tag: &str, is_err: bool, bytes: Option<usize>) {
+    use crate::client::debug as auth_debug;
+    use crate::client::store::SESSION_STORAGE_KEY;
+    if key != SESSION_STORAGE_KEY {
+        return;
+    }
+    let bytes_value = bytes
+        .map(|n| serde_json::Value::from(n))
+        .unwrap_or(serde_json::Value::Null);
+    auth_debug::log(
+        tag,
+        auth_debug::fields(&[("err", is_err.into()), ("bytes", bytes_value)]),
+    );
 }
 
 #[cfg(test)]

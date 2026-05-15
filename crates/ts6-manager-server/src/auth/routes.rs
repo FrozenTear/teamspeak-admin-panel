@@ -130,20 +130,52 @@ async fn refresh_handler(
     State(state): State<AppState>,
     Json(req): Json<RefreshRequest>,
 ) -> Result<Json<TokenPairResponse>, Response> {
+    let started = std::time::Instant::now();
     let lifetime = chrono::Duration::from_std(state.jwt_refresh_expiry)
         .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Internal error"))?;
 
-    let rotated = refresh::rotate(&state.db, &req.refresh_token, lifetime)
-        .await
-        .map_err(|_| err(StatusCode::UNAUTHORIZED, msg::INVALID_TOKEN))?;
+    let rotated = match refresh::rotate(&state.db, &req.refresh_token, lifetime).await {
+        Ok(r) => r,
+        Err(_) => {
+            // PURA-226 candidate failure #4 — operator restart wiped the
+            // DB volume, so the SPA's still-valid refresh row no longer
+            // exists. The `refresh::rotate` impl already warns on
+            // reuse-detection; pair that with a per-request `debug` line
+            // so an operator who flipped LOG_LEVEL sees the bounce path
+            // tagged with the source endpoint and elapsed time.
+            tracing::debug!(
+                duration_ms = started.elapsed().as_millis() as u64,
+                reason = "invalid_or_expired",
+                "refresh 401"
+            );
+            return Err(err(StatusCode::UNAUTHORIZED, msg::INVALID_TOKEN));
+        }
+    };
 
     // The DB lookup gives us the user's CURRENT role for the new access
     // token (spec §6.5.3 step 7).
-    let user = users::find_by_id(&state.db, rotated.user_id)
-        .await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Internal error"))?
-        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, msg::USER_DISABLED))?;
+    let user = match users::find_by_id(&state.db, rotated.user_id).await {
+        Ok(Some(u)) => u,
+        Ok(None) => {
+            tracing::debug!(
+                user_id = rotated.user_id,
+                duration_ms = started.elapsed().as_millis() as u64,
+                reason = "user_row_missing_after_rotate",
+                "refresh 401"
+            );
+            return Err(err(StatusCode::UNAUTHORIZED, msg::USER_DISABLED));
+        }
+        Err(_) => {
+            return Err(err(StatusCode::INTERNAL_SERVER_ERROR, "Internal error"));
+        }
+    };
     if !user.enabled {
+        tracing::debug!(
+            user_id = user.id,
+            duration_ms = started.elapsed().as_millis() as u64,
+            reason = "user_disabled_after_rotate",
+            "refresh 401"
+        );
         return Err(err(StatusCode::UNAUTHORIZED, msg::USER_DISABLED));
     }
 
@@ -155,6 +187,13 @@ async fn refresh_handler(
         &state.jwt_secret,
     )
     .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Internal error"))?;
+
+    tracing::debug!(
+        user_id = user.id,
+        family = %rotated.family,
+        duration_ms = started.elapsed().as_millis() as u64,
+        "refresh ok"
+    );
 
     Ok(Json(TokenPairResponse {
         access_token: access,

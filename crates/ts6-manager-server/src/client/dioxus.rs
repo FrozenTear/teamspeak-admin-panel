@@ -11,6 +11,7 @@ use std::sync::Arc;
 use dioxus::prelude::*;
 
 use crate::client::api;
+use crate::client::debug as auth_debug;
 use crate::client::session::{HttpRefresh, RefreshFn, RefreshGate, SessionHandle};
 use crate::client::storage::Storage;
 use crate::client::store::{AuthState, load_state, save_state};
@@ -58,6 +59,12 @@ impl DioxusSession {
     /// logout on success. The interceptor uses [`SessionHandle::update_pair`]
     /// instead because it preserves the cached `UserInfo`.
     pub fn replace(&self, state: AuthState) {
+        let next_authed = state.is_authenticated();
+        let prev_authed = self.state.read().is_authenticated();
+        auth_debug::log(
+            "session.replace",
+            auth_debug::fields(&[("from", prev_authed.into()), ("to", next_authed.into())]),
+        );
         *self.state.write_unchecked() = state.clone();
         save_state(&*self.storage, &state);
     }
@@ -76,7 +83,19 @@ impl SessionHandle for DioxusSession {
             },
             // Race: someone invalidated us between the gate's lock and our
             // write. Don't resurrect a session — leave Anonymous in place.
-            AuthState::Anonymous => return,
+            // PURA-226 — emit a dedicated breadcrumb for this branch so a
+            // dropped rotation is distinguishable from a successful one in
+            // the console capture. The gate's `session.update_pair` line
+            // fires *before* this call, so a tail of
+            // `session.update_pair → session.update_pair.dropped_on_anonymous`
+            // is the candidate failure #3 fingerprint.
+            AuthState::Anonymous => {
+                auth_debug::log(
+                    "session.update_pair.dropped_on_anonymous",
+                    serde_json::Value::Null,
+                );
+                return;
+            }
         };
         *self.state.write_unchecked() = next.clone();
         save_state(&*self.storage, &next);
@@ -141,7 +160,23 @@ pub fn provide_session() -> DioxusSession {
 /// signal subscriptions.
 pub fn rehydrate_from_storage(session: &DioxusSession) {
     let loaded = load_state(&*session.storage);
-    if matches!(loaded, AuthState::Authenticated { .. }) {
+    let hydrated = matches!(loaded, AuthState::Authenticated { .. });
+    auth_debug::log(
+        "session.rehydrate",
+        auth_debug::fields(&[
+            ("hydrated", hydrated.into()),
+            (
+                "access",
+                match &loaded {
+                    AuthState::Authenticated { access, .. } => {
+                        auth_debug::short_token(access).into()
+                    }
+                    AuthState::Anonymous => "".into(),
+                },
+            ),
+        ]),
+    );
+    if hydrated {
         let state = session.state;
         *state.write_unchecked() = loaded;
     }
