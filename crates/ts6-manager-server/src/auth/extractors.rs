@@ -11,10 +11,13 @@
 //! `RequireServerAccess` extractor — that lands when the first per-server
 //! REST route does (none exist yet in the Phase 1 surface).
 
+use std::convert::Infallible;
+use std::net::SocketAddr;
+
 use axum::Json;
-use axum::extract::{FromRef, FromRequestParts};
+use axum::extract::{ConnectInfo, FromRef, FromRequestParts};
 use axum::http::StatusCode;
-use axum::http::header::AUTHORIZATION;
+use axum::http::header::{AUTHORIZATION, USER_AGENT};
 use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 use ts6_manager_shared::auth::{ErrorResponse, auth_error_strings as msg};
@@ -22,6 +25,7 @@ use ts6_manager_shared::auth::{ErrorResponse, auth_error_strings as msg};
 use crate::app_state::AppState;
 use crate::auth::jwt;
 use crate::repos::users;
+use crate::web::proxy;
 
 /// User context attached to a request after [`RequireAuth`] succeeds.
 #[derive(Debug, Clone)]
@@ -174,6 +178,44 @@ where
             return Err(AuthError::Forbidden);
         }
         Ok(RequireModerator(user))
+    }
+}
+
+/// PURA-235 / docs/admin/audit-shape.md §4.3 — captures request metadata
+/// the audit-log writer needs (client IP per spec §6.8, raw `User-Agent`
+/// header). Infallible: missing values degrade to `None` so the audit row
+/// can still record what it knows.
+///
+/// `requestUserAgent` is truncated to 1 KiB at the persistence boundary
+/// inside the repo, not here — keeps the original-length string available
+/// to tracing if a future caller wants it.
+#[derive(Debug, Clone, Default)]
+pub struct RequestMeta {
+    pub ip: Option<String>,
+    pub user_agent: Option<String>,
+}
+
+impl<S> FromRequestParts<S> for RequestMeta
+where
+    AppState: FromRef<S>,
+    S: Send + Sync,
+{
+    type Rejection = Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let app: AppState = AppState::from_ref(state);
+        let connect = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|c| c.0);
+        let ip = connect
+            .map(|addr| proxy::client_ip(&parts.headers, addr, app.trusted_proxy_hops).to_string());
+        let user_agent = parts
+            .headers
+            .get(USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        Ok(RequestMeta { ip, user_agent })
     }
 }
 

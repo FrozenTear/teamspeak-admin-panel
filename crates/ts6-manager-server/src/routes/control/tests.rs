@@ -243,6 +243,7 @@ async fn fresh_state() -> AppState {
         moq_public_url: None,
         yt_cookie: std::sync::Arc::new(std::sync::RwLock::new(None)),
         data_dir: std::path::PathBuf::from("./data"),
+        trusted_proxy_hops: 0,
     }
 }
 

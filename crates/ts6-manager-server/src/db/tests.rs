@@ -22,6 +22,7 @@ async fn migrations_apply_priority_slice_on_fresh_db() {
             "0006_ssh_audit_log".to_string(),
             "0007_video_source".to_string(),
             "0008_server_last_seen_at".to_string(),
+            "0009_admin_audit_log".to_string(),
         ],
         "first run should apply every migration"
     );
@@ -41,7 +42,7 @@ async fn migrations_runner_is_idempotent() {
     );
     assert_eq!(
         second.skipped.len(),
-        8,
+        9,
         "second run should skip every migration applied on the first run"
     );
 }

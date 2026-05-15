@@ -13,6 +13,7 @@
 use anyhow::{Result, bail};
 use surrealdb::types::{RecordId, RecordIdKey};
 
+pub mod admin_audit_log;
 pub mod app_settings;
 pub mod bot_execution_logs;
 pub mod bot_executions;

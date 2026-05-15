@@ -8,12 +8,14 @@
 //! `crate::crypto` (seal/unseal) into wire-shape responses defined in
 //! `ts6_manager_shared::{setup, servers}`.
 
+pub mod audit;
 pub mod control;
 pub mod metrics;
 pub mod music_bots;
 pub mod servers;
 pub mod settings;
 pub mod setup;
+pub mod users;
 
 use ts6_manager_shared::servers::ServerSummary;
 
