@@ -146,7 +146,10 @@ pub fn ChannelsPage() -> Element {
 
         if let Some(err) = error.read().as_ref() {
             Banner { variant: BannerVariant::Danger, title: "Could not load channels".to_string(),
-                "{format_error(err)}"
+                p { "{format_error(err)}" }
+                if let Some(hint) = err.transport_hint() {
+                    p { class: "banner-hint", "{hint}" }
+                }
             }
         }
 

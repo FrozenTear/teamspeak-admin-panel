@@ -101,8 +101,13 @@ pub fn DashboardPlaceholder() -> Element {
                 },
                 Some(Err(err)) => {
                     let (title, body) = error_copy(err);
+                    let hint = err.transport_hint().map(str::to_string);
                     rsx! {
-                        DashboardErrorView { title: title.to_string(), body: body }
+                        DashboardErrorView {
+                            title: title.to_string(),
+                            body: body,
+                            transport_hint: hint,
+                        }
                     }
                 }
             } }
@@ -271,13 +276,24 @@ fn DashboardKpi(props: DashboardKpiProps) -> Element {
 struct DashboardErrorViewProps {
     title: String,
     body: String,
+    /// PURA-211 — when the upstream error is a transport-class failure
+    /// (`code == -1` per spec §10.5), the banner appends a one-line
+    /// loopback hint pointing the operator at the most common operator
+    /// misconfiguration: WebQuery bound to 127.0.0.1 only while the
+    /// stored host is a public DNS name. Empty when the hint does not
+    /// apply (upstream upstream-code error, session expired, etc.).
+    #[props(default)]
+    transport_hint: Option<String>,
 }
 
 #[component]
 fn DashboardErrorView(props: DashboardErrorViewProps) -> Element {
     rsx! {
         Banner { variant: BannerVariant::Danger, title: props.title,
-            "{props.body}"
+            p { class: "dashboard-error-body", "{props.body}" }
+            if let Some(hint) = props.transport_hint.as_deref() {
+                p { class: "dashboard-error-hint", "{hint}" }
+            }
         }
     }
 }

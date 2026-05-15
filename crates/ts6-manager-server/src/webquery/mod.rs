@@ -41,6 +41,7 @@
 pub mod dashboard;
 pub mod escape;
 pub mod models;
+pub mod probe;
 
 use std::collections::HashMap;
 use std::sync::Arc;

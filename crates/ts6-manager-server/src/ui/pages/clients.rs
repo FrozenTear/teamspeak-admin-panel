@@ -223,7 +223,10 @@ pub fn ClientsPage() -> Element {
 
         if let Some(err) = last_error.read().as_ref() {
             Banner { variant: BannerVariant::Danger, title: "Could not load clients".to_string(),
-                "{format_error(err)}"
+                p { "{format_error(err)}" }
+                if let Some(hint) = err.transport_hint() {
+                    p { class: "banner-hint", "{hint}" }
+                }
             }
         }
 

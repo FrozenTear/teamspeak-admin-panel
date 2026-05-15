@@ -10,6 +10,14 @@
 //! enforced by [`AppState::setup_lock`] held across the count-check + the
 //! atomic insert pair (see [`crate::repos::setup::init_admin_and_first_server`]).
 //!
+//! `POST /api/setup/test-connection` (PURA-211, unauthenticated, only while
+//! `needsSetup == true`): probes operator-supplied WebQuery credentials via
+//! a one-shot reqwest call before the wizard commits the row. Returns a
+//! typed `TestConnectionResponse` with a stable-wire `kind` discriminator
+//! so the FE can render remediation copy without parsing reqwest's
+//! `Display`. After setup completes the route hard-fails with the same
+//! `409 already_initialized` body as `init`.
+//!
 //! Security lenses applied:
 //! - **AuthN/AuthZ**: setup is intentionally credential-less; the gate is
 //!   `user_count == 0`. Once any user exists, the endpoint hard-fails.
@@ -36,6 +44,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use ts6_manager_shared::auth::{ErrorResponse, UserInfo};
 use ts6_manager_shared::setup::{SetupInitRequest, SetupInitResponse, SetupStatusResponse};
+use ts6_manager_shared::test_connection::{TestConnectionRequest, TestConnectionResponse};
 
 use crate::app_state::AppState;
 use crate::auth::{complexity, password};
@@ -45,6 +54,7 @@ use crate::repos::users::NewUser;
 use crate::repos::{self, users};
 use crate::routes::server_summary_from_row;
 use crate::web::rate_limit::{RateLimitState, rate_limit_auth};
+use crate::webquery::probe::probe_webquery;
 
 /// Wire-string for the one-shot 409. PURA-22 fixes the body verbatim so the
 /// FE can branch without parsing English copy.
@@ -66,10 +76,20 @@ const DEFAULT_SSH_PORT: i64 = 10022;
 /// the wizard's needs-setup probe and rate-limiting it would just
 /// degrade the first-run UX without buying any defence.
 pub fn router(rate_limit: RateLimitState) -> Router<AppState> {
-    let rl_layer = from_fn_with_state(rate_limit, rate_limit_auth);
+    let rl_layer = from_fn_with_state(rate_limit.clone(), rate_limit_auth);
+    // PURA-211: same per-IP bucket as `init` so an attacker who finds an
+    // un-initialised panel can't burn a probe loop against arbitrary
+    // hosts. Honours the same `needsSetup` gate inside the handler — a
+    // post-init panel hard-fails the same way `init` does, so the
+    // endpoint disappears the moment the wizard succeeds.
+    let probe_rl_layer = from_fn_with_state(rate_limit, rate_limit_auth);
     Router::new()
         .route("/api/setup/status", get(status))
         .route("/api/setup/init", post(init).layer(rl_layer))
+        .route(
+            "/api/setup/test-connection",
+            post(test_connection).layer(probe_rl_layer),
+        )
 }
 
 async fn status(State(state): State<AppState>) -> Result<Json<SetupStatusResponse>, Response> {
@@ -202,6 +222,45 @@ async fn init(
         server: server_summary_from_row(server_row),
     };
     Ok((StatusCode::CREATED, Json(body)))
+}
+
+/// PURA-211 — operator-supplied connectivity probe. Same `needsSetup` gate
+/// as `POST /api/setup/init` so the surface disappears the moment the
+/// wizard completes; per-IP rate-limited via the shared setup bucket so an
+/// attacker who hits an un-initialised panel cannot use it as an outbound
+/// probing relay.
+///
+/// Returns a typed `TestConnectionResponse` body on every code path
+/// (including reachability failures) so the FE can render structured
+/// error copy without parsing reqwest's `Display`. HTTP 200 carries the
+/// classified result; HTTP 409 fires when setup is already complete.
+async fn test_connection(
+    State(state): State<AppState>,
+    Json(req): Json<TestConnectionRequest>,
+) -> Result<Json<TestConnectionResponse>, Response> {
+    let n = users::count(&state.db).await.map_err(|e| {
+        tracing::error!(err = %e, "setup_test_connection: user count query failed");
+        internal()
+    })?;
+    if n > 0 {
+        return Err(err(StatusCode::CONFLICT, ALREADY_INITIALIZED));
+    }
+
+    let port: u16 = req
+        .webquery_port
+        .unwrap_or(DEFAULT_WEBQUERY_PORT)
+        .try_into()
+        .unwrap_or(10080);
+    let use_https = req.use_https.unwrap_or(false);
+    // `allow_self_signed` reads the operator's boot env flag so an
+    // operator who set `TS_ALLOW_SELF_SIGNED=1` can probe a self-hosted
+    // HTTPS endpoint from the wizard. No request body field controls this
+    // — the wire surface stays minimal.
+    let allow_self_signed = std::env::var("TS_ALLOW_SELF_SIGNED")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let resp = probe_webquery(&req.host, port, use_https, &req.api_key, allow_self_signed).await;
+    Ok(Json(resp))
 }
 
 fn err(status: StatusCode, body: &str) -> Response {
@@ -584,5 +643,93 @@ mod tests {
             rows[0].sshHostKeyFingerprint.as_deref(),
             Some("SHA256:0123456789abcdef0123456789abcdef0123456789abcdef0")
         );
+    }
+
+    /// PURA-211 — un-initialised panels accept the probe and return a
+    /// typed `TestConnectionResponse`. Pointing at an unused loopback
+    /// port reliably triggers `kind = "connect"`, which is the PURA-211
+    /// root-cause shape (WebQuery bound elsewhere / firewall drop).
+    #[tokio::test]
+    async fn test_connection_returns_typed_connect_on_unused_port_before_setup() {
+        let state = fresh_state().await;
+        let app = app(state);
+
+        // Grab a port the OS will reliably return ECONNREFUSED on.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let req = ts6_manager_shared::test_connection::TestConnectionRequest {
+            host: "127.0.0.1".into(),
+            api_key: "doesn't-matter".into(),
+            webquery_port: Some(port as i64),
+            use_https: Some(false),
+        };
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/setup/test-connection")
+                    .header("content-type", "application/json")
+                    .body(json_body(&req))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: ts6_manager_shared::test_connection::TestConnectionResponse =
+            read_json(resp).await;
+        assert!(!body.ok);
+        assert_eq!(
+            body.kind,
+            ts6_manager_shared::test_connection::TestConnectionKind::Connect
+        );
+        assert!(body.url_tried.contains(&format!(":{port}/version")));
+    }
+
+    /// PURA-211 — once `needsSetup` is false the route disappears: the
+    /// surface must hard-fail with the same `409 already_initialized`
+    /// body as `init`, so an attacker who finds a post-init panel cannot
+    /// use it as an outbound probing relay.
+    #[tokio::test]
+    async fn test_connection_returns_409_already_initialized_post_setup() {
+        let state = fresh_state().await;
+        let app = app(state);
+
+        // Seed an initialised panel.
+        let init = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/setup/init")
+                    .header("content-type", "application/json")
+                    .body(json_body(&valid_init_body()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(init.status(), StatusCode::CREATED);
+
+        let req = ts6_manager_shared::test_connection::TestConnectionRequest {
+            host: "127.0.0.1".into(),
+            api_key: "k".into(),
+            webquery_port: Some(10080),
+            use_https: Some(false),
+        };
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/setup/test-connection")
+                    .header("content-type", "application/json")
+                    .body(json_body(&req))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let err: ErrorResponse = read_json(resp).await;
+        assert_eq!(err.error, ALREADY_INITIALIZED);
     }
 }
