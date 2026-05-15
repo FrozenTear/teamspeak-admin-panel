@@ -23,6 +23,8 @@ mod crypto;
 #[cfg(feature = "server")]
 mod db;
 #[cfg(feature = "server")]
+mod flow;
+#[cfg(feature = "server")]
 mod logging;
 #[cfg(feature = "server")]
 mod music_bots;
@@ -218,6 +220,24 @@ mod server_entry {
             })
         });
 
+        // PURA-242 — v1.1 flow engine + REST surface. The engine boots
+        // before the listener opens so the boot-time in-flight-run sweep
+        // and cron registration (PURA-241 engine §6.1) complete first.
+        // `BasicDispatcher` runs `logLine` actions for real and fails the
+        // other three action kinds loudly; wiring the production action
+        // dispatcher (`ts6Command` / `musicBotCommand` / `webhookOut`) is
+        // a tracked follow-up. The handle is bound `_flow_engine` so the
+        // `FlowEngine`'s cron + TTL tasks live for the whole serve scope
+        // and abort on shutdown via its `Drop`.
+        let _flow_engine = crate::flow::FlowEngine::start(crate::flow::EngineDeps::new(
+            database.clone(),
+            std::sync::Arc::new(crate::flow::BasicDispatcher),
+        ))
+        .await
+        .context("flow engine boot")?;
+        let flow_api_state =
+            crate::flow::routes::FlowApiState::new(state.clone(), _flow_engine.handle());
+
         // Phase 1 SECURITY (slice 4b): per-IP rate limit on the auth
         // surface. One bucket shared across `/login` and `/refresh` per
         // spec §6.8; `trusted_proxy_hops` decides whether the limiter
@@ -296,6 +316,11 @@ mod server_entry {
         // `widget_cache` so a rotated or deleted token 404s on the next
         // public-route call (spec §7.29 / §26.4).
         let widget_admin_router = widgets::admin::router().with_state(state);
+        // PURA-242 — v1.1 flow-engine REST surface (`/api/flows`, `/fire`,
+        // `/runs`). Carries its own `FlowApiState` (wraps `AppState` +
+        // the engine handle); `RequireAuth` / `RequireAdmin` still apply
+        // via the `FromRef<FlowApiState> for AppState` impl.
+        let flows_router = crate::flow::routes::router().with_state(flow_api_state);
 
         // PURA-17: `serve_dioxus_application` registers static assets +
         // server functions and adds a fallback that serves the dx-CLI
@@ -333,6 +358,8 @@ mod server_entry {
             .merge(widget_router)
             // PURA-72 Slice D ([PURA-89]) — operator widget CRUD `/api/widgets`.
             .merge(widget_admin_router)
+            // PURA-242 — v1.1 flow-engine REST surface.
+            .merge(flows_router)
             .serve_dioxus_application(serve_cfg, ui::App)
             .layer(web::cors_layer(&cfg.frontend_url));
         let router = web::security_headers_stack(cfg.node_env).apply(router);

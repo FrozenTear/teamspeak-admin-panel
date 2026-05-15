@@ -14,7 +14,8 @@ path = "src/lib.rs"
 [dependencies]
 chrono = { workspace = true }
 serde = { workspace = true }
-# `serde_json` is part of the public API of `flows::Action` (args carry
-# dynamic JSON) and `flows::FlowRun.trigger`. Stays WASM-clean because
-# `serde_json` is pure Rust without OS deps.
+# PURA-241 — `flows::Trigger` / `Action::*::args` / `FlowRun.trigger`
+# carry operator-authored JSON. `serde_json` is part of the public API
+# of `flows` and stays WASM-clean (pure Rust, no OS deps), so the Dioxus
+# client deserialises straight into these types.
 serde_json = { workspace = true }

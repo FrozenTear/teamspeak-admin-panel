@@ -950,6 +950,10 @@ fn describe_error(err: &ApiError) -> (&'static str, String) {
             "Widget not available",
             "This widget URL is no longer valid.".into(),
         ),
+        // PURA-232 — the public widget route does not go through the
+        // session gate, so this arm should never fire here. Map it to a
+        // generic loading message for defence-in-depth.
+        ApiError::SessionAnonymous => ("Loading widget…", "Please wait a moment.".into()),
         ApiError::UnsupportedTarget => (
             "Widget unavailable in this view",
             "Public widgets only render in the browser build.".into(),

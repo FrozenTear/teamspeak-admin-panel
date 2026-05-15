@@ -728,6 +728,7 @@ fn format_error(err: &ApiError) -> String {
             s
         }
         ApiError::Unauthorized(_) => "Session expired. Sign in again.".into(),
+        ApiError::SessionAnonymous => "Loading…".into(),
         ApiError::Client { status, message } => format!("{status}: {message}"),
         ApiError::Server { status, message } => format!("{status}: {message}"),
         ApiError::Transport(m) => format!("Transport error: {m}"),

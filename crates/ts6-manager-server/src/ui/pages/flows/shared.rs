@@ -135,6 +135,10 @@ pub fn format_error(err: &ApiError) -> String {
         ApiError::Transport(m) => format!("Transport error: {m}"),
         ApiError::Deserialise(m) => format!("Unexpected response: {m}"),
         ApiError::UnsupportedTarget => "Action unavailable in this view.".into(),
+        // Session not yet rehydrated — the page is still mounting. Mirrors
+        // `music_bots::shared::format_error` so the flows pages render the
+        // same transient copy rather than an error banner.
+        ApiError::SessionAnonymous => "Loading…".into(),
     }
 }
 

@@ -36,6 +36,21 @@ pub enum ApiError {
     /// disabled). Either way: re-auth required.
     Unauthorized(String),
 
+    /// PURA-232 — the auth gate short-circuited a request because the
+    /// session signal was still `Anonymous`. Distinct from
+    /// [`ApiError::Unauthorized`] so fetch-state surfaces (e.g.
+    /// `ServersIndexPage`) render this as Loading instead of "Session
+    /// expired — Sign in again".
+    ///
+    /// This is fired in the brief window between an `AppShell` mount
+    /// and `rehydrate_from_storage` completing, or right after a logout
+    /// before the route guard takes over. The pattern in
+    /// `mount_servers_context` is to subscribe to `is_authenticated()`
+    /// via `use_memo` and refetch when the session transitions
+    /// Anonymous → Authenticated — that turns this error into a
+    /// self-healing transient.
+    SessionAnonymous,
+
     /// Spec §7.0.2 502 envelope — TeamSpeak upstream failed.
     /// `code` follows the WebQuery numeric scheme; `-1` is the panel-internal
     /// "transport / TLS / decrypt failure" sentinel (§10.5).
@@ -74,6 +89,13 @@ impl ApiError {
         matches!(self, ApiError::BadGateway { .. })
     }
 
+    /// PURA-232 — `true` only for the SPA-internal anonymous short-circuit.
+    /// Use this in fetch-state surfaces to render a Loading skeleton
+    /// instead of a "Session expired" banner.
+    pub fn is_session_anonymous(&self) -> bool {
+        matches!(self, ApiError::SessionAnonymous)
+    }
+
     /// PURA-211 — one-line remediation hint for the transport-class branch
     /// (spec §10.5 sentinel `code == -1` on a 502 BadGateway). Returns
     /// `None` when the hint does not apply. Surfaced by every page that
@@ -97,6 +119,7 @@ impl std::fmt::Display for ApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ApiError::Unauthorized(m) => write!(f, "401 Unauthorized: {m}"),
+            ApiError::SessionAnonymous => write!(f, "session not ready (anonymous)"),
             ApiError::BadGateway {
                 error,
                 code,
@@ -127,6 +150,7 @@ impl From<AuthError> for ApiError {
     fn from(err: AuthError) -> Self {
         match err {
             AuthError::Unauthorized(m) => ApiError::Unauthorized(m),
+            AuthError::SessionAnonymous => ApiError::SessionAnonymous,
             AuthError::Client { status, message } => ApiError::Client { status, message },
             AuthError::Server { status, message } => ApiError::Server { status, message },
             AuthError::Transport(m) => ApiError::Transport(m),
@@ -377,6 +401,7 @@ fn log_api_call_exit<T>(method: &str, path: &str, status: u16, result: &Result<T
 fn api_error_tag(err: &ApiError) -> &'static str {
     match err {
         ApiError::Unauthorized(_) => "unauthorized",
+        ApiError::SessionAnonymous => "session_anonymous",
         ApiError::BadGateway { .. } => "bad_gateway",
         ApiError::Client { .. } => "client",
         ApiError::Server { .. } => "server",

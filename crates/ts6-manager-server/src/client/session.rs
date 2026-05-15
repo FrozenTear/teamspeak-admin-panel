@@ -141,9 +141,10 @@ impl RefreshGate {
     ///
     /// Behaviour:
     /// - If the session is `Anonymous`, returns
-    ///   `AuthError::Unauthorized(INVALID_TOKEN)` without calling `f`. The
-    ///   route layer is expected to redirect to `/login` rather than have
-    ///   us forge a bearer.
+    ///   [`AuthError::SessionAnonymous`] without calling `f` (PURA-232).
+    ///   This is a client-side short-circuit, not a server 401 — callers
+    ///   render it as a transient Loading state, and the route layer
+    ///   redirects to `/login` if the session never materialises.
     /// - On `Unauthorized(INVALID_TOKEN)` from `f`, take the lock, possibly
     ///   refresh, replay `f` once. Replay failure terminates the session.
     /// - On any other 401 from `f` (`NO_TOKEN` / `USER_DISABLED`), invalidate
@@ -165,10 +166,23 @@ impl RefreshGate {
                 // the gate's contract documents. Lets the operator see
                 // when a request rode the gate without a session (race
                 // with a logout, rehydrate that found no blob).
+                //
+                // PURA-232 — return a dedicated [`AuthError::SessionAnonymous`]
+                // variant instead of the server-401 envelope. The previous
+                // shape (`Unauthorized(INVALID_TOKEN)`) caused
+                // `ServersIndexPage` (and any other fetch-state surface) to
+                // render "Session expired — Sign in again" the moment a
+                // race fired between `mount_servers_context`'s `use_future`
+                // and `App`'s rehydrate `use_effect`. The race is intrinsic
+                // to first-paint — `provide_session` deliberately returns
+                // `Anonymous` so SSR and the browser hydrate identical
+                // trees, then the post-mount effect upgrades the state.
+                // Re-classifying the short-circuit as a distinct,
+                // self-healing transient is the smallest fix that
+                // unblocks operators stuck on the bouncing /servers
+                // banner after a hard-refresh.
                 auth_debug::log("gate.anonymous_short_circuit", serde_json::Value::Null);
-                return Err(AuthError::Unauthorized(
-                    ts6_manager_shared::auth::auth_error_strings::INVALID_TOKEN.into(),
-                ));
+                return Err(AuthError::SessionAnonymous);
             }
         };
         let first_access = first_snapshot.access.clone();
@@ -220,10 +234,14 @@ impl RefreshGate {
         let after_lock = match self.snapshot() {
             Some(s) => s,
             None => {
+                // PURA-232 — same SessionAnonymous classification as the
+                // first-snapshot branch above. The session was invalidated
+                // (logout, peer 401 sweep) between our initial read and
+                // our lock acquisition; this is the SPA's own state
+                // change, not a server 401. Render as Loading; the route
+                // guard will bounce to `/login` on the next render.
                 auth_debug::log("gate.session_lost_under_lock", serde_json::Value::Null);
-                return Err(AuthError::Unauthorized(
-                    ts6_manager_shared::auth::auth_error_strings::INVALID_TOKEN.into(),
-                ));
+                return Err(AuthError::SessionAnonymous);
             }
         };
         if after_lock.access != first_access {
@@ -499,7 +517,21 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn anonymous_session_short_circuits_to_unauthorized() {
+    async fn anonymous_session_short_circuits_with_session_anonymous_error() {
+        // PURA-232 regression — the gate's Anonymous short-circuit MUST
+        // return a dedicated [`AuthError::SessionAnonymous`] variant, not
+        // a synthetic `Unauthorized("Invalid or expired token")`. Pages
+        // map the latter to "Session expired — Sign in again", which
+        // strands operators in a bouncing banner the moment
+        // `mount_servers_context`'s `use_future` polls before
+        // `rehydrate_from_storage` upgrades the session signal.
+        //
+        // Pinned invariants:
+        //   - error variant is `SessionAnonymous`
+        //   - `is_unauthorized()` returns false (this is not a server 401)
+        //   - `is_invalid_or_expired_token()` returns false (no refresh
+        //     dance — there's no token to refresh)
+        //   - refresh fn never fires
         let storage = arc_storage(MemoryStore::new());
         let session: Arc<dyn SessionHandle> =
             Arc::new(InMemorySession::new(AuthState::Anonymous, storage.clone()));
@@ -510,8 +542,57 @@ mod tests {
             .run(|_| async { Ok::<u32, AuthError>(0) })
             .await
             .unwrap_err();
-        assert!(err.is_invalid_or_expired_token(), "got: {err}");
+        assert!(
+            matches!(err, AuthError::SessionAnonymous),
+            "anonymous short-circuit must return SessionAnonymous, got: {err:?}"
+        );
+        assert!(
+            !err.is_unauthorized(),
+            "SessionAnonymous must not be classified as a server 401: {err}"
+        );
+        assert!(
+            !err.is_invalid_or_expired_token(),
+            "SessionAnonymous must not trigger refresh-eligible classification: {err}"
+        );
         assert_eq!(stub.calls(), 0);
+    }
+
+    /// PURA-232 — the Anonymous short-circuit MUST NOT call
+    /// `session.invalidate()`. The session is already Anonymous, so the
+    /// op is a no-op at best, and at worst it pollutes the breadcrumb
+    /// trail and triggers spurious storage writes. Pin the no-op
+    /// invariant by asserting the session and storage are untouched
+    /// after the short-circuit fires.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn anonymous_short_circuit_does_not_invalidate_or_touch_storage() {
+        let storage = arc_storage(MemoryStore::new());
+        let session: Arc<dyn SessionHandle> =
+            Arc::new(InMemorySession::new(AuthState::Anonymous, storage.clone()));
+        let stub = StubRefresh::new(|_| panic!("must not refresh"));
+        let gate = RefreshGate::new(session.clone(), stub.clone());
+
+        // Sanity: no persisted blob to start with.
+        assert!(
+            storage
+                .get(crate::client::store::SESSION_STORAGE_KEY)
+                .is_none(),
+            "fresh storage should be empty"
+        );
+
+        let _ = gate.run(|_| async { Ok::<u32, AuthError>(0) }).await;
+
+        // Session stays Anonymous; storage stays empty. No
+        // `session.invalidate()` fired (which would have called
+        // `save_state(Anonymous)` and is a no-op here but would still
+        // surface in instrumentation as a misleading
+        // `session.invalidate` breadcrumb).
+        assert_eq!(session.read(), AuthState::Anonymous);
+        assert!(
+            storage
+                .get(crate::client::store::SESSION_STORAGE_KEY)
+                .is_none(),
+            "anonymous short-circuit must not write to storage"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1114,5 +1195,121 @@ mod tests {
         );
         // Critical paired invariant — the session is still authed.
         assert!(session.read().is_authenticated());
+    }
+
+    /// PURA-233 regression — the v1.0.10 instrumentation truncated
+    /// every token to its first 8 bytes for the breadcrumb. Every
+    /// JWT minted by [`crate::auth::jwt`] starts with `eyJ0eXAi`
+    /// (the base64url encoding of the canonical `{"typ":"JWT",`
+    /// header), so the post-refresh `session.update_pair`
+    /// breadcrumb collapsed onto the same `access:"eyJ0eXAi"`
+    /// string as the pre-refresh `gate.enter` line. An operator
+    /// pasting their `?debug=auth` console capture into the issue
+    /// thread could not tell whether the rotation had actually
+    /// happened — exactly the diagnostic blindspot that left the
+    /// board stranded on the `/servers` Session-expired loop with
+    /// no way to discriminate between the four candidate failure
+    /// modes listed in [PURA-225](/PURA/issues/PURA-225).
+    ///
+    /// The contract this test pins: after a successful refresh,
+    /// the `gate.enter` breadcrumb (logged against the OLD access
+    /// token) and the `session.update_pair` breadcrumb (logged
+    /// against the NEW access token) MUST emit distinct
+    /// `new_access` / `access` prefixes whenever the underlying
+    /// tokens differ. Two JWTs that differ only in their signature
+    /// segment — the only segment that necessarily varies across a
+    /// rotation, since payload-level claims (`sub`, `username`,
+    /// `role`) are usually unchanged — must surface as different
+    /// breadcrumbs.
+    #[tokio::test(flavor = "current_thread")]
+    async fn refresh_breadcrumbs_distinguish_jwts_with_shared_header_prefix() {
+        use ts6_manager_shared::auth::auth_error_strings as msg;
+
+        // Two JWT-shaped strings that share the standard header +
+        // payload prefix but differ in their signature tail. Without
+        // the PURA-233 short_token fix both would render as
+        // `access:"eyJ0eXAi"` in the breadcrumb and an operator
+        // could not tell them apart from a console capture alone.
+        const JWT_OLD: &str = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.SIG_OLD";
+        const JWT_NEW: &str = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.SIG_NEW";
+
+        auth_debug::test_override::enable();
+        let storage = arc_storage(MemoryStore::new());
+        let session: Arc<dyn SessionHandle> = Arc::new(InMemorySession::new(
+            authed(JWT_OLD, "old-refresh"),
+            storage.clone(),
+        ));
+        let stub = StubRefresh::new(|_| {
+            Ok(TokenPairResponse {
+                access_token: JWT_NEW.into(),
+                refresh_token: "new-refresh".into(),
+            })
+        });
+        let gate = RefreshGate::new(session.clone(), stub.clone());
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_clone = calls.clone();
+        gate.run(move |snap| {
+            let calls = calls_clone.clone();
+            async move {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    assert_eq!(snap.access, JWT_OLD);
+                    Err(AuthError::Unauthorized(msg::INVALID_TOKEN.into()))
+                } else {
+                    assert_eq!(snap.access, JWT_NEW);
+                    Ok::<u32, AuthError>(7)
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        let captured = auth_debug::test_override::drain();
+        auth_debug::test_override::disable();
+
+        // The two breadcrumbs the operator correlates by eye:
+        //   gate.enter        — recorded against JWT_OLD
+        //   session.update_pair — recorded against JWT_NEW
+        let gate_enter_line = captured
+            .iter()
+            .find(|line| line.contains(r#""tag":"gate.enter""#))
+            .unwrap_or_else(|| panic!("no gate.enter breadcrumb captured:\n{captured:?}"));
+        let update_pair_line = captured
+            .iter()
+            .find(|line| line.contains(r#""tag":"session.update_pair""#))
+            .unwrap_or_else(|| panic!("no session.update_pair captured:\n{captured:?}"));
+
+        // The `access` field is wrapped in JSON quotes, so the prefix
+        // appears as `"access":"<short_token output>"`. The
+        // post-refresh line uses the `new_access` field name on the
+        // same value. Extract both and pin them as distinct.
+        let gate_prefix = extract_field(gate_enter_line, "access");
+        let update_prefix = extract_field(update_pair_line, "new_access");
+        assert_ne!(
+            gate_prefix, update_prefix,
+            "post-rotation breadcrumb MUST distinguish the new access token \
+             from the old; both collapsed onto {gate_prefix:?} with the v1.0.10 \
+             short_token (PURA-233):\n\
+             gate.enter:        {gate_enter_line}\n\
+             session.update_pair: {update_pair_line}"
+        );
+    }
+
+    /// Tiny scraper for `"field":"value"` pairs inside a JSON-encoded
+    /// breadcrumb line. The test capture format is a single-line
+    /// `serde_json::to_string` of an [`auth_debug::AuthEvent`]; we
+    /// avoid pulling in the full parser because the captured lines
+    /// can contain ad-hoc fields that vary across breadcrumbs and the
+    /// asserts only care about one field at a time.
+    fn extract_field(line: &str, key: &str) -> String {
+        let needle = format!(r#""{key}":""#);
+        let idx = line
+            .find(&needle)
+            .unwrap_or_else(|| panic!("field `{key}` not found in:\n{line}"));
+        let rest = &line[idx + needle.len()..];
+        let end = rest
+            .find('"')
+            .unwrap_or_else(|| panic!("unterminated value for `{key}` in:\n{line}"));
+        rest[..end].to_string()
     }
 }
