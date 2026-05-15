@@ -89,6 +89,42 @@ pub fn action_kind_label(action: &wire::Action) -> &'static str {
     }
 }
 
+/// Human label for an [`wire::ActionResult.kind`] wire discriminant. The
+/// per-run results panel (`ui-brief.md` §3.3) only has the camelCase
+/// string the engine emitted, not the typed [`wire::Action`], so this
+/// maps it back to the same copy [`action_kind_label`] produces.
+pub fn action_wire_kind_label(kind: &str) -> &str {
+    match kind {
+        "ts6Command" => "TS6 command",
+        "musicBotCommand" => "Music-bot command",
+        "webhookOut" => "Webhook",
+        "logLine" => "Log line",
+        // An unrecognised kind is surfaced verbatim rather than hidden —
+        // a wire/engine drift should be visible, not silently relabelled.
+        other => other,
+    }
+}
+
+/// Operator-facing label for a per-action [`wire::ActionStatus`].
+pub fn action_status_label(status: wire::ActionStatus) -> &'static str {
+    match status {
+        wire::ActionStatus::Ok => "Ok",
+        wire::ActionStatus::Errored => "Errored",
+        wire::ActionStatus::Skipped => "Skipped",
+    }
+}
+
+/// Pill class for a per-action [`wire::ActionStatus`] — same `bot-badge`
+/// vocabulary as [`run_status_badge_class`], so a failed action reads as
+/// danger and the benign outcomes stay neutral.
+pub fn action_status_badge_class(status: wire::ActionStatus) -> &'static str {
+    match status {
+        wire::ActionStatus::Ok => "bot-badge bot-badge--play",
+        wire::ActionStatus::Errored => "bot-badge bot-badge--error",
+        wire::ActionStatus::Skipped => "bot-badge bot-badge--off",
+    }
+}
+
 /// `ui-brief.md` §2 cron preset chips. Display label → cron expression.
 pub const CRON_PRESETS: &[(&str, &str)] = &[
     ("every 5 min", "0 */5 * * * *"),
@@ -99,8 +135,55 @@ pub const CRON_PRESETS: &[(&str, &str)] = &[
 /// `ui-brief.md` §3.2 hard cap on actions per flow.
 pub const MAX_ACTIONS: usize = 8;
 
+/// PURA-248 M5 — tooltip shown on a write-action control when a read-only
+/// (non-admin) operator hovers it. The route layer is the real gate; this
+/// just explains the disabled state up front instead of after a 403.
+pub const ADMIN_ONLY_HINT: &str = "Admin-only. Ask a server admin to make changes.";
+
+/// `Some(hint)` only when the operator is not an admin — so a control's
+/// `title` prop stays `None` (no tooltip) for admins.
+pub fn admin_only_title(is_admin: bool) -> Option<String> {
+    (!is_admin).then(|| ADMIN_ONLY_HINT.to_string())
+}
+
 /// `ui-brief.md` §3.2 — name field is 120 chars max.
 pub const MAX_NAME_LEN: usize = 120;
+
+/// Field count the engine's cron dialect expects — the `cron` crate
+/// (`docs/flows/architecture.md` open questions) parses a 6-field
+/// expression (`second minute hour day-of-month month day-of-week`) and
+/// also accepts an optional 7th `year` field.
+pub const CRON_MIN_FIELDS: usize = 6;
+pub const CRON_MAX_FIELDS: usize = 7;
+
+/// Live, client-side sanity check for the cron input (`ui-brief.md` §3.2).
+///
+/// A *non-authoritative* field-count heuristic — the server does the real
+/// dialect parse and owns the 400. The point is to catch the most common
+/// operator slip (a 5-field "standard" cron with no seconds field) before
+/// a round-trip. Returns `None` when the expression is empty (the
+/// required-field check on submit owns that case) or the field count is
+/// plausible.
+pub fn cron_validation_message(expr: &str) -> Option<String> {
+    let trimmed = expr.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let fields = trimmed.split_whitespace().count();
+    if fields < CRON_MIN_FIELDS {
+        Some(format!(
+            "Looks short — this engine expects {CRON_MIN_FIELDS} fields \
+             (second minute hour day month weekday). Got {fields}."
+        ))
+    } else if fields > CRON_MAX_FIELDS {
+        Some(format!(
+            "Looks long — expected {CRON_MIN_FIELDS} fields plus an optional \
+             year ({CRON_MAX_FIELDS} max). Got {fields}."
+        ))
+    } else {
+        None
+    }
+}
 
 /// Convert an [`ApiError`] into the operator-facing message banners +
 /// toasts use. Mirrors `music_bots::shared::format_error` so the FE
@@ -258,5 +341,24 @@ mod tests {
     #[test]
     fn last_run_cell_em_dash_when_never_run() {
         assert_eq!(last_run_cell(None), "—");
+    }
+
+    #[test]
+    fn cron_validation_flags_short_and_long_expressions() {
+        // Empty is the required-field check's job, not ours.
+        assert_eq!(cron_validation_message(""), None);
+        assert_eq!(cron_validation_message("   "), None);
+        // The classic slip: a 5-field standard cron, no seconds.
+        assert!(cron_validation_message("*/5 * * * *").is_some());
+        // A well-formed 6-field expression clears the check.
+        assert_eq!(cron_validation_message("0 */5 * * * *"), None);
+        // 7 fields (with year) is still accepted by the `cron` crate.
+        assert_eq!(cron_validation_message("0 0 12 * * * 2026"), None);
+        // 8+ fields is over the cap.
+        assert!(cron_validation_message("0 0 12 * * * 2026 extra").is_some());
+        // Every preset must pass its own validation.
+        for (_, expr) in CRON_PRESETS {
+            assert_eq!(cron_validation_message(expr), None, "preset {expr}");
+        }
     }
 }

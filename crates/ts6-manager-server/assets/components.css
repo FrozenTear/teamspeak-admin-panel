@@ -1200,3 +1200,98 @@
 }
 
 .muted { color: var(--text-muted); }
+
+/* ─── Flows pages ────────────────────────────────────────
+   PROVISIONAL (PURA-248): the flow pages (PURA-243) shipped markup for
+   `.tabs`, `.tab`, `.chip`, `.chip-row`, `.kv-row`, `.field-inline`,
+   `.field-hint` and `.disclosure` but no matching rules — those
+   surfaces rendered unstyled. These rules compose existing design
+   tokens only (no new values) so the pages are coherent. UXDesigner
+   owns the final tab / chip / disclosure token spec — see PURA-248. */
+
+/* Inline field help — lighter sibling of `.field-error`, matches the
+   existing `.field-help` token but under the name the flow form uses. */
+.field-hint {
+  font: var(--weight-regular) var(--text-xs) / var(--lh-xs) var(--font-sans);
+  color: var(--text-muted);
+}
+
+/* Checkbox + label on one line; a nested `.field-hint` wraps below. */
+.field-inline {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  font: var(--weight-medium) var(--text-sm) / var(--lh-sm) var(--font-sans);
+  color: var(--text-primary);
+}
+.field-inline .field-hint { flex-basis: 100%; }
+
+/* Underline tab bar — detail page Runs / Definition. */
+.tabs {
+  display: flex;
+  gap: var(--space-2);
+  border-bottom: 1px solid var(--border-subtle);
+}
+.tab {
+  appearance: none;
+  background: none;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  padding: var(--space-3) var(--space-4);
+  font: var(--weight-medium) var(--text-sm) / var(--lh-sm) var(--font-sans);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.tab:hover { color: var(--text-primary); }
+.tab.is-active {
+  color: var(--accent-fg);
+  border-bottom-color: var(--accent-bg);
+}
+.tab:focus-visible {
+  outline: 2px solid var(--accent-bg);
+  outline-offset: -2px;
+}
+
+/* Preset chips — cron presets on the create form. */
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+}
+.chip {
+  appearance: none;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-surface);
+  border-radius: var(--radius-full);
+  padding: var(--space-2) var(--space-4);
+  font: var(--weight-regular) var(--text-xs) / var(--lh-xs) var(--font-sans);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.chip:hover { background: var(--bg-hover); color: var(--text-primary); }
+.chip:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* Key/value editor row — two inputs and a remove button. */
+.kv-row {
+  display: flex;
+  gap: var(--space-3);
+  align-items: center;
+}
+.kv-row > .input { flex: 1 1 auto; min-width: 0; }
+
+/* Collapsible disclosure — advanced identifiers, run-status legend. */
+.disclosure > summary {
+  cursor: pointer;
+  font: var(--weight-medium) var(--text-sm) / var(--lh-sm) var(--font-sans);
+  color: var(--text-secondary);
+}
+.disclosure > summary:hover { color: var(--text-primary); }
+.disclosure[open] > summary { margin-bottom: var(--space-4); }
+.legend { list-style: none; padding: 0; margin: 0; }
+.legend-row {
+  display: flex;
+  gap: var(--space-4);
+  align-items: baseline;
+}
