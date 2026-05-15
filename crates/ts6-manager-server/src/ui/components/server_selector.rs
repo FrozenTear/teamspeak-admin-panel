@@ -345,6 +345,12 @@ fn selected_id_to_label(
 fn error_copy(err: &ApiError) -> String {
     match err {
         ApiError::Unauthorized(_) => "Session expired. Sign in again.".into(),
+        // PURA-232 — see `error_copy` in `pages/servers_index.rs` for the
+        // long-form rationale. `mount_servers_context` collapses this to
+        // `Loading` before it reaches the selector, but the arm is here
+        // for defence in depth so a future refactor can't reintroduce
+        // the "Session expired" bounce on a session-not-ready transient.
+        ApiError::SessionAnonymous => "Loading…".into(),
         ApiError::BadGateway { error, .. } => {
             format!("Could not reach TeamSpeak ({error}).")
         }

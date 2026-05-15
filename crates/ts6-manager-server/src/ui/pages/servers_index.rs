@@ -757,6 +757,13 @@ fn DeleteServerConfirm(props: DeleteServerConfirmProps) -> Element {
 fn format_action_error(err: &ApiError, action: &str) -> String {
     match err {
         ApiError::Unauthorized(_) => "Session expired — sign in again to retry.".into(),
+        // PURA-232 — the SPA-internal "session not ready" short-circuit
+        // is a transient that resolves once rehydrate / login completes.
+        // Tell the operator to retry rather than miscategorising the
+        // session as expired.
+        ApiError::SessionAnonymous => {
+            format!("Could not {action}: session not ready yet, retry in a moment.")
+        }
         ApiError::Client { status: 404, .. } => {
             "This server has already been removed. Refresh the page to update the list.".into()
         }
@@ -798,6 +805,16 @@ fn error_copy(err: &ApiError) -> (&'static str, String) {
         ApiError::Unauthorized(_) => (
             "Session expired",
             "Sign in again to view configured servers.".into(),
+        ),
+        // PURA-232 — `SessionAnonymous` only reaches this page if a
+        // future refactor lets the SPA-internal short-circuit error
+        // escape `mount_servers_context`'s `Loading` fall-through. Render
+        // a neutral retry message instead of misleading the operator
+        // with "Session expired — Sign in again", which would put them
+        // in a bouncing /login loop while the session quietly rehydrates.
+        ApiError::SessionAnonymous => (
+            "Loading your servers…",
+            "Session is initialising, this should clear in a moment.".into(),
         ),
         ApiError::BadGateway {
             error,

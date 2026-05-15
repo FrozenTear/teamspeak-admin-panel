@@ -28,6 +28,22 @@ pub enum AuthError {
     /// HTTP 401 from the server. The carried string is the spec error body
     /// (e.g. [`msg::INVALID_TOKEN`] or [`msg::USER_DISABLED`]).
     Unauthorized(String),
+    /// PURA-232 — the auth gate was asked to run a request while the
+    /// session signal is still `Anonymous`. This is a CLIENT-side
+    /// short-circuit, not a server response, and is the expected state
+    /// during the brief window between an `AppShell` mount and
+    /// `rehydrate_from_storage` (or between a logout and the next login).
+    ///
+    /// Pages MUST NOT render this as "Session expired" — the session
+    /// isn't expired, it just hasn't loaded yet. The route-level guard
+    /// will redirect to `/login` if the session never materialises;
+    /// fetch-state surfaces should treat this as a transient Loading
+    /// signal and refetch once the session transitions to Authenticated.
+    ///
+    /// Spec §6.4.1 / §6.4.2 only define server-emitted 401 sub-codes
+    /// (`NO_TOKEN` / `INVALID_TOKEN` / `USER_DISABLED`); this variant is
+    /// purely SPA-internal and never crosses the network boundary.
+    SessionAnonymous,
     /// HTTP 4xx other than 401, with the server's error string if parseable.
     Client { status: u16, message: String },
     /// HTTP 5xx.
@@ -50,7 +66,9 @@ impl AuthError {
         matches!(self, AuthError::Unauthorized(s) if s == msg::INVALID_TOKEN)
     }
 
-    /// `true` for any 401, regardless of body.
+    /// `true` for any 401, regardless of body. Pure server-401 predicate —
+    /// the [`AuthError::SessionAnonymous`] short-circuit returns `false`
+    /// here because it never reached the server.
     pub fn is_unauthorized(&self) -> bool {
         matches!(self, AuthError::Unauthorized(_))
     }
@@ -60,6 +78,7 @@ impl std::fmt::Display for AuthError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AuthError::Unauthorized(m) => write!(f, "401 Unauthorized: {m}"),
+            AuthError::SessionAnonymous => write!(f, "session not ready (anonymous)"),
             AuthError::Client { status, message } => write!(f, "{status}: {message}"),
             AuthError::Server { status, message } => write!(f, "{status}: {message}"),
             AuthError::Transport(m) => write!(f, "transport error: {m}"),
@@ -133,9 +152,14 @@ fn refresh_err_status(err: &AuthError) -> serde_json::Value {
     match err {
         AuthError::Unauthorized(_) => 401.into(),
         AuthError::Client { status, .. } | AuthError::Server { status, .. } => (*status).into(),
-        AuthError::Transport(_) | AuthError::Deserialise(_) | AuthError::UnsupportedTarget => {
-            serde_json::Value::Null
-        }
+        // PURA-232 — `SessionAnonymous` never originates from the refresh
+        // call itself; the gate short-circuits before calling
+        // `crate::client::auth::refresh`. Belt-and-braces in case the
+        // call path ever changes.
+        AuthError::SessionAnonymous
+        | AuthError::Transport(_)
+        | AuthError::Deserialise(_)
+        | AuthError::UnsupportedTarget => serde_json::Value::Null,
     }
 }
 

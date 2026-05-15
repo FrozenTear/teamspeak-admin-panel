@@ -24,7 +24,7 @@ use dioxus::prelude::*;
 use ts6_manager_shared::servers::ServerSummary;
 
 use crate::client::api::{self, ApiError};
-use crate::client::dioxus::use_auth_gate;
+use crate::client::dioxus::{use_auth_gate, use_session};
 use crate::client::session::RefreshGate;
 
 /// Three-state load model for the `/api/servers` list.
@@ -59,17 +59,50 @@ pub struct ServersContext {
 /// `use_signal` / `use_future` / `use_context_provider` calls all run as
 /// top-level hooks in the parent's hook list.
 ///
-/// Fires the fetch exactly once per AppShell mount via `use_future`. A
-/// refresh button + interval refresh land in Phase 2 with the rest of the
-/// live-telemetry story.
+/// The fetch is gated on `is_authenticated()` via a `use_memo` subscription
+/// so it self-heals across the Anonymous → Authenticated transition. The
+/// first poll on a hard-refresh of `/servers` can land before
+/// `App`'s post-mount `rehydrate_from_storage` `use_effect` upgrades the
+/// session signal; without the gate, the gate's anonymous short-circuit
+/// would cache a synthetic `Unauthorized` and the page would render
+/// "Session expired" the moment the chrome appeared
+/// ([PURA-232](/PURA/issues/PURA-232)). A refresh button + interval
+/// refresh land in Phase 2 with the rest of the live-telemetry story.
 pub fn mount_servers_context() -> ServersContext {
     let gate = use_auth_gate();
+    let session = use_session();
     let mut data: Signal<ServersData> = use_signal(|| ServersData::Loading);
+
+    // PURA-232 — memoise the authed bit so token rotations
+    // (`session.update_pair` from the refresh gate) don't cancel and
+    // restart the in-flight fetch. The memo's value only flips on
+    // Anonymous ↔ Authenticated transitions, which is exactly the
+    // signal we want the future to react to.
+    let is_authed = use_memo(move || session.state.read().is_authenticated());
+
     let _ = use_future(move || {
         let gate = gate.clone();
+        // Read the memo INSIDE the closure body so the future subscribes
+        // to memo-value changes; once subscribed, the runtime cancels
+        // any in-flight prior future and re-spawns when authed flips.
+        let authed = is_authed();
         async move {
+            if !authed {
+                // Stay in Loading. The route guard (`AppShell`) bounces
+                // to /login if the session never materialises; if it
+                // does (rehydrate / post-login), this closure re-runs
+                // with `authed=true` and fires the real fetch.
+                data.set(ServersData::Loading);
+                return;
+            }
             let next = match fetch_servers(gate).await {
                 Ok(rows) => ServersData::Loaded(rows),
+                // PURA-232 — extra belt-and-braces. The gate now emits
+                // `SessionAnonymous` instead of a server-401 envelope on
+                // its own short-circuit; even if a future refactor
+                // tweaks the upstream surface, the page must not render
+                // this as a fatal error.
+                Err(ApiError::SessionAnonymous) => ServersData::Loading,
                 Err(e) => ServersData::Error(e),
             };
             data.set(next);

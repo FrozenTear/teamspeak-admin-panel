@@ -322,6 +322,12 @@ fn error_copy(err: &ApiError) -> (&'static str, String) {
             "Session expired",
             "Your session ended. Sign in again to view live counts.".into(),
         ),
+        // PURA-232 — see comment on the matching arm in
+        // `ui/pages/servers_index.rs::error_copy`.
+        ApiError::SessionAnonymous => (
+            "Loading your dashboard…",
+            "Session is initialising, this should clear in a moment.".into(),
+        ),
         ApiError::Client { status, message } => (
             "Dashboard request rejected",
             format!("{status}: {message}"),

@@ -141,9 +141,10 @@ impl RefreshGate {
     ///
     /// Behaviour:
     /// - If the session is `Anonymous`, returns
-    ///   `AuthError::Unauthorized(INVALID_TOKEN)` without calling `f`. The
-    ///   route layer is expected to redirect to `/login` rather than have
-    ///   us forge a bearer.
+    ///   [`AuthError::SessionAnonymous`] without calling `f` (PURA-232).
+    ///   This is a client-side short-circuit, not a server 401 — callers
+    ///   render it as a transient Loading state, and the route layer
+    ///   redirects to `/login` if the session never materialises.
     /// - On `Unauthorized(INVALID_TOKEN)` from `f`, take the lock, possibly
     ///   refresh, replay `f` once. Replay failure terminates the session.
     /// - On any other 401 from `f` (`NO_TOKEN` / `USER_DISABLED`), invalidate
@@ -165,10 +166,23 @@ impl RefreshGate {
                 // the gate's contract documents. Lets the operator see
                 // when a request rode the gate without a session (race
                 // with a logout, rehydrate that found no blob).
+                //
+                // PURA-232 — return a dedicated [`AuthError::SessionAnonymous`]
+                // variant instead of the server-401 envelope. The previous
+                // shape (`Unauthorized(INVALID_TOKEN)`) caused
+                // `ServersIndexPage` (and any other fetch-state surface) to
+                // render "Session expired — Sign in again" the moment a
+                // race fired between `mount_servers_context`'s `use_future`
+                // and `App`'s rehydrate `use_effect`. The race is intrinsic
+                // to first-paint — `provide_session` deliberately returns
+                // `Anonymous` so SSR and the browser hydrate identical
+                // trees, then the post-mount effect upgrades the state.
+                // Re-classifying the short-circuit as a distinct,
+                // self-healing transient is the smallest fix that
+                // unblocks operators stuck on the bouncing /servers
+                // banner after a hard-refresh.
                 auth_debug::log("gate.anonymous_short_circuit", serde_json::Value::Null);
-                return Err(AuthError::Unauthorized(
-                    ts6_manager_shared::auth::auth_error_strings::INVALID_TOKEN.into(),
-                ));
+                return Err(AuthError::SessionAnonymous);
             }
         };
         let first_access = first_snapshot.access.clone();
@@ -220,10 +234,14 @@ impl RefreshGate {
         let after_lock = match self.snapshot() {
             Some(s) => s,
             None => {
+                // PURA-232 — same SessionAnonymous classification as the
+                // first-snapshot branch above. The session was invalidated
+                // (logout, peer 401 sweep) between our initial read and
+                // our lock acquisition; this is the SPA's own state
+                // change, not a server 401. Render as Loading; the route
+                // guard will bounce to `/login` on the next render.
                 auth_debug::log("gate.session_lost_under_lock", serde_json::Value::Null);
-                return Err(AuthError::Unauthorized(
-                    ts6_manager_shared::auth::auth_error_strings::INVALID_TOKEN.into(),
-                ));
+                return Err(AuthError::SessionAnonymous);
             }
         };
         if after_lock.access != first_access {
@@ -499,7 +517,21 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn anonymous_session_short_circuits_to_unauthorized() {
+    async fn anonymous_session_short_circuits_with_session_anonymous_error() {
+        // PURA-232 regression — the gate's Anonymous short-circuit MUST
+        // return a dedicated [`AuthError::SessionAnonymous`] variant, not
+        // a synthetic `Unauthorized("Invalid or expired token")`. Pages
+        // map the latter to "Session expired — Sign in again", which
+        // strands operators in a bouncing banner the moment
+        // `mount_servers_context`'s `use_future` polls before
+        // `rehydrate_from_storage` upgrades the session signal.
+        //
+        // Pinned invariants:
+        //   - error variant is `SessionAnonymous`
+        //   - `is_unauthorized()` returns false (this is not a server 401)
+        //   - `is_invalid_or_expired_token()` returns false (no refresh
+        //     dance — there's no token to refresh)
+        //   - refresh fn never fires
         let storage = arc_storage(MemoryStore::new());
         let session: Arc<dyn SessionHandle> =
             Arc::new(InMemorySession::new(AuthState::Anonymous, storage.clone()));
@@ -510,8 +542,57 @@ mod tests {
             .run(|_| async { Ok::<u32, AuthError>(0) })
             .await
             .unwrap_err();
-        assert!(err.is_invalid_or_expired_token(), "got: {err}");
+        assert!(
+            matches!(err, AuthError::SessionAnonymous),
+            "anonymous short-circuit must return SessionAnonymous, got: {err:?}"
+        );
+        assert!(
+            !err.is_unauthorized(),
+            "SessionAnonymous must not be classified as a server 401: {err}"
+        );
+        assert!(
+            !err.is_invalid_or_expired_token(),
+            "SessionAnonymous must not trigger refresh-eligible classification: {err}"
+        );
         assert_eq!(stub.calls(), 0);
+    }
+
+    /// PURA-232 — the Anonymous short-circuit MUST NOT call
+    /// `session.invalidate()`. The session is already Anonymous, so the
+    /// op is a no-op at best, and at worst it pollutes the breadcrumb
+    /// trail and triggers spurious storage writes. Pin the no-op
+    /// invariant by asserting the session and storage are untouched
+    /// after the short-circuit fires.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn anonymous_short_circuit_does_not_invalidate_or_touch_storage() {
+        let storage = arc_storage(MemoryStore::new());
+        let session: Arc<dyn SessionHandle> =
+            Arc::new(InMemorySession::new(AuthState::Anonymous, storage.clone()));
+        let stub = StubRefresh::new(|_| panic!("must not refresh"));
+        let gate = RefreshGate::new(session.clone(), stub.clone());
+
+        // Sanity: no persisted blob to start with.
+        assert!(
+            storage
+                .get(crate::client::store::SESSION_STORAGE_KEY)
+                .is_none(),
+            "fresh storage should be empty"
+        );
+
+        let _ = gate.run(|_| async { Ok::<u32, AuthError>(0) }).await;
+
+        // Session stays Anonymous; storage stays empty. No
+        // `session.invalidate()` fired (which would have called
+        // `save_state(Anonymous)` and is a no-op here but would still
+        // surface in instrumentation as a misleading
+        // `session.invalidate` breadcrumb).
+        assert_eq!(session.read(), AuthState::Anonymous);
+        assert!(
+            storage
+                .get(crate::client::store::SESSION_STORAGE_KEY)
+                .is_none(),
+            "anonymous short-circuit must not write to storage"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

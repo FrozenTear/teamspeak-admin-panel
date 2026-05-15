@@ -193,6 +193,10 @@ fn login_error_message(err: &AuthError) -> &'static str {
         // mismatch rather than spawning a refresh dance.
         AuthError::Unauthorized(m) if m == msg::USER_DISABLED => msg::USER_DISABLED,
         AuthError::Unauthorized(_) => msg::INVALID_CREDENTIALS,
+        // PURA-232 — `SessionAnonymous` cannot reach the login error path
+        // (the login client bypasses the auth gate entirely) but the
+        // exhaustive match forces an arm. Treat it as a transient.
+        AuthError::SessionAnonymous => msg::SIGN_IN_UNAVAILABLE,
         AuthError::Client { status: 429, .. } => msg::RATE_LIMIT_AUTH,
         AuthError::Client { .. } => msg::INVALID_CREDENTIALS,
         AuthError::Server { .. } => msg::SIGN_IN_UNAVAILABLE,
