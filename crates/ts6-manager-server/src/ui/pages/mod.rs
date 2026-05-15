@@ -12,6 +12,7 @@ mod clients;
 mod dashboard_placeholder;
 #[cfg(debug_assertions)]
 mod dev_video_player;
+mod flows;
 mod home;
 mod login;
 mod logs;
@@ -32,6 +33,7 @@ pub use clients::ClientsPage;
 pub use dashboard_placeholder::DashboardPlaceholder;
 #[cfg(debug_assertions)]
 pub use dev_video_player::DevVideoPlayerPage;
+pub use flows::{FlowDetailPage, FlowEditPage, FlowFormPage, FlowsListPage};
 pub use home::Home;
 pub use login::LoginPage;
 pub use logs::LogsPage;

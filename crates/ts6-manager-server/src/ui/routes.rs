@@ -20,10 +20,11 @@ use crate::ui::layout::AppShell;
 #[cfg(debug_assertions)]
 use crate::ui::pages::DevVideoPlayerPage;
 use crate::ui::pages::{
-    BansPage, BotDetailPage, BotsIndexPage, ChannelsPage, ClientsPage, DashboardPlaceholder, Home,
-    LoginPage, LogsPage, MusicLibraryPage, MusicPlaylistsPage, NotFoundPage, PublicWidgetPage,
-    RadioStationsPage, ServerEditPage, ServerInfoPage, ServersIndexPage, SettingsPage, SetupPage,
-    VideoSourcesPage, WidgetsPage,
+    BansPage, BotDetailPage, BotsIndexPage, ChannelsPage, ClientsPage, DashboardPlaceholder,
+    FlowDetailPage, FlowEditPage, FlowFormPage, FlowsListPage, Home, LoginPage, LogsPage,
+    MusicLibraryPage, MusicPlaylistsPage, NotFoundPage, PublicWidgetPage, RadioStationsPage,
+    ServerEditPage, ServerInfoPage, ServersIndexPage, SettingsPage, SetupPage, VideoSourcesPage,
+    WidgetsPage,
 };
 
 #[rustfmt::skip]
@@ -105,6 +106,21 @@ pub enum Route {
     #[route("/music-bots/:bot_id/radio")]
     RadioStationsPage { bot_id: u64 },
 
+    // PURA-243 — flow engine pages. The /flows/new route must precede
+    // /flows/:flow_id so `new` resolves to the create form instead of
+    // tripping the dynamic-segment parser.
+    #[route("/flows")]
+    FlowsListPage {},
+
+    #[route("/flows/new")]
+    FlowFormPage {},
+
+    #[route("/flows/:flow_id/edit")]
+    FlowEditPage { flow_id: i64 },
+
+    #[route("/flows/:flow_id")]
+    FlowDetailPage { flow_id: i64 },
+
     // PURA-218 — explicit `/servers` index inside AppShell. Must precede
     // the catch-all variant so `/servers` resolves to a real authed page
     // instead of falling through to `NotFoundPage`.
@@ -160,6 +176,30 @@ mod tests {
 
         let route = Route::from_str("/music-bots").expect("bots index parse");
         assert!(matches!(route, Route::BotsIndexPage {}));
+    }
+
+    /// PURA-243 — the static `/flows/new` route must win over the dynamic
+    /// `/flows/:flow_id` route. Without the explicit ordering in the enum,
+    /// `/flows/new` would parse `new` as a `flow_id` and fail (or, if the
+    /// id were a string, silently land on the wrong page).
+    #[test]
+    fn flows_static_routes_beat_dynamic_segment() {
+        assert!(matches!(
+            Route::from_str("/flows").expect("/flows parse"),
+            Route::FlowsListPage {}
+        ));
+        assert!(matches!(
+            Route::from_str("/flows/new").expect("/flows/new parse"),
+            Route::FlowFormPage {}
+        ));
+        assert!(matches!(
+            Route::from_str("/flows/42").expect("/flows/42 parse"),
+            Route::FlowDetailPage { flow_id: 42 }
+        ));
+        assert!(matches!(
+            Route::from_str("/flows/42/edit").expect("/flows/42/edit parse"),
+            Route::FlowEditPage { flow_id: 42 }
+        ));
     }
 
     /// PURA-218 — `/servers` resolves to the new authed index page, not

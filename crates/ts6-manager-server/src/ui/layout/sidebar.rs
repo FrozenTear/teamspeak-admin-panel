@@ -132,6 +132,15 @@ pub fn Sidebar(props: SidebarProps) -> Element {
             | Route::MusicPlaylistsPage { .. }
             | Route::RadioStationsPage { .. }
     );
+    // PURA-243 — Flows highlight on the list, create, detail, and edit
+    // routes so the operator stays oriented across the flow lifecycle.
+    let flows_active = matches!(
+        props.active,
+        Route::FlowsListPage {}
+            | Route::FlowFormPage {}
+            | Route::FlowDetailPage { .. }
+            | Route::FlowEditPage { .. }
+    );
     rsx! {
         aside { class: "sidebar",
             // Brand sits OUTSIDE `<nav aria-label="Primary">` so the
@@ -169,6 +178,9 @@ pub fn Sidebar(props: SidebarProps) -> Element {
                 NavGroup { label: "Automation",
                     PlaceholderItem { icon: "⊕", label: "Bots" }
                     NavItem { icon: "♪", label: "Music bots", to: Route::BotsIndexPage {}, active: music_bots_active }
+                    // PURA-243 — Flows sits between Music bots and
+                    // Widgets per `docs/flows/ui-brief.md` §2.
+                    NavItem { icon: "⚡", label: "Flows", to: Route::FlowsListPage {}, active: flows_active }
                     NavItem { icon: "▣", label: "Widgets", to: Route::WidgetsPage {}, active: widgets_active }
                 }
 

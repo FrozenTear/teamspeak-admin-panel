@@ -212,6 +212,47 @@
 .tag-warning { background: rgba(224, 169, 59, 0.14); color: var(--warning-fg); }
 .tag-danger  { background: rgba(230, 76, 95, 0.14); color: var(--danger-fg); }
 
+/* ─── Status badge (bot-badge) ─────────────────────────
+   Status pill shared by the music-bot, video-source and flow pages.
+   PROVISIONAL (PURA-246 B2): the `bot-badge` family was referenced by
+   those pages but absent from this stylesheet, so the badges rendered
+   unstyled. These rules mirror the approved `.tag` token values 1:1
+   under the brief-mandated `bot-badge` selector. UXDesigner owns the
+   final run-status token spec — see PURA-246. */
+.bot-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-3);
+  height: 22px;
+  padding: 0 var(--space-4);
+  border-radius: var(--radius-full);
+  font: var(--weight-medium) var(--text-xs) / 1 var(--font-sans);
+  white-space: nowrap;
+}
+.bot-badge--play    { background: rgba(46, 184, 114, 0.14); color: var(--success-fg); }
+.bot-badge--idle    { background: rgba(46, 184, 114, 0.14); color: var(--success-fg); }
+.bot-badge--pending { background: rgba(224, 169, 59, 0.14); color: var(--warning-fg); }
+.bot-badge--off     { background: rgba(94, 106, 130, 0.20); color: var(--text-secondary); }
+.bot-badge--error   { background: rgba(230, 76, 95, 0.14); color: var(--danger-fg); }
+
+/* Flow glyph icon (PURA-253 §7.1) — decorative; paired with a text label
+   everywhere it renders, so the surface stays icon-independent. */
+.flow-icon {
+  display: inline-grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+  color: currentColor;
+  opacity: 0.8;
+}
+/* Inside a status pill the glyph keeps the badge's AA-contrast colour. */
+.bot-badge .flow-icon {
+  width: 1em;
+  height: 1em;
+  opacity: 1;
+}
+
 /* ─── Skeleton ───────────────────────────────────────── */
 .skeleton {
   background: linear-gradient(90deg,
@@ -1177,3 +1218,105 @@
 }
 
 .muted { color: var(--text-muted); }
+
+/* ─── Flows pages ────────────────────────────────────────
+   PROVISIONAL (PURA-248): the flow pages (PURA-243) shipped markup for
+   `.tabs`, `.tab`, `.chip`, `.chip-row`, `.kv-row`, `.field-inline`,
+   `.field-hint` and `.disclosure` but no matching rules — those
+   surfaces rendered unstyled. These rules compose existing design
+   tokens only (no new values) so the pages are coherent. UXDesigner
+   owns the final tab / chip / disclosure token spec — see PURA-248. */
+
+/* Inline field help — lighter sibling of `.field-error`, matches the
+   existing `.field-help` token but under the name the flow form uses. */
+.field-hint {
+  font: var(--weight-regular) var(--text-xs) / var(--lh-xs) var(--font-sans);
+  color: var(--text-muted);
+}
+
+/* Checkbox + label on one line; a nested `.field-hint` wraps below. */
+.field-inline {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  font: var(--weight-medium) var(--text-sm) / var(--lh-sm) var(--font-sans);
+  color: var(--text-primary);
+}
+.field-inline .field-hint { flex-basis: 100%; }
+
+/* Underline tab bar — detail page Runs / Definition. */
+.tabs {
+  display: flex;
+  gap: var(--space-2);
+  border-bottom: 1px solid var(--border-subtle);
+}
+.tab {
+  appearance: none;
+  background: none;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  padding: var(--space-3) var(--space-4);
+  font: var(--weight-medium) var(--text-sm) / var(--lh-sm) var(--font-sans);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.tab:hover { color: var(--text-primary); }
+.tab.is-active {
+  color: var(--accent-fg);
+  border-bottom-color: var(--accent-bg);
+}
+.tab:focus-visible {
+  outline: 2px solid var(--accent-bg);
+  outline-offset: -2px;
+}
+
+/* Preset chips — cron presets on the create form. */
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+}
+.chip {
+  appearance: none;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-surface);
+  border-radius: var(--radius-full);
+  padding: var(--space-2) var(--space-4);
+  font: var(--weight-regular) var(--text-xs) / var(--lh-xs) var(--font-sans);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.chip:hover { background: var(--bg-hover); color: var(--text-primary); }
+.chip:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* Key/value editor row — two inputs and a remove button. */
+.kv-row {
+  display: flex;
+  gap: var(--space-3);
+  align-items: center;
+}
+.kv-row > .input { flex: 1 1 auto; min-width: 0; }
+/* PURA-253 L2-tail — the remove control needs a ≥24×24 px hit target
+   (Fitts's Law) regardless of the `×` glyph's own size. */
+.kv-row > button {
+  min-width: 24px;
+  min-height: 24px;
+  flex: 0 0 auto;
+}
+
+/* Collapsible disclosure — advanced identifiers, run-status legend. */
+.disclosure > summary {
+  cursor: pointer;
+  font: var(--weight-medium) var(--text-sm) / var(--lh-sm) var(--font-sans);
+  color: var(--text-secondary);
+}
+.disclosure > summary:hover { color: var(--text-primary); }
+.disclosure[open] > summary { margin-bottom: var(--space-4); }
+.legend { list-style: none; padding: 0; margin: 0; }
+.legend-row {
+  display: flex;
+  gap: var(--space-4);
+  align-items: baseline;
+}

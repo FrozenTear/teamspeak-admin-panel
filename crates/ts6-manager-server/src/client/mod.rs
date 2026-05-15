@@ -30,6 +30,7 @@ pub mod api;
 pub mod auth;
 pub mod debug;
 pub mod dioxus;
+pub mod flows;
 pub mod music_bots;
 pub mod servers;
 pub mod session;

@@ -66,6 +66,14 @@ pub fn Button(
     #[props(default)] disabled: bool,
     #[props(default)] loading: bool,
     #[props(default)] block: bool,
+    /// Optional native `title` tooltip — handy for explaining why a button
+    /// is `disabled` (e.g. an admin-only action for a read-only operator).
+    #[props(default)]
+    title: Option<String>,
+    /// Optional `aria-label` — use when the visible children are an icon
+    /// or glyph that does not read as a label on its own.
+    #[props(default)]
+    aria_label: Option<String>,
     #[props(default)] onclick: EventHandler<MouseEvent>,
     children: Element,
 ) -> Element {
@@ -87,6 +95,8 @@ pub fn Button(
             class: "{class}",
             r#type: "{kind.attr()}",
             disabled: is_disabled,
+            title: title,
+            "aria-label": aria_label,
             "aria-busy": "{aria_busy}",
             onclick: move |evt| onclick.call(evt),
             if loading {

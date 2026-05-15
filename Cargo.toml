@@ -197,6 +197,13 @@ resvg = { version = "0.45", default-features = false, features = ["text", "syste
 usvg = { version = "0.45", default-features = false, features = ["text", "system-fonts"] }
 tiny-skia = { version = "0.11", default-features = false, features = ["std", "png-format"] }
 
+# PURA-241 — v1.1 flow engine cron trigger. `cron@0.12` parses 6-field UTC
+# expressions and produces `Schedule::upcoming(Utc)` for the engine's
+# trigger loop. Pure-Rust, no transitive openssl / native-tls. The
+# architecture brief §10 recommended the `cron` crate; pinning the minor
+# matches our convention.
+cron = "0.12"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
