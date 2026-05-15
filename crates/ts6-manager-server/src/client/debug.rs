@@ -98,14 +98,33 @@ pub fn fields(entries: &[(&str, serde_json::Value)]) -> serde_json::Value {
     serde_json::Value::Object(map)
 }
 
-/// Short form of a bearer / refresh token. Emitted instead of the raw
-/// value so a console capture pasted into the issue thread does not
-/// leak credentials. Returns the first 8 characters when the token is
-/// long enough; the empty string when not (keeps the output stable —
-/// nothing to truncate).
+/// Short, distinguishable form of a bearer / refresh token. Emitted
+/// instead of the raw value so a console capture pasted into the issue
+/// thread does not leak credentials.
+///
+/// **PURA-233** — the v1.0.10 instrumentation emitted the first 8
+/// characters only. Every HS256 JWT minted by [`crate::auth::jwt`]
+/// begins with the same `eyJ0eXAi` header prefix (the base64 encoding
+/// of `{"typ":"JWT",`), so every breadcrumb showed an identical access
+/// prefix regardless of whether a refresh had actually rotated the
+/// token. That made the four candidate failure modes
+/// (`[PURA-225](/PURA/issues/PURA-225)` list) indistinguishable from a
+/// pasted console capture — you could not tell #1 (rotation race) from
+/// #3 (rotation dropped) from #4 (rotation succeeded but the upstream
+/// rejects the new access).
+///
+/// The new format keeps the same 8-character budget but takes 4 from
+/// the head and 4 from the tail, separated by `..`, so two different
+/// JWTs that share the standard header prefix still surface as
+/// different breadcrumbs (`eyJ0..A1b2` vs. `eyJ0..C3d4`). Tokens
+/// shorter than 8 characters fall through to the original "return
+/// verbatim" branch — the contract for non-JWT-shaped values stays
+/// unchanged.
 pub fn short_token(s: &str) -> String {
     if s.len() >= 8 {
-        s[..8].to_string()
+        let head = &s[..4];
+        let tail = &s[s.len() - 4..];
+        format!("{head}..{tail}")
     } else {
         s.to_string()
     }
@@ -282,9 +301,43 @@ mod tests {
 
     #[test]
     fn short_token_truncates_but_preserves_shape() {
-        assert_eq!(short_token("0123456789abcdef"), "01234567");
+        // PURA-233 — head 4 + tail 4 with a `..` separator so two
+        // different JWTs that share the standard `eyJ0eXAi` header
+        // prefix surface as different breadcrumbs.
+        assert_eq!(short_token("0123456789abcdef"), "0123..cdef");
         assert_eq!(short_token("abc"), "abc"); // shorter than 8 — keep as-is
         assert_eq!(short_token(""), "");
+    }
+
+    /// PURA-233 — pin the diagnostic contract that the
+    /// [`short_token`] output for two distinct JWTs which share the
+    /// canonical `eyJ0eXAi` header prefix MUST surface as distinct
+    /// breadcrumbs. The v1.0.10 implementation truncated to the first
+    /// 8 bytes only, which made every JWT's breadcrumb collapse to
+    /// the same string and stranded the board on the `/servers`
+    /// Session-expired loop with no way to tell rotation candidates
+    /// apart from a pasted console capture.
+    #[test]
+    fn short_token_distinguishes_jwts_with_shared_header_prefix() {
+        // Canonical HS256 JWT header (`{"typ":"JWT","alg":"HS256"}`)
+        // base64url-encodes to `eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9`,
+        // so the first ~36 bytes of any JWT minted by `jwt::mint_*`
+        // are byte-identical. The diagnostic contract is "different
+        // tokens get different breadcrumbs"; two JWTs that differ
+        // only in their signature segment must NOT collapse onto the
+        // same `short_token` output.
+        let jwt_old = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.AAAAOLD";
+        let jwt_new = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.AAAANEW";
+        assert_ne!(
+            short_token(jwt_old),
+            short_token(jwt_new),
+            "two JWTs differing only in signature MUST yield distinct breadcrumbs"
+        );
+        // Belt-and-braces: the format must include the tail so an
+        // operator pasting a capture can correlate `gate.enter` and
+        // `session.update_pair` lines without seeing the raw token.
+        assert!(short_token(jwt_old).ends_with("AOLD"));
+        assert!(short_token(jwt_new).ends_with("ANEW"));
     }
 
     #[test]

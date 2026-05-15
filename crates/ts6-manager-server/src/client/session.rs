@@ -1115,4 +1115,120 @@ mod tests {
         // Critical paired invariant — the session is still authed.
         assert!(session.read().is_authenticated());
     }
+
+    /// PURA-233 regression — the v1.0.10 instrumentation truncated
+    /// every token to its first 8 bytes for the breadcrumb. Every
+    /// JWT minted by [`crate::auth::jwt`] starts with `eyJ0eXAi`
+    /// (the base64url encoding of the canonical `{"typ":"JWT",`
+    /// header), so the post-refresh `session.update_pair`
+    /// breadcrumb collapsed onto the same `access:"eyJ0eXAi"`
+    /// string as the pre-refresh `gate.enter` line. An operator
+    /// pasting their `?debug=auth` console capture into the issue
+    /// thread could not tell whether the rotation had actually
+    /// happened — exactly the diagnostic blindspot that left the
+    /// board stranded on the `/servers` Session-expired loop with
+    /// no way to discriminate between the four candidate failure
+    /// modes listed in [PURA-225](/PURA/issues/PURA-225).
+    ///
+    /// The contract this test pins: after a successful refresh,
+    /// the `gate.enter` breadcrumb (logged against the OLD access
+    /// token) and the `session.update_pair` breadcrumb (logged
+    /// against the NEW access token) MUST emit distinct
+    /// `new_access` / `access` prefixes whenever the underlying
+    /// tokens differ. Two JWTs that differ only in their signature
+    /// segment — the only segment that necessarily varies across a
+    /// rotation, since payload-level claims (`sub`, `username`,
+    /// `role`) are usually unchanged — must surface as different
+    /// breadcrumbs.
+    #[tokio::test(flavor = "current_thread")]
+    async fn refresh_breadcrumbs_distinguish_jwts_with_shared_header_prefix() {
+        use ts6_manager_shared::auth::auth_error_strings as msg;
+
+        // Two JWT-shaped strings that share the standard header +
+        // payload prefix but differ in their signature tail. Without
+        // the PURA-233 short_token fix both would render as
+        // `access:"eyJ0eXAi"` in the breadcrumb and an operator
+        // could not tell them apart from a console capture alone.
+        const JWT_OLD: &str = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.SIG_OLD";
+        const JWT_NEW: &str = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.SIG_NEW";
+
+        auth_debug::test_override::enable();
+        let storage = arc_storage(MemoryStore::new());
+        let session: Arc<dyn SessionHandle> = Arc::new(InMemorySession::new(
+            authed(JWT_OLD, "old-refresh"),
+            storage.clone(),
+        ));
+        let stub = StubRefresh::new(|_| {
+            Ok(TokenPairResponse {
+                access_token: JWT_NEW.into(),
+                refresh_token: "new-refresh".into(),
+            })
+        });
+        let gate = RefreshGate::new(session.clone(), stub.clone());
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_clone = calls.clone();
+        gate.run(move |snap| {
+            let calls = calls_clone.clone();
+            async move {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    assert_eq!(snap.access, JWT_OLD);
+                    Err(AuthError::Unauthorized(msg::INVALID_TOKEN.into()))
+                } else {
+                    assert_eq!(snap.access, JWT_NEW);
+                    Ok::<u32, AuthError>(7)
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        let captured = auth_debug::test_override::drain();
+        auth_debug::test_override::disable();
+
+        // The two breadcrumbs the operator correlates by eye:
+        //   gate.enter        — recorded against JWT_OLD
+        //   session.update_pair — recorded against JWT_NEW
+        let gate_enter_line = captured
+            .iter()
+            .find(|line| line.contains(r#""tag":"gate.enter""#))
+            .unwrap_or_else(|| panic!("no gate.enter breadcrumb captured:\n{captured:?}"));
+        let update_pair_line = captured
+            .iter()
+            .find(|line| line.contains(r#""tag":"session.update_pair""#))
+            .unwrap_or_else(|| panic!("no session.update_pair captured:\n{captured:?}"));
+
+        // The `access` field is wrapped in JSON quotes, so the prefix
+        // appears as `"access":"<short_token output>"`. The
+        // post-refresh line uses the `new_access` field name on the
+        // same value. Extract both and pin them as distinct.
+        let gate_prefix = extract_field(gate_enter_line, "access");
+        let update_prefix = extract_field(update_pair_line, "new_access");
+        assert_ne!(
+            gate_prefix, update_prefix,
+            "post-rotation breadcrumb MUST distinguish the new access token \
+             from the old; both collapsed onto {gate_prefix:?} with the v1.0.10 \
+             short_token (PURA-233):\n\
+             gate.enter:        {gate_enter_line}\n\
+             session.update_pair: {update_pair_line}"
+        );
+    }
+
+    /// Tiny scraper for `"field":"value"` pairs inside a JSON-encoded
+    /// breadcrumb line. The test capture format is a single-line
+    /// `serde_json::to_string` of an [`auth_debug::AuthEvent`]; we
+    /// avoid pulling in the full parser because the captured lines
+    /// can contain ad-hoc fields that vary across breadcrumbs and the
+    /// asserts only care about one field at a time.
+    fn extract_field(line: &str, key: &str) -> String {
+        let needle = format!(r#""{key}":""#);
+        let idx = line
+            .find(&needle)
+            .unwrap_or_else(|| panic!("field `{key}` not found in:\n{line}"));
+        let rest = &line[idx + needle.len()..];
+        let end = rest
+            .find('"')
+            .unwrap_or_else(|| panic!("unterminated value for `{key}` in:\n{line}"));
+        rest[..end].to_string()
+    }
 }
