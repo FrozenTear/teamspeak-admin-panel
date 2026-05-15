@@ -297,6 +297,7 @@ mod tests {
             enabled: true,
             created_at: now,
             updated_at: now,
+            last_seen_at: None,
         }
     }
 
