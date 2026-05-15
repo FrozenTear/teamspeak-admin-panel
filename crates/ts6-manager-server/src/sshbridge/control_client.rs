@@ -320,6 +320,27 @@ impl ControlBackend for SshControlClient {
         Ok(())
     }
 
+    async fn sendtextmessage(
+        &self,
+        sid: i64,
+        targetmode: i64,
+        target: i64,
+        msg: &str,
+    ) -> ControlResult<()> {
+        let line = format!(
+            "sendtextmessage targetmode={targetmode} target={target} msg={}",
+            escape(msg)
+        );
+        self.run_scoped(sid, &line).await?;
+        Ok(())
+    }
+
+    async fn servergroupaddclient(&self, sid: i64, sgid: i64, cldbid: i64) -> ControlResult<()> {
+        let line = format!("servergroupaddclient sgid={sgid} cldbid={cldbid}");
+        self.run_scoped(sid, &line).await?;
+        Ok(())
+    }
+
     async fn banadd(&self, sid: i64, params: &BanAddParams<'_>) -> ControlResult<i64> {
         let mut line = String::from("banadd");
         if let Some(v) = params.ip {

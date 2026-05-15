@@ -175,6 +175,23 @@ impl ProductionDispatcher {
                     .await
                     .map_err(|e| format!("ts6Command clientunmute failed: {e}"))?;
             }
+            "sendtextmessage" => {
+                let targetmode = arg_i64(&rendered, "targetmode")?;
+                let target = arg_i64(&rendered, "target")?;
+                let msg = arg_str(&rendered, "msg")?;
+                backend
+                    .sendtextmessage(sid, targetmode, target, &msg)
+                    .await
+                    .map_err(|e| format!("ts6Command sendtextmessage failed: {e}"))?;
+            }
+            "servergroupaddclient" => {
+                let sgid = arg_i64(&rendered, "sgid")?;
+                let cldbid = arg_i64(&rendered, "cldbid")?;
+                backend
+                    .servergroupaddclient(sid, sgid, cldbid)
+                    .await
+                    .map_err(|e| format!("ts6Command servergroupaddclient failed: {e}"))?;
+            }
             // Unreachable past `validate_ts6_command`, but kept exhaustive.
             other => return Err(format!("ts6Command `{other}` is not whitelisted")),
         }

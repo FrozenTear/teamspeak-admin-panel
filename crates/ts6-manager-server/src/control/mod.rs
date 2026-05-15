@@ -337,6 +337,24 @@ pub trait ControlBackend: Send + Sync + std::fmt::Debug {
         output_muted: Option<bool>,
     ) -> ControlResult<()>;
 
+    /// `sendtextmessage` (sid scope) — deliver a text message to a client
+    /// (`targetmode=1`), a channel (`targetmode=2`), or the whole virtual
+    /// server (`targetmode=3`). `target` is the matching id for the mode.
+    /// Backs the `welcome-on-join` flow example
+    /// (`docs/flows/http-api.md` §3.1).
+    async fn sendtextmessage(
+        &self,
+        sid: i64,
+        targetmode: i64,
+        target: i64,
+        msg: &str,
+    ) -> ControlResult<()>;
+
+    /// `servergroupaddclient` (sid scope) — add client database id
+    /// `cldbid` to server group `sgid`. Backs the auto-group-assign flow
+    /// example (`docs/flows/architecture.md` §4).
+    async fn servergroupaddclient(&self, sid: i64, sgid: i64, cldbid: i64) -> ControlResult<()>;
+
     /// `banadd` — returns the new ban id.
     async fn banadd(&self, sid: i64, params: &BanAddParams<'_>) -> ControlResult<i64>;
 
@@ -462,6 +480,24 @@ impl ControlBackend for WebQueryClient {
         output_muted: Option<bool>,
     ) -> ControlResult<()> {
         self.client_set_muted(sid, clid, input_muted, output_muted)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn sendtextmessage(
+        &self,
+        sid: i64,
+        targetmode: i64,
+        target: i64,
+        msg: &str,
+    ) -> ControlResult<()> {
+        self.sendtextmessage(sid, targetmode, target, msg)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn servergroupaddclient(&self, sid: i64, sgid: i64, cldbid: i64) -> ControlResult<()> {
+        self.servergroupaddclient(sid, sgid, cldbid)
             .await
             .map_err(Into::into)
     }

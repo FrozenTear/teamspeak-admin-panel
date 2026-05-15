@@ -15,14 +15,14 @@
 //! [`crate::control::ControlBackend`] method. That trait does not expose
 //! a raw ServerQuery passthrough, so the whitelist is exactly the set of
 //! mutating commands the trait already models: `clientmove`,
-//! `clientkick`, `clientmute`, `clientunmute`.
+//! `clientkick`, `clientmute`, `clientunmute`, `sendtextmessage`, and
+//! `servergroupaddclient`.
 //!
-//! The architecture brief (`docs/flows/architecture.md` §4) also names
-//! `sendtextmessage` / `servergroupaddclient` as examples. Those need a
-//! new typed `ControlBackend` method before they can be whitelisted —
-//! tracked as a follow-up (see the PURA-249 dispatcher PR notes); adding
-//! them here without the backend method would only move the failure from
-//! create-time to run-time.
+//! PURA-250 added the typed `sendtextmessage` / `servergroupaddclient`
+//! `ControlBackend` methods, so the `welcome-on-join` example from the
+//! HTTP API spec (`docs/flows/http-api.md` §3.1) and the auto-group
+//! example from the architecture brief (`docs/flows/architecture.md` §4)
+//! both validate and dispatch end to end.
 //!
 //! ## `musicBotCommand`
 //!
@@ -60,6 +60,14 @@ const TS6_COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "clientunmute",
         required_args: &["clid"],
+    },
+    CommandSpec {
+        name: "sendtextmessage",
+        required_args: &["targetmode", "target", "msg"],
+    },
+    CommandSpec {
+        name: "servergroupaddclient",
+        required_args: &["sgid", "cldbid"],
     },
 ];
 
@@ -175,10 +183,45 @@ mod tests {
 
     #[test]
     fn ts6_unknown_command_is_rejected() {
-        let err = validate_ts6_command("sendtextmessage", &args(json!({}))).unwrap_err();
+        // `clientpoke` is a real ServerQuery command but is deliberately
+        // not whitelisted — no typed `ControlBackend` method backs it.
+        let err = validate_ts6_command("clientpoke", &args(json!({}))).unwrap_err();
         assert!(err.contains("not whitelisted"), "got: {err}");
         // The empty string is just another non-whitelisted command.
         assert!(validate_ts6_command("", &args(json!({}))).is_err());
+    }
+
+    #[test]
+    fn ts6_sendtextmessage_requires_targetmode_target_and_msg() {
+        // PURA-250 — `sendtextmessage` is now whitelisted; the create-time
+        // gate checks key presence for all three required args.
+        assert!(validate_ts6_command("sendtextmessage", &args(json!({}))).is_err());
+        assert!(
+            validate_ts6_command(
+                "sendtextmessage",
+                &args(json!({"targetmode": 2, "target": 5}))
+            )
+            .is_err()
+        );
+        validate_ts6_command(
+            "sendtextmessage",
+            &args(json!({
+                "targetmode": 2,
+                "target": "${trigger.channelId}",
+                "msg": "Welcome ${trigger.clientNickname}.",
+            })),
+        )
+        .expect("targetmode + target + msg present");
+    }
+
+    #[test]
+    fn ts6_servergroupaddclient_requires_sgid_and_cldbid() {
+        assert!(validate_ts6_command("servergroupaddclient", &args(json!({"sgid": 6}))).is_err());
+        validate_ts6_command(
+            "servergroupaddclient",
+            &args(json!({"sgid": 6, "cldbid": 12})),
+        )
+        .expect("sgid + cldbid present");
     }
 
     #[test]

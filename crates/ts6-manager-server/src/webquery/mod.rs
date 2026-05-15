@@ -670,6 +670,51 @@ impl WebQueryClient {
         self.clientedit_raw(sid, clid, &props).await
     }
 
+    /// `sendtextmessage` (sid scope) — deliver a text message to a client
+    /// (`targetmode=1`, `target=clid`), a channel (`targetmode=2`,
+    /// `target=cid`), or the whole virtual server (`targetmode=3`,
+    /// `target=sid`). Powers the `welcome-on-join` flow example
+    /// (`docs/flows/http-api.md` §3.1).
+    pub async fn sendtextmessage(
+        &self,
+        sid: i64,
+        targetmode: i64,
+        target: i64,
+        msg: &str,
+    ) -> WebQueryResult<()> {
+        let targetmode_s = targetmode.to_string();
+        let target_s = target.to_string();
+        self.get::<UnitBody>(
+            &format!("/{sid}/sendtextmessage"),
+            &[
+                ("targetmode", targetmode_s.as_str()),
+                ("target", target_s.as_str()),
+                ("msg", msg),
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// `servergroupaddclient` (sid scope) — add the client database id
+    /// `cldbid` to server group `sgid`. Powers the auto-group-assign flow
+    /// example (`docs/flows/architecture.md` §4).
+    pub async fn servergroupaddclient(
+        &self,
+        sid: i64,
+        sgid: i64,
+        cldbid: i64,
+    ) -> WebQueryResult<()> {
+        let sgid_s = sgid.to_string();
+        let cldbid_s = cldbid.to_string();
+        self.get::<UnitBody>(
+            &format!("/{sid}/servergroupaddclient"),
+            &[("sgid", sgid_s.as_str()), ("cldbid", cldbid_s.as_str())],
+        )
+        .await?;
+        Ok(())
+    }
+
     /// `banlist` (sid scope).
     pub async fn banlist(&self, sid: i64) -> WebQueryResult<Vec<BanEntry>> {
         // Empty banlist surfaces as upstream 1281 on some upstreams.
