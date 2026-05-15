@@ -419,14 +419,18 @@ fn EditServerDrawer(props: EditServerDrawerProps) -> Element {
         let wq_port_v = match webquery_port.read().trim().parse::<i64>() {
             Ok(n) if (1..=65535).contains(&n) => n,
             _ => {
-                error.set(Some("WebQuery port must be a number between 1 and 65535.".into()));
+                error.set(Some(
+                    "WebQuery port must be a number between 1 and 65535.".into(),
+                ));
                 return;
             }
         };
         let ssh_port_v = match ssh_port.read().trim().parse::<i64>() {
             Ok(n) if (1..=65535).contains(&n) => n,
             _ => {
-                error.set(Some("SSH port must be a number between 1 and 65535.".into()));
+                error.set(Some(
+                    "SSH port must be a number between 1 and 65535.".into(),
+                ));
                 return;
             }
         };

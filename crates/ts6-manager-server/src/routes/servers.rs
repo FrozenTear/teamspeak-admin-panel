@@ -220,10 +220,12 @@ async fn delete_server(
         return Err(err(StatusCode::NOT_FOUND, "server not found"));
     }
 
-    server_connections::delete(&state.db, id).await.map_err(|e| {
-        tracing::error!(err = %e, id, "delete_server: repo delete failed");
-        internal()
-    })?;
+    server_connections::delete(&state.db, id)
+        .await
+        .map_err(|e| {
+            tracing::error!(err = %e, id, "delete_server: repo delete failed");
+            internal()
+        })?;
 
     // Evict the cached upstream clients so the next dashboard fetch (or any
     // other per-server lookup) sees the row as gone instead of hitting a
