@@ -32,6 +32,7 @@ right command per shape).
 - [SurrealDB error boundary surfaced to the API](#surrealdb-error-boundary-surfaced-to-the-api)
 - [FFmpeg fetch refused — DNS rebinding pin tripped](#ffmpeg-fetch-refused--dns-rebinding-pin-tripped)
 - [Dashboard tick republisher silent / backing off](#dashboard-tick-republisher-silent--backing-off)
+- [Dashboard says "control transport error" after a fresh deploy](#dashboard-says-control-transport-error-after-a-fresh-deploy)
 - [Headless browser probes deadlock against the SPA](#headless-browser-probes-deadlock-against-the-spa)
 
 ---
@@ -504,6 +505,79 @@ republisher will recover on its next reconcile cycle (≤ 60 s).
 
 **Cross-link.** Implementation:
 [`crates/ts6-manager-server/src/ws/dashboard_tick.rs`](../crates/ts6-manager-server/src/ws/dashboard_tick.rs).
+
+---
+
+## Dashboard says "control transport error" after a fresh deploy
+
+**What the operator sees.** All four data pages of the panel — Dashboard,
+Channels, Clients, Server info — show the same red banner shortly after
+the wizard finishes:
+
+> **Could not reach TeamSpeak**
+> TeamSpeak API Error: control transport error: error sending request for
+> url (http://your-hostname:10080/1/serverinfo) (code -1)
+
+The Music Bots page shows the bot connected and "In channel" — i.e. the
+voice path through `127.0.0.1:9987` works, only the WebQuery (HTTP/10080)
+path is failing.
+
+**Why it happens.** Spec §10.5 sentinel `code == -1` is the panel-side
+"the request never landed on TS6" signal — DNS failed, connection
+refused, TLS handshake error, or the 15 s WebQuery timeout. On a fresh
+deploy with the panel running on the same host as TS6, the operator
+typically reaches it via the public DNS name (e.g. `scuffedcrew.no`),
+which then takes one of two failing paths:
+
+1. **TS6's WebQuery is bound to `127.0.0.1` only.** The panel's outbound
+   resolves the public hostname to the public IP and the request goes
+   externally; either the public IP doesn't have `:10080` open or the
+   hairpin-NAT round-trip never completes.
+2. **The host firewall drops `:10080` on the public interface.** TS6
+   WebQuery accepts loopback connections fine, but external ones get
+   silently filtered.
+
+The voice path on `127.0.0.1:9987` works because the bot already binds
+to loopback. The fix is to do the same for WebQuery.
+
+**What to do.**
+
+The setup wizard ([PURA-211](https://github.com/FrozenTear/teamspeak-admin-panel/issues))
+now ships a **Test connection** button on the first-server step that
+classifies the failure (DNS / connect / TLS / 401) in plain language and
+shows the URL the panel attempted. Run it before clicking *Create
+administrator and continue* whenever a deploy is new or moved.
+
+If you're past setup (i.e. the panel is already initialised and the
+dashboard is what's showing the banner), edit the affected server
+connection's `host` to point at the loopback address the bot uses —
+typically `127.0.0.1`:
+
+```sh
+# 1. Find the connection row in SurrealDB.
+podman exec ts6-manager-fullstack surreal sql \
+    --endpoint surrealkv:/var/lib/ts6-manager/db \
+    --namespace ts6 --database manager \
+    --pretty <<'SQL'
+SELECT id, name, host, webqueryPort FROM server_connection;
+SQL
+
+# 2. Edit the row through the UI (Server info → Edit, when the edit form
+#    ships) or, until then, an admin DB shell:
+#    UPDATE server_connection:<id> SET host = '127.0.0.1';
+```
+
+**Cross-link.**
+
+- The probe lives in
+  [`crates/ts6-manager-server/src/webquery/probe.rs`](../crates/ts6-manager-server/src/webquery/probe.rs)
+  and is wired into `POST /api/setup/test-connection` (unauthenticated,
+  only while `needsSetup == true`).
+- `127.0.0.1` is what the music-bot path already binds to — see
+  [PURA-188](https://github.com/FrozenTear/teamspeak-admin-panel/issues)
+  (hostNetwork) and
+  [PURA-197](https://github.com/FrozenTear/teamspeak-admin-panel/issues)
+  (HOST env so the Quadlet pod can do `Network=host` safely).
 
 ---
 

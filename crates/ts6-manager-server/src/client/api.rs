@@ -72,6 +72,24 @@ impl ApiError {
     pub fn is_bad_gateway(&self) -> bool {
         matches!(self, ApiError::BadGateway { .. })
     }
+
+    /// PURA-211 — one-line remediation hint for the transport-class branch
+    /// (spec §10.5 sentinel `code == -1` on a 502 BadGateway). Returns
+    /// `None` when the hint does not apply. Surfaced by every page that
+    /// renders a "Could not reach TeamSpeak" banner (dashboard, channels,
+    /// clients, server info) so an operator who hits the same setup
+    /// pitfall doesn't have to read reqwest internals to recover.
+    pub fn transport_hint(&self) -> Option<&'static str> {
+        match self {
+            ApiError::BadGateway { code: Some(-1), .. } => Some(
+                "Tip: if your panel runs on the same host as TS6, try `127.0.0.1` as the \
+                 server's WebQuery host. The Test connection button on the setup wizard \
+                 classifies the failure (DNS / connect / TLS / 401) without you reading \
+                 reqwest internals.",
+            ),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for ApiError {
@@ -497,6 +515,35 @@ mod tests {
     fn auth_error_unauthorized_maps_to_api_unauthorized() {
         let api: ApiError = AuthError::Unauthorized("Invalid or expired token".into()).into();
         assert!(api.is_unauthorized(), "got: {api:?}");
+    }
+
+    /// PURA-211 — spec §10.5 sentinel `code == -1` on a BadGateway maps to
+    /// the loopback-host hint. Upstream-code errors (e.g. invalid serverID)
+    /// must NOT carry the hint because the fix is to pass a valid sid, not
+    /// to flip the host to 127.0.0.1.
+    #[test]
+    fn transport_hint_fires_only_on_minus_one_sentinel() {
+        let transport_err = ApiError::BadGateway {
+            error: "TeamSpeak API Error".into(),
+            code: Some(-1),
+            details: Some("connection refused".into()),
+        };
+        let hint = transport_err.transport_hint().expect("hint must fire");
+        assert!(hint.contains("127.0.0.1"));
+        assert!(hint.contains("Test connection"));
+
+        let upstream_err = ApiError::BadGateway {
+            error: "TeamSpeak API Error".into(),
+            code: Some(1153),
+            details: Some("invalid serverID".into()),
+        };
+        assert!(upstream_err.transport_hint().is_none());
+
+        let unauth_err = ApiError::Unauthorized("Invalid or expired token".into());
+        assert!(unauth_err.transport_hint().is_none());
+
+        let transport_classless = ApiError::Transport("net::ERR".into());
+        assert!(transport_classless.transport_hint().is_none());
     }
 
     #[cfg(not(target_arch = "wasm32"))]

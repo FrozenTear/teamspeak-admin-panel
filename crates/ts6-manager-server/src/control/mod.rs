@@ -63,11 +63,12 @@ use crate::sshbridge::{
     transport::{TransportConfig, TransportHandle, spawn_with_db as spawn_transport_with_db},
 };
 use crate::webquery::{
-    BanAddParams, WebQueryClient, WebQueryError,
+    BanAddParams, ClassifiedTransport, WebQueryClient, WebQueryError,
     models::{
         BanEntry, ChannelEntry, ClientDbEntry, ClientEntry, ClientInfo, ConnectionInfo, LogEntry,
         ServerInfo, VersionInfo, VirtualServerEntry,
     },
+    other_transport,
 };
 use zeroize::Zeroizing;
 
@@ -83,9 +84,15 @@ pub enum ControlBackendError {
     Upstream { code: i64, message: String },
 
     /// Transport-class failure (network, TLS, SSH session). Maps to
-    /// `502` with `code = -1` per §10.5.
+    /// `502` with `code = -1` per §10.5. PURA-220: shape-aligned with
+    /// [`WebQueryError::Transport`] so the §7.0.2 `details` envelope
+    /// carries the typed kind prefix (`connect: …`, `dns: …`,
+    /// `timeout: …`, `tls: …`, `body: …`) that the dashboard /
+    /// channels / clients / server-info banners render. SSH-backed
+    /// failures default to [`WebQueryTransportKind::Other`] because the
+    /// reqwest classifier doesn't apply to the SSH path.
     #[error("control transport error: {0}")]
-    Transport(String),
+    Transport(ClassifiedTransport),
 
     /// The response could not be parsed into the expected typed shape.
     /// Maps to `502` with `code = -1`.
@@ -145,15 +152,39 @@ impl ControlBackendError {
         }
     }
 
-    /// Operator-friendly `details` string for the §7.0.2 body.
+    /// Operator-friendly `details` string for the §7.0.2 body. Transport
+    /// failures render as `"<kind>: <message>"` (PURA-220) so the
+    /// dashboard / channels / clients / server-info banner picks up the
+    /// class prefix without parsing English.
     pub fn upstream_message(&self) -> String {
         match self {
             Self::Upstream { message, .. } => message.clone(),
+            Self::Transport(ct) => ct.formatted(),
             Self::HostKeyMismatch { config_id } => format!(
                 "host-key fingerprint did not match the pinned value for connection #{config_id}; \
                  verify the new fingerprint via `ssh-keyscan` and update sshHostKeyFingerprint on the row"
             ),
             other => other.to_string(),
+        }
+    }
+
+    /// Builder for the `Transport` variant carrying [`other_transport`]
+    /// shape — short-hand for static-message call sites (e.g. the pool's
+    /// "No connection configured for server config ID X" sentinel).
+    pub(crate) fn transport_other(message: impl Into<String>) -> Self {
+        Self::Transport(other_transport(message))
+    }
+
+    /// Typed transport-classifier kind when this error is a control-plane
+    /// transport failure. WebQuery backends populate the matching kind
+    /// from the reqwest classifier; SSH backends always report
+    /// [`WebQueryTransportKind::Other`] because the reqwest path doesn't
+    /// apply. Returns `None` for non-transport errors so callers can
+    /// branch on classification without matching the full variant shape.
+    pub fn transport_kind(&self) -> Option<crate::webquery::WebQueryTransportKind> {
+        match self {
+            Self::Transport(ct) => Some(ct.kind),
+            _ => None,
         }
     }
 }
@@ -162,7 +193,11 @@ impl From<WebQueryError> for ControlBackendError {
     fn from(e: WebQueryError) -> Self {
         match e {
             WebQueryError::Upstream { code, message } => Self::Upstream { code, message },
-            WebQueryError::Transport(s) => Self::Transport(s),
+            // PURA-220: typed transport classification flows verbatim from
+            // the WebQuery surface into the control envelope so the §7.0.2
+            // `details` banner carries the same `connect:` / `dns:` /
+            // `timeout:` / `tls:` / `body:` prefix the wizard probe shows.
+            WebQueryError::Transport(ct) => Self::Transport(ct),
             WebQueryError::InvalidResponse(s) => Self::InvalidResponse(s),
             WebQueryError::Decrypt { config_id, source } => Self::Decrypt {
                 config_id,
@@ -176,7 +211,13 @@ impl From<SshBridgeError> for ControlBackendError {
     fn from(e: SshBridgeError) -> Self {
         match e {
             SshBridgeError::Upstream { code, message } => Self::Upstream { code, message },
-            SshBridgeError::Transport(s) => Self::Transport(s),
+            // PURA-220: the SSH transport doesn't run through reqwest, so
+            // the typed classifier doesn't apply. Default to `Other` and
+            // forward the underlying message verbatim — the operator still
+            // sees the SSH cause prefixed with `other:` in the §7.0.2
+            // `details` envelope, which is strictly more information than
+            // the pre-PURA-220 raw-string form carried.
+            SshBridgeError::Transport(s) => Self::Transport(other_transport(s)),
             SshBridgeError::InvalidResponse(s) => Self::InvalidResponse(s),
             SshBridgeError::Decrypt { config_id, source } => Self::Decrypt {
                 config_id,
@@ -521,7 +562,7 @@ impl ControlBackendPool {
             return Ok(existing);
         }
         let connection = connection.ok_or_else(|| {
-            ControlBackendError::Transport(format!(
+            ControlBackendError::transport_other(format!(
                 "No connection configured for server config ID {config_id}"
             ))
         })?;
@@ -685,6 +726,7 @@ fn unseal_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::webquery::WebQueryTransportKind;
 
     #[test]
     fn http_status_aligns_with_per_backend_mapping() {
@@ -695,7 +737,7 @@ mod tests {
         assert_eq!(upstream.http_status(), StatusCode::BAD_GATEWAY);
         assert_eq!(upstream.upstream_code(), 2568);
 
-        let transport = ControlBackendError::Transport("boom".into());
+        let transport = ControlBackendError::transport_other("boom");
         assert_eq!(transport.http_status(), StatusCode::BAD_GATEWAY);
         assert_eq!(transport.upstream_code(), -1);
 
@@ -718,9 +760,47 @@ mod tests {
             ControlBackendError::Upstream { code: 1281, .. }
         ));
 
-        let we = WebQueryError::Transport("dns".into());
+        // PURA-220: typed transport variant must flow through the From
+        // impl with `kind` preserved so the §7.0.2 envelope keeps the
+        // classifier prefix the FE banner branches on.
+        let we = WebQueryError::Transport(ClassifiedTransport {
+            kind: WebQueryTransportKind::Dns,
+            message: "Could not resolve the host in http://x/y. (no such host)".into(),
+        });
         let ce: ControlBackendError = we.into();
-        assert!(matches!(ce, ControlBackendError::Transport(_)));
+        match &ce {
+            ControlBackendError::Transport(ct) => {
+                assert_eq!(ct.kind, WebQueryTransportKind::Dns);
+                assert!(ct.message.contains("no such host"));
+            }
+            other => panic!("expected Transport, got {other:?}"),
+        }
+        // The §7.0.2 `details` envelope renders the typed prefix.
+        let details = ce.upstream_message();
+        assert!(
+            details.starts_with("dns: "),
+            "expected dns-prefixed details, got `{details}`"
+        );
+    }
+
+    /// PURA-220 — SSH transport errors map onto the same `Transport`
+    /// envelope shape with `kind = Other` because the reqwest
+    /// classifier doesn't apply. The §7.0.2 `details` carries the
+    /// `other:` prefix so the operator still sees a class on the
+    /// banner instead of the raw SSH cause.
+    #[test]
+    fn ssh_transport_maps_onto_typed_other_variant() {
+        let se = SshBridgeError::Transport("banner timeout".into());
+        let ce: ControlBackendError = se.into();
+        match &ce {
+            ControlBackendError::Transport(ct) => {
+                assert_eq!(ct.kind, WebQueryTransportKind::Other);
+                assert_eq!(ct.message, "banner timeout");
+            }
+            other => panic!("expected Transport, got {other:?}"),
+        }
+        let details = ce.upstream_message();
+        assert_eq!(details, "other: banner timeout");
     }
 
     #[test]
@@ -767,12 +847,24 @@ mod tests {
             .expect("in-memory connect");
         let pool = ControlBackendPool::new(false, db);
         let err = pool.get_or_build(99, None).await.unwrap_err();
-        match err {
-            ControlBackendError::Transport(s) => {
-                assert!(s.contains("99"), "expected config id in error: {s}");
+        match &err {
+            ControlBackendError::Transport(ct) => {
+                assert_eq!(ct.kind, WebQueryTransportKind::Other);
+                assert!(
+                    ct.message.contains("99"),
+                    "expected config id in transport message: {}",
+                    ct.message
+                );
             }
             other => panic!("expected Transport, got {other:?}"),
         }
+        // §7.0.2 details still carries the canonical sentinel via the
+        // `other:` prefix introduced in PURA-220.
+        let details = err.upstream_message();
+        assert!(
+            details.starts_with("other: ") && details.contains("server config ID 99"),
+            "expected canonical §10.7 message prefixed with `other:`, got `{details}`"
+        );
     }
 
     /// Build a minimal `ServerConnection` with `controlPath='ssh'` for the

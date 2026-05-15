@@ -28,13 +28,17 @@
 use dioxus::prelude::*;
 use ts6_manager_shared::auth::{LoginRequest, UserInfo};
 use ts6_manager_shared::setup::{SetupInitRequest, SetupInitServer};
+use ts6_manager_shared::test_connection::{
+    TestConnectionKind, TestConnectionRequest, TestConnectionResponse,
+};
 
 use crate::client::auth as auth_client;
 use crate::client::dioxus::use_session;
 use crate::client::setup::{self, SetupInitError};
 use crate::client::store::AuthState;
 use crate::ui::components::{
-    Banner, BannerVariant, Button, ButtonSize, ButtonType, Field, PasswordInput, TextInput,
+    Banner, BannerVariant, Button, ButtonSize, ButtonType, ButtonVariant, Field, PasswordInput,
+    TextInput,
 };
 use crate::ui::routes::Route;
 
@@ -88,6 +92,11 @@ pub fn SetupPage() -> Element {
     let mut submitting = use_signal(|| false);
     let mut password_error: Signal<Option<String>> = use_signal(|| None);
     let mut form_error: Signal<Option<String>> = use_signal(|| None);
+    // PURA-211 — "Test connection" affordance. Independent of the
+    // submit path: the operator can probe before committing the row.
+    let mut probing = use_signal(|| false);
+    let mut probe_result: Signal<Option<TestConnectionResponse>> = use_signal(|| None);
+    let mut probe_error: Signal<Option<String>> = use_signal(|| None);
 
     // Submit gate: every required field must be non-empty AND the two
     // password fields must match. Disabling the button is the cheap-and-
@@ -168,6 +177,52 @@ pub fn SetupPage() -> Element {
                 Err(SetupInitError::Other(_)) => {
                     submitting.set(false);
                     form_error.set(Some(GENERIC_FAILURE_COPY.to_string()));
+                }
+            }
+        });
+    };
+
+    // PURA-211 — kick off the probe with the same wire shape the wizard
+    // submits. The host + apiKey fields must be filled; webqueryPort /
+    // useHttps default server-side. Result lands in `probe_result` so
+    // the panel below the form can render it.
+    let server_fields_filled =
+        !server_host.read().is_empty() && !api_key.read().is_empty();
+    let can_probe = !probing() && !submitting() && server_fields_filled;
+    let on_probe = move |_evt: MouseEvent| {
+        if !can_probe {
+            return;
+        }
+        let req = TestConnectionRequest {
+            host: server_host.read().clone(),
+            api_key: api_key.read().clone(),
+            webquery_port: None,
+            use_https: None,
+        };
+        probing.set(true);
+        probe_result.set(None);
+        probe_error.set(None);
+        spawn(async move {
+            let base = api_base();
+            match setup::test_connection(&base, &req).await {
+                Ok(resp) => {
+                    probing.set(false);
+                    probe_result.set(Some(resp));
+                }
+                Err(SetupInitError::AlreadyInitialized) => {
+                    probing.set(false);
+                    probe_error.set(Some(ALREADY_INITIALIZED_COPY.to_string()));
+                }
+                Err(SetupInitError::WeakPassword(_)) => {
+                    // The probe route never returns 400/weak-password —
+                    // surface defensively as a generic failure if it ever
+                    // does so we don't swallow the result.
+                    probing.set(false);
+                    probe_error.set(Some(GENERIC_FAILURE_COPY.to_string()));
+                }
+                Err(SetupInitError::Other(e)) => {
+                    probing.set(false);
+                    probe_error.set(Some(format!("Could not run the probe: {e}")));
                 }
             }
         });
@@ -313,6 +368,27 @@ pub fn SetupPage() -> Element {
                         }
                     }
 
+                    // PURA-211 — probe affordance. Sits between the
+                    // server fields and the SSH section so the operator
+                    // can verify WebQuery reachability before commit.
+                    div { class: "setup-probe-row",
+                        Button {
+                            kind: ButtonType::Button,
+                            variant: ButtonVariant::Secondary,
+                            size: ButtonSize::Medium,
+                            loading: probing(),
+                            disabled: !can_probe,
+                            onclick: on_probe,
+                            "Test connection"
+                        }
+                    }
+                    if let Some(msg) = probe_error.read().clone() {
+                        Banner { variant: BannerVariant::Danger, title: "Test failed", "{msg}" }
+                    }
+                    if let Some(resp) = probe_result.read().clone() {
+                        ProbeResultPanel { result: resp }
+                    }
+
                     // SSH section — collapsible disclosure
                     details {
                         open: ssh_open(),
@@ -383,6 +459,60 @@ pub fn SetupPage() -> Element {
                 }
             }
         }
+    }
+}
+
+/// PURA-211 — inline render of [`TestConnectionResponse`]. Three states:
+/// connected (green), classified failure (red), and the rare success-but-
+/// no-version-banner shape (treated as connected, no `serverVersion`
+/// suffix). Always shows the URL the panel attempted so the operator can
+/// copy it into a bug report verbatim.
+#[derive(Props, Clone, PartialEq)]
+struct ProbeResultPanelProps {
+    result: TestConnectionResponse,
+}
+
+#[component]
+fn ProbeResultPanel(props: ProbeResultPanelProps) -> Element {
+    let r = props.result;
+    let variant = if r.ok {
+        BannerVariant::Success
+    } else {
+        BannerVariant::Danger
+    };
+    let title = if r.ok {
+        "Connected".to_string()
+    } else {
+        format!("Test failed — {}", classify_label(r.kind))
+    };
+    let hint = r.kind.hint();
+    rsx! {
+        Banner { variant: variant, title: title,
+            p { class: "probe-result-message", "{r.message}" }
+            p { class: "probe-result-url",
+                "Tried: "
+                code { "{r.url_tried}" }
+            }
+            if let Some(v) = r.server_version.as_deref() {
+                p { class: "probe-result-version", "Server reported: {v}" }
+            }
+            if !hint.is_empty() {
+                p { class: "probe-result-hint", "{hint}" }
+            }
+        }
+    }
+}
+
+fn classify_label(kind: TestConnectionKind) -> &'static str {
+    match kind {
+        TestConnectionKind::Ok => "OK",
+        TestConnectionKind::Dns => "DNS lookup failed",
+        TestConnectionKind::Connect => "Connection refused",
+        TestConnectionKind::Timeout => "Timeout",
+        TestConnectionKind::Tls => "TLS error",
+        TestConnectionKind::Unauthorized => "API key rejected",
+        TestConnectionKind::InvalidResponse => "Unexpected response",
+        TestConnectionKind::Other => "Unreachable",
     }
 }
 

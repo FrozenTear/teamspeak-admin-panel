@@ -41,6 +41,8 @@
 pub mod dashboard;
 pub mod escape;
 pub mod models;
+pub mod probe;
+pub mod transport_class;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -60,6 +62,9 @@ pub use models::{
     BanAddResponse, BanEntry, ChannelClientPerm, ChannelEntry, ChannelInfo, ClientDbEntry,
     ClientEntry, ClientInfo, ConnectionInfo, HostInfo, LogEntry, ServerInfo, VersionInfo,
     VirtualServerEntry,
+};
+pub use transport_class::{
+    ClassifiedTransport, WebQueryTransportKind, other_static as other_transport,
 };
 
 /// TS upstream code for `database_empty_result`. List reads opt into mapping
@@ -82,10 +87,15 @@ pub enum WebQueryError {
     #[error("TS upstream error {code}: {message}")]
     Upstream { code: i64, message: String },
 
-    /// HTTP transport failure (connect refused, TLS rejection, DNS, timeout).
-    /// Maps to `502` with `code = -1` per spec §10.5.
+    /// HTTP transport failure (connect refused, TLS rejection, DNS, timeout,
+    /// response-body read). Maps to `502` with `code = -1` per spec §10.5.
+    /// PURA-220: shaped as a struct variant so the §7.0.2 `details` envelope
+    /// can carry the typed `kind` prefix the operator banners render —
+    /// dashboard / channels / clients / server-info paths previously
+    /// surfaced reqwest's `Display` blob verbatim. The `Display` impl
+    /// keeps the `transport error:` sentinel for §10.5 compat.
     #[error("transport error: {0}")]
-    Transport(String),
+    Transport(ClassifiedTransport),
 
     /// Response was reachable but not the expected `{body, status}` envelope.
     #[error("malformed WebQuery response: {0}")]
@@ -121,12 +131,36 @@ impl WebQueryError {
         }
     }
 
-    /// Operator-friendly `details` string for the §7.0.2 body.
+    /// Operator-friendly `details` string for the §7.0.2 body. Transport
+    /// failures render as `"<kind>: <message>"` (PURA-220) so the operator
+    /// banner picks up the class prefix without having to parse English.
     pub fn upstream_message(&self) -> String {
         match self {
             WebQueryError::Upstream { message, .. } => message.clone(),
+            WebQueryError::Transport(ct) => ct.formatted(),
             other => other.to_string(),
         }
+    }
+
+    /// Typed transport-classifier kind, when this error is a transport
+    /// failure. Returns `None` for envelope-level errors. The dashboard
+    /// banner and `routes::control` audit log can branch on this without
+    /// having to match the full `Transport(ClassifiedTransport)` shape.
+    pub fn transport_kind(&self) -> Option<WebQueryTransportKind> {
+        match self {
+            WebQueryError::Transport(ct) => Some(ct.kind),
+            _ => None,
+        }
+    }
+}
+
+impl WebQueryError {
+    /// Builder for the `Transport` variant carrying [`other_transport`]
+    /// shape — short-hand for the static-message call sites
+    /// (`apiKey is not a valid HTTP header`, "No connection configured
+    /// for server config ID X", builder failures).
+    pub(crate) fn transport_other(message: impl Into<String>) -> Self {
+        WebQueryError::Transport(transport_class::other_static(message))
     }
 }
 
@@ -190,7 +224,7 @@ impl WebQueryClient {
 
         let inner = builder
             .build()
-            .map_err(|e| WebQueryError::Transport(e.to_string()))?;
+            .map_err(|e| WebQueryError::transport_other(e.to_string()))?;
 
         Ok(Self {
             config_id,
@@ -287,7 +321,7 @@ impl WebQueryClient {
 
             let mut headers = HeaderMap::new();
             let key = HeaderValue::from_str(&self.api_key).map_err(|_| {
-                WebQueryError::Transport("apiKey is not a valid HTTP header".into())
+                WebQueryError::transport_other("apiKey is not a valid HTTP header")
             })?;
             headers.insert(API_KEY_HEADER, key);
 
@@ -304,8 +338,19 @@ impl WebQueryClient {
                 Ok(resp) => resp,
                 Err(e) => {
                     let latency_ms = started.elapsed().as_millis() as u64;
-                    tracing::warn!(latency_ms, outcome = "transport", error = %e);
-                    return Err(WebQueryError::Transport(e.to_string()));
+                    // PURA-220: classify so the §7.0.2 `details` and the
+                    // dashboard banner pick up "Connection refused …" /
+                    // "DNS lookup failed …" instead of reqwest's `Display`
+                    // blob. The same `url` we just dialed feeds the
+                    // operator-facing message verbatim.
+                    let classified = transport_class::classify_reqwest_error(&e, &url);
+                    tracing::warn!(
+                        latency_ms,
+                        outcome = "transport",
+                        kind = classified.kind.as_str(),
+                        error = %e,
+                    );
+                    return Err(WebQueryError::Transport(classified));
                 }
             };
 
@@ -315,8 +360,14 @@ impl WebQueryClient {
                 Ok(b) => b,
                 Err(e) => {
                     let latency_ms = started.elapsed().as_millis() as u64;
-                    tracing::warn!(latency_ms, outcome = "transport", error = %e);
-                    return Err(WebQueryError::Transport(e.to_string()));
+                    let classified = transport_class::classify_response_body_error(&e, &url);
+                    tracing::warn!(
+                        latency_ms,
+                        outcome = "transport",
+                        kind = classified.kind.as_str(),
+                        error = %e,
+                    );
+                    return Err(WebQueryError::Transport(classified));
                 }
             };
 
@@ -865,7 +916,7 @@ impl WebQueryPool {
             return Ok(existing);
         }
         let connection = connection.ok_or_else(|| {
-            WebQueryError::Transport(format!(
+            WebQueryError::transport_other(format!(
                 "No connection configured for server config ID {config_id}"
             ))
         })?;

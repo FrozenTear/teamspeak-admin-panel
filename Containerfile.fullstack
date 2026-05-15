@@ -123,13 +123,22 @@ FROM docker.io/debian:bookworm-slim
 #                           HTTP(S) `AudioSource::Url` (the only path the
 #                           `/api/music-bots/{id}/play` REST surface exercises;
 #                           see `crates/voice/src/audio.rs::source_to_spec`).
+# Pin yt-dlp to a known-good upstream release. The Debian Bookworm apt package
+# is pinned at 2023.03.04 — too old for YouTube's current cipher/sig mechanism.
+# Bump this ARG when YouTube stops working again (keep the pin explicit so a
+# future regression is a deliberate, reviewed change — not a silent `latest`
+# pull at build time).
+ARG YTDLP_VERSION=2025.01.26
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
         ffmpeg \
         libssl3 \
-        yt-dlp \
+ && curl -fsSL -o /usr/local/bin/yt-dlp \
+        "https://github.com/yt-dlp/yt-dlp/releases/download/${YTDLP_VERSION}/yt-dlp" \
+ && chmod 0755 /usr/local/bin/yt-dlp \
+ && yt-dlp --version \
  && rm -rf /var/lib/apt/lists/* \
  && groupadd --system --gid 10001 ts6 \
  && useradd --system --uid 10001 --gid ts6 --shell /usr/sbin/nologin --home-dir /var/lib/ts6-manager ts6 \

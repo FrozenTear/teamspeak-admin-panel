@@ -12,7 +12,7 @@ use std::io;
 use std::process::Stdio;
 
 use async_trait::async_trait;
-use tokio::io::{AsyncReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, ChildStdout, Command};
 
 use super::PcmSource;
@@ -51,13 +51,23 @@ impl FfmpegSource {
             .arg("pipe:1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
 
         let mut child = cmd.spawn()?;
         let stdout = child
             .stdout
             .take()
             .ok_or_else(|| io::Error::other("ffmpeg child has no stdout"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| io::Error::other("ffmpeg child has no stderr"))?;
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                tracing::warn!(target: "ffmpeg", "{}", line);
+            }
+        });
         Ok(Self {
             child: Some(child),
             stdout: BufReader::with_capacity(64 * 1024, stdout),
@@ -90,7 +100,7 @@ impl FfmpegSource {
             .arg("pipe:1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
 
         let mut child = cmd.spawn()?;
         let stdin = child
@@ -101,6 +111,16 @@ impl FfmpegSource {
             .stdout
             .take()
             .ok_or_else(|| io::Error::other("ffmpeg child has no stdout"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| io::Error::other("ffmpeg child has no stderr"))?;
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                tracing::warn!(target: "ffmpeg", "{}", line);
+            }
+        });
         Ok((
             Self {
                 child: Some(child),

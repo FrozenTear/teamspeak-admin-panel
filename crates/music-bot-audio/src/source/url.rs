@@ -11,7 +11,7 @@ use std::io;
 use std::process::Stdio;
 
 use async_trait::async_trait;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
 
@@ -38,17 +38,43 @@ impl YtDlpSource {
             .arg("-f")
             .arg("bestaudio")
             .arg("-o")
-            .arg("-")
-            .arg(url)
+            .arg("-");
+
+        // PURA-216 — `YT_COOKIE_FILE` points at a Netscape `cookies.txt`
+        // (typically Firefox-exported via the "cookies.txt" extension). Needed
+        // for age-gated, region-locked, and "confirm you're not a bot"
+        // rate-limited videos. Inline env read keeps the seam local; a future
+        // UI cookie-management ticket will refactor to plumb the path through
+        // PipelineConfig from `Config.yt_cookie_file`.
+        if let Ok(path) = std::env::var("YT_COOKIE_FILE")
+            && !path.is_empty()
+        {
+            cmd.arg("--cookies").arg(&path);
+            tracing::debug!(target: "yt_dlp", cookie_file = %path, "passing cookies file to yt-dlp");
+        }
+
+        cmd.arg(url)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
 
         let mut yt_dlp = cmd.spawn()?;
         let mut yt_stdout = yt_dlp
             .stdout
             .take()
             .ok_or_else(|| io::Error::other("yt-dlp child has no stdout"))?;
+
+        // Log yt-dlp stderr so signature/cipher errors are visible to operators.
+        let yt_stderr = yt_dlp
+            .stderr
+            .take()
+            .ok_or_else(|| io::Error::other("yt-dlp child has no stderr"))?;
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(yt_stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                tracing::warn!(target: "yt_dlp", "{}", line);
+            }
+        });
 
         // Bridge yt-dlp.stdout → ffmpeg.stdin in a background task. Closes
         // ffmpeg's stdin when yt-dlp finishes so ffmpeg sees clean EOF.

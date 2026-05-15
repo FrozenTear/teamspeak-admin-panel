@@ -401,9 +401,28 @@ async fn transport_error_when_target_refuses_connection() {
     .unwrap();
 
     let err = client.version().await.unwrap_err();
-    assert!(matches!(err, WebQueryError::Transport(_)), "got {err:?}");
+    // PURA-220: refused-connection paths now carry the typed `Connect`
+    // kind so the §7.0.2 envelope and the dashboard banner pick up
+    // "connect: …" prefixes instead of reqwest's `Display` blob.
+    match &err {
+        WebQueryError::Transport(ct) => {
+            assert_eq!(ct.kind, WebQueryTransportKind::Connect);
+            assert!(
+                ct.message.contains(&format!("{}:{}", addr.ip(), addr.port())),
+                "operator message must reference the dial target: {}",
+                ct.message
+            );
+        }
+        other => panic!("expected Transport, got {other:?}"),
+    }
     assert_eq!(err.http_status(), StatusCode::BAD_GATEWAY);
     assert_eq!(err.upstream_code(), -1);
+    // §7.0.2 details renders the typed prefix end-to-end.
+    let details = err.upstream_message();
+    assert!(
+        details.starts_with("connect: "),
+        "expected connect-prefixed details, got `{details}`"
+    );
 }
 
 #[tokio::test]
@@ -421,10 +440,26 @@ async fn https_against_plaintext_target_fails_when_self_signed_disabled() {
     .unwrap();
 
     let err = client.version().await.unwrap_err();
-    assert!(
-        matches!(err, WebQueryError::Transport(_)),
-        "TLS path must surface as a transport error, got {err:?}"
-    );
+    // PURA-220: keep the variant assertion permissive — reqwest may
+    // surface a TLS-over-plaintext failure as a connect-class error on
+    // some builds. The point of the test is that the typed envelope
+    // flows through, regardless of the exact bucket the classifier
+    // picks for an HTTP-talking-server-mistaken-for-TLS shape.
+    match &err {
+        WebQueryError::Transport(ct) => {
+            assert!(
+                matches!(
+                    ct.kind,
+                    WebQueryTransportKind::Tls
+                        | WebQueryTransportKind::Connect
+                        | WebQueryTransportKind::Other
+                ),
+                "TLS-over-plaintext should classify as Tls/Connect/Other, got {:?}",
+                ct.kind
+            );
+        }
+        other => panic!("TLS path must surface as a transport error, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -452,6 +487,19 @@ async fn pool_missing_connection_returns_canonical_500_message() {
     assert!(
         s.contains("No connection configured for server config ID 404"),
         "spec §10.7 canonical message; got `{s}`"
+    );
+    // PURA-220: §7.0.2 `details` envelope renders the canonical message
+    // prefixed with the typed `other:` class.
+    match &err {
+        WebQueryError::Transport(ct) => {
+            assert_eq!(ct.kind, WebQueryTransportKind::Other);
+        }
+        other => panic!("expected Transport, got {other:?}"),
+    }
+    let details = err.upstream_message();
+    assert!(
+        details.starts_with("other: ") && details.contains("404"),
+        "expected `other:`-prefixed details, got `{details}`"
     );
 }
 

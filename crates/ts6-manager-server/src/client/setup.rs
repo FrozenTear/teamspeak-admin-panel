@@ -13,6 +13,7 @@
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use ts6_manager_shared::setup::{SetupInitRequest, SetupInitResponse, SetupStatusResponse};
+use ts6_manager_shared::test_connection::{TestConnectionRequest, TestConnectionResponse};
 
 use crate::client::api::ApiError;
 #[cfg(target_arch = "wasm32")]
@@ -52,6 +53,25 @@ impl std::error::Error for SetupInitError {}
 /// `GET /api/setup/status` — returns `{ needsSetup }`. Unauthenticated.
 pub async fn status(base: &str) -> Result<SetupStatusResponse, ApiError> {
     unauth_request_json::<(), _>(base, "GET", "/api/setup/status", None).await
+}
+
+/// PURA-211 — `POST /api/setup/test-connection`. Always parses the body
+/// as a [`TestConnectionResponse`] (even on probe failure — the server
+/// surfaces classification info in the body, not the HTTP status), and
+/// surfaces `409 already_initialized` as a dedicated error so the wizard
+/// can bounce to login the same way `init` does.
+pub async fn test_connection(
+    base: &str,
+    req: &TestConnectionRequest,
+) -> Result<TestConnectionResponse, SetupInitError> {
+    match unauth_request_json(base, "POST", "/api/setup/test-connection", Some(req)).await {
+        Ok(body) => Ok(body),
+        Err(ApiError::Client {
+            status: 409,
+            message,
+        }) if message == ALREADY_INITIALIZED => Err(SetupInitError::AlreadyInitialized),
+        Err(other) => Err(SetupInitError::Other(other)),
+    }
 }
 
 /// `POST /api/setup/init` — one-shot admin + first-server creation.

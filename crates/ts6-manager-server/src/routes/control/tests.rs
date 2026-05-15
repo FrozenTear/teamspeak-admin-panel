@@ -855,6 +855,50 @@ async fn client_detail_passes_through_with_live_when_online() {
     assert_eq!(live.cid, 5);
 }
 
+/// PURA-220 — the §7.0.2 `details` envelope on a control-route request
+/// that hits a refused TCP target carries the typed `connect:` prefix
+/// (and references the dial target), not reqwest's `Display` blob. This
+/// is the regression PURA-211 caught on the dashboard banner but never
+/// applied to the `/clients` / `/channels` / `/info` paths.
+#[tokio::test]
+async fn transport_error_details_carry_typed_class_prefix() {
+    // Bind/drop pattern reliably yields ECONNREFUSED on connect.
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let dead_port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let state = fresh_state().await;
+    let server = seed_server(&state, dead_port, "API-KEY").await;
+    let (_admin, atoken) = seed_user_with_token(&state, "alice", "admin").await;
+
+    let resp = app(state)
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/servers/{}/vs/1/channels", server.id))
+                .header("authorization", auth_header(&atoken))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    let v = read_body_value(resp).await;
+    assert_eq!(v["error"], "TeamSpeak API Error");
+    assert_eq!(v["code"], -1);
+    let details = v["details"].as_str().expect("details is a string");
+    assert!(
+        details.starts_with("connect: "),
+        "expected operator-friendly `connect:` prefix per PURA-220, got `{details}`"
+    );
+    assert!(
+        details.contains(&format!("127.0.0.1:{dead_port}")),
+        "details must name the dial target, got `{details}`"
+    );
+}
+
 // Silence unused-helper lints when individual tests are toggled.
 #[allow(dead_code)]
 fn _ensure_db_arc_used() {

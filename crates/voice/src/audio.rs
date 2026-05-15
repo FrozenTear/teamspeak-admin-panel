@@ -66,6 +66,10 @@ pub(crate) struct ActiveAudio {
     /// Flipped by `Pause` / `Resume`. The sibling parks on
     /// `pause_rx.changed()` while `*pause_rx.borrow()` is true.
     pub pause: watch::Sender<bool>,
+    /// Incremented by the connected loop each time it sends an Opus frame.
+    /// Zero at `Finished` means the pipeline produced no audio (e.g. yt-dlp
+    /// failed on a YouTube URL and ffmpeg saw empty stdin).
+    pub frames_sent: u64,
     /// Kept so `Drop` aborts the sibling on teardown. The sibling owns
     /// the [`AudioPipeline`] (whose own `Drop` aborts the worker task),
     /// so this single handle is enough to cancel the whole audio stack.
@@ -193,6 +197,7 @@ pub(crate) async fn start_pipeline(
         source_label: label.clone(),
         audio_rx: msg_rx,
         pause: pause_tx,
+        frames_sent: 0,
         _sibling: sibling,
     });
     Ok(label)
