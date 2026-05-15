@@ -38,8 +38,22 @@ impl YtDlpSource {
             .arg("-f")
             .arg("bestaudio")
             .arg("-o")
-            .arg("-")
-            .arg(url)
+            .arg("-");
+
+        // PURA-216 — `YT_COOKIE_FILE` points at a Netscape `cookies.txt`
+        // (typically Firefox-exported via the "cookies.txt" extension). Needed
+        // for age-gated, region-locked, and "confirm you're not a bot"
+        // rate-limited videos. Inline env read keeps the seam local; a future
+        // UI cookie-management ticket will refactor to plumb the path through
+        // PipelineConfig from `Config.yt_cookie_file`.
+        if let Ok(path) = std::env::var("YT_COOKIE_FILE")
+            && !path.is_empty()
+        {
+            cmd.arg("--cookies").arg(&path);
+            tracing::debug!(target: "yt_dlp", cookie_file = %path, "passing cookies file to yt-dlp");
+        }
+
+        cmd.arg(url)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

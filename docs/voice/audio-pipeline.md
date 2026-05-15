@@ -158,6 +158,17 @@ The pipeline shells out to:
 
 These are not provisioned by the workspace; the operator-side `Containerfile.fullstack` and the host package manager handle them. Compose-side runbooks live alongside `docs/ts6-fixture.md`.
 
+### YouTube cookies (PURA-216)
+
+YouTube increasingly requires a logged-in session for age-gated content, region-locked content, and "Sign in to confirm you're not a bot" rate-limited videos. yt-dlp accepts a Netscape `cookies.txt` file via `--cookies <path>`. The manager picks it up from the `YT_COOKIE_FILE` env var:
+
+1. Generate the cookies file from a browser logged into youtube.com. Recommended: the [cookies.txt](https://addons.mozilla.org/firefox/addon/cookies-txt/) Firefox add-on. Export to `cookies.txt`.
+2. Make the file readable by the manager process (the fullstack image runs as uid `10001` / `ts6:ts6`). Place it under `<DATA_DIR>` so it persists across image rebuilds — e.g. `/var/lib/ts6-manager/yt-cookies.txt`.
+3. Set `YT_COOKIE_FILE=/var/lib/ts6-manager/yt-cookies.txt` in the manager's environment (Quadlet env file or kube `env:` entry).
+4. Restart the manager. Boot summary logs `yt_cookie_file_set=true`. Each yt-dlp invocation passes `--cookies <path>`; absence of the env var means no flag is added.
+
+Cookies expire (typical YouTube cookies: weeks to months). A future UI ticket adds an upload + replace surface inside the operator panel; for now, replace the file in place and restart the manager.
+
 ## What this crate does not do
 
 - TS6 wire transmission — that's WS-1's job. The pipeline only produces `OpusFrame { bytes, scheduled_at, … }`.
