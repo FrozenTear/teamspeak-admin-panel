@@ -121,15 +121,16 @@ on_exit() {
 trap on_exit EXIT
 
 # do_req STEP METHOD URL [JSON_DATA]
-# Writes step-STEP.req.json and step-STEP.resp.json into $EVID_DIR.
-# Prints the HTTP status code on stdout; leaves the response body in
-# $RESP_BODY (a file path).
+# Writes step-STEP.req.json and step-STEP.resp.json into $EVID_DIR, and sets
+# the globals RESP_CODE (HTTP status string) and RESP_BODY (response file
+# path). Call it as a plain statement — NOT inside $(...) — so the globals
+# propagate to the caller's shell.
+RESP_CODE=""
 RESP_BODY=""
 do_req() {
     local step="$1" method="$2" url="$3" data="${4:-}"
     local req_file="$EVID_DIR/step-$step.req.json"
     local resp_file="$EVID_DIR/step-$step.resp.json"
-    local code
 
     if [[ -n "$data" ]]; then
         jq -n --arg m "$method" --arg u "$url" --argjson b "$data" \
@@ -148,10 +149,11 @@ do_req() {
         curl_args+=(-H 'Content-Type: application/json' --data "$data")
     fi
 
+    local code
     code="$(curl "${curl_args[@]}" "$url" 2>>"$EVID_DIR/curl.log" || true)"
     [[ -s "$resp_file" ]] || printf '{}' >"$resp_file"
+    RESP_CODE="${code:-000}"
     RESP_BODY="$resp_file"
-    printf '%s' "${code:-000}"
 }
 
 # Best-effort cleanup used on the failure paths so a probe abort does not
@@ -170,12 +172,12 @@ log "evidence dir: $EVID_DIR"
 log "target: $BASE_URL"
 
 # --- Step 1: health pre-check ------------------------------------------------
-code="$(do_req 1 GET "$BASE_URL$HEALTH_PATH")"
-if [[ ! "$code" =~ ^2[0-9][0-9]$ ]]; then
-    fail "health pre-check: GET $HEALTH_PATH returned $code"
+do_req 1 GET "$BASE_URL$HEALTH_PATH"
+if [[ ! "$RESP_CODE" =~ ^2[0-9][0-9]$ ]]; then
+    fail "health pre-check: GET $HEALTH_PATH returned $RESP_CODE"
     exit "$EXIT_PRECHECK"
 fi
-log "step 1 OK — health $code"
+log "step 1 OK — health $RESP_CODE"
 
 # --- Step 2: create the probe flow (admin) -----------------------------------
 rand_hex="$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
@@ -199,9 +201,9 @@ create_payload="$(jq -n \
         }
     }')"
 
-code="$(do_req 2 POST "$BASE_URL/api/flows" "$create_payload")"
-if [[ "$code" != "201" ]]; then
-    fail "create flow: expected 201, got $code (see step-2.resp.json)"
+do_req 2 POST "$BASE_URL/api/flows" "$create_payload"
+if [[ "$RESP_CODE" != "201" ]]; then
+    fail "create flow: expected 201, got $RESP_CODE (see step-2.resp.json)"
     exit "$EXIT_CREATE"
 fi
 flow_id="$(jq -r '.id // empty' "$RESP_BODY")"
@@ -213,9 +215,9 @@ FINAL_FLOW_ID="$flow_id"
 log "step 2 OK — created flow id=$flow_id name=$flow_name"
 
 # --- Step 3: enable ----------------------------------------------------------
-code="$(do_req 3 PATCH "$BASE_URL/api/flows/$flow_id" '{"enabled":true}')"
-if [[ "$code" != "200" ]]; then
-    fail "enable flow $flow_id: expected 200, got $code"
+do_req 3 PATCH "$BASE_URL/api/flows/$flow_id" '{"enabled":true}'
+if [[ "$RESP_CODE" != "200" ]]; then
+    fail "enable flow $flow_id: expected 200, got $RESP_CODE"
     try_cleanup "$flow_id"
     exit "$EXIT_ENABLE"
 fi
@@ -228,9 +230,9 @@ fi
 log "step 3 OK — flow $flow_id enabled"
 
 # --- Step 4: manual fire -----------------------------------------------------
-code="$(do_req 4 POST "$BASE_URL/api/flows/$flow_id/fire")"
-if [[ "$code" != "202" ]]; then
-    fail "fire flow $flow_id: expected 202, got $code"
+do_req 4 POST "$BASE_URL/api/flows/$flow_id/fire"
+if [[ "$RESP_CODE" != "202" ]]; then
+    fail "fire flow $flow_id: expected 202, got $RESP_CODE"
     try_cleanup "$flow_id"
     exit "$EXIT_FIRE"
 fi
@@ -251,8 +253,8 @@ final_status="timeout"
 polls=0
 while :; do
     polls=$(( polls + 1 ))
-    code="$(do_req 5 GET "$BASE_URL/api/flows/$flow_id/runs?limit=1")"
-    if [[ "$code" == "200" ]]; then
+    do_req 5 GET "$BASE_URL/api/flows/$flow_id/runs?limit=1"
+    if [[ "$RESP_CODE" == "200" ]]; then
         last_id="$(jq -r '.runs[0].id // empty' "$RESP_BODY")"
         last_status="$(jq -r '.runs[0].status // empty' "$RESP_BODY")"
         if [[ -n "$last_id" && "$last_id" == "$run_id" ]]; then
@@ -287,9 +289,9 @@ case "$final_status" in
 esac
 
 # --- Step 6: cleanup ---------------------------------------------------------
-code="$(do_req 6 DELETE "$BASE_URL/api/flows/$flow_id?force=true")"
-if [[ "$code" != "204" ]]; then
-    warn "cleanup: DELETE flow $flow_id expected 204, got $code"
+do_req 6 DELETE "$BASE_URL/api/flows/$flow_id?force=true"
+if [[ "$RESP_CODE" != "204" ]]; then
+    warn "cleanup: DELETE flow $flow_id expected 204, got $RESP_CODE"
     warn "probe verdict is GREEN; stray flow id=$flow_id needs manual removal"
     exit "$EXIT_CLEANUP"
 fi
