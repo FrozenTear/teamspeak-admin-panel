@@ -22,7 +22,7 @@ use crate::ui::pages::DevVideoPlayerPage;
 use crate::ui::pages::{
     BansPage, BotDetailPage, BotsIndexPage, ChannelsPage, ClientsPage, DashboardPlaceholder, Home,
     LoginPage, LogsPage, MusicLibraryPage, MusicPlaylistsPage, PublicWidgetPage, RadioStationsPage,
-    ServerInfoPage, SetupPage, VideoSourcesPage, WidgetsPage,
+    ServerEditPage, ServerInfoPage, SetupPage, VideoSourcesPage, WidgetsPage,
 };
 
 #[rustfmt::skip]
@@ -67,6 +67,10 @@ pub enum Route {
 
     #[route("/server-info")]
     ServerInfoPage {},
+
+    // PURA-221 — SSH credential editor for existing server connections.
+    #[route("/server-edit")]
+    ServerEditPage {},
 
     #[route("/logs")]
     LogsPage {},

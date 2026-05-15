@@ -205,6 +205,72 @@ pub async fn list_for_user(db: &Database, user_id: i64) -> Result<Vec<ServerConn
     Ok(resp.take(0)?)
 }
 
+/// Partial update for PATCH /api/servers/:id. Only fields wrapped in `Some`
+/// are written; `None` fields leave the existing DB value unchanged.
+/// Callers must pre-seal `api_key` and `ssh_password` before calling this.
+/// Double-option pattern for clearable nullable fields:
+/// - `None` → don't touch this field
+/// - `Some(None)` → set to NULL in DB
+/// - `Some(Some(v))` → set to `v`
+type Nullable<T> = Option<Option<T>>;
+
+pub struct PatchServerConnection {
+    pub name: Option<String>,
+    pub host: Option<String>,
+    pub webquery_port: Option<i64>,
+    /// Pre-sealed ciphertext if the caller is updating the key; `None` to preserve.
+    pub api_key: Option<String>,
+    pub use_https: Option<bool>,
+    pub ssh_port: Option<i64>,
+    pub ssh_username: Nullable<String>,
+    /// Pre-sealed ciphertext, or `Some(None)` to clear, or `None` to preserve.
+    pub ssh_password: Nullable<String>,
+    pub control_path: Option<String>,
+    pub ssh_auth_method: Option<String>,
+    pub ssh_host_key_fingerprint: Nullable<String>,
+}
+
+pub async fn patch(db: &Database, id: i64, p: PatchServerConnection) -> Result<Option<ServerConnection>> {
+    let mut parts: Vec<&str> = Vec::new();
+    if p.name.is_some() { parts.push("name = $name"); }
+    if p.host.is_some() { parts.push("host = $host"); }
+    if p.webquery_port.is_some() { parts.push("webqueryPort = $webqueryPort"); }
+    if p.api_key.is_some() { parts.push("apiKey = $apiKey"); }
+    if p.use_https.is_some() { parts.push("useHttps = $useHttps"); }
+    if p.ssh_port.is_some() { parts.push("sshPort = $sshPort"); }
+    if p.ssh_username.is_some() { parts.push("sshUsername = $sshUsername"); }
+    if p.ssh_password.is_some() { parts.push("sshPassword = $sshPassword"); }
+    if p.control_path.is_some() { parts.push("controlPath = $controlPath"); }
+    if p.ssh_auth_method.is_some() { parts.push("sshAuthMethod = $sshAuthMethod"); }
+    if p.ssh_host_key_fingerprint.is_some() { parts.push("sshHostKeyFingerprint = $sshHostKeyFingerprint"); }
+
+    if parts.is_empty() {
+        return find_by_id(db, id).await;
+    }
+
+    parts.push("updatedAt = time::now()");
+    let set_clause = parts.join(", ");
+    let sql = format!(
+        "UPDATE type::record('server_connection', $id) SET {set_clause} RETURN {PROJECTION};"
+    );
+
+    let mut q = db.query(sql).bind(("id", id));
+    if let Some(v) = p.name { q = q.bind(("name", v)); }
+    if let Some(v) = p.host { q = q.bind(("host", v)); }
+    if let Some(v) = p.webquery_port { q = q.bind(("webqueryPort", v)); }
+    if let Some(v) = p.api_key { q = q.bind(("apiKey", v)); }
+    if let Some(v) = p.use_https { q = q.bind(("useHttps", v)); }
+    if let Some(v) = p.ssh_port { q = q.bind(("sshPort", v)); }
+    if let Some(v) = p.ssh_username { q = q.bind(("sshUsername", v)); }
+    if let Some(v) = p.ssh_password { q = q.bind(("sshPassword", v)); }
+    if let Some(v) = p.control_path { q = q.bind(("controlPath", v)); }
+    if let Some(v) = p.ssh_auth_method { q = q.bind(("sshAuthMethod", v)); }
+    if let Some(v) = p.ssh_host_key_fingerprint { q = q.bind(("sshHostKeyFingerprint", v)); }
+
+    let mut resp = q.await.context("server_connection patch query failed")?.check()?;
+    Ok(resp.take(0)?)
+}
+
 /// Delete a server connection. The `server_connection_cascade` event in
 /// 0001_baseline.surql wipes dependent `server_user_grant` rows for this
 /// connection (per spec §4.2 cascade rules).

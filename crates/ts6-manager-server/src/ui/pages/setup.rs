@@ -79,6 +79,12 @@ pub fn SetupPage() -> Element {
     let mut server_host = use_signal(String::new);
     let mut api_key = use_signal(String::new);
 
+    // SSH section signals
+    let mut ssh_open = use_signal(|| false);
+    let mut ssh_username = use_signal(String::new);
+    let mut ssh_password = use_signal(String::new);
+    let mut ssh_host_key_fingerprint = use_signal(String::new);
+
     let mut submitting = use_signal(|| false);
     let mut password_error: Signal<Option<String>> = use_signal(|| None);
     let mut form_error: Signal<Option<String>> = use_signal(|| None);
@@ -109,6 +115,9 @@ pub fn SetupPage() -> Element {
             server_name.read().clone(),
             server_host.read().clone(),
             api_key.read().clone(),
+            ssh_username.read().clone(),
+            ssh_password.read().clone(),
+            ssh_host_key_fingerprint.read().clone(),
         );
         let username_for_login = req.username.clone();
         let password_for_login = req.password.clone();
@@ -304,6 +313,64 @@ pub fn SetupPage() -> Element {
                         }
                     }
 
+                    // SSH section — collapsible disclosure
+                    details {
+                        open: ssh_open(),
+                        ontoggle: move |_| ssh_open.set(!ssh_open()),
+                        summary { class: "setup-section-summary",
+                            "Real-time events (SSH ServerQuery) — optional"
+                        }
+                        div { class: "stack-md",
+                            p { class: "setup-section-helper",
+                                "Fill in SSH credentials to enable live events (client joins, leaves, etc.). Leave blank to use WebQuery polling only."
+                            }
+                            Field {
+                                label: "SSH username".to_string(),
+                                id: "setup-ssh-username".to_string(),
+                                optional: true,
+                                TextInput {
+                                    id: "setup-ssh-username".to_string(),
+                                    name: "sshUsername".to_string(),
+                                    autocomplete: "off".to_string(),
+                                    disabled: submitting(),
+                                    value: ssh_username.read().clone(),
+                                    oninput: move |evt: FormEvent| ssh_username.set(evt.value()),
+                                    onchange: move |evt: FormEvent| ssh_username.set(evt.value()),
+                                }
+                            }
+                            Field {
+                                label: "SSH password".to_string(),
+                                id: "setup-ssh-password".to_string(),
+                                optional: true,
+                                helper: "Stored encrypted at rest.".to_string(),
+                                PasswordInput {
+                                    id: "setup-ssh-password".to_string(),
+                                    name: "sshPassword".to_string(),
+                                    autocomplete: "off".to_string(),
+                                    disabled: submitting(),
+                                    value: ssh_password.read().clone(),
+                                    oninput: move |evt: FormEvent| ssh_password.set(evt.value()),
+                                    onchange: move |evt: FormEvent| ssh_password.set(evt.value()),
+                                }
+                            }
+                            Field {
+                                label: "SSH host-key fingerprint".to_string(),
+                                id: "setup-ssh-fingerprint".to_string(),
+                                optional: true,
+                                helper: "SHA-256 fingerprint, e.g. SHA256:abc…. Leave blank to use TOFU on first connect.".to_string(),
+                                TextInput {
+                                    id: "setup-ssh-fingerprint".to_string(),
+                                    name: "sshHostKeyFingerprint".to_string(),
+                                    autocomplete: "off".to_string(),
+                                    disabled: submitting(),
+                                    value: ssh_host_key_fingerprint.read().clone(),
+                                    oninput: move |evt: FormEvent| ssh_host_key_fingerprint.set(evt.value()),
+                                    onchange: move |evt: FormEvent| ssh_host_key_fingerprint.set(evt.value()),
+                                }
+                            }
+                        }
+                    }
+
                     Button {
                         kind: ButtonType::Submit,
                         size: ButtonSize::Large,
@@ -322,6 +389,9 @@ pub fn SetupPage() -> Element {
 /// Build the wire `SetupInitRequest` from the wizard's signal payloads.
 /// Optional fields that the operator left blank become `None` so the server
 /// fills in spec defaults — no zero-string sentinels on the wire.
+/// When the operator fills in an SSH username the `controlPath` is set to
+/// `"ssh"` and `sshAuthMethod` to `"password"` automatically.
+#[allow(clippy::too_many_arguments)]
 fn build_request(
     username: String,
     display_name: String,
@@ -329,7 +399,11 @@ fn build_request(
     server_name: String,
     server_host: String,
     api_key: String,
+    ssh_username: String,
+    ssh_password: String,
+    ssh_host_key_fingerprint: String,
 ) -> SetupInitRequest {
+    let has_ssh = !ssh_username.is_empty();
     SetupInitRequest {
         username,
         password,
@@ -337,18 +411,15 @@ fn build_request(
         server: SetupInitServer {
             name: server_name,
             host: server_host,
-            // Phase 1 wizard stays minimal: ports + SSH default server-side
-            // (see `crates/.../routes/setup.rs::DEFAULT_*`). An "advanced
-            // settings" disclosure can override these in Phase 2.
             webquery_port: None,
             api_key,
             use_https: None,
             ssh_port: None,
-            ssh_username: None,
-            ssh_password: None,
-            control_path: None,
-            ssh_auth_method: None,
-            ssh_host_key_fingerprint: None,
+            ssh_username: Some(ssh_username).filter(|s| !s.is_empty()),
+            ssh_password: Some(ssh_password).filter(|s| !s.is_empty()),
+            control_path: if has_ssh { Some("ssh".into()) } else { None },
+            ssh_auth_method: if has_ssh { Some("password".into()) } else { None },
+            ssh_host_key_fingerprint: Some(ssh_host_key_fingerprint).filter(|s| !s.is_empty()),
         },
     }
 }
@@ -397,15 +468,17 @@ fn api_base() -> String {
 mod tests {
     use super::*;
 
+    fn no_ssh() -> (String, String, String) {
+        (String::new(), String::new(), String::new())
+    }
+
     #[test]
     fn build_request_strips_empty_optional_display_name() {
+        let (su, sp, sfp) = no_ssh();
         let req = build_request(
-            "admin".into(),
-            String::new(),
-            "Hunter2!ok".into(),
-            "Primary".into(),
-            "ts.example.com".into(),
-            "K".into(),
+            "admin".into(), String::new(), "Hunter2!ok".into(),
+            "Primary".into(), "ts.example.com".into(), "K".into(),
+            su, sp, sfp,
         );
         assert!(
             req.display_name.is_none(),
@@ -415,52 +488,57 @@ mod tests {
 
     #[test]
     fn build_request_keeps_provided_display_name() {
+        let (su, sp, sfp) = no_ssh();
         let req = build_request(
-            "admin".into(),
-            "Robert Soot".into(),
-            "Hunter2!ok".into(),
-            "Primary".into(),
-            "ts.example.com".into(),
-            "K".into(),
+            "admin".into(), "Robert Soot".into(), "Hunter2!ok".into(),
+            "Primary".into(), "ts.example.com".into(), "K".into(),
+            su, sp, sfp,
         );
         assert_eq!(req.display_name.as_deref(), Some("Robert Soot"));
     }
 
     #[test]
     fn build_request_does_not_emit_zero_string_for_optional_server_fields() {
-        // Phase 1 wizard never collects ports / SSH; the wire payload must
-        // leave those as None so the server can fill in spec defaults
-        // rather than treating an empty string as the operator's choice.
+        let (su, sp, sfp) = no_ssh();
         let req = build_request(
-            "admin".into(),
-            String::new(),
-            "Hunter2!ok".into(),
-            "Primary".into(),
-            "ts.example.com".into(),
-            "K".into(),
+            "admin".into(), String::new(), "Hunter2!ok".into(),
+            "Primary".into(), "ts.example.com".into(), "K".into(),
+            su, sp, sfp,
         );
         assert!(req.server.webquery_port.is_none());
         assert!(req.server.use_https.is_none());
         assert!(req.server.ssh_port.is_none());
         assert!(req.server.ssh_username.is_none());
         assert!(req.server.ssh_password.is_none());
+        assert!(req.server.control_path.is_none());
     }
 
     #[test]
     fn build_request_round_trips_required_fields_into_wire_struct() {
+        let (su, sp, sfp) = no_ssh();
         let req = build_request(
-            "rsoot".into(),
-            "Robert".into(),
-            "Hunter2!ok".into(),
-            "Primary".into(),
-            "ts.example.com".into(),
-            "WEBQUERY-KEY".into(),
+            "rsoot".into(), "Robert".into(), "Hunter2!ok".into(),
+            "Primary".into(), "ts.example.com".into(), "WEBQUERY-KEY".into(),
+            su, sp, sfp,
         );
         assert_eq!(req.username, "rsoot");
         assert_eq!(req.password, "Hunter2!ok");
         assert_eq!(req.server.name, "Primary");
         assert_eq!(req.server.host, "ts.example.com");
         assert_eq!(req.server.api_key, "WEBQUERY-KEY");
+    }
+
+    #[test]
+    fn build_request_with_ssh_sets_control_path_ssh() {
+        let req = build_request(
+            "admin".into(), String::new(), "Hunter2!ok".into(),
+            "Primary".into(), "ts.example.com".into(), "K".into(),
+            "serveradmin".into(), "pw".into(), "SHA256:abc".into(),
+        );
+        assert_eq!(req.server.control_path.as_deref(), Some("ssh"));
+        assert_eq!(req.server.ssh_auth_method.as_deref(), Some("password"));
+        assert_eq!(req.server.ssh_username.as_deref(), Some("serveradmin"));
+        assert_eq!(req.server.ssh_host_key_fingerprint.as_deref(), Some("SHA256:abc"));
     }
 
     #[test]

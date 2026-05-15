@@ -23,17 +23,17 @@
 
 use axum::Json;
 use axum::Router;
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use ts6_manager_shared::auth::ErrorResponse;
-use ts6_manager_shared::servers::{CreateServerRequest, ServerSummary};
+use ts6_manager_shared::servers::{CreateServerRequest, PatchServerRequest, ServerSummary};
 
 use crate::app_state::AppState;
 use crate::auth::extractors::{RequireAdmin, RequireAuth};
 use crate::crypto;
-use crate::repos::server_connections::{self, NewServerConnection};
+use crate::repos::server_connections::{self, NewServerConnection, PatchServerConnection};
 use crate::routes::server_summary_from_row;
 
 const DEFAULT_WEBQUERY_PORT: i64 = 10080;
@@ -44,7 +44,9 @@ const DEFAULT_SSH_PORT: i64 = 10022;
 /// avoided because axum 0.8 enforces strict trailing-slash matching, and
 /// spec §7.5 names the endpoint `/api/servers` (no trailing slash).
 pub fn router() -> Router<AppState> {
-    Router::new().route("/api/servers", get(list).post(create))
+    Router::new()
+        .route("/api/servers", get(list).post(create))
+        .route("/api/servers/{id}", axum::routing::patch(patch_server))
 }
 
 async fn list(
@@ -90,12 +92,6 @@ async fn create(
         _ => None,
     };
 
-    // D-SSH-AUTH (PURA-77): the new SSHBridge auth fields are not part of
-    // the public `CreateServerRequest` body yet — they default to None here
-    // and the migration's `DEFAULT 'webquery'` / `DEFAULT 'password'` clauses
-    // produce the spec-equivalent row. PURA-69 follow-up C extends this
-    // handler with the key/agent/fingerprint fields once SecurityEngineer
-    // signs off on the wire surface.
     let new = NewServerConnection {
         name: req.name,
         host: req.host,
@@ -109,11 +105,11 @@ async fn create(
         queryBotNickname: None,
         sshBotNickname: None,
         enabled: true,
-        controlPath: None,
-        sshAuthMethod: None,
+        controlPath: req.control_path.filter(|s| !s.is_empty()),
+        sshAuthMethod: req.ssh_auth_method.filter(|s| !s.is_empty()),
         sshPrivateKey: None,
         sshKeyAgentSocket: None,
-        sshHostKeyFingerprint: None,
+        sshHostKeyFingerprint: req.ssh_host_key_fingerprint.filter(|s| !s.is_empty()),
     };
 
     let row = server_connections::insert(&state.db, new)
@@ -123,6 +119,71 @@ async fn create(
             internal()
         })?;
     Ok((StatusCode::CREATED, Json(server_summary_from_row(row))))
+}
+
+async fn patch_server(
+    State(state): State<AppState>,
+    RequireAdmin(_admin): RequireAdmin,
+    Path(id): Path<i64>,
+    Json(req): Json<PatchServerRequest>,
+) -> Result<Json<ServerSummary>, Response> {
+    // Validate controlPath if supplied.
+    if let Some(ref cp) = req.control_path {
+        if !["webquery", "ssh"].contains(&cp.as_str()) {
+            return Err(err(StatusCode::BAD_REQUEST, "controlPath must be 'webquery' or 'ssh'"));
+        }
+    }
+    if let Some(ref am) = req.ssh_auth_method {
+        if !["password", "key", "agent"].contains(&am.as_str()) {
+            return Err(err(StatusCode::BAD_REQUEST, "sshAuthMethod must be 'password', 'key', or 'agent'"));
+        }
+    }
+
+    let sealed_api_key = match req.api_key.as_deref() {
+        Some(s) if !s.is_empty() => Some(crypto::seal(s).map_err(|e| {
+            tracing::error!(err = %e, "patch_server: apiKey seal failed");
+            internal()
+        })?),
+        _ => None,
+    };
+    let sealed_ssh_password = match req.ssh_password.as_deref() {
+        Some(s) if !s.is_empty() => Some(Some(crypto::seal(s).map_err(|e| {
+            tracing::error!(err = %e, "patch_server: sshPassword seal failed");
+            internal()
+        })?)),
+        Some(_) => Some(None), // explicit empty string → clear the field
+        None => None,          // omitted → preserve existing
+    };
+
+    // Convert `Option<String>` wire fields to the double-option `Nullable<String>`
+    // the repo expects: None = preserve, Some(None) = clear, Some(Some(s)) = set.
+    fn nullable(v: Option<String>) -> Option<Option<String>> {
+        v.map(|s| if s.is_empty() { None } else { Some(s) })
+    }
+
+    let patch = PatchServerConnection {
+        name: req.name,
+        host: req.host,
+        webquery_port: req.webquery_port,
+        api_key: sealed_api_key,
+        use_https: req.use_https,
+        ssh_port: req.ssh_port,
+        ssh_username: nullable(req.ssh_username),
+        ssh_password: sealed_ssh_password,
+        control_path: req.control_path.filter(|s| !s.is_empty()),
+        ssh_auth_method: req.ssh_auth_method.filter(|s| !s.is_empty()),
+        ssh_host_key_fingerprint: nullable(req.ssh_host_key_fingerprint),
+    };
+
+    let row = server_connections::patch(&state.db, id, patch)
+        .await
+        .map_err(|e| {
+            tracing::error!(err = %e, id, "patch_server: update failed");
+            internal()
+        })?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "server not found"))?;
+
+    Ok(Json(server_summary_from_row(row)))
 }
 
 fn err(status: StatusCode, body: &str) -> Response {
@@ -232,6 +293,9 @@ mod tests {
             ssh_port: Some(10022),
             ssh_username: Some("serveradmin".into()),
             ssh_password: Some("ssh-secret-pw".into()),
+            control_path: None,
+            ssh_auth_method: None,
+            ssh_host_key_fingerprint: None,
         }
     }
 
@@ -505,5 +569,107 @@ mod tests {
             .unwrap();
         let body: Vec<ServerSummary> = read_json(resp).await;
         assert!(body.is_empty(), "viewer with no grants must see empty list");
+    }
+
+    /// PURA-221 — `POST /api/servers` with `controlPath = "ssh"` persists the
+    /// control path and auth method on the row.
+    #[tokio::test]
+    async fn create_server_with_control_path_ssh_persists_row() {
+        let state = fresh_state().await;
+        let aid = seed_user(&state, "admin", "admin").await;
+        let token = mint_token(&state, aid, "admin", "admin");
+        let app = app(state.clone());
+
+        let body = CreateServerRequest {
+            control_path: Some("ssh".into()),
+            ssh_auth_method: Some("password".into()),
+            ssh_host_key_fingerprint: Some("SHA256:abc".into()),
+            ..create_body()
+        };
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/servers")
+                    .header("authorization", auth_header(&token))
+                    .header("content-type", "application/json")
+                    .body(json_body(&body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let rows = server_connections::list(&state.db).await.unwrap();
+        assert_eq!(rows[0].controlPath, "ssh");
+        assert_eq!(rows[0].sshAuthMethod, "password");
+        assert_eq!(rows[0].sshHostKeyFingerprint.as_deref(), Some("SHA256:abc"));
+    }
+
+    /// PURA-221 — `PATCH /api/servers/:id` re-seals a new sshPassword and
+    /// updates controlPath without touching the apiKey ciphertext.
+    #[tokio::test]
+    async fn patch_server_reseals_ssh_password_and_updates_control_path() {
+        let state = fresh_state().await;
+        let aid = seed_user(&state, "admin", "admin").await;
+        let token = mint_token(&state, aid, "admin", "admin");
+        let app = app(state.clone());
+
+        // Create the server first.
+        let create_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/servers")
+                    .header("authorization", auth_header(&token))
+                    .header("content-type", "application/json")
+                    .body(json_body(&create_body()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_resp.status(), StatusCode::CREATED);
+        let created: ServerSummary = read_json(create_resp).await;
+        let server_id = created.id;
+
+        // Capture existing apiKey ciphertext for preservation check.
+        let pre_rows = server_connections::list(&state.db).await.unwrap();
+        let api_key_ct = pre_rows[0].apiKey.clone();
+
+        // PATCH — enable SSH without touching apiKey.
+        let patch_body = ts6_manager_shared::servers::PatchServerRequest {
+            ssh_username: Some("serveradmin".into()),
+            ssh_password: Some("new-ssh-pw".into()),
+            control_path: Some("ssh".into()),
+            ssh_auth_method: Some("password".into()),
+            ssh_host_key_fingerprint: Some("SHA256:xyz".into()),
+            ..Default::default()
+        };
+        let patch_resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::PATCH)
+                    .uri(format!("/api/servers/{server_id}"))
+                    .header("authorization", auth_header(&token))
+                    .header("content-type", "application/json")
+                    .body(json_body(&patch_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(patch_resp.status(), StatusCode::OK);
+
+        let rows = server_connections::list(&state.db).await.unwrap();
+        let row = &rows[0];
+        // apiKey ciphertext unchanged (we didn't supply a new one).
+        assert_eq!(row.apiKey, api_key_ct, "apiKey ciphertext must be preserved on PATCH without apiKey");
+        // sshPassword re-sealed with the new plaintext.
+        let new_pw = row.sshPassword.as_deref().expect("sshPassword set");
+        assert!(new_pw.starts_with("enc:"), "new sshPassword must be sealed");
+        assert_eq!(crate::crypto::unseal(new_pw).unwrap(), "new-ssh-pw");
+        assert_eq!(row.controlPath, "ssh");
+        assert_eq!(row.sshHostKeyFingerprint.as_deref(), Some("SHA256:xyz"));
     }
 }
