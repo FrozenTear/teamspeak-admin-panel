@@ -459,6 +459,23 @@ mod tests {
         ) -> ControlResult<()> {
             unimplemented!("not used by dashboard fetch")
         }
+        async fn sendtextmessage(
+            &self,
+            _sid: i64,
+            _targetmode: i64,
+            _target: i64,
+            _msg: &str,
+        ) -> ControlResult<()> {
+            unimplemented!("not used by dashboard fetch")
+        }
+        async fn servergroupaddclient(
+            &self,
+            _sid: i64,
+            _sgid: i64,
+            _cldbid: i64,
+        ) -> ControlResult<()> {
+            unimplemented!("not used by dashboard fetch")
+        }
         async fn banadd(&self, _sid: i64, _params: &BanAddParams<'_>) -> ControlResult<i64> {
             unimplemented!("not used by dashboard fetch")
         }

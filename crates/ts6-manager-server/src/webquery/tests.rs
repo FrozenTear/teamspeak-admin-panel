@@ -217,6 +217,11 @@ impl MockServer {
             .route("/{sid}/clientpoke", get(handler_clientpoke))
             .route("/{sid}/clientmove", get(handler_clientmove))
             .route("/{sid}/clientedit", get(handler_clientedit))
+            .route("/{sid}/sendtextmessage", get(handler_sendtextmessage))
+            .route(
+                "/{sid}/servergroupaddclient",
+                get(handler_servergroupaddclient),
+            )
             .route(
                 "/{sid}/channelclientpermlist",
                 get(handler_channelclientpermlist),
@@ -882,6 +887,48 @@ async fn handler_clientedit(
     .into_response()
 }
 
+async fn handler_sendtextmessage(
+    State(state): State<MockState>,
+    headers: HeaderMap,
+    Path(_sid): Path<i64>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if !key_matches(&headers, &state.expected_api_key) {
+        return upstream_error(1283, "client_query_login_failed");
+    }
+    let targetmode = params.get("targetmode").cloned().unwrap_or_default();
+    let target = params.get("target").cloned().unwrap_or_default();
+    *state.captured_query.lock().unwrap() = Some((
+        format!("{targetmode}/{target}"),
+        params.get("msg").cloned().unwrap_or_default(),
+    ));
+    Json(json!({
+        "body": null,
+        "status": {"code": 0, "message": "ok"},
+    }))
+    .into_response()
+}
+
+async fn handler_servergroupaddclient(
+    State(state): State<MockState>,
+    headers: HeaderMap,
+    Path(_sid): Path<i64>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if !key_matches(&headers, &state.expected_api_key) {
+        return upstream_error(1283, "client_query_login_failed");
+    }
+    *state.captured_query.lock().unwrap() = Some((
+        params.get("sgid").cloned().unwrap_or_default(),
+        params.get("cldbid").cloned().unwrap_or_default(),
+    ));
+    Json(json!({
+        "body": {},
+        "status": {"code": 0, "message": "ok"},
+    }))
+    .into_response()
+}
+
 async fn handler_channelclientpermlist(
     State(state): State<MockState>,
     headers: HeaderMap,
@@ -1065,6 +1112,26 @@ async fn clientmove_passes_clid_and_target_cid() {
     client.clientmove(1, 10, 7, None).await.unwrap();
     let captured = server.state.captured_query.lock().unwrap().clone().unwrap();
     assert_eq!(captured, ("10".to_string(), "7".to_string()));
+}
+
+#[tokio::test]
+async fn sendtextmessage_passes_targetmode_target_and_msg() {
+    let server = MockServer::start("k").await;
+    let client = build_client(&server, "k");
+
+    client.sendtextmessage(1, 2, 5, "Welcome.").await.unwrap();
+    let captured = server.state.captured_query.lock().unwrap().clone().unwrap();
+    assert_eq!(captured, ("2/5".to_string(), "Welcome.".to_string()));
+}
+
+#[tokio::test]
+async fn servergroupaddclient_passes_sgid_and_cldbid() {
+    let server = MockServer::start("k").await;
+    let client = build_client(&server, "k");
+
+    client.servergroupaddclient(1, 6, 12).await.unwrap();
+    let captured = server.state.captured_query.lock().unwrap().clone().unwrap();
+    assert_eq!(captured, ("6".to_string(), "12".to_string()));
 }
 
 #[tokio::test]

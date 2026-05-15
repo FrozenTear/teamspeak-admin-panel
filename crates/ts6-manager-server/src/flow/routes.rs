@@ -68,7 +68,7 @@ use ts6_manager_shared::flows::{
 use crate::app_state::AppState;
 use crate::auth::extractors::{RequireAdmin, RequireAuth};
 use crate::flow::FlowEngineHandle;
-use crate::flow::engine::{FireError, parse_definition};
+use crate::flow::engine::{FireError, commands, parse_definition};
 use crate::flow::trigger::ParsedTrigger;
 use crate::repos::bot_flow_runs::{self, BotFlowRun};
 use crate::repos::bot_flows::{self, BotFlow, BotFlowUpdate, NewBotFlow};
@@ -183,15 +183,17 @@ fn validate_name(name: &str) -> Result<(), Response> {
     Ok(())
 }
 
-/// `http-api.md` §3.1 — action-list bounds, non-empty command strings, and
-/// a parseable trigger (the cron-expression check lives in
+/// `http-api.md` §3.1 — action-list bounds, the per-command whitelist,
+/// and a parseable trigger (the cron-expression check lives in
 /// [`ParsedTrigger::parse`]).
 ///
-/// The per-command whitelist named in §3.1
-/// (`flow::engine::commands::mod.rs`) is deferred to the production
-/// action-dispatcher follow-up — that module does not exist yet and the
-/// whitelist is the dispatcher's contract, not the router's. Here we only
-/// reject structurally-broken actions.
+/// `ts6Command` / `musicBotCommand` actions are checked against the
+/// whitelist in [`crate::flow::engine::commands`] — the same module the
+/// production dispatcher (PURA-249) re-checks at run time. This rejects a
+/// flow naming an unknown command (or one missing a required argument
+/// key) at create / patch time with `400 validation` rather than letting
+/// it fail only when a run fires. Argument *values* are not type-checked
+/// here: a `${trigger.*}` template does not resolve until run time.
 fn validate_definition(def: &FlowDefinition) -> Result<(), Response> {
     if def.actions.is_empty() {
         return Err(validation("definition.actions must not be empty"));
@@ -202,18 +204,23 @@ fn validate_definition(def: &FlowDefinition) -> Result<(), Response> {
         )));
     }
     for (i, action) in def.actions.iter().enumerate() {
-        let command = match action {
-            Action::Ts6Command { command, .. } | Action::MusicBotCommand { command, .. } => {
-                Some(command)
+        match action {
+            Action::Ts6Command { command, args } => {
+                commands::validate_ts6_command(command, args)
+                    .map_err(|e| validation(format!("definition.actions[{i}]: {e}")))?;
             }
-            Action::WebhookOut { .. } | Action::LogLine { .. } => None,
-        };
-        if let Some(command) = command
-            && command.trim().is_empty()
-        {
-            return Err(validation(format!(
-                "definition.actions[{i}].command must not be empty"
-            )));
+            Action::MusicBotCommand { command, args, .. } => {
+                commands::validate_music_bot_command(command, args)
+                    .map_err(|e| validation(format!("definition.actions[{i}]: {e}")))?;
+            }
+            Action::WebhookOut { url, .. } => {
+                if url.trim().is_empty() {
+                    return Err(validation(format!(
+                        "definition.actions[{i}].url must not be empty"
+                    )));
+                }
+            }
+            Action::LogLine { .. } => {}
         }
     }
     ParsedTrigger::parse(&def.trigger)

@@ -30,6 +30,7 @@
 // and several handle methods read as dead until that child lands.
 #![allow(dead_code, unused_imports)]
 
+pub mod dispatch;
 pub mod engine;
 pub mod routes;
 pub mod trigger;

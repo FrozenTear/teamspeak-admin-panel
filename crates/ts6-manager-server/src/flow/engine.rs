@@ -43,6 +43,11 @@ use ts6_manager_shared::flows::{
 use crate::db::Database;
 use crate::repos::{bot_flow_runs, bot_flows};
 
+/// Flow-action command whitelist (`http-api.md` §3.1) — consulted by the
+/// routes layer at create / patch time and by the production dispatcher
+/// at run time. Path is `flow::engine::commands` as named in the spec.
+pub mod commands;
+
 use super::trigger::{ParsedTrigger, TriggerEvent};
 
 /// Dependencies the engine takes at boot. Built by the routes child's
