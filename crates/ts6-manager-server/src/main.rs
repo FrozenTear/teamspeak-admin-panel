@@ -23,6 +23,8 @@ mod crypto;
 #[cfg(feature = "server")]
 mod db;
 #[cfg(feature = "server")]
+mod flow;
+#[cfg(feature = "server")]
 mod logging;
 #[cfg(feature = "server")]
 mod music_bots;
