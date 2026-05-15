@@ -14,6 +14,7 @@ path = "src/lib.rs"
 [dependencies]
 chrono = { workspace = true }
 serde = { workspace = true }
-
-[dev-dependencies]
+# `serde_json` is part of the public API of `flows::Action` (args carry
+# dynamic JSON) and `flows::FlowRun.trigger`. Stays WASM-clean because
+# `serde_json` is pure Rust without OS deps.
 serde_json = { workspace = true }

@@ -12,6 +12,12 @@
 #   scripts/headless-probe.sh <base-url> <route1> [route2 ...]
 # Example:
 #   scripts/headless-probe.sh http://127.0.0.1:9080 /login /dashboard /music-bots
+#
+# PURA-243 — the flow-engine landing page is a smoke target; add `/flows`
+# to the route list so the flows nav surface is covered:
+#   scripts/headless-probe.sh http://127.0.0.1:9080 /flows /flows/new
+# Run against a `dx serve --release` bundle — debug WASM is too large for a
+# heartbeat-feasible smoke (see project_dx_serve_debug_wasm_blocks_qa).
 
 set -euo pipefail
 
