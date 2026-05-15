@@ -89,6 +89,11 @@ pub struct ServerSummary {
     pub enabled: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// PURA-222 — bumped after every successful WebQuery dashboard fetch.
+    /// `None` means "not observed since this server was added"; the FE
+    /// renders that case as `Never` rather than inventing a 1970 epoch.
+    #[serde(default)]
+    pub last_seen_at: Option<DateTime<Utc>>,
 }
 
 #[cfg(test)]
@@ -147,6 +152,7 @@ mod tests {
             enabled: true,
             created_at: now,
             updated_at: now,
+            last_seen_at: None,
         };
         let json = serde_json::to_string(&row).unwrap();
         assert!(!json.contains("apiKey"));
@@ -154,5 +160,35 @@ mod tests {
         assert!(!json.contains("sshPassword"));
         assert!(!json.contains("ssh_password"));
         assert!(json.contains(r#""hasSshCredentials":true"#));
+        // PURA-222 — `lastSeenAt` lives on the wire as `null` when the row
+        // hasn't been probed yet; the FE branches on that to render "Never".
+        assert!(json.contains(r#""lastSeenAt":null"#));
+    }
+
+    #[test]
+    fn server_summary_carries_last_seen_at_when_present() {
+        let now = chrono::Utc::now();
+        let row = ServerSummary {
+            id: 1,
+            name: "Primary".into(),
+            host: "ts.example.com".into(),
+            webquery_port: 10080,
+            use_https: true,
+            ssh_port: 10022,
+            ssh_username: None,
+            has_ssh_credentials: false,
+            query_bot_channel: None,
+            query_bot_nickname: None,
+            ssh_bot_nickname: None,
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+            last_seen_at: Some(now),
+        };
+        let json = serde_json::to_string(&row).unwrap();
+        assert!(
+            json.contains(r#""lastSeenAt":""#),
+            "lastSeenAt must serialise as a non-null timestamp when set: {json}"
+        );
     }
 }

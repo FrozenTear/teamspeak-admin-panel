@@ -41,6 +41,9 @@ pub struct ServerConnection {
     pub enabled: bool,
     pub createdAt: DateTime<Utc>,
     pub updatedAt: DateTime<Utc>,
+    // PURA-222 — bumped by `touch_last_seen` after every successful
+    // dashboard fetch; `None` means "never observed since add".
+    pub lastSeenAt: Option<DateTime<Utc>>,
     // D-SSH-AUTH (PURA-77) — see study-documents/ts6-manager-impl-deviations.md
     pub controlPath: String,
     pub sshAuthMethod: String,
@@ -91,6 +94,7 @@ pub(crate) const PROJECTION: &str = "
     enabled,
     createdAt,
     updatedAt,
+    lastSeenAt,
     controlPath,
     sshAuthMethod,
     sshPrivateKey,
@@ -327,6 +331,16 @@ pub async fn patch(
 /// connection (per spec §4.2 cascade rules).
 pub async fn delete(db: &Database, id: i64) -> Result<()> {
     let sql = "DELETE type::record('server_connection', $id);";
+    db.query(sql).bind(("id", id)).await?.check()?;
+    Ok(())
+}
+
+/// PURA-222 — bump `lastSeenAt` to `time::now()`. Called after a successful
+/// dashboard fetch so the `/servers` index can render "last successful probe"
+/// truthfully. The dashboard handler dispatches this fire-and-forget; the
+/// `Result` is exposed so unit tests can assert the write actually landed.
+pub async fn touch_last_seen(db: &Database, id: i64) -> Result<()> {
+    let sql = "UPDATE type::record('server_connection', $id) SET lastSeenAt = time::now();";
     db.query(sql).bind(("id", id)).await?.check()?;
     Ok(())
 }

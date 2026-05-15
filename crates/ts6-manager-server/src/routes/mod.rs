@@ -44,5 +44,6 @@ pub(crate) fn server_summary_from_row(row: ServerConnection) -> ServerSummary {
         enabled: row.enabled,
         created_at: row.createdAt,
         updated_at: row.updatedAt,
+        last_seen_at: row.lastSeenAt,
     }
 }

@@ -46,7 +46,10 @@ const DEFAULT_SSH_PORT: i64 = 10022;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/servers", get(list).post(create))
-        .route("/api/servers/{id}", axum::routing::patch(patch_server))
+        .route(
+            "/api/servers/{id}",
+            axum::routing::patch(patch_server).delete(delete_server),
+        )
 }
 
 async fn list(
@@ -190,6 +193,45 @@ async fn patch_server(
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "server not found"))?;
 
     Ok(Json(server_summary_from_row(row)))
+}
+
+/// PURA-222 — `DELETE /api/servers/{id}`. Admin-only. Returns `204 No
+/// Content` on success, `404` when the row is missing. The
+/// `server_connection_cascade` event in `0001_baseline.surql` (and the
+/// `*_chapter4` / `*_video_source` follow-on events) wipe dependent rows;
+/// this handler also evicts the cached pool clients so the dashboard route
+/// surfaces "not found" immediately rather than continuing to dial the
+/// just-deleted upstream from a stale [`crate::webquery::WebQueryClient`] /
+/// [`crate::control::ControlBackend`].
+async fn delete_server(
+    State(state): State<AppState>,
+    RequireAdmin(_admin): RequireAdmin,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, Response> {
+    // Confirm the row exists first so we can return 404 truthfully — a bare
+    // DELETE on a missing record id silently no-ops on SurrealDB.
+    let existing = server_connections::find_by_id(&state.db, id)
+        .await
+        .map_err(|e| {
+            tracing::error!(err = %e, id, "delete_server: pre-check find_by_id failed");
+            internal()
+        })?;
+    if existing.is_none() {
+        return Err(err(StatusCode::NOT_FOUND, "server not found"));
+    }
+
+    server_connections::delete(&state.db, id).await.map_err(|e| {
+        tracing::error!(err = %e, id, "delete_server: repo delete failed");
+        internal()
+    })?;
+
+    // Evict the cached upstream clients so the next dashboard fetch (or any
+    // other per-server lookup) sees the row as gone instead of hitting a
+    // stale keep-alive socket against the just-deleted server.
+    state.webquery.remove(id).await;
+    state.control.remove(id).await;
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 fn err(status: StatusCode, body: &str) -> Response {
@@ -682,5 +724,159 @@ mod tests {
         assert_eq!(crate::crypto::unseal(new_pw).unwrap(), "new-ssh-pw");
         assert_eq!(row.controlPath, "ssh");
         assert_eq!(row.sshHostKeyFingerprint.as_deref(), Some("SHA256:xyz"));
+    }
+
+    // ── PURA-222 — DELETE /api/servers/:id + touch_last_seen ───────────
+
+    /// Helper — insert one server row directly via the repo. Mirrors
+    /// `create_body()` shape but skips the HTTP layer so the assertions
+    /// stay focused on the DELETE handler.
+    async fn seed_server(state: &AppState) -> i64 {
+        let new = NewServerConnection {
+            name: "Primary".into(),
+            host: "ts.example.com".into(),
+            webqueryPort: 10080,
+            apiKey: crate::crypto::seal("k").unwrap(),
+            useHttps: false,
+            sshPort: 10022,
+            sshUsername: None,
+            sshPassword: None,
+            queryBotChannel: None,
+            queryBotNickname: None,
+            sshBotNickname: None,
+            enabled: true,
+            controlPath: None,
+            sshAuthMethod: None,
+            sshPrivateKey: None,
+            sshKeyAgentSocket: None,
+            sshHostKeyFingerprint: None,
+        };
+        server_connections::insert(&state.db, new).await.unwrap().id
+    }
+
+    #[tokio::test]
+    async fn admin_can_delete_server_and_row_disappears() {
+        let state = fresh_state().await;
+        let aid = seed_user(&state, "admin", "admin").await;
+        let token = mint_token(&state, aid, "admin", "admin");
+        let server_id = seed_server(&state).await;
+        let app = app(state.clone());
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("/api/servers/{server_id}"))
+                    .header("authorization", auth_header(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let rows = server_connections::list(&state.db).await.unwrap();
+        assert!(rows.is_empty(), "row must be removed: {rows:?}");
+    }
+
+    #[tokio::test]
+    async fn delete_server_returns_404_when_id_missing() {
+        let state = fresh_state().await;
+        let aid = seed_user(&state, "admin", "admin").await;
+        let token = mint_token(&state, aid, "admin", "admin");
+        let app = app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/api/servers/9999")
+                    .header("authorization", auth_header(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "DELETE on a missing id must surface 404, not silent 204"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_admin_cannot_delete_server() {
+        let state = fresh_state().await;
+        let mid = seed_user(&state, "modr", "moderator").await;
+        let server_id = seed_server(&state).await;
+        let token = mint_token(&state, mid, "modr", "moderator");
+        let app = app(state.clone());
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("/api/servers/{server_id}"))
+                    .header("authorization", auth_header(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let rows = server_connections::list(&state.db).await.unwrap();
+        assert_eq!(rows.len(), 1, "non-admin DELETE must not remove rows");
+    }
+
+    /// PURA-222 — `lastSeenAt` rides the `GET /api/servers` response; the
+    /// bookkeeping repo helper must round-trip a timestamp into
+    /// `ServerSummary.last_seen_at` so the FE can render the column.
+    #[tokio::test]
+    async fn touch_last_seen_surfaces_on_server_list_payload() {
+        let state = fresh_state().await;
+        let aid = seed_user(&state, "admin", "admin").await;
+        let token = mint_token(&state, aid, "admin", "admin");
+        let server_id = seed_server(&state).await;
+
+        let app = app(state.clone());
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/servers")
+                    .header("authorization", auth_header(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body: Vec<ServerSummary> = read_json(resp).await;
+        assert!(
+            body[0].last_seen_at.is_none(),
+            "fresh row must have lastSeenAt: null until first dashboard fetch"
+        );
+
+        server_connections::touch_last_seen(&state.db, server_id)
+            .await
+            .unwrap();
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/servers")
+                    .header("authorization", auth_header(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body: Vec<ServerSummary> = read_json(resp).await;
+        assert!(
+            body[0].last_seen_at.is_some(),
+            "post-touch row must surface a non-null lastSeenAt: {body:?}"
+        );
     }
 }

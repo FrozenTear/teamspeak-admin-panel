@@ -894,6 +894,7 @@ mod tests {
             enabled: true,
             createdAt: Utc::now(),
             updatedAt: Utc::now(),
+            lastSeenAt: None,
             controlPath: "ssh".into(),
             sshAuthMethod: ssh_auth_method.into(),
             sshPrivateKey: ssh_private_key.map(str::to_owned),
