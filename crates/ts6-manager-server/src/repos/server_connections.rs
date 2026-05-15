@@ -230,19 +230,45 @@ pub struct PatchServerConnection {
     pub ssh_host_key_fingerprint: Nullable<String>,
 }
 
-pub async fn patch(db: &Database, id: i64, p: PatchServerConnection) -> Result<Option<ServerConnection>> {
+pub async fn patch(
+    db: &Database,
+    id: i64,
+    p: PatchServerConnection,
+) -> Result<Option<ServerConnection>> {
     let mut parts: Vec<&str> = Vec::new();
-    if p.name.is_some() { parts.push("name = $name"); }
-    if p.host.is_some() { parts.push("host = $host"); }
-    if p.webquery_port.is_some() { parts.push("webqueryPort = $webqueryPort"); }
-    if p.api_key.is_some() { parts.push("apiKey = $apiKey"); }
-    if p.use_https.is_some() { parts.push("useHttps = $useHttps"); }
-    if p.ssh_port.is_some() { parts.push("sshPort = $sshPort"); }
-    if p.ssh_username.is_some() { parts.push("sshUsername = $sshUsername"); }
-    if p.ssh_password.is_some() { parts.push("sshPassword = $sshPassword"); }
-    if p.control_path.is_some() { parts.push("controlPath = $controlPath"); }
-    if p.ssh_auth_method.is_some() { parts.push("sshAuthMethod = $sshAuthMethod"); }
-    if p.ssh_host_key_fingerprint.is_some() { parts.push("sshHostKeyFingerprint = $sshHostKeyFingerprint"); }
+    if p.name.is_some() {
+        parts.push("name = $name");
+    }
+    if p.host.is_some() {
+        parts.push("host = $host");
+    }
+    if p.webquery_port.is_some() {
+        parts.push("webqueryPort = $webqueryPort");
+    }
+    if p.api_key.is_some() {
+        parts.push("apiKey = $apiKey");
+    }
+    if p.use_https.is_some() {
+        parts.push("useHttps = $useHttps");
+    }
+    if p.ssh_port.is_some() {
+        parts.push("sshPort = $sshPort");
+    }
+    if p.ssh_username.is_some() {
+        parts.push("sshUsername = $sshUsername");
+    }
+    if p.ssh_password.is_some() {
+        parts.push("sshPassword = $sshPassword");
+    }
+    if p.control_path.is_some() {
+        parts.push("controlPath = $controlPath");
+    }
+    if p.ssh_auth_method.is_some() {
+        parts.push("sshAuthMethod = $sshAuthMethod");
+    }
+    if p.ssh_host_key_fingerprint.is_some() {
+        parts.push("sshHostKeyFingerprint = $sshHostKeyFingerprint");
+    }
 
     if parts.is_empty() {
         return find_by_id(db, id).await;
@@ -255,19 +281,44 @@ pub async fn patch(db: &Database, id: i64, p: PatchServerConnection) -> Result<O
     );
 
     let mut q = db.query(sql).bind(("id", id));
-    if let Some(v) = p.name { q = q.bind(("name", v)); }
-    if let Some(v) = p.host { q = q.bind(("host", v)); }
-    if let Some(v) = p.webquery_port { q = q.bind(("webqueryPort", v)); }
-    if let Some(v) = p.api_key { q = q.bind(("apiKey", v)); }
-    if let Some(v) = p.use_https { q = q.bind(("useHttps", v)); }
-    if let Some(v) = p.ssh_port { q = q.bind(("sshPort", v)); }
-    if let Some(v) = p.ssh_username { q = q.bind(("sshUsername", v)); }
-    if let Some(v) = p.ssh_password { q = q.bind(("sshPassword", v)); }
-    if let Some(v) = p.control_path { q = q.bind(("controlPath", v)); }
-    if let Some(v) = p.ssh_auth_method { q = q.bind(("sshAuthMethod", v)); }
-    if let Some(v) = p.ssh_host_key_fingerprint { q = q.bind(("sshHostKeyFingerprint", v)); }
+    if let Some(v) = p.name {
+        q = q.bind(("name", v));
+    }
+    if let Some(v) = p.host {
+        q = q.bind(("host", v));
+    }
+    if let Some(v) = p.webquery_port {
+        q = q.bind(("webqueryPort", v));
+    }
+    if let Some(v) = p.api_key {
+        q = q.bind(("apiKey", v));
+    }
+    if let Some(v) = p.use_https {
+        q = q.bind(("useHttps", v));
+    }
+    if let Some(v) = p.ssh_port {
+        q = q.bind(("sshPort", v));
+    }
+    if let Some(v) = p.ssh_username {
+        q = q.bind(("sshUsername", v));
+    }
+    if let Some(v) = p.ssh_password {
+        q = q.bind(("sshPassword", v));
+    }
+    if let Some(v) = p.control_path {
+        q = q.bind(("controlPath", v));
+    }
+    if let Some(v) = p.ssh_auth_method {
+        q = q.bind(("sshAuthMethod", v));
+    }
+    if let Some(v) = p.ssh_host_key_fingerprint {
+        q = q.bind(("sshHostKeyFingerprint", v));
+    }
 
-    let mut resp = q.await.context("server_connection patch query failed")?.check()?;
+    let mut resp = q
+        .await
+        .context("server_connection patch query failed")?
+        .check()?;
     Ok(resp.take(0)?)
 }
 

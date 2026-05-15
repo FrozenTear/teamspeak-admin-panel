@@ -2,7 +2,9 @@
 
 use ts6_manager_shared::servers::{CreateServerRequest, PatchServerRequest, ServerSummary};
 
-use crate::client::api::{ApiError, authorized_get_json, authorized_patch_json, authorized_post_json};
+use crate::client::api::{
+    ApiError, authorized_get_json, authorized_patch_json, authorized_post_json,
+};
 use crate::client::session::RefreshGate;
 
 pub async fn list(gate: &RefreshGate, base: &str) -> Result<Vec<ServerSummary>, ApiError> {

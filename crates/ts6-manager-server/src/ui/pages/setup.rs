@@ -186,8 +186,7 @@ pub fn SetupPage() -> Element {
     // submits. The host + apiKey fields must be filled; webqueryPort /
     // useHttps default server-side. Result lands in `probe_result` so
     // the panel below the form can render it.
-    let server_fields_filled =
-        !server_host.read().is_empty() && !api_key.read().is_empty();
+    let server_fields_filled = !server_host.read().is_empty() && !api_key.read().is_empty();
     let can_probe = !probing() && !submitting() && server_fields_filled;
     let on_probe = move |_evt: MouseEvent| {
         if !can_probe {
@@ -548,7 +547,11 @@ fn build_request(
             ssh_username: Some(ssh_username).filter(|s| !s.is_empty()),
             ssh_password: Some(ssh_password).filter(|s| !s.is_empty()),
             control_path: if has_ssh { Some("ssh".into()) } else { None },
-            ssh_auth_method: if has_ssh { Some("password".into()) } else { None },
+            ssh_auth_method: if has_ssh {
+                Some("password".into())
+            } else {
+                None
+            },
             ssh_host_key_fingerprint: Some(ssh_host_key_fingerprint).filter(|s| !s.is_empty()),
         },
     }
@@ -606,9 +609,15 @@ mod tests {
     fn build_request_strips_empty_optional_display_name() {
         let (su, sp, sfp) = no_ssh();
         let req = build_request(
-            "admin".into(), String::new(), "Hunter2!ok".into(),
-            "Primary".into(), "ts.example.com".into(), "K".into(),
-            su, sp, sfp,
+            "admin".into(),
+            String::new(),
+            "Hunter2!ok".into(),
+            "Primary".into(),
+            "ts.example.com".into(),
+            "K".into(),
+            su,
+            sp,
+            sfp,
         );
         assert!(
             req.display_name.is_none(),
@@ -620,9 +629,15 @@ mod tests {
     fn build_request_keeps_provided_display_name() {
         let (su, sp, sfp) = no_ssh();
         let req = build_request(
-            "admin".into(), "Robert Soot".into(), "Hunter2!ok".into(),
-            "Primary".into(), "ts.example.com".into(), "K".into(),
-            su, sp, sfp,
+            "admin".into(),
+            "Robert Soot".into(),
+            "Hunter2!ok".into(),
+            "Primary".into(),
+            "ts.example.com".into(),
+            "K".into(),
+            su,
+            sp,
+            sfp,
         );
         assert_eq!(req.display_name.as_deref(), Some("Robert Soot"));
     }
@@ -631,9 +646,15 @@ mod tests {
     fn build_request_does_not_emit_zero_string_for_optional_server_fields() {
         let (su, sp, sfp) = no_ssh();
         let req = build_request(
-            "admin".into(), String::new(), "Hunter2!ok".into(),
-            "Primary".into(), "ts.example.com".into(), "K".into(),
-            su, sp, sfp,
+            "admin".into(),
+            String::new(),
+            "Hunter2!ok".into(),
+            "Primary".into(),
+            "ts.example.com".into(),
+            "K".into(),
+            su,
+            sp,
+            sfp,
         );
         assert!(req.server.webquery_port.is_none());
         assert!(req.server.use_https.is_none());
@@ -647,9 +668,15 @@ mod tests {
     fn build_request_round_trips_required_fields_into_wire_struct() {
         let (su, sp, sfp) = no_ssh();
         let req = build_request(
-            "rsoot".into(), "Robert".into(), "Hunter2!ok".into(),
-            "Primary".into(), "ts.example.com".into(), "WEBQUERY-KEY".into(),
-            su, sp, sfp,
+            "rsoot".into(),
+            "Robert".into(),
+            "Hunter2!ok".into(),
+            "Primary".into(),
+            "ts.example.com".into(),
+            "WEBQUERY-KEY".into(),
+            su,
+            sp,
+            sfp,
         );
         assert_eq!(req.username, "rsoot");
         assert_eq!(req.password, "Hunter2!ok");
@@ -661,14 +688,23 @@ mod tests {
     #[test]
     fn build_request_with_ssh_sets_control_path_ssh() {
         let req = build_request(
-            "admin".into(), String::new(), "Hunter2!ok".into(),
-            "Primary".into(), "ts.example.com".into(), "K".into(),
-            "serveradmin".into(), "pw".into(), "SHA256:abc".into(),
+            "admin".into(),
+            String::new(),
+            "Hunter2!ok".into(),
+            "Primary".into(),
+            "ts.example.com".into(),
+            "K".into(),
+            "serveradmin".into(),
+            "pw".into(),
+            "SHA256:abc".into(),
         );
         assert_eq!(req.server.control_path.as_deref(), Some("ssh"));
         assert_eq!(req.server.ssh_auth_method.as_deref(), Some("password"));
         assert_eq!(req.server.ssh_username.as_deref(), Some("serveradmin"));
-        assert_eq!(req.server.ssh_host_key_fingerprint.as_deref(), Some("SHA256:abc"));
+        assert_eq!(
+            req.server.ssh_host_key_fingerprint.as_deref(),
+            Some("SHA256:abc")
+        );
     }
 
     #[test]

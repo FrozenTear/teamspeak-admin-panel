@@ -128,15 +128,21 @@ async fn patch_server(
     Json(req): Json<PatchServerRequest>,
 ) -> Result<Json<ServerSummary>, Response> {
     // Validate controlPath if supplied.
-    if let Some(ref cp) = req.control_path {
-        if !["webquery", "ssh"].contains(&cp.as_str()) {
-            return Err(err(StatusCode::BAD_REQUEST, "controlPath must be 'webquery' or 'ssh'"));
-        }
+    if let Some(ref cp) = req.control_path
+        && !["webquery", "ssh"].contains(&cp.as_str())
+    {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "controlPath must be 'webquery' or 'ssh'",
+        ));
     }
-    if let Some(ref am) = req.ssh_auth_method {
-        if !["password", "key", "agent"].contains(&am.as_str()) {
-            return Err(err(StatusCode::BAD_REQUEST, "sshAuthMethod must be 'password', 'key', or 'agent'"));
-        }
+    if let Some(ref am) = req.ssh_auth_method
+        && !["password", "key", "agent"].contains(&am.as_str())
+    {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "sshAuthMethod must be 'password', 'key', or 'agent'",
+        ));
     }
 
     let sealed_api_key = match req.api_key.as_deref() {
@@ -664,7 +670,10 @@ mod tests {
         let rows = server_connections::list(&state.db).await.unwrap();
         let row = &rows[0];
         // apiKey ciphertext unchanged (we didn't supply a new one).
-        assert_eq!(row.apiKey, api_key_ct, "apiKey ciphertext must be preserved on PATCH without apiKey");
+        assert_eq!(
+            row.apiKey, api_key_ct,
+            "apiKey ciphertext must be preserved on PATCH without apiKey"
+        );
         // sshPassword re-sealed with the new plaintext.
         let new_pw = row.sshPassword.as_deref().expect("sshPassword set");
         assert!(new_pw.starts_with("enc:"), "new sshPassword must be sealed");

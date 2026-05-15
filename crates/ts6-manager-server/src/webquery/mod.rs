@@ -320,9 +320,8 @@ impl WebQueryClient {
             let url = format!("{}{}", self.base_url, path);
 
             let mut headers = HeaderMap::new();
-            let key = HeaderValue::from_str(&self.api_key).map_err(|_| {
-                WebQueryError::transport_other("apiKey is not a valid HTTP header")
-            })?;
+            let key = HeaderValue::from_str(&self.api_key)
+                .map_err(|_| WebQueryError::transport_other("apiKey is not a valid HTTP header"))?;
             headers.insert(API_KEY_HEADER, key);
 
             let started = Instant::now();

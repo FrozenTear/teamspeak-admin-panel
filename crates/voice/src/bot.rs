@@ -430,12 +430,11 @@ async fn handle_audio_msg(
             // Pipeline drained; advance the queue and auto-start the
             // next track if the head is non-empty. If not, emit a
             // single AudioFinished and let the bot sit idle.
-            let frames = current_audio
-                .as_ref()
-                .map(|a| a.frames_sent)
-                .unwrap_or(0);
+            let frames = current_audio.as_ref().map(|a| a.frames_sent).unwrap_or(0);
             if frames == 0 {
-                warn!("audio pipeline finished with 0 frames — yt-dlp or ffmpeg likely failed; check yt_dlp/ffmpeg warn logs above");
+                warn!(
+                    "audio pipeline finished with 0 frames — yt-dlp or ffmpeg likely failed; check yt_dlp/ffmpeg warn logs above"
+                );
                 let _ = events.send(BotEvent::Error(BotError::Internal(
                     "audio pipeline produced 0 frames — check yt-dlp/ffmpeg logs".into(),
                 )));

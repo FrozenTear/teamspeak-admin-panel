@@ -137,8 +137,8 @@ mod tests {
     #[test]
     fn unknown_paths_resolve_to_not_found() {
         for path in ["/totally-unknown", "/x/y/z", "/clients/bogus"] {
-            let route = Route::from_str(path)
-                .unwrap_or_else(|err| panic!("failed to parse {path}: {err}"));
+            let route =
+                Route::from_str(path).unwrap_or_else(|err| panic!("failed to parse {path}: {err}"));
             assert!(
                 matches!(route, Route::NotFoundPage { .. }),
                 "expected NotFoundPage for {path}, got {route:?}",

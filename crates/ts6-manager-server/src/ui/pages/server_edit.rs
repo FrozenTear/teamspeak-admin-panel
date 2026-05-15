@@ -12,11 +12,14 @@ use crate::client::api::ApiError;
 use crate::client::dioxus::{use_auth_gate, use_session};
 use crate::client::store::AuthState;
 use crate::client::{self};
-use crate::ui::components::{Banner, BannerVariant, Button, ButtonSize, ButtonType, Field, PasswordInput, TextInput};
+use crate::ui::components::{
+    Banner, BannerVariant, Button, ButtonSize, ButtonType, Field, PasswordInput, TextInput,
+};
 use crate::ui::layout::use_servers_context;
 use crate::ui::pages::active_server;
 
-const GENERIC_FAILURE: &str = "Could not save server settings. Check your input and the panel logs, then try again.";
+const GENERIC_FAILURE: &str =
+    "Could not save server settings. Check your input and the panel logs, then try again.";
 
 #[component]
 pub fn ServerEditPage() -> Element {
@@ -59,7 +62,9 @@ pub fn ServerEditPage() -> Element {
     let gate_for_submit = gate.clone();
     let onsubmit = move |evt: FormEvent| {
         evt.prevent_default();
-        if submitting() { return; }
+        if submitting() {
+            return;
+        }
 
         let ssh_u = ssh_username.read().clone();
         let ssh_p = ssh_password.read().clone();
@@ -69,9 +74,21 @@ pub fn ServerEditPage() -> Element {
         let req = PatchServerRequest {
             ssh_username: Some(ssh_u.clone()),
             ssh_password: if ssh_p.is_empty() { None } else { Some(ssh_p) },
-            control_path: Some(if use_ssh && !ssh_u.is_empty() { "ssh".into() } else { "webquery".into() }),
-            ssh_auth_method: if use_ssh && !ssh_u.is_empty() { Some("password".into()) } else { None },
-            ssh_host_key_fingerprint: if ssh_fp.is_empty() { None } else { Some(ssh_fp) },
+            control_path: Some(if use_ssh && !ssh_u.is_empty() {
+                "ssh".into()
+            } else {
+                "webquery".into()
+            }),
+            ssh_auth_method: if use_ssh && !ssh_u.is_empty() {
+                Some("password".into())
+            } else {
+                None
+            },
+            ssh_host_key_fingerprint: if ssh_fp.is_empty() {
+                None
+            } else {
+                Some(ssh_fp)
+            },
             ..Default::default()
         };
 
@@ -87,7 +104,10 @@ pub fn ServerEditPage() -> Element {
                     submitting.set(false);
                     success_msg.set(Some("Server settings saved.".into()));
                 }
-                Err(ApiError::Client { status: 400, message }) => {
+                Err(ApiError::Client {
+                    status: 400,
+                    message,
+                }) => {
                     submitting.set(false);
                     error_msg.set(Some(message));
                 }
