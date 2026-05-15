@@ -19,7 +19,8 @@ use crate::ui::components::{Banner, BannerVariant, Button, ButtonType, ButtonVar
 use crate::ui::layout::use_servers_context;
 use crate::ui::pages::active_server;
 use crate::ui::pages::flows::shared::{
-    CRON_PRESETS, MAX_ACTIONS, MAX_NAME_LEN, action_kind_label, format_error,
+    CRON_PRESETS, MAX_ACTIONS, MAX_NAME_LEN, action_kind_label, cron_validation_message,
+    format_error,
 };
 use crate::ui::routes::Route;
 
@@ -393,11 +394,20 @@ fn FlowForm(props: FlowFormProps) -> Element {
             section { class: "card stack-sm",
                 h2 { "Target server" }
                 p { class: "muted",
-                    "Scoped to ", strong { "{props.server_name}" },
-                    " (virtual server ", code { "{virtual_server_id}" }, ")."
+                    "Scoped to ", strong { "{props.server_name}" }, "."
                 }
                 p { class: "field-hint",
                     "Pick a different server from the header selector before creating the flow if this isn't right."
+                }
+                // PURA-248 L8 — the raw `serverConfigId` / `virtualServerId`
+                // are power-user detail. Progressive disclosure keeps the
+                // section's primary line ("which server") uncluttered.
+                details { class: "disclosure",
+                    summary { "Show advanced identifiers" }
+                    p { class: "muted",
+                        "Server config ", code { "{server_config_id}" },
+                        " · virtual server ", code { "{virtual_server_id}" }, "."
+                    }
                 }
             }
 
@@ -406,7 +416,9 @@ fn FlowForm(props: FlowFormProps) -> Element {
                 h2 { "Trigger" }
                 if definition_locked {
                     Banner { variant: BannerVariant::Warning,
-                        "This flow is enabled. Disable it to edit the trigger."
+                        "This flow is enabled, so its trigger is locked. Uncheck "
+                        strong { "Enable on save" }
+                        " near the bottom of this form and save to unlock it."
                     }
                 }
                 TriggerCards {
@@ -425,7 +437,9 @@ fn FlowForm(props: FlowFormProps) -> Element {
                 h2 { "Actions" }
                 if definition_locked {
                     Banner { variant: BannerVariant::Warning,
-                        "This flow is enabled. Disable it to edit the actions."
+                        "This flow is enabled, so its actions are locked. Uncheck "
+                        strong { "Enable on save" }
+                        " near the bottom of this form and save to unlock them."
                     }
                 }
                 ActionsList {
@@ -441,19 +455,25 @@ fn FlowForm(props: FlowFormProps) -> Element {
                     "{msg}"
                 }
             }
+            // PURA-248 L4 — the enable toggle is a save-time *decision*, not
+            // a button. It sits on its own line above the Cancel/submit row
+            // so it is not mistaken for a third action button.
+            label { class: "field-inline",
+                input {
+                    r#type: "checkbox",
+                    checked: *enabled.read(),
+                    oninput: move |e| enabled.set(e.value() == "true"),
+                }
+                " Enable on save"
+                span { class: "field-hint",
+                    "An enabled flow starts responding to its trigger immediately. Its trigger and actions are then locked until you disable it again."
+                }
+            }
             div { class: "actions",
                 Link {
                     to: Route::FlowsListPage {},
                     class: "btn btn-ghost",
                     "Cancel"
-                }
-                label { class: "field-inline",
-                    input {
-                        r#type: "checkbox",
-                        checked: *enabled.read(),
-                        oninput: move |e| enabled.set(e.value() == "true"),
-                    }
-                    " Enable on save"
                 }
                 Button {
                     variant: ButtonVariant::Primary,
@@ -509,14 +529,32 @@ fn TriggerCards(props: TriggerCardsProps) -> Element {
                         p { class: "muted", "Run on a cron expression. Missed ticks during downtime are not replayed." }
                         if cron_active {
                             div { class: "stack-sm",
-                                label { class: "field",
-                                    span { class: "field-label", "Cron expression" }
-                                    input {
-                                        class: "input",
-                                        value: "{cron_expression}",
-                                        placeholder: "0 */5 * * * *",
-                                        disabled: locked,
-                                        oninput: move |e| on_cron_change.call(e.value()),
+                                {
+                                    // PURA-248 M7 — live, non-authoritative
+                                    // field-count check below the input. The
+                                    // server still owns the real cron parse.
+                                    let cron_warning = cron_validation_message(&cron_expression);
+                                    let cron_invalid = cron_warning.is_some();
+                                    rsx! {
+                                        label { class: "field",
+                                            span { class: "field-label", "Cron expression" }
+                                            input {
+                                                class: "input",
+                                                value: "{cron_expression}",
+                                                placeholder: "0 */5 * * * *",
+                                                disabled: locked,
+                                                "aria-invalid": if cron_invalid { "true" } else { "false" },
+                                                oninput: move |e| on_cron_change.call(e.value()),
+                                            }
+                                            if let Some(msg) = cron_warning.as_ref() {
+                                                span {
+                                                    class: "field-error",
+                                                    role: "status",
+                                                    "aria-live": "polite",
+                                                    "{msg}"
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                                 div { class: "chip-row",
@@ -733,6 +771,12 @@ fn ActionEditor(props: ActionEditorProps) -> Element {
                     option { value: "WebhookOut", selected: matches!(current_kind, ActionKind::WebhookOut), "Webhook" }
                     option { value: "LogLine", selected: matches!(current_kind, ActionKind::LogLine), "Log line" }
                 }
+                // PURA-248 M3 — switching kind resets the action to its
+                // defaults (the kind-specific fields cannot carry over).
+                // Signpost it so the reset is not a silent surprise.
+                span { class: "field-hint",
+                    "Changing the kind clears this action's other fields."
+                }
             }
         }
     };
@@ -908,46 +952,97 @@ struct KeyValueEditorProps {
     on_change: EventHandler<serde_json::Map<String, serde_json::Value>>,
 }
 
+/// Operator-facing notice (PURA-248 L5) for rows that `project` dropped
+/// when coercing the editable rows down to a JSON map — a value with no
+/// key, or a key that collided with an earlier row. A fully blank row is
+/// not counted: that is just an unfilled new row, not a drop.
+fn kv_drop_notice(keyless: usize, duplicate: usize) -> Option<String> {
+    match (keyless, duplicate) {
+        (0, 0) => None,
+        (k, 0) => Some(format!(
+            "{k} row(s) have a value but no key — not saved. Add a key or remove the row."
+        )),
+        (0, d) => Some(format!(
+            "{d} duplicate key(s) dropped — only the first row for each key is kept."
+        )),
+        (k, d) => Some(format!(
+            "{d} duplicate key(s) dropped, {k} keyless row(s) not saved."
+        )),
+    }
+}
+
 #[component]
 fn KeyValueEditor(props: KeyValueEditorProps) -> Element {
     let label = props.label.clone();
-    let entries: Vec<(String, String)> = props
-        .values
-        .iter()
-        .map(|(k, v)| (k.clone(), value_to_string(v)))
-        .collect();
-    let values_map = props.values.clone();
     let locked = props.locked;
     let on_change = props.on_change;
 
-    let emit = move |entries: Vec<(String, String)>| {
+    // Local working state — the editable (key, value) string rows. The
+    // parent stores args as a `serde_json::Map`, which cannot represent a
+    // blank-keyed or duplicate row; round-tripping every keystroke through
+    // the map would drop the row the operator is still typing (PURA-248
+    // L5 — and previously made "+ Add arg" a no-op). So the editable rows
+    // live here, and we only *project* the coerced map outward. State is
+    // seeded once: the parent only ever feeds this editor its own
+    // projected map, so there is no external source of truth to re-sync.
+    let mut rows = use_signal(|| {
+        props
+            .values
+            .iter()
+            .map(|(k, v)| (k.clone(), value_to_string(v)))
+            .collect::<Vec<(String, String)>>()
+    });
+    // Live notice when projecting silently dropped rows (L5).
+    let mut drop_notice = use_signal(|| None::<String>);
+
+    // Coerce the current rows to a JSON map, record what was dropped, and
+    // notify the parent. Captures only `Copy` handles, so it is itself a
+    // `Copy` closure and can be reused across the per-row event handlers.
+    let mut project = move || {
+        let current = rows.read().clone();
         let mut next = serde_json::Map::new();
         let mut seen: HashMap<String, ()> = HashMap::new();
-        for (k, v) in entries.into_iter() {
-            if k.is_empty() {
+        let mut keyless = 0usize;
+        let mut duplicate = 0usize;
+        for (k, v) in current.iter() {
+            let key = k.trim();
+            if key.is_empty() {
+                if !v.trim().is_empty() {
+                    keyless += 1;
+                }
                 continue;
             }
-            if seen.contains_key(&k) {
+            if seen.contains_key(key) {
+                duplicate += 1;
                 continue;
             }
-            seen.insert(k.clone(), ());
-            // Try to preserve numeric / bool / null; fall back to string.
-            let value = string_to_value(&v);
-            next.insert(k, value);
+            seen.insert(key.to_string(), ());
+            // Preserve numeric / bool / null; fall back to string.
+            next.insert(key.to_string(), string_to_value(v));
         }
+        drop_notice.set(kv_drop_notice(keyless, duplicate));
         on_change.call(next);
     };
+
+    let entries = rows.read().clone();
 
     rsx! {
         fieldset { class: "stack-sm",
             legend { class: "field-label", "{label}" }
+            // PURA-248 L6 — the JSON coercion is a footgun without copy.
+            p { class: "field-hint",
+                "Values are JSON-coerced — ",
+                code { "5" },
+                " saves as a number and ",
+                code { "true" },
+                " as a boolean. Wrap a value in quotes to force text."
+            }
             if entries.is_empty() {
                 p { class: "muted", "No args. Add a key/value pair below." }
             } else {
                 ul { class: "stack-sm",
                     for (idx, (k, v)) in entries.iter().enumerate() {
                         {
-                            let entries = entries.clone();
                             let k_val = k.clone();
                             let v_val = v.clone();
                             rsx! {
@@ -955,41 +1050,34 @@ fn KeyValueEditor(props: KeyValueEditorProps) -> Element {
                                     input {
                                         class: "input",
                                         disabled: locked,
+                                        // PURA-248 M1 — placeholder is not a label.
+                                        "aria-label": "Arg name",
                                         value: "{k_val}",
                                         placeholder: "key",
-                                        oninput: {
-                                            let entries = entries.clone();
-                                            move |e| {
-                                                let mut next = entries.clone();
-                                                next[idx].0 = e.value();
-                                                emit(next);
-                                            }
+                                        oninput: move |e| {
+                                            rows.with_mut(|r| r[idx].0 = e.value());
+                                            project();
                                         },
                                     }
                                     input {
                                         class: "input",
                                         disabled: locked,
+                                        "aria-label": "Arg value",
                                         value: "{v_val}",
                                         placeholder: "value",
-                                        oninput: {
-                                            let entries = entries.clone();
-                                            move |e| {
-                                                let mut next = entries.clone();
-                                                next[idx].1 = e.value();
-                                                emit(next);
-                                            }
+                                        oninput: move |e| {
+                                            rows.with_mut(|r| r[idx].1 = e.value());
+                                            project();
                                         },
                                     }
                                     if !locked {
-                                        Button {
-                                            variant: ButtonVariant::Ghost,
-                                            onclick: {
-                                                let entries = entries.clone();
-                                                move |_| {
-                                                    let mut next = entries.clone();
-                                                    next.remove(idx);
-                                                    emit(next);
-                                                }
+                                        button {
+                                            r#type: "button",
+                                            class: "btn btn-ghost btn-sm",
+                                            "aria-label": "Remove arg",
+                                            onclick: move |_| {
+                                                rows.with_mut(|r| { r.remove(idx); });
+                                                project();
                                             },
                                             "×"
                                         }
@@ -1000,19 +1088,20 @@ fn KeyValueEditor(props: KeyValueEditorProps) -> Element {
                     }
                 }
             }
+            if let Some(notice) = drop_notice.read().as_ref() {
+                p {
+                    class: "field-error",
+                    role: "status",
+                    "aria-live": "polite",
+                    "{notice}"
+                }
+            }
             if !locked {
                 Button {
                     variant: ButtonVariant::Ghost,
-                    onclick: {
-                        let values_map = values_map.clone();
-                        move |_| {
-                            let mut entries: Vec<(String, String)> = values_map
-                                .iter()
-                                .map(|(k, v)| (k.clone(), value_to_string(v)))
-                                .collect();
-                            entries.push((String::new(), String::new()));
-                            emit(entries);
-                        }
+                    onclick: move |_| {
+                        rows.with_mut(|r| r.push((String::new(), String::new())));
+                        project();
                     },
                     "+ Add arg"
                 }
@@ -1050,6 +1139,8 @@ fn HeaderListEditor(props: HeaderListEditorProps) -> Element {
                                     input {
                                         class: "input",
                                         disabled: locked,
+                                        // PURA-248 M1 — placeholder is not a label.
+                                        "aria-label": "Header name",
                                         value: "{k_val}",
                                         placeholder: "Header-Name",
                                         oninput: {
@@ -1064,6 +1155,7 @@ fn HeaderListEditor(props: HeaderListEditorProps) -> Element {
                                     input {
                                         class: "input",
                                         disabled: locked,
+                                        "aria-label": "Header value",
                                         value: "{v_val}",
                                         placeholder: "value",
                                         oninput: {
@@ -1076,8 +1168,10 @@ fn HeaderListEditor(props: HeaderListEditorProps) -> Element {
                                         },
                                     }
                                     if !locked {
-                                        Button {
-                                            variant: ButtonVariant::Ghost,
+                                        button {
+                                            r#type: "button",
+                                            class: "btn btn-ghost btn-sm",
+                                            "aria-label": "Remove header",
                                             onclick: {
                                                 let headers = headers.clone();
                                                 move |_| {
