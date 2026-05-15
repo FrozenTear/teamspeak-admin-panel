@@ -8,6 +8,7 @@
 //! that the userspace copy is in the noise compared to the network fetch.
 
 use std::io;
+use std::path::Path;
 use std::process::Stdio;
 
 use async_trait::async_trait;
@@ -26,7 +27,14 @@ pub struct YtDlpSource {
 }
 
 impl YtDlpSource {
-    pub async fn new(url: &str, channels: u8) -> io::Result<Self> {
+    /// Spawn a yt-dlp → ffmpeg pipeline.
+    ///
+    /// `cookie_file` is the resolved Netscape `cookies.txt` path (or `None`).
+    /// Callers resolve it from `app_setting:yt_cookie_path` (DB) with
+    /// `YT_COOKIE_FILE` env as the boot-time fallback; the path is read at
+    /// call-site so a UI cookie upload takes effect on the *next* track
+    /// without a manager restart.
+    pub async fn new(url: &str, channels: u8, cookie_file: Option<&Path>) -> io::Result<Self> {
         // Spawn ffmpeg first, take its stdin so we can pipe yt-dlp output in.
         let (inner, mut ffmpeg_stdin) = FfmpegSource::from_stdin(channels).await?;
 
@@ -40,17 +48,13 @@ impl YtDlpSource {
             .arg("-o")
             .arg("-");
 
-        // PURA-216 — `YT_COOKIE_FILE` points at a Netscape `cookies.txt`
-        // (typically Firefox-exported via the "cookies.txt" extension). Needed
-        // for age-gated, region-locked, and "confirm you're not a bot"
-        // rate-limited videos. Inline env read keeps the seam local; a future
-        // UI cookie-management ticket will refactor to plumb the path through
-        // PipelineConfig from `Config.yt_cookie_file`.
-        if let Ok(path) = std::env::var("YT_COOKIE_FILE")
-            && !path.is_empty()
-        {
-            cmd.arg("--cookies").arg(&path);
-            tracing::debug!(target: "yt_dlp", cookie_file = %path, "passing cookies file to yt-dlp");
+        // PURA-223 — cookie path plumbed from PipelineConfig (resolved from
+        // `app_setting:yt_cookie_path` by the caller at play-time, with
+        // `YT_COOKIE_FILE` env as the boot fallback). Needed for age-gated,
+        // region-locked, and rate-limited videos.
+        if let Some(p) = cookie_file {
+            cmd.arg("--cookies").arg(p);
+            tracing::debug!(target: "yt_dlp", cookie_file = %p.display(), "passing cookies file to yt-dlp");
         }
 
         cmd.arg(url)

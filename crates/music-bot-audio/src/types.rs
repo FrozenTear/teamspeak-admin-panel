@@ -1,5 +1,6 @@
 //! Public types — the seam WS-1 (bot lifecycle) consumes.
 
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 /// Opus voice frames are pinned to 48 kHz per RFC 7587 / TS6 §19.10.
@@ -61,6 +62,11 @@ pub struct PipelineConfig {
     /// Event broadcast capacity. Subscribers that lag past this are dropped
     /// — events are advisory.
     pub event_buffer: usize,
+    /// PURA-223 — resolved Netscape `cookies.txt` path for yt-dlp. `None`
+    /// means no cookies (anonymous). Resolved by the caller at play-time
+    /// from `app_setting:yt_cookie_path` (DB) or `YT_COOKIE_FILE` env so
+    /// a UI-uploaded cookie is effective without a manager restart.
+    pub yt_cookie_file: Option<PathBuf>,
 }
 
 impl Default for PipelineConfig {
@@ -71,6 +77,7 @@ impl Default for PipelineConfig {
             application: OpusApplication::Audio,
             frame_buffer: 8,
             event_buffer: 32,
+            yt_cookie_file: None,
         }
     }
 }

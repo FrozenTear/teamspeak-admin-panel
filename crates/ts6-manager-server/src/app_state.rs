@@ -6,7 +6,7 @@
 //! (REST, WS, FLOW) extend this struct in their own slices.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use tokio::sync::Mutex;
@@ -82,6 +82,14 @@ pub struct AppState {
     /// did not configure a public relay URL — the viewer falls back to
     /// "No live video".
     pub moq_public_url: Option<String>,
+    /// PURA-223 — live-updated yt-dlp cookie file path. Written by
+    /// `PUT /api/settings/youtube-cookies`; read by each bot actor at
+    /// track-play time. `Arc<RwLock<…>>` so the route handler can update
+    /// it without touching the actors directly.
+    pub yt_cookie: Arc<RwLock<Option<PathBuf>>>,
+    /// PURA-223 — on-disk directory for operator-uploaded files (e.g.
+    /// `yt-cookies.txt`). Defaults to `./data`; override with `DATA_DIR`.
+    pub data_dir: PathBuf,
 }
 
 impl AppState {
@@ -123,6 +131,11 @@ impl AppState {
                 Arc::new(ts6_ssrf::MockResolver::new())
             }
         };
+        // PURA-223 — boot-time cookie: prefer YT_COOKIE_FILE env var.
+        // The settings route will replace this at runtime if an operator
+        // uploads a cookie via the UI.
+        let yt_cookie = Arc::new(RwLock::new(cfg.yt_cookie_file.clone()));
+
         Self {
             db,
             jwt_secret: Arc::new(cfg.jwt_secret.as_bytes().to_vec()),
@@ -137,6 +150,8 @@ impl AppState {
             sidecar,
             ssrf_resolver,
             moq_public_url: cfg.moq_public_url.clone(),
+            yt_cookie,
+            data_dir: cfg.data_dir.clone(),
         }
     }
 }

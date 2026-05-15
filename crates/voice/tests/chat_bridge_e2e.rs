@@ -95,7 +95,7 @@ async fn run() -> Result<()> {
         .with_handshake_timeout(HANDSHAKE_TIMEOUT)
         .with_auto_connect(true);
     let store: Arc<dyn MusicBotStore> = Arc::new(InMemoryMusicBotStore::new());
-    let bot = spawn_bot(BotId(1), bot_config, store);
+    let bot = spawn_bot(BotId(1, std::sync::Arc::new(std::sync::RwLock::new(None))), bot_config, store);
     let mut bot_events = bot.subscribe();
 
     // 2. Wait for the bot's `Connected` event so we know the default channel.
