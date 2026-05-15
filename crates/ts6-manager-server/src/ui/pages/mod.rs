@@ -16,6 +16,7 @@ mod home;
 mod login;
 mod logs;
 mod music_bots;
+mod not_found;
 mod public_widget;
 mod server_info;
 mod setup;
@@ -34,6 +35,7 @@ pub use logs::LogsPage;
 pub use music_bots::{
     BotDetailPage, BotsIndexPage, MusicLibraryPage, MusicPlaylistsPage, RadioStationsPage,
 };
+pub use not_found::NotFoundPage;
 pub use public_widget::PublicWidgetPage;
 pub use server_info::ServerInfoPage;
 pub use setup::SetupPage;

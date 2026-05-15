@@ -11,7 +11,7 @@ use std::io;
 use std::process::Stdio;
 
 use async_trait::async_trait;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
 
@@ -42,13 +42,25 @@ impl YtDlpSource {
             .arg(url)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
 
         let mut yt_dlp = cmd.spawn()?;
         let mut yt_stdout = yt_dlp
             .stdout
             .take()
             .ok_or_else(|| io::Error::other("yt-dlp child has no stdout"))?;
+
+        // Log yt-dlp stderr so signature/cipher errors are visible to operators.
+        let yt_stderr = yt_dlp
+            .stderr
+            .take()
+            .ok_or_else(|| io::Error::other("yt-dlp child has no stderr"))?;
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(yt_stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                tracing::warn!(target: "yt_dlp", "{}", line);
+            }
+        });
 
         // Bridge yt-dlp.stdout → ffmpeg.stdin in a background task. Closes
         // ffmpeg's stdin when yt-dlp finishes so ffmpeg sees clean EOF.
