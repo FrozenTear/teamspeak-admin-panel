@@ -54,6 +54,7 @@ server = [
     "dep:tiny-skia",
     "dep:music-bot",
     "dep:tokio-stream",
+    "dep:cron",
 ]
 web = ["dioxus/web"]
 # PURA-72 Slice C (PURA-88) — verification feature flag. When enabled,
@@ -145,6 +146,11 @@ music-bot = { path = "../voice", optional = true }
 # the axum SSE response can consume directly. Server-only — no WASM
 # build path opens an SSE listener.
 tokio-stream = { version = "0.1", default-features = false, features = ["sync"], optional = true }
+
+# PURA-241 v1.1 flow engine — cron-expression parser + next-tick iterator
+# for the `Trigger::Cron` source. Server-only; the WASM build never runs
+# the trigger loop.
+cron = { workspace = true, optional = true }
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
