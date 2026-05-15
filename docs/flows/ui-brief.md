@@ -62,12 +62,14 @@ Sections, top-to-bottom:
 
 4. **Actions** — drag-reorderable list of up to 8 cards. Each card is an action kind selector with kind-specific fields:
 
-   - **Send TS6 command** — `command` dropdown (whitelisted), `args` JSON editor with key/value rows. Substitution-key palette: a `${trigger.…}` chip-picker that inserts a templated reference (resolved keys differ per trigger; we render only the keys the current trigger exposes).
+   - **Send TS6 command** — `command` dropdown (whitelisted), `args` JSON editor with key/value rows. Operators may type `${trigger.…}` placeholders into arg values by hand; they are resolved server-side. *(The substitution chip-picker is deferred — see the note below.)*
    - **Send music-bot command** — bot selector (active bots on this virtual server), `command` dropdown, args grid.
    - **Send a webhook** — `url` text (validated against the SSRF allow-list reflectively: a "validate" button calls a future `POST /api/flows/validate-webhook` — **out of scope for v1.1**, render as an inline note "URL is sent as-is; ensure it is on the manager's allow-list"), optional headers grid.
    - **Write a log line** — `message` textarea. Always-available; useful as a smoke action.
 
    Bottom of the list: `[+ Add action]`.
+
+   > **Substitution chip-picker — deferred to v1.2 (PURA-253 M2).** This section originally sketched a `${trigger.…}` chip-picker that would insert templated trigger references into action args. Building it in v1.1 would race the engine-side substitution contract: the resolved key set differs per trigger kind and is not yet pinned, so a picker built today risks offering keys the engine will not resolve — a signifier that lies is worse than no signifier. v1.1 operators type `${trigger.…}` placeholders by hand; they are still resolved server-side. Revisit in v1.2 once the substitution contract is pinned.
 
 5. **Save** — primary button `[Create flow]` + a checkbox **Enable on save** (default off; the create-then-fire-from-list-page flow is intentional so the operator can sanity-check before going live).
 
@@ -123,7 +125,50 @@ These are the architectural sharp edges; the UI is responsible for making them l
 
 - Reuse the existing pill / badge / button atoms from `music_bots` — do not invent a flow-specific design language.
 - The create form is the only page that needs new layout thinking; everything else is "same table, different columns". Allocate UX design effort accordingly.
-- Action kinds want **icons** for fast scanning of the actions list (TS6 command = chevron-into-server, music-bot = note, webhook = arrow-out, log = text). UXDesigner picks the exact set.
+- Action kinds and run statuses carry glyph icons for fast scanning — the resolved token set is **§7.1** (PURA-253 H2 / L2).
+
+### 7.1 Flow icon token set (PURA-253 H2 / L2)
+
+The flow pages use glyph icons — the manager's existing `.icn` pattern (no SVG
+registry; the sidebar passes Unicode glyphs directly). Each icon is a named
+token; DioxusLead wires the helpers. Every placement also shows a text label,
+so the glyph is decorative (`aria-hidden="true"`) and the surfaces stay
+colour- and icon-independent.
+
+**Action-kind icons** — actions-list cards (form), read-only Definition tab,
+per-run action-results drawer:
+
+| Action kind        | Token                        | Glyph | Rationale |
+| ------------------ | ---------------------------- | ----- | --------- |
+| TS6 command        | `flow-icon-ts6-command`      | `»`   | A command sent *into* the server — the brief's chevron-into-server. |
+| Music-bot command  | `flow-icon-musicbot-command` | `♪`   | Reuses the **Music bots** nav glyph — recognition link between the action and the feature it drives (Jakob's Law). |
+| Webhook            | `flow-icon-webhook`          | `↗`   | An arrow leaving the manager — outbound HTTP. |
+| Log line           | `flow-icon-log-line`         | `≡`   | Reuses the **Logs** nav glyph — same recognition link. |
+
+**Run / action-status icons** — inside the `bot-badge` pill and the status
+dot-legend. The surface is already colour-independent via the text label; the
+glyph hardens that (WCAG 1.4.1) and, more usefully, disambiguates
+**Interrupted** from **Skipped**, which share the neutral colour today:
+
+| Status             | Token                          | Glyph |
+| ------------------ | ------------------------------ | ----- |
+| Running (InFlight) | `flow-icon-status-running`     | `⟳`   |
+| Ok                 | `flow-icon-status-ok`          | `✓`   |
+| Errored            | `flow-icon-status-errored`     | `✕`   |
+| Interrupted        | `flow-icon-status-interrupted` | `‖`   |
+| Skipped            | `flow-icon-status-skipped`     | `↷`   |
+
+Per-action status (`Ok`/`Errored`/`Skipped`) reuses the same three glyphs.
+
+**Editor remove control (L2-tail)** — `flow-icon-remove` → `×` (the existing
+glyph; PURA-248 already added the `aria-label`s). Folding it into the token set
+means the key/value and header `×` controls source one registry, not a bare
+string literal. The remove button needs a **≥24×24 px** hit target (Fitts's
+Law) regardless of glyph size.
+
+Glyphs are first-pass picks from the same misc-symbol range the sidebar already
+ships (`♪ ≡ ⊘ ⚙ ▶`); DioxusLead swaps any that render as tofu in the live font
+stack. Full helper signatures + CSS are in PURA-253.
 
 ## 8. Accessibility / i18n
 
