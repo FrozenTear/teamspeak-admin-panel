@@ -220,18 +220,19 @@ mod server_entry {
             })
         });
 
-        // PURA-242 — v1.1 flow engine + REST surface. The engine boots
-        // before the listener opens so the boot-time in-flight-run sweep
-        // and cron registration (PURA-241 engine §6.1) complete first.
-        // `BasicDispatcher` runs `logLine` actions for real and fails the
-        // other three action kinds loudly; wiring the production action
-        // dispatcher (`ts6Command` / `musicBotCommand` / `webhookOut`) is
-        // a tracked follow-up. The handle is bound `_flow_engine` so the
-        // `FlowEngine`'s cron + TTL tasks live for the whole serve scope
-        // and abort on shutdown via its `Drop`.
+        // PURA-242 / PURA-249 — v1.1 flow engine + REST surface. The
+        // engine boots before the listener opens so the boot-time
+        // in-flight-run sweep and cron registration (PURA-241 engine
+        // §6.1) complete first. PURA-249 swaps the `BasicDispatcher`
+        // stand-in for `ProductionDispatcher`: `ts6Command` lowers onto
+        // a typed `ControlBackend` call, `musicBotCommand` onto a
+        // `BotCommand`, `webhookOut` onto an SSRF-gated `reqwest` POST,
+        // and `logLine` keeps its behaviour. The handle is bound
+        // `_flow_engine` so the `FlowEngine`'s cron + TTL tasks live for
+        // the whole serve scope and abort on shutdown via its `Drop`.
         let _flow_engine = crate::flow::FlowEngine::start(crate::flow::EngineDeps::new(
             database.clone(),
-            std::sync::Arc::new(crate::flow::BasicDispatcher),
+            std::sync::Arc::new(crate::flow::dispatch::ProductionDispatcher::new(&state)),
         ))
         .await
         .context("flow engine boot")?;
