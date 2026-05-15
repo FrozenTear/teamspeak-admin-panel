@@ -54,6 +54,14 @@ COPY Cargo.loc[k] ./
 # built as `BundleFormat::Server`, so this code never type-checked for
 # wasm at all.
 COPY .cargo ./.cargo
+COPY scripts ./scripts
+
+# PURA-255 / docs/flows/v1.1-gate.md §5 — router-merge guard. The v0.1.0-rc1
+# image silently shipped without `/api/flows` because the flow router was
+# defined but never `.merge()`d into the axum app. This grep-fails the image
+# build before the expensive `dx bundle` step if `main.rs` ever loses the
+# `flows_router` mount, so a missing-router regression cannot ship again.
+RUN scripts/check-router.sh flows_router
 
 # Build both the wasm client and the patched native server binary in one pass.
 # Output layout (impl-plan §10) — written under the workspace target dir:
