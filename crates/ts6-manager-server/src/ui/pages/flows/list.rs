@@ -15,6 +15,7 @@ use crate::ui::components::toast::{ToastVariant, use_toaster};
 use crate::ui::components::{Banner, BannerVariant, Button, ButtonSize, ButtonVariant};
 use crate::ui::layout::use_servers_context;
 use crate::ui::pages::active_server;
+use crate::ui::pages::flows::dialog::{ConfirmDialog, DeletePrompt};
 use crate::ui::pages::flows::shared::{
     enabled_badge_class, enabled_label, format_error, is_run_in_flight_conflict, last_run_cell,
     trigger_summary,
@@ -119,42 +120,60 @@ pub fn FlowsListPage() -> Element {
         }
     };
 
-    let on_delete = {
+    // Delete is a two-stage, explicit-confirm flow (PURA-246 B1): a row
+    // click only opens the confirm dialog; the actual `delete_flow` call
+    // happens on dialog-confirm, and a `run_in_flight` 409 re-prompts with
+    // an explicit force choice rather than silently escalating.
+    let delete_prompt: Signal<DeletePrompt> = use_signal(|| DeletePrompt::Closed);
+    let deleting: Signal<bool> = use_signal(|| false);
+
+    let on_confirm_delete = {
         let gate = gate.clone();
         let mut bump = bump;
-        move |flow: wire::FlowId| {
+        move |_| {
+            let mut delete_prompt = delete_prompt;
+            let mut deleting = deleting;
+            let (flow, force) = match *delete_prompt.read() {
+                DeletePrompt::Confirm(id) => (id, false),
+                DeletePrompt::Force(id) => (id, true),
+                DeletePrompt::Closed => return,
+            };
             let gate = gate.clone();
             spawn(async move {
-                match fl::delete_flow(gate.clone(), flow, false).await {
+                deleting.set(true);
+                let result = fl::delete_flow(gate, flow, force).await;
+                deleting.set(false);
+                match result {
                     Ok(()) => {
-                        toaster.push(ToastVariant::Success, "Deleted flow", None);
+                        if force {
+                            toaster.push(
+                                ToastVariant::Warning,
+                                "Force-deleted flow",
+                                Some("Interrupted the in-flight run.".into()),
+                            );
+                        } else {
+                            toaster.push(ToastVariant::Success, "Deleted flow", None);
+                        }
+                        delete_prompt.set(DeletePrompt::Closed);
                         bump();
                     }
-                    Err(e) if is_run_in_flight_conflict(&e) => {
-                        // Match the brief §3.1 dialog copy — operator
-                        // double-confirms via a danger toast that fires
-                        // the force-delete branch.
-                        match fl::delete_flow(gate, flow, true).await {
-                            Ok(()) => {
-                                toaster.push(
-                                    ToastVariant::Warning,
-                                    "Force-deleted flow",
-                                    Some("Interrupted in-flight run.".into()),
-                                );
-                                bump();
-                            }
-                            Err(e2) => toaster.push(
-                                ToastVariant::Danger,
-                                "Force delete failed",
-                                Some(format_error(&e2)),
-                            ),
-                        }
+                    // 409 on a non-force delete → escalate to an explicit
+                    // force-delete prompt; the operator decides.
+                    Err(e) if !force && is_run_in_flight_conflict(&e) => {
+                        delete_prompt.set(DeletePrompt::Force(flow));
                     }
-                    Err(e) => toaster.push(
-                        ToastVariant::Danger,
-                        "Delete failed",
-                        Some(format_error(&e)),
-                    ),
+                    Err(e) => {
+                        toaster.push(
+                            ToastVariant::Danger,
+                            if force {
+                                "Force delete failed"
+                            } else {
+                                "Delete failed"
+                            },
+                            Some(format_error(&e)),
+                        );
+                        delete_prompt.set(DeletePrompt::Closed);
+                    }
                 }
             });
         }
@@ -203,7 +222,7 @@ pub fn FlowsListPage() -> Element {
                 }
             } else if rows.read().is_empty() {
                 div { class: "empty",
-                    div { class: "icon", "⚡" }
+                    div { class: "icon", aria_hidden: "true", "⚡" }
                     h3 { "No flows yet" }
                     p {
                         "Flows let you trigger an action when something happens — for example, send a welcome message when a client joins."
@@ -227,9 +246,9 @@ pub fn FlowsListPage() -> Element {
                         let on_toggle = on_toggle_enabled.clone();
                         move |(id, en): (wire::FlowId, bool)| on_toggle(id, en)
                     }),
-                    on_delete: EventHandler::new({
-                        let on_delete = on_delete.clone();
-                        move |id: wire::FlowId| on_delete(id)
+                    on_delete: EventHandler::new(move |id: wire::FlowId| {
+                        let mut delete_prompt = delete_prompt;
+                        delete_prompt.set(DeletePrompt::Confirm(id));
                     }),
                 }
             }
@@ -237,6 +256,38 @@ pub fn FlowsListPage() -> Element {
 
         footer { class: "muted",
             p { "{footer_copy}" }
+        }
+
+        if delete_prompt.read().is_open() {
+            {
+                let is_force = delete_prompt.read().is_force();
+                let on_confirm = on_confirm_delete.clone();
+                rsx! {
+                    ConfirmDialog {
+                        title: if is_force {
+                            "A run is in flight".to_string()
+                        } else {
+                            "Delete this flow?".to_string()
+                        },
+                        message: if is_force {
+                            "This flow has a run in progress. Force-deleting will interrupt the running flow and remove its run history. This cannot be undone.".to_string()
+                        } else {
+                            "Run history will be removed. This cannot be undone.".to_string()
+                        },
+                        confirm_label: if is_force {
+                            "Force delete".to_string()
+                        } else {
+                            "Delete".to_string()
+                        },
+                        busy: *deleting.read(),
+                        on_confirm: move |_| on_confirm(()),
+                        on_cancel: move |_| {
+                            let mut delete_prompt = delete_prompt;
+                            delete_prompt.set(DeletePrompt::Closed);
+                        },
+                    }
+                }
+            }
         }
     }
 }

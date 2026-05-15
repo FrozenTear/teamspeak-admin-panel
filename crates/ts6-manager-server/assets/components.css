@@ -212,6 +212,29 @@
 .tag-warning { background: rgba(224, 169, 59, 0.14); color: var(--warning-fg); }
 .tag-danger  { background: rgba(230, 76, 95, 0.14); color: var(--danger-fg); }
 
+/* ─── Status badge (bot-badge) ─────────────────────────
+   Status pill shared by the music-bot, video-source and flow pages.
+   PROVISIONAL (PURA-246 B2): the `bot-badge` family was referenced by
+   those pages but absent from this stylesheet, so the badges rendered
+   unstyled. These rules mirror the approved `.tag` token values 1:1
+   under the brief-mandated `bot-badge` selector. UXDesigner owns the
+   final run-status token spec — see PURA-246. */
+.bot-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-3);
+  height: 22px;
+  padding: 0 var(--space-4);
+  border-radius: var(--radius-full);
+  font: var(--weight-medium) var(--text-xs) / 1 var(--font-sans);
+  white-space: nowrap;
+}
+.bot-badge--play    { background: rgba(46, 184, 114, 0.14); color: var(--success-fg); }
+.bot-badge--idle    { background: rgba(46, 184, 114, 0.14); color: var(--success-fg); }
+.bot-badge--pending { background: rgba(224, 169, 59, 0.14); color: var(--warning-fg); }
+.bot-badge--off     { background: rgba(94, 106, 130, 0.20); color: var(--text-secondary); }
+.bot-badge--error   { background: rgba(230, 76, 95, 0.14); color: var(--danger-fg); }
+
 /* ─── Skeleton ───────────────────────────────────────── */
 .skeleton {
   background: linear-gradient(90deg,

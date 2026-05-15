@@ -24,11 +24,17 @@ pub fn enabled_label(enabled: bool) -> &'static str {
 
 /// Map a [`wire::FlowRunStatus`] to a pill class. The dot legend on the
 /// detail page renders the same vocabulary.
+///
+/// PURA-246 B2 — colour must not collapse a *failure* (`Errored`) into the
+/// same neutral bucket as the two benign terminal outcomes. The Runs tab
+/// exists to answer "did it work?", so `Errored` carries a distinct danger
+/// token; `Interrupted`/`SkippedDisabled` stay neutral. Text labels (see
+/// [`run_status_label`]) keep the surface colour-independent.
 pub fn run_status_badge_class(status: wire::FlowRunStatus) -> &'static str {
     match status {
         wire::FlowRunStatus::InFlight => "bot-badge bot-badge--pending",
         wire::FlowRunStatus::Ok => "bot-badge bot-badge--play",
-        wire::FlowRunStatus::Errored => "bot-badge bot-badge--off",
+        wire::FlowRunStatus::Errored => "bot-badge bot-badge--error",
         wire::FlowRunStatus::Interrupted => "bot-badge bot-badge--off",
         wire::FlowRunStatus::SkippedDisabled => "bot-badge bot-badge--off",
     }

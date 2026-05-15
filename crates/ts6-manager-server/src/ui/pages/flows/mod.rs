@@ -14,6 +14,7 @@
 //! introduced (matches the `music_bots` family from PURA-124 WS-6).
 
 mod detail;
+mod dialog;
 mod form;
 mod list;
 mod shared;

@@ -13,6 +13,7 @@ use crate::client::flows as fl;
 use crate::client::store::AuthState;
 use crate::ui::components::toast::{ToastVariant, use_toaster};
 use crate::ui::components::{Banner, BannerVariant, Button, ButtonSize, ButtonVariant};
+use crate::ui::pages::flows::dialog::{ConfirmDialog, DeletePrompt};
 use crate::ui::pages::flows::shared::{
     action_kind_label, enabled_badge_class, enabled_label, format_error, is_run_in_flight_conflict,
     relative_when, run_status_badge_class, run_status_hint, run_status_label, trigger_summary,
@@ -165,39 +166,57 @@ pub fn FlowDetailPage(flow_id: i64) -> Element {
         }
     };
 
-    let on_delete = {
+    // Delete is a two-stage, explicit-confirm flow (PURA-246 B1): the
+    // header button only opens the confirm dialog; a `run_in_flight` 409
+    // re-prompts with an explicit force choice rather than auto-escalating.
+    let delete_prompt: Signal<DeletePrompt> = use_signal(|| DeletePrompt::Closed);
+    let deleting: Signal<bool> = use_signal(|| false);
+
+    let on_confirm_delete = {
         let gate = gate.clone();
         let nav = use_navigator();
         move |_| {
+            let mut delete_prompt = delete_prompt;
+            let mut deleting = deleting;
+            let force = match *delete_prompt.read() {
+                DeletePrompt::Confirm(_) => false,
+                DeletePrompt::Force(_) => true,
+                DeletePrompt::Closed => return,
+            };
             let gate = gate.clone();
             spawn(async move {
-                match fl::delete_flow(gate.clone(), flow, false).await {
+                deleting.set(true);
+                let result = fl::delete_flow(gate, flow, force).await;
+                deleting.set(false);
+                match result {
                     Ok(()) => {
-                        toaster.push(ToastVariant::Success, "Deleted flow", None);
+                        if force {
+                            toaster.push(
+                                ToastVariant::Warning,
+                                "Force-deleted flow",
+                                Some("Interrupted the in-flight run.".into()),
+                            );
+                        } else {
+                            toaster.push(ToastVariant::Success, "Deleted flow", None);
+                        }
+                        delete_prompt.set(DeletePrompt::Closed);
                         nav.push(Route::FlowsListPage {});
                     }
-                    Err(e) if is_run_in_flight_conflict(&e) => {
-                        match fl::delete_flow(gate, flow, true).await {
-                            Ok(()) => {
-                                toaster.push(
-                                    ToastVariant::Warning,
-                                    "Force-deleted flow",
-                                    Some("Interrupted in-flight run.".into()),
-                                );
-                                nav.push(Route::FlowsListPage {});
-                            }
-                            Err(e2) => toaster.push(
-                                ToastVariant::Danger,
-                                "Force delete failed",
-                                Some(format_error(&e2)),
-                            ),
-                        }
+                    Err(e) if !force && is_run_in_flight_conflict(&e) => {
+                        delete_prompt.set(DeletePrompt::Force(flow));
                     }
-                    Err(e) => toaster.push(
-                        ToastVariant::Danger,
-                        "Delete failed",
-                        Some(format_error(&e)),
-                    ),
+                    Err(e) => {
+                        toaster.push(
+                            ToastVariant::Danger,
+                            if force {
+                                "Force delete failed"
+                            } else {
+                                "Delete failed"
+                            },
+                            Some(format_error(&e)),
+                        );
+                        delete_prompt.set(DeletePrompt::Closed);
+                    }
                 }
             });
         }
@@ -237,9 +256,9 @@ pub fn FlowDetailPage(flow_id: i64) -> Element {
                     let on_toggle = on_toggle_enabled.clone();
                     move |en: bool| on_toggle(en)
                 }),
-                on_delete: EventHandler::new({
-                    let on_delete = on_delete.clone();
-                    move |_| on_delete(())
+                on_delete: EventHandler::new(move |_| {
+                    let mut delete_prompt = delete_prompt;
+                    delete_prompt.set(DeletePrompt::Confirm(flow));
                 }),
             }
 
@@ -281,6 +300,38 @@ pub fn FlowDetailPage(flow_id: i64) -> Element {
                 }
             } else {
                 DefinitionPanel { flow: f }
+            }
+        }
+
+        if delete_prompt.read().is_open() {
+            {
+                let is_force = delete_prompt.read().is_force();
+                let on_confirm = on_confirm_delete.clone();
+                rsx! {
+                    ConfirmDialog {
+                        title: if is_force {
+                            "A run is in flight".to_string()
+                        } else {
+                            "Delete this flow?".to_string()
+                        },
+                        message: if is_force {
+                            "This flow has a run in progress. Force-deleting will interrupt the running flow and remove its run history. This cannot be undone.".to_string()
+                        } else {
+                            "Run history will be removed. This cannot be undone.".to_string()
+                        },
+                        confirm_label: if is_force {
+                            "Force delete".to_string()
+                        } else {
+                            "Delete".to_string()
+                        },
+                        busy: *deleting.read(),
+                        on_confirm: move |_| on_confirm(()),
+                        on_cancel: move |_| {
+                            let mut delete_prompt = delete_prompt;
+                            delete_prompt.set(DeletePrompt::Closed);
+                        },
+                    }
+                }
             }
         }
     }
@@ -370,7 +421,7 @@ fn RunsPanel(props: RunsPanelProps) -> Element {
             }
             if runs.is_empty() && !loading {
                 div { class: "empty",
-                    div { class: "icon", "↻" }
+                    div { class: "icon", aria_hidden: "true", "↻" }
                     h3 { "No runs yet" }
                     p { "Hit ", strong { "Fire" }, " to make the engine run this flow on demand." }
                 }
