@@ -16,6 +16,7 @@ use surrealdb::types::{RecordId, RecordIdKey};
 pub mod app_settings;
 pub mod bot_execution_logs;
 pub mod bot_executions;
+pub mod bot_flow_runs;
 pub mod bot_flows;
 pub mod bot_variables;
 pub mod music_bots;

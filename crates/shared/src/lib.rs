@@ -13,6 +13,7 @@
 pub mod auth;
 pub mod control;
 pub mod dashboard;
+pub mod flows;
 pub mod health;
 pub mod music_bots;
 pub mod servers;
