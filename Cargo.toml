@@ -119,6 +119,17 @@ web-sys = { version = "0.3", features = [
     "Performance",
     "AudioSampleFormat",
     "Url",
+    # PURA-224 — file picker + multipart upload for the YouTube cookie
+    # settings surface. `HtmlInputElement` reads the file list off the
+    # operator's `<input type=file>`, `FormData` builds the multipart body
+    # the backend expects (`PUT /api/settings/youtube-cookies`, field
+    # `file`), `File`/`Blob` are the value types FormData carries, and
+    # `FileList` is what the input element hands back.
+    "Blob",
+    "File",
+    "FileList",
+    "FormData",
+    "HtmlInputElement",
 ] }
 urlencoding = "2"
 

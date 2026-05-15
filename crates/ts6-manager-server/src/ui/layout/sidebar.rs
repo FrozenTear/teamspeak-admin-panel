@@ -120,6 +120,7 @@ pub fn Sidebar(props: SidebarProps) -> Element {
     let logs_active = matches!(props.active, Route::LogsPage {});
     let widgets_active = matches!(props.active, Route::WidgetsPage {});
     let video_sources_active = matches!(props.active, Route::VideoSourcesPage {});
+    let settings_active = matches!(props.active, Route::SettingsPage {});
     // PURA-124 WS-6 — Music bots highlight when the route is the index
     // OR any of the per-bot detail / library / playlists / radio
     // surfaces, so the operator stays oriented across the whole flow.
@@ -174,7 +175,7 @@ pub fn Sidebar(props: SidebarProps) -> Element {
                 NavGroup { label: "Admin",
                     NavItem { icon: "≡", label: "Logs", to: Route::LogsPage {}, active: logs_active }
                     PlaceholderItem { icon: "◯", label: "Instance" }
-                    PlaceholderItem { icon: "⚙", label: "Settings" }
+                    NavItem { icon: "⚙", label: "Settings", to: Route::SettingsPage {}, active: settings_active }
                 }
             }
         }
@@ -342,22 +343,23 @@ mod tests {
     fn placeholder_items_carry_aria_disabled_and_tabindex_minus_one() {
         let html = render_sidebar_harness();
         // PURA-124 WS-6 has converted "Music bots" into a real nav item.
+        // PURA-224 has converted "Settings" into a real nav item.
         // Remaining placeholders: 1 × Server (Files), 6 × Moderation
         // (Server groups, Channel groups, Permissions, Tokens,
-        // Complaints, Messages), 1 × Automation (Bots), 2 × Admin
-        // (Instance, Settings) = 10. The count is the authoritative
-        // signal here — adding/removing a real route should bump it.
+        // Complaints, Messages), 1 × Automation (Bots), 1 × Admin
+        // (Instance) = 9. The count is the authoritative signal here —
+        // adding/removing a real route should bump it.
         let disabled = html.matches(r#"aria-disabled="true""#).count();
         let tabindex_minus = html.matches(r#"tabindex="-1""#).count();
-        // 10 placeholders + the `<nav>` itself carries `tabindex=-1` for
-        // the skip-link target, so 11 total `tabindex="-1"` attributes.
+        // 9 placeholders + the `<nav>` itself carries `tabindex=-1` for
+        // the skip-link target, so 10 total `tabindex="-1"` attributes.
         assert_eq!(
-            disabled, 10,
-            "expected 10 aria-disabled placeholders, got {disabled}"
+            disabled, 9,
+            "expected 9 aria-disabled placeholders, got {disabled}"
         );
         assert_eq!(
-            tabindex_minus, 11,
-            "expected 11 tabindex='-1' (10 placeholders + nav landmark), got {tabindex_minus}"
+            tabindex_minus, 10,
+            "expected 10 tabindex='-1' (9 placeholders + nav landmark), got {tabindex_minus}"
         );
     }
 }

@@ -22,7 +22,8 @@ use crate::ui::pages::DevVideoPlayerPage;
 use crate::ui::pages::{
     BansPage, BotDetailPage, BotsIndexPage, ChannelsPage, ClientsPage, DashboardPlaceholder, Home,
     LoginPage, LogsPage, MusicLibraryPage, MusicPlaylistsPage, NotFoundPage, PublicWidgetPage,
-    RadioStationsPage, ServerInfoPage, ServersIndexPage, SetupPage, VideoSourcesPage, WidgetsPage,
+    RadioStationsPage, ServerInfoPage, ServersIndexPage, SettingsPage, SetupPage,
+    VideoSourcesPage, WidgetsPage,
 };
 
 #[rustfmt::skip]
@@ -105,6 +106,12 @@ pub enum Route {
     // instead of falling through to `NotFoundPage`.
     #[route("/servers")]
     ServersIndexPage {},
+
+    // PURA-224 — admin settings surface. First section is YouTube cookie
+    // upload (PURA-223 backend); future sections live alongside it under
+    // the same `/settings` route.
+    #[route("/settings")]
+    SettingsPage {},
 
     // PURA-213 — catch-all NotFound. Lives outside `AppShell` so the page
     // renders for both authed and anon visitors without an auth bounce

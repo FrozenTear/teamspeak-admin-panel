@@ -31,6 +31,7 @@ pub mod auth;
 pub mod dioxus;
 pub mod music_bots;
 pub mod session;
+pub mod settings;
 pub mod setup;
 pub mod storage;
 pub mod store;
