@@ -15,8 +15,10 @@ use crate::ui::components::toast::{ToastVariant, use_toaster};
 use crate::ui::components::{Banner, BannerVariant, Button, ButtonSize, ButtonVariant};
 use crate::ui::pages::flows::dialog::{ConfirmDialog, DeletePrompt};
 use crate::ui::pages::flows::shared::{
-    action_kind_label, enabled_badge_class, enabled_label, format_error, is_run_in_flight_conflict,
-    relative_when, run_status_badge_class, run_status_hint, run_status_label, trigger_summary,
+    ADMIN_ONLY_HINT, action_kind_label, action_status_badge_class, action_status_label,
+    action_wire_kind_label, admin_only_title, enabled_badge_class, enabled_label, format_error,
+    is_run_in_flight_conflict, relative_when, run_status_badge_class, run_status_hint,
+    run_status_label, trigger_summary,
 };
 use crate::ui::routes::Route;
 
@@ -35,6 +37,16 @@ pub fn FlowDetailPage(flow_id: i64) -> Element {
     let flow = wire::FlowId(flow_id);
     let gate = use_auth_gate();
     let toaster = use_toaster();
+
+    // PURA-248 M5 — the role rides in the session blob client-side, so the
+    // write affordances can be suppressed up front rather than waiting for
+    // a 403. The route layer remains the real enforcement point.
+    let is_admin = session
+        .state
+        .read()
+        .user()
+        .map(|u| u.role.eq_ignore_ascii_case("admin"))
+        .unwrap_or(false);
 
     let mut detail: Signal<Option<wire::Flow>> = use_signal(|| None);
     let mut detail_error: Signal<Option<ApiError>> = use_signal(|| None::<ApiError>);
@@ -248,6 +260,7 @@ pub fn FlowDetailPage(flow_id: i64) -> Element {
         } else if let Some(f) = snap {
             FlowHeader {
                 flow: f.clone(),
+                is_admin,
                 on_fire: EventHandler::new({
                     let on_fire = on_fire.clone();
                     move |_| on_fire(())
@@ -262,23 +275,56 @@ pub fn FlowDetailPage(flow_id: i64) -> Element {
                 }),
             }
 
-            // Tab bar.
-            div { class: "tabs", role: "tablist",
-                button {
-                    r#type: "button",
-                    role: "tab",
-                    class: if *tab.read() == DetailTab::Runs { "tab is-active" } else { "tab" },
-                    "aria-selected": if *tab.read() == DetailTab::Runs { "true" } else { "false" },
-                    onclick: move |_| tab.set(DetailTab::Runs),
-                    "Runs"
-                }
-                button {
-                    r#type: "button",
-                    role: "tab",
-                    class: if *tab.read() == DetailTab::Definition { "tab is-active" } else { "tab" },
-                    "aria-selected": if *tab.read() == DetailTab::Definition { "true" } else { "false" },
-                    onclick: move |_| tab.set(DetailTab::Definition),
-                    "Definition"
+            // Tab bar — APG tabs pattern (PURA-248 M6): roving tabindex,
+            // arrow/Home/End navigation, and each tab `aria-controls` its
+            // panel. The panels carry the matching `id` + `aria-labelledby`.
+            {
+                let runs_active = *tab.read() == DetailTab::Runs;
+                let on_tab_keydown = move |evt: KeyboardEvent| {
+                    let next = match evt.key() {
+                        Key::ArrowRight | Key::ArrowDown => Some(DetailTab::Definition),
+                        Key::ArrowLeft | Key::ArrowUp => Some(DetailTab::Runs),
+                        Key::Home => Some(DetailTab::Runs),
+                        Key::End => Some(DetailTab::Definition),
+                        _ => None,
+                    };
+                    if let Some(t) = next {
+                        evt.prevent_default();
+                        tab.set(t);
+                        #[cfg(target_arch = "wasm32")]
+                        focus_element(match t {
+                            DetailTab::Runs => "flow-tab-runs",
+                            DetailTab::Definition => "flow-tab-definition",
+                        });
+                    }
+                };
+                rsx! {
+                    div { class: "tabs", role: "tablist", "aria-label": "Flow detail sections",
+                        button {
+                            r#type: "button",
+                            role: "tab",
+                            id: "flow-tab-runs",
+                            class: if runs_active { "tab is-active" } else { "tab" },
+                            "aria-selected": if runs_active { "true" } else { "false" },
+                            "aria-controls": "flow-panel-runs",
+                            tabindex: if runs_active { "0" } else { "-1" },
+                            onclick: move |_| tab.set(DetailTab::Runs),
+                            onkeydown: on_tab_keydown,
+                            "Runs"
+                        }
+                        button {
+                            r#type: "button",
+                            role: "tab",
+                            id: "flow-tab-definition",
+                            class: if !runs_active { "tab is-active" } else { "tab" },
+                            "aria-selected": if !runs_active { "true" } else { "false" },
+                            "aria-controls": "flow-panel-definition",
+                            tabindex: if !runs_active { "0" } else { "-1" },
+                            onclick: move |_| tab.set(DetailTab::Definition),
+                            onkeydown: on_tab_keydown,
+                            "Definition"
+                        }
+                    }
                 }
             }
 
@@ -299,7 +345,7 @@ pub fn FlowDetailPage(flow_id: i64) -> Element {
                     }),
                 }
             } else {
-                DefinitionPanel { flow: f }
+                DefinitionPanel { flow: f, is_admin }
             }
         }
 
@@ -340,6 +386,7 @@ pub fn FlowDetailPage(flow_id: i64) -> Element {
 #[derive(Props, Clone, PartialEq)]
 struct FlowHeaderProps {
     flow: wire::Flow,
+    is_admin: bool,
     on_fire: EventHandler<()>,
     on_toggle_enabled: EventHandler<bool>,
     on_delete: EventHandler<()>,
@@ -348,6 +395,7 @@ struct FlowHeaderProps {
 #[component]
 fn FlowHeader(props: FlowHeaderProps) -> Element {
     let f = props.flow.clone();
+    let is_admin = props.is_admin;
     let on_fire = props.on_fire;
     let on_toggle = props.on_toggle_enabled;
     let on_delete = props.on_delete;
@@ -367,25 +415,43 @@ fn FlowHeader(props: FlowHeaderProps) -> Element {
                 if let Some(d) = f.description.as_deref().filter(|s| !s.is_empty()) {
                     p { class: "muted", "{d}" }
                 }
+                if !is_admin {
+                    p { class: "muted", "Read-only access — firing, editing and deleting flows is admin-only." }
+                }
             }
             div { class: "page-actions",
                 Button {
                     variant: ButtonVariant::Primary,
+                    disabled: !is_admin,
+                    title: admin_only_title(is_admin),
                     onclick: move |_| on_fire.call(()),
                     "Fire"
                 }
                 Button {
                     variant: ButtonVariant::Secondary,
+                    disabled: !is_admin,
+                    title: admin_only_title(is_admin),
                     onclick: move |_| on_toggle.call(enabled),
                     if enabled { "Disable" } else { "Enable" }
                 }
-                Link {
-                    to: edit_route,
-                    class: "btn btn-ghost",
-                    "Edit"
+                if is_admin {
+                    Link {
+                        to: edit_route,
+                        class: "btn btn-ghost",
+                        "Edit"
+                    }
+                } else {
+                    Button {
+                        variant: ButtonVariant::Ghost,
+                        disabled: true,
+                        title: Some(ADMIN_ONLY_HINT.to_string()),
+                        "Edit"
+                    }
                 }
                 Button {
                     variant: ButtonVariant::Danger,
+                    disabled: !is_admin,
+                    title: admin_only_title(is_admin),
                     onclick: move |_| on_delete.call(()),
                     "Delete"
                 }
@@ -412,8 +478,17 @@ fn RunsPanel(props: RunsPanelProps) -> Element {
     let has_more = props.has_more;
     let on_refresh = props.on_refresh;
     let on_load_more = props.on_load_more;
+
+    // PURA-248 H1 — the run whose per-action `actionResults[]` breakdown is
+    // shown in the slide-out drawer. `None` keeps the drawer closed.
+    let mut selected_run: Signal<Option<wire::FlowRun>> = use_signal(|| None);
+
     rsx! {
-        section { role: "tabpanel", class: "stack-md",
+        section {
+            role: "tabpanel",
+            id: "flow-panel-runs",
+            "aria-labelledby": "flow-tab-runs",
+            class: "stack-md",
             if let Some(e) = err.as_ref() {
                 Banner { variant: BannerVariant::Danger, title: "Could not load runs".to_string(),
                     "{format_error(e)}"
@@ -435,12 +510,14 @@ fn RunsPanel(props: RunsPanelProps) -> Element {
                             th { scope: "col", "Status" }
                             th { scope: "col", "Duration" }
                             th { scope: "col", "Error" }
+                            th { scope: "col", class: "actions-col", "Details" }
                         }
                     }
                     tbody {
                         for r in runs.iter() {
                             {
                                 let r = r.clone();
+                                let row_run = r.clone();
                                 let when = relative_when(r.summary.started_at);
                                 let trig_kind = r
                                     .trigger
@@ -455,8 +532,10 @@ fn RunsPanel(props: RunsPanelProps) -> Element {
                                     .unwrap_or_else(|| "—".into());
                                 let err = r.error.clone().unwrap_or_else(|| "—".into());
                                 let hint = run_status_hint(r.summary.status);
+                                let run_id = r.summary.id.0;
+                                let action_count = r.action_results.len();
                                 rsx! {
-                                    tr { key: "{r.summary.id.0}",
+                                    tr { key: "{run_id}",
                                         td { "{when}" }
                                         td { "{trig_kind}" }
                                         td {
@@ -467,6 +546,15 @@ fn RunsPanel(props: RunsPanelProps) -> Element {
                                         }
                                         td { "{dur}" }
                                         td { class: "muted", "{err}" }
+                                        td { class: "actions-col",
+                                            Button {
+                                                variant: ButtonVariant::Ghost,
+                                                size: ButtonSize::Small,
+                                                aria_label: Some(format!("View action results for run #{run_id}")),
+                                                onclick: move |_| selected_run.set(Some(row_run.clone())),
+                                                {format!("View ({action_count})")}
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -491,6 +579,171 @@ fn RunsPanel(props: RunsPanelProps) -> Element {
                     }
                 }
             }
+            RunStatusLegend {}
+        }
+        if let Some(run) = selected_run.read().clone() {
+            RunDrawer {
+                run,
+                on_close: EventHandler::new(move |_| selected_run.set(None)),
+            }
+        }
+    }
+}
+
+/// PURA-248 L7 + M8 — a collapsible legend for the run-status pills. The
+/// `skipped_disabled` explainer (M8) used to live only in a `title=`
+/// attribute on the pill, which is unreachable by keyboard and touch;
+/// folding it into the `<details>` legend makes it reachable for everyone.
+#[component]
+fn RunStatusLegend() -> Element {
+    let entries: [(wire::FlowRunStatus, &str); 5] = [
+        (
+            wire::FlowRunStatus::Ok,
+            "Every action in the flow completed without an error.",
+        ),
+        (
+            wire::FlowRunStatus::Errored,
+            "At least one action failed — open the run to see which one.",
+        ),
+        (wire::FlowRunStatus::InFlight, "The run is still executing."),
+        (
+            wire::FlowRunStatus::Interrupted,
+            "The run was cut short — usually a force-delete or a manager restart.",
+        ),
+        (
+            wire::FlowRunStatus::SkippedDisabled,
+            run_status_hint(wire::FlowRunStatus::SkippedDisabled).unwrap_or(""),
+        ),
+    ];
+    rsx! {
+        details { class: "disclosure",
+            summary { "What do the run statuses mean?" }
+            ul { class: "stack-sm legend",
+                for (status, copy) in entries {
+                    li { key: "{run_status_label(status)}", class: "legend-row",
+                        span { class: run_status_badge_class(status),
+                            "{run_status_label(status)}"
+                        }
+                        span { class: "muted", "{copy}" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Props, Clone, PartialEq)]
+struct RunDrawerProps {
+    run: wire::FlowRun,
+    on_close: EventHandler<()>,
+}
+
+/// PURA-248 H1 — slide-out panel with one row per planned action of a
+/// single run (`kind` / `status` / `durationMs` / `error`), per
+/// `ui-brief.md` §3.3. Built on the shared `.drawer` primitive; Escape and
+/// backdrop-click dismiss it, mirroring `flows::dialog::ConfirmDialog`.
+#[component]
+fn RunDrawer(props: RunDrawerProps) -> Element {
+    let run = props.run.clone();
+    let on_close = props.on_close;
+    let summary = run.summary.clone();
+    let when = relative_when(summary.started_at);
+    let dur = summary
+        .duration_ms
+        .map(|d| format!("{d} ms"))
+        .unwrap_or_else(|| "—".into());
+    let trig_kind = run
+        .trigger
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?")
+        .to_string();
+    let run_error = run.error.clone();
+    let results = run.action_results.clone();
+    rsx! {
+        div {
+            class: "drawer-backdrop",
+            onclick: move |_| on_close.call(()),
+            onkeydown: move |evt| {
+                if evt.key() == Key::Escape {
+                    evt.prevent_default();
+                    on_close.call(());
+                }
+            },
+            div {
+                class: "drawer",
+                role: "dialog",
+                "aria-modal": "true",
+                "aria-labelledby": "flow-run-drawer-title",
+                onclick: move |evt| evt.stop_propagation(),
+                div { class: "drawer-header",
+                    h2 { id: "flow-run-drawer-title", "Run #{summary.id.0}" }
+                    button {
+                        r#type: "button",
+                        class: "btn btn-ghost btn-sm",
+                        "aria-label": "Close run details",
+                        autofocus: true,
+                        onclick: move |_| on_close.call(()),
+                        "×"
+                    }
+                }
+                div { class: "drawer-body stack-md",
+                    div { class: "stack-sm",
+                        p {
+                            span { class: run_status_badge_class(summary.status),
+                                "{run_status_label(summary.status)}"
+                            }
+                        }
+                        p { class: "muted", "Started ", "{when}", " · trigger ", code { "{trig_kind}" }, " · {dur}" }
+                        if let Some(e) = run_error.as_ref() {
+                            Banner { variant: BannerVariant::Danger, title: "Run error".to_string(),
+                                "{e}"
+                            }
+                        }
+                    }
+                    section { class: "stack-sm",
+                        h3 { "Action results" }
+                        if results.is_empty() {
+                            p { class: "muted",
+                                "No action results were recorded for this run — it ended before any action ran."
+                            }
+                        } else {
+                            table { class: "data-table", "aria-label": "Action results",
+                                thead {
+                                    tr {
+                                        th { scope: "col", "#" }
+                                        th { scope: "col", "Action" }
+                                        th { scope: "col", "Status" }
+                                        th { scope: "col", "Duration" }
+                                        th { scope: "col", "Error" }
+                                    }
+                                }
+                                tbody {
+                                    for ar in results.iter() {
+                                        {
+                                            let ar = ar.clone();
+                                            let ar_err = ar.error.clone().unwrap_or_else(|| "—".into());
+                                            rsx! {
+                                                tr { key: "{ar.index}",
+                                                    td { "{ar.index + 1}" }
+                                                    td { "{action_wire_kind_label(&ar.kind)}" }
+                                                    td {
+                                                        span { class: action_status_badge_class(ar.status),
+                                                            "{action_status_label(ar.status)}"
+                                                        }
+                                                    }
+                                                    td { "{ar.duration_ms} ms" }
+                                                    td { class: "muted", "{ar_err}" }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -498,14 +751,20 @@ fn RunsPanel(props: RunsPanelProps) -> Element {
 #[derive(Props, Clone, PartialEq)]
 struct DefinitionPanelProps {
     flow: wire::Flow,
+    is_admin: bool,
 }
 
 #[component]
 fn DefinitionPanel(props: DefinitionPanelProps) -> Element {
     let f = props.flow.clone();
+    let is_admin = props.is_admin;
     let definition_locked = f.enabled;
     rsx! {
-        section { role: "tabpanel", class: "stack-md",
+        section {
+            role: "tabpanel",
+            id: "flow-panel-definition",
+            "aria-labelledby": "flow-tab-definition",
+            class: "stack-md",
             article { class: "card",
                 h2 { "Trigger" }
                 p { "{trigger_summary(&f.definition.trigger)}" }
@@ -526,14 +785,22 @@ fn DefinitionPanel(props: DefinitionPanelProps) -> Element {
                 }
             }
             div { class: "actions",
-                if definition_locked {
+                // PURA-248 M5 — a read-only operator never reaches the edit
+                // form; the disabled control plus `title` says why up front.
+                if !is_admin {
                     Button {
                         variant: ButtonVariant::Secondary,
                         disabled: true,
-                        // The brief asks for the disabled hover tooltip
-                        // — `title` is the cheapest way to surface it
-                        // without pulling in a tooltip primitive.
-                        onclick: move |_| (),
+                        title: Some(ADMIN_ONLY_HINT.to_string()),
+                        "Edit definition"
+                    }
+                } else if definition_locked {
+                    Button {
+                        variant: ButtonVariant::Secondary,
+                        disabled: true,
+                        title: Some(
+                            "Disable the flow first — an enabled flow's definition is locked.".to_string(),
+                        ),
                         "Edit definition (disable first)"
                     }
                 } else {
@@ -590,5 +857,21 @@ fn ActionSummary(props: ActionSummaryProps) -> Element {
         wire::Action::LogLine { message } => rsx! {
             p { class: "muted", "message: ", code { "{message}" } }
         },
+    }
+}
+
+/// Move DOM focus to an element by id — used by the tab keyboard handler
+/// (PURA-248 M6) to keep focus on the active tab after arrow-key
+/// navigation. Mirrors the helper in `components/dropdown.rs`.
+#[cfg(target_arch = "wasm32")]
+fn focus_element(id: &str) {
+    use wasm_bindgen::JsCast;
+    if let Some(elem) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id(id))
+    {
+        if let Some(html) = elem.dyn_ref::<web_sys::HtmlElement>() {
+            let _ = html.focus();
+        }
     }
 }

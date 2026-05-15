@@ -17,8 +17,8 @@ use crate::ui::layout::use_servers_context;
 use crate::ui::pages::active_server;
 use crate::ui::pages::flows::dialog::{ConfirmDialog, DeletePrompt};
 use crate::ui::pages::flows::shared::{
-    enabled_badge_class, enabled_label, format_error, is_run_in_flight_conflict, last_run_cell,
-    trigger_summary,
+    ADMIN_ONLY_HINT, admin_only_title, enabled_badge_class, enabled_label, format_error,
+    is_run_in_flight_conflict, last_run_cell, trigger_summary,
 };
 use crate::ui::routes::Route;
 
@@ -33,6 +33,16 @@ pub fn FlowsListPage() -> Element {
     let toaster = use_toaster();
     let servers_ctx = use_servers_context();
     let server = active_server::resolve(&servers_ctx.data.read(), &*storage);
+
+    // PURA-248 M5 — role rides in the client-side session blob, so the
+    // write affordances are suppressed up front. The route layer remains
+    // the real enforcement point.
+    let is_admin = session
+        .state
+        .read()
+        .user()
+        .map(|u| u.role.eq_ignore_ascii_case("admin"))
+        .unwrap_or(false);
 
     let mut rows: Signal<Vec<wire::Flow>> = use_signal(Vec::new);
     let mut error: Signal<Option<ApiError>> = use_signal(|| None::<ApiError>);
@@ -199,10 +209,19 @@ pub fn FlowsListPage() -> Element {
                 }
             }
             div { class: "page-actions",
-                Link {
-                    to: Route::FlowFormPage {},
-                    class: "btn btn-primary",
-                    "+ New flow"
+                if is_admin {
+                    Link {
+                        to: Route::FlowFormPage {},
+                        class: "btn btn-primary",
+                        "+ New flow"
+                    }
+                } else {
+                    Button {
+                        variant: ButtonVariant::Primary,
+                        disabled: true,
+                        title: Some(ADMIN_ONLY_HINT.to_string()),
+                        "+ New flow"
+                    }
                 }
             }
         }
@@ -217,9 +236,9 @@ pub fn FlowsListPage() -> Element {
 
         section { class: "stack-md",
             if *loading.read() && rows.read().is_empty() {
-                div { class: "card", aria_busy: "true",
-                    p { class: "muted", "Loading flows…" }
-                }
+                // PURA-248 L3 — table-row skeletons hold the table's shape
+                // while flows load, instead of a layout-shifting text card.
+                FlowsTableSkeleton {}
             } else if rows.read().is_empty() {
                 div { class: "empty",
                     div { class: "icon", aria_hidden: "true", "⚡" }
@@ -228,15 +247,25 @@ pub fn FlowsListPage() -> Element {
                         "Flows let you trigger an action when something happens — for example, send a welcome message when a client joins."
                     }
                     div { class: "actions",
-                        Link {
-                            to: Route::FlowFormPage {},
-                            class: "btn btn-primary",
-                            "Create a flow"
+                        if is_admin {
+                            Link {
+                                to: Route::FlowFormPage {},
+                                class: "btn btn-primary",
+                                "Create a flow"
+                            }
+                        } else {
+                            Button {
+                                variant: ButtonVariant::Primary,
+                                disabled: true,
+                                title: Some(ADMIN_ONLY_HINT.to_string()),
+                                "Create a flow"
+                            }
                         }
                     }
                 }
             } else {
                 FlowsTable {
+                    is_admin,
                     rows: rows.read().clone(),
                     on_fire: EventHandler::new({
                         let on_fire = on_fire.clone();
@@ -295,9 +324,46 @@ pub fn FlowsListPage() -> Element {
 #[derive(Props, Clone, PartialEq)]
 struct FlowsTableProps {
     rows: Vec<wire::Flow>,
+    is_admin: bool,
     on_fire: EventHandler<wire::FlowId>,
     on_toggle_enabled: EventHandler<(wire::FlowId, bool)>,
     on_delete: EventHandler<wire::FlowId>,
+}
+
+/// PURA-248 L3 — loading placeholder for [`FlowsTable`]. Holds the table's
+/// shape (header + four shimmer rows) so the page does not lurch when the
+/// real rows arrive, unlike the prior single-line text card.
+#[component]
+fn FlowsTableSkeleton() -> Element {
+    rsx! {
+        div { aria_busy: "true",
+            span { class: "sr-only", role: "status", "aria-live": "polite",
+                "Loading flows…"
+            }
+            table { class: "data-table", aria_hidden: "true",
+                thead {
+                    tr {
+                        th { scope: "col", "Name" }
+                        th { scope: "col", "Trigger" }
+                        th { scope: "col", "Status" }
+                        th { scope: "col", "Last run" }
+                        th { scope: "col", class: "actions-col", "Actions" }
+                    }
+                }
+                tbody {
+                    for i in 0..4 {
+                        tr { key: "{i}",
+                            td { div { class: "skeleton skeleton-line wide" } }
+                            td { div { class: "skeleton skeleton-line" } }
+                            td { div { class: "skeleton skeleton-line narrow" } }
+                            td { div { class: "skeleton skeleton-line" } }
+                            td { div { class: "skeleton skeleton-line narrow" } }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[component]
@@ -320,6 +386,7 @@ fn FlowsTable(props: FlowsTableProps) -> Element {
                         let f = f.clone();
                         let id = f.id;
                         let enabled = f.enabled;
+                        let is_admin = props.is_admin;
                         let on_fire = props.on_fire;
                         let on_toggle = props.on_toggle_enabled;
                         let on_delete = props.on_delete;
@@ -344,27 +411,52 @@ fn FlowsTable(props: FlowsTableProps) -> Element {
                                     }
                                 }
                                 td { "{last}" }
+                                // PURA-248 L1 — the brief sketched a
+                                // `[Fire] [Edit] [⋯]` row with Enable/Disable
+                                // and Delete folded into an overflow menu.
+                                // Divergence rationale: at four actions in a
+                                // dedicated actions column they stay scannable
+                                // in one glance; an overflow menu would add a
+                                // click plus a focus-trap surface for no real
+                                // density win. Revisit if the row grows past
+                                // ~5 actions or the column tightens on mobile.
                                 td { class: "actions-col",
                                     Button {
                                         variant: ButtonVariant::Primary,
                                         size: ButtonSize::Small,
+                                        disabled: !is_admin,
+                                        title: admin_only_title(is_admin),
                                         onclick: move |_| on_fire.call(id),
                                         "Fire"
                                     }
-                                    Link {
-                                        to: Route::FlowEditPage { flow_id: id.0 },
-                                        class: "btn btn-ghost btn-sm",
-                                        "Edit"
+                                    if is_admin {
+                                        Link {
+                                            to: Route::FlowEditPage { flow_id: id.0 },
+                                            class: "btn btn-ghost btn-sm",
+                                            "Edit"
+                                        }
+                                    } else {
+                                        Button {
+                                            variant: ButtonVariant::Ghost,
+                                            size: ButtonSize::Small,
+                                            disabled: true,
+                                            title: Some(ADMIN_ONLY_HINT.to_string()),
+                                            "Edit"
+                                        }
                                     }
                                     Button {
                                         variant: ButtonVariant::Secondary,
                                         size: ButtonSize::Small,
+                                        disabled: !is_admin,
+                                        title: admin_only_title(is_admin),
                                         onclick: move |_| on_toggle.call((id, enabled)),
                                         if enabled { "Disable" } else { "Enable" }
                                     }
                                     Button {
                                         variant: ButtonVariant::Danger,
                                         size: ButtonSize::Small,
+                                        disabled: !is_admin,
+                                        title: admin_only_title(is_admin),
                                         onclick: move |_| on_delete.call(id),
                                         "Delete"
                                     }
