@@ -127,18 +127,16 @@ pub fn BotDetailPage(bot_id: u64) -> Element {
     };
 
     let mut join_input: Signal<String> = use_signal(String::new);
+    // Drives `disabled` on the submit button so the form can't fire a
+    // validation toast that contradicts the bot's connected-state badge.
+    let join_channel_id =
+        use_memo(move || join_input.read().trim().parse::<u64>().ok());
     let on_join = {
         let gate = gate.clone();
         let mut bump = bump;
         move |evt: FormEvent| {
             evt.prevent_default();
-            let raw = join_input.read().trim().to_string();
-            let Ok(channel_id) = raw.parse::<u64>() else {
-                toaster.push(
-                    ToastVariant::Warning,
-                    "Channel id required",
-                    Some("Enter the numeric channel id to join.".into()),
-                );
+            let Some(channel_id) = *join_channel_id.read() else {
                 return;
             };
             let gate = gate.clone();
@@ -266,6 +264,7 @@ pub fn BotDetailPage(bot_id: u64) -> Element {
                             variant: ButtonVariant::Primary,
                             size: ButtonSize::Small,
                             kind: ButtonType::Submit,
+                            disabled: join_channel_id.read().is_none(),
                             "Join channel"
                         }
                         Button {
