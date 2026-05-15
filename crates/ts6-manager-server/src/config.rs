@@ -26,8 +26,8 @@ const DEFAULT_MUSIC_DIR: &str = "/data/music";
 const DEFAULT_DATA_DIR: &str = "./data";
 const DEFAULT_FRONTEND_URL_DEV: &str = "http://localhost:5173";
 const DEFAULT_FRONTEND_URL_PROD: &str = "http://localhost:3000";
-const DEFAULT_ACCESS_EXPIRY: &str = "15m";
-const DEFAULT_REFRESH_EXPIRY: &str = "7d";
+const DEFAULT_ACCESS_EXPIRY: &str = "4h";
+const DEFAULT_REFRESH_EXPIRY: &str = "30d";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeEnv {

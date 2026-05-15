@@ -10,8 +10,8 @@ chapters 6 + 7.
 
 | Env var               | Default | Format          | Meaning                                                                    |
 | --------------------- | ------- | --------------- | -------------------------------------------------------------------------- |
-| `JWT_ACCESS_EXPIRY`   | `15m`   | `30s`/`15m`/`2h`/`7d` | Lifetime of access JWT minted at `POST /api/auth/login` and `POST /api/auth/refresh`. After this elapses every authed REST call returns `401 Invalid or expired token` until the SPA rotates. |
-| `JWT_REFRESH_EXPIRY`  | `7d`    | same suffixes   | Lifetime of refresh-token rows in SurrealDB. After this the refresh row is rejected and the operator must re-authenticate. |
+| `JWT_ACCESS_EXPIRY`   | `4h`    | `30s`/`15m`/`2h`/`7d` | Lifetime of access JWT minted at `POST /api/auth/login` and `POST /api/auth/refresh`. After this elapses every authed REST call returns `401 Invalid or expired token` until the SPA rotates. |
+| `JWT_REFRESH_EXPIRY`  | `30d`   | same suffixes   | Lifetime of refresh-token rows in SurrealDB. After this the refresh row is rejected and the operator must re-authenticate. |
 | `JWT_SECRET`          | —       | ≥32 random bytes | HS256 signing key. **Production refuses to start without a non-placeholder value.** Rotating this invalidates every access JWT in flight (refresh tokens survive — they're DB-rooted). |
 
 Numeric-only values are seconds (`60` → 60s). Suffix parser lives in
@@ -20,12 +20,18 @@ Numeric-only values are seconds (`60` → 60s). Suffix parser lives in
 ### Picking values
 
 - `JWT_ACCESS_EXPIRY` is the worst-case staleness window for a revoked
-  role / disabled user. Keep it short (≤ 15 min). Don't lower it below
-  ~1 min — every expiry round-trips through the refresh endpoint, which
-  is rate-limited along with `/login` (15 reqs / 15 min / IP).
+  role / disabled user. Default 4h is tuned for a single-operator panel
+  where revocation latency is acceptable in exchange for far fewer
+  silent-rotation events (each rotation is a chance for transient
+  failure to surface as a user-visible bounce). Tighten to ≤ 15 min on
+  multi-user deploys where revocation latency matters more. Don't
+  lower below ~1 min — every expiry round-trips through the refresh
+  endpoint, which is rate-limited along with `/login` (15 reqs / 15
+  min / IP).
 - `JWT_REFRESH_EXPIRY` is the idle timeout for the whole session.
-  Default 7 days balances "operator can come back the next day without
+  Default 30 days balances "operator can come back next month without
   re-login" against "stolen refresh token doesn't live forever".
+  Tighten on multi-user deploys.
 - `JWT_ACCESS_EXPIRY` MUST be shorter than `JWT_REFRESH_EXPIRY`. Boot
   doesn't enforce this yet; setting access > refresh produces a
   session that re-issues access tokens faster than the refresh row
