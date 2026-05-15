@@ -6,6 +6,7 @@
 //! by sibling PURA-5 children.
 
 pub mod active_server;
+mod admin;
 mod bans;
 mod channels;
 mod clients;
@@ -26,6 +27,7 @@ mod setup;
 mod video_sources;
 mod widgets;
 
+pub use admin::AuditPage;
 pub use bans::BansPage;
 pub use channels::ChannelsPage;
 pub use clients::ClientsPage;

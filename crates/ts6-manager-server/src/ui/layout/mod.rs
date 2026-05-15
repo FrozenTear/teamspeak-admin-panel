@@ -97,6 +97,14 @@ pub fn AppShell() -> Element {
         return rsx! { "" };
     }
 
+    // Admin nav entries (audit log) are gated on the JWT role claim — a
+    // visual gate only; the API re-checks the DB-current role. See
+    // `docs/admin/ui-brief.md` §5.
+    let is_admin = {
+        let state = session.state.read();
+        state.user().map(|u| u.role == "admin").unwrap_or(false)
+    };
+
     rsx! {
         div { class: "app",
             // Skip-to-nav link is the first focusable element. Visually
@@ -109,7 +117,7 @@ pub fn AppShell() -> Element {
                 href: "#{NAV_LANDMARK_ID}",
                 "Skip to navigation"
             }
-            Sidebar { active: route.clone() }
+            Sidebar { active: route.clone(), is_admin }
             Header {}
             div { class: "mobile-selector-bar",
                 ServerSelector { variant: ServerSelectorVariant::Mobile }
