@@ -70,6 +70,63 @@ the gate invalidated on ANY refresh failure, bouncing the operator to
 to 401 only — anything else is "rotation did not happen", not
 "session is dead".
 
+## 401 sub-codes the gate treats (PURA-225)
+
+The backend's `RequireAuth` extractor emits three distinct 401
+envelopes (all share `Content-Type: application/json` and the spec
+`{ "error": "<verbatim copy>" }` shape — strings defined in
+`crates/shared/src/auth.rs` `auth_error_strings`):
+
+| Sub-code body                       | Server reason                                                                                        | Gate treats as                                                          |
+| ----------------------------------- | ---------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| `Invalid or expired token`          | JWT verify failed (expired / bad signature) OR the DB lookup for the user id errored.                | **Refresh-eligible.** One single-flight refresh; replay; invalidate only if the replay still 401s. |
+| `User account disabled or deleted` | DB lookup returned `Some(user)` with `enabled = false`, or returned `None` (user row gone).         | **Session-killing.** Invalidate immediately — refresh cannot resurrect the row. |
+| `No token provided`                 | The request reached the extractor without a `Authorization: Bearer <jwt>` header.                    | **Session-killing.** Invalidate immediately — the SPA's bearer is missing; refresh would also miss it. |
+
+A 401 with any **other** body (empty, unknown sub-code, non-JSON) is
+also treated as session-killing — the gate's
+`is_invalid_or_expired_token()` test only passes for the exact spec
+string. This is the PURA-225 contract: the gate refuses to leave the
+session `Authenticated` after a 401 the server itself called "session
+is dead" — that combination strands the operator on a "Session
+expired" banner with no path back to `/login`.
+
+A successful refresh followed by a **replayed call that also 401s** is
+the same signal: invalidate. The server rotated the access token but
+the upstream still rejects it, so the family is dead at the server.
+
+### Operator-facing escape hatch
+
+If the refresh path is wedged in a way that PURA-214's transient
+handling cannot recover from (proxy 5xx loop, JSON corruption from a
+buggy intermediary), the gate keeps the session alive on purpose. To
+ensure the operator is never stuck, every authed surface that renders
+a "Session expired" banner (today: `/servers`, and the chrome's
+`ServerSelector` dropdown footer) also surfaces a primary **"Sign in
+again"** button. It calls `session.replace(AuthState::Anonymous)` and
+`nav.replace(LoginPage { next })` so a single click reaches `/login`
+with the current path captured for return after re-auth.
+
+### Test coverage
+
+The contract is pinned by unit tests in `client/session.rs`:
+
+- `non_invalid_token_data_401_invalidates_session` — `USER_DISABLED` /
+  `NO_TOKEN` 401s clear the session.
+- `non_401_data_errors_do_not_invalidate_session` — `Server`,
+  `Transport`, `Client` errors keep the session alive.
+- `replay_401_after_successful_refresh_invalidates_session` — a 401 on
+  the replay after a successful refresh kills the session.
+- `transient_refresh_failure_keeps_session_authenticated` /
+  `non_401_4xx_refresh_failure_keeps_session_authenticated` — PURA-214
+  regression (kept).
+- `refresh_failure_invalidates_session_no_silent_retry` — 401 on
+  refresh itself (kept).
+
+UI-side coverage lives in `ui::pages::servers_index::tests`
+(`unauthorized_error_state_renders_sign_in_again_cta`,
+`non_unauthorized_error_state_omits_sign_in_again_cta`).
+
 ## Logging
 
 The server logs at boot summarise the active config (see
