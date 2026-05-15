@@ -13,15 +13,17 @@
 //!   created later in the same wizard.
 //! - The classification step is the whole point: surface "Connection
 //!   refused on host:port" / "DNS failed" / "Timeout after 15s" / "TLS
-//!   error" / "HTTP 401" instead of reqwest's `Display` blob. Until
-//!   [`WebQueryError::Transport`] grows a typed variant (delegated to
-//!   RustPlatform — see the PURA-211 child issue), this classifier is
-//!   the single source of operator-friendly remediation copy.
+//!   error" / "HTTP 401" instead of reqwest's `Display` blob. PURA-220
+//!   shared the underlying classifier with the main WebQuery request
+//!   path — see [`crate::webquery::transport_class`]. The probe still
+//!   owns the wizard-only `Unauthorized` and `InvalidResponse` legs
+//!   because those flow from envelope-level shapes, not reqwest errors.
 
 use reqwest::{Client, StatusCode};
 use ts6_manager_shared::test_connection::{TestConnectionKind, TestConnectionResponse};
 
-use super::{API_KEY_HEADER, Envelope, REQUEST_TIMEOUT};
+use super::transport_class::{ClassifiedTransport, WebQueryTransportKind};
+use super::{API_KEY_HEADER, Envelope, REQUEST_TIMEOUT, transport_class};
 use crate::webquery::models::VersionInfo;
 
 /// Result of [`probe_webquery`] — always carries `url_tried` so the FE can
@@ -58,14 +60,10 @@ pub async fn probe_webquery(
     let response = match send_result {
         Ok(r) => r,
         Err(e) => {
-            let (kind, message) = classify_reqwest_error(&e, &url_tried);
-            return TestConnectionResponse {
-                ok: false,
+            return classified_into_response(
+                transport_class::classify_reqwest_error(&e, &url_tried),
                 url_tried,
-                kind,
-                message,
-                server_version: None,
-            };
+            );
         }
     };
 
@@ -86,14 +84,10 @@ pub async fn probe_webquery(
     let bytes = match response.bytes().await {
         Ok(b) => b,
         Err(e) => {
-            let (kind, message) = classify_reqwest_error(&e, &url_tried);
-            return TestConnectionResponse {
-                ok: false,
+            return classified_into_response(
+                transport_class::classify_response_body_error(&e, &url_tried),
                 url_tried,
-                kind,
-                message,
-                server_version: None,
-            };
+            );
         }
     };
 
@@ -157,121 +151,33 @@ fn build_one_shot_client(allow_self_signed: bool) -> Result<Client, reqwest::Err
     builder.build()
 }
 
-/// Classify a `reqwest::Error` into a [`TestConnectionKind`] + an
-/// operator-facing message. Order of `is_*` checks matters — `is_request()`
-/// catches several variants, so the more specific shapes (`is_timeout`,
-/// `is_connect`, `is_status`) need to run first.
-fn classify_reqwest_error(err: &reqwest::Error, url_tried: &str) -> (TestConnectionKind, String) {
-    // The 15s timeout is the most common opaque-looking failure mode on
-    // hairpin-NAT setups, so check it before the generic connect-ish
-    // bucket.
-    if err.is_timeout() {
-        return (
-            TestConnectionKind::Timeout,
-            format!(
-                "Timed out after {}s waiting for {url_tried}.",
-                REQUEST_TIMEOUT.as_secs()
-            ),
-        );
+/// Map a shared [`ClassifiedTransport`] onto the wizard's
+/// [`TestConnectionResponse`]. The wizard's `kind` enum is a wire-shape
+/// superset of the transport classifier (it adds `Unauthorized` /
+/// `InvalidResponse` / `Ok` because those are envelope-level shapes the
+/// probe handles after the handshake), so this is a one-way mapping.
+fn classified_into_response(
+    classified: ClassifiedTransport,
+    url_tried: String,
+) -> TestConnectionResponse {
+    let kind = match classified.kind {
+        WebQueryTransportKind::Dns => TestConnectionKind::Dns,
+        WebQueryTransportKind::Connect => TestConnectionKind::Connect,
+        WebQueryTransportKind::Timeout => TestConnectionKind::Timeout,
+        WebQueryTransportKind::Tls => TestConnectionKind::Tls,
+        // The wizard predates the shared classifier; "lost body mid-flight"
+        // wasn't a wizard outcome (probe always reads the full body of a
+        // 1-row /version response). Fold it onto Other so the FE renders
+        // the operator-friendly message without inventing a new chip.
+        WebQueryTransportKind::Body | WebQueryTransportKind::Other => TestConnectionKind::Other,
+    };
+    TestConnectionResponse {
+        ok: false,
+        url_tried,
+        kind,
+        message: classified.message,
+        server_version: None,
     }
-    // reqwest's `is_connect()` collapses both the DNS-failed and
-    // connection-refused shapes. The error chain has the underlying
-    // hyper / hickory / std::io::Error, where the `kind()` /
-    // `Display` distinguishes them.
-    let chain = error_chain_string(err);
-    if err.is_connect() {
-        if looks_like_dns_failure(&chain) {
-            return (
-                TestConnectionKind::Dns,
-                format!(
-                    "Could not resolve the host in {url_tried}. ({})",
-                    short_cause(&chain)
-                ),
-            );
-        }
-        return (
-            TestConnectionKind::Connect,
-            format!(
-                "Could not open a TCP connection to {url_tried}. ({})",
-                short_cause(&chain)
-            ),
-        );
-    }
-    if is_tls_failure(err, &chain) {
-        return (
-            TestConnectionKind::Tls,
-            format!("TLS handshake failed for {url_tried}. ({})", short_cause(&chain)),
-        );
-    }
-    // Some hickory/hyper builds surface "dns error: …" via a non-connect
-    // request error rather than via `is_connect()`. Catch that as a
-    // belt-and-braces — operators see a DNS failure framed as DNS.
-    if looks_like_dns_failure(&chain) {
-        return (
-            TestConnectionKind::Dns,
-            format!(
-                "Could not resolve the host in {url_tried}. ({})",
-                short_cause(&chain)
-            ),
-        );
-    }
-    (
-        TestConnectionKind::Other,
-        format!("Request to {url_tried} failed: {}", short_cause(&chain)),
-    )
-}
-
-fn error_chain_string<E: std::error::Error + 'static>(err: &E) -> String {
-    let mut out = err.to_string();
-    let mut source: Option<&(dyn std::error::Error + 'static)> = err.source();
-    while let Some(s) = source {
-        out.push_str(" -> ");
-        out.push_str(&s.to_string());
-        source = s.source();
-    }
-    out
-}
-
-fn short_cause(chain: &str) -> String {
-    // Reqwest's `Display` impl already includes URL + cause; trim the URL
-    // part because the operator can already see it in `url_tried`. Length-
-    // cap so the banner doesn't grow into a wall of text.
-    let trimmed = chain
-        .split(" -> ")
-        .last()
-        .unwrap_or(chain)
-        .trim()
-        .trim_end_matches('.');
-    const MAX: usize = 160;
-    if trimmed.len() <= MAX {
-        trimmed.to_string()
-    } else {
-        format!("{}…", &trimmed[..MAX])
-    }
-}
-
-fn looks_like_dns_failure(chain: &str) -> bool {
-    let lower = chain.to_ascii_lowercase();
-    // Cover the message shapes we see across hickory + getaddrinfo +
-    // tokio's `dns error: ...` wrappers. Keep these as fragments — the
-    // exact wording rotates between reqwest versions.
-    lower.contains("dns error")
-        || lower.contains("failed to lookup address")
-        || lower.contains("name or service not known")
-        || lower.contains("nodename nor servname")
-        || lower.contains("no such host")
-        || lower.contains("temporary failure in name resolution")
-}
-
-fn is_tls_failure(err: &reqwest::Error, chain: &str) -> bool {
-    if !err.is_request() && !err.is_builder() {
-        return false;
-    }
-    let lower = chain.to_ascii_lowercase();
-    lower.contains("tls")
-        || lower.contains("certificate")
-        || lower.contains("ssl")
-        || lower.contains("handshake")
 }
 
 #[cfg(test)]
@@ -302,14 +208,7 @@ mod tests {
     async fn probe_returns_dns_on_unresolvable_host() {
         // `.invalid` is RFC-2606 reserved — guaranteed to fail name
         // resolution on every conforming resolver.
-        let resp = probe_webquery(
-            "no-such-host.invalid",
-            10080,
-            false,
-            "k",
-            false,
-        )
-        .await;
+        let resp = probe_webquery("no-such-host.invalid", 10080, false, "k", false).await;
         assert!(!resp.ok);
         // Some resolvers wrap the failure differently — accept either the
         // dedicated DNS shape or the more general Connect bucket, so this
@@ -326,57 +225,33 @@ mod tests {
     }
 
     #[test]
-    fn classify_dns_fragments_each_match() {
-        for fragment in [
-            "dns error: failed to lookup address",
-            "failed to lookup address information: Name or service not known",
-            "No such host is known",
-            "nodename nor servname provided",
-            "temporary failure in name resolution",
-        ] {
-            assert!(
-                looks_like_dns_failure(fragment),
-                "fragment did not match DNS bucket: {fragment}"
+    fn classifier_kind_maps_onto_wizard_kind() {
+        // The probe relies on the shared classifier's variants funnelling
+        // into the wizard's `TestConnectionKind` without losing the four
+        // remediation-tagged buckets. If a future classifier variant
+        // sneaks in we want this mapping to fail noisily.
+        let cases = [
+            (WebQueryTransportKind::Dns, TestConnectionKind::Dns),
+            (WebQueryTransportKind::Connect, TestConnectionKind::Connect),
+            (WebQueryTransportKind::Timeout, TestConnectionKind::Timeout),
+            (WebQueryTransportKind::Tls, TestConnectionKind::Tls),
+            (WebQueryTransportKind::Body, TestConnectionKind::Other),
+            (WebQueryTransportKind::Other, TestConnectionKind::Other),
+        ];
+        for (input, expected) in cases {
+            let resp = classified_into_response(
+                ClassifiedTransport {
+                    kind: input,
+                    message: "m".into(),
+                },
+                "http://x/y".into(),
             );
-        }
-    }
-
-    #[test]
-    fn tls_bucket_keyword_fragments_match() {
-        // We can't easily synthesise a `reqwest::Error` of the exact
-        // shape `is_tls_failure` wants — but the keyword-bucket half of
-        // the helper is the only piece that varies with reqwest version,
-        // so we test that directly to catch a regression if the fragment
-        // list drifts.
-        for fragment in [
-            "tls handshake failure",
-            "certificate has expired",
-            "ssl error",
-            "handshake interrupted",
-        ] {
-            let lower = fragment.to_ascii_lowercase();
-            assert!(
-                lower.contains("tls")
-                    || lower.contains("certificate")
-                    || lower.contains("ssl")
-                    || lower.contains("handshake"),
-                "fragment did not match TLS bucket: {fragment}"
+            assert_eq!(
+                resp.kind, expected,
+                "WebQueryTransportKind::{input:?} must map to {expected:?}"
             );
+            assert_eq!(resp.message, "m");
+            assert!(!resp.ok);
         }
-    }
-
-    #[test]
-    fn short_cause_truncates_long_messages() {
-        let long = "x".repeat(400);
-        let out = short_cause(&long);
-        assert!(out.ends_with('…'));
-        // 160 ASCII bytes + the multi-byte ellipsis (3 bytes in UTF-8).
-        assert!(out.chars().count() <= 161, "got {} chars: {out}", out.chars().count());
-    }
-
-    #[test]
-    fn short_cause_trims_trailing_dot_and_takes_last_chain_segment() {
-        let chain = "outer -> inner cause.";
-        assert_eq!(short_cause(chain), "inner cause");
     }
 }
