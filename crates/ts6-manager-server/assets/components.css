@@ -235,6 +235,24 @@
 .bot-badge--off     { background: rgba(94, 106, 130, 0.20); color: var(--text-secondary); }
 .bot-badge--error   { background: rgba(230, 76, 95, 0.14); color: var(--danger-fg); }
 
+/* Flow glyph icon (PURA-253 §7.1) — decorative; paired with a text label
+   everywhere it renders, so the surface stays icon-independent. */
+.flow-icon {
+  display: inline-grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+  color: currentColor;
+  opacity: 0.8;
+}
+/* Inside a status pill the glyph keeps the badge's AA-contrast colour. */
+.bot-badge .flow-icon {
+  width: 1em;
+  height: 1em;
+  opacity: 1;
+}
+
 /* ─── Skeleton ───────────────────────────────────────── */
 .skeleton {
   background: linear-gradient(90deg,
@@ -1280,6 +1298,13 @@
   align-items: center;
 }
 .kv-row > .input { flex: 1 1 auto; min-width: 0; }
+/* PURA-253 L2-tail — the remove control needs a ≥24×24 px hit target
+   (Fitts's Law) regardless of the `×` glyph's own size. */
+.kv-row > button {
+  min-width: 24px;
+  min-height: 24px;
+  flex: 0 0 auto;
+}
 
 /* Collapsible disclosure — advanced identifiers, run-status legend. */
 .disclosure > summary {

@@ -125,6 +125,62 @@ pub fn action_status_badge_class(status: wire::ActionStatus) -> &'static str {
     }
 }
 
+// ── Flow glyph icons (PURA-253 §7.1, resolved by UXDesigner) ──────────
+// Decorative glyphs paired with a text label everywhere they render, so
+// each surface stays colour- and icon-independent (WCAG 1.4.1). Markup
+// wraps them in `span.flow-icon[aria-hidden=true]`.
+
+/// Decorative glyph for an action kind — paired with [`action_kind_label`]
+/// in the actions-list cards and the Definition tab. PURA-253 H2.
+pub fn action_kind_icon(action: &wire::Action) -> &'static str {
+    match action {
+        wire::Action::Ts6Command { .. } => "»",
+        wire::Action::MusicBotCommand { .. } => "♪",
+        wire::Action::WebhookOut { .. } => "↗",
+        wire::Action::LogLine { .. } => "≡",
+    }
+}
+
+/// Glyph variant for the per-run action-results drawer, which only has the
+/// camelCase wire discriminant. Mirrors [`action_wire_kind_label`].
+pub fn action_wire_kind_icon(kind: &str) -> &'static str {
+    match kind {
+        "ts6Command" => "»",
+        "musicBotCommand" => "♪",
+        "webhookOut" => "↗",
+        "logLine" => "≡",
+        // Unknown kind — the label is still shown verbatim alongside.
+        _ => "•",
+    }
+}
+
+/// Decorative status glyph — paired with [`run_status_label`]. Hardens the
+/// colour-blind path and disambiguates Interrupted from Skipped, which
+/// share the neutral pill colour. PURA-253 H2.
+pub fn run_status_icon(status: wire::FlowRunStatus) -> &'static str {
+    match status {
+        wire::FlowRunStatus::InFlight => "⟳",
+        wire::FlowRunStatus::Ok => "✓",
+        wire::FlowRunStatus::Errored => "✕",
+        wire::FlowRunStatus::Interrupted => "‖",
+        wire::FlowRunStatus::SkippedDisabled => "↷",
+    }
+}
+
+/// Per-action status glyph — the `Ok`/`Errored`/`Skipped` subset of the
+/// run-status set, paired with [`action_status_label`].
+pub fn action_status_icon(status: wire::ActionStatus) -> &'static str {
+    match status {
+        wire::ActionStatus::Ok => "✓",
+        wire::ActionStatus::Errored => "✕",
+        wire::ActionStatus::Skipped => "↷",
+    }
+}
+
+/// L2-tail — single source for the key/value + header editor remove glyph,
+/// so those controls source one registry rather than a bare literal.
+pub const REMOVE_GLYPH: &str = "×";
+
 /// `ui-brief.md` §2 cron preset chips. Display label → cron expression.
 pub const CRON_PRESETS: &[(&str, &str)] = &[
     ("every 5 min", "0 */5 * * * *"),
@@ -341,6 +397,19 @@ mod tests {
     #[test]
     fn last_run_cell_em_dash_when_never_run() {
         assert_eq!(last_run_cell(None), "—");
+    }
+
+    #[test]
+    fn action_wire_kind_icon_matches_known_kinds_and_falls_back() {
+        // The typed-enum helpers are exhaustive by the compiler; the
+        // wire-discriminant match over `&str` is not, so pin it.
+        assert_eq!(action_wire_kind_icon("ts6Command"), "»");
+        assert_eq!(action_wire_kind_icon("musicBotCommand"), "♪");
+        assert_eq!(action_wire_kind_icon("webhookOut"), "↗");
+        assert_eq!(action_wire_kind_icon("logLine"), "≡");
+        // An unknown discriminant gets a neutral dot — never empty.
+        assert_eq!(action_wire_kind_icon("somethingNew"), "•");
+        assert!(!action_wire_kind_icon("").is_empty());
     }
 
     #[test]

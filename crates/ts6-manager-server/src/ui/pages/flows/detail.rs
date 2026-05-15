@@ -15,10 +15,11 @@ use crate::ui::components::toast::{ToastVariant, use_toaster};
 use crate::ui::components::{Banner, BannerVariant, Button, ButtonSize, ButtonVariant};
 use crate::ui::pages::flows::dialog::{ConfirmDialog, DeletePrompt};
 use crate::ui::pages::flows::shared::{
-    ADMIN_ONLY_HINT, action_kind_label, action_status_badge_class, action_status_label,
-    action_wire_kind_label, admin_only_title, enabled_badge_class, enabled_label, format_error,
-    is_run_in_flight_conflict, relative_when, run_status_badge_class, run_status_hint,
-    run_status_label, trigger_summary,
+    ADMIN_ONLY_HINT, action_kind_icon, action_kind_label, action_status_badge_class,
+    action_status_icon, action_status_label, action_wire_kind_icon, action_wire_kind_label,
+    admin_only_title, enabled_badge_class, enabled_label, format_error, is_run_in_flight_conflict,
+    relative_when, run_status_badge_class, run_status_hint, run_status_icon, run_status_label,
+    trigger_summary,
 };
 use crate::ui::routes::Route;
 
@@ -541,6 +542,9 @@ fn RunsPanel(props: RunsPanelProps) -> Element {
                                         td {
                                             span { class: run_status_badge_class(r.summary.status),
                                                 title: hint.unwrap_or(""),
+                                                span { class: "flow-icon", aria_hidden: "true",
+                                                    "{run_status_icon(r.summary.status)}"
+                                                }
                                                 "{run_status_label(r.summary.status)}"
                                             }
                                         }
@@ -622,6 +626,9 @@ fn RunStatusLegend() -> Element {
                 for (status, copy) in entries {
                     li { key: "{run_status_label(status)}", class: "legend-row",
                         span { class: run_status_badge_class(status),
+                            span { class: "flow-icon", aria_hidden: "true",
+                                "{run_status_icon(status)}"
+                            }
                             "{run_status_label(status)}"
                         }
                         span { class: "muted", "{copy}" }
@@ -691,6 +698,9 @@ fn RunDrawer(props: RunDrawerProps) -> Element {
                     div { class: "stack-sm",
                         p {
                             span { class: run_status_badge_class(summary.status),
+                                span { class: "flow-icon", aria_hidden: "true",
+                                    "{run_status_icon(summary.status)}"
+                                }
                                 "{run_status_label(summary.status)}"
                             }
                         }
@@ -726,9 +736,17 @@ fn RunDrawer(props: RunDrawerProps) -> Element {
                                             rsx! {
                                                 tr { key: "{ar.index}",
                                                     td { "{ar.index + 1}" }
-                                                    td { "{action_wire_kind_label(&ar.kind)}" }
+                                                    td {
+                                                        span { class: "flow-icon", aria_hidden: "true",
+                                                            "{action_wire_kind_icon(&ar.kind)}"
+                                                        }
+                                                        " {action_wire_kind_label(&ar.kind)}"
+                                                    }
                                                     td {
                                                         span { class: action_status_badge_class(ar.status),
+                                                            span { class: "flow-icon", aria_hidden: "true",
+                                                                "{action_status_icon(ar.status)}"
+                                                            }
                                                             "{action_status_label(ar.status)}"
                                                         }
                                                     }
@@ -777,7 +795,12 @@ fn DefinitionPanel(props: DefinitionPanelProps) -> Element {
                     ol { class: "stack-sm",
                         for (idx, a) in f.definition.actions.iter().enumerate() {
                             li { key: "{idx}",
-                                strong { "{action_kind_label(a)}" }
+                                strong {
+                                    span { class: "flow-icon", aria_hidden: "true",
+                                        "{action_kind_icon(a)}"
+                                    }
+                                    " {action_kind_label(a)}"
+                                }
                                 ActionSummary { action: a.clone() }
                             }
                         }

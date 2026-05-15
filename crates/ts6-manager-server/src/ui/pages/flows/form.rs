@@ -19,8 +19,8 @@ use crate::ui::components::{Banner, BannerVariant, Button, ButtonType, ButtonVar
 use crate::ui::layout::use_servers_context;
 use crate::ui::pages::active_server;
 use crate::ui::pages::flows::shared::{
-    CRON_PRESETS, MAX_ACTIONS, MAX_NAME_LEN, action_kind_label, cron_validation_message,
-    format_error,
+    CRON_PRESETS, MAX_ACTIONS, MAX_NAME_LEN, REMOVE_GLYPH, action_kind_icon, action_kind_label,
+    cron_validation_message, format_error,
 };
 use crate::ui::routes::Route;
 
@@ -662,7 +662,12 @@ fn ActionsList(props: ActionsListProps) -> Element {
                     rsx! {
                         li { key: "{idx}", class: "card stack-sm",
                             div { class: "actions",
-                                strong { "Action {idx + 1} — {action_kind_label(&action)}" }
+                                strong {
+                                    span { class: "flow-icon", aria_hidden: "true",
+                                        "{action_kind_icon(&action)}"
+                                    }
+                                    " Action {idx + 1} — {action_kind_label(&action)}"
+                                }
                                 if !locked {
                                     Button {
                                         variant: ButtonVariant::Ghost,
@@ -1079,7 +1084,7 @@ fn KeyValueEditor(props: KeyValueEditorProps) -> Element {
                                                 rows.with_mut(|r| { r.remove(idx); });
                                                 project();
                                             },
-                                            "×"
+                                            span { class: "flow-icon", aria_hidden: "true", {REMOVE_GLYPH} }
                                         }
                                     }
                                 }
@@ -1180,7 +1185,7 @@ fn HeaderListEditor(props: HeaderListEditorProps) -> Element {
                                                     on_change.call(next);
                                                 }
                                             },
-                                            "×"
+                                            span { class: "flow-icon", aria_hidden: "true", {REMOVE_GLYPH} }
                                         }
                                     }
                                 }
