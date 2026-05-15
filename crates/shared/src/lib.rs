@@ -10,6 +10,7 @@
 
 #![deny(missing_debug_implementations)]
 
+pub mod admin;
 pub mod auth;
 pub mod control;
 pub mod dashboard;

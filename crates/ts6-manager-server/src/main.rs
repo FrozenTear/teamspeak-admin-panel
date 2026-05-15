@@ -12,6 +12,8 @@
 #[cfg(feature = "server")]
 mod app_state;
 #[cfg(feature = "server")]
+mod audit;
+#[cfg(feature = "server")]
 mod auth;
 mod client;
 #[cfg(feature = "server")]
@@ -166,6 +168,13 @@ mod server_entry {
         // app so a shutdown of the runtime tears it down with everything else.
         crate::sshbridge::retention::spawn_sweep(database.clone());
 
+        // PURA-228 / PURA-236: companion hourly sweep for `admin_audit_log`
+        // — TTL prune + the 100k row-cap defence (audit-shape.md §3.4). A
+        // distinct task from the SSH sweep for blast-radius isolation.
+        // Spawned after migrations so the seeded
+        // `app_setting:admin_audit_retention_days` row exists.
+        crate::audit::retention::spawn_sweep(database.clone());
+
         let serve_cfg = ServeConfig::new();
         let state = app_state::AppState::from_config(&cfg, database.clone());
 
@@ -295,7 +304,12 @@ mod server_entry {
         // writes. PATCH / DELETE / regenerate-token invalidate the public
         // `widget_cache` so a rotated or deleted token 404s on the next
         // public-route call (spec §7.29 / §26.4).
-        let widget_admin_router = widgets::admin::router().with_state(state);
+        let widget_admin_router = widgets::admin::router().with_state(state.clone());
+        // PURA-235 — v1.1 admin management: `/api/users/*` CRUD + per-user
+        // sessions, and `/api/audit` read. Admin-only via the `RequireAdmin`
+        // extractor inside each handler.
+        let users_router = routes::users::router().with_state(state.clone());
+        let audit_router = routes::audit::router().with_state(state);
 
         // PURA-17: `serve_dioxus_application` registers static assets +
         // server functions and adds a fallback that serves the dx-CLI
@@ -333,6 +347,9 @@ mod server_entry {
             .merge(widget_router)
             // PURA-72 Slice D ([PURA-89]) — operator widget CRUD `/api/widgets`.
             .merge(widget_admin_router)
+            // PURA-235 — v1.1 admin management surface.
+            .merge(users_router)
+            .merge(audit_router)
             .serve_dioxus_application(serve_cfg, ui::App)
             .layer(web::cors_layer(&cfg.frontend_url));
         let router = web::security_headers_stack(cfg.node_env).apply(router);

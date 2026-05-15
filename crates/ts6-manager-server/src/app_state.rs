@@ -90,6 +90,12 @@ pub struct AppState {
     /// PURA-223 — on-disk directory for operator-uploaded files (e.g.
     /// `yt-cookies.txt`). Defaults to `./data`; override with `DATA_DIR`.
     pub data_dir: PathBuf,
+    /// PURA-235 — number of trusted reverse-proxy hops in front of the
+    /// listener. Used by the [`crate::auth::extractors::RequestMeta`]
+    /// extractor for the v1.1 admin audit log so the `requestIp` field
+    /// captures the real client IP per spec §6.8 (rather than the
+    /// edge-proxy's address) on deployments that sit behind one.
+    pub trusted_proxy_hops: u8,
 }
 
 impl AppState {
@@ -152,6 +158,7 @@ impl AppState {
             moq_public_url: cfg.moq_public_url.clone(),
             yt_cookie,
             data_dir: cfg.data_dir.clone(),
+            trusted_proxy_hops: cfg.trusted_proxy_hops,
         }
     }
 }
