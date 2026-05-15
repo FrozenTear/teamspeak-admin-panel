@@ -22,7 +22,7 @@ use crate::ui::pages::DevVideoPlayerPage;
 use crate::ui::pages::{
     BansPage, BotDetailPage, BotsIndexPage, ChannelsPage, ClientsPage, DashboardPlaceholder, Home,
     LoginPage, LogsPage, MusicLibraryPage, MusicPlaylistsPage, NotFoundPage, PublicWidgetPage,
-    RadioStationsPage, ServerInfoPage, SetupPage, VideoSourcesPage, WidgetsPage,
+    RadioStationsPage, ServerInfoPage, ServersIndexPage, SetupPage, VideoSourcesPage, WidgetsPage,
 };
 
 #[rustfmt::skip]
@@ -100,6 +100,12 @@ pub enum Route {
     #[route("/music-bots/:bot_id/radio")]
     RadioStationsPage { bot_id: u64 },
 
+    // PURA-218 — explicit `/servers` index inside AppShell. Must precede
+    // the catch-all variant so `/servers` resolves to a real authed page
+    // instead of falling through to `NotFoundPage`.
+    #[route("/servers")]
+    ServersIndexPage {},
+
     // PURA-213 — catch-all NotFound. Lives outside `AppShell` so the page
     // renders for both authed and anon visitors without an auth bounce
     // (e.g. typo'd URLs shouldn't kick anon users to `/login?next=<bad>`).
@@ -118,14 +124,14 @@ mod tests {
     use super::Route;
     use std::str::FromStr;
 
-    /// PURA-213 — without a catch-all variant, visiting `/servers` (or any
-    /// other unmapped path) threw a `Routable` parse error that the default
-    /// dioxus-core error path rendered as raw text on the production image.
-    /// This test pins the contract: every unmapped path must resolve to
+    /// PURA-213 — without a catch-all variant, visiting an unknown path
+    /// threw a `Routable` parse error that the default dioxus-core error
+    /// path rendered as raw text on the production image. This test pins
+    /// the contract: every unmapped path must resolve to
     /// `Route::NotFoundPage` and never fall through to a parse error.
     #[test]
     fn unknown_paths_resolve_to_not_found() {
-        for path in ["/servers", "/totally-unknown", "/x/y/z", "/clients/bogus"] {
+        for path in ["/totally-unknown", "/x/y/z", "/clients/bogus"] {
             let route = Route::from_str(path)
                 .unwrap_or_else(|err| panic!("failed to parse {path}: {err}"));
             assert!(
@@ -145,14 +151,29 @@ mod tests {
         assert!(matches!(route, Route::BotsIndexPage {}));
     }
 
+    /// PURA-218 — `/servers` resolves to the new authed index page, not
+    /// the catch-all NotFound. Pins the regression introduced by PURA-213
+    /// (where the dashboard CTA landed on the friendly 404).
+    #[test]
+    fn servers_path_resolves_to_servers_index_not_catch_all() {
+        let route = Route::from_str("/servers").expect("/servers parse");
+        assert!(
+            matches!(route, Route::ServersIndexPage {}),
+            "expected ServersIndexPage for /servers, got {route:?}",
+        );
+    }
+
     /// The captured segments reconstruct the attempted path so the
     /// `NotFoundPage` component can show the operator what they typed.
     #[test]
     fn not_found_captures_path_segments() {
-        let route = Route::from_str("/servers").expect("servers parse");
+        let route = Route::from_str("/x/y/z").expect("x/y/z parse");
         let Route::NotFoundPage { segments } = route else {
             panic!("expected NotFoundPage variant");
         };
-        assert_eq!(segments, vec!["servers".to_string()]);
+        assert_eq!(
+            segments,
+            vec!["x".to_string(), "y".to_string(), "z".to_string()]
+        );
     }
 }

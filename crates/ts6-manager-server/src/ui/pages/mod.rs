@@ -19,6 +19,7 @@ mod music_bots;
 mod not_found;
 mod public_widget;
 mod server_info;
+mod servers_index;
 mod setup;
 mod video_sources;
 mod widgets;
@@ -38,6 +39,7 @@ pub use music_bots::{
 pub use not_found::NotFoundPage;
 pub use public_widget::PublicWidgetPage;
 pub use server_info::ServerInfoPage;
+pub use servers_index::ServersIndexPage;
 pub use setup::SetupPage;
 pub use video_sources::VideoSourcesPage;
 pub use widgets::WidgetsPage;
