@@ -74,6 +74,15 @@ pub async fn insert(db: &Database, new: NewRefreshToken) -> Result<RefreshToken>
     row.context("refresh_token insert returned no row")
 }
 
+/// Look up by integer id. Used by the admin `/api/users/{id}/sessions/{sid}`
+/// route to confirm a single session exists and resolve its `userId` +
+/// `family` before deleting the family-wide cohort.
+pub async fn find_by_id(db: &Database, id: i64) -> Result<Option<RefreshToken>> {
+    let sql = format!("SELECT {PROJECTION} FROM type::record('refresh_token', $id);");
+    let mut resp = db.query(sql).bind(("id", id)).await?.check()?;
+    Ok(resp.take(0)?)
+}
+
 pub async fn find_by_token(db: &Database, token: &str) -> Result<Option<RefreshToken>> {
     let sql = format!("SELECT {PROJECTION} FROM refresh_token WHERE token = $tok LIMIT 1;");
     let mut resp = db
@@ -153,6 +162,31 @@ pub async fn delete_all_for_user(db: &Database, user_id: i64) -> Result<()> {
     let sql = "DELETE refresh_token WHERE userId = $uid;";
     db.query(sql).bind(("uid", user_id)).await?.check()?;
     Ok(())
+}
+
+/// PURA-235 — admin-driven family-wide session revoke per
+/// `docs/admin/http-api.md` §3.3. Returns the row count deleted so the
+/// caller can surface it in the audit payload.
+pub async fn delete_by_family(db: &Database, family: &str) -> Result<u64> {
+    let pre = list_for_family(db, family).await?;
+    let n = pre.len() as u64;
+    let sql = "DELETE refresh_token WHERE family = $fam;";
+    db.query(sql)
+        .bind(("fam", family.to_string()))
+        .await?
+        .check()?;
+    Ok(n)
+}
+
+/// PURA-235 — admin-page `activeSessionCount` field per
+/// `docs/admin/http-api.md` §2.1. Counts rows where `replacedBy IS NONE`
+/// and `expiresAt > now` — i.e. the live successor of each family.
+pub async fn count_active_for_user(db: &Database, user_id: i64) -> Result<i64> {
+    let sql = "RETURN array::len(SELECT id FROM refresh_token
+        WHERE userId = $uid AND replacedBy IS NONE AND expiresAt > time::now());";
+    let mut resp = db.query(sql).bind(("uid", user_id)).await?.check()?;
+    let n: Option<i64> = resp.take(0)?;
+    Ok(n.unwrap_or(0))
 }
 
 /// Sweep tokens whose `expiresAt < now`. Useful as a periodic cleanup task
