@@ -223,6 +223,7 @@ async fn main() -> Result<()> {
         application: OpusApplication::Audio,
         frame_buffer: 16,
         event_buffer: 16,
+        yt_cookie_file: None,
     };
 
     let mut pipeline = AudioPipeline::spawn(spec, cfg)

@@ -31,9 +31,7 @@ pub struct CookieStatus {
     pub uploaded_at: Option<String>,
 }
 
-pub async fn get_youtube_cookie_status(
-    gate: Arc<RefreshGate>,
-) -> Result<CookieStatus, ApiError> {
+pub async fn get_youtube_cookie_status(gate: Arc<RefreshGate>) -> Result<CookieStatus, ApiError> {
     api::authorized_get_json::<CookieStatus>(
         &gate,
         &api::api_base(),
@@ -72,9 +70,7 @@ pub async fn upload_youtube_cookie_file(
                 let form = web_sys::FormData::new()
                     .map_err(|e| AuthError::Transport(format!("FormData::new: {e:?}")))?;
                 form.append_with_blob_and_filename("file", &file, &file.name())
-                    .map_err(|e| {
-                        AuthError::Transport(format!("FormData::append: {e:?}"))
-                    })?;
+                    .map_err(|e| AuthError::Transport(format!("FormData::append: {e:?}")))?;
 
                 let resp = gloo_net::http::Request::put(&url)
                     .header("authorization", &format!("Bearer {access}"))

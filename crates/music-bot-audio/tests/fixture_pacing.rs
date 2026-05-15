@@ -53,6 +53,7 @@ async fn ffmpeg_fixture_paces_within_tolerance() {
         application: OpusApplication::Audio,
         frame_buffer: 16,
         event_buffer: 16,
+        yt_cookie_file: None,
     };
     let mut pipeline = AudioPipeline::spawn(
         AudioSourceSpec::Ffmpeg {

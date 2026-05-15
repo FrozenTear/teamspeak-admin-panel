@@ -82,6 +82,7 @@ mod tests {
             application: OpusApplication::Audio,
             frame_buffer: 4,
             event_buffer: 4,
+            yt_cookie_file: None,
         }
     }
 

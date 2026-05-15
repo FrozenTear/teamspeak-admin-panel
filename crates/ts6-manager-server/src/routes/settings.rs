@@ -40,11 +40,10 @@ const KEY_TS: &str = "yt_cookie_uploaded_at";
 const MAX_SIZE_BYTES: usize = 64 * 1024;
 
 pub fn router() -> Router<AppState> {
-    Router::new()
-        .route(
-            "/api/settings/youtube-cookies",
-            get(get_cookies).put(put_cookies).delete(delete_cookies),
-        )
+    Router::new().route(
+        "/api/settings/youtube-cookies",
+        get(get_cookies).put(put_cookies).delete(delete_cookies),
+    )
 }
 
 /// Wire shape for `GET /api/settings/youtube-cookies`.
@@ -67,7 +66,11 @@ async fn get_cookies(_admin: RequireAdmin, State(state): State<AppState>) -> Res
         Some(r) => (true, Some(r.value)),
         None => (false, None),
     };
-    Json(CookieStatus { uploaded, uploaded_at }).into_response()
+    Json(CookieStatus {
+        uploaded,
+        uploaded_at,
+    })
+    .into_response()
 }
 
 async fn put_cookies(
@@ -79,18 +82,16 @@ async fn put_cookies(
     let mut file_bytes: Option<Vec<u8>> = None;
     loop {
         match multipart.next_field().await {
-            Ok(Some(field)) if field.name() == Some("file") => {
-                match field.bytes().await {
-                    Ok(b) => {
-                        file_bytes = Some(b.to_vec());
-                        break;
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "failed to read multipart field bytes");
-                        return (StatusCode::BAD_REQUEST, "failed to read upload").into_response();
-                    }
+            Ok(Some(field)) if field.name() == Some("file") => match field.bytes().await {
+                Ok(b) => {
+                    file_bytes = Some(b.to_vec());
+                    break;
                 }
-            }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to read multipart field bytes");
+                    return (StatusCode::BAD_REQUEST, "failed to read upload").into_response();
+                }
+            },
             Ok(Some(_)) => continue, // skip unknown fields
             Ok(None) => break,
             Err(e) => {
@@ -121,7 +122,7 @@ async fn put_cookies(
         .iter()
         .filter(|&&b| b < 0x09 || (b > 0x0D && b < 0x20) || b == 0x7F)
         .count();
-    if bytes.len() > 0 && non_printable * 2 > bytes.len() {
+    if !bytes.is_empty() && non_printable * 2 > bytes.len() {
         return (StatusCode::BAD_REQUEST, "file does not appear to be text").into_response();
     }
 
@@ -213,10 +214,10 @@ async fn delete_cookies(_admin: RequireAdmin, State(state): State<AppState>) -> 
 
     if let Some(row) = path_row {
         let p = PathBuf::from(&row.value);
-        if p.exists() {
-            if let Err(e) = fs::remove_file(&p) {
-                tracing::warn!(error = %e, path = %p.display(), "failed to remove cookie file");
-            }
+        if p.exists()
+            && let Err(e) = fs::remove_file(&p)
+        {
+            tracing::warn!(error = %e, path = %p.display(), "failed to remove cookie file");
         }
     }
 

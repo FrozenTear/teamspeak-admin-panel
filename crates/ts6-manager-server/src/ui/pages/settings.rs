@@ -99,11 +99,7 @@ fn YoutubeCookieSection() -> Element {
             spawn(async move {
                 match cookie_api::delete_youtube_cookie_file(gate).await {
                     Ok(()) => {
-                        toaster.push(
-                            ToastVariant::Success,
-                            "YouTube cookies removed",
-                            None,
-                        );
+                        toaster.push(ToastVariant::Success, "YouTube cookies removed", None);
                         reload.with_mut(|n| *n += 1);
                     }
                     Err(e) => {
@@ -137,11 +133,7 @@ fn YoutubeCookieSection() -> Element {
                 };
                 match result {
                     Ok(()) => {
-                        toaster.push(
-                            ToastVariant::Success,
-                            "YouTube cookies uploaded",
-                            None,
-                        );
+                        toaster.push(ToastVariant::Success, "YouTube cookies uploaded", None);
                         reload.with_mut(|n| *n += 1);
                     }
                     Err(e) => {
@@ -270,8 +262,12 @@ fn FilePickerButton(props: FilePickerButtonProps) -> Element {
         #[cfg(target_arch = "wasm32")]
         {
             use wasm_bindgen::JsCast;
-            let Some(window) = web_sys::window() else { return };
-            let Some(document) = window.document() else { return };
+            let Some(window) = web_sys::window() else {
+                return;
+            };
+            let Some(document) = window.document() else {
+                return;
+            };
             let Some(element) = document.get_element_by_id("yt-cookie-file") else {
                 return;
             };

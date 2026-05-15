@@ -251,6 +251,7 @@ enum ConnectedExit {
 /// Mirrors `ts6-voice-prototype`'s borrow-checker dance: build the events
 /// future inline as the select arm so it gets dropped at each iteration,
 /// freeing `&mut con` for command dispatch / `send_audio` in the body.
+#[allow(clippy::too_many_arguments)]
 async fn run_connected_loop(
     con: &mut Connection,
     state: &mut BotState,

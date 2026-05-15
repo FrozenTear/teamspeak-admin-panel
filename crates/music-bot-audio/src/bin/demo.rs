@@ -90,6 +90,7 @@ async fn main() -> Result<()> {
         application: OpusApplication::Audio,
         frame_buffer: 16,
         event_buffer: 32,
+        yt_cookie_file: None,
     };
 
     let spec = match cli.source {

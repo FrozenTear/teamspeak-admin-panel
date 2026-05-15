@@ -6,8 +6,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;

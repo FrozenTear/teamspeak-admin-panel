@@ -134,9 +134,7 @@ mod server_entry {
         // PURA-223 — if a previous run uploaded a cookie via the UI, the
         // path was persisted to `app_setting:yt_cookie_path`. Prefer that
         // over the env-var-sourced boot value so UI uploads survive restarts.
-        if let Ok(Some(row)) =
-            crate::repos::app_settings::get(&database, "yt_cookie_path").await
-        {
+        if let Ok(Some(row)) = crate::repos::app_settings::get(&database, "yt_cookie_path").await {
             let db_path = std::path::PathBuf::from(&row.value);
             if db_path.exists() {
                 *state.yt_cookie.write().unwrap() = Some(db_path);

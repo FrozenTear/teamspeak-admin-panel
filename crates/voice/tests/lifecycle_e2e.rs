@@ -93,7 +93,11 @@ async fn run() -> Result<()> {
         .with_auto_connect(true);
 
     let store: Arc<dyn MusicBotStore> = Arc::new(InMemoryMusicBotStore::new());
-    let handle = spawn_bot(BotId(1, std::sync::Arc::new(std::sync::RwLock::new(None))), config, store);
+    let handle = spawn_bot(
+        BotId(1, std::sync::Arc::new(std::sync::RwLock::new(None))),
+        config,
+        store,
+    );
     let mut events = handle.subscribe();
 
     // 1. Connected event fires with the default channel.
