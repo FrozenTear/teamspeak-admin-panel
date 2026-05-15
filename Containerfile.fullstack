@@ -135,6 +135,7 @@ RUN apt-get update \
         curl \
         ffmpeg \
         libssl3 \
+        python3 \
  && curl -fsSL -o /usr/local/bin/yt-dlp \
         "https://github.com/yt-dlp/yt-dlp/releases/download/${YTDLP_VERSION}/yt-dlp" \
  && chmod 0755 /usr/local/bin/yt-dlp \

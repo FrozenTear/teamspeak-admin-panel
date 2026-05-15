@@ -179,7 +179,11 @@ fn error_copy(err: &ApiError) -> (&'static str, String) {
             "Session expired",
             "Sign in again to view configured servers.".into(),
         ),
-        ApiError::BadGateway { error, code, details } => {
+        ApiError::BadGateway {
+            error,
+            code,
+            details,
+        } => {
             let mut body = error.clone();
             if let Some(d) = details.as_deref().filter(|v| !v.is_empty()) {
                 body.push_str(": ");
@@ -190,14 +194,10 @@ fn error_copy(err: &ApiError) -> (&'static str, String) {
             }
             ("Could not load servers", body)
         }
-        ApiError::Client { status, message } | ApiError::Server { status, message } => (
-            "Could not load servers",
-            format!("{status}: {message}"),
-        ),
-        ApiError::Transport(m) => (
-            "Could not load servers",
-            format!("Transport error: {m}"),
-        ),
+        ApiError::Client { status, message } | ApiError::Server { status, message } => {
+            ("Could not load servers", format!("{status}: {message}"))
+        }
+        ApiError::Transport(m) => ("Could not load servers", format!("Transport error: {m}")),
         ApiError::Deserialise(m) => (
             "Unexpected response",
             format!("/api/servers returned an unexpected payload: {m}"),
@@ -217,7 +217,6 @@ mod tests {
     use crate::client::store::AuthState;
     use crate::ui::layout::ServersContext;
     use chrono::Utc;
-    use dioxus::prelude::*;
     use std::sync::Arc;
     use ts6_manager_shared::auth::UserInfo;
 

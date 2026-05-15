@@ -18,6 +18,7 @@ mod logs;
 mod music_bots;
 mod not_found;
 mod public_widget;
+mod server_edit;
 mod server_info;
 mod servers_index;
 mod settings;
@@ -39,6 +40,7 @@ pub use music_bots::{
 };
 pub use not_found::NotFoundPage;
 pub use public_widget::PublicWidgetPage;
+pub use server_edit::ServerEditPage;
 pub use server_info::ServerInfoPage;
 pub use servers_index::ServersIndexPage;
 pub use settings::SettingsPage;

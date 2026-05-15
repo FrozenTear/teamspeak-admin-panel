@@ -45,7 +45,7 @@ pub struct TestConnectionResponse {
 
 /// Stable wire-string classification of the probe outcome. The FE picks copy
 /// + remediation hint off this discriminator. A non-`ok` response always
-/// carries a `kind != Ok`.
+///   carries a `kind != Ok`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TestConnectionKind {
@@ -84,9 +84,7 @@ impl TestConnectionKind {
     pub fn hint(self) -> &'static str {
         match self {
             TestConnectionKind::Ok => "",
-            TestConnectionKind::Dns => {
-                "Check the host spelling and that the panel can resolve it."
-            }
+            TestConnectionKind::Dns => "Check the host spelling and that the panel can resolve it.",
             TestConnectionKind::Connect => {
                 "TS6's WebQuery may be bound to 127.0.0.1, or a firewall is dropping the port. \
                  If the panel runs on the same host as TS6, try 127.0.0.1."
@@ -106,9 +104,7 @@ impl TestConnectionKind {
                 "The host responded but didn't speak WebQuery. Check the port — TS6 defaults to \
                  10080; a different service may be listening on the one you typed."
             }
-            TestConnectionKind::Other => {
-                "See the panel logs for the full reqwest error."
-            }
+            TestConnectionKind::Other => "See the panel logs for the full reqwest error.",
         }
     }
 }

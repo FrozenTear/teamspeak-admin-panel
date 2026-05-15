@@ -408,7 +408,8 @@ async fn transport_error_when_target_refuses_connection() {
         WebQueryError::Transport(ct) => {
             assert_eq!(ct.kind, WebQueryTransportKind::Connect);
             assert!(
-                ct.message.contains(&format!("{}:{}", addr.ip(), addr.port())),
+                ct.message
+                    .contains(&format!("{}:{}", addr.ip(), addr.port())),
                 "operator message must reference the dial target: {}",
                 ct.message
             );

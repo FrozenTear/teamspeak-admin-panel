@@ -22,7 +22,7 @@ use crate::ui::pages::DevVideoPlayerPage;
 use crate::ui::pages::{
     BansPage, BotDetailPage, BotsIndexPage, ChannelsPage, ClientsPage, DashboardPlaceholder, Home,
     LoginPage, LogsPage, MusicLibraryPage, MusicPlaylistsPage, NotFoundPage, PublicWidgetPage,
-    RadioStationsPage, ServerInfoPage, ServersIndexPage, SettingsPage, SetupPage,
+    RadioStationsPage, ServerEditPage, ServerInfoPage, ServersIndexPage, SettingsPage, SetupPage,
     VideoSourcesPage, WidgetsPage,
 };
 
@@ -68,6 +68,10 @@ pub enum Route {
 
     #[route("/server-info")]
     ServerInfoPage {},
+
+    // PURA-221 — SSH credential editor for existing server connections.
+    #[route("/server-edit")]
+    ServerEditPage {},
 
     #[route("/logs")]
     LogsPage {},
@@ -139,8 +143,8 @@ mod tests {
     #[test]
     fn unknown_paths_resolve_to_not_found() {
         for path in ["/totally-unknown", "/x/y/z", "/clients/bogus"] {
-            let route = Route::from_str(path)
-                .unwrap_or_else(|err| panic!("failed to parse {path}: {err}"));
+            let route =
+                Route::from_str(path).unwrap_or_else(|err| panic!("failed to parse {path}: {err}"));
             assert!(
                 matches!(route, Route::NotFoundPage { .. }),
                 "expected NotFoundPage for {path}, got {route:?}",

@@ -129,8 +129,7 @@ pub fn BotDetailPage(bot_id: u64) -> Element {
     let mut join_input: Signal<String> = use_signal(String::new);
     // Drives `disabled` on the submit button so the form can't fire a
     // validation toast that contradicts the bot's connected-state badge.
-    let join_channel_id =
-        use_memo(move || join_input.read().trim().parse::<u64>().ok());
+    let join_channel_id = use_memo(move || join_input.read().trim().parse::<u64>().ok());
     let on_join = {
         let gate = gate.clone();
         let mut bump = bump;
@@ -475,11 +474,7 @@ fn PlayNowComposer(bot_id: u64, state: wire::BotState) -> Element {
                     }
                     Err(e) => {
                         let msg = format_error(&e);
-                        toaster.push(
-                            ToastVariant::Danger,
-                            "Play failed",
-                            Some(msg.clone()),
-                        );
+                        toaster.push(ToastVariant::Danger, "Play failed", Some(msg.clone()));
                         inline_error.set(Some(msg));
                     }
                 }

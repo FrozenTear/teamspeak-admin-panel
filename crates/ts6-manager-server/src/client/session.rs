@@ -11,8 +11,13 @@
 //!    fresh token and returns.
 //! 3. Otherwise calls `POST /api/auth/refresh` once. On success, updates the
 //!    [`AuthState`] (in-memory + storage) and replays the original call.
-//! 4. **On any refresh failure invalidates the session** — no silent
-//!    looping.
+//! 4. **Only a 401 on the refresh call invalidates the session.** Other
+//!    failure modes (transport, 5xx, deserialise) propagate untouched so
+//!    the session survives a transient server hiccup or restart blip.
+//!    Spec §6.5.3 reuse-detection only surfaces as 401 + `Invalid or
+//!    expired token`; anything else means the rotation did not happen,
+//!    which is recoverable on a later retry. See PURA-214 for the
+//!    incident this contract was tightened against.
 //!
 //! The refresh transport is injected via [`RefreshFn`] so unit tests can
 //! exercise the locking + replay logic without touching the network.
@@ -194,11 +199,19 @@ impl RefreshGate {
                 f(replay).await
             }
             Err(e) => {
-                // Refresh failure: invalidate the session immediately.
-                // Spec §6.5.3 reuse-detection means a 401 here may indicate
-                // the family was revoked; either way the user must re-auth.
-                self.session.invalidate();
-                Err(translate_refresh_error(e))
+                // PURA-214 — only 401 on the refresh response means the
+                // session is unrecoverably dead (token replayed, family
+                // revoked, owning user disabled). Any other refresh
+                // failure (transport blip, 5xx from a restarting upstream,
+                // 502 through a proxy, JSON parse fail) is a transient
+                // signal — the rotation did not happen, but the refresh
+                // token is still valid in the DB. Keep the session
+                // authenticated so the next call retries; propagate the
+                // raw error so the caller can render the right banner.
+                if e.is_unauthorized() {
+                    self.session.invalidate();
+                }
+                Err(e)
             }
         }
     }
@@ -216,30 +229,6 @@ impl RefreshGate {
             }),
             AuthState::Anonymous => None,
         }
-    }
-}
-
-/// Surface a refresh-call failure to the original caller.
-///
-/// We always return some flavour of [`AuthError::Unauthorized`] so the route
-/// layer's "logged out" handler kicks in. The original error's message is
-/// preserved for debug logs even though most callers will only branch on the
-/// 401-ness.
-fn translate_refresh_error(e: AuthError) -> AuthError {
-    use ts6_manager_shared::auth::auth_error_strings as msg;
-    match e {
-        AuthError::Unauthorized(m) => AuthError::Unauthorized(m),
-        AuthError::Transport(m) => AuthError::Transport(m),
-        AuthError::Deserialise(m) => AuthError::Deserialise(m),
-        AuthError::Client { status, message } | AuthError::Server { status, message }
-            if status >= 500 =>
-        {
-            AuthError::Server { status, message }
-        }
-        AuthError::Client { .. } | AuthError::Server { .. } => {
-            AuthError::Unauthorized(msg::INVALID_TOKEN.into())
-        }
-        AuthError::UnsupportedTarget => AuthError::UnsupportedTarget,
     }
 }
 
@@ -479,6 +468,117 @@ mod tests {
             storage
                 .get(crate::client::store::SESSION_STORAGE_KEY)
                 .is_none()
+        );
+    }
+
+    /// PURA-214 regression — a 5xx, transport blip, or deserialise failure
+    /// from `/api/auth/refresh` MUST NOT bounce the user to /login. The
+    /// rotation didn't happen but the refresh token is still live in the
+    /// DB; the next call retries naturally and the session keeps running.
+    ///
+    /// Before the fix this test fails: the gate invalidated on any refresh
+    /// error and the user lost their session on every restart-blip during
+    /// the access-token expiry window.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn transient_refresh_failure_keeps_session_authenticated() {
+        use ts6_manager_shared::auth::auth_error_strings as msg;
+
+        for transient in [
+            AuthError::Server {
+                status: 502,
+                message: "Bad Gateway".into(),
+            },
+            AuthError::Server {
+                status: 503,
+                message: "Service Unavailable".into(),
+            },
+            AuthError::Transport("fetch failed".into()),
+            AuthError::Deserialise("not json".into()),
+        ] {
+            let storage = arc_storage(MemoryStore::new());
+            let session: Arc<dyn SessionHandle> = Arc::new(InMemorySession::new(
+                authed("old-access", "old-refresh"),
+                storage.clone(),
+            ));
+            let err_template = transient.clone();
+            let stub = StubRefresh::new(move |_| Err(err_template.clone()));
+            let gate = RefreshGate::new(session.clone(), stub.clone());
+
+            let req_calls = Arc::new(AtomicU32::new(0));
+            let req_clone = req_calls.clone();
+            let err = gate
+                .run(move |_| {
+                    let req = req_clone.clone();
+                    async move {
+                        req.fetch_add(1, Ordering::SeqCst);
+                        Err::<u32, _>(AuthError::Unauthorized(msg::INVALID_TOKEN.into()))
+                    }
+                })
+                .await
+                .unwrap_err();
+            // Raw refresh error surfaces — caller renders the right banner
+            // instead of "session expired".
+            match (&transient, &err) {
+                (AuthError::Server { status: a, .. }, AuthError::Server { status: b, .. }) => {
+                    assert_eq!(a, b)
+                }
+                (AuthError::Transport(_), AuthError::Transport(_)) => {}
+                (AuthError::Deserialise(_), AuthError::Deserialise(_)) => {}
+                (a, b) => panic!("variant mismatch — transient: {a:?}, got: {b:?}"),
+            }
+            assert!(
+                !err.is_unauthorized(),
+                "transient refresh failure must not surface as 401: {err:?}"
+            );
+            assert_eq!(stub.calls(), 1, "refresh fired exactly once");
+            assert_eq!(
+                req_calls.load(Ordering::SeqCst),
+                1,
+                "original request fired once (initial 401), no replay"
+            );
+            // Critical invariant: session stays Authenticated so the next
+            // call retries instead of bouncing through /login.
+            assert!(
+                session.read().is_authenticated(),
+                "transient refresh failure must NOT invalidate the session ({transient:?})"
+            );
+            assert!(
+                storage
+                    .get(crate::client::store::SESSION_STORAGE_KEY)
+                    .is_some(),
+                "persisted session blob must survive transient refresh failure"
+            );
+        }
+    }
+
+    /// PURA-214 — a 4xx that ISN'T a 401 (e.g. server returned 400 because
+    /// of a malformed request, an outdated client, or a deployment skew)
+    /// is also not a "session is dead" signal. Don't invalidate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn non_401_4xx_refresh_failure_keeps_session_authenticated() {
+        use ts6_manager_shared::auth::auth_error_strings as msg;
+
+        let storage = arc_storage(MemoryStore::new());
+        let session: Arc<dyn SessionHandle> = Arc::new(InMemorySession::new(
+            authed("old-access", "old-refresh"),
+            storage.clone(),
+        ));
+        let stub = StubRefresh::new(|_| {
+            Err(AuthError::Client {
+                status: 400,
+                message: "Bad Request".into(),
+            })
+        });
+        let gate = RefreshGate::new(session.clone(), stub.clone());
+
+        let err = gate
+            .run(|_| async { Err::<u32, _>(AuthError::Unauthorized(msg::INVALID_TOKEN.into())) })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AuthError::Client { status: 400, .. }));
+        assert!(
+            session.read().is_authenticated(),
+            "non-401 4xx must NOT kill the session"
         );
     }
 

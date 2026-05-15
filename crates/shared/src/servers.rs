@@ -30,6 +30,35 @@ pub struct CreateServerRequest {
     pub ssh_port: Option<i64>,
     pub ssh_username: Option<String>,
     pub ssh_password: Option<String>,
+    /// `"webquery"` (default) or `"ssh"`.
+    #[serde(default)]
+    pub control_path: Option<String>,
+    /// `"password"`, `"key"`, or `"agent"`. Only consulted when `controlPath == "ssh"`.
+    #[serde(default)]
+    pub ssh_auth_method: Option<String>,
+    /// SHA-256 host-key fingerprint. Required when `controlPath == "ssh"`.
+    #[serde(default)]
+    pub ssh_host_key_fingerprint: Option<String>,
+}
+
+/// `PATCH /api/servers/:id` request body. All fields optional — only supplied
+/// fields are mutated; omitted fields preserve the existing DB value.
+/// `apiKey` and `sshPassword` are re-sealed on mutation; omitted ciphertext
+/// is preserved unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PatchServerRequest {
+    pub name: Option<String>,
+    pub host: Option<String>,
+    pub webquery_port: Option<i64>,
+    pub api_key: Option<String>,
+    pub use_https: Option<bool>,
+    pub ssh_port: Option<i64>,
+    pub ssh_username: Option<String>,
+    pub ssh_password: Option<String>,
+    pub control_path: Option<String>,
+    pub ssh_auth_method: Option<String>,
+    pub ssh_host_key_fingerprint: Option<String>,
 }
 
 /// Response shape for both `GET /api/servers` (list) and the freshly
@@ -77,6 +106,9 @@ mod tests {
             ssh_port: Some(10022),
             ssh_username: Some("admin".into()),
             ssh_password: Some("pw".into()),
+            control_path: Some("ssh".into()),
+            ssh_auth_method: Some("password".into()),
+            ssh_host_key_fingerprint: Some("SHA256:abc".into()),
         };
         let json = serde_json::to_string(&req).unwrap();
         for forbidden in [

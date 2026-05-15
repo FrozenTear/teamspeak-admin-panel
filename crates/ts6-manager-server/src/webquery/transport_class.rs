@@ -135,10 +135,7 @@ pub fn classify_reqwest_error(err: &ReqwestError, url: &str) -> ClassifiedTransp
     if is_tls_failure(err, &chain) {
         return ClassifiedTransport {
             kind: WebQueryTransportKind::Tls,
-            message: format!(
-                "TLS handshake failed for {url}. ({})",
-                short_cause(&chain)
-            ),
+            message: format!("TLS handshake failed for {url}. ({})", short_cause(&chain)),
         };
     }
     // Some hickory/hyper builds surface "dns error: …" via a non-connect
