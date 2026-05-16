@@ -238,6 +238,12 @@ sub_flow_graph() {
 # The main graph (gate.md §2.2): trigger -> transform -> branch -> {logA,
 # logB, logDefault} -> logA -> parallel(fan_out) -> join. The transform sets
 # route="a", so branch case "a" fires and case "b"/default are pruned.
+#
+# `fan_out.collection` is the expression `trigger.context.items` — the v2
+# expression dialect has no array-literal syntax (`[ … ]` is the index
+# operator only), so the 2-element collection gate.md §2.2 calls for is
+# supplied via the fire context (step 6) and read back off the blackboard,
+# the pattern the engine's own parallel tests use.
 main_graph() {
     local sub_flow_id="$1" msg="$2"
     jq -n --argjson sub "$sub_flow_id" --arg msg "$msg" '{
@@ -264,7 +270,7 @@ main_graph() {
             config: { kind: "logLine", message: ($msg + " branch=default") } },
           { id: "fan_out", position: { x: -100, y: 400 },
             kind: "parallel",
-            collection: "[1, 2]",
+            collection: "trigger.context.items",
             subFlowId: $sub,
             maxConcurrency: 2 },
           { id: "join", position: { x: -100, y: 500 },
@@ -414,7 +420,9 @@ fi
 log "step 5 OK — flow $flow_id enabled"
 
 # --- Step 6: manual fire -----------------------------------------------------
-do_req 6 POST "$BASE_URL/api/flows/$flow_id/fire"
+# The fire context carries `items` — a 2-element array — which the `fan_out`
+# parallel node reads via `trigger.context.items` (see main_graph()).
+do_req 6 POST "$BASE_URL/api/flows/$flow_id/fire" '{"context":{"items":[1,2]}}'
 if [[ "$RESP_CODE" != "202" ]]; then
     fail "fire flow $flow_id: expected 202, got $RESP_CODE"
     try_cleanup "$flow_id"
