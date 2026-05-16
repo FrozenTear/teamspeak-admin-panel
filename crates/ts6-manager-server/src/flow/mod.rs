@@ -37,6 +37,8 @@ pub mod routes;
 pub mod trigger;
 
 #[cfg(test)]
+mod automod_seed_tests;
+#[cfg(test)]
 mod engine_tests;
 #[cfg(test)]
 mod routes_tests;

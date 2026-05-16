@@ -1,0 +1,39 @@
+{
+  "version": 2,
+  "graph": {
+    "nodes": [
+      {
+        "id": "channel_hop",
+        "label": "One client switches channel 6 times in 15 seconds",
+        "position": { "x": 0, "y": 0 },
+        "kind": "trigger",
+        "config": {
+          "kind": "ts6Flood",
+          "source": "clientMoved",
+          "threshold": 6,
+          "windowSecs": 15,
+          "scope": "subject"
+        }
+      },
+      {
+        "id": "mute",
+        "label": "Mute the client (talker flag)",
+        "position": { "x": 0, "y": 160 },
+        "kind": "action",
+        "config": {
+          "kind": "moderate",
+          "effect": "mute",
+          "reasonTemplate": "Automod: channel-hopping detected. Your talker flag has been revoked.",
+          "ruleKey": "automod-channel-hop-mute"
+        }
+      }
+    ],
+    "edges": [
+      {
+        "id": "e_trigger_mute",
+        "from": { "node": "channel_hop", "port": "out" },
+        "to": { "node": "mute", "port": "in" }
+      }
+    ]
+  }
+}

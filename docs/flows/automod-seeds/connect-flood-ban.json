@@ -1,0 +1,40 @@
+{
+  "version": 2,
+  "graph": {
+    "nodes": [
+      {
+        "id": "connect_flood",
+        "label": "One client reconnects 5 times in 30 seconds",
+        "position": { "x": 0, "y": 0 },
+        "kind": "trigger",
+        "config": {
+          "kind": "ts6Flood",
+          "source": "clientJoined",
+          "threshold": 5,
+          "windowSecs": 30,
+          "scope": "subject"
+        }
+      },
+      {
+        "id": "temp_ban",
+        "label": "Temporarily ban the client",
+        "position": { "x": 0, "y": 160 },
+        "kind": "action",
+        "config": {
+          "kind": "moderate",
+          "effect": "ban",
+          "durationSecs": 3600,
+          "reasonTemplate": "Automod: connection flood detected. This is a temporary ban; you may rejoin in one hour.",
+          "ruleKey": "automod-connect-flood-ban"
+        }
+      }
+    ],
+    "edges": [
+      {
+        "id": "e_trigger_ban",
+        "from": { "node": "connect_flood", "port": "out" },
+        "to": { "node": "temp_ban", "port": "in" }
+      }
+    ]
+  }
+}
