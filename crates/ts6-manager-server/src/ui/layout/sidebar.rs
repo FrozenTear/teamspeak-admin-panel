@@ -107,10 +107,13 @@ pub fn PlaceholderItem(props: PlaceholderItemProps) -> Element {
 pub struct SidebarProps {
     /// Currently matched route — used to flag the active item.
     pub active: Route,
-    /// PURA-237 — `true` when the signed-in operator has the `admin` role.
-    /// Drives visibility of the admin-only nav entries (ui-brief §5). The
-    /// `/admin/*` routes also enforce `RequireAdmin` server-side; this is
-    /// the front-end suppression so non-admins never see a link that 403s.
+    /// PURA-237 / PURA-238 — `true` when the signed-in operator has the
+    /// `admin` role. Drives visibility of the admin-only nav entries
+    /// (Users + Audit log) per `docs/admin/ui-brief.md` §5. The `/admin/*`
+    /// routes also enforce `RequireAdmin` server-side; this is the
+    /// front-end suppression so non-admins never see a link that 403s.
+    /// Defaults to `false` so the SSR chrome-snapshot harness — which has
+    /// no session context — keeps rendering the non-admin rail.
     #[props(default = false)]
     pub is_admin: bool,
 }
@@ -128,6 +131,7 @@ pub fn Sidebar(props: SidebarProps) -> Element {
     let video_sources_active = matches!(props.active, Route::VideoSourcesPage {});
     let settings_active = matches!(props.active, Route::SettingsPage {});
     let admin_users_active = matches!(props.active, Route::AdminUsersPage {});
+    let audit_active = matches!(props.active, Route::AuditPage {});
     // PURA-124 WS-6 — Music bots highlight when the route is the index
     // OR any of the per-bot detail / library / playlists / radio
     // surfaces, so the operator stays oriented across the whole flow.
@@ -199,6 +203,12 @@ pub fn Sidebar(props: SidebarProps) -> Element {
                         NavItem { icon: "◈", label: "Users", to: Route::AdminUsersPage {}, active: admin_users_active }
                     }
                     NavItem { icon: "≡", label: "Logs", to: Route::LogsPage {}, active: logs_active }
+                    // PURA-238 — audit-log viewer. Visible only to admin
+                    // sessions; non-admins never see the entry and hit a
+                    // 403 surface if they deep-link the route directly.
+                    if props.is_admin {
+                        NavItem { icon: "⊟", label: "Audit log", to: Route::AuditPage {}, active: audit_active }
+                    }
                     PlaceholderItem { icon: "◯", label: "Instance" }
                     NavItem { icon: "⚙", label: "Settings", to: Route::SettingsPage {}, active: settings_active }
                 }

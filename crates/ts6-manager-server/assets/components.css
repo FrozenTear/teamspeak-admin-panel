@@ -1487,3 +1487,170 @@
   color: var(--text-muted);
   font-size: var(--text-xs);
 }
+/* ─── PURA-238 — admin audit-log viewer ──────────────────────────────── */
+.audit-layout {
+  display: flex;
+  gap: var(--space-5);
+  align-items: flex-start;
+  margin-top: var(--space-5);
+}
+.audit-filters {
+  flex: 0 0 220px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  background: var(--bg-surface-raised);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: var(--space-5);
+  position: sticky;
+  top: var(--space-5);
+}
+.audit-filter { display: flex; flex-direction: column; gap: var(--space-2); }
+.audit-filter label {
+  font: var(--weight-semibold) var(--text-2xs) / var(--lh-2xs) var(--font-sans);
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.audit-main { flex: 1 1 auto; min-width: 0; }
+.audit-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--space-4);
+  margin-bottom: var(--space-4);
+}
+.audit-count { color: var(--text-secondary); font-size: var(--text-sm); }
+.audit-toolbar-actions { display: flex; gap: var(--space-3); }
+.audit-scroll {
+  max-height: 64vh;
+  overflow-y: auto;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+.audit-table { border: 0; border-radius: 0; }
+.audit-table thead th { position: sticky; top: 0; z-index: var(--z-sticky); }
+.audit-row { cursor: pointer; }
+.audit-row:focus-visible {
+  outline: 2px solid var(--accent-fg);
+  outline-offset: -2px;
+}
+.audit-row.is-selected { background: var(--bg-selected); }
+.audit-row--failure td:first-child { box-shadow: inset 2px 0 0 var(--danger-fg); }
+.audit-time {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+}
+.audit-deleted { font-style: italic; color: var(--text-muted); }
+.audit-payload-cell { max-width: 280px; }
+.audit-payload-preview {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.audit-load-more { margin: var(--space-4); width: calc(100% - var(--space-7)); }
+
+/* Kind badges — semantic palette for the ten v1.1 event kinds. */
+.audit-kind {
+  display: inline-block;
+  padding: 1px var(--space-3);
+  border-radius: var(--radius-full);
+  font: var(--weight-semibold) var(--text-2xs) / 1.7 var(--font-sans);
+  white-space: nowrap;
+}
+.audit-kind--create { background: var(--success-bg); color: var(--text-inverse); }
+.audit-kind--remove { background: var(--danger-bg); color: var(--text-inverse); }
+.audit-kind--security { background: var(--warning-bg); color: var(--text-inverse); }
+.audit-kind--role { background: var(--accent-bg); color: var(--text-inverse); }
+.audit-kind--neutral { background: var(--bg-hover); color: var(--text-secondary); }
+
+.audit-outcome { font-size: var(--text-xs); text-transform: capitalize; }
+.audit-outcome--failure { color: var(--danger-fg); font-weight: var(--weight-semibold); }
+.audit-outcome--success { color: var(--text-muted); }
+
+/* Detail panel — the third column of the three-column layout. */
+.audit-detail {
+  flex: 0 0 340px;
+  align-self: stretch;
+  display: flex;
+  flex-direction: column;
+  max-height: 72vh;
+  background: var(--bg-surface-raised);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  position: sticky;
+  top: var(--space-5);
+}
+.audit-detail-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: var(--space-4) var(--space-5);
+  border-bottom: 1px solid var(--border-subtle);
+}
+.audit-detail-header h2 {
+  margin: 0;
+  font: var(--weight-semibold) var(--text-md) / var(--lh-md) var(--font-sans);
+}
+.audit-detail-body { flex: 1 1 auto; overflow-y: auto; padding: var(--space-5); }
+.audit-detail-fields {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.audit-detail-field { display: flex; flex-direction: column; gap: 1px; }
+.audit-detail-field dt {
+  font: var(--weight-semibold) var(--text-2xs) / var(--lh-2xs) var(--font-sans);
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.audit-detail-field dd {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text-primary);
+  word-break: break-word;
+}
+.audit-detail-subhead {
+  margin: var(--space-5) 0 var(--space-3);
+  font: var(--weight-semibold) var(--text-sm) / var(--lh-sm) var(--font-sans);
+}
+.audit-payload-full {
+  margin: 0;
+  padding: var(--space-4);
+  background: var(--bg-surface-sunken);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 280px;
+  overflow-y: auto;
+}
+.audit-detail-footer {
+  padding: var(--space-4) var(--space-5);
+  border-top: 1px solid var(--border-subtle);
+  display: flex;
+  justify-content: flex-end;
+}
+
+/* Desktop-first; the filter rail and detail panel stack on narrow
+   viewports (ui-brief §7 — mobile-acceptable). */
+@media (max-width: 900px) {
+  .audit-layout { flex-direction: column; }
+  .audit-filters,
+  .audit-detail {
+    flex-basis: auto;
+    width: 100%;
+    position: static;
+    max-height: none;
+  }
+}

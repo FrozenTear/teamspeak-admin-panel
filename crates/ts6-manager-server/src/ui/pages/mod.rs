@@ -28,7 +28,7 @@ mod setup;
 mod video_sources;
 mod widgets;
 
-pub use admin::AdminUsersPage;
+pub use admin::{AdminUsersPage, AuditPage};
 pub use bans::BansPage;
 pub use channels::ChannelsPage;
 pub use clients::ClientsPage;

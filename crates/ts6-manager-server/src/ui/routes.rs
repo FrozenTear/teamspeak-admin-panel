@@ -20,7 +20,7 @@ use crate::ui::layout::AppShell;
 #[cfg(debug_assertions)]
 use crate::ui::pages::DevVideoPlayerPage;
 use crate::ui::pages::{
-    AdminUsersPage, BansPage, BotDetailPage, BotsIndexPage, ChannelsPage, ClientsPage,
+    AdminUsersPage, AuditPage, BansPage, BotDetailPage, BotsIndexPage, ChannelsPage, ClientsPage,
     DashboardPlaceholder, FlowDetailPage, FlowEditPage, FlowFormPage, FlowsListPage, Home,
     LoginPage, LogsPage, MusicLibraryPage, MusicPlaylistsPage, NotFoundPage, PublicWidgetPage,
     RadioStationsPage, ServerEditPage, ServerInfoPage, ServersIndexPage, SettingsPage, SetupPage,
@@ -140,6 +140,14 @@ pub enum Route {
     // a 403 surface rather than a doomed fetch loop.
     #[route("/admin/users")]
     AdminUsersPage {},
+
+    // PURA-238 — v1.1 admin audit-log viewer. Admin-gated: the sidebar
+    // entry is hidden for non-admins and `AuditPage` renders an in-page
+    // 403 surface if a non-admin reaches the route directly. The route
+    // itself stays mountable for everyone so the gate is a clean 403
+    // page rather than a NotFound fall-through.
+    #[route("/admin/audit")]
+    AuditPage {},
 
     // PURA-213 — catch-all NotFound. Lives outside `AppShell` so the page
     // renders for both authed and anon visitors without an auth bounce
