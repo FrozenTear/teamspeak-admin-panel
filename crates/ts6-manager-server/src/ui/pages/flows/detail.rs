@@ -4,9 +4,11 @@
 //! surface; Definition is the read-only canvas view of the flow graph
 //! (edit lives at `/flows/{id}/edit`).
 
+use std::collections::HashMap;
+
 use dioxus::prelude::*;
 use ts6_manager_shared::flows as wire;
-use ts6_manager_shared::flows::v2::{self, project_legacy};
+use ts6_manager_shared::flows::v2::{self, NodeId, project_legacy};
 
 use crate::client::api::ApiError;
 use crate::client::dioxus::{use_auth_gate, use_session};
@@ -14,7 +16,7 @@ use crate::client::flows as fl;
 use crate::client::store::AuthState;
 use crate::ui::components::toast::{ToastVariant, use_toaster};
 use crate::ui::components::{Banner, BannerVariant, Button, ButtonSize, ButtonVariant};
-use crate::ui::pages::flows::canvas::FlowCanvasEditor;
+use crate::ui::pages::flows::canvas::{FlowCanvasEditor, RunOverlayStatus};
 use crate::ui::pages::flows::dialog::{ConfirmDialog, DeletePrompt};
 use crate::ui::pages::flows::shared::{
     ADMIN_ONLY_HINT, action_status_badge_class, action_status_icon, action_status_label,
@@ -124,6 +126,55 @@ pub fn FlowDetailPage(flow_id: i64) -> Element {
     let bump_flow = move || reload.with_mut(|n| *n += 1);
     let bump_runs = move || runs_reload.with_mut(|n| *n += 1);
 
+    // ── Run-overlay poll ─────────────────────────────────────────────────
+    // When a run is active (`active_run` is Some), poll `get_run_detail`
+    // every ~1 s and map nodeResults to per-node overlay status. The poll
+    // stops automatically when the run leaves InFlight (resource returns
+    // None when the predicate fails, clearing the overlay state).
+    let mut active_run: Signal<Option<wire::FlowRunId>> = use_signal(|| None);
+    let mut run_overlay: Signal<Option<HashMap<NodeId, RunOverlayStatus>>> =
+        use_signal(|| None);
+
+    let _overlay_poll = {
+        let gate = gate.clone();
+        use_resource(move || {
+            let run_id = *active_run.read();
+            let gate = gate.clone();
+            async move {
+                let run_id = run_id?;
+                // 1 s interval — short enough to feel live, long enough not
+                // to hammer the server for a typically-fast flow run.
+                gloo_timers::future::TimeoutFuture::new(1_000).await;
+                fl::get_run_detail(gate, flow, run_id).await.ok()
+            }
+        })
+    };
+
+    // Drive the overlay signal from the poll result each render cycle.
+    use_effect(move || {
+        if let Some(Some(run_view)) = _overlay_poll.read().clone() {
+            if run_view.summary.status == wire::FlowRunStatus::InFlight {
+                // Still running — synthesise the overlay: finished nodes
+                // carry their NodeStatus; unfinished nodes show Running.
+                let finished: HashMap<NodeId, RunOverlayStatus> = run_view
+                    .node_results
+                    .iter()
+                    .map(|r| (r.node_id.clone(), RunOverlayStatus::from_node_status(r.status)))
+                    .collect();
+                run_overlay.set(Some(finished));
+            } else {
+                // Run finished — show final states then clear the poll.
+                let final_states: HashMap<NodeId, RunOverlayStatus> = run_view
+                    .node_results
+                    .iter()
+                    .map(|r| (r.node_id.clone(), RunOverlayStatus::from_node_status(r.status)))
+                    .collect();
+                run_overlay.set(Some(final_states));
+                active_run.set(None);
+            }
+        }
+    });
+
     let on_fire = {
         let gate = gate.clone();
         let mut bump_runs = bump_runs;
@@ -137,6 +188,11 @@ pub fn FlowDetailPage(flow_id: i64) -> Element {
                             format!("Fired run #{}", resp.run_id.0),
                             None,
                         );
+                        // Start the run-overlay poll and switch to the
+                        // Definition tab so the operator sees the canvas light up.
+                        active_run.set(Some(resp.run_id));
+                        run_overlay.set(None);
+                        tab.set(DetailTab::Definition);
                         bump_runs();
                     }
                     Err(e) => {
@@ -347,7 +403,11 @@ pub fn FlowDetailPage(flow_id: i64) -> Element {
                     }),
                 }
             } else {
-                DefinitionPanel { flow: f, is_admin }
+                DefinitionPanel {
+                    flow: f,
+                    is_admin,
+                    run_overlay: run_overlay.read().clone(),
+                }
             }
         }
 
@@ -782,14 +842,17 @@ fn RunDrawer(props: RunDrawerProps) -> Element {
 struct DefinitionPanelProps {
     flow: v2::FlowView,
     is_admin: bool,
+    run_overlay: Option<HashMap<NodeId, RunOverlayStatus>>,
 }
 
 /// Read-only canvas view of the flow graph. v1.1 flows are projected into a
 /// degenerate path graph via `project_legacy` so the canvas can display them.
+/// When `run_overlay` is Some, per-node status is painted on the canvas.
 #[component]
 fn DefinitionPanel(props: DefinitionPanelProps) -> Element {
     let f = props.flow.clone();
     let is_admin = props.is_admin;
+    let run_overlay = props.run_overlay.clone();
     let definition_locked = f.enabled;
 
     let graph = f
@@ -838,7 +901,7 @@ fn DefinitionPanel(props: DefinitionPanelProps) -> Element {
             FlowCanvasEditor {
                 initial: graph,
                 read_only: true,
-                run_overlay: None,
+                run_overlay,
                 on_save: None,
             }
         }

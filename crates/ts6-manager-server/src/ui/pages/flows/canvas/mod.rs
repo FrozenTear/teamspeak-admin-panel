@@ -34,4 +34,4 @@ mod style;
 #[cfg(debug_assertions)]
 pub use editor::DevFlowCanvasPage;
 pub use editor::FlowCanvasEditor;
-pub use model::starter_graph;
+pub use model::{RunOverlayStatus, starter_graph};
