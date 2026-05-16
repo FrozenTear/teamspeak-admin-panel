@@ -107,6 +107,12 @@ pub fn PlaceholderItem(props: PlaceholderItemProps) -> Element {
 pub struct SidebarProps {
     /// Currently matched route — used to flag the active item.
     pub active: Route,
+    /// PURA-237 — `true` when the signed-in operator has the `admin` role.
+    /// Drives visibility of the admin-only nav entries (ui-brief §5). The
+    /// `/admin/*` routes also enforce `RequireAdmin` server-side; this is
+    /// the front-end suppression so non-admins never see a link that 403s.
+    #[props(default = false)]
+    pub is_admin: bool,
 }
 
 #[allow(non_snake_case)]
@@ -121,6 +127,7 @@ pub fn Sidebar(props: SidebarProps) -> Element {
     let widgets_active = matches!(props.active, Route::WidgetsPage {});
     let video_sources_active = matches!(props.active, Route::VideoSourcesPage {});
     let settings_active = matches!(props.active, Route::SettingsPage {});
+    let admin_users_active = matches!(props.active, Route::AdminUsersPage {});
     // PURA-124 WS-6 — Music bots highlight when the route is the index
     // OR any of the per-bot detail / library / playlists / radio
     // surfaces, so the operator stays oriented across the whole flow.
@@ -185,6 +192,12 @@ pub fn Sidebar(props: SidebarProps) -> Element {
                 }
 
                 NavGroup { label: "Admin",
+                    // PURA-237 — admin user management. Visible only to
+                    // admin sessions; the route + `/api/users` both enforce
+                    // `RequireAdmin` independently of this suppression.
+                    if props.is_admin {
+                        NavItem { icon: "◈", label: "Users", to: Route::AdminUsersPage {}, active: admin_users_active }
+                    }
                     NavItem { icon: "≡", label: "Logs", to: Route::LogsPage {}, active: logs_active }
                     PlaceholderItem { icon: "◯", label: "Instance" }
                     NavItem { icon: "⚙", label: "Settings", to: Route::SettingsPage {}, active: settings_active }
@@ -372,6 +385,55 @@ mod tests {
         assert_eq!(
             tabindex_minus, 10,
             "expected 10 tabindex='-1' (9 placeholders + nav landmark), got {tabindex_minus}"
+        );
+    }
+
+    // ── PURA-237 — admin nav gating ───────────────────────────────────────
+
+    /// Mirror of [`TestRoute`] for the `is_admin = true` harness. A separate
+    /// one-route enum keeps the admin-on render isolated from the default
+    /// `SidebarHarness` so the placeholder-count test above stays stable.
+    #[derive(Clone, Routable, Debug, PartialEq)]
+    #[rustfmt::skip]
+    enum AdminTestRoute {
+        #[route("/dashboard")]
+        AdminSidebarHarness {},
+    }
+
+    #[component]
+    fn AdminSidebarHarness() -> Element {
+        rsx! { Sidebar { active: Route::DashboardPlaceholder {}, is_admin: true } }
+    }
+
+    fn render_admin_sidebar() -> String {
+        let history: Rc<dyn History> = Rc::new(MemoryHistory::with_initial_path("/dashboard"));
+        fn root() -> Element {
+            rsx! { Router::<AdminTestRoute> {} }
+        }
+        let mut dom = VirtualDom::new(root).with_root_context(history);
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    /// ui-brief §5 — an admin session sees the admin user-management nav
+    /// entry pointing at `/admin/users`.
+    #[test]
+    fn admin_session_sees_users_nav_entry() {
+        let html = render_admin_sidebar();
+        assert!(
+            html.contains(r#"href="/admin/users""#),
+            "admin nav must link to /admin/users: {html}"
+        );
+    }
+
+    /// The default harness (`is_admin` defaults to `false`) must NOT render
+    /// the admin nav entry — a non-admin never sees a link that would 403.
+    #[test]
+    fn non_admin_session_hides_users_nav_entry() {
+        let html = render_sidebar_harness();
+        assert!(
+            !html.contains("/admin/users"),
+            "non-admin sidebar must not surface the admin nav link: {html}"
         );
     }
 }

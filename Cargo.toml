@@ -71,6 +71,9 @@ web-sys = { version = "0.3", features = [
     "MessageEvent",
     "Event",
     "EventTarget",
+    # PURA-237 — browser CSPRNG for the admin create/edit "suggest a strong
+    # password" button (`crypto.getRandomValues`, docs/admin/ui-brief.md §3.2).
+    "Crypto",
     # PURA-143 WS-5 — Dioxus video player (WebTransport + WebCodecs + WebAudio).
     # The widget opens a WT session against the sidecar's QUIC listener,
     # subscribes to `<source-id>/video|audio` via moq-lite-04, decodes VP8 to a
