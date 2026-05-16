@@ -72,6 +72,26 @@
 
 .btn-block { width: 100%; }
 
+/* ─── Link ───────────────────────────────────────────── */
+/* PURA-294: bare anchors (route breadcrumbs, in-table case links,
+ * the moderation timeline's case-link) consume the --text-link
+ * token. Without this rule an unclassed `Link` falls through to the
+ * UA default anchor colour (#0000EE) — ~2:1 on --bg-canvas, which
+ * axe flags as color-contrast (serious). --text-link (#3CBEEF)
+ * clears WCAG-AA 4.5:1 with margin on every dark surface: 9.0:1 on
+ * --bg-canvas, 8.5:1 on --bg-surface, 8.0:1 on --bg-surface-raised,
+ * so it also satisfies the small-text threshold (e.g. the text-xs
+ * .mod-timeline-caselink). Button-styled links (.btn-primary /
+ * -secondary / -ghost / -danger) keep their own colour — a class
+ * selector outranks this element rule. The UA underline is kept as
+ * the non-colour affordance (WCAG 1.4.1). */
+a {
+  color: var(--text-link);
+}
+a:hover {
+  color: var(--c-accent-700);
+}
+
 /* ─── Input ──────────────────────────────────────────── */
 .input {
   width: 100%;
