@@ -344,9 +344,28 @@ pub fn appeal_url(base: Option<&str>, wire_token: &str) -> String {
     public_url(base, "appeal", wire_token)
 }
 
-/// Build the report-form URL for `wire_token`. See [`appeal_url`].
-pub fn report_url(base: Option<&str>, wire_token: &str) -> String {
-    public_url(base, "report", wire_token)
+/// Build the report-form URL for `wire_token`.
+///
+/// The report-challenge token is UID-bound, not server-bound, but the
+/// report form needs the `serverConfigId` / `virtualServerId` scope to
+/// file the report (`PublicReportRequest`). The poke is the only channel
+/// that reaches the proven UID, so the scope rides the URL it delivers —
+/// the form page reads all three from the query string. See [`appeal_url`]
+/// for the base-URL handling.
+pub fn report_url(
+    base: Option<&str>,
+    wire_token: &str,
+    server_config_id: i64,
+    virtual_server_id: i64,
+) -> String {
+    let path = format!(
+        "/moderation/report?token={wire_token}\
+         &serverConfigId={server_config_id}&virtualServerId={virtual_server_id}"
+    );
+    match base {
+        Some(b) => format!("{}{path}", b.trim_end_matches('/')),
+        None => path,
+    }
 }
 
 fn public_url(base: Option<&str>, form: &str, wire_token: &str) -> String {
@@ -414,6 +433,7 @@ fn resolve_clid(clients: &[crate::webquery::models::ClientEntry], uid: &str) -> 
 /// connection or none.
 pub async fn deliver_report_challenge(
     backend: &dyn ControlBackend,
+    server_config_id: i64,
     sid: i64,
     uid: &str,
     wire_token: &str,
@@ -425,7 +445,7 @@ pub async fn deliver_report_challenge(
     let msg = format!(
         "[Moderation] To file your report, open this single-use link \
          (valid 15 minutes): {}",
-        report_url(base_url, wire_token)
+        report_url(base_url, wire_token, server_config_id, sid)
     );
     // targetmode=1 — a private message to exactly this clid.
     backend.sendtextmessage(sid, 1, clid, &msg).await?;
@@ -700,10 +720,12 @@ mod tests {
             appeal_url(Some("https://ts.example.com"), "tok123"),
             "https://ts.example.com/moderation/appeal?token=tok123"
         );
-        // Trailing slash on the base is normalised.
+        // Trailing slash on the base is normalised; the report URL also
+        // carries the server scope the report form needs (PURA-309).
         assert_eq!(
-            report_url(Some("https://ts.example.com/"), "tok123"),
-            "https://ts.example.com/moderation/report?token=tok123"
+            report_url(Some("https://ts.example.com/"), "tok123", 7, 3),
+            "https://ts.example.com/moderation/report?token=tok123\
+             &serverConfigId=7&virtualServerId=3"
         );
         // No base configured → site-relative path, no panic.
         assert_eq!(

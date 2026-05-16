@@ -43,6 +43,7 @@
 #![allow(clippy::result_large_err)]
 
 pub mod appeals;
+pub mod forms;
 pub mod metrics;
 pub mod reports;
 
@@ -135,6 +136,20 @@ pub fn router(trusted_proxy_cidrs: Vec<IpNet>) -> Router<AppState> {
             get(appeals::view_redacted_case),
         )
         .route("/api/public/moderation/appeals", post(appeals::submit))
+        // PURA-309 — the server-rendered public report / appeal web forms.
+        // These are HTML pages, not the `/api/*` JSON surface; the poke /
+        // ban-reason links the token layer mints point exactly here. They
+        // share this router's rate-limit + body-size middleware (page GETs
+        // count against the per-IP bucket — token-probing the appeal page
+        // is itself the threat, brief §4.4).
+        .route(
+            "/moderation/report",
+            get(forms::report_form).post(forms::report_submit),
+        )
+        .route(
+            "/moderation/appeal",
+            get(forms::appeal_form).post(forms::appeal_submit),
+        )
         // Inner: per-IP rate limit + client-IP attribution. Outer: body
         // cap, so an oversized body is rejected before anything else.
         .layer(axum::middleware::from_fn_with_state(
@@ -306,6 +321,12 @@ pub(super) async fn flag_enabled(state: &AppState, key: &str) -> bool {
 pub(super) const FLAG_REPORTS_ENABLED: &str = "moderation.reports.enabled";
 /// `app_setting` key — appeals kill-switch.
 pub(super) const FLAG_APPEALS_ENABLED: &str = "moderation.appeals.enabled";
+/// `app_setting` key — per-server CAPTCHA / proof-of-work toggle for the
+/// public forms (PURA-309, brief §4.6). Default off; when on, the forms
+/// render a verification placeholder. The challenge itself is **not**
+/// implemented — integration is deferred per plan §7, so this is the
+/// stubbed config seam, not an enforced gate.
+pub(super) const FLAG_CAPTCHA_ENABLED: &str = "moderation.captcha.enabled";
 
 /// Hash a client IP for `sourceIpHash` storage (brief §5 / §6 hook 6 —
 /// abuse correlation without persisting raw PII).

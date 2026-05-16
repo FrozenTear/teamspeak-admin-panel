@@ -503,3 +503,218 @@ fn source_ip_hash_is_deterministic_and_keyed() {
     assert_ne!(a, "198.51.100.42", "the raw IP is never the stored value");
     assert_eq!(a.len(), 64, "SHA-256 hex");
 }
+
+// ---- PURA-309: server-rendered public report / appeal forms -----------
+//
+// Each test below drives the HTML form routes through the real router
+// (rate-limit + body-cap middleware included). They use a distinct peer
+// IP per test so the process-wide per-IP token bucket is never the thing
+// under test here.
+
+/// GET a form page, attributed to a caller-chosen peer so each test gets
+/// its own per-IP rate-limit bucket.
+fn get_from(uri: &str, peer: &str) -> Request<Body> {
+    let mut req = Request::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .body(Body::empty())
+        .unwrap();
+    req.extensions_mut()
+        .insert(ConnectInfo(peer.parse::<SocketAddr>().unwrap()));
+    req
+}
+
+/// POST an `application/x-www-form-urlencoded` body — the native HTML
+/// `<form>` content type the server-rendered pages submit.
+fn post_form_from(uri: &str, body: &str, peer: &str) -> Request<Body> {
+    let mut req = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    req.extensions_mut()
+        .insert(ConnectInfo(peer.parse::<SocketAddr>().unwrap()));
+    req
+}
+
+async fn body_text(resp: axum::response::Response) -> String {
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+#[tokio::test]
+async fn report_form_404_when_flag_disabled() {
+    let state = fresh_state().await;
+    let resp = app(state)
+        .oneshot(get_from("/moderation/report", "198.51.100.1:40000"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn report_form_renders_request_link_step_with_server_scope() {
+    let state = fresh_state().await;
+    enable(&state, FLAG_REPORTS_ENABLED).await;
+    let resp = app(state)
+        .oneshot(get_from(
+            "/moderation/report?serverConfigId=1&virtualServerId=1",
+            "198.51.100.2:40000",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let html = body_text(resp).await;
+    assert!(
+        html.contains("name=\"uid\""),
+        "request-link step has a UID field"
+    );
+    assert!(html.contains("Send me a report link"));
+    // No JavaScript on the public form — pure server-rendered HTML.
+    assert!(!html.contains("<script"), "the form must ship no script");
+}
+
+#[tokio::test]
+async fn report_form_renders_report_form_when_token_present() {
+    let state = fresh_state().await;
+    enable(&state, FLAG_REPORTS_ENABLED).await;
+    let resp = app(state)
+        .oneshot(get_from(
+            "/moderation/report?token=abc.def&serverConfigId=2&virtualServerId=3",
+            "198.51.100.3:40000",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let html = body_text(resp).await;
+    assert!(
+        html.contains("name=\"statement\""),
+        "report form has a statement field"
+    );
+    assert!(
+        html.contains("value=\"abc.def\""),
+        "the token is carried as a hidden field"
+    );
+    assert!(html.contains("value=\"2\"") && html.contains("value=\"3\""));
+}
+
+#[tokio::test]
+async fn report_submit_invalid_token_renders_forbidden_page() {
+    let state = fresh_state().await;
+    enable(&state, FLAG_REPORTS_ENABLED).await;
+    let body = "token=deadbeef.cafe&server_config_id=1&virtual_server_id=1\
+                &subject=bad-actor&category=spam&statement=spamming";
+    let resp = app(state)
+        .oneshot(post_form_from(
+            "/moderation/report",
+            body,
+            "198.51.100.4:40000",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert!(body_text(resp).await.contains("Invalid or expired"));
+}
+
+#[tokio::test]
+async fn appeal_form_404_when_flag_disabled() {
+    let state = fresh_state().await;
+    let resp = app(state)
+        .oneshot(get_from(
+            "/moderation/appeal?token=x.y",
+            "198.51.100.5:40000",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn appeal_form_shows_info_page_without_a_token() {
+    let state = fresh_state().await;
+    enable(&state, FLAG_APPEALS_ENABLED).await;
+    let resp = app(state)
+        .oneshot(get_from("/moderation/appeal", "198.51.100.6:40000"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(body_text(resp).await.contains("open the appeal link"));
+}
+
+#[tokio::test]
+async fn appeal_form_renders_redacted_case_and_form() {
+    let state = fresh_state().await;
+    enable(&state, FLAG_APPEALS_ENABLED).await;
+    let case_id = actioned_case(&state, "subject-uid-form").await;
+    let minted = tokens::mint_appeal(&state.db, case_id).await.unwrap();
+
+    let resp = app(state)
+        .oneshot(get_from(
+            &format!("/moderation/appeal?token={}", minted.plaintext),
+            "198.51.100.7:40000",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let html = body_text(resp).await;
+    assert!(
+        html.contains("banned for spam"),
+        "the redacted reason is shown"
+    );
+    assert!(
+        html.contains("Submit an appeal"),
+        "an appealable case offers the form"
+    );
+    assert!(html.contains("name=\"statement\""));
+}
+
+#[tokio::test]
+async fn appeal_submit_files_appeal_and_renders_confirmation() {
+    let state = fresh_state().await;
+    enable(&state, FLAG_APPEALS_ENABLED).await;
+    let case_id = actioned_case(&state, "subject-uid-submit").await;
+    let minted = tokens::mint_appeal(&state.db, case_id).await.unwrap();
+
+    let body = format!(
+        "token={}&statement=This+action+was+a+mistake",
+        minted.plaintext
+    );
+    let resp = app(state.clone())
+        .oneshot(post_form_from(
+            "/moderation/appeal",
+            &body,
+            "198.51.100.8:40000",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(body_text(resp).await.contains("Appeal submitted"));
+
+    let appeals = moderation_appeals::list_for_case(&state.db, case_id)
+        .await
+        .unwrap();
+    assert_eq!(appeals.len(), 1, "the appeal row was written");
+    assert_eq!(appeals[0].status, "pending");
+}
+
+#[tokio::test]
+async fn captcha_stub_renders_only_when_the_flag_is_on() {
+    let state = fresh_state().await;
+    enable(&state, FLAG_REPORTS_ENABLED).await;
+    enable(&state, FLAG_CAPTCHA_ENABLED).await;
+    let resp = app(state)
+        .oneshot(get_from(
+            "/moderation/report?serverConfigId=1&virtualServerId=1",
+            "198.51.100.9:40000",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        body_text(resp)
+            .await
+            .contains("additional verification enabled"),
+        "the CAPTCHA placeholder appears when the toggle is on",
+    );
+}

@@ -39,11 +39,11 @@ use super::{
 /// Report categories accepted by convention (brief §5). A free-text
 /// category would be one more un-vetted string on an unauthenticated
 /// route; a closed set keeps the operator triage queue tidy.
-const CATEGORIES: &[&str] = &["spam", "harassment", "other"];
+pub(super) const CATEGORIES: &[&str] = &["spam", "harassment", "other"];
 
 /// Max length of the optional evidence URL. No file uploads on the 9.2
 /// public surface — a URL field only (brief §4.5).
-const MAX_URL_LEN: usize = 2048;
+pub(super) const MAX_URL_LEN: usize = 2048;
 
 /// `POST /api/public/moderation/request-report-link` — mint + poke-deliver
 /// a `report_challenge_token` to the connected client holding `uid`.
@@ -106,6 +106,7 @@ pub async fn request_report_link(
 
     match tokens::deliver_report_challenge(
         backend.as_ref(),
+        req.server_config_id,
         req.virtual_server_id,
         uid,
         &minted.plaintext,
