@@ -509,7 +509,7 @@ impl UpdateFlowBody {
 /// [`super::Flow`] field, an explicit [`FlowVersion`], and the stored spec
 /// shape — `graph` for a v2 flow, `definition` for a legacy one (exactly
 /// one is ever present). PURA-267's canvas consumes this verbatim.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FlowView {
     pub id: FlowId,
@@ -538,7 +538,7 @@ impl FlowView {
 
 /// Compact run row — the v1.1 summary plus a [`FlowVersion`] badge
 /// (`http-api.md` §4).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FlowRunSummaryView {
     pub id: FlowRunId,

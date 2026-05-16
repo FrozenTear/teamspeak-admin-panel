@@ -1,11 +1,12 @@
 //! `/flows/{id}` — per-flow operator surface.
 //!
 //! Tabs: Runs (default) + Definition. Runs is the operator's debugging
-//! surface; Definition is the read-only view of the trigger + actions
+//! surface; Definition is the read-only canvas view of the flow graph
 //! (edit lives at `/flows/{id}/edit`).
 
 use dioxus::prelude::*;
 use ts6_manager_shared::flows as wire;
+use ts6_manager_shared::flows::v2::{self, project_legacy};
 
 use crate::client::api::ApiError;
 use crate::client::dioxus::{use_auth_gate, use_session};
@@ -13,13 +14,13 @@ use crate::client::flows as fl;
 use crate::client::store::AuthState;
 use crate::ui::components::toast::{ToastVariant, use_toaster};
 use crate::ui::components::{Banner, BannerVariant, Button, ButtonSize, ButtonVariant};
+use crate::ui::pages::flows::canvas::FlowCanvasEditor;
 use crate::ui::pages::flows::dialog::{ConfirmDialog, DeletePrompt};
 use crate::ui::pages::flows::shared::{
-    ADMIN_ONLY_HINT, action_kind_icon, action_kind_label, action_status_badge_class,
-    action_status_icon, action_status_label, action_wire_kind_icon, action_wire_kind_label,
-    admin_only_title, enabled_badge_class, enabled_label, format_error, is_run_in_flight_conflict,
-    relative_when, run_status_badge_class, run_status_hint, run_status_icon, run_status_label,
-    trigger_summary,
+    ADMIN_ONLY_HINT, action_status_badge_class, action_status_icon, action_status_label,
+    action_wire_kind_icon, action_wire_kind_label, admin_only_title, enabled_badge_class,
+    enabled_label, format_error, is_run_in_flight_conflict, relative_when, run_status_badge_class,
+    run_status_hint, run_status_icon, run_status_label, trigger_summary,
 };
 use crate::ui::routes::Route;
 
@@ -49,7 +50,7 @@ pub fn FlowDetailPage(flow_id: i64) -> Element {
         .map(|u| u.role.eq_ignore_ascii_case("admin"))
         .unwrap_or(false);
 
-    let mut detail: Signal<Option<wire::Flow>> = use_signal(|| None);
+    let mut detail: Signal<Option<v2::FlowView>> = use_signal(|| None);
     let mut detail_error: Signal<Option<ApiError>> = use_signal(|| None::<ApiError>);
     let mut detail_loading: Signal<bool> = use_signal(|| true);
     let mut reload: Signal<u64> = use_signal(|| 0u64);
@@ -60,7 +61,7 @@ pub fn FlowDetailPage(flow_id: i64) -> Element {
             let gate = gate.clone();
             let _ = *reload.peek();
             let _ = reload.read();
-            async move { fl::get_flow(gate, flow).await }
+            async move { fl::get_flow_view(gate, flow).await }
         }
     });
 
@@ -151,12 +152,12 @@ pub fn FlowDetailPage(flow_id: i64) -> Element {
         let mut bump_flow = bump_flow;
         move |currently_enabled: bool| {
             let gate = gate.clone();
-            let body = wire::UpdateFlowRequest {
+            let body = v2::UpdateFlowBody {
                 enabled: Some(!currently_enabled),
                 ..Default::default()
             };
             spawn(async move {
-                match fl::update_flow(gate, flow, &body).await {
+                match fl::update_graph_flow(gate, flow, &body).await {
                     Ok(_) => {
                         toaster.push(
                             ToastVariant::Success,
@@ -386,7 +387,7 @@ pub fn FlowDetailPage(flow_id: i64) -> Element {
 
 #[derive(Props, Clone, PartialEq)]
 struct FlowHeaderProps {
-    flow: wire::Flow,
+    flow: v2::FlowView,
     is_admin: bool,
     on_fire: EventHandler<()>,
     on_toggle_enabled: EventHandler<bool>,
@@ -402,6 +403,11 @@ fn FlowHeader(props: FlowHeaderProps) -> Element {
     let on_delete = props.on_delete;
     let enabled = f.enabled;
     let edit_route = Route::FlowEditPage { flow_id: f.id.0 };
+    let trig_label = f
+        .definition
+        .as_ref()
+        .map(|d| trigger_summary(&d.trigger))
+        .unwrap_or_else(|| "graph".into());
     rsx! {
         section { class: "page-header",
             div { class: "page-title-block",
@@ -411,7 +417,7 @@ fn FlowHeader(props: FlowHeaderProps) -> Element {
                         "{enabled_label(enabled)}"
                     }
                     " · "
-                    "{trigger_summary(&f.definition.trigger)}"
+                    "{trig_label}"
                 }
                 if let Some(d) = f.description.as_deref().filter(|s| !s.is_empty()) {
                     p { class: "muted", "{d}" }
@@ -774,71 +780,66 @@ fn RunDrawer(props: RunDrawerProps) -> Element {
 
 #[derive(Props, Clone, PartialEq)]
 struct DefinitionPanelProps {
-    flow: wire::Flow,
+    flow: v2::FlowView,
     is_admin: bool,
 }
 
+/// Read-only canvas view of the flow graph. v1.1 flows are projected into a
+/// degenerate path graph via `project_legacy` so the canvas can display them.
 #[component]
 fn DefinitionPanel(props: DefinitionPanelProps) -> Element {
     let f = props.flow.clone();
     let is_admin = props.is_admin;
     let definition_locked = f.enabled;
+
+    let graph = f
+        .spec()
+        .ok()
+        .map(|spec| match spec {
+            v2::FlowSpec::Graph { graph } => graph,
+            v2::FlowSpec::Legacy { definition } => project_legacy(&definition),
+        })
+        .unwrap_or_else(|| v2::FlowGraph {
+            nodes: vec![],
+            edges: vec![],
+        });
+
     rsx! {
         section {
             role: "tabpanel",
             id: "flow-panel-definition",
             "aria-labelledby": "flow-tab-definition",
             class: "stack-md",
-            article { class: "card",
-                h2 { "Trigger" }
-                p { "{trigger_summary(&f.definition.trigger)}" }
-            }
-            article { class: "card",
-                h2 { "Actions" }
-                if f.definition.actions.is_empty() {
-                    p { class: "muted", "No actions defined." }
-                } else {
-                    ol { class: "stack-sm",
-                        for (idx, a) in f.definition.actions.iter().enumerate() {
-                            li { key: "{idx}",
-                                strong {
-                                    span { class: "flow-icon", aria_hidden: "true",
-                                        "{action_kind_icon(a)}"
-                                    }
-                                    " {action_kind_label(a)}"
-                                }
-                                ActionSummary { action: a.clone() }
-                            }
-                        }
-                    }
-                }
-            }
             div { class: "actions",
-                // PURA-248 M5 — a read-only operator never reaches the edit
-                // form; the disabled control plus `title` says why up front.
                 if !is_admin {
                     Button {
                         variant: ButtonVariant::Secondary,
                         disabled: true,
                         title: Some(ADMIN_ONLY_HINT.to_string()),
-                        "Edit definition"
+                        "Edit graph"
                     }
                 } else if definition_locked {
                     Button {
                         variant: ButtonVariant::Secondary,
                         disabled: true,
                         title: Some(
-                            "Disable the flow first — an enabled flow's definition is locked.".to_string(),
+                            "Disable the flow first — an enabled flow's graph is locked.".to_string(),
                         ),
-                        "Edit definition (disable first)"
+                        "Edit graph (disable first)"
                     }
                 } else {
                     Link {
                         to: Route::FlowEditPage { flow_id: f.id.0 },
                         class: "btn btn-secondary",
-                        "Edit definition"
+                        "Edit graph"
                     }
                 }
+            }
+            FlowCanvasEditor {
+                initial: graph,
+                read_only: true,
+                run_overlay: None,
+                on_save: None,
             }
         }
     }
