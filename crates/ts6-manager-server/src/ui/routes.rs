@@ -22,12 +22,12 @@ use crate::ui::pages::DevFlowCanvasPage;
 #[cfg(debug_assertions)]
 use crate::ui::pages::DevVideoPlayerPage;
 use crate::ui::pages::{
-    AdminUsersPage, AuditPage, BansPage, BotDetailPage, BotsIndexPage, ChannelsPage, ClientsPage,
-    DashboardPlaceholder, FlowDetailPage, FlowEditPage, FlowFormPage, FlowsListPage, Home,
-    LoginPage, LogsPage, ModerationCasePage, ModerationQueuePage, MusicLibraryPage,
-    MusicPlaylistsPage, NotFoundPage, PermissionGrantsPage, PublicWidgetPage, RadioStationsPage,
-    ServerEditPage, ServerInfoPage, ServersIndexPage, SettingsPage, SetupPage, SubjectHistoryPage,
-    VideoSourcesPage, WidgetsPage,
+    AdminUsersPage, AuditPage, AutomodMetricsPage, BansPage, BotDetailPage, BotsIndexPage,
+    ChannelsPage, ClientsPage, DashboardPlaceholder, FlowDetailPage, FlowEditPage, FlowFormPage,
+    FlowsListPage, Home, LoginPage, LogsPage, ModerationCasePage, ModerationQueuePage,
+    MusicLibraryPage, MusicPlaylistsPage, NotFoundPage, PermissionGrantsPage, PublicWidgetPage,
+    RadioStationsPage, ServerEditPage, ServerInfoPage, ServersIndexPage, SettingsPage, SetupPage,
+    SubjectHistoryPage, VideoSourcesPage, WidgetsPage,
 };
 
 #[rustfmt::skip]
@@ -176,6 +176,12 @@ pub enum Route {
     #[route("/moderation/subjects/:uid")]
     SubjectHistoryPage { uid: String },
 
+    // PURA-303 Phase 9.1.4 — per-rule automod metrics. Static segment, so
+    // it never collides with the `/moderation/cases|subjects/*` dynamic
+    // routes. Same admin + moderator in-page gate.
+    #[route("/moderation/automod")]
+    AutomodMetricsPage {},
+
     // PURA-287 — per-user moderation grant editor. Admin-gated like the
     // other `/admin/*` surfaces; the sidebar entry is hidden for non-admins
     // and `PUT /api/users/{id}/permissions` enforces `RequireAdmin`.
@@ -267,6 +273,11 @@ mod tests {
         assert!(matches!(
             Route::from_str("/moderation/subjects/subject-uid-1").expect("subject parse"),
             Route::SubjectHistoryPage { uid } if uid == "subject-uid-1"
+        ));
+        // PURA-303 — the two-segment automod metrics route.
+        assert!(matches!(
+            Route::from_str("/moderation/automod").expect("automod parse"),
+            Route::AutomodMetricsPage {}
         ));
         assert!(matches!(
             Route::from_str("/admin/permissions").expect("permissions parse"),

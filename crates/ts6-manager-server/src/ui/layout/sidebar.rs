@@ -141,6 +141,9 @@ pub fn Sidebar(props: SidebarProps) -> Element {
             | Route::ModerationCasePage { .. }
             | Route::SubjectHistoryPage { .. }
     );
+    // PURA-303 — the per-rule automod metrics surface highlights its own
+    // nav entry, distinct from the case queue.
+    let automod_active = matches!(props.active, Route::AutomodMetricsPage {});
     // PURA-124 WS-6 — Music bots highlight when the route is the index
     // OR any of the per-bot detail / library / playlists / radio
     // surfaces, so the operator stays oriented across the whole flow.
@@ -193,6 +196,8 @@ pub fn Sidebar(props: SidebarProps) -> Element {
                     PlaceholderItem { icon: "∘", label: "Tokens" }
                     // PURA-287 — moderation case + complaint queue.
                     NavItem { icon: "⚖", label: "Cases", to: Route::ModerationQueuePage {}, active: moderation_active }
+                    // PURA-303 — per-rule automod metrics.
+                    NavItem { icon: "🤖", label: "Automod", to: Route::AutomodMetricsPage {}, active: automod_active }
                     PlaceholderItem { icon: "✉", label: "Messages" }
                 }
 

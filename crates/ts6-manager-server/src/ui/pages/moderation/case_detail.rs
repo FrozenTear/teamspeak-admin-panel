@@ -34,7 +34,7 @@ use crate::client::api::{self, ApiError};
 use crate::client::dioxus::{use_auth_gate, use_session};
 use crate::client::store::AuthState;
 use crate::ui::components::toast::{ToastVariant, use_toaster};
-use crate::ui::components::{Banner, BannerVariant, Button, ButtonType, ButtonVariant};
+use crate::ui::components::{Banner, BannerVariant, Button, ButtonSize, ButtonType, ButtonVariant};
 use crate::ui::routes::Route;
 
 use super::perm;
@@ -145,6 +145,51 @@ fn CaseBody(props: CaseBodyProps) -> Element {
     let is_resolved = case.status == "resolved";
     let subject_uid = case.subject_uid.clone();
 
+    // PURA-303 — revert is an automod-case affordance, gated per kind on
+    // the same catalog permissions the composer uses.
+    let is_automod = case.origin == "automod";
+    let can_revert_mute = perm::role_holds(&props.role, "moderation.action.mute");
+    let can_revert_ban = perm::role_holds(&props.role, "moderation.action.ban");
+
+    let gate = use_auth_gate();
+    let toaster = use_toaster();
+    let revert_busy = use_signal(|| false);
+    let on_revert = {
+        let gate = gate.clone();
+        let mut reload = props.reload;
+        let mut revert_busy = revert_busy;
+        let case_id = props.case_id;
+        move |action_id: i64| {
+            if *revert_busy.peek() {
+                return;
+            }
+            let gate = gate.clone();
+            revert_busy.set(true);
+            spawn(async move {
+                let path = format!("/api/moderation/cases/{case_id}/actions/{action_id}/revert");
+                let res = api::authorized_post_json::<(), ModerationCaseAction>(
+                    &gate,
+                    &api::api_base(),
+                    &path,
+                    None,
+                )
+                .await;
+                revert_busy.set(false);
+                match res {
+                    Ok(_) => {
+                        toaster.push(ToastVariant::Success, "Action reverted", None);
+                        reload.with_mut(|n| *n += 1);
+                    }
+                    Err(e) => toaster.push(
+                        ToastVariant::Danger,
+                        "Could not revert action",
+                        Some(format_error(&e)),
+                    ),
+                }
+            });
+        }
+    };
+
     rsx! {
         div { class: "mod-case-head",
             h1 { "{case.subject_nickname_snapshot}" }
@@ -172,7 +217,14 @@ fn CaseBody(props: CaseBodyProps) -> Element {
 
         section { class: "stack-md mod-panel",
             h2 { "Action timeline" }
-            Timeline { rows: timeline }
+            Timeline {
+                rows: timeline,
+                is_automod,
+                can_revert_mute,
+                can_revert_ban,
+                revert_busy: *revert_busy.read(),
+                on_revert: EventHandler::new(on_revert),
+            }
         }
 
         if is_resolved {
@@ -191,6 +243,7 @@ fn CaseBody(props: CaseBodyProps) -> Element {
             }
             ResolvePanel {
                 case_id: props.case_id,
+                is_automod,
                 role: props.role.clone(),
                 reload: props.reload,
             }
@@ -201,6 +254,14 @@ fn CaseBody(props: CaseBodyProps) -> Element {
 #[derive(Props, Clone, PartialEq)]
 struct TimelineProps {
     rows: Vec<ModerationCaseAction>,
+    /// Revert is offered only on automod cases (PURA-303).
+    is_automod: bool,
+    can_revert_mute: bool,
+    can_revert_ban: bool,
+    /// A revert request is in flight — buttons render disabled.
+    revert_busy: bool,
+    /// Fires with the id of the `mute` / `ban` action to revert.
+    on_revert: EventHandler<i64>,
 }
 
 #[component]
@@ -214,22 +275,63 @@ fn Timeline(props: TimelineProps) -> Element {
             }
         };
     }
+
+    // An action that already carries a reverting row (`unmute` / `unban`
+    // tagged with its id) must not offer a second Revert control.
+    let reverted_ids: std::collections::HashSet<i64> = props
+        .rows
+        .iter()
+        .filter_map(|a| {
+            a.payload
+                .as_ref()
+                .and_then(|p| p.get("revertsActionId"))
+                .and_then(serde_json::Value::as_i64)
+        })
+        .collect();
+
     rsx! {
         ol { class: "mod-timeline",
             for a in props.rows.iter() {
-                li { key: "{a.id}", class: "mod-timeline-row",
-                    span { class: "mod-timeline-icon", aria_hidden: "true",
-                        "{action_kind_icon(&a.action_kind)}"
-                    }
-                    div { class: "mod-timeline-body",
-                        div { class: "mod-timeline-head",
-                            strong { "{action_kind_label(&a.action_kind)}" }
-                            span { class: "muted", " by {a.actor_username_snapshot}" }
-                            span { class: "mod-timeline-when", "{relative_when(a.created_at)}" }
-                        }
-                        p { class: "mod-timeline-reason", "{a.reason}" }
-                        if let Some(ts_ref) = a.ts_ref.as_ref().filter(|r| !r.is_empty()) {
-                            p { class: "info-hint", "TeamSpeak ban #{ts_ref}" }
+                {
+                    let a = a.clone();
+                    // Revert is shown for an un-reverted mute/ban on an
+                    // automod case when the role holds the matching grant.
+                    let can_revert = props.is_automod
+                        && !reverted_ids.contains(&a.id)
+                        && match a.action_kind.as_str() {
+                            "mute" => props.can_revert_mute,
+                            "ban" => props.can_revert_ban,
+                            _ => false,
+                        };
+                    let action_id = a.id;
+                    let on_revert = props.on_revert;
+                    rsx! {
+                        li { key: "{a.id}", class: "mod-timeline-row",
+                            span { class: "mod-timeline-icon", aria_hidden: "true",
+                                "{action_kind_icon(&a.action_kind)}"
+                            }
+                            div { class: "mod-timeline-body",
+                                div { class: "mod-timeline-head",
+                                    strong { "{action_kind_label(&a.action_kind)}" }
+                                    span { class: "muted", " by {a.actor_username_snapshot}" }
+                                    span { class: "mod-timeline-when", "{relative_when(a.created_at)}" }
+                                }
+                                p { class: "mod-timeline-reason", "{a.reason}" }
+                                if let Some(ts_ref) = a.ts_ref.as_ref().filter(|r| !r.is_empty()) {
+                                    p { class: "info-hint", "TeamSpeak ban #{ts_ref}" }
+                                }
+                                if can_revert {
+                                    div { class: "mod-timeline-actions",
+                                        Button {
+                                            variant: ButtonVariant::Ghost,
+                                            size: ButtonSize::Small,
+                                            disabled: props.revert_busy,
+                                            onclick: move |_| on_revert.call(action_id),
+                                            "Revert"
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -495,6 +597,10 @@ struct LifecycleProps {
     case_id: i64,
     role: String,
     reload: Signal<u64>,
+    /// PURA-303 — when set, the resolve form offers a false-positive
+    /// toggle. Always `false` for the reopen panel.
+    #[props(default)]
+    is_automod: bool,
 }
 
 #[component]
@@ -507,8 +613,10 @@ fn ResolvePanel(props: LifecycleProps) -> Element {
     }
 
     let mut note = use_signal(String::new);
+    let mut false_positive = use_signal(|| false);
     let mut busy = use_signal(|| false);
     let case_id = props.case_id;
+    let is_automod = props.is_automod;
     let mut reload = props.reload;
 
     let on_resolve = {
@@ -526,12 +634,17 @@ fn ResolvePanel(props: LifecycleProps) -> Element {
                 );
                 return;
             }
+            // The flag travels only on automod cases — the server tags
+            // the `resolve` action's payload so the metrics view can
+            // compute a per-rule false-positive rate.
+            let fp_v = is_automod.then(|| *false_positive.peek());
             let gate = gate.clone();
             let toaster = toaster;
             busy.set(true);
             spawn(async move {
                 let req = ResolveCaseRequest {
                     resolution_note: note_v,
+                    false_positive: fp_v,
                 };
                 let path = format!("/api/moderation/cases/{case_id}/resolve");
                 let res = api::authorized_post_json::<_, serde_json::Value>(
@@ -546,6 +659,7 @@ fn ResolvePanel(props: LifecycleProps) -> Element {
                     Ok(_) => {
                         toaster.push(ToastVariant::Success, "Case resolved", None);
                         note.set(String::new());
+                        false_positive.set(false);
                         reload.with_mut(|n| *n += 1);
                     }
                     Err(e) => toaster.push(
@@ -574,6 +688,21 @@ fn ResolvePanel(props: LifecycleProps) -> Element {
                         placeholder: "How was this resolved?",
                         value: "{note.read()}",
                         oninput: move |e| note.set(e.value()),
+                    }
+                }
+                if is_automod {
+                    label { class: "mod-fp-check",
+                        input {
+                            r#type: "checkbox",
+                            checked: *false_positive.read(),
+                            onchange: move |e| false_positive.set(e.checked()),
+                        }
+                        span { class: "mod-fp-check-text",
+                            span { "Resolve as a false positive" }
+                            span { class: "mod-fp-check-hint",
+                                "Tags this resolution as an automod misfire — it counts against the rule in the automod metrics view."
+                            }
+                        }
                     }
                 }
                 Button {
