@@ -1,11 +1,14 @@
 //! `/flows/{id}` — per-flow operator surface.
 //!
 //! Tabs: Runs (default) + Definition. Runs is the operator's debugging
-//! surface; Definition is the read-only view of the trigger + actions
+//! surface; Definition is the read-only canvas view of the flow graph
 //! (edit lives at `/flows/{id}/edit`).
+
+use std::collections::HashMap;
 
 use dioxus::prelude::*;
 use ts6_manager_shared::flows as wire;
+use ts6_manager_shared::flows::v2::{self, NodeId, project_legacy};
 
 use crate::client::api::ApiError;
 use crate::client::dioxus::{use_auth_gate, use_session};
@@ -13,13 +16,13 @@ use crate::client::flows as fl;
 use crate::client::store::AuthState;
 use crate::ui::components::toast::{ToastVariant, use_toaster};
 use crate::ui::components::{Banner, BannerVariant, Button, ButtonSize, ButtonVariant};
+use crate::ui::pages::flows::canvas::{FlowCanvasEditor, RunOverlayStatus};
 use crate::ui::pages::flows::dialog::{ConfirmDialog, DeletePrompt};
 use crate::ui::pages::flows::shared::{
-    ADMIN_ONLY_HINT, action_kind_icon, action_kind_label, action_status_badge_class,
-    action_status_icon, action_status_label, action_wire_kind_icon, action_wire_kind_label,
-    admin_only_title, enabled_badge_class, enabled_label, format_error, is_run_in_flight_conflict,
-    relative_when, run_status_badge_class, run_status_hint, run_status_icon, run_status_label,
-    trigger_summary,
+    ADMIN_ONLY_HINT, action_status_badge_class, action_status_icon, action_status_label,
+    action_wire_kind_icon, action_wire_kind_label, admin_only_title, enabled_badge_class,
+    enabled_label, format_error, is_run_in_flight_conflict, relative_when, run_status_badge_class,
+    run_status_hint, run_status_icon, run_status_label, trigger_summary,
 };
 use crate::ui::routes::Route;
 
@@ -49,7 +52,7 @@ pub fn FlowDetailPage(flow_id: i64) -> Element {
         .map(|u| u.role.eq_ignore_ascii_case("admin"))
         .unwrap_or(false);
 
-    let mut detail: Signal<Option<wire::Flow>> = use_signal(|| None);
+    let mut detail: Signal<Option<v2::FlowView>> = use_signal(|| None);
     let mut detail_error: Signal<Option<ApiError>> = use_signal(|| None::<ApiError>);
     let mut detail_loading: Signal<bool> = use_signal(|| true);
     let mut reload: Signal<u64> = use_signal(|| 0u64);
@@ -60,7 +63,7 @@ pub fn FlowDetailPage(flow_id: i64) -> Element {
             let gate = gate.clone();
             let _ = *reload.peek();
             let _ = reload.read();
-            async move { fl::get_flow(gate, flow).await }
+            async move { fl::get_flow_view(gate, flow).await }
         }
     });
 
@@ -123,6 +126,55 @@ pub fn FlowDetailPage(flow_id: i64) -> Element {
     let bump_flow = move || reload.with_mut(|n| *n += 1);
     let bump_runs = move || runs_reload.with_mut(|n| *n += 1);
 
+    // ── Run-overlay poll ─────────────────────────────────────────────────
+    // When a run is active (`active_run` is Some), poll `get_run_detail`
+    // every ~1 s and map nodeResults to per-node overlay status. The poll
+    // stops automatically when the run leaves InFlight (resource returns
+    // None when the predicate fails, clearing the overlay state).
+    let mut active_run: Signal<Option<wire::FlowRunId>> = use_signal(|| None);
+    let mut run_overlay: Signal<Option<HashMap<NodeId, RunOverlayStatus>>> =
+        use_signal(|| None);
+
+    let _overlay_poll = {
+        let gate = gate.clone();
+        use_resource(move || {
+            let run_id = *active_run.read();
+            let gate = gate.clone();
+            async move {
+                let run_id = run_id?;
+                // 1 s interval — short enough to feel live, long enough not
+                // to hammer the server for a typically-fast flow run.
+                gloo_timers::future::TimeoutFuture::new(1_000).await;
+                fl::get_run_detail(gate, flow, run_id).await.ok()
+            }
+        })
+    };
+
+    // Drive the overlay signal from the poll result each render cycle.
+    use_effect(move || {
+        if let Some(Some(run_view)) = _overlay_poll.read().clone() {
+            if run_view.summary.status == wire::FlowRunStatus::InFlight {
+                // Still running — synthesise the overlay: finished nodes
+                // carry their NodeStatus; unfinished nodes show Running.
+                let finished: HashMap<NodeId, RunOverlayStatus> = run_view
+                    .node_results
+                    .iter()
+                    .map(|r| (r.node_id.clone(), RunOverlayStatus::from_node_status(r.status)))
+                    .collect();
+                run_overlay.set(Some(finished));
+            } else {
+                // Run finished — show final states then clear the poll.
+                let final_states: HashMap<NodeId, RunOverlayStatus> = run_view
+                    .node_results
+                    .iter()
+                    .map(|r| (r.node_id.clone(), RunOverlayStatus::from_node_status(r.status)))
+                    .collect();
+                run_overlay.set(Some(final_states));
+                active_run.set(None);
+            }
+        }
+    });
+
     let on_fire = {
         let gate = gate.clone();
         let mut bump_runs = bump_runs;
@@ -136,6 +188,11 @@ pub fn FlowDetailPage(flow_id: i64) -> Element {
                             format!("Fired run #{}", resp.run_id.0),
                             None,
                         );
+                        // Start the run-overlay poll and switch to the
+                        // Definition tab so the operator sees the canvas light up.
+                        active_run.set(Some(resp.run_id));
+                        run_overlay.set(None);
+                        tab.set(DetailTab::Definition);
                         bump_runs();
                     }
                     Err(e) => {
@@ -151,12 +208,12 @@ pub fn FlowDetailPage(flow_id: i64) -> Element {
         let mut bump_flow = bump_flow;
         move |currently_enabled: bool| {
             let gate = gate.clone();
-            let body = wire::UpdateFlowRequest {
+            let body = v2::UpdateFlowBody {
                 enabled: Some(!currently_enabled),
                 ..Default::default()
             };
             spawn(async move {
-                match fl::update_flow(gate, flow, &body).await {
+                match fl::update_graph_flow(gate, flow, &body).await {
                     Ok(_) => {
                         toaster.push(
                             ToastVariant::Success,
@@ -346,7 +403,11 @@ pub fn FlowDetailPage(flow_id: i64) -> Element {
                     }),
                 }
             } else {
-                DefinitionPanel { flow: f, is_admin }
+                DefinitionPanel {
+                    flow: f,
+                    is_admin,
+                    run_overlay: run_overlay.read().clone(),
+                }
             }
         }
 
@@ -386,7 +447,7 @@ pub fn FlowDetailPage(flow_id: i64) -> Element {
 
 #[derive(Props, Clone, PartialEq)]
 struct FlowHeaderProps {
-    flow: wire::Flow,
+    flow: v2::FlowView,
     is_admin: bool,
     on_fire: EventHandler<()>,
     on_toggle_enabled: EventHandler<bool>,
@@ -402,6 +463,11 @@ fn FlowHeader(props: FlowHeaderProps) -> Element {
     let on_delete = props.on_delete;
     let enabled = f.enabled;
     let edit_route = Route::FlowEditPage { flow_id: f.id.0 };
+    let trig_label = f
+        .definition
+        .as_ref()
+        .map(|d| trigger_summary(&d.trigger))
+        .unwrap_or_else(|| "graph".into());
     rsx! {
         section { class: "page-header",
             div { class: "page-title-block",
@@ -411,7 +477,7 @@ fn FlowHeader(props: FlowHeaderProps) -> Element {
                         "{enabled_label(enabled)}"
                     }
                     " · "
-                    "{trigger_summary(&f.definition.trigger)}"
+                    "{trig_label}"
                 }
                 if let Some(d) = f.description.as_deref().filter(|s| !s.is_empty()) {
                     p { class: "muted", "{d}" }
@@ -774,71 +840,69 @@ fn RunDrawer(props: RunDrawerProps) -> Element {
 
 #[derive(Props, Clone, PartialEq)]
 struct DefinitionPanelProps {
-    flow: wire::Flow,
+    flow: v2::FlowView,
     is_admin: bool,
+    run_overlay: Option<HashMap<NodeId, RunOverlayStatus>>,
 }
 
+/// Read-only canvas view of the flow graph. v1.1 flows are projected into a
+/// degenerate path graph via `project_legacy` so the canvas can display them.
+/// When `run_overlay` is Some, per-node status is painted on the canvas.
 #[component]
 fn DefinitionPanel(props: DefinitionPanelProps) -> Element {
     let f = props.flow.clone();
     let is_admin = props.is_admin;
+    let run_overlay = props.run_overlay.clone();
     let definition_locked = f.enabled;
+
+    let graph = f
+        .spec()
+        .ok()
+        .map(|spec| match spec {
+            v2::FlowSpec::Graph { graph } => graph,
+            v2::FlowSpec::Legacy { definition } => project_legacy(&definition),
+        })
+        .unwrap_or_else(|| v2::FlowGraph {
+            nodes: vec![],
+            edges: vec![],
+        });
+
     rsx! {
         section {
             role: "tabpanel",
             id: "flow-panel-definition",
             "aria-labelledby": "flow-tab-definition",
             class: "stack-md",
-            article { class: "card",
-                h2 { "Trigger" }
-                p { "{trigger_summary(&f.definition.trigger)}" }
-            }
-            article { class: "card",
-                h2 { "Actions" }
-                if f.definition.actions.is_empty() {
-                    p { class: "muted", "No actions defined." }
-                } else {
-                    ol { class: "stack-sm",
-                        for (idx, a) in f.definition.actions.iter().enumerate() {
-                            li { key: "{idx}",
-                                strong {
-                                    span { class: "flow-icon", aria_hidden: "true",
-                                        "{action_kind_icon(a)}"
-                                    }
-                                    " {action_kind_label(a)}"
-                                }
-                                ActionSummary { action: a.clone() }
-                            }
-                        }
-                    }
-                }
-            }
             div { class: "actions",
-                // PURA-248 M5 — a read-only operator never reaches the edit
-                // form; the disabled control plus `title` says why up front.
                 if !is_admin {
                     Button {
                         variant: ButtonVariant::Secondary,
                         disabled: true,
                         title: Some(ADMIN_ONLY_HINT.to_string()),
-                        "Edit definition"
+                        "Edit graph"
                     }
                 } else if definition_locked {
                     Button {
                         variant: ButtonVariant::Secondary,
                         disabled: true,
                         title: Some(
-                            "Disable the flow first — an enabled flow's definition is locked.".to_string(),
+                            "Disable the flow first — an enabled flow's graph is locked.".to_string(),
                         ),
-                        "Edit definition (disable first)"
+                        "Edit graph (disable first)"
                     }
                 } else {
                     Link {
                         to: Route::FlowEditPage { flow_id: f.id.0 },
                         class: "btn btn-secondary",
-                        "Edit definition"
+                        "Edit graph"
                     }
                 }
+            }
+            FlowCanvasEditor {
+                initial: graph,
+                read_only: true,
+                run_overlay,
+                on_save: None,
             }
         }
     }

@@ -15,6 +15,12 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 
+/// v2 graph/node wire types — flow-engine redesign ([PURA-259](/PURA/issues/PURA-259) /
+/// [PURA-260](/PURA/issues/PURA-260)). The v1.1 types in this module are kept
+/// untouched: the projection shim ([`v2::project_legacy`]) reads legacy rows
+/// through them.
+pub mod v2;
+
 /// Flow identifier minted by the engine on `POST /api/flows`. Stable for
 /// the flow's lifetime; reused by every nested resource path
 /// (`/api/flows/{id}/...`).

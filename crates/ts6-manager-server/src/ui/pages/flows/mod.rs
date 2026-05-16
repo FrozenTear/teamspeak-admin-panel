@@ -13,6 +13,7 @@
 //! `page-header`, and `bot-badge` tokens so no new design language is
 //! introduced (matches the `music_bots` family from PURA-124 WS-6).
 
+mod canvas;
 mod detail;
 mod dialog;
 mod form;
@@ -22,3 +23,11 @@ mod shared;
 pub use detail::FlowDetailPage;
 pub use form::{FlowEditPage, FlowFormPage};
 pub use list::FlowsListPage;
+
+// PURA-267 — v2 visual canvas builder. The editor component is re-exported
+// for the future `/flows/new` + `/flows/{id}/edit` swap; the debug-only
+// `/dev/flow-canvas` page mounts it while the v2 HTTP surface lands.
+#[cfg(debug_assertions)]
+pub use canvas::DevFlowCanvasPage;
+#[allow(unused_imports)]
+pub use canvas::FlowCanvasEditor;
