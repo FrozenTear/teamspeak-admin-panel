@@ -66,6 +66,9 @@ pub enum AuditKind {
     /// Phase 9.1 automod (PURA-301) — a `Moderate` flow node opened or
     /// reused a case and applied a moderation effect.
     ModerationAutomodAction,
+    /// Phase 9.1.3 automod safeguards (PURA-302) — a rule's per-rule
+    /// circuit breaker tripped and the rule was auto-demoted to `shadow`.
+    ModerationAutomodBreaker,
 }
 
 impl AuditKind {
@@ -89,6 +92,7 @@ impl AuditKind {
             AuditKind::ModerationNoteAdded => "moderationNoteAdded",
             AuditKind::ModerationComplaintResolved => "moderationComplaintResolved",
             AuditKind::ModerationAutomodAction => "moderationAutomodAction",
+            AuditKind::ModerationAutomodBreaker => "moderationAutomodBreaker",
         }
     }
 }
