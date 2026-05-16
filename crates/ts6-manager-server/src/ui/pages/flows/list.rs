@@ -108,7 +108,11 @@ pub fn FlowsListPage() -> Element {
                     Ok(_) => {
                         toaster.push(
                             ToastVariant::Success,
-                            if currently_enabled { "Disabled" } else { "Enabled" },
+                            if currently_enabled {
+                                "Disabled"
+                            } else {
+                                "Enabled"
+                            },
                             None,
                         );
                         bump();
@@ -183,7 +187,11 @@ pub fn FlowsListPage() -> Element {
                     Err(e) => {
                         toaster.push(
                             ToastVariant::Danger,
-                            if force { "Force delete failed" } else { "Delete failed" },
+                            if force {
+                                "Force delete failed"
+                            } else {
+                                "Delete failed"
+                            },
                             Some(format_error(&e)),
                         );
                         delete_prompt.set(DeletePrompt::Closed);

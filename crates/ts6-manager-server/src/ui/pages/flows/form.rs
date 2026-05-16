@@ -22,7 +22,7 @@ use crate::ui::components::toast::{ToastVariant, use_toaster};
 use crate::ui::components::{Banner, BannerVariant};
 use crate::ui::layout::use_servers_context;
 use crate::ui::pages::active_server;
-use crate::ui::pages::flows::canvas::{starter_graph, FlowCanvasEditor};
+use crate::ui::pages::flows::canvas::{FlowCanvasEditor, starter_graph};
 use crate::ui::pages::flows::shared::{MAX_NAME_LEN, format_error};
 use crate::ui::routes::Route;
 

@@ -14,6 +14,7 @@
 //!   * `.fc-{node,chip}--{trigger,effect,control}` — per-kind family tint;
 //!   * `.fc-node--{running,ok,errored,skipped,interrupted}` — run overlay;
 //!   * `.fc-node-status` — the in-card overlay status row.
+//!
 //! They are inert (no selector matches) until then; harmless dead CSS.
 //!
 //! Scoped under `.fc-*` so it cannot leak into app chrome.

@@ -132,8 +132,7 @@ pub fn FlowDetailPage(flow_id: i64) -> Element {
     // stops automatically when the run leaves InFlight (resource returns
     // None when the predicate fails, clearing the overlay state).
     let mut active_run: Signal<Option<wire::FlowRunId>> = use_signal(|| None);
-    let mut run_overlay: Signal<Option<HashMap<NodeId, RunOverlayStatus>>> =
-        use_signal(|| None);
+    let mut run_overlay: Signal<Option<HashMap<NodeId, RunOverlayStatus>>> = use_signal(|| None);
 
     let _overlay_poll = {
         let gate = gate.clone();
@@ -159,7 +158,12 @@ pub fn FlowDetailPage(flow_id: i64) -> Element {
                 let finished: HashMap<NodeId, RunOverlayStatus> = run_view
                     .node_results
                     .iter()
-                    .map(|r| (r.node_id.clone(), RunOverlayStatus::from_node_status(r.status)))
+                    .map(|r| {
+                        (
+                            r.node_id.clone(),
+                            RunOverlayStatus::from_node_status(r.status),
+                        )
+                    })
                     .collect();
                 run_overlay.set(Some(finished));
             } else {
@@ -167,7 +171,12 @@ pub fn FlowDetailPage(flow_id: i64) -> Element {
                 let final_states: HashMap<NodeId, RunOverlayStatus> = run_view
                     .node_results
                     .iter()
-                    .map(|r| (r.node_id.clone(), RunOverlayStatus::from_node_status(r.status)))
+                    .map(|r| {
+                        (
+                            r.node_id.clone(),
+                            RunOverlayStatus::from_node_status(r.status),
+                        )
+                    })
                     .collect();
                 run_overlay.set(Some(final_states));
                 active_run.set(None);

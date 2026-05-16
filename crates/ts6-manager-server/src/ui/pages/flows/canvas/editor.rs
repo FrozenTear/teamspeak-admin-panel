@@ -232,11 +232,11 @@ pub fn FlowCanvasEditor(
     let on_canvas_move = move |evt: PointerEvent| {
         let p = evt.client_coordinates();
         let z = zoom();
-        if let Some(d) = drag() {
-            if let Some(n) = graph.write().nodes.iter_mut().find(|n| n.id == d.node) {
-                n.position.x = (d.start_nx + (p.x - d.start_px) / z).max(0.0);
-                n.position.y = (d.start_ny + (p.y - d.start_py) / z).max(0.0);
-            }
+        if let Some(d) = drag()
+            && let Some(n) = graph.write().nodes.iter_mut().find(|n| n.id == d.node)
+        {
+            n.position.x = (d.start_nx + (p.x - d.start_px) / z).max(0.0);
+            n.position.y = (d.start_ny + (p.y - d.start_py) / z).max(0.0);
         }
         if let Some(pd) = pan_drag() {
             pan.set((
