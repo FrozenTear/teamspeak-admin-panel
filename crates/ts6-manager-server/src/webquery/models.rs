@@ -356,6 +356,29 @@ pub struct BanAddResponse {
     pub banid: i64,
 }
 
+/// `complainlist` row — one TS6 complaint. A complaint is a
+/// `(tcldbid, fcldbid)` pair: the `t*` fields name the **target** (the
+/// subject complained about), the `f*` fields name the **from** client
+/// (the complainant). TS6 exposes no single complaint id on the wire —
+/// the addressing key is the pair. Field names are the TS6 WebQuery wire
+/// keys verbatim. The route layer translates upstream code 1281
+/// (`database_empty_result`) to an empty list, mirroring `banlist`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComplaintEntry {
+    #[serde(deserialize_with = "stringy::deserialize")]
+    pub tcldbid: i64,
+    #[serde(default)]
+    pub tname: String,
+    #[serde(deserialize_with = "stringy::deserialize")]
+    pub fcldbid: i64,
+    #[serde(default)]
+    pub fname: String,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub timestamp: i64,
+}
+
 /// `channelclientpermlist` row — single permission entry on a `(cid, cldbid)`
 /// pair. The route layer translates upstream code 1281 (`database_empty_result`)
 /// to an empty list.
@@ -679,6 +702,26 @@ mod tests {
         let raw = serde_json::json!({"banid": "11"});
         let parsed: BanAddResponse = serde_json::from_value(raw).unwrap();
         assert_eq!(parsed.banid, 11);
+    }
+
+    #[test]
+    fn complaint_entry_parses() {
+        // TS6 delivers every field as a JSON string; the stringy
+        // visitors coerce `tcldbid` / `fcldbid` / `timestamp` to `i64`.
+        let raw = serde_json::json!({
+            "tcldbid": "5",
+            "tname": "Troublemaker",
+            "fcldbid": "3",
+            "fname": "Reporter",
+            "message": "spamming the channel",
+            "timestamp": "1700000000",
+        });
+        let parsed: ComplaintEntry = serde_json::from_value(raw).unwrap();
+        assert_eq!(parsed.tcldbid, 5);
+        assert_eq!(parsed.fcldbid, 3);
+        assert_eq!(parsed.timestamp, 1_700_000_000);
+        assert_eq!(parsed.tname, "Troublemaker");
+        assert_eq!(parsed.message, "spamming the channel");
     }
 
     #[test]

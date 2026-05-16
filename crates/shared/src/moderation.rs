@@ -140,6 +140,46 @@ pub struct CreateNoteRequest {
     pub body: String,
 }
 
+/// One TS6 complaint in the moderation queue (`GET /api/moderation/complaints`).
+///
+/// A complaint is a `(tcldbid, fcldbid)` pair — the `t*` fields name the
+/// **target** (the subject complained about), the `f*` fields name the
+/// **complainant**. TS6 exposes no single complaint id, so the resolve
+/// endpoint addresses a complaint by this pair rather than a path id.
+/// Field names are the TS6 `complainlist` wire keys, preserved verbatim
+/// (spec §7.15 is a passthrough surface).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Complaint {
+    /// Target client-database id — the subject complained about.
+    pub tcldbid: i64,
+    /// Target client's last known nickname.
+    pub tname: String,
+    /// Complainant client-database id.
+    pub fcldbid: i64,
+    /// Complainant client's last known nickname.
+    pub fname: String,
+    pub message: String,
+    /// Complaint creation time as a Unix timestamp (seconds).
+    pub timestamp: i64,
+}
+
+/// `POST /api/moderation/complaints/resolve` request body.
+///
+/// With `fcldbid` present, dismisses the single complaint identified by
+/// the `(tcldbid, fcldbid)` pair (`complaindel`). With `fcldbid` absent,
+/// dismisses every complaint about the `tcldbid` subject
+/// (`complaindelall`). `tcldbid` is always required — `complaindelall`
+/// is per-target, not a vserver-wide purge (`9.0-spike`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolveComplaintRequest {
+    pub server_config_id: i64,
+    pub virtual_server_id: i64,
+    pub tcldbid: i64,
+    #[serde(default)]
+    pub fcldbid: Option<i64>,
+}
+
 /// Error envelope for the moderation surface. Matches the per-surface
 /// `ErrorBody` shape used by the control and music-bot routes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -224,6 +264,48 @@ mod tests {
         .unwrap();
         assert!(req.origin.is_none());
         assert!(req.origin_ref.is_none());
+    }
+
+    #[test]
+    fn complaint_uses_ts6_native_wire_keys() {
+        let c = Complaint {
+            tcldbid: 5,
+            tname: "Target".into(),
+            fcldbid: 3,
+            fname: "Reporter".into(),
+            message: "spam".into(),
+            timestamp: 1_700_000_000,
+        };
+        let v = serde_json::to_value(&c).unwrap();
+        // Wire keys are the TS6 `complainlist` names verbatim — no
+        // camelCase rename (spec §7.15 passthrough surface).
+        assert!(v.get("tcldbid").is_some());
+        assert!(v.get("fcldbid").is_some());
+        assert!(v.get("tname").is_some());
+        let back: Complaint = serde_json::from_value(v).unwrap();
+        assert_eq!(back, c);
+    }
+
+    #[test]
+    fn resolve_complaint_request_fcldbid_is_optional() {
+        // `complaindelall` form — no fcldbid.
+        let req: ResolveComplaintRequest = serde_json::from_value(serde_json::json!({
+            "serverConfigId": 1,
+            "virtualServerId": 1,
+            "tcldbid": 5
+        }))
+        .unwrap();
+        assert_eq!(req.tcldbid, 5);
+        assert!(req.fcldbid.is_none());
+        // `complaindel` form — fcldbid present.
+        let req: ResolveComplaintRequest = serde_json::from_value(serde_json::json!({
+            "serverConfigId": 1,
+            "virtualServerId": 1,
+            "tcldbid": 5,
+            "fcldbid": 3
+        }))
+        .unwrap();
+        assert_eq!(req.fcldbid, Some(3));
     }
 
     #[test]

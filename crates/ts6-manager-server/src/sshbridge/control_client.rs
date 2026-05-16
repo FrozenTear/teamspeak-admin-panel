@@ -39,8 +39,8 @@ use crate::control::{ControlBackend, ControlBackendError, ControlResult};
 use crate::webquery::BanAddParams;
 use crate::webquery::escape::escape;
 use crate::webquery::models::{
-    BanEntry, ChannelEntry, ClientDbEntry, ClientEntry, ClientInfo, ConnectionInfo, LogEntry,
-    ServerInfo, VersionInfo, VirtualServerEntry,
+    BanEntry, ChannelEntry, ClientDbEntry, ClientEntry, ClientInfo, ComplaintEntry, ConnectionInfo,
+    LogEntry, ServerInfo, VersionInfo, VirtualServerEntry,
 };
 
 use super::transport::{CommandOutcome, TransportHandle};
@@ -382,6 +382,42 @@ impl ControlBackend for SshControlClient {
 
     async fn bandel(&self, sid: i64, banid: i64) -> ControlResult<()> {
         let line = format!("bandel banid={banid}");
+        self.run_scoped(sid, &line).await?;
+        Ok(())
+    }
+
+    async fn complainlist(
+        &self,
+        sid: i64,
+        tcldbid: Option<i64>,
+    ) -> ControlResult<Vec<ComplaintEntry>> {
+        let line = match tcldbid {
+            Some(t) => format!("complainlist tcldbid={t}"),
+            None => "complainlist".to_string(),
+        };
+        // Empty complaint lists surface as `database_empty_result`
+        // (1281) on some upstreams; collapse that to an empty `Vec` so
+        // the REST contract matches the WebQuery `list_or_empty`
+        // behaviour, same as `banlist` above.
+        match self.run_scoped(sid, &line).await {
+            Ok(outcome) => Self::parse_list(&outcome.body_lines),
+            Err(ControlBackendError::Upstream { code, .. })
+                if code == crate::webquery::DATABASE_EMPTY_RESULT =>
+            {
+                Ok(Vec::new())
+            }
+            Err(other) => Err(other),
+        }
+    }
+
+    async fn complaindel(&self, sid: i64, tcldbid: i64, fcldbid: i64) -> ControlResult<()> {
+        let line = format!("complaindel tcldbid={tcldbid} fcldbid={fcldbid}");
+        self.run_scoped(sid, &line).await?;
+        Ok(())
+    }
+
+    async fn complaindelall(&self, sid: i64, tcldbid: i64) -> ControlResult<()> {
+        let line = format!("complaindelall tcldbid={tcldbid}");
         self.run_scoped(sid, &line).await?;
         Ok(())
     }

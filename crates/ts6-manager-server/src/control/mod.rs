@@ -65,8 +65,8 @@ use crate::sshbridge::{
 use crate::webquery::{
     BanAddParams, ClassifiedTransport, WebQueryClient, WebQueryError,
     models::{
-        BanEntry, ChannelEntry, ClientDbEntry, ClientEntry, ClientInfo, ConnectionInfo, LogEntry,
-        ServerInfo, VersionInfo, VirtualServerEntry,
+        BanEntry, ChannelEntry, ClientDbEntry, ClientEntry, ClientInfo, ComplaintEntry,
+        ConnectionInfo, LogEntry, ServerInfo, VersionInfo, VirtualServerEntry,
     },
     other_transport,
 };
@@ -361,6 +361,26 @@ pub trait ControlBackend: Send + Sync + std::fmt::Debug {
     /// `bandel` — drop a single ban by id.
     async fn bandel(&self, sid: i64, banid: i64) -> ControlResult<()>;
 
+    /// `complainlist` (sid scope) — the TS6 complaint queue. `tcldbid`
+    /// filters to one target subject (spec §7.15); `None` returns the
+    /// whole queue. Empty complaint lists collapse to an empty `Vec`,
+    /// matching [`Self::banlist`] (`9.0-spike`).
+    async fn complainlist(
+        &self,
+        sid: i64,
+        tcldbid: Option<i64>,
+    ) -> ControlResult<Vec<ComplaintEntry>>;
+
+    /// `complaindel` (sid scope) — dismiss one complaint by its
+    /// `(tcldbid, fcldbid)` pair. Upstream `512` is indistinguishable
+    /// between an invalid id and a no-such-complaint (`9.0-spike`); the
+    /// route layer maps it to `404`.
+    async fn complaindel(&self, sid: i64, tcldbid: i64, fcldbid: i64) -> ControlResult<()>;
+
+    /// `complaindelall` (sid scope) — dismiss every complaint about one
+    /// target. Per-target (`tcldbid` required), idempotent (`9.0-spike`).
+    async fn complaindelall(&self, sid: i64, tcldbid: i64) -> ControlResult<()>;
+
     /// Underlying SSH transport handle, if this backend is SSH-driven.
     /// `None` for WebQuery — that path has no `notify*` event surface.
     /// PURA-80 uses this to share the existing SSH session with the
@@ -508,6 +528,24 @@ impl ControlBackend for WebQueryClient {
 
     async fn bandel(&self, sid: i64, banid: i64) -> ControlResult<()> {
         self.bandel(sid, banid).await.map_err(Into::into)
+    }
+
+    async fn complainlist(
+        &self,
+        sid: i64,
+        tcldbid: Option<i64>,
+    ) -> ControlResult<Vec<ComplaintEntry>> {
+        self.complainlist(sid, tcldbid).await.map_err(Into::into)
+    }
+
+    async fn complaindel(&self, sid: i64, tcldbid: i64, fcldbid: i64) -> ControlResult<()> {
+        self.complaindel(sid, tcldbid, fcldbid)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn complaindelall(&self, sid: i64, tcldbid: i64) -> ControlResult<()> {
+        self.complaindelall(sid, tcldbid).await.map_err(Into::into)
     }
 }
 

@@ -524,3 +524,89 @@ async fn note_create_rejects_blank_body() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
+
+// ---- TS6 complaint sub-surface (PURA-289) ----------------------------
+
+const COMPLAINTS_URI: &str = "/api/moderation/complaints?serverConfigId=1&virtualServerId=1";
+
+fn resolve_complaint_req() -> wire::ResolveComplaintRequest {
+    wire::ResolveComplaintRequest {
+        server_config_id: 1,
+        virtual_server_id: 1,
+        tcldbid: 5,
+        fcldbid: Some(3),
+    }
+}
+
+#[tokio::test]
+async fn viewer_without_grants_is_forbidden_on_complaint_list() {
+    let state = fresh_state().await;
+    let vid = seed_user(&state, "view", "viewer").await;
+    let token = mint(&state, vid, "view", "viewer");
+    let resp = app(state)
+        .oneshot(get(COMPLAINTS_URI, &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn viewer_without_grants_is_forbidden_on_complaint_resolve() {
+    let state = fresh_state().await;
+    let vid = seed_user(&state, "view", "viewer").await;
+    let token = mint(&state, vid, "view", "viewer");
+    let resp = app(state)
+        .oneshot(post(
+            "/api/moderation/complaints/resolve",
+            &token,
+            &resolve_complaint_req(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn unauthenticated_complaint_list_is_rejected() {
+    let state = fresh_state().await;
+    let resp = app(state)
+        .oneshot(
+            Request::builder()
+                .uri(COMPLAINTS_URI)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn complaint_list_404_when_server_connection_absent() {
+    // A moderator passes the `ComplaintView` gate by role default, but
+    // with no `server_connection` row the backend lookup is a 404.
+    let state = fresh_state().await;
+    let mid = seed_user(&state, "mod", "moderator").await;
+    let token = mint(&state, mid, "mod", "moderator");
+    let resp = app(state)
+        .oneshot(get(COMPLAINTS_URI, &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn complaint_resolve_404_when_server_connection_absent() {
+    let state = fresh_state().await;
+    let mid = seed_user(&state, "mod", "moderator").await;
+    let token = mint(&state, mid, "mod", "moderator");
+    let resp = app(state)
+        .oneshot(post(
+            "/api/moderation/complaints/resolve",
+            &token,
+            &resolve_complaint_req(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}

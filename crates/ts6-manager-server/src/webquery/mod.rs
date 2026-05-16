@@ -60,8 +60,8 @@ use crate::repos::server_connections::ServerConnection;
 
 pub use models::{
     BanAddResponse, BanEntry, ChannelClientPerm, ChannelEntry, ChannelInfo, ClientDbEntry,
-    ClientEntry, ClientInfo, ConnectionInfo, HostInfo, LogEntry, ServerInfo, VersionInfo,
-    VirtualServerEntry,
+    ClientEntry, ClientInfo, ComplaintEntry, ConnectionInfo, HostInfo, LogEntry, ServerInfo,
+    VersionInfo, VirtualServerEntry,
 };
 pub use transport_class::{
     ClassifiedTransport, WebQueryTransportKind, other_static as other_transport,
@@ -785,6 +785,60 @@ impl WebQueryClient {
             &[("cid", cid_s.as_str()), ("cldbid", cldbid_s.as_str())],
         )
         .await
+    }
+
+    /// `complainlist` (sid scope) — the TS6 complaint queue. `tcldbid`
+    /// filters to one target subject (spec §7.15); `None` returns the
+    /// whole queue. Empty complaint lists surface as upstream `1281`
+    /// (`database_empty_result`); collapse that to `[]` via
+    /// [`Self::list_or_empty`], same as `banlist` (`9.0-spike`).
+    pub async fn complainlist(
+        &self,
+        sid: i64,
+        tcldbid: Option<i64>,
+    ) -> WebQueryResult<Vec<ComplaintEntry>> {
+        let tcldbid_s;
+        let params: Vec<(&str, &str)> = if let Some(t) = tcldbid {
+            tcldbid_s = t.to_string();
+            vec![("tcldbid", tcldbid_s.as_str())]
+        } else {
+            Vec::new()
+        };
+        self.list_or_empty::<ComplaintEntry>(&format!("/{sid}/complainlist"), &params)
+            .await
+    }
+
+    /// `complaindel` (sid scope) — dismiss one complaint, identified by
+    /// its `(tcldbid, fcldbid)` pair. Per the `9.0-spike` findings TS6
+    /// returns `512` ("invalid clientID") for both an invalid id and a
+    /// non-existent complaint — the two are indistinguishable; the route
+    /// layer maps `512` → `404`.
+    pub async fn complaindel(&self, sid: i64, tcldbid: i64, fcldbid: i64) -> WebQueryResult<()> {
+        let tcldbid_s = tcldbid.to_string();
+        let fcldbid_s = fcldbid.to_string();
+        self.get::<UnitBody>(
+            &format!("/{sid}/complaindel"),
+            &[
+                ("tcldbid", tcldbid_s.as_str()),
+                ("fcldbid", fcldbid_s.as_str()),
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// `complaindelall` (sid scope) — dismiss **every** complaint about
+    /// one target. Per-target: `tcldbid` is required (`9.0-spike`), this
+    /// is not a vserver-wide purge. Idempotent — a dismiss-all on an
+    /// already-clean target succeeds with code 0.
+    pub async fn complaindelall(&self, sid: i64, tcldbid: i64) -> WebQueryResult<()> {
+        let tcldbid_s = tcldbid.to_string();
+        self.get::<UnitBody>(
+            &format!("/{sid}/complaindelall"),
+            &[("tcldbid", tcldbid_s.as_str())],
+        )
+        .await?;
+        Ok(())
     }
 }
 

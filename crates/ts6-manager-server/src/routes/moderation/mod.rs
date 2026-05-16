@@ -9,14 +9,19 @@
 //!   `POST /cases/{id}/reopen`.
 //! - `notes` — `GET|POST /subjects/{uid}/notes`.
 //! - `history` — `GET /subjects/{uid}/history`.
+//! - `complaints` — `GET /complaints`, `POST /complaints/resolve` (the
+//!   TS6 complaint sub-surface, PURA-289).
 //!
-//! The TS6 **complaint** sub-surface (`GET /complaints`,
-//! `POST /complaints/{id}/resolve`) is split into a follow-up issue: it
-//! needs new `complainlist` / `complaindel` / `complaindelall` WebQuery +
-//! SSH-backend wrappers (see the `9.0-spike` findings,
-//! `study-documents/spikes/phase-9.0-ts6-complaint-ban-surface.md` §"Impact
-//! on 9.0-routes design"). That cross-cutting `ControlBackend` trait
-//! change is tracked separately so this surface can land cleanly.
+//! The TS6 **complaint** sub-surface landed in PURA-289 as a follow-up:
+//! it needed new `complainlist` / `complaindel` / `complaindelall`
+//! WebQuery + SSH-backend wrappers and a cross-cutting `ControlBackend`
+//! trait change (see the `9.0-spike` findings,
+//! `study-documents/spikes/phase-9.0-ts6-complaint-ban-surface.md`).
+//! `POST /complaints/resolve` deviates from the plan §7 path shape
+//! `POST /complaints/{id}/resolve` — a TS6 complaint is a
+//! `(tcldbid, fcldbid)` pair with no single id, so the pair travels in
+//! a JSON body instead. `complainadd` is intentionally absent (board-
+//! acked §7.15 deviation, PURA-283).
 //!
 //! Case state machine (brief §7): `open → actioned → resolved`, plus
 //! `resolved → open` (reopen). Every transition appends a
@@ -27,6 +32,7 @@
 
 mod actions;
 mod cases;
+mod complaints;
 mod history;
 mod notes;
 
@@ -62,6 +68,11 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/moderation/subjects/{uid}/notes",
             get(notes::list).post(notes::create),
+        )
+        .route("/api/moderation/complaints", get(complaints::list))
+        .route(
+            "/api/moderation/complaints/resolve",
+            post(complaints::resolve),
         )
 }
 

@@ -482,6 +482,19 @@ mod tests {
         async fn bandel(&self, _sid: i64, _banid: i64) -> ControlResult<()> {
             unimplemented!("not used by dashboard fetch")
         }
+        async fn complainlist(
+            &self,
+            _sid: i64,
+            _tcldbid: Option<i64>,
+        ) -> ControlResult<Vec<crate::webquery::models::ComplaintEntry>> {
+            unimplemented!("not used by dashboard fetch")
+        }
+        async fn complaindel(&self, _sid: i64, _tcldbid: i64, _fcldbid: i64) -> ControlResult<()> {
+            unimplemented!("not used by dashboard fetch")
+        }
+        async fn complaindelall(&self, _sid: i64, _tcldbid: i64) -> ControlResult<()> {
+            unimplemented!("not used by dashboard fetch")
+        }
     }
 
     async fn seed_connection(db: &Database, name: &str, enabled: bool) -> ServerConnection {

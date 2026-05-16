@@ -60,6 +60,9 @@ pub enum AuditKind {
     ModerationCaseResolved,
     ModerationCaseReopened,
     ModerationNoteAdded,
+    /// Phase 9.0 complaint sub-surface (PURA-289) — a TS6 complaint was
+    /// dismissed via `complaindel` / `complaindelall`.
+    ModerationComplaintResolved,
 }
 
 impl AuditKind {
@@ -81,6 +84,7 @@ impl AuditKind {
             AuditKind::ModerationCaseResolved => "moderationCaseResolved",
             AuditKind::ModerationCaseReopened => "moderationCaseReopened",
             AuditKind::ModerationNoteAdded => "moderationNoteAdded",
+            AuditKind::ModerationComplaintResolved => "moderationComplaintResolved",
         }
     }
 }
@@ -130,6 +134,17 @@ impl Target {
             kind: "moderation_subject".to_string(),
             id: None,
             label: Some(subject_uid.into()),
+        }
+    }
+
+    /// Phase 9.0 — a TS6 complaint target. `id` is the target
+    /// client-database id (`tcldbid`); a complaint has no single id of
+    /// its own, so the target subject is the forensically useful key.
+    pub fn moderation_complaint(tcldbid: i64) -> Self {
+        Self {
+            kind: "moderation_complaint".to_string(),
+            id: Some(tcldbid),
+            label: None,
         }
     }
 }
