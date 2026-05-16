@@ -168,7 +168,7 @@ Query params (optional, all client-side filterable but server-side honoured for 
 1. Look up target; `404` if absent.
 2. Refuse if `:id == requester.id` → `400 { "error": "Cannot delete yourself" }`.
 3. Refuse if target is the last enabled admin → `400 { "error": "Cannot delete the last enabled admin" }`.
-4. `repos::users::delete(target.id)` — the existing `user_cascade` event in `0001_baseline.surql` removes `refresh_token` and `server_user_grant` rows. The new `user_set_null_admin_audit` event in `0009_admin_audit_log.surql` null-points historic audit rows.
+4. `repos::users::delete(target.id)` — the existing `user_cascade` event in `0001_baseline.surql` removes `refresh_token` and `server_user_grant` rows. The new `user_set_null_admin_audit` event in `0010_admin_audit_log.surql` null-points historic audit rows.
 5. Emit `userDeleted` audit event **before** the delete (so the audit row's `targetId` is still resolvable for the event detail — the set-null cascade fires after the delete completes and clears it on the historic row).
 6. Return `204`.
 

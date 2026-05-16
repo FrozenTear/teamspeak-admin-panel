@@ -28,7 +28,7 @@ This document is the **architecture brief**. HTTP wire, UI brief, and audit-log 
 ### 2.1 In scope (v1.1)
 
 - **Existing roles exposed.** `/api/users` CRUD over `admin`, `moderator`, `viewer` per [spec §6.1](../../study-documents/ts6-manager-spec.md). No new tiers.
-- **Persistence.** Reuses the existing `user` table (no migration to `user`). Adds `admin_audit_log` table via new migration `0009_admin_audit_log.surql`.
+- **Persistence.** Reuses the existing `user` table (no migration to `user`). Adds `admin_audit_log` table via new migration `0010_admin_audit_log.surql`.
 - **Session lifecycle.** Disabling, deleting, or password-resetting a user revokes that user's refresh-token family set immediately (re-uses the §6.5 family-revocation primitive already in `auth/refresh.rs`).
 - **Authorization.** `RequireAdmin` extractor (existing) gates `/api/users/*` and `/api/audit/*`. No new extractor.
 - **UI surface.** Three admin pages — Users, Sessions (per-user pane), Audit. Header-gated by role.
@@ -109,7 +109,7 @@ v1.2 revisits if the wedge ([self-host vs Discord](../../README.md)) demands per
 
 ### 4.2 What v1.1 adds
 
-**One new migration:** `crates/ts6-manager-server/migrations/0009_admin_audit_log.surql`. Schema and event details live in [`audit-shape.md`](./audit-shape.md); summary here:
+**One new migration:** `crates/ts6-manager-server/migrations/0010_admin_audit_log.surql`. Schema and event details live in [`audit-shape.md`](./audit-shape.md); summary here:
 
 ```surql
 DEFINE SEQUENCE admin_audit_log_id BATCH 1 START 1;
@@ -121,7 +121,7 @@ DEFINE FIELD kind             ON admin_audit_log TYPE string;  -- event discrimi
 DEFINE FIELD targetKind       ON admin_audit_log TYPE option<string>;
 DEFINE FIELD targetId         ON admin_audit_log TYPE option<int>;
 DEFINE FIELD targetLabel      ON admin_audit_log TYPE option<string>; -- snapshot
-DEFINE FIELD payload          ON admin_audit_log TYPE option<object>; -- redacted detail
+DEFINE FIELD payload          ON admin_audit_log TYPE option<object> FLEXIBLE; -- redacted detail
 DEFINE FIELD outcome          ON admin_audit_log TYPE string;  -- "success" | "failure"
 DEFINE FIELD errorMsg         ON admin_audit_log TYPE option<string>;
 DEFINE FIELD requestIp        ON admin_audit_log TYPE option<string>;
@@ -155,7 +155,7 @@ The pattern mirrors `ssh_audit_log` (`0006_ssh_audit_log.surql`) deliberately:
 
 ### 4.3 Migration list update
 
-Update `crates/ts6-manager-server/src/db/migrations.rs` to register `0009_admin_audit_log.surql` and add the file to the pinned migration list in tests (the test that asserts the pinned ordering — see `feedback_run_tests_before_tagging.md` lesson learned from PURA-209).
+Update `crates/ts6-manager-server/src/db/migrations.rs` to register `0010_admin_audit_log.surql` and add the file to the pinned migration list in tests (the test that asserts the pinned ordering — see `feedback_run_tests_before_tagging.md` lesson learned from PURA-209).
 
 ### 4.4 Surrealdb operator notes
 
