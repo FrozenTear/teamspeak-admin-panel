@@ -542,8 +542,12 @@ pub fn FlowCanvasEditor(initial: FlowGraph, read_only: bool) -> Element {
                     }
                     button {
                         r#type: "button", "aria-label": "tidy layout",
-                        disabled: true,
-                        title: "Auto-layout — pending PURA-267 follow-up",
+                        disabled: read_only,
+                        title: "Layered auto-layout — left-to-right by depth",
+                        onclick: move |_| {
+                            model::tidy_layout(&mut graph.write());
+                            status.set("Tidied — nodes laid out left-to-right by depth".to_string());
+                        },
                         "Tidy"
                     }
                 }

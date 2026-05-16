@@ -57,15 +57,21 @@ impl PaletteKind {
 
     /// Decorative glyph (`ui-brief.md` §7) — `aria-hidden`, never the sole
     /// carrier of meaning.
+    ///
+    /// Codepoints are the PURA-276 glyph audit's resolved set, not the §7
+    /// first picks: four were swapped off emoji-presentation or rare-block
+    /// codepoints onto text-presentation Arrows / Geometric-Shapes
+    /// codepoints with broad font coverage. See
+    /// `docs/flows/v2/canvas-visual-spec.md` §6.
     pub fn glyph(self) -> &'static str {
         match self {
-            PaletteKind::Trigger => "\u{26a1}",   // ⚡
+            PaletteKind::Trigger => "\u{21af}",   // ↯  (was ⚡ U+26A1 — emoji)
             PaletteKind::Action => "\u{00bb}",    // »
-            PaletteKind::Branch => "\u{2442}",    // ⑂
+            PaletteKind::Branch => "\u{22d4}",    // ⋔  (was ⑂ U+2442 — rare)
             PaletteKind::Parallel => "\u{21c9}",  // ⇉
-            PaletteKind::Delay => "\u{23f1}",     // ⏱
+            PaletteKind::Delay => "\u{25f7}",     // ◷  (was ⏱ U+23F1 — emoji)
             PaletteKind::Transform => "\u{21c4}", // ⇄
-            PaletteKind::Subflow => "\u{29c9}",   // ⧉
+            PaletteKind::Subflow => "\u{25a3}",   // ▣  (was ⧉ U+29C9 — rare)
         }
     }
 
@@ -338,6 +344,94 @@ pub fn has_trigger(graph: &FlowGraph) -> bool {
         .any(|n| matches!(n.kind, NodeKind::Trigger { .. }))
 }
 
+// --- "Tidy" auto-layout (ui-brief.md §4.2) -------------------------------
+
+/// Horizontal gap between layout columns (one column per graph layer).
+const TIDY_COL_W: f64 = 280.0;
+/// Vertical gap between rows within a column.
+const TIDY_ROW_H: f64 = 144.0;
+/// Top-left margin of the laid-out graph.
+const TIDY_MARGIN_X: f64 = 64.0;
+const TIDY_MARGIN_Y: f64 = 72.0;
+
+/// The "Tidy" layered (Sugiyama-style) auto-layout (`ui-brief.md` §4.2).
+///
+/// Each node's column is its **longest-path depth from the trigger** — a
+/// node sits one column right of its deepest predecessor — so edges flow
+/// left-to-right and never point backward in a valid (acyclic) graph.
+/// Nodes within a column stack into rows. Cycle members (which a valid
+/// graph never has, but the editor may transiently) and trigger-unreachable
+/// nodes fall back to column 0 rather than being lost.
+///
+/// This is **operator-initiated only** — never automatic — so hand-placed
+/// nodes are never moved without intent (`ui-brief.md` §4.2).
+pub fn tidy_layout(graph: &mut FlowGraph) {
+    use std::collections::HashMap;
+
+    let ids: Vec<NodeId> = graph.nodes.iter().map(|n| n.id.clone()).collect();
+    let mut succ: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    let mut indeg: HashMap<NodeId, usize> = ids.iter().map(|id| (id.clone(), 0)).collect();
+    for e in &graph.edges {
+        // Self-loops cannot contribute to a layering — skip them.
+        if e.from.node == e.to.node {
+            continue;
+        }
+        succ.entry(e.from.node.clone())
+            .or_default()
+            .push(e.to.node.clone());
+        if let Some(d) = indeg.get_mut(&e.to.node) {
+            *d += 1;
+        }
+    }
+
+    // Kahn traversal — `column` is maxed over every predecessor, so a node
+    // lands in the column after its *deepest* predecessor (longest path).
+    let mut column: HashMap<NodeId, usize> = HashMap::new();
+    let mut queue: Vec<NodeId> = ids
+        .iter()
+        .filter(|id| indeg.get(*id).copied().unwrap_or(0) == 0)
+        .cloned()
+        .collect();
+    for id in &queue {
+        column.insert(id.clone(), 0);
+    }
+    let mut head = 0;
+    while head < queue.len() {
+        let cur = queue[head].clone();
+        head += 1;
+        let cur_col = column.get(&cur).copied().unwrap_or(0);
+        if let Some(targets) = succ.get(&cur).cloned() {
+            for s in targets {
+                let entry = column.entry(s.clone()).or_insert(0);
+                *entry = (*entry).max(cur_col + 1);
+                if let Some(d) = indeg.get_mut(&s) {
+                    *d -= 1;
+                    if *d == 0 {
+                        queue.push(s);
+                    }
+                }
+            }
+        }
+    }
+
+    // Group by column (BTreeMap keeps columns ordered) and stack into rows.
+    let mut by_column: BTreeMap<usize, Vec<NodeId>> = BTreeMap::new();
+    for id in &ids {
+        by_column
+            .entry(column.get(id).copied().unwrap_or(0))
+            .or_default()
+            .push(id.clone());
+    }
+    for (col, members) in &by_column {
+        for (row, id) in members.iter().enumerate() {
+            if let Some(n) = graph.nodes.iter_mut().find(|n| &n.id == id) {
+                n.position.x = TIDY_MARGIN_X + (*col as f64) * TIDY_COL_W;
+                n.position.y = TIDY_MARGIN_Y + (row as f64) * TIDY_ROW_H;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,5 +533,41 @@ mod tests {
         // Only the trigger→branch edge survives; the case-1 edge is gone.
         assert_eq!(graph.edges.len(), 1);
         assert_eq!(graph.edges[0].from.node, trigger);
+    }
+
+    #[test]
+    fn tidy_lays_a_path_out_left_to_right_by_longest_depth() {
+        let mut graph = starter_graph();
+        let trigger = NodeId("trigger_1".into());
+        let a = add_node(&mut graph, PaletteKind::Action, Position { x: 999.0, y: 999.0 });
+        let b = add_node(&mut graph, PaletteKind::Delay, Position { x: 5.0, y: 5.0 });
+        connect(&mut graph, &trigger, "out", &a);
+        connect(&mut graph, &a, "out", &b);
+
+        tidy_layout(&mut graph);
+
+        let x = |id: &NodeId| graph.nodes.iter().find(|n| &n.id == id).unwrap().position.x;
+        // trigger → a → b each step one column further right.
+        assert!(x(&trigger) < x(&a), "trigger left of a");
+        assert!(x(&a) < x(&b), "a left of b");
+        assert_eq!(x(&trigger), TIDY_MARGIN_X);
+    }
+
+    #[test]
+    fn tidy_columns_a_node_after_its_deepest_predecessor() {
+        // trigger → a → c  and  trigger → c directly: c must land in the
+        // column after `a` (longest path), not after the trigger.
+        let mut graph = starter_graph();
+        let trigger = NodeId("trigger_1".into());
+        let a = add_node(&mut graph, PaletteKind::Action, Position { x: 0.0, y: 0.0 });
+        let c = add_node(&mut graph, PaletteKind::Action, Position { x: 0.0, y: 0.0 });
+        connect(&mut graph, &trigger, "out", &a);
+        connect(&mut graph, &a, "out", &c);
+        connect(&mut graph, &trigger, "out", &c);
+
+        tidy_layout(&mut graph);
+
+        let x = |id: &NodeId| graph.nodes.iter().find(|n| &n.id == id).unwrap().position.x;
+        assert!(x(&c) > x(&a), "c sits past its deepest predecessor a");
     }
 }
