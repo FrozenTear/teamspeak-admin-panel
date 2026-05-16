@@ -163,17 +163,27 @@ impl ProductionDispatcher {
             }
             "clientmute" => {
                 let clid = arg_i64(&rendered, "clid")?;
+                // PURA-295 / PURA-292: server-side mute is revoking the
+                // `client_is_talker` flag. The client-self `client_*_muted`
+                // properties the old `client_set_muted` wrote are rejected
+                // `1538` for a third party on a live TS6 host.
                 backend
-                    .client_set_muted(sid, clid, Some(true), None)
+                    .client_set_talker(sid, clid, false)
                     .await
                     .map_err(|e| format!("ts6Command clientmute failed: {e}"))?;
             }
             "clientunmute" => {
                 let clid = arg_i64(&rendered, "clid")?;
-                backend
-                    .client_set_muted(sid, clid, Some(false), None)
-                    .await
-                    .map_err(|e| format!("ts6Command clientunmute failed: {e}"))?;
+                // PURA-295 / PURA-292: restore the `client_is_talker` flag.
+                // TS6 answers `1538` when the target is not in a moderated
+                // channel — there the client can already speak, so the
+                // unmute intent is satisfied (mirrors
+                // `routes/moderation/actions.rs`). Surface any other error.
+                match backend.client_set_talker(sid, clid, true).await {
+                    Ok(()) => {}
+                    Err(e) if e.upstream_code() == 1538 => {}
+                    Err(e) => return Err(format!("ts6Command clientunmute failed: {e}")),
+                }
             }
             "sendtextmessage" => {
                 let targetmode = arg_i64(&rendered, "targetmode")?;
