@@ -36,8 +36,9 @@ use chrono::Utc;
 use serde_json::Value as JsonValue;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
+use ts6_manager_shared::flows::v2::{FlowGraph, NodeKind, decode_flow_data};
 use ts6_manager_shared::flows::{
-    Action, ActionResult, ActionStatus, FlowDefinition, FlowId, FlowRunId, FlowRunStatus,
+    Action, FlowDefinition, FlowId, FlowRunId, FlowRunStatus, Trigger,
 };
 
 use crate::db::Database;
@@ -47,6 +48,17 @@ use crate::repos::{bot_flow_runs, bot_flows};
 /// routes layer at create / patch time and by the production dispatcher
 /// at run time. Path is `flow::engine::commands` as named in the spec.
 pub mod commands;
+
+/// v2 expression dialect — the blackboard, `eval`/`eval_bool`/`interpolate`
+/// ([PURA-266](/PURA/issues/PURA-266); `architecture.md` §7).
+pub mod expr;
+
+/// v2 graph execution engine — the topological scheduler that supersedes
+/// this module's v1.1 linear loop ([PURA-266](/PURA/issues/PURA-266);
+/// `architecture.md` §5–§6).
+pub mod graph;
+
+use graph::{GraphDeps, run_graph};
 
 use super::trigger::{ParsedTrigger, TriggerEvent};
 
@@ -196,14 +208,25 @@ impl FlowEngine {
             .await
             .context("flow_engine boot: list bot_flow")?;
         for flow in flows.into_iter().filter(|f| f.enabled) {
-            let Some(definition) = parse_definition(&flow.flowData) else {
+            let graph = match decode_flow_data(&flow.flowData) {
+                Ok(g) => g,
+                Err(e) => {
+                    tracing::warn!(
+                        flow.id = flow.id,
+                        error = %e,
+                        "flow_engine boot: malformed flowData; skipping registration"
+                    );
+                    continue;
+                }
+            };
+            let Some(trigger) = graph_trigger(&graph) else {
                 tracing::warn!(
                     flow.id = flow.id,
-                    "flow_engine boot: malformed flowData JSON; skipping registration"
+                    "flow_engine boot: graph has no trigger node; skipping registration"
                 );
                 continue;
             };
-            let Ok(parsed) = ParsedTrigger::parse(&definition.trigger) else {
+            let Ok(parsed) = ParsedTrigger::parse(trigger) else {
                 tracing::warn!(
                     flow.id = flow.id,
                     "flow_engine boot: malformed trigger; skipping cron registration"
@@ -320,15 +343,11 @@ impl FlowEngineHandle {
             .await
             .map_err(FireError::Persist)?
             .ok_or(FireError::NotFound(flow_id))?;
-        let definition = parse_definition(&flow.flowData)
-            .ok_or_else(|| FireError::MalformedFlow(flow_id, "definition JSON".into()))?;
+        let graph = decode_flow_data(&flow.flowData)
+            .map_err(|e| FireError::MalformedFlow(flow_id, e.to_string()))?;
         let event = TriggerEvent::Manual { context };
         self.fire_event(
-            flow_id,
-            &flow.name,
-            &definition,
-            event,
-            /*allow_disabled*/ true,
+            flow_id, &flow.name, &graph, event, /*allow_disabled*/ true,
         )
         .await
     }
@@ -340,7 +359,7 @@ impl FlowEngineHandle {
         &self,
         flow_id: FlowId,
         flow_name: &str,
-        definition: &FlowDefinition,
+        graph: &FlowGraph,
         event: TriggerEvent,
         allow_disabled: bool,
     ) -> std::result::Result<FlowRunId, FireError> {
@@ -353,14 +372,15 @@ impl FlowEngineHandle {
             .ok_or(FireError::NotFound(flow_id))?;
         if !flow.enabled && !allow_disabled {
             let trigger_doc = event.to_json();
-            let action_results = empty_action_results(&definition.actions);
             let run = bot_flow_runs::insert(
                 &self.inner.db,
                 bot_flow_runs::NewBotFlowRun {
                     flowId: flow_id.0,
                     trigger: trigger_doc,
                     status: FlowRunStatus::SkippedDisabled,
-                    actionResults: action_results,
+                    // No execution → no per-node records (PURA-266).
+                    actionResults: Vec::new(),
+                    nodeResults: Vec::new(),
                 },
             )
             .await
@@ -392,16 +412,17 @@ impl FlowEngineHandle {
         };
 
         // Persist the in-flight row first so the FE can poll while the
-        // run is mid-flight.
+        // run is mid-flight. A v2 run records `nodeResults` at finish and
+        // leaves `actionResults` empty (`http-api.md` §5.2).
         let trigger_doc = event.to_json();
-        let action_results = empty_action_results(&definition.actions);
         let run = bot_flow_runs::insert(
             &self.inner.db,
             bot_flow_runs::NewBotFlowRun {
                 flowId: flow_id.0,
                 trigger: trigger_doc.clone(),
                 status: FlowRunStatus::InFlight,
-                actionResults: action_results,
+                actionResults: Vec::new(),
+                nodeResults: Vec::new(),
             },
         )
         .await
@@ -413,7 +434,7 @@ impl FlowEngineHandle {
         // blocking this fire call.
         let inner = self.inner.clone();
         let flow_name = flow_name.to_string();
-        let definition = definition.clone();
+        let graph = graph.clone();
         tokio::spawn(async move {
             // `_per_flow_permit` is dropped at task end → next fire for
             // this flow can proceed.
@@ -429,14 +450,14 @@ impl FlowEngineHandle {
                     return;
                 }
             };
-            run_one(
+            run_graph_run(
                 inner,
                 flow_id,
                 run_id,
                 flow_name,
                 flow.serverConfigId,
                 flow.virtualServerId,
-                definition,
+                graph,
                 trigger_doc,
                 cross_permit,
             )
@@ -479,7 +500,7 @@ impl FlowEngineHandle {
                     continue;
                 }
             };
-            let Some(definition) = parse_definition(&flow.flowData) else {
+            let Ok(graph) = decode_flow_data(&flow.flowData) else {
                 continue;
             };
             let event = TriggerEvent::Ts6ClientJoined {
@@ -492,7 +513,7 @@ impl FlowEngineHandle {
             // ts6 ignores `enabled = false` for *action dispatch* but
             // still writes a `skipped_disabled` audit row.
             let _ = self
-                .fire_event(sub.flow_id, &flow.name, &definition, event, false)
+                .fire_event(sub.flow_id, &flow.name, &graph, event, false)
                 .await;
         }
     }
@@ -503,9 +524,11 @@ impl FlowEngineHandle {
         let flow = bot_flows::find_by_id(&self.inner.db, flow_id.0)
             .await?
             .with_context(|| format!("enable: flow {} not found", flow_id.0))?;
-        let definition = parse_definition(&flow.flowData)
+        let graph = decode_flow_data(&flow.flowData)
             .with_context(|| format!("enable: flow {} flowData malformed", flow_id.0))?;
-        let parsed = ParsedTrigger::parse(&definition.trigger)?;
+        let trigger = graph_trigger(&graph)
+            .with_context(|| format!("enable: flow {} graph has no trigger node", flow_id.0))?;
+        let parsed = ParsedTrigger::parse(trigger)?;
         match parsed {
             ParsedTrigger::Cron(_) => {
                 // The routes child spawns the loop; in this scope we
@@ -592,81 +615,44 @@ fn lock_or_poisoned<T>(m: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
     }
 }
 
-/// Per-run task. Spawned by [`FlowEngineHandle::fire_event`]; finishes
-/// when the action list is exhausted or the first action errors.
+/// Per-run task. Spawned by [`FlowEngineHandle::fire_event`]; drives the
+/// graph through the v2 topological scheduler ([`graph::run_graph`]) and
+/// stamps the terminal `bot_flow_run` row. A v2 run records `nodeResults`
+/// and leaves `actionResults` empty (PURA-266; `http-api.md` §5.2).
 #[allow(clippy::too_many_arguments)]
-async fn run_one(
+async fn run_graph_run(
     inner: Arc<EngineInner>,
     flow_id: FlowId,
     run_id: FlowRunId,
     flow_name: String,
     server_config_id: i64,
     virtual_server_id: i64,
-    definition: FlowDefinition,
+    flow_graph: FlowGraph,
     trigger_doc: JsonValue,
     _cross_permit: OwnedSemaphorePermit,
 ) {
     let start = Instant::now();
-    let mut results: Vec<ActionResult> = empty_action_results(&definition.actions);
-    let mut overall_status = FlowRunStatus::Ok;
-    let mut overall_error: Option<String> = None;
-
-    for (idx, action) in definition.actions.iter().enumerate() {
-        let action_start = Instant::now();
-        let ctx = ActionContext {
-            flow_id,
-            run_id,
-            flow_name: flow_name.clone(),
-            server_config_id,
-            virtual_server_id,
-            action_index: idx as u32,
-            trigger: trigger_doc.clone(),
-        };
-
-        // Catch panics in the dispatcher so a misbehaving action does
-        // not kill the engine task. `tokio::spawn` propagates panics
-        // through the JoinHandle as `Err(JoinError)` — we map that to a
-        // synthetic `Errored` outcome and continue.
-        let outcome = {
-            let inner = inner.clone();
-            let action = action.clone();
-            let ctx = ctx.clone();
-            match tokio::spawn(async move { inner.dispatcher.dispatch(&ctx, &action).await }).await
-            {
-                Ok(o) => o,
-                Err(join_err) => ActionOutcome::Errored(format!("dispatcher panicked: {join_err}")),
-            }
-        };
-
-        let duration = action_start.elapsed();
-        let row = ActionResult {
-            index: idx as u32,
-            kind: action_kind(action).to_string(),
-            status: match &outcome {
-                ActionOutcome::Ok => ActionStatus::Ok,
-                ActionOutcome::Errored(_) => ActionStatus::Errored,
-            },
-            duration_ms: duration.as_millis() as u64,
-            error: match &outcome {
-                ActionOutcome::Ok => None,
-                ActionOutcome::Errored(msg) => Some(msg.clone()),
-            },
-        };
-        results[idx] = row;
-
-        if let ActionOutcome::Errored(msg) = outcome {
-            overall_status = FlowRunStatus::Errored;
-            overall_error = Some(msg);
-            // Remaining actions stay as `Skipped` (their default).
-            break;
-        }
-    }
-
+    let deps = GraphDeps {
+        db: inner.db.clone(),
+        dispatcher: inner.dispatcher.clone(),
+        flow_id,
+        run_id,
+        flow_name: flow_name.clone(),
+        server_config_id,
+        virtual_server_id,
+    };
+    let outcome = run_graph(flow_graph, trigger_doc, deps).await;
     let total_ms = start.elapsed().as_millis() as u64;
+    let status = outcome.status;
+    let node_count = outcome.node_results.len();
+
     let finish = bot_flow_runs::FinishRun {
-        status: overall_status,
-        error: overall_error,
-        actionResults: results,
+        status: outcome.status,
+        error: outcome.error,
+        // v2 runs record per-node results; `actionResults` stays empty so
+        // the persisted row matches `http-api.md` §5.2.
+        actionResults: Vec::new(),
+        nodeResults: outcome.node_results,
     };
     if let Err(e) = bot_flow_runs::finish(&inner.db, run_id.0, finish).await {
         tracing::error!(
@@ -687,38 +673,28 @@ async fn run_one(
         flow.id = flow_id.0,
         flow.name = %flow_name,
         run.id = run_id.0,
-        status = ?overall_status,
+        status = ?status,
+        node_count,
         duration_ms = total_ms,
         "flow run finished"
     );
 }
 
-fn action_kind(action: &Action) -> &'static str {
-    match action {
-        Action::Ts6Command { .. } => "ts6Command",
-        Action::MusicBotCommand { .. } => "musicBotCommand",
-        Action::WebhookOut { .. } => "webhookOut",
-        Action::LogLine { .. } => "logLine",
-    }
+/// The trigger config of a graph — the `config` of its unique `trigger`
+/// node ([`graph::validate`] guarantees exactly one). `None` only for a
+/// structurally broken graph; the engine treats that as "skip with a WARN".
+fn graph_trigger(graph: &FlowGraph) -> Option<&Trigger> {
+    graph.nodes.iter().find_map(|n| match &n.kind {
+        NodeKind::Trigger { config } => Some(config),
+        _ => None,
+    })
 }
 
-fn empty_action_results(actions: &[Action]) -> Vec<ActionResult> {
-    actions
-        .iter()
-        .enumerate()
-        .map(|(idx, action)| ActionResult {
-            index: idx as u32,
-            kind: action_kind(action).to_string(),
-            status: ActionStatus::Skipped,
-            duration_ms: 0,
-            error: None,
-        })
-        .collect()
-}
-
-/// Decode the JSON-encoded `bot_flow.flowData` column into the typed
-/// [`FlowDefinition`]. Returns `None` on parse failure — engines treat
-/// that as "skip the flow with a WARN".
+/// Decode the JSON-encoded `bot_flow.flowData` column into the typed v1.1
+/// [`FlowDefinition`]. Returns `None` on parse failure or for a v2-envelope
+/// row. The v2 engine itself loads graphs via
+/// [`ts6_manager_shared::flows::v2::decode_flow_data`]; this helper survives
+/// only for the v1.1 routes layer's legacy-flow code paths.
 pub(crate) fn parse_definition(raw: &str) -> Option<FlowDefinition> {
     serde_json::from_str(raw).ok()
 }
@@ -752,12 +728,12 @@ fn spawn_cron_loop(
                     continue;
                 }
             };
-            let Some(definition) = parse_definition(&flow.flowData) else {
+            let Ok(graph) = decode_flow_data(&flow.flowData) else {
                 continue;
             };
             let event = TriggerEvent::Cron { tick: next };
             let _ = handle
-                .fire_event(flow_id, &flow.name, &definition, event, false)
+                .fire_event(flow_id, &flow.name, &graph, event, false)
                 .await;
         }
     })

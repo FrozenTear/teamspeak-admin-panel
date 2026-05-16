@@ -7,6 +7,11 @@
 //! strings to match the convention `bot_flow.flowData` set, and
 //! decode/encode through `serde_json` at the repo boundary.
 //!
+//! v2 flow-engine ([PURA-259](/PURA/issues/PURA-259)) adds per-node run
+//! records (`nodeResults`) with **zero schema migration**: rather than a
+//! new column, the existing opaque-`string` `actionResults` column carries
+//! a versioned envelope. See [`ResultsEnvelope`] / [`decode_results`].
+//!
 //! Bounded-storage policy (brief §5.3):
 //!   - [`enforce_per_flow_cap`] keeps at most [`PER_FLOW_RUN_CAP`] rows
 //!     for a given `flowId`, deleting oldest by `startedAt` first. Called
@@ -25,6 +30,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use surrealdb::types::SurrealValue;
+use ts6_manager_shared::flows::v2::NodeResult;
 use ts6_manager_shared::flows::{ActionResult, FlowRunStatus};
 
 use crate::db::Database;
@@ -50,9 +56,9 @@ struct BotFlowRunRow {
     actionResults: String,
 }
 
-/// Decoded `bot_flow_run` row — the repo-level projection. `trigger` and
-/// `actionResults` are decoded from their JSON-string representations so
-/// callers work in typed shapes.
+/// Decoded `bot_flow_run` row — the repo-level projection. `trigger`,
+/// `actionResults` and `nodeResults` are decoded from the JSON-string
+/// `actionResults` column so callers work in typed shapes.
 #[derive(Debug, Clone)]
 pub struct BotFlowRun {
     pub id: i64,
@@ -62,7 +68,11 @@ pub struct BotFlowRun {
     pub startedAt: DateTime<Utc>,
     pub finishedAt: Option<DateTime<Utc>>,
     pub error: Option<String>,
+    /// v1.1 per-action results. Empty for a v2 run, which records
+    /// [`Self::nodeResults`] instead.
     pub actionResults: Vec<ActionResult>,
+    /// v2 per-node results (PURA-259). Empty for a legacy v1.1 run.
+    pub nodeResults: Vec<NodeResult>,
 }
 
 #[derive(Debug, Clone)]
@@ -76,8 +86,11 @@ pub struct NewBotFlowRun {
     pub status: FlowRunStatus,
     /// Planned action results, in order. When the engine inserts the row
     /// at run-start every entry is `Skipped` with `duration_ms = 0`; the
-    /// engine updates them as actions finish via [`update_action_result`].
+    /// engine updates them as actions finish via [`finish`].
     pub actionResults: Vec<ActionResult>,
+    /// v2 per-node results (PURA-259). The v1.1 engine inserts `[]`; the
+    /// v2 engine populates this and leaves `actionResults` empty.
+    pub nodeResults: Vec<NodeResult>,
 }
 
 const PROJECTION: &str = "
@@ -125,11 +138,59 @@ fn status_from_str(s: &str) -> Result<FlowRunStatus> {
     })
 }
 
+/// Versioned envelope persisted in the opaque `actionResults` column when a
+/// run carries v2 per-node records. A run with no node results stores the
+/// bare v1.1 array instead — see [`encode_results`] — so legacy and
+/// v1.1-engine rows stay byte-identical and need no migration (PURA-259;
+/// `docs/flows/v2/http-api.md` §5.2).
+#[derive(Debug, Serialize, Deserialize)]
+struct ResultsEnvelope {
+    #[serde(default)]
+    actionResults: Vec<ActionResult>,
+    #[serde(default)]
+    nodeResults: Vec<NodeResult>,
+}
+
+/// Encode the two result arrays into the `actionResults` column string.
+/// With no node results this writes the bare v1.1 array (keeping legacy
+/// rows byte-identical); a v2 run writes the [`ResultsEnvelope`] object.
+fn encode_results(action_results: &[ActionResult], node_results: &[NodeResult]) -> Result<String> {
+    if node_results.is_empty() {
+        serde_json::to_string(action_results).context("encode actionResults")
+    } else {
+        let envelope = ResultsEnvelope {
+            actionResults: action_results.to_vec(),
+            nodeResults: node_results.to_vec(),
+        };
+        serde_json::to_string(&envelope).context("encode bot_flow_run results envelope")
+    }
+}
+
+/// Decode the `actionResults` column string into the two typed arrays. A
+/// bare JSON array is a legacy/v1.1 row (`nodeResults` empty); a JSON
+/// object is the [`ResultsEnvelope`].
+fn decode_results(raw: &str) -> Result<(Vec<ActionResult>, Vec<NodeResult>)> {
+    let value: serde_json::Value =
+        serde_json::from_str(raw).context("decode bot_flow_run results column")?;
+    match value {
+        serde_json::Value::Array(_) => {
+            let action_results =
+                serde_json::from_value(value).context("decode bot_flow_run actionResults array")?;
+            Ok((action_results, Vec::new()))
+        }
+        serde_json::Value::Object(_) => {
+            let envelope: ResultsEnvelope =
+                serde_json::from_value(value).context("decode bot_flow_run results envelope")?;
+            Ok((envelope.actionResults, envelope.nodeResults))
+        }
+        _ => anyhow::bail!("bot_flow_run results column is neither a JSON array nor object"),
+    }
+}
+
 fn decode(row: BotFlowRunRow) -> Result<BotFlowRun> {
     let trigger: serde_json::Value =
         serde_json::from_str(&row.trigger).context("decode bot_flow_run.trigger")?;
-    let actionResults: Vec<ActionResult> =
-        serde_json::from_str(&row.actionResults).context("decode bot_flow_run.actionResults")?;
+    let (actionResults, nodeResults) = decode_results(&row.actionResults)?;
     Ok(BotFlowRun {
         id: row.id,
         flowId: row.flowId,
@@ -139,13 +200,13 @@ fn decode(row: BotFlowRunRow) -> Result<BotFlowRun> {
         finishedAt: row.finishedAt,
         error: row.error,
         actionResults,
+        nodeResults,
     })
 }
 
 pub async fn insert(db: &Database, new: NewBotFlowRun) -> Result<BotFlowRun> {
     let trigger_json = serde_json::to_string(&new.trigger).context("encode trigger")?;
-    let action_results_json =
-        serde_json::to_string(&new.actionResults).context("encode actionResults")?;
+    let action_results_json = encode_results(&new.actionResults, &new.nodeResults)?;
     let status_str = status_to_str(new.status);
     let terminal = !matches!(new.status, FlowRunStatus::InFlight);
     let sql = format!(
@@ -233,14 +294,15 @@ pub struct FinishRun {
     /// Truncated to [`ERROR_MAX_BYTES`] at the repo boundary.
     pub error: Option<String>,
     pub actionResults: Vec<ActionResult>,
+    /// v2 per-node results (PURA-259). The v1.1 engine passes `[]`.
+    pub nodeResults: Vec<NodeResult>,
 }
 
 /// Stamp the terminal state onto a previously-in-flight row. Sets
 /// `finishedAt = now`.
 pub async fn finish(db: &Database, id: i64, finish: FinishRun) -> Result<Option<BotFlowRun>> {
     let error = finish.error.as_deref().map(truncate_error);
-    let action_results_json =
-        serde_json::to_string(&finish.actionResults).context("encode actionResults")?;
+    let action_results_json = encode_results(&finish.actionResults, &finish.nodeResults)?;
     let sql = format!(
         "UPDATE type::record('bot_flow_run', $id) MERGE {{
             status: $status,

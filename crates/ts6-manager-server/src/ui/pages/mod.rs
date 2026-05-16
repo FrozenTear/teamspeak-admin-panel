@@ -36,6 +36,8 @@ pub use clients::ClientsPage;
 pub use dashboard_placeholder::DashboardPlaceholder;
 #[cfg(debug_assertions)]
 pub use dev_video_player::DevVideoPlayerPage;
+#[cfg(debug_assertions)]
+pub use flows::DevFlowCanvasPage;
 pub use flows::{FlowDetailPage, FlowEditPage, FlowFormPage, FlowsListPage};
 pub use home::Home;
 pub use login::LoginPage;

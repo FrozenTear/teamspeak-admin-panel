@@ -2,10 +2,12 @@
 //!
 //! Default landing for the Flows nav item. Renders an empty-state card if
 //! no flows exist for the active server, otherwise a table per
-//! `ui-brief.md` §3.1.
+//! `ui-brief.md` §3.1. Rows carry a `v1`/`graph` version badge and a
+//! "Convert" action for legacy v1.1 flows (PURA-267).
 
 use dioxus::prelude::*;
 use ts6_manager_shared::flows as wire;
+use ts6_manager_shared::flows::v2;
 
 use crate::client::api::ApiError;
 use crate::client::dioxus::{use_auth_gate, use_session};
@@ -18,8 +20,8 @@ use crate::ui::pages::active_server;
 use crate::ui::pages::flows::dialog::{ConfirmDialog, DeletePrompt};
 use crate::ui::pages::flows::shared::{
     ADMIN_ONLY_HINT, admin_only_title, enabled_badge_class, enabled_label, format_error,
-    is_run_in_flight_conflict, last_run_meta, run_status_badge_class, run_status_icon,
-    run_status_label, trigger_summary,
+    is_run_in_flight_conflict, run_status_badge_class, run_status_icon, run_status_label,
+    trigger_summary,
 };
 use crate::ui::routes::Route;
 
@@ -35,9 +37,6 @@ pub fn FlowsListPage() -> Element {
     let servers_ctx = use_servers_context();
     let server = active_server::resolve(&servers_ctx.data.read(), &*storage);
 
-    // PURA-248 M5 — role rides in the client-side session blob, so the
-    // write affordances are suppressed up front. The route layer remains
-    // the real enforcement point.
     let is_admin = session
         .state
         .read()
@@ -45,7 +44,7 @@ pub fn FlowsListPage() -> Element {
         .map(|u| u.role.eq_ignore_ascii_case("admin"))
         .unwrap_or(false);
 
-    let mut rows: Signal<Vec<wire::Flow>> = use_signal(Vec::new);
+    let mut rows: Signal<Vec<v2::FlowView>> = use_signal(Vec::new);
     let mut error: Signal<Option<ApiError>> = use_signal(|| None::<ApiError>);
     let mut loading: Signal<bool> = use_signal(|| true);
     let mut reload: Signal<u64> = use_signal(|| 0u64);
@@ -55,12 +54,9 @@ pub fn FlowsListPage() -> Element {
         let gate = gate.clone();
         move || {
             let gate = gate.clone();
-            // `peek()` so the resource subscribes once and we drive
-            // refetches by bumping the dependency token below — avoids
-            // the read/set deadlock pattern documented in PURA-132.
             let _ = *reload.peek();
             let _ = reload.read();
-            async move { fl::list_flows(gate, Some(virtual_server_id)).await }
+            async move { fl::list_flow_views(gate, Some(virtual_server_id)).await }
         }
     });
 
@@ -103,12 +99,12 @@ pub fn FlowsListPage() -> Element {
         let mut bump = bump;
         move |flow: wire::FlowId, currently_enabled: bool| {
             let gate = gate.clone();
-            let body = wire::UpdateFlowRequest {
+            let body = v2::UpdateFlowBody {
                 enabled: Some(!currently_enabled),
                 ..Default::default()
             };
             spawn(async move {
-                match fl::update_flow(gate, flow, &body).await {
+                match fl::update_graph_flow(gate, flow, &body).await {
                     Ok(_) => {
                         toaster.push(
                             ToastVariant::Success,
@@ -131,10 +127,27 @@ pub fn FlowsListPage() -> Element {
         }
     };
 
-    // Delete is a two-stage, explicit-confirm flow (PURA-246 B1): a row
-    // click only opens the confirm dialog; the actual `delete_flow` call
-    // happens on dialog-confirm, and a `run_in_flight` 409 re-prompts with
-    // an explicit force choice rather than silently escalating.
+    let on_convert = {
+        let gate = gate.clone();
+        let mut bump = bump;
+        move |flow: wire::FlowId| {
+            let gate = gate.clone();
+            spawn(async move {
+                match fl::convert_flow(gate, flow).await {
+                    Ok(_) => {
+                        toaster.push(ToastVariant::Success, "Converted to graph flow", None);
+                        bump();
+                    }
+                    Err(e) => toaster.push(
+                        ToastVariant::Danger,
+                        "Convert failed",
+                        Some(format_error(&e)),
+                    ),
+                }
+            });
+        }
+    };
+
     let delete_prompt: Signal<DeletePrompt> = use_signal(|| DeletePrompt::Closed);
     let deleting: Signal<bool> = use_signal(|| false);
 
@@ -168,8 +181,6 @@ pub fn FlowsListPage() -> Element {
                         delete_prompt.set(DeletePrompt::Closed);
                         bump();
                     }
-                    // 409 on a non-force delete → escalate to an explicit
-                    // force-delete prompt; the operator decides.
                     Err(e) if !force && is_run_in_flight_conflict(&e) => {
                         delete_prompt.set(DeletePrompt::Force(flow));
                     }
@@ -237,8 +248,6 @@ pub fn FlowsListPage() -> Element {
 
         section { class: "stack-md",
             if *loading.read() && rows.read().is_empty() {
-                // PURA-248 L3 — table-row skeletons hold the table's shape
-                // while flows load, instead of a layout-shifting text card.
                 FlowsTableSkeleton {}
             } else if rows.read().is_empty() {
                 div { class: "empty",
@@ -275,6 +284,10 @@ pub fn FlowsListPage() -> Element {
                     on_toggle_enabled: EventHandler::new({
                         let on_toggle = on_toggle_enabled.clone();
                         move |(id, en): (wire::FlowId, bool)| on_toggle(id, en)
+                    }),
+                    on_convert: EventHandler::new({
+                        let on_convert = on_convert.clone();
+                        move |id: wire::FlowId| on_convert(id)
                     }),
                     on_delete: EventHandler::new(move |id: wire::FlowId| {
                         let mut delete_prompt = delete_prompt;
@@ -322,18 +335,18 @@ pub fn FlowsListPage() -> Element {
     }
 }
 
+// ── Table components ───────────────────────────────────────────────────────
+
 #[derive(Props, Clone, PartialEq)]
 struct FlowsTableProps {
-    rows: Vec<wire::Flow>,
+    rows: Vec<v2::FlowView>,
     is_admin: bool,
     on_fire: EventHandler<wire::FlowId>,
     on_toggle_enabled: EventHandler<(wire::FlowId, bool)>,
+    on_convert: EventHandler<wire::FlowId>,
     on_delete: EventHandler<wire::FlowId>,
 }
 
-/// PURA-248 L3 — loading placeholder for [`FlowsTable`]. Holds the table's
-/// shape (header + four shimmer rows) so the page does not lurch when the
-/// real rows arrive, unlike the prior single-line text card.
 #[component]
 fn FlowsTableSkeleton() -> Element {
     rsx! {
@@ -341,9 +354,6 @@ fn FlowsTableSkeleton() -> Element {
             span { class: "sr-only", role: "status", "aria-live": "polite",
                 "Loading flows…"
             }
-            // `data-table--cards` (PURA-246 R1) — reflows to stacked cards
-            // on narrow viewports; the skeleton opts in so it matches the
-            // populated table's shape at every width.
             table { class: "data-table data-table--cards", aria_hidden: "true",
                 thead {
                     tr {
@@ -380,12 +390,42 @@ fn FlowsTableSkeleton() -> Element {
     }
 }
 
+/// One-line trigger summary for a `FlowView`. v2 graph flows have no stored
+/// definition on the FE side; they show "graph" instead of a trigger kind.
+fn flow_trigger_label(f: &v2::FlowView) -> String {
+    match f.definition.as_ref() {
+        Some(def) => trigger_summary(&def.trigger),
+        None => "graph".into(),
+    }
+}
+
+/// Compact last-run summary from a `FlowRunSummaryView` — same badge +
+/// relative-time approach as the v1.1 list, adapted to the v2 type.
+fn last_run_cell(last: Option<&v2::FlowRunSummaryView>) -> Element {
+    match last {
+        None => rsx! { span { class: "muted", "Never run" } },
+        Some(r) => {
+            use crate::ui::pages::flows::shared::relative_when;
+            let when = relative_when(r.started_at);
+            let status = r.status;
+            rsx! {
+                span { class: "last-run-cell",
+                    span { class: run_status_badge_class(status),
+                        span { class: "flow-icon", aria_hidden: "true",
+                            "{run_status_icon(status)}"
+                        }
+                        "{run_status_label(status)}"
+                    }
+                    span { class: "muted last-run-when", "{when}" }
+                }
+            }
+        }
+    }
+}
+
 #[component]
 fn FlowsTable(props: FlowsTableProps) -> Element {
     rsx! {
-        // `data-table--cards` (PURA-246 R1) — on viewports ≤768px each row
-        // reflows into a stacked card so the Actions column is never pushed
-        // off-screen behind a horizontal scrollbar.
         table { class: "data-table data-table--cards",
             "aria-label": "Flows",
             thead {
@@ -406,9 +446,16 @@ fn FlowsTable(props: FlowsTableProps) -> Element {
                         let is_admin = props.is_admin;
                         let on_fire = props.on_fire;
                         let on_toggle = props.on_toggle_enabled;
+                        let on_convert = props.on_convert;
                         let on_delete = props.on_delete;
-                        let trig = trigger_summary(&f.definition.trigger);
-                        let last = last_run_meta(f.last_run.as_ref());
+                        let trig = flow_trigger_label(&f);
+                        let is_v1 = f.flow_version == 1;
+                        let version_label = if is_v1 { "v1" } else { "graph" };
+                        let version_class = if is_v1 {
+                            "bot-badge bot-badge--off"
+                        } else {
+                            "bot-badge bot-badge--idle"
+                        };
                         rsx! {
                             tr { key: "{id.0}",
                                 td { class: "client-cell",
@@ -417,6 +464,7 @@ fn FlowsTable(props: FlowsTableProps) -> Element {
                                         class: "client-name",
                                         "{f.name}"
                                     }
+                                    span { class: "{version_class}", "{version_label}" }
                                     if let Some(d) = f.description.as_deref().filter(|s| !s.is_empty()) {
                                         span { class: "client-uid", "{d}" }
                                     }
@@ -427,42 +475,9 @@ fn FlowsTable(props: FlowsTableProps) -> Element {
                                         "{enabled_label(enabled)}"
                                     }
                                 }
-                                // PURA-246 R2 — the list is the first scan
-                                // surface, so the last-run status carries
-                                // colour here (a `bot-badge` pill + glyph),
-                                // not just a plain word. A failed last run no
-                                // longer looks identical to an ok one.
                                 td { "data-label": "Last run",
-                                    {match last {
-                                        Some((status, caption)) => rsx! {
-                                            span { class: "last-run-cell",
-                                                span { class: run_status_badge_class(status),
-                                                    span { class: "flow-icon", aria_hidden: "true",
-                                                        "{run_status_icon(status)}"
-                                                    }
-                                                    "{run_status_label(status)}"
-                                                }
-                                                span { class: "muted last-run-when", "{caption}" }
-                                            }
-                                        },
-                                        None => rsx! {
-                                            span { class: "muted", "Never run" }
-                                        },
-                                    }}
+                                    {last_run_cell(f.last_run.as_ref())}
                                 }
-                                // PURA-248 L1 / PURA-246 R4 — the brief
-                                // sketched a `[Fire] [Edit] [⋯]` row with
-                                // Enable/Disable and Delete folded into an
-                                // overflow menu. Divergence rationale: at four
-                                // actions in a dedicated actions column they
-                                // stay scannable in one glance; an overflow
-                                // menu would add a click plus a focus-trap
-                                // surface for no real density win. The mobile
-                                // crowding the menu would have solved is
-                                // instead handled by the `data-table--cards`
-                                // reflow (R1), which stacks the four buttons
-                                // full-width. Revisit only if the row grows
-                                // past ~5 actions.
                                 td { class: "actions-col", "data-label": "Actions",
                                     Button {
                                         variant: ButtonVariant::Primary,
@@ -487,13 +502,23 @@ fn FlowsTable(props: FlowsTableProps) -> Element {
                                             "Edit"
                                         }
                                     }
-                                    Button {
-                                        variant: ButtonVariant::Secondary,
-                                        size: ButtonSize::Small,
-                                        disabled: !is_admin,
-                                        title: admin_only_title(is_admin),
-                                        onclick: move |_| on_toggle.call((id, enabled)),
-                                        if enabled { "Disable" } else { "Enable" }
+                                    if is_v1 && is_admin {
+                                        Button {
+                                            variant: ButtonVariant::Secondary,
+                                            size: ButtonSize::Small,
+                                            title: Some("Convert this legacy flow to a v2 graph".to_string()),
+                                            onclick: move |_| on_convert.call(id),
+                                            "Convert"
+                                        }
+                                    } else {
+                                        Button {
+                                            variant: ButtonVariant::Secondary,
+                                            size: ButtonSize::Small,
+                                            disabled: !is_admin,
+                                            title: admin_only_title(is_admin),
+                                            onclick: move |_| on_toggle.call((id, enabled)),
+                                            if enabled { "Disable" } else { "Enable" }
+                                        }
                                     }
                                     Button {
                                         variant: ButtonVariant::Danger,

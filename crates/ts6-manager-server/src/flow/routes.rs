@@ -1,45 +1,41 @@
-//! v1.1 flow-engine REST surface — PURA-242 (F-impl-routes).
+//! Flow-engine REST surface — v1.1 (PURA-242) extended to the v2 graph
+//! contract (PURA-278, `docs/flows/v2/http-api.md`).
 //!
-//! Implements the contract in `docs/flows/http-api.md` verbatim:
+//! | Method   | Path                            | Auth          |
+//! | -------- | ------------------------------- | ------------- |
+//! | `GET`    | `/api/flows`                    | `RequireAuth` |
+//! | `POST`   | `/api/flows`                    | `RequireAdmin`|
+//! | `GET`    | `/api/flows/{id}`               | `RequireAuth` |
+//! | `PATCH`  | `/api/flows/{id}`               | `RequireAdmin`|
+//! | `DELETE` | `/api/flows/{id}`               | `RequireAdmin`|
+//! | `POST`   | `/api/flows/{id}/fire`          | `RequireAdmin`|
+//! | `GET`    | `/api/flows/{id}/runs`          | `RequireAuth` |
+//! | `GET`    | `/api/flows/{id}/runs/{runId}`  | `RequireAuth` |
+//! | `POST`   | `/api/flows/validate`           | `RequireAdmin`|
+//! | `POST`   | `/api/flows/{id}/convert`       | `RequireAdmin`|
 //!
-//! | Method   | Path                     | Auth          |
-//! | -------- | ------------------------ | ------------- |
-//! | `GET`    | `/api/flows`             | `RequireAuth` |
-//! | `POST`   | `/api/flows`             | `RequireAdmin`|
-//! | `GET`    | `/api/flows/{id}`        | `RequireAuth` |
-//! | `PATCH`  | `/api/flows/{id}`        | `RequireAdmin`|
-//! | `DELETE` | `/api/flows/{id}`        | `RequireAdmin`|
-//! | `POST`   | `/api/flows/{id}/fire`   | `RequireAdmin`|
-//! | `GET`    | `/api/flows/{id}/runs`   | `RequireAuth` |
+//! ## v2 wire surface (`http-api.md` §2)
+//!
+//! `POST` / `PATCH` accept the untagged spec: a `{ graph }` body (v2 —
+//! canonical) or a back-compat `{ definition }` body (v1.1 — projected via
+//! [`project_legacy`] and stored as a v2 envelope). A graph body runs
+//! structural + expression + sub-flow validation before insert; a
+//! structural failure answers `400` with the [`GraphInvalidBody`] `errors`
+//! array rather than the bare `ErrorBody`. Responses are the v2 [`FlowView`]
+//! / [`FlowRunView`], each carrying an explicit `flowVersion`.
 //!
 //! ## State
 //!
-//! The router carries its own [`FlowApiState`] rather than the crate-wide
-//! `AppState`. That wrapper bundles `AppState` (so the shared
-//! `RequireAuth` / `RequireAdmin` extractors keep working via `FromRef`)
-//! with the [`FlowEngineHandle`] the engine layer (PURA-241) exposes and a
-//! small per-flow fire-rate bucket. `AppState` itself is left untouched —
-//! the `FromRef<FlowApiState> for AppState` impl is exactly the seam the
-//! generic extractor design in `auth::extractors` was built for.
+//! The router carries [`FlowApiState`] — `AppState` (so the shared
+//! `RequireAuth` / `RequireAdmin` extractors compose via `FromRef`) plus the
+//! [`FlowEngineHandle`] and a per-flow fire-rate bucket.
 //!
 //! ## Error envelope
 //!
-//! Every non-2xx the handlers emit serialises `flows::ErrorBody`
-//! (`{ "error": <discriminant>, "message": <human> }`) per `http-api.md`
-//! §4. The `401` / `403` rejections are produced upstream by the
-//! `RequireAuth` / `RequireAdmin` extractors and use the shared
-//! `auth::ErrorResponse` envelope — same split every other router in the
-//! crate (`routes::music_bots`, `routes::metrics`) lives with.
-//!
-//! ## Action dispatch
-//!
-//! Mounting the routes does not require the production action dispatcher.
-//! `main.rs` boots the engine with `BasicDispatcher` (PURA-241): `logLine`
-//! actions run for real, the other three kinds fail loudly. Wiring the
-//! production dispatcher (`ts6Command` templating, `musicBotCommand`,
-//! `webhookOut` + SSRF) is tracked as a follow-up child — it needs the
-//! Security Engineer for the `webhookOut` blocklist and is out of scope
-//! for this REST-surface ticket.
+//! Non-2xx bodies serialise `flows::ErrorBody` (`{ error, message }`) per
+//! `http-api.md` §4 — except a graph-validation `400`, which carries the
+//! `errors` array ([`GraphInvalidBody`]). `401` / `403` come from the
+//! extractors and use the shared `auth::ErrorResponse` envelope.
 
 // Handler / helper fallible functions return `Result<_, Response>` — the
 // `Err` variant is an axum `Response`, which is large. That is the
@@ -47,7 +43,7 @@
 // `result_large_err` lint is suppressed module-wide rather than per-fn.
 #![allow(clippy::result_large_err)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -55,33 +51,40 @@ use axum::body::Bytes;
 use axum::extract::{FromRef, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
 use serde::Deserialize;
+use ts6_manager_shared::flows::v2::{
+    CreateFlowBody, FlowGraph, FlowRunSummaryView, FlowRunView, FlowSpec, FlowVersion, FlowView,
+    GraphInvalidBody, ListFlowsView, ListRunsView, UpdateFlowBody, ValidateGraphRequest,
+    ValidateGraphResponse, ValidationError, decode_flow_data, encode_flow_data, flow_version,
+    project_legacy,
+};
 use ts6_manager_shared::flows::{
-    Action, CreateFlowRequest, ErrorBody, FireFlowRequest, FireFlowResponse, Flow, FlowDefinition,
-    FlowId, FlowRun, FlowRunId, FlowRunSummary, ListFlowsResponse, ListRunsResponse,
-    UpdateFlowRequest,
+    Action, ErrorBody, FireFlowRequest, FireFlowResponse, FlowDefinition, FlowId, FlowRunId,
 };
 
 use crate::app_state::AppState;
 use crate::auth::extractors::{RequireAdmin, RequireAuth};
 use crate::flow::FlowEngineHandle;
-use crate::flow::engine::{FireError, commands, parse_definition};
+use crate::flow::engine::{FireError, commands, graph, parse_definition};
 use crate::flow::trigger::ParsedTrigger;
 use crate::repos::bot_flow_runs::{self, BotFlowRun};
 use crate::repos::bot_flows::{self, BotFlow, BotFlowUpdate, NewBotFlow};
 
 /// `http-api.md` §3.1 — flow name length cap.
 const MAX_NAME_LEN: usize = 120;
-/// `http-api.md` §3.1 — action-list length cap.
+/// `http-api.md` §3.1 — action-list length cap (legacy `definition` body).
 const MAX_ACTIONS: usize = 8;
 /// `http-api.md` §3.5 — default / max run-history page size.
 const DEFAULT_RUN_LIMIT: usize = 25;
 const MAX_RUN_LIMIT: usize = 200;
 /// `http-api.md` §1 — per-flow `POST /fire` soft cap of 1 fire / 2 s.
 const FIRE_MIN_INTERVAL: Duration = Duration::from_secs(2);
+/// Sub-flow reference-graph traversal cap — matches the engine's runtime
+/// `MAX_DEPTH`. Nesting past this is reported as `subflow_cycle`.
+const SUBFLOW_MAX_DEPTH: usize = 5;
 
 /// Router state for the flow surface. Wraps the crate-wide [`AppState`] so
 /// the shared auth extractors compose, and adds the engine handle plus the
@@ -116,8 +119,9 @@ impl FromRef<FlowApiState> for AppState {
 }
 
 /// Build the flow sub-router. `main.rs` calls `.with_state(FlowApiState)`
-/// then `merge`s the result into the top-level app alongside the other
-/// eleven routers — the absolute paths line up with `http-api.md` §1.
+/// then `merge`s the result into the top-level app. The static
+/// `/api/flows/validate` path coexists with the `/api/flows/{id}` param
+/// route — `matchit` resolves the static segment first.
 pub fn router() -> Router<FlowApiState> {
     Router::new()
         .route("/api/flows", get(list_flows).post(create_flow))
@@ -125,8 +129,11 @@ pub fn router() -> Router<FlowApiState> {
             "/api/flows/{id}",
             get(get_flow).patch(update_flow).delete(delete_flow),
         )
-        .route("/api/flows/{id}/fire", axum::routing::post(fire_flow))
+        .route("/api/flows/validate", post(validate_graph_route))
+        .route("/api/flows/{id}/fire", post(fire_flow))
+        .route("/api/flows/{id}/convert", post(convert_flow))
         .route("/api/flows/{id}/runs", get(list_runs))
+        .route("/api/flows/{id}/runs/{runId}", get(get_run))
 }
 
 // ---- Error helpers -----------------------------------------------------
@@ -169,6 +176,12 @@ fn internal() -> Response {
     )
 }
 
+/// `400 graph_invalid` — `http-api.md` §4. Carries the full `errors` array
+/// so the canvas can render every structural failure inline.
+fn graph_invalid(errors: Vec<ValidationError>) -> Response {
+    (StatusCode::BAD_REQUEST, Json(GraphInvalidBody::new(errors))).into_response()
+}
+
 // ---- Validation --------------------------------------------------------
 
 fn validate_name(name: &str) -> Result<(), Response> {
@@ -183,17 +196,10 @@ fn validate_name(name: &str) -> Result<(), Response> {
     Ok(())
 }
 
-/// `http-api.md` §3.1 — action-list bounds, the per-command whitelist,
-/// and a parseable trigger (the cron-expression check lives in
-/// [`ParsedTrigger::parse`]).
-///
-/// `ts6Command` / `musicBotCommand` actions are checked against the
-/// whitelist in [`crate::flow::engine::commands`] — the same module the
-/// production dispatcher (PURA-249) re-checks at run time. This rejects a
-/// flow naming an unknown command (or one missing a required argument
-/// key) at create / patch time with `400 validation` rather than letting
-/// it fail only when a run fires. Argument *values* are not type-checked
-/// here: a `${trigger.*}` template does not resolve until run time.
+/// Legacy `definition`-body validation (`http-api.md` §3.1) — action-list
+/// bounds, the per-command whitelist, and a parseable trigger. Applied only
+/// to a back-compat `{ definition }` body; a `{ graph }` body goes through
+/// [`graph::validate_graph`] instead.
 fn validate_definition(def: &FlowDefinition) -> Result<(), Response> {
     if def.actions.is_empty() {
         return Err(validation("definition.actions must not be empty"));
@@ -229,21 +235,121 @@ fn validate_definition(def: &FlowDefinition) -> Result<(), Response> {
 }
 
 /// Parse a JSON request body, surfacing serde errors as `400 validation`
-/// with the serde message (`http-api.md` §4 — e.g. the
-/// `trigger.kind: unknown variant` example). Done by hand rather than via
-/// `axum::Json` because that extractor answers `422` on a data error and
-/// emits a plain-text body — neither matches the spec envelope.
+/// with the serde message (`http-api.md` §4). Done by hand rather than via
+/// `axum::Json` because that extractor answers `422` with a plain-text body
+/// — neither matches the spec envelope.
 fn parse_body<T: for<'de> Deserialize<'de>>(body: &Bytes) -> Result<T, Response> {
     serde_json::from_slice(body).map_err(|e| validation(e.to_string()))
 }
 
+// ---- Spec handling -----------------------------------------------------
+
+/// Sub-flow ids a graph references via its `subflow` / `parallel` nodes.
+fn referenced_subflows(graph: &FlowGraph) -> Vec<FlowId> {
+    use ts6_manager_shared::flows::v2::NodeKind;
+    graph
+        .nodes
+        .iter()
+        .filter_map(|n| match &n.kind {
+            NodeKind::Subflow { sub_flow_id } => Some(*sub_flow_id),
+            NodeKind::Parallel { sub_flow_id, .. } => Some(*sub_flow_id),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `subflow_missing` / `subflow_cycle` (`http-api.md` §6) — a DB-backed
+/// pass that [`graph::validate_graph`] cannot do (it has no flow set).
+/// Walks the static sub-flow reference graph: an unknown id is
+/// `subflow_missing`; nesting past [`SUBFLOW_MAX_DEPTH`] — which only an
+/// unbounded reference cycle (or pathological nesting) produces — is
+/// `subflow_cycle`. A DB read failure surfaces as `Err(internal)`.
+async fn subflow_errors(
+    state: &FlowApiState,
+    graph: &FlowGraph,
+) -> Result<Vec<ValidationError>, Response> {
+    let mut errors = Vec::new();
+    let mut seen_missing: HashSet<i64> = HashSet::new();
+    let mut cycle_flagged = false;
+    let mut work: Vec<(i64, usize)> = referenced_subflows(graph)
+        .into_iter()
+        .map(|f| (f.0, 1))
+        .collect();
+
+    while let Some((fid, depth)) = work.pop() {
+        if depth > SUBFLOW_MAX_DEPTH {
+            if !cycle_flagged {
+                errors.push(ValidationError::new(
+                    "subflow_cycle",
+                    format!(
+                        "sub-flow references nest deeper than the depth-{SUBFLOW_MAX_DEPTH} cap \
+                         — a reference cycle is the usual cause"
+                    ),
+                ));
+                cycle_flagged = true;
+            }
+            continue;
+        }
+        match bot_flows::find_by_id(&state.app.db, fid).await {
+            Ok(Some(row)) => {
+                if let Ok(child) = decode_flow_data(&row.flowData) {
+                    for c in referenced_subflows(&child) {
+                        work.push((c.0, depth + 1));
+                    }
+                }
+            }
+            Ok(None) => {
+                if seen_missing.insert(fid) {
+                    errors.push(ValidationError::new(
+                        "subflow_missing",
+                        format!(
+                            "sub-flow {fid} is referenced by a subflow/parallel node but does \
+                             not exist"
+                        ),
+                    ));
+                }
+            }
+            Err(_) => return Err(internal()),
+        }
+    }
+    Ok(errors)
+}
+
+/// Validate a graph and encode it to a `flowData` blob. A structural /
+/// expression / sub-flow failure short-circuits to `400 graph_invalid`.
+async fn graph_flow_data(state: &FlowApiState, graph: &FlowGraph) -> Result<String, Response> {
+    let report = graph::validate_graph(graph);
+    let mut errors = report.errors;
+    errors.extend(graph::validate_expressions(graph));
+    errors.extend(subflow_errors(state, graph).await?);
+    if !errors.is_empty() {
+        return Err(graph_invalid(errors));
+    }
+    Ok(encode_flow_data(graph))
+}
+
+/// Validate a [`FlowSpec`] and encode it to the canonical v2 `flowData`
+/// envelope. A legacy `{ definition }` body is whitelist-validated then
+/// projected ([`project_legacy`]) — `http-api.md` §2.2 stores it as a v2
+/// envelope, so a v1.1-shaped body never produces a `flowVersion: 1` row.
+async fn spec_flow_data(state: &FlowApiState, spec: &FlowSpec) -> Result<String, Response> {
+    match spec {
+        FlowSpec::Graph { graph } => graph_flow_data(state, graph).await,
+        FlowSpec::Legacy { definition } => {
+            validate_definition(definition)?;
+            Ok(encode_flow_data(&project_legacy(definition)))
+        }
+    }
+}
+
 // ---- Wire conversion ---------------------------------------------------
 
-/// Compact run shape for `Flow.last_run` and the flatten base of [`FlowRun`].
-fn run_summary(run: &BotFlowRun) -> FlowRunSummary {
-    FlowRunSummary {
+/// Compact run summary with the flow's [`FlowVersion`] badge.
+fn run_summary_view(run: &BotFlowRun, flow_version: FlowVersion) -> FlowRunSummaryView {
+    FlowRunSummaryView {
         id: FlowRunId(run.id),
         status: run.status,
+        flow_version,
         started_at: run.startedAt,
         finished_at: run.finishedAt,
         duration_ms: run
@@ -252,29 +358,58 @@ fn run_summary(run: &BotFlowRun) -> FlowRunSummary {
     }
 }
 
-fn to_wire_run(run: BotFlowRun) -> FlowRun {
-    FlowRun {
-        summary: run_summary(&run),
+/// Project a run row to the wire [`FlowRunView`]. The list endpoint passes
+/// `include_node_results = false` to stay light (`http-api.md` §3.2); the
+/// `runs/{runId}` detail endpoint passes `true`.
+fn to_run_view(
+    run: BotFlowRun,
+    flow_version: FlowVersion,
+    include_node_results: bool,
+) -> FlowRunView {
+    let summary = run_summary_view(&run, flow_version);
+    FlowRunView {
+        summary,
         flow_id: FlowId(run.flowId),
         trigger: run.trigger,
         error: run.error,
         action_results: run.actionResults,
+        node_results: if include_node_results {
+            run.nodeResults
+        } else {
+            Vec::new()
+        },
     }
 }
 
-/// Translate a `bot_flow` row into the wire [`Flow`]. The JSON-encoded
-/// `flowData` column is decoded into the typed [`FlowDefinition`]; a
-/// corrupt column is a `500` (it should be impossible — the router is the
-/// only writer and validates before every write).
-fn to_wire_flow(row: BotFlow, last_run: Option<FlowRunSummary>) -> Result<Flow, Response> {
-    let definition = parse_definition(&row.flowData).ok_or_else(internal)?;
-    Ok(Flow {
+/// Translate a `bot_flow` row into the wire [`FlowView`]. The `flowData`
+/// column decodes into a v2 `graph` (a `version: 2` envelope) or a v1.1
+/// `definition` (a row with no `version` key); a corrupt column is a `500`
+/// — the router validates before every write, so it should be impossible.
+fn to_flow_view(
+    row: BotFlow,
+    version: FlowVersion,
+    last_run: Option<FlowRunSummaryView>,
+) -> Result<FlowView, Response> {
+    let (graph, definition) = if version == 2 {
+        (
+            Some(decode_flow_data(&row.flowData).map_err(|_| internal())?),
+            None,
+        )
+    } else {
+        (
+            None,
+            Some(parse_definition(&row.flowData).ok_or_else(internal)?),
+        )
+    };
+    Ok(FlowView {
         id: FlowId(row.id),
         name: row.name,
         description: row.description,
         server_config_id: row.serverConfigId,
         virtual_server_id: row.virtualServerId,
         enabled: row.enabled,
+        flow_version: version,
+        graph,
         definition,
         created_at: row.createdAt,
         updated_at: row.updatedAt,
@@ -282,15 +417,23 @@ fn to_wire_flow(row: BotFlow, last_run: Option<FlowRunSummary>) -> Result<Flow, 
     })
 }
 
-/// Read `flow.last_run` — the latest run row, projected to a summary.
-async fn last_run_summary(
+/// The `flowVersion` a `flowData` blob represents — `1` for a legacy linear
+/// flow, `2` for a graph envelope. A blob that is not even valid JSON is a
+/// corrupt row → `500`.
+fn version_of(flow_data: &str) -> Result<FlowVersion, Response> {
+    flow_version(flow_data).map_err(|_| internal())
+}
+
+/// Read `flow.lastRun` — the latest run row, projected to a summary.
+async fn last_run_summary_view(
     state: &FlowApiState,
     flow_id: i64,
-) -> Result<Option<FlowRunSummary>, Response> {
+    flow_version: FlowVersion,
+) -> Result<Option<FlowRunSummaryView>, Response> {
     let latest = bot_flow_runs::latest_for_flow(&state.app.db, flow_id)
         .await
         .map_err(|_| internal())?;
-    Ok(latest.as_ref().map(run_summary))
+    Ok(latest.as_ref().map(|r| run_summary_view(r, flow_version)))
 }
 
 /// Name uniqueness per `(serverConfigId, virtualServerId)` — `http-api.md`
@@ -341,34 +484,45 @@ async fn list_flows(
         {
             continue;
         }
-        let last_run = match last_run_summary(&state, row.id).await {
+        let version = match version_of(&row.flowData) {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
+        let last_run = match last_run_summary_view(&state, row.id, version).await {
             Ok(lr) => lr,
             Err(resp) => return resp,
         };
-        match to_wire_flow(row, last_run) {
+        match to_flow_view(row, version, last_run) {
             Ok(flow) => flows.push(flow),
             Err(resp) => return resp,
         }
     }
-    (StatusCode::OK, Json(ListFlowsResponse { flows })).into_response()
+    (StatusCode::OK, Json(ListFlowsView { flows })).into_response()
 }
 
-/// `POST /api/flows` — create a flow (`RequireAdmin`).
+/// `POST /api/flows` — create a flow (`RequireAdmin`). Accepts the untagged
+/// `{ graph }` / `{ definition }` spec; a graph body is structurally
+/// validated before insert.
 async fn create_flow(
     _admin: RequireAdmin,
     State(state): State<FlowApiState>,
     body: Bytes,
 ) -> Response {
-    let req: CreateFlowRequest = match parse_body(&body) {
+    let req: CreateFlowBody = match parse_body(&body) {
         Ok(req) => req,
         Err(resp) => return resp,
+    };
+    let spec = match req.spec() {
+        Ok(spec) => spec,
+        Err(msg) => return validation(msg),
     };
     if let Err(resp) = validate_name(&req.name) {
         return resp;
     }
-    if let Err(resp) = validate_definition(&req.definition) {
-        return resp;
-    }
+    let flow_data = match spec_flow_data(&state, &spec).await {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
     match name_is_taken(
         &state,
         req.server_config_id,
@@ -383,10 +537,6 @@ async fn create_flow(
         Err(resp) => return resp,
     }
 
-    let flow_data = match serde_json::to_string(&req.definition) {
-        Ok(s) => s,
-        Err(_) => return internal(),
-    };
     let row = match bot_flows::insert(
         &state.app.db,
         NewBotFlow {
@@ -412,7 +562,11 @@ async fn create_flow(
         tracing::warn!(error = %e, flow.id = row.id, "flow create: engine enable failed");
     }
 
-    match to_wire_flow(row, None) {
+    let version = match version_of(&row.flowData) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    match to_flow_view(row, version, None) {
         Ok(flow) => (StatusCode::CREATED, Json(flow)).into_response(),
         Err(resp) => resp,
     }
@@ -429,11 +583,15 @@ async fn get_flow(
         Ok(None) => return not_found(),
         Err(_) => return internal(),
     };
-    let last_run = match last_run_summary(&state, id).await {
+    let version = match version_of(&row.flowData) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let last_run = match last_run_summary_view(&state, id, version).await {
         Ok(lr) => lr,
         Err(resp) => return resp,
     };
-    match to_wire_flow(row, last_run) {
+    match to_flow_view(row, version, last_run) {
         Ok(flow) => (StatusCode::OK, Json(flow)).into_response(),
         Err(resp) => resp,
     }
@@ -446,9 +604,13 @@ async fn update_flow(
     Path(id): Path<i64>,
     body: Bytes,
 ) -> Response {
-    let req: UpdateFlowRequest = match parse_body(&body) {
+    let req: UpdateFlowBody = match parse_body(&body) {
         Ok(req) => req,
         Err(resp) => return resp,
+    };
+    let spec = match req.spec() {
+        Ok(s) => s,
+        Err(msg) => return validation(msg),
     };
     let current = match bot_flows::find_by_id(&state.app.db, id).await {
         Ok(Some(row)) => row,
@@ -456,12 +618,12 @@ async fn update_flow(
         Err(_) => return internal(),
     };
 
-    // §3.2 — a `definition` swap is only legal while the flow is disabled.
-    if req.definition.is_some() && current.enabled {
+    // §4 — a graph swap is only legal while the flow is disabled.
+    if spec.is_some() && current.enabled {
         return error(
             StatusCode::CONFLICT,
             "definition_swap_locked",
-            "cannot replace definition while the flow is enabled; disable it first",
+            "cannot replace the definition while the flow is enabled; disable it first",
         );
     }
 
@@ -470,11 +632,15 @@ async fn update_flow(
     {
         return resp;
     }
-    if let Some(definition) = &req.definition
-        && let Err(resp) = validate_definition(definition)
-    {
-        return resp;
-    }
+
+    // A graph swap is validated + encoded ahead of the write.
+    let flow_data = match &spec {
+        Some(s) => match spec_flow_data(&state, s).await {
+            Ok(blob) => Some(blob),
+            Err(resp) => return resp,
+        },
+        None => None,
+    };
 
     // Uniqueness check against the post-patch `(name, virtualServerId)`.
     let effective_name = req.name.as_deref().unwrap_or(&current.name);
@@ -496,19 +662,13 @@ async fn update_flow(
         return name_taken();
     }
 
-    let mut update = BotFlowUpdate {
+    let update = BotFlowUpdate {
         name: req.name.clone(),
         description: req.description.clone(),
         virtualServerId: req.virtual_server_id,
         enabled: req.enabled,
-        flowData: None,
+        flowData: flow_data,
     };
-    if let Some(definition) = &req.definition {
-        update.flowData = Some(match serde_json::to_string(definition) {
-            Ok(s) => s,
-            Err(_) => return internal(),
-        });
-    }
 
     let updated = match bot_flows::update(&state.app.db, id, update).await {
         Ok(Some(row)) => row,
@@ -527,11 +687,15 @@ async fn update_flow(
         _ => {}
     }
 
-    let last_run = match last_run_summary(&state, id).await {
+    let version = match version_of(&updated.flowData) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let last_run = match last_run_summary_view(&state, id, version).await {
         Ok(lr) => lr,
         Err(resp) => return resp,
     };
-    match to_wire_flow(updated, last_run) {
+    match to_flow_view(updated, version, last_run) {
         Ok(flow) => (StatusCode::OK, Json(flow)).into_response(),
         Err(resp) => resp,
     }
@@ -681,6 +845,96 @@ async fn fire_flow(
         .into_response()
 }
 
+/// `POST /api/flows/validate` — structural + expression + sub-flow
+/// validation of a graph without persisting (`http-api.md` §3.1). The
+/// canvas calls this on every meaningful edit. `RequireAdmin`.
+async fn validate_graph_route(
+    _admin: RequireAdmin,
+    State(state): State<FlowApiState>,
+    body: Bytes,
+) -> Response {
+    let req: ValidateGraphRequest = match parse_body(&body) {
+        Ok(req) => req,
+        Err(resp) => return resp,
+    };
+    let report = graph::validate_graph(&req.graph);
+    let mut errors = report.errors;
+    errors.extend(graph::validate_expressions(&req.graph));
+    match subflow_errors(&state, &req.graph).await {
+        Ok(more) => errors.extend(more),
+        Err(resp) => return resp,
+    }
+    (
+        StatusCode::OK,
+        Json(ValidateGraphResponse {
+            valid: errors.is_empty(),
+            errors,
+            warnings: report.warnings,
+        }),
+    )
+        .into_response()
+}
+
+/// `POST /api/flows/{id}/convert` — project a legacy v1.1 flow to a v2
+/// graph in place (`http-api.md` §3.3). `RequireAdmin`.
+async fn convert_flow(
+    _admin: RequireAdmin,
+    State(state): State<FlowApiState>,
+    Path(id): Path<i64>,
+) -> Response {
+    let row = match bot_flows::find_by_id(&state.app.db, id).await {
+        Ok(Some(row)) => row,
+        Ok(None) => return not_found(),
+        Err(_) => return internal(),
+    };
+    let version = match version_of(&row.flowData) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    if version == 2 {
+        return error(
+            StatusCode::CONFLICT,
+            "already_graph",
+            "flow is already a v2 graph",
+        );
+    }
+    if row.enabled {
+        return error(
+            StatusCode::CONFLICT,
+            "definition_swap_locked",
+            "disable the flow before converting; conversion changes the definition",
+        );
+    }
+    let definition = match parse_definition(&row.flowData) {
+        Some(def) => def,
+        None => return internal(),
+    };
+    // `project_legacy` assigns the top-to-bottom node layout (§3.3).
+    let flow_data = encode_flow_data(&project_legacy(&definition));
+    let updated = match bot_flows::update(
+        &state.app.db,
+        id,
+        BotFlowUpdate {
+            flowData: Some(flow_data),
+            ..BotFlowUpdate::default()
+        },
+    )
+    .await
+    {
+        Ok(Some(row)) => row,
+        Ok(None) => return not_found(),
+        Err(_) => return internal(),
+    };
+    let last_run = match last_run_summary_view(&state, id, 2).await {
+        Ok(lr) => lr,
+        Err(resp) => return resp,
+    };
+    match to_flow_view(updated, 2, last_run) {
+        Ok(flow) => (StatusCode::OK, Json(flow)).into_response(),
+        Err(resp) => resp,
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ListRunsQuery {
@@ -688,20 +942,24 @@ struct ListRunsQuery {
     cursor: Option<i64>,
 }
 
-/// `GET /api/flows/{id}/runs` — keyset-paginated run history.
+/// `GET /api/flows/{id}/runs` — keyset-paginated run history. Summaries-only
+/// payload: `nodeResults` is emitted empty to keep the history page light
+/// (`http-api.md` §3.2).
 async fn list_runs(
     _user: RequireAuth,
     State(state): State<FlowApiState>,
     Path(id): Path<i64>,
     Query(query): Query<ListRunsQuery>,
 ) -> Response {
-    if bot_flows::find_by_id(&state.app.db, id)
-        .await
-        .map(|f| f.is_none())
-        .unwrap_or(true)
-    {
-        return not_found();
-    }
+    let flow = match bot_flows::find_by_id(&state.app.db, id).await {
+        Ok(Some(row)) => row,
+        Ok(None) => return not_found(),
+        Err(_) => return internal(),
+    };
+    let version = match version_of(&flow.flowData) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
 
     let limit = query
         .limit
@@ -718,7 +976,39 @@ async fn list_runs(
     } else {
         None
     };
-    let runs = rows.into_iter().map(to_wire_run).collect();
+    let runs = rows
+        .into_iter()
+        .map(|r| to_run_view(r, version, false))
+        .collect();
 
-    (StatusCode::OK, Json(ListRunsResponse { runs, next_cursor })).into_response()
+    (StatusCode::OK, Json(ListRunsView { runs, next_cursor })).into_response()
+}
+
+/// `GET /api/flows/{id}/runs/{runId}` — one run with the full `nodeResults`
+/// array, the run-overlay source (`http-api.md` §3.2). `404` if the run is
+/// unknown or not owned by `{id}`.
+async fn get_run(
+    _user: RequireAuth,
+    State(state): State<FlowApiState>,
+    Path((id, run_id)): Path<(i64, i64)>,
+) -> Response {
+    let flow = match bot_flows::find_by_id(&state.app.db, id).await {
+        Ok(Some(row)) => row,
+        Ok(None) => return not_found(),
+        Err(_) => return internal(),
+    };
+    let version = match version_of(&flow.flowData) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let run = match bot_flow_runs::find_by_id(&state.app.db, run_id).await {
+        Ok(Some(run)) => run,
+        Ok(None) => return not_found(),
+        Err(_) => return internal(),
+    };
+    // A run row that belongs to a different flow is, to this path, unknown.
+    if run.flowId != id {
+        return not_found();
+    }
+    (StatusCode::OK, Json(to_run_view(run, version, true))).into_response()
 }

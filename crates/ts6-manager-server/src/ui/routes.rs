@@ -18,6 +18,8 @@ use dioxus::prelude::*;
 
 use crate::ui::layout::AppShell;
 #[cfg(debug_assertions)]
+use crate::ui::pages::DevFlowCanvasPage;
+#[cfg(debug_assertions)]
 use crate::ui::pages::DevVideoPlayerPage;
 use crate::ui::pages::{
     AdminUsersPage, AuditPage, BansPage, BotDetailPage, BotsIndexPage, ChannelsPage, ClientsPage,
@@ -50,6 +52,16 @@ pub enum Route {
     #[cfg(debug_assertions)]
     #[route("/dev/video-player?:relay&:ns")]
     DevVideoPlayerPage { relay: Option<String>, ns: Option<String> },
+
+    // PURA-267 — dev-only mount for the v2 visual flow-canvas builder.
+    // Lives outside `AppShell` and `cfg(debug_assertions)`-gated, exactly
+    // like the canvas-tech spike route: release bundles (`dx serve
+    // --release`) do not expose it. The production swap of `/flows/new`,
+    // `/flows/{id}/edit`, and the Definition tab lands once the v2 HTTP
+    // surface (PURA-266) can be wired for save / validate / run-overlay.
+    #[cfg(debug_assertions)]
+    #[route("/dev/flow-canvas")]
+    DevFlowCanvasPage {},
 
     #[layout(AppShell)]
     #[route("/")]

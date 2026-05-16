@@ -18,9 +18,9 @@ use chrono::{Duration, Utc};
 use surrealdb::types::SurrealValue;
 
 use super::{
-    app_settings, bot_execution_logs, bot_executions, bot_flows, bot_variables, music_bots,
-    music_requests, playlist_songs, playlists, radio_stations, server_connections, songs,
-    ssh_audit_log, stream_sessions, users, widgets,
+    app_settings, bot_execution_logs, bot_executions, bot_flow_runs, bot_flows, bot_variables,
+    music_bots, music_requests, playlist_songs, playlists, radio_stations, server_connections,
+    songs, ssh_audit_log, stream_sessions, users, widgets,
 };
 use crate::db::{connect_in_memory, migrations};
 
@@ -1509,4 +1509,259 @@ async fn audit_entry_persist_round_trips_through_table() {
     assert_eq!(r.exitCode, 0);
     assert_eq!(r.latencyMs, 42);
     assert_eq!(r.userId, Some(user_id));
+}
+
+// =====================================================================
+// PURA-265 — flow-engine v2 wire types + persistence.
+//
+// The v2 graph rides the *existing* opaque `bot_flow.flowData` column as a
+// versioned envelope, and v2 per-node run records ride the existing opaque
+// `bot_flow_run.actionResults` column — zero SurrealDB schema migration.
+// These tests prove both round-trip at the repo boundary and that a legacy
+// v1.1 row still decodes, via the projection shim.
+// =====================================================================
+
+/// Hand-built multi-node graph: `trigger → branch → {welcome, fallback}`.
+/// Exercises 4 node kinds and a fan-out so the round-trip is non-trivial.
+fn sample_v2_graph() -> ts6_manager_shared::flows::v2::FlowGraph {
+    use ts6_manager_shared::flows::v2::*;
+    use ts6_manager_shared::flows::{Action, Trigger};
+
+    FlowGraph {
+        nodes: vec![
+            Node {
+                id: NodeId("start".into()),
+                label: None,
+                position: Position { x: 0.0, y: 0.0 },
+                kind: NodeKind::Trigger {
+                    config: Trigger::Ts6ClientJoined {
+                        channel_id: Some(5),
+                    },
+                },
+            },
+            Node {
+                id: NodeId("by_channel".into()),
+                label: Some("Route by channel".into()),
+                position: Position { x: 0.0, y: 120.0 },
+                kind: NodeKind::Branch {
+                    cases: vec![BranchCase {
+                        label: "lobby".into(),
+                        when: "trigger.channelId == 1".into(),
+                    }],
+                },
+            },
+            Node {
+                id: NodeId("welcome".into()),
+                label: None,
+                position: Position { x: -80.0, y: 240.0 },
+                kind: NodeKind::Action {
+                    config: Action::LogLine {
+                        message: "welcome".into(),
+                    },
+                },
+            },
+            Node {
+                id: NodeId("fallback".into()),
+                label: None,
+                position: Position { x: 80.0, y: 240.0 },
+                kind: NodeKind::Action {
+                    config: Action::LogLine {
+                        message: "fallback".into(),
+                    },
+                },
+            },
+        ],
+        edges: vec![
+            Edge {
+                id: EdgeId("e0".into()),
+                from: PortRef {
+                    node: NodeId("start".into()),
+                    port: "out".into(),
+                },
+                to: PortRef {
+                    node: NodeId("by_channel".into()),
+                    port: "in".into(),
+                },
+                join_policy: JoinPolicy::All,
+            },
+            Edge {
+                id: EdgeId("e1".into()),
+                from: PortRef {
+                    node: NodeId("by_channel".into()),
+                    port: "lobby".into(),
+                },
+                to: PortRef {
+                    node: NodeId("welcome".into()),
+                    port: "in".into(),
+                },
+                join_policy: JoinPolicy::All,
+            },
+            Edge {
+                id: EdgeId("e2".into()),
+                from: PortRef {
+                    node: NodeId("by_channel".into()),
+                    port: "default".into(),
+                },
+                to: PortRef {
+                    node: NodeId("fallback".into()),
+                    port: "in".into(),
+                },
+                join_policy: JoinPolicy::All,
+            },
+        ],
+    }
+}
+
+#[tokio::test]
+async fn bot_flow_v2_graph_round_trips_through_flow_data_column() {
+    use ts6_manager_shared::flows::v2;
+
+    let db = setup().await;
+    let server_id = seed_server(&db).await;
+
+    let graph = sample_v2_graph();
+    // The v2 envelope `{ "version": 2, "graph": { … } }` is just a JSON
+    // string in the *existing* `flowData` column — no schema migration.
+    let flow_data = v2::encode_flow_data(&graph);
+    assert!(
+        flow_data.contains(r#""version":2"#),
+        "envelope: {flow_data}"
+    );
+
+    let inserted = bot_flows::insert(
+        &db,
+        bot_flows::NewBotFlow {
+            name: "graph-flow".into(),
+            description: None,
+            flowData: flow_data,
+            serverConfigId: server_id,
+            virtualServerId: 1,
+            enabled: false,
+        },
+    )
+    .await
+    .expect("insert v2 bot_flow");
+
+    let fetched = bot_flows::find_by_id(&db, inserted.id)
+        .await
+        .expect("find_by_id")
+        .expect("row exists");
+
+    // The repo deserializer reports v2 and decodes the multi-node graph
+    // back identically.
+    assert_eq!(v2::flow_version(&fetched.flowData).unwrap(), 2);
+    let decoded = v2::decode_flow_data(&fetched.flowData).expect("decode v2 envelope");
+    assert_eq!(decoded, graph);
+}
+
+#[tokio::test]
+async fn bot_flow_legacy_row_deserializes_via_projection_shim() {
+    use ts6_manager_shared::flows::v2::{self, NodeKind};
+
+    let db = setup().await;
+    let server_id = seed_server(&db).await;
+
+    // A legacy v1.1 row: a bare `FlowDefinition` with no `version` key —
+    // exactly what the v1.1 engine wrote before PURA-259.
+    let legacy_flow_data = r#"{"trigger":{"kind":"ts6ClientJoined","channelId":3},"actions":[{"kind":"logLine","message":"a"},{"kind":"logLine","message":"b"}]}"#;
+
+    let inserted = bot_flows::insert(
+        &db,
+        bot_flows::NewBotFlow {
+            name: "legacy-flow".into(),
+            description: None,
+            flowData: legacy_flow_data.into(),
+            serverConfigId: server_id,
+            virtualServerId: 1,
+            enabled: false,
+        },
+    )
+    .await
+    .expect("insert legacy bot_flow");
+
+    let fetched = bot_flows::find_by_id(&db, inserted.id)
+        .await
+        .expect("find_by_id")
+        .expect("row exists");
+
+    // No `version` key ⇒ flowVersion 1; the deserializer falls back to the
+    // v1.1 `FlowDefinition` and projects it into a degenerate path graph.
+    assert_eq!(v2::flow_version(&fetched.flowData).unwrap(), 1);
+    let graph = v2::decode_flow_data(&fetched.flowData).expect("decode legacy via shim");
+    assert_eq!(graph.nodes.len(), 3, "trigger + one node per action");
+    assert_eq!(graph.edges.len(), 2, "chained path graph");
+    assert!(matches!(graph.nodes[0].kind, NodeKind::Trigger { .. }));
+    assert!(matches!(graph.nodes[1].kind, NodeKind::Action { .. }));
+    assert!(matches!(graph.nodes[2].kind, NodeKind::Action { .. }));
+}
+
+#[tokio::test]
+async fn bot_flow_run_node_results_round_trip_in_action_results_column() {
+    use ts6_manager_shared::flows::FlowRunStatus;
+    use ts6_manager_shared::flows::v2::{NodeId, NodeResult, NodeStatus};
+
+    let db = setup().await;
+    let server_id = seed_server(&db).await;
+    let flow = bot_flows::insert(
+        &db,
+        bot_flows::NewBotFlow {
+            name: "v2-run".into(),
+            description: None,
+            flowData: r#"{"version":2,"graph":{"nodes":[],"edges":[]}}"#.into(),
+            serverConfigId: server_id,
+            virtualServerId: 1,
+            enabled: true,
+        },
+    )
+    .await
+    .expect("insert bot_flow");
+
+    let started = Utc::now();
+    let node_results = vec![
+        NodeResult {
+            node_id: NodeId("start".into()),
+            kind: "trigger".into(),
+            status: NodeStatus::Ok,
+            started_at: started,
+            finished_at: Some(started),
+            duration_ms: Some(0),
+            error: None,
+            output: Some(serde_json::json!({ "channelId": 5 })),
+        },
+        NodeResult {
+            node_id: NodeId("welcome".into()),
+            kind: "action".into(),
+            status: NodeStatus::Errored,
+            started_at: started,
+            finished_at: Some(started),
+            duration_ms: Some(318),
+            error: Some("client not on server".into()),
+            output: None,
+        },
+    ];
+
+    let inserted = bot_flow_runs::insert(
+        &db,
+        bot_flow_runs::NewBotFlowRun {
+            flowId: flow.id,
+            trigger: serde_json::json!({ "kind": "manualFire" }),
+            status: FlowRunStatus::InFlight,
+            // A v2 run records per-node results and leaves actionResults
+            // empty — both ride the one opaque `actionResults` column.
+            actionResults: vec![],
+            nodeResults: node_results.clone(),
+        },
+    )
+    .await
+    .expect("insert v2 bot_flow_run");
+
+    let fetched = bot_flow_runs::find_by_id(&db, inserted.id)
+        .await
+        .expect("find_by_id")
+        .expect("run row exists");
+    assert!(
+        fetched.actionResults.is_empty(),
+        "v2 run leaves actionResults empty"
+    );
+    assert_eq!(fetched.nodeResults, node_results, "nodeResults round-trip");
 }
