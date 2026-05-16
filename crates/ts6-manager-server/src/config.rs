@@ -127,6 +127,14 @@ pub struct Config {
     /// `WIDGET_RATE_LIMIT_PER_IP_PER_MINUTE`. Protects the box from a
     /// single client iterating tokens.
     pub widget_rate_limit_per_ip_rpm: u32,
+    /// PURA-307 — reverse-proxy allow-list for the public moderation
+    /// surface (`/api/public/moderation/*`). `X-Forwarded-For` is trusted
+    /// for client-IP attribution **only** when the direct peer falls
+    /// inside one of these CIDR blocks (PURA-269 §6 hook 2). Sourced from
+    /// `MODERATION_TRUSTED_PROXY_CIDRS` (comma-separated); empty by
+    /// default, which is default-deny — XFF is ignored and the rate
+    /// limiter keys on the direct connection IP.
+    pub moderation_trusted_proxy_cidrs: Vec<ipnet::IpNet>,
 }
 
 impl Config {
@@ -190,6 +198,9 @@ impl Config {
         let widget_rate_limit_per_ip_rpm =
             parse_env_u32("WIDGET_RATE_LIMIT_PER_IP_PER_MINUTE", 30)?;
 
+        // PURA-307 — public moderation surface trusted-proxy allow-list.
+        let moderation_trusted_proxy_cidrs = parse_env_cidrs("MODERATION_TRUSTED_PROXY_CIDRS")?;
+
         Ok(Self {
             node_env,
             host,
@@ -217,6 +228,7 @@ impl Config {
             trusted_proxy_hops,
             widget_rate_limit_per_token_rpm,
             widget_rate_limit_per_ip_rpm,
+            moderation_trusted_proxy_cidrs,
         })
     }
 
@@ -317,6 +329,28 @@ fn parse_env_u32(key: &str, default: u32) -> Result<u32> {
             .with_context(|| format!("env var {key} is not a valid u32: {v}")),
         _ => Ok(default),
     }
+}
+
+/// Parse a comma-separated list of CIDR blocks (`10.0.0.0/8,192.168.0.0/16`)
+/// — the `MODERATION_TRUSTED_PROXY_CIDRS` allow-list of reverse proxies
+/// whose `X-Forwarded-For` header the public moderation surface trusts
+/// (PURA-269 §6 hook 2). An empty / unset value yields an empty list,
+/// which the resolver treats as **default-deny** — XFF is ignored and the
+/// direct peer IP is used. A malformed entry fails boot loudly rather than
+/// being silently dropped, so a typo cannot quietly weaken IP attribution.
+fn parse_env_cidrs(key: &str) -> Result<Vec<ipnet::IpNet>> {
+    let raw = match env::var(key) {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => return Ok(Vec::new()),
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<ipnet::IpNet>()
+                .with_context(|| format!("env var {key} has an invalid CIDR entry: {s}"))
+        })
+        .collect()
 }
 
 fn parse_bool_flag(key: &str) -> bool {

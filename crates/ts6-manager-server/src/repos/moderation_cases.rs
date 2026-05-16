@@ -22,8 +22,10 @@ use crate::db::Database;
 /// Valid `origin` values. `automod` is reserved for Phase 9.1.
 pub const ORIGINS: &[&str] = &["operator", "complaint", "automod"];
 
-/// Valid `status` values. `appealed` is reserved for Phase 9.2.
-pub const STATUSES: &[&str] = &["open", "actioned", "resolved"];
+/// Valid `status` values. `appealed` is the Phase 9.2 state a case enters
+/// when the subject files a public appeal (`actioned → appealed`,
+/// PURA-307); an operator decision moves it on to `resolved`.
+pub const STATUSES: &[&str] = &["open", "actioned", "resolved", "appealed"];
 
 #[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
 #[surreal(crate = "surrealdb::types")]

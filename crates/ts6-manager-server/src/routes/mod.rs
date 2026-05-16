@@ -13,6 +13,7 @@ pub mod control;
 pub mod metrics;
 pub mod moderation;
 pub mod music_bots;
+pub mod public_moderation;
 pub mod servers;
 pub mod settings;
 pub mod setup;

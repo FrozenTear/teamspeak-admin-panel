@@ -45,6 +45,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 ts6-manager-shared = { path = "crates/shared" }
 ts6-ssrf = { path = "crates/ts6-ssrf" }
+# PURA-307 — CIDR parsing for the public moderation surface's trusted
+# reverse-proxy allow-list (`MODERATION_TRUSTED_PROXY_CIDRS`).
+ipnet = "2.12"
 
 # PURA-14 — auth client slice. `gloo-net` and `web-sys` are wasm-only; they
 # are gated behind `cfg(target_arch = "wasm32")` in source, but the deps must
@@ -150,6 +153,8 @@ jsonwebtoken = "9"
 governor = "0.6"
 rand = "0.8"
 scrypt = { version = "0.11", default-features = false, features = ["std"] }
+sha2 = "0.10"
+subtle = "2"
 thiserror = "2"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "set-header"] }

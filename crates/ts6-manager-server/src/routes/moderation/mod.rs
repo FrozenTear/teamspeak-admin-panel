@@ -39,6 +39,9 @@ mod cases;
 mod complaints;
 mod history;
 mod notes;
+/// Phase 9.2 token mint/verify + TS6 poke delivery (PURA-306). `pub` so
+/// the 9.2 public routes (PURA-307) can verify inbound tokens.
+pub mod tokens;
 
 #[cfg(test)]
 mod tests;

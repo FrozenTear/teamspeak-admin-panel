@@ -337,7 +337,15 @@ mod server_entry {
         let users_router = routes::users::router().with_state(state.clone());
         let audit_router = routes::audit::router().with_state(state.clone());
         // PURA-286 — Phase 9.0 moderation REST surface (`/api/moderation/*`).
-        let moderation_router = routes::moderation::router().with_state(state);
+        let moderation_router = routes::moderation::router().with_state(state.clone());
+        // PURA-307 — Phase 9.2 public report/appeal surface
+        // (`/api/public/moderation/*`). Unauthenticated by design: its own
+        // isolated router with per-IP / per-UID rate-limit + body-size
+        // middleware baked in. `X-Forwarded-For` is trusted only from the
+        // operator's configured reverse-proxy CIDR allow-list.
+        let public_moderation_router =
+            routes::public_moderation::router(cfg.moderation_trusted_proxy_cidrs.clone())
+                .with_state(state);
 
         // PURA-17: `serve_dioxus_application` registers static assets +
         // server functions and adds a fallback that serves the dx-CLI
@@ -382,6 +390,8 @@ mod server_entry {
             .merge(audit_router)
             // PURA-286 — Phase 9.0 moderation surface.
             .merge(moderation_router)
+            // PURA-307 — Phase 9.2 public report/appeal surface.
+            .merge(public_moderation_router)
             .serve_dioxus_application(serve_cfg, ui::App)
             .layer(web::cors_layer(&cfg.frontend_url));
         let router = web::security_headers_stack(cfg.node_env).apply(router);

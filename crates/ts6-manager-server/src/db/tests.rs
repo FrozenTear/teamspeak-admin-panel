@@ -27,6 +27,9 @@ async fn migrations_apply_priority_slice_on_fresh_db() {
             "0011_moderation".to_string(),
             "0012_moderation_warn_action_kind".to_string(),
             "0013_moderation_unban_action_kind".to_string(),
+            "0014_moderation_appeals".to_string(),
+            "0015_moderation_token".to_string(),
+            "0016_moderation_appeal_filed_action_kind".to_string(),
         ],
         "first run should apply every migration"
     );
@@ -46,7 +49,7 @@ async fn migrations_runner_is_idempotent() {
     );
     assert_eq!(
         second.skipped.len(),
-        12,
+        14,
         "second run should skip every migration applied on the first run"
     );
 }

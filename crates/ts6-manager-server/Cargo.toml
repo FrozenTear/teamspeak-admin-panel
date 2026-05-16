@@ -37,9 +37,12 @@ server = [
     "dep:bcrypt",
     "dep:governor",
     "dep:hex",
+    "dep:ipnet",
     "dep:jsonwebtoken",
     "dep:rand",
     "dep:scrypt",
+    "dep:sha2",
+    "dep:subtle",
     "dep:thiserror",
     "dep:tower",
     "dep:tower-http",
@@ -99,9 +102,12 @@ async-trait = { workspace = true, optional = true }
 bcrypt = { workspace = true, optional = true }
 governor = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
+ipnet = { workspace = true, optional = true }
 jsonwebtoken = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 scrypt = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+subtle = { workspace = true, optional = true }
 thiserror = { workspace = true, optional = true }
 tower = { workspace = true, optional = true }
 tower-http = { workspace = true, optional = true }
