@@ -458,15 +458,6 @@ mod tests {
         ) -> ControlResult<()> {
             unimplemented!("not used by dashboard fetch")
         }
-        async fn client_set_muted(
-            &self,
-            _sid: i64,
-            _clid: i64,
-            _input_muted: Option<bool>,
-            _output_muted: Option<bool>,
-        ) -> ControlResult<()> {
-            unimplemented!("not used by dashboard fetch")
-        }
         async fn sendtextmessage(
             &self,
             _sid: i64,

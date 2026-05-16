@@ -308,27 +308,6 @@ impl ControlBackend for SshControlClient {
         Ok(())
     }
 
-    async fn client_set_muted(
-        &self,
-        sid: i64,
-        clid: i64,
-        input_muted: Option<bool>,
-        output_muted: Option<bool>,
-    ) -> ControlResult<()> {
-        if input_muted.is_none() && output_muted.is_none() {
-            return Ok(());
-        }
-        let mut line = format!("clientedit clid={clid}");
-        if let Some(v) = input_muted {
-            line.push_str(&format!(" CLIENT_INPUT_MUTED={}", if v { 1 } else { 0 }));
-        }
-        if let Some(v) = output_muted {
-            line.push_str(&format!(" CLIENT_OUTPUT_MUTED={}", if v { 1 } else { 0 }));
-        }
-        self.run_scoped(sid, &line).await?;
-        Ok(())
-    }
-
     async fn sendtextmessage(
         &self,
         sid: i64,

@@ -181,34 +181,22 @@ pub async fn kick(
     }
 }
 
+/// Revoke the `client_is_talker` talker flag — the TS6 server-side mute
+/// primitive (PURA-292/PURA-299). Effective in moderated channels
+/// (`channel_needed_talk_power > 0`). Accepts an optional body for wire-compat
+/// with older callers but ignores its contents.
 pub async fn mute(
     State(state): State<AppState>,
     RequireAuth(user): RequireAuth,
     Path((config_id, sid, clid)): Path<(i64, i64, i64)>,
-    body: Option<Json<MuteRequest>>,
+    _body: Option<Json<MuteRequest>>,
 ) -> Result<StatusCode, Response> {
     let connection = access::check_write(&state, &user, config_id).await?;
     let client = backend(&state, &connection).await?;
-    // Default behaviour with no body: mute both directions.
-    let req = body.map(|Json(b)| b).unwrap_or(MuteRequest {
-        input_muted: Some(true),
-        output_muted: Some(true),
-    });
-    if req.input_muted.is_none() && req.output_muted.is_none() {
-        return Err(bad_request(
-            "mute body must set at least one of inputMuted/outputMuted",
-        ));
-    }
     let started = Instant::now();
     let action = "client.mute";
-    let details = format!(
-        "input_muted={:?} output_muted={:?}",
-        req.input_muted, req.output_muted
-    );
-    match client
-        .client_set_muted(sid, clid, req.input_muted, req.output_muted)
-        .await
-    {
+    let details = format!("clid={clid} client_is_talker=0");
+    match client.client_set_talker(sid, clid, false).await {
         Ok(()) => {
             emit_success(
                 &state,
@@ -225,11 +213,7 @@ pub async fn mute(
                 &state,
                 config_id,
                 "ts:client:muted",
-                json!({
-                    "clid": clid,
-                    "inputMuted": req.input_muted,
-                    "outputMuted": req.output_muted,
-                }),
+                json!({ "clid": clid, "talker": false }),
             )
             .await;
             Ok(StatusCode::NO_CONTENT)
@@ -249,6 +233,10 @@ pub async fn mute(
     }
 }
 
+/// Restore the `client_is_talker` talker flag — the TS6 server-side unmute
+/// primitive (PURA-292/PURA-299). TS6 rejects `client_is_talker=1` with `1538`
+/// when the target is not in a moderated channel; in that case the client can
+/// already speak, so we treat `1538` as success.
 pub async fn unmute(
     State(state): State<AppState>,
     RequireAuth(user): RequireAuth,
@@ -258,11 +246,21 @@ pub async fn unmute(
     let client = backend(&state, &connection).await?;
     let started = Instant::now();
     let action = "client.unmute";
-    let details = "input_muted=false output_muted=false".to_string();
-    match client
-        .client_set_muted(sid, clid, Some(false), Some(false))
-        .await
-    {
+    let details = format!("clid={clid} client_is_talker=1");
+    let result = match client.client_set_talker(sid, clid, true).await {
+        Ok(()) => Ok(()),
+        Err(ref e) if e.upstream_code() == 1538 => {
+            // Target not in a moderated channel — client can already speak.
+            tracing::info!(
+                sid,
+                clid,
+                "unmute: TS6 1538 — target not in a moderated channel, talker flag moot"
+            );
+            Ok(())
+        }
+        Err(e) => Err(e),
+    };
+    match result {
         Ok(()) => {
             emit_success(
                 &state,
@@ -279,7 +277,7 @@ pub async fn unmute(
                 &state,
                 config_id,
                 "ts:client:unmuted",
-                json!({ "clid": clid }),
+                json!({ "clid": clid, "talker": true }),
             )
             .await;
             Ok(StatusCode::NO_CONTENT)
@@ -472,6 +470,7 @@ fn project_client_list_item(
         client_output_muted: e.client_output_muted,
         client_input_hardware: e.client_input_hardware,
         client_output_hardware: e.client_output_hardware,
+        client_is_talker: e.client_is_talker,
         client_idle_time: e.client_idle_time,
         client_lastconnected: e.client_lastconnected,
         client_created: e.client_created,

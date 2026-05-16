@@ -22,9 +22,7 @@ use std::sync::Arc;
 
 use dioxus::prelude::*;
 use serde_json::Value;
-use ts6_manager_shared::control::{
-    ClientListItem, KickKind, KickRequest, MoveRequest, MuteRequest,
-};
+use ts6_manager_shared::control::{ClientListItem, KickKind, KickRequest, MoveRequest, MuteRequest};
 
 use crate::client::api::{self, ApiError};
 use crate::client::dioxus::{use_auth_gate, use_session};
@@ -156,16 +154,15 @@ pub fn ClientsPage() -> Element {
         move |clid: i64, on: bool| {
             let gate = gate.clone();
             spawn(async move {
-                let body = MuteRequest {
-                    input_muted: Some(on),
-                    output_muted: Some(on),
-                };
-                let path = format!("/api/servers/{server_id}/vs/{sid}/clients/{clid}/mute");
+                // `on=true` → mute (revoke talker flag); `on=false` → unmute.
+                let segment = if on { "mute" } else { "unmute" };
+                let path =
+                    format!("/api/servers/{server_id}/vs/{sid}/clients/{clid}/{segment}");
                 match api::authorized_post_json::<_, ()>(
                     &gate,
                     &api::api_base(),
                     &path,
-                    Some(&body),
+                    None::<&()>,
                 )
                 .await
                 {
@@ -296,7 +293,9 @@ fn ClientsTable(props: ClientsTableProps) -> Element {
                         let r = r.clone();
                         let clid = r.clid;
                         let cid = r.cid;
-                        let muted = r.client_input_muted != 0 || r.client_output_muted != 0;
+                        // Silenced = operator revoked the talker flag.
+                        // Effective in moderated channels only.
+                        let muted = r.client_is_talker == 0;
                         let on_kick_server = props.on_kick_server;
                         let on_kick_channel = props.on_kick_channel;
                         let on_mute = props.on_mute;
@@ -310,7 +309,14 @@ fn ClientsTable(props: ClientsTableProps) -> Element {
                                 }
                                 td { "{cid}" }
                                 td {
-                                    if muted { "Muted" } else { "Active" }
+                                    if muted {
+                                        span {
+                                            title: "Silenced via talker flag — effective in moderated channels only",
+                                            "Silenced"
+                                        }
+                                    } else {
+                                        "Active"
+                                    }
                                     if r.client_away != 0 { " · Away" }
                                 }
                                 td { class: "actions-col",
@@ -429,20 +435,14 @@ fn apply_event(rows: &mut Vec<ClientListItem>, env: &WsEvent) {
             if let Some(clid) = env.data.get("clid").and_then(Value::as_i64)
                 && let Some(row) = rows.iter_mut().find(|r| r.clid == clid)
             {
-                if let Some(b) = env.data.get("inputMuted").and_then(Value::as_bool) {
-                    row.client_input_muted = if b { 1 } else { 0 };
-                }
-                if let Some(b) = env.data.get("outputMuted").and_then(Value::as_bool) {
-                    row.client_output_muted = if b { 1 } else { 0 };
-                }
+                row.client_is_talker = 0;
             }
         }
         "ts:client:unmuted" => {
             if let Some(clid) = env.data.get("clid").and_then(Value::as_i64)
                 && let Some(row) = rows.iter_mut().find(|r| r.clid == clid)
             {
-                row.client_input_muted = 0;
-                row.client_output_muted = 0;
+                row.client_is_talker = 1;
             }
         }
         _ => {}
@@ -540,29 +540,29 @@ mod tests {
     }
 
     #[test]
-    fn mute_updates_columns() {
-        let mut rows = vec![row(3)];
+    fn mute_clears_talker_flag() {
+        let mut rows = vec![ClientListItem {
+            client_is_talker: 1,
+            ..row(3)
+        }];
         apply_event(
             &mut rows,
-            &evt(
-                "ts:client:muted",
-                json!({"clid": 3, "inputMuted": true, "outputMuted": false}),
-            ),
+            &evt("ts:client:muted", json!({"clid": 3, "talker": false})),
         );
-        assert_eq!(rows[0].client_input_muted, 1);
-        assert_eq!(rows[0].client_output_muted, 0);
+        assert_eq!(rows[0].client_is_talker, 0);
     }
 
     #[test]
-    fn unmute_clears_both_columns() {
+    fn unmute_restores_talker_flag() {
         let mut rows = vec![ClientListItem {
-            client_input_muted: 1,
-            client_output_muted: 1,
+            client_is_talker: 0,
             ..row(4)
         }];
-        apply_event(&mut rows, &evt("ts:client:unmuted", json!({"clid": 4})));
-        assert_eq!(rows[0].client_input_muted, 0);
-        assert_eq!(rows[0].client_output_muted, 0);
+        apply_event(
+            &mut rows,
+            &evt("ts:client:unmuted", json!({"clid": 4, "talker": true})),
+        );
+        assert_eq!(rows[0].client_is_talker, 1);
     }
 
     #[test]

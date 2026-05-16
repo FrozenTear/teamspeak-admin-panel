@@ -627,7 +627,7 @@ impl WebQueryClient {
 
     /// `clientedit` (sid scope) — flexible primitive for property changes
     /// (e.g. `CLIENT_DESCRIPTION`, `CLIENT_IS_TALKER`). Used by
-    /// [`Self::client_set_muted`].
+    /// [`Self::client_set_talker`].
     pub async fn clientedit_raw(
         &self,
         sid: i64,
@@ -667,40 +667,6 @@ impl WebQueryClient {
     ) -> WebQueryResult<()> {
         self.clientedit_raw(sid, clid, &[("client_is_talker", bool_to_int(can_talk))])
             .await
-    }
-
-    /// Mute helper — sets `CLIENT_INPUT_MUTED` and/or `CLIENT_OUTPUT_MUTED`
-    /// on the client via `clientedit`. `None` leaves the field unchanged.
-    ///
-    /// **Caveat (PURA-292):** `CLIENT_INPUT_MUTED` / `CLIENT_OUTPUT_MUTED`
-    /// are client-self properties — live TS6 6.0.0-beta rejects them on
-    /// `clientedit` for a third party (`1538`). The control surface and
-    /// flow engine still call this; see the PURA-292 follow-up child
-    /// issue. For server-side moderation muting use
-    /// [`Self::client_set_talker`].
-    pub async fn client_set_muted(
-        &self,
-        sid: i64,
-        clid: i64,
-        input_muted: Option<bool>,
-        output_muted: Option<bool>,
-    ) -> WebQueryResult<()> {
-        let mut props: Vec<(&str, &str)> = Vec::with_capacity(2);
-        let in_s;
-        let out_s;
-        if let Some(v) = input_muted {
-            in_s = bool_to_int(v);
-            props.push(("CLIENT_INPUT_MUTED", in_s));
-        }
-        if let Some(v) = output_muted {
-            out_s = bool_to_int(v);
-            props.push(("CLIENT_OUTPUT_MUTED", out_s));
-        }
-        if props.is_empty() {
-            // Caller asked for no-op; avoid a wasted upstream round-trip.
-            return Ok(());
-        }
-        self.clientedit_raw(sid, clid, &props).await
     }
 
     /// `sendtextmessage` (sid scope) — deliver a text message to a client

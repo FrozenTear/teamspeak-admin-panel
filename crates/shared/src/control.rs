@@ -14,6 +14,10 @@
 
 use serde::{Deserialize, Serialize};
 
+fn default_talker() -> i64 {
+    1
+}
+
 /// `GET /api/servers/{configId}/vs/{sid}/clients` row. Mirrors the TS
 /// WebQuery `clientlist -uid -away -voice -times -groups -info -country`
 /// projection (spec §7.8). `connection_client_ip` is admin-only — the
@@ -33,6 +37,12 @@ pub struct ClientListItem {
     pub client_output_muted: i64,
     pub client_input_hardware: i64,
     pub client_output_hardware: i64,
+    /// Operator-set talker flag — the TS6 server-side mute primitive
+    /// (PURA-292/PURA-299). `0` = talk permission revoked; `1` = allowed.
+    /// Effective only in moderated channels (`channel_needed_talk_power > 0`).
+    /// Defaults to `1` for all clients.
+    #[serde(default = "default_talker")]
+    pub client_is_talker: i64,
     pub client_idle_time: i64,
     pub client_lastconnected: i64,
     pub client_created: i64,

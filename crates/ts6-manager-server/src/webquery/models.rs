@@ -17,6 +17,10 @@ use std::str::FromStr;
 use serde::de::{self, Deserializer, Visitor};
 use serde::{Deserialize, Serialize};
 
+fn one_i64() -> i64 {
+    1
+}
+
 /// `version` — instance scope (`/version`). Used as the cheap health probe
 /// per spec §10.7. We only need to know the call succeeded; the body is
 /// retained for diagnostics / future use.
@@ -123,6 +127,10 @@ pub struct ClientEntry {
     pub client_input_hardware: i64,
     #[serde(default, deserialize_with = "stringy::deserialize_default")]
     pub client_output_hardware: i64,
+    // Operator-set talker flag (PURA-299). Defaults to 1 (allowed); 0 means
+    // talk permission revoked. Effective only in moderated channels.
+    #[serde(default = "one_i64", deserialize_with = "stringy::deserialize_default")]
+    pub client_is_talker: i64,
     // -times
     #[serde(default, deserialize_with = "stringy::deserialize_default")]
     pub client_idle_time: i64,

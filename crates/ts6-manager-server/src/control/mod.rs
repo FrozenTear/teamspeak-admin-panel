@@ -335,21 +335,6 @@ pub trait ControlBackend: Send + Sync + std::fmt::Debug {
     /// third party — this is the call moderation actions dispatch.
     async fn client_set_talker(&self, sid: i64, clid: i64, can_talk: bool) -> ControlResult<()>;
 
-    /// Convenience over `clientedit` — sets `CLIENT_INPUT_MUTED` /
-    /// `CLIENT_OUTPUT_MUTED`. `None` leaves the field unchanged. A
-    /// fully-`None` call is a no-op (no upstream round-trip).
-    ///
-    /// **PURA-292 caveat:** these are client-self properties; a live TS6
-    /// host rejects them for any other client. For server-side muting
-    /// use [`Self::client_set_talker`].
-    async fn client_set_muted(
-        &self,
-        sid: i64,
-        clid: i64,
-        input_muted: Option<bool>,
-        output_muted: Option<bool>,
-    ) -> ControlResult<()>;
-
     /// `sendtextmessage` (sid scope) — deliver a text message to a client
     /// (`targetmode=1`), a channel (`targetmode=2`), or the whole virtual
     /// server (`targetmode=3`). `target` is the matching id for the mode.
@@ -507,18 +492,6 @@ impl ControlBackend for WebQueryClient {
 
     async fn client_set_talker(&self, sid: i64, clid: i64, can_talk: bool) -> ControlResult<()> {
         self.client_set_talker(sid, clid, can_talk)
-            .await
-            .map_err(Into::into)
-    }
-
-    async fn client_set_muted(
-        &self,
-        sid: i64,
-        clid: i64,
-        input_muted: Option<bool>,
-        output_muted: Option<bool>,
-    ) -> ControlResult<()> {
-        self.client_set_muted(sid, clid, input_muted, output_muted)
             .await
             .map_err(Into::into)
     }

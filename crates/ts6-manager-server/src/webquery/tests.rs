@@ -1140,27 +1140,6 @@ async fn servergroupaddclient_passes_sgid_and_cldbid() {
 }
 
 #[tokio::test]
-async fn client_set_muted_writes_input_muted_property() {
-    // NOTE (PURA-292): this asserts the *legacy* `CLIENT_INPUT_MUTED`
-    // wire shape against the mock. That property is client-self state —
-    // a live TS6 host rejects it for a third party (`1538`). Moderation
-    // muting goes through `client_set_talker`; the control surface and
-    // flow engine still call this helper (PURA-292 follow-up child issue).
-    let server = MockServer::start("k").await;
-    let client = build_client(&server, "k");
-
-    client
-        .client_set_muted(1, 10, Some(true), None)
-        .await
-        .unwrap();
-    let captured = server.state.captured_query.lock().unwrap().clone().unwrap();
-    assert_eq!(
-        captured,
-        ("10".to_string(), "CLIENT_INPUT_MUTED=1".to_string())
-    );
-}
-
-#[tokio::test]
 async fn client_set_talker_edits_lowercase_talker_property() {
     let server = MockServer::start("k").await;
     let client = build_client(&server, "k");
@@ -1183,16 +1162,6 @@ async fn client_set_talker_edits_lowercase_talker_property() {
         captured,
         ("11".to_string(), "client_is_talker=1".to_string())
     );
-}
-
-#[tokio::test]
-async fn client_set_muted_with_no_changes_is_noop() {
-    let server = MockServer::start("k").await;
-    let client = build_client(&server, "k");
-
-    client.client_set_muted(1, 10, None, None).await.unwrap();
-    // No upstream call should fire — captured_query stays None.
-    assert!(server.state.captured_query.lock().unwrap().is_none());
 }
 
 #[tokio::test]
@@ -1409,6 +1378,16 @@ async fn integration_client_set_talker_against_local_ts6() {
         .client_set_talker(sid, target.clid, false)
         .await
         .expect("client_set_talker(false) must be accepted by live TS6");
+
+    // Restore — `client_is_talker=1` may get `1538` when not in a moderated
+    // channel; that is expected and means the client can already speak.
+    match client.client_set_talker(sid, target.clid, true).await {
+        Ok(()) => {}
+        Err(e) if e.upstream_code() == 1538 => {
+            eprintln!("unmute: 1538 — target not in a moderated channel (expected)");
+        }
+        Err(e) => panic!("client_set_talker(true) failed unexpectedly: {e}"),
+    }
 }
 
 // =========================================================================

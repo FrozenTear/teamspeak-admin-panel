@@ -60,6 +60,9 @@ pub fn build_widget_data(widget: &Widget, inputs: WidgetInputs) -> WidgetData {
             clid: c.clid,
             nickname: c.client_nickname.clone(),
             is_away: c.client_away != 0,
+            // Self-reported mic/speaker state — distinct from the operator
+            // talker flag (`client_is_talker`). Both are valid reads; the
+            // snapshot widget shows the client's own hardware mute state.
             is_muted: c.client_input_muted != 0 || c.client_output_muted != 0,
         });
     }
