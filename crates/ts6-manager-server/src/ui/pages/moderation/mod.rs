@@ -14,6 +14,9 @@
 //!   behind an explicit collateral-damage warning.
 //! - [`SubjectHistoryPage`] — `/moderation/subjects/{uid}`. Every case,
 //!   action, and note for one subject UID, plus the add-note form.
+//! - [`AutomodMetricsPage`] — `/moderation/automod`. Per-`ruleKey`
+//!   automod outcome counts (Phase 9.1.4) — the shadow-vs-enforce
+//!   promotion surface.
 //! - [`PermissionGrantsPage`] — `/admin/permissions`. The per-user
 //!   `moderation.*` grant editor (admin-only).
 //!
@@ -33,12 +36,14 @@
 mod case_detail;
 mod grants;
 mod history;
+mod metrics;
 pub(crate) mod perm;
 mod queue;
 
 pub use case_detail::ModerationCasePage;
 pub use grants::PermissionGrantsPage;
 pub use history::SubjectHistoryPage;
+pub use metrics::AutomodMetricsPage;
 pub use queue::ModerationQueuePage;
 
 use chrono::{DateTime, Utc};
@@ -146,6 +151,7 @@ pub(crate) fn action_kind_icon(kind: &str) -> &'static str {
         "ban_ip" => "⊘",
         "mute" => "🔇",
         "unmute" => "🔊",
+        "unban" => "⊙",
         "note" => "✎",
         "resolve" => "✓",
         "reopen" => "↺",
@@ -161,6 +167,7 @@ pub(crate) fn action_kind_label(kind: &str) -> &'static str {
         "ban_ip" => "Banned (IP)",
         "mute" => "Muted",
         "unmute" => "Unmuted",
+        "unban" => "Ban lifted",
         "note" => "Note",
         "resolve" => "Resolved",
         "reopen" => "Reopened",

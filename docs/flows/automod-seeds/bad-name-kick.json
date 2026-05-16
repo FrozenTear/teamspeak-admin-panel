@@ -1,0 +1,50 @@
+{
+  "version": 2,
+  "graph": {
+    "nodes": [
+      {
+        "id": "client_joined",
+        "label": "A client joins the server",
+        "position": { "x": 0, "y": 0 },
+        "kind": "trigger",
+        "config": { "kind": "ts6ClientJoined", "channelId": null }
+      },
+      {
+        "id": "match_bad_name",
+        "label": "Display name matches the block-list",
+        "position": { "x": 0, "y": 160 },
+        "kind": "branch",
+        "cases": [
+          {
+            "label": "flagged",
+            "when": "contains(lower(trigger.clientNickname), \"free nitro\") or contains(lower(trigger.clientNickname), \"discord.gg\") or contains(lower(trigger.clientNickname), \"t.me/\") or matches_glob(lower(trigger.clientNickname), \"*server admin*\")"
+          }
+        ]
+      },
+      {
+        "id": "kick",
+        "label": "Kick the flagged client",
+        "position": { "x": 0, "y": 320 },
+        "kind": "action",
+        "config": {
+          "kind": "moderate",
+          "effect": "kick",
+          "reasonTemplate": "Automod: your display name was flagged by the bad-name filter. Please rejoin with a different name.",
+          "ruleKey": "automod-bad-name-kick"
+        }
+      }
+    ],
+    "edges": [
+      {
+        "id": "e_trigger_branch",
+        "from": { "node": "client_joined", "port": "out" },
+        "to": { "node": "match_bad_name", "port": "in" }
+      },
+      {
+        "id": "e_branch_kick",
+        "from": { "node": "match_bad_name", "port": "flagged" },
+        "to": { "node": "kick", "port": "in" }
+      }
+    ]
+  }
+}

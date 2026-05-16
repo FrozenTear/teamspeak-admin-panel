@@ -75,6 +75,19 @@ pub fn trigger_summary(trigger: &wire::Trigger) -> String {
         wire::Trigger::Ts6ClientJoined {
             channel_id: Some(c),
         } => format!("ts6 client joined (channel {c})"),
+        wire::Trigger::Ts6ChatMessage { channel_id: None, .. } => "ts6 chat message".into(),
+        wire::Trigger::Ts6ChatMessage {
+            channel_id: Some(c),
+            ..
+        } => format!("ts6 chat message (channel {c})"),
+        wire::Trigger::Ts6Flood { source, threshold, window_secs, .. } => {
+            let src = match source {
+                wire::FloodSource::ClientJoined => "joins",
+                wire::FloodSource::ChatMessage => "messages",
+                wire::FloodSource::ClientMoved => "moves",
+            };
+            format!("flood: {threshold} {src} in {window_secs}s")
+        }
     }
 }
 
@@ -86,6 +99,7 @@ pub fn action_kind_label(action: &wire::Action) -> &'static str {
         wire::Action::MusicBotCommand { .. } => "Music-bot command",
         wire::Action::WebhookOut { .. } => "Webhook",
         wire::Action::LogLine { .. } => "Log line",
+        wire::Action::Moderate { .. } => "Moderate",
     }
 }
 
@@ -99,6 +113,7 @@ pub fn action_wire_kind_label(kind: &str) -> &str {
         "musicBotCommand" => "Music-bot command",
         "webhookOut" => "Webhook",
         "logLine" => "Log line",
+        "moderate" => "Moderate",
         // An unrecognised kind is surfaced verbatim rather than hidden —
         // a wire/engine drift should be visible, not silently relabelled.
         other => other,
@@ -138,6 +153,7 @@ pub fn action_kind_icon(action: &wire::Action) -> &'static str {
         wire::Action::MusicBotCommand { .. } => "♪",
         wire::Action::WebhookOut { .. } => "↗",
         wire::Action::LogLine { .. } => "≡",
+        wire::Action::Moderate { .. } => "⚠",
     }
 }
 

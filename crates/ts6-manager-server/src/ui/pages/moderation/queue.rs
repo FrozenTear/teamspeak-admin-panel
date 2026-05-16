@@ -47,6 +47,16 @@ const STATUS_FILTERS: [(&str, Option<&str>); 4] = [
     ("All", None),
 ];
 
+/// Origin filter options — label + the `?origin=` query value (`None` =
+/// every origin). The `Automod` preset (PURA-303) is how an operator
+/// pulls up just the auto-moderation queue.
+const ORIGIN_FILTERS: [(&str, Option<&str>); 4] = [
+    ("All origins", None),
+    ("Operator", Some("operator")),
+    ("Complaint", Some("complaint")),
+    ("Automod", Some("automod")),
+];
+
 #[component]
 pub fn ModerationQueuePage() -> Element {
     let session = use_session();
@@ -99,6 +109,7 @@ pub fn ModerationQueuePage() -> Element {
 
     // ── case queue ──────────────────────────────────────────────────────
     let mut status_idx: Signal<usize> = use_signal(|| 0usize); // default: Open
+    let mut origin_idx: Signal<usize> = use_signal(|| 0usize); // default: All
     let cases_reload: Signal<u64> = use_signal(|| 0u64);
 
     let cases = use_resource({
@@ -106,6 +117,7 @@ pub fn ModerationQueuePage() -> Element {
         move || {
             let gate = gate.clone();
             let idx = *status_idx.read();
+            let oidx = *origin_idx.read();
             let _ = *cases_reload.read(); // subscribe so restart re-fetches
             async move {
                 let mut path = format!(
@@ -113,6 +125,9 @@ pub fn ModerationQueuePage() -> Element {
                 );
                 if let Some(status) = STATUS_FILTERS[idx].1 {
                     path.push_str(&format!("&status={status}"));
+                }
+                if let Some(origin) = ORIGIN_FILTERS[oidx].1 {
+                    path.push_str(&format!("&origin={origin}"));
                 }
                 api::authorized_get_json::<Page<ModerationCase>>(&gate, &api::api_base(), &path)
                     .await
@@ -249,6 +264,7 @@ pub fn ModerationQueuePage() -> Element {
     let cases_snapshot = cases.read().clone();
     let complaints_snapshot = complaints.read().clone();
     let active_status = *status_idx.read();
+    let active_origin = *origin_idx.read();
 
     rsx! {
         div { class: "crumb", "Moderation · {server_name}" }
@@ -261,6 +277,11 @@ pub fn ModerationQueuePage() -> Element {
         section { class: "stack-md mod-panel",
             div { class: "mod-panel-head",
                 h2 { "Cases" }
+                Link { class: "mod-panel-link", to: Route::AutomodMetricsPage {},
+                    "Automod rule metrics →"
+                }
+            }
+            div { class: "mod-filter-bar",
                 div { class: "tabs", role: "tablist", "aria-label": "Filter cases by status",
                     for (i , (label , _)) in STATUS_FILTERS.iter().enumerate() {
                         button {
@@ -270,6 +291,19 @@ pub fn ModerationQueuePage() -> Element {
                             "aria-selected": if i == active_status { "true" } else { "false" },
                             class: if i == active_status { "tab is-active" } else { "tab" },
                             onclick: move |_| status_idx.set(i),
+                            "{label}"
+                        }
+                    }
+                }
+                div { class: "tabs", role: "tablist", "aria-label": "Filter cases by origin",
+                    for (i , (label , _)) in ORIGIN_FILTERS.iter().enumerate() {
+                        button {
+                            key: "{label}",
+                            r#type: "button",
+                            role: "tab",
+                            "aria-selected": if i == active_origin { "true" } else { "false" },
+                            class: if i == active_origin { "tab is-active" } else { "tab" },
+                            onclick: move |_| origin_idx.set(i),
                             "{label}"
                         }
                     }

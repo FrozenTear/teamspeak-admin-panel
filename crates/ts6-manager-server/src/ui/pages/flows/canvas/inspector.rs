@@ -19,7 +19,9 @@
 use dioxus::prelude::*;
 use serde_json::{Map, Value};
 use ts6_manager_shared::flows::v2::{BranchCase, FlowGraph, NodeId, NodeKind, TransformOutput};
-use ts6_manager_shared::flows::{Action, FlowId, Trigger};
+use ts6_manager_shared::flows::{
+    Action, FloodScope, FloodSource, FlowId, ModerateEffect, Trigger,
+};
 
 use super::model;
 
@@ -152,6 +154,8 @@ fn TriggerForm(
         Trigger::ManualFire => "manualFire",
         Trigger::Cron { .. } => "cron",
         Trigger::Ts6ClientJoined { .. } => "ts6ClientJoined",
+        Trigger::Ts6ChatMessage { .. } => "ts6ChatMessage",
+        Trigger::Ts6Flood { .. } => "ts6Flood",
     };
     rsx! {
         label { class: "fc-field",
@@ -220,6 +224,29 @@ fn TriggerForm(
                     }
                 }
             },
+            Trigger::Ts6ChatMessage { .. } => rsx! {
+                p { class: "fc-hint",
+                    "Fires on every TS6 chat message. Run context exposes trigger.message, trigger.clientNickname, trigger.channelId."
+                }
+            },
+            Trigger::Ts6Flood { source, threshold, window_secs, scope } => {
+                let src_label = match source {
+                    FloodSource::ClientJoined => "clientJoined",
+                    FloodSource::ChatMessage => "chatMessage",
+                    FloodSource::ClientMoved => "clientMoved",
+                };
+                let scope_label = match scope {
+                    FloodScope::Subject => "subject",
+                    FloodScope::Ip => "ip",
+                    FloodScope::Global => "global",
+                };
+                rsx! {
+                    p { class: "fc-hint",
+                        "Fires when the windowed counter crosses the threshold. "
+                        "Source: {src_label}, threshold: {threshold}, window: {window_secs}s, scope: {scope_label}."
+                    }
+                }
+            },
         }
     }
 }
@@ -248,6 +275,7 @@ fn ActionForm(
         Action::MusicBotCommand { .. } => "musicBotCommand",
         Action::WebhookOut { .. } => "webhookOut",
         Action::LogLine { .. } => "logLine",
+        Action::Moderate { .. } => "moderate",
     };
     rsx! {
         label { class: "fc-field",
@@ -268,6 +296,12 @@ fn ActionForm(
                             "webhookOut" => Action::WebhookOut {
                                 url: String::new(), headers: Vec::new(),
                             },
+                            "moderate" => Action::Moderate {
+                                effect: ModerateEffect::Warn,
+                                duration_secs: None,
+                                reason_template: String::new(),
+                                rule_key: String::new(),
+                            },
                             _ => Action::LogLine { message: String::new() },
                         };
                         set_kind(graph, &node_id, NodeKind::Action { config: next });
@@ -277,6 +311,7 @@ fn ActionForm(
                 option { value: "ts6Command", "TS6 command" }
                 option { value: "musicBotCommand", "Music-bot command" }
                 option { value: "webhookOut", "Webhook (HTTP POST)" }
+                option { value: "moderate", "Moderate (automod)" }
             }
         }
         match config {
@@ -414,6 +449,88 @@ fn ActionForm(
                             ),
                         ),
                         command_for_rebuild: command,
+                    }
+                }
+            }
+            Action::Moderate { effect, duration_secs, reason_template, rule_key } => {
+                let effect_val = effect.as_action_kind();
+                let dur_val = duration_secs.map(|d| d.to_string()).unwrap_or_default();
+                let nid_effect = node_id.clone();
+                let nid_dur = node_id.clone();
+                let nid_reason = node_id.clone();
+                let nid_rule = node_id.clone();
+                let (rt_e, rk_e) = (reason_template.clone(), rule_key.clone());
+                let (rt_d, rk_d) = (reason_template.clone(), rule_key.clone());
+                let rk_r = rule_key.clone();
+                let rt_r = reason_template.clone();
+                rsx! {
+                    label { class: "fc-field",
+                        span { "Effect" }
+                        select {
+                            disabled: read_only, value: "{effect_val}",
+                            onchange: move |e: FormEvent| {
+                                let next = match e.value().as_str() {
+                                    "mute" => ModerateEffect::Mute,
+                                    "kick" => ModerateEffect::Kick,
+                                    "ban" => ModerateEffect::Ban,
+                                    _ => ModerateEffect::Warn,
+                                };
+                                set_kind(graph, &nid_effect, NodeKind::Action {
+                                    config: Action::Moderate {
+                                        effect: next, duration_secs,
+                                        reason_template: rt_e.clone(), rule_key: rk_e.clone(),
+                                    },
+                                });
+                            },
+                            option { value: "warn", "Warn (private message)" }
+                            option { value: "mute", "Mute (talker flag)" }
+                            option { value: "kick", "Kick" }
+                            option { value: "ban", "Ban" }
+                        }
+                    }
+                    label { class: "fc-field",
+                        span { "Duration (seconds, blank = none)" }
+                        input {
+                            r#type: "number", value: "{dur_val}", disabled: read_only,
+                            onchange: move |e: FormEvent| {
+                                let parsed = e.value().trim().parse::<u32>().ok();
+                                set_kind(graph, &nid_dur, NodeKind::Action {
+                                    config: Action::Moderate {
+                                        effect, duration_secs: parsed,
+                                        reason_template: rt_d.clone(), rule_key: rk_d.clone(),
+                                    },
+                                });
+                            },
+                        }
+                    }
+                    label { class: "fc-field",
+                        span { "Reason template" }
+                        input {
+                            r#type: "text", value: "{reason_template}", disabled: read_only,
+                            oninput: move |e: FormEvent| set_kind(graph, &nid_reason, NodeKind::Action {
+                                config: Action::Moderate {
+                                    effect, duration_secs,
+                                    reason_template: e.value(), rule_key: rk_r.clone(),
+                                },
+                            }),
+                        }
+                    }
+                    label { class: "fc-field",
+                        span { "Rule key" }
+                        input {
+                            r#type: "text", value: "{rule_key}", disabled: read_only,
+                            oninput: move |e: FormEvent| set_kind(graph, &nid_rule, NodeKind::Action {
+                                config: Action::Moderate {
+                                    effect, duration_secs,
+                                    reason_template: rt_r.clone(), rule_key: e.value(),
+                                },
+                            }),
+                        }
+                    }
+                    p { class: "fc-hint",
+                        "The subject is resolved from the trigger event. Automod actions open an "
+                        code { "origin=automod" }
+                        " moderation case."
                     }
                 }
             }

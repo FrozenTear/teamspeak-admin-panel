@@ -453,6 +453,7 @@ async fn resolve_then_reopen_walks_the_state_machine() {
             &token,
             &wire::ResolveCaseRequest {
                 resolution_note: "warned, no recurrence".into(),
+                false_positive: None,
             },
         ))
         .await
@@ -470,6 +471,7 @@ async fn resolve_then_reopen_walks_the_state_machine() {
             &token,
             &wire::ResolveCaseRequest {
                 resolution_note: "again".into(),
+                false_positive: None,
             },
         ))
         .await
@@ -536,6 +538,7 @@ async fn resolve_requires_a_resolution_note() {
             &token,
             &wire::ResolveCaseRequest {
                 resolution_note: "  ".into(),
+                false_positive: None,
             },
         ))
         .await
@@ -695,4 +698,285 @@ async fn complaint_resolve_404_when_server_connection_absent() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+// ── PURA-303 — automod review & override surface ────────────────────────
+
+/// An `origin = automod` case with the `<ruleKey>:<flowId>` origin-ref
+/// the 9.1.2 bridge writes.
+fn automod_case_req(uid: &str, rule_key: &str, flow_id: i64) -> wire::OpenCaseRequest {
+    wire::OpenCaseRequest {
+        server_config_id: 1,
+        virtual_server_id: 1,
+        subject_uid: uid.into(),
+        subject_nickname_snapshot: uid.into(),
+        reason: "automod: flood".into(),
+        origin: Some("automod".into()),
+        origin_ref: Some(format!("{rule_key}:{flow_id}")),
+    }
+}
+
+async fn open_case(app: &Router, token: &str, req: &wire::OpenCaseRequest) -> wire::ModerationCase {
+    let resp = app
+        .clone()
+        .oneshot(post("/api/moderation/cases", token, req))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    read_json(resp).await
+}
+
+#[tokio::test]
+async fn case_list_origin_filter_isolates_automod() {
+    let state = fresh_state().await;
+    let aid = seed_user(&state, "admin", "admin").await;
+    let token = mint(&state, aid, "admin", "admin");
+    let app = app(state);
+
+    open_case(&app, &token, &open_case_req()).await;
+    open_case(&app, &token, &automod_case_req("uid-bot", "bad-name", 7)).await;
+
+    let resp = app
+        .clone()
+        .oneshot(get("/api/moderation/cases?origin=automod", &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let page: Page<wire::ModerationCase> = read_json(resp).await;
+    assert_eq!(page.total, 1);
+    assert_eq!(page.items[0].origin, "automod");
+
+    let resp = app
+        .clone()
+        .oneshot(get("/api/moderation/cases?origin=operator", &token))
+        .await
+        .unwrap();
+    let page: Page<wire::ModerationCase> = read_json(resp).await;
+    assert_eq!(page.total, 1);
+    assert_eq!(page.items[0].origin, "operator");
+
+    // An out-of-vocabulary origin is a 400, not an empty page.
+    let resp = app
+        .oneshot(get("/api/moderation/cases?origin=bogus", &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn automod_false_positive_resolve_tags_the_resolve_action() {
+    let state = fresh_state().await;
+    let aid = seed_user(&state, "admin", "admin").await;
+    let token = mint(&state, aid, "admin", "admin");
+    let app = app(state);
+
+    let case = open_case(&app, &token, &automod_case_req("uid-fp", "bad-name", 7)).await;
+
+    let resp = app
+        .clone()
+        .oneshot(post(
+            &format!("/api/moderation/cases/{}/resolve", case.id),
+            &token,
+            &wire::ResolveCaseRequest {
+                resolution_note: "rule misfired on a legitimate nickname".into(),
+                false_positive: Some(true),
+            },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .oneshot(get(&format!("/api/moderation/cases/{}", case.id), &token))
+        .await
+        .unwrap();
+    let detail: wire::CaseDetail = read_json(resp).await;
+    let resolve_row = detail
+        .timeline
+        .iter()
+        .find(|a| a.action_kind == "resolve")
+        .expect("resolve timeline row");
+    assert_eq!(
+        resolve_row
+            .payload
+            .as_ref()
+            .and_then(|p| p.get("falsePositive"))
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+}
+
+#[tokio::test]
+async fn false_positive_flag_is_ignored_on_an_operator_case() {
+    let state = fresh_state().await;
+    let aid = seed_user(&state, "admin", "admin").await;
+    let token = mint(&state, aid, "admin", "admin");
+    let app = app(state);
+
+    let case = open_case(&app, &token, &open_case_req()).await;
+    let resp = app
+        .clone()
+        .oneshot(post(
+            &format!("/api/moderation/cases/{}/resolve", case.id),
+            &token,
+            &wire::ResolveCaseRequest {
+                resolution_note: "warned".into(),
+                false_positive: Some(true),
+            },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .oneshot(get(&format!("/api/moderation/cases/{}", case.id), &token))
+        .await
+        .unwrap();
+    let detail: wire::CaseDetail = read_json(resp).await;
+    let resolve_row = detail
+        .timeline
+        .iter()
+        .find(|a| a.action_kind == "resolve")
+        .expect("resolve timeline row");
+    // The flag is meaningful only for automod cases — an operator case
+    // gets a plain `resolve` row with no `falsePositive` tag.
+    assert!(
+        resolve_row
+            .payload
+            .as_ref()
+            .and_then(|p| p.get("falsePositive"))
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn automod_metrics_reports_per_rule_rows() {
+    let state = fresh_state().await;
+    let aid = seed_user(&state, "admin", "admin").await;
+    let token = mint(&state, aid, "admin", "admin");
+    let app = app(state);
+
+    // Two cases for `bad-name`, one for `flood`.
+    let fp_case = open_case(&app, &token, &automod_case_req("uid-1", "bad-name", 7)).await;
+    open_case(&app, &token, &automod_case_req("uid-2", "bad-name", 7)).await;
+    open_case(&app, &token, &automod_case_req("uid-3", "flood", 9)).await;
+
+    // Resolve one `bad-name` case as a false positive.
+    app.clone()
+        .oneshot(post(
+            &format!("/api/moderation/cases/{}/resolve", fp_case.id),
+            &token,
+            &wire::ResolveCaseRequest {
+                resolution_note: "misfire".into(),
+                false_positive: Some(true),
+            },
+        ))
+        .await
+        .unwrap();
+
+    let resp = app
+        .oneshot(get(
+            "/api/moderation/automod/metrics?serverConfigId=1&virtualServerId=1",
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let rows: Vec<wire::AutomodRuleMetrics> = read_json(resp).await;
+
+    let bad_name = rows
+        .iter()
+        .find(|r| r.rule_key == "bad-name")
+        .expect("bad-name row");
+    assert_eq!(bad_name.cases_total, 2);
+    assert_eq!(bad_name.false_positives, 1);
+
+    let flood = rows
+        .iter()
+        .find(|r| r.rule_key == "flood")
+        .expect("flood row");
+    assert_eq!(flood.cases_total, 1);
+    assert_eq!(flood.false_positives, 0);
+    // Busiest rule first.
+    assert_eq!(rows[0].rule_key, "bad-name");
+}
+
+#[tokio::test]
+async fn revert_is_rejected_on_a_non_automod_case() {
+    let state = fresh_state().await;
+    let aid = seed_user(&state, "admin", "admin").await;
+    let token = mint(&state, aid, "admin", "admin");
+    let app = app(state);
+
+    let case = open_case(&app, &token, &open_case_req()).await;
+    // The origin check fires before the action is even loaded.
+    let resp = app
+        .oneshot(post(
+            &format!("/api/moderation/cases/{}/actions/1/revert", case.id),
+            &token,
+            &serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn revert_404_for_a_missing_action() {
+    let state = fresh_state().await;
+    let aid = seed_user(&state, "admin", "admin").await;
+    let token = mint(&state, aid, "admin", "admin");
+    let app = app(state);
+
+    let case = open_case(&app, &token, &automod_case_req("uid-x", "bad-name", 7)).await;
+    let resp = app
+        .oneshot(post(
+            &format!("/api/moderation/cases/{}/actions/9999/revert", case.id),
+            &token,
+            &serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn revert_rejects_an_unrevertable_action_kind() {
+    let state = fresh_state().await;
+    let aid = seed_user(&state, "admin", "admin").await;
+    let token = mint(&state, aid, "admin", "admin");
+    let app = app(state);
+
+    let case = open_case(&app, &token, &automod_case_req("uid-n", "bad-name", 7)).await;
+    // A `note` action touches no backend — append one, then try to revert
+    // it. Only `mute` / `ban` are revertable.
+    let resp = app
+        .clone()
+        .oneshot(post(
+            &format!("/api/moderation/cases/{}/actions", case.id),
+            &token,
+            &wire::AppendActionRequest {
+                action_kind: "note".into(),
+                reason: "context".into(),
+                clid: None,
+                ip: None,
+                ban_duration_secs: None,
+            },
+        ))
+        .await
+        .unwrap();
+    let note: wire::ModerationCaseAction = read_json(resp).await;
+
+    let resp = app
+        .oneshot(post(
+            &format!(
+                "/api/moderation/cases/{}/actions/{}/revert",
+                case.id, note.id
+            ),
+            &token,
+            &serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }

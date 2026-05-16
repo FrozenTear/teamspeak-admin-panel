@@ -31,6 +31,9 @@ const MAX_LIMIT: i64 = 100;
 pub(super) struct CaseListQuery {
     subject_uid: Option<String>,
     status: Option<String>,
+    /// `operator` / `complaint` / `automod` — backs the Phase 9.1.4
+    /// automod-queue preset.
+    origin: Option<String>,
     server_config_id: Option<i64>,
     virtual_server_id: Option<i64>,
     limit: Option<i64>,
@@ -50,11 +53,19 @@ pub(super) async fn list(
             "status must be one of open / actioned / resolved",
         ));
     }
+    if let Some(ref o) = q.origin
+        && !ORIGINS.contains(&o.as_str())
+    {
+        return Err(validation(
+            "origin must be one of operator / complaint / automod",
+        ));
+    }
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let offset = q.offset.unwrap_or(0).max(0);
     let filter = CaseFilter {
         subjectUid: q.subject_uid,
         status: q.status,
+        origin: q.origin,
         serverConfigId: q.server_config_id,
         virtualServerId: q.virtual_server_id,
     };
@@ -190,7 +201,23 @@ pub(super) async fn resolve(
         })?
         .ok_or_else(|| not_found("case not found"))?;
 
-    append_transition(&state, &actor, &updated, "resolve", note).await?;
+    // Phase 9.1.4: a false-positive resolution tags the `resolve` timeline
+    // row so the per-rule automod metrics view can rate the rule. The flag
+    // is meaningful only for `origin = automod` cases — silently ignore it
+    // on operator / complaint cases rather than 400, so the same resolve
+    // form works everywhere.
+    let false_positive = req.false_positive.unwrap_or(false) && updated.origin == "automod";
+    let transition_payload = false_positive.then(|| serde_json::json!({ "falsePositive": true }));
+
+    append_transition(
+        &state,
+        &actor,
+        &updated,
+        "resolve",
+        note,
+        transition_payload,
+    )
+    .await?;
     audit::record(
         &state.db,
         Event {
@@ -200,7 +227,10 @@ pub(super) async fn resolve(
                 updated.id,
                 updated.subjectUid.as_str(),
             )),
-            payload: Some(serde_json::json!({ "caseId": updated.id })),
+            payload: Some(serde_json::json!({
+                "caseId": updated.id,
+                "falsePositive": false_positive,
+            })),
             outcome: Outcome::Success,
             error_msg: None,
             request: meta,
@@ -238,7 +268,7 @@ pub(super) async fn reopen(
         })?
         .ok_or_else(|| not_found("case not found"))?;
 
-    append_transition(&state, &actor, &updated, "reopen", reason).await?;
+    append_transition(&state, &actor, &updated, "reopen", reason, None).await?;
     audit::record(
         &state.db,
         Event {
@@ -274,13 +304,16 @@ async fn load_case(
 }
 
 /// Append the `resolve` / `reopen` timeline row that pairs every
-/// lifecycle transition (brief §7).
+/// lifecycle transition (brief §7). `payload` carries transition-specific
+/// detail — the Phase 9.1.4 `falsePositive` tag on a `resolve` row — and
+/// is `None` for an ordinary transition.
 async fn append_transition(
     state: &AppState,
     actor: &crate::auth::extractors::AuthUser,
     case: &crate::repos::moderation_cases::ModerationCase,
     kind: &str,
     reason: &str,
+    payload: Option<serde_json::Value>,
 ) -> Result<(), Response> {
     moderation_case_actions::insert(
         &state.db,
@@ -291,7 +324,7 @@ async fn append_transition(
             actionKind: kind.to_string(),
             reason: reason.to_string(),
             tsRef: None,
-            payload: None,
+            payload,
         },
     )
     .await

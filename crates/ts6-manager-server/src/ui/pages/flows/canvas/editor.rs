@@ -85,12 +85,27 @@ fn node_summary(kind: &NodeKind) -> String {
                 Some(c) => format!("client joined · channel {c}"),
                 None => "client joined · any channel".into(),
             },
+            Trigger::Ts6ChatMessage { channel_id, .. } => match channel_id {
+                Some(c) => format!("chat message · channel {c}"),
+                None => "chat message · any channel".into(),
+            },
+            Trigger::Ts6Flood { source, threshold, window_secs, .. } => {
+                let src = match source {
+                    ts6_manager_shared::flows::FloodSource::ClientJoined => "joins",
+                    ts6_manager_shared::flows::FloodSource::ChatMessage => "messages",
+                    ts6_manager_shared::flows::FloodSource::ClientMoved => "moves",
+                };
+                format!("flood · {threshold} {src}/{window_secs}s")
+            }
         },
         NodeKind::Action { config } => match config {
             Action::LogLine { .. } => "log line".into(),
             Action::WebhookOut { url, .. } => format!("webhook · {url}"),
             Action::Ts6Command { command, .. } => format!("ts6 · {command}"),
             Action::MusicBotCommand { command, .. } => format!("music bot · {command}"),
+            Action::Moderate {
+                effect, rule_key, ..
+            } => format!("moderate · {} · {rule_key}", effect.as_action_kind()),
         },
         NodeKind::Branch { cases } => format!("{} case(s) + default", cases.len()),
         NodeKind::Parallel { collection, .. } => format!("fan out · {collection}"),

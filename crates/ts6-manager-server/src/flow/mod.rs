@@ -30,11 +30,14 @@
 // and several handle methods read as dead until that child lands.
 #![allow(dead_code, unused_imports)]
 
+pub mod automod;
 pub mod dispatch;
 pub mod engine;
 pub mod routes;
 pub mod trigger;
 
+#[cfg(test)]
+mod automod_seed_tests;
 #[cfg(test)]
 mod engine_tests;
 #[cfg(test)]
@@ -44,4 +47,4 @@ pub use engine::{
     ActionContext, ActionDispatcher, ActionOutcome, BasicDispatcher, EngineDeps, FireError,
     FlowEngine, FlowEngineHandle,
 };
-pub use trigger::{ParsedTrigger, TriggerEvent};
+pub use trigger::{FloodRegistry, FloodSpec, ParsedTrigger, TriggerEvent};

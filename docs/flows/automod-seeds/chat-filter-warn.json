@@ -1,0 +1,50 @@
+{
+  "version": 2,
+  "graph": {
+    "nodes": [
+      {
+        "id": "chat_message",
+        "label": "A client sends a chat message",
+        "position": { "x": 0, "y": 0 },
+        "kind": "trigger",
+        "config": { "kind": "ts6ChatMessage", "channelId": null, "targetMode": null }
+      },
+      {
+        "id": "match_blocked_phrase",
+        "label": "Message contains a blocked phrase",
+        "position": { "x": 0, "y": 160 },
+        "kind": "branch",
+        "cases": [
+          {
+            "label": "blocked",
+            "when": "contains(lower(trigger.message), \"buy followers\") or contains(lower(trigger.message), \"free-robux\") or contains(lower(trigger.message), \"crypto pump\")"
+          }
+        ]
+      },
+      {
+        "id": "warn",
+        "label": "Warn the client",
+        "position": { "x": 0, "y": 320 },
+        "kind": "action",
+        "config": {
+          "kind": "moderate",
+          "effect": "warn",
+          "reasonTemplate": "Automod: your message contained a phrase blocked by the chat filter. Please review the server rules.",
+          "ruleKey": "automod-chat-filter-warn"
+        }
+      }
+    ],
+    "edges": [
+      {
+        "id": "e_trigger_branch",
+        "from": { "node": "chat_message", "port": "out" },
+        "to": { "node": "match_blocked_phrase", "port": "in" }
+      },
+      {
+        "id": "e_branch_warn",
+        "from": { "node": "match_blocked_phrase", "port": "blocked" },
+        "to": { "node": "warn", "port": "in" }
+      }
+    ]
+  }
+}

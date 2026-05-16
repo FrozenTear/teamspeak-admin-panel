@@ -1886,6 +1886,55 @@ a:hover {
   margin-top: var(--space-5);
 }
 
+/* Automod review surface — PURA-303. */
+
+/* Secondary link in a panel head (e.g. "Automod rule metrics →"). */
+.mod-panel-link {
+  font-size: var(--text-sm);
+  white-space: nowrap;
+}
+
+/* Stacked filter rows (status above origin) on the case queue. */
+.mod-filter-bar {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: var(--space-4) 0;
+}
+
+/* Inline revert control on a mute / ban timeline row. */
+.mod-timeline-actions {
+  margin-top: var(--space-3);
+}
+
+/* False-positive toggle in the resolve form. */
+.mod-fp-check {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  cursor: pointer;
+}
+.mod-fp-check input[type="checkbox"] {
+  margin-top: 3px;
+  flex: 0 0 auto;
+}
+.mod-fp-check-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.mod-fp-check-hint {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+}
+
+/* Per-rule metrics — a false-positive rate worth an operator's attention
+   is tinted to stand out from the dense table. */
+.mod-rate--high {
+  color: var(--danger-fg);
+  font-weight: var(--weight-semibold);
+}
+
 /* select / textarea reuse the .input primitive's box; these top up the
    parts the text-input rule does not cover. */
 select.input {

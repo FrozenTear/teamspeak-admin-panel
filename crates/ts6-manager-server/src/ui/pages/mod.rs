@@ -43,7 +43,8 @@ pub use home::Home;
 pub use login::LoginPage;
 pub use logs::LogsPage;
 pub use moderation::{
-    ModerationCasePage, ModerationQueuePage, PermissionGrantsPage, SubjectHistoryPage,
+    AutomodMetricsPage, ModerationCasePage, ModerationQueuePage, PermissionGrantsPage,
+    SubjectHistoryPage,
 };
 pub use music_bots::{
     BotDetailPage, BotsIndexPage, MusicLibraryPage, MusicPlaylistsPage, RadioStationsPage,

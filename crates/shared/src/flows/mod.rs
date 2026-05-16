@@ -34,6 +34,31 @@ pub struct FlowId(pub i64);
 #[serde(transparent)]
 pub struct FlowRunId(pub i64);
 
+/// Source event that feeds a [`Trigger::Ts6Flood`] windowed counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FloodSource {
+    /// Each `notifycliententerview` increments the counter.
+    ClientJoined,
+    /// Each `notifytextmessage` increments the counter.
+    ChatMessage,
+    /// Each `notifyclientmoved` increments the counter (channel-hopping).
+    ClientMoved,
+}
+
+/// Key domain for the per-`(spec, key)` sliding-window counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FloodScope {
+    /// Counter per unique client identifier.
+    Subject,
+    /// Counter per source IP address (not yet wired — treated as `subject`
+    /// until the SSH bridge surfaces the IP).
+    Ip,
+    /// Single server-wide counter (all clients share one bucket).
+    Global,
+}
+
 /// What event makes the engine create a run for this flow. Wire is
 /// externally-tagged on `kind`, matching the example bodies in
 /// `docs/flows/http-api.md` §3.1.
@@ -51,6 +76,53 @@ pub enum Trigger {
     /// Fired when a TS6 client joins a channel. `channel_id = None` matches
     /// any channel.
     Ts6ClientJoined { channel_id: Option<i64> },
+    /// Fired on each `notifytextmessage`. `channel_id = None` matches any
+    /// channel; `target_mode` mirrors the TS6 `targetmode` parameter
+    /// (`"channel"`, `"private"`, `"server"`). Run context exposes
+    /// `${trigger.message}`, `${trigger.clientUniqueIdentifier}`,
+    /// `${trigger.clientNickname}`, `${trigger.channelId}`.
+    Ts6ChatMessage {
+        channel_id: Option<i64>,
+        /// Optional target-mode filter. `None` matches all modes.
+        target_mode: Option<String>,
+    },
+    /// Windowed flood counter. Fires when `source` events from a single
+    /// `scope` bucket reach `threshold` within a rolling `window_secs`
+    /// window. Channel-hopping = `Ts6Flood { source: clientMoved }`.
+    Ts6Flood {
+        source: FloodSource,
+        threshold: u32,
+        window_secs: u32,
+        scope: FloodScope,
+    },
+}
+
+/// TS6 effect a [`Action::Moderate`] node applies to its subject. The
+/// wire discriminant doubles as the `moderation_case_action.actionKind`
+/// value (Phase 9.1 automod brief §4.3 / §5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ModerateEffect {
+    /// Private `sendtextmessage` to the subject.
+    Warn,
+    /// Server talker-flag revoke (`client_is_talker = 0`).
+    Mute,
+    /// `clientkick`.
+    Kick,
+    /// `banadd` — temporary when `duration_secs` is set.
+    Ban,
+}
+
+impl ModerateEffect {
+    /// The `moderation_case_action.actionKind` string for this effect.
+    pub fn as_action_kind(self) -> &'static str {
+        match self {
+            ModerateEffect::Warn => "warn",
+            ModerateEffect::Mute => "mute",
+            ModerateEffect::Kick => "kick",
+            ModerateEffect::Ban => "ban",
+        }
+    }
 }
 
 /// One step executed when a run starts. `args` are `serde_json::Value`
@@ -85,6 +157,24 @@ pub enum Action {
     },
     /// Smoke / debug action — appends one line to the manager log.
     LogLine { message: String },
+    /// Apply an audited moderation effect to the trigger's subject and
+    /// bridge it into the Phase 9.0 case model (Phase 9.1 automod brief
+    /// §4). The subject (UID + nickname snapshot) is resolved from the
+    /// trigger context at dispatch time, so it is not a config field.
+    Moderate {
+        /// The TS6 effect to apply.
+        effect: ModerateEffect,
+        /// Mute / ban duration in seconds. `None` for `warn` / `kick`,
+        /// and for a permanent ban (operator-only policy lands in 9.1.3).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_secs: Option<u32>,
+        /// Templated reason — interpolated by the engine, then stored on
+        /// `moderation_case.reason` and the timeline action row.
+        reason_template: String,
+        /// Stable rule identifier. Drives case dedup (one open automod
+        /// case per subject + rule) and per-rule metrics.
+        rule_key: String,
+    },
 }
 
 /// Trigger + ordered action list — what the engine executes when a run starts.
@@ -295,6 +385,30 @@ mod tests {
         let any_channel = Trigger::Ts6ClientJoined { channel_id: None };
         let json = serde_json::to_string(&any_channel).unwrap();
         assert!(json.contains(r#""channelId":null"#), "got: {json}");
+
+        let chat = Trigger::Ts6ChatMessage {
+            channel_id: Some(3),
+            target_mode: Some("channel".into()),
+        };
+        let json = serde_json::to_string(&chat).unwrap();
+        assert!(json.contains(r#""kind":"ts6ChatMessage""#), "got: {json}");
+        assert!(json.contains(r#""channelId":3"#), "got: {json}");
+        assert!(json.contains(r#""targetMode":"channel""#), "got: {json}");
+        assert_eq!(serde_json::from_str::<Trigger>(&json).unwrap(), chat);
+
+        let flood = Trigger::Ts6Flood {
+            source: FloodSource::ChatMessage,
+            threshold: 5,
+            window_secs: 10,
+            scope: FloodScope::Subject,
+        };
+        let json = serde_json::to_string(&flood).unwrap();
+        assert!(json.contains(r#""kind":"ts6Flood""#), "got: {json}");
+        assert!(json.contains(r#""source":"chatMessage""#), "got: {json}");
+        assert!(json.contains(r#""threshold":5"#), "got: {json}");
+        assert!(json.contains(r#""windowSecs":10"#), "got: {json}");
+        assert!(json.contains(r#""scope":"subject""#), "got: {json}");
+        assert_eq!(serde_json::from_str::<Trigger>(&json).unwrap(), flood);
     }
 
     #[test]
@@ -305,6 +419,42 @@ mod tests {
         let json = serde_json::to_string(&a).unwrap();
         assert!(json.contains(r#""kind":"logLine""#), "got: {json}");
         assert!(json.contains(r#""message":"hello""#), "got: {json}");
+    }
+
+    #[test]
+    fn action_moderate_round_trips_with_camel_case_fields() {
+        let a = Action::Moderate {
+            effect: ModerateEffect::Ban,
+            duration_secs: Some(3600),
+            reason_template: "flood: ${trigger.count} msgs".into(),
+            rule_key: "chat-flood".into(),
+        };
+        let json = serde_json::to_string(&a).unwrap();
+        assert!(json.contains(r#""kind":"moderate""#), "got: {json}");
+        assert!(json.contains(r#""effect":"ban""#), "got: {json}");
+        assert!(json.contains(r#""durationSecs":3600"#), "got: {json}");
+        assert!(json.contains(r#""reasonTemplate""#), "got: {json}");
+        assert!(json.contains(r#""ruleKey":"chat-flood""#), "got: {json}");
+        assert_eq!(serde_json::from_str::<Action>(&json).unwrap(), a);
+
+        // `durationSecs` is omitted for a `warn` and absent round-trips.
+        let warn = Action::Moderate {
+            effect: ModerateEffect::Warn,
+            duration_secs: None,
+            reason_template: "be nice".into(),
+            rule_key: "chat-filter".into(),
+        };
+        let json = serde_json::to_string(&warn).unwrap();
+        assert!(!json.contains("durationSecs"), "got: {json}");
+        assert_eq!(serde_json::from_str::<Action>(&json).unwrap(), warn);
+    }
+
+    #[test]
+    fn moderate_effect_action_kind_strings() {
+        assert_eq!(ModerateEffect::Warn.as_action_kind(), "warn");
+        assert_eq!(ModerateEffect::Mute.as_action_kind(), "mute");
+        assert_eq!(ModerateEffect::Kick.as_action_kind(), "kick");
+        assert_eq!(ModerateEffect::Ban.as_action_kind(), "ban");
     }
 
     #[test]

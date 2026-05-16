@@ -227,6 +227,13 @@ fn validate_definition(def: &FlowDefinition) -> Result<(), Response> {
                 }
             }
             Action::LogLine { .. } => {}
+            Action::Moderate { rule_key, .. } => {
+                if rule_key.trim().is_empty() {
+                    return Err(validation(format!(
+                        "definition.actions[{i}].ruleKey must not be empty"
+                    )));
+                }
+            }
         }
     }
     ParsedTrigger::parse(&def.trigger)

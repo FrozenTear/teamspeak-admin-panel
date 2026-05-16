@@ -18,6 +18,11 @@
 //!   and connect. Redirects are disabled so a `30x` to an internal URL
 //!   cannot bypass the gate.
 //! - **`logLine`** → unchanged from [`BasicDispatcher`].
+//! - **`moderate`** → an audited moderation effect bridged onto the
+//!   Phase 9.0 case model, gated by the Phase 9.1.3 false-positive
+//!   safeguards ([`super::automod`] — shadow/enforce mode, per-rule
+//!   circuit breaker, severity ceiling, exemptions, subject cooldown,
+//!   global kill switch).
 //!
 //! The command whitelist consulted at create / patch time lives in
 //! [`crate::flow::engine::commands`]; the dispatcher re-checks it at run
@@ -29,21 +34,24 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use serde_json::{Map, Value as JsonValue};
-use ts6_manager_shared::flows::Action;
+use serde_json::{Map, Value as JsonValue, json};
+use ts6_manager_shared::flows::{Action, ModerateEffect};
 use ts6_ssrf::Resolver;
 
 use music_bot::{AudioCommand, BotCommand, BotId, NewTrack, QueueCommand};
 
 use crate::app_state::AppState;
-use crate::control::ControlBackendPool;
+use crate::audit::AuditKind;
+use crate::control::{ControlBackend, ControlBackendPool};
 use crate::db::Database;
 use crate::music_bots::MusicBotService;
-use crate::repos::server_connections;
+use crate::repos::{admin_audit_log, moderation_case_actions, moderation_cases, server_connections};
+use crate::webquery::BanAddParams;
 
+use super::automod::{self, AutomodSafeguards};
 use super::engine::commands;
 use super::engine::{ActionContext, ActionDispatcher, ActionOutcome};
 
@@ -60,6 +68,11 @@ pub struct ProductionDispatcher {
     control: ControlBackendPool,
     music: MusicBotService,
     ssrf_resolver: Arc<dyn Resolver>,
+    /// Phase 9.1.3 (PURA-302) automod false-positive safeguards. Consulted
+    /// by [`Self::dispatch_moderate`] before any TS6 effect. Shared behind
+    /// an `Arc` so a future operator-routes child can reach the same
+    /// handle to drive the kill switch / rule-promote setters.
+    safeguards: Arc<AutomodSafeguards>,
 }
 
 impl ProductionDispatcher {
@@ -71,7 +84,14 @@ impl ProductionDispatcher {
             control: state.control.clone(),
             music: state.music_bots.clone(),
             ssrf_resolver: state.ssrf_resolver.clone(),
+            safeguards: Arc::new(AutomodSafeguards::from_env()),
         }
+    }
+
+    /// The automod safeguards handle — the operator-toggle surface
+    /// (kill switch, rule promote/demote) for a future routes child.
+    pub fn safeguards(&self) -> Arc<AutomodSafeguards> {
+        self.safeguards.clone()
     }
 }
 
@@ -98,6 +118,15 @@ impl ActionDispatcher for ProductionDispatcher {
             } => self.dispatch_music_bot(*bot_id, command, args).await,
             Action::WebhookOut { url, headers } => {
                 dispatch_webhook(self.ssrf_resolver.as_ref(), ctx, url, headers).await
+            }
+            Action::Moderate {
+                effect,
+                duration_secs,
+                reason_template,
+                rule_key,
+            } => {
+                self.dispatch_moderate(ctx, *effect, *duration_secs, reason_template, rule_key)
+                    .await
             }
         };
         match result {
@@ -243,6 +272,506 @@ impl ProductionDispatcher {
             .await
             .map_err(|e| format!("musicBotCommand: bot {bot_id}: {e}"))
     }
+
+    /// Lower a `Moderate` node onto the Phase 9.0 case model — the single
+    /// audited bridge between an automod flow run and `moderation_case`
+    /// (Phase 9.1 brief §4.3 / §5). Resolves the subject from the trigger
+    /// event, runs it through the §6 false-positive safeguards
+    /// ([`super::automod`]), applies the TS6 effect when the safeguards
+    /// resolve to `enforce`, then opens or reuses the case and appends
+    /// the timeline action + audit row.
+    async fn dispatch_moderate(
+        &self,
+        ctx: &ActionContext,
+        effect: ModerateEffect,
+        duration_secs: Option<u32>,
+        reason: &str,
+        rule_key: &str,
+    ) -> Result<(), String> {
+        let subject = resolve_subject(&ctx.trigger)?;
+
+        // §6.3 severity ceiling — automod `ban` is temporary-only. A
+        // permanent ban from a flow is a config error: fail loud here,
+        // before the mode is even resolved, so the misconfigured rule is
+        // obvious rather than silently shadowed.
+        automod::check_severity_ceiling(effect, duration_secs)?;
+
+        let trigger_kind = ctx
+            .trigger
+            .get("kind")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("unknown");
+        let observed_count = ctx.trigger.get("count").and_then(JsonValue::as_i64);
+
+        // Resolve the safeguard outcome. The cheap gate (kill switch +
+        // per-rule shadow/enforce mode) settles the shadow-by-default
+        // common path with no TS6 round-trip; only an enforce-eligible
+        // rule pays the subject lookups `decide` needs.
+        let mut ts_ref: Option<String> = None;
+        let (mode, shadow_reason, breaker_alert) = match self.safeguards.gate(rule_key) {
+            automod::Gate::Shadowed(reason) => (ModerationMode::Shadow, Some(reason), false),
+            automod::Gate::EnforceEligible => {
+                let backend = self.resolve_backend(ctx).await?;
+                let sid = ctx.virtual_server_id;
+                let presence =
+                    resolve_subject_presence(backend.as_ref(), sid, &subject.uid).await;
+                // The prior-case count is only consulted when the
+                // repeat-offender knob is on (disabled by default — §10),
+                // so the query is skipped on the common path.
+                let prior_cases = if self.safeguards.repeat_offender_enabled() {
+                    self.prior_automod_case_count(&subject.uid).await
+                } else {
+                    0
+                };
+                let input = automod::SubjectInput {
+                    rule_key,
+                    subject_uid: &subject.uid,
+                    subject_server_groups: &presence.server_groups,
+                    effect,
+                    prior_automod_case_count: prior_cases,
+                };
+                match self.safeguards.decide(&input, Instant::now()) {
+                    automod::Decision::Enforce => {
+                        // The TS6 effect. A failed `enforce` effect
+                        // (subject already gone, upstream error) must not
+                        // drop the audit trail: it is logged and the case
+                        // is still recorded — brief §4.2 atomicity is "no
+                        // effect without a case", not the converse.
+                        match apply_effect(
+                            backend.as_ref(),
+                            sid,
+                            &subject,
+                            effect,
+                            duration_secs,
+                            reason,
+                            presence.clid,
+                        )
+                        .await
+                        {
+                            Ok(r) => ts_ref = r,
+                            Err(e) => tracing::warn!(
+                                flow.id = ctx.flow_id.0,
+                                run.id = ctx.run_id.0,
+                                rule_key,
+                                error = %e,
+                                "Moderate: TS6 effect failed; recording the case anyway"
+                            ),
+                        }
+                        (ModerationMode::Enforce, None, false)
+                    }
+                    automod::Decision::Shadow {
+                        reason,
+                        breaker_newly_tripped,
+                    } => (ModerationMode::Shadow, Some(reason), breaker_newly_tripped),
+                }
+            }
+        };
+
+        // §6.2 — a circuit-breaker trip auto-demotes the rule; raise one
+        // operator alert on the transition (not on every later
+        // suppression — the gate short-circuits those).
+        if breaker_alert {
+            self.raise_breaker_alert(ctx, rule_key, &subject).await;
+        }
+
+        // Open/reuse the case, append the timeline action and audit row.
+        bridge_to_case(
+            &self.db,
+            &CaseBridge {
+                server_config_id: ctx.server_config_id,
+                virtual_server_id: ctx.virtual_server_id,
+                subject: &subject,
+                effect,
+                reason,
+                rule_key,
+                flow_id: ctx.flow_id.0,
+                run_id: ctx.run_id.0,
+                trigger_kind,
+                observed_count,
+                mode,
+                shadow_reason: shadow_reason.map(automod::ShadowReason::as_str),
+                ts_ref,
+            },
+        )
+        .await
+    }
+
+    /// Resolve the flow's control backend from its `serverConfigId`.
+    async fn resolve_backend(
+        &self,
+        ctx: &ActionContext,
+    ) -> Result<Arc<dyn ControlBackend>, String> {
+        let connection = server_connections::find_by_id(&self.db, ctx.server_config_id)
+            .await
+            .map_err(|e| format!("Moderate: reading server connection failed: {e}"))?
+            .ok_or_else(|| {
+                format!(
+                    "Moderate: no server connection for serverConfigId {}",
+                    ctx.server_config_id
+                )
+            })?;
+        self.control
+            .get_or_build(connection.id, Some(&connection))
+            .await
+            .map_err(|e| format!("Moderate: control backend unavailable: {e}"))
+    }
+
+    /// Count the subject's prior `automod`-origin cases — the input to
+    /// the §6.3 repeat-offender floor. A query failure is logged and
+    /// treated as `0` (the safeguard then suppresses the ban, the
+    /// fail-safe direction).
+    async fn prior_automod_case_count(&self, subject_uid: &str) -> u32 {
+        match moderation_cases::list_for_subject(&self.db, subject_uid).await {
+            Ok(cases) => cases.iter().filter(|c| c.origin == "automod").count() as u32,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    subject = subject_uid,
+                    "Moderate: prior automod-case count failed; treating as 0"
+                );
+                0
+            }
+        }
+    }
+
+    /// §6.2 — raise the operator alert for a circuit-breaker trip: a loud
+    /// log line plus an `admin_audit_log` row so the demotion is visible
+    /// in the audit surface.
+    async fn raise_breaker_alert(
+        &self,
+        ctx: &ActionContext,
+        rule_key: &str,
+        subject: &ResolvedSubject,
+    ) {
+        tracing::error!(
+            flow.id = ctx.flow_id.0,
+            run.id = ctx.run_id.0,
+            rule_key,
+            "automod circuit breaker tripped — rule auto-demoted to shadow; \
+             review the rule before re-promoting it to enforce"
+        );
+        let payload = json!({
+            "ruleKey": rule_key,
+            "flowId": ctx.flow_id.0,
+            "runId": ctx.run_id.0,
+            "demotedTo": "shadow",
+        });
+        if let Err(e) = admin_audit_log::insert(
+            &self.db,
+            admin_audit_log::NewAdminAuditLog {
+                actorUserId: None,
+                actorUsername: "automod".to_string(),
+                kind: AuditKind::ModerationAutomodBreaker.as_str().to_string(),
+                targetKind: Some("automodRule".to_string()),
+                targetId: None,
+                targetLabel: Some(rule_key.to_string()),
+                payload: Some(payload),
+                outcome: "failure".to_string(),
+                errorMsg: Some(
+                    "circuit breaker tripped — rule auto-demoted to shadow".to_string(),
+                ),
+                requestIp: None,
+                requestUserAgent: None,
+            },
+        )
+        .await
+        {
+            tracing::warn!(
+                error = %e,
+                rule_key,
+                subject = %subject.uid,
+                "Moderate: writing the circuit-breaker audit row failed"
+            );
+        }
+    }
+}
+
+/// The subject's live presence on the virtual server — what the §6
+/// safeguards and the TS6 effect need beyond the durable UID.
+struct SubjectPresence {
+    /// The subject's session `clid`, or `None` when not connected.
+    clid: Option<i64>,
+    /// The subject's current server-group ids (for the group exemption).
+    server_groups: Vec<i64>,
+}
+
+/// Resolve the subject's session `clid` and server groups in one
+/// `clientlist` round-trip. Best-effort: a lookup failure or an offline
+/// subject yields `clid: None` / empty groups rather than erroring — the
+/// caller decides whether a missing `clid` blocks the effect, and a
+/// missing group set simply means the group exemption cannot match.
+async fn resolve_subject_presence(
+    backend: &dyn ControlBackend,
+    sid: i64,
+    uid: &str,
+) -> SubjectPresence {
+    match backend.clientlist_with_flags(sid, &["-groups"]).await {
+        Ok(clients) => clients
+            .into_iter()
+            .find(|c| c.client_unique_identifier == uid)
+            .map(|c| SubjectPresence {
+                clid: Some(c.clid),
+                server_groups: parse_server_groups(&c.client_servergroups),
+            })
+            .unwrap_or(SubjectPresence {
+                clid: None,
+                server_groups: Vec::new(),
+            }),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                subject = uid,
+                "Moderate: subject presence lookup failed; \
+                 group exemption + clid resolution proceed empty"
+            );
+            SubjectPresence {
+                clid: None,
+                server_groups: Vec::new(),
+            }
+        }
+    }
+}
+
+/// Parse the comma-separated `client_servergroups` field (`-groups`
+/// projection) into a list of sgids; non-numeric fragments are skipped.
+fn parse_server_groups(raw: &str) -> Vec<i64> {
+    raw.split(',')
+        .filter_map(|s| s.trim().parse::<i64>().ok())
+        .collect()
+}
+
+/// Apply the [`ModerateEffect`] to the subject. Returns the TS6 ban id
+/// when `effect == Ban`, `None` otherwise. `clid` is the subject's
+/// resolved session id — `warn` / `mute` / `kick` need it and error when
+/// the subject is offline; `ban` keys on the durable UID and ignores it.
+async fn apply_effect(
+    backend: &dyn ControlBackend,
+    sid: i64,
+    subject: &ResolvedSubject,
+    effect: ModerateEffect,
+    duration_secs: Option<u32>,
+    reason: &str,
+    clid: Option<i64>,
+) -> Result<Option<String>, String> {
+    let require_clid = || {
+        clid.ok_or_else(|| format!("Moderate: subject `{}` is not connected", subject.uid))
+    };
+    match effect {
+        ModerateEffect::Ban => {
+            // `banadd` keys on the durable UID, so no `clid` is needed.
+            // The §6.3 severity ceiling already guaranteed `duration_secs`
+            // is set, so `time` is never a permanent ban here.
+            let params = BanAddParams {
+                ip: None,
+                uid: Some(&subject.uid),
+                mytsid: None,
+                name: None,
+                banreason: Some(reason),
+                time: duration_secs.map(i64::from),
+            };
+            let ban_id = backend
+                .banadd(sid, &params)
+                .await
+                .map_err(|e| format!("Moderate ban (banadd) failed: {e}"))?;
+            Ok(Some(ban_id.to_string()))
+        }
+        ModerateEffect::Warn => {
+            backend
+                .sendtextmessage(sid, 1, require_clid()?, reason)
+                .await
+                .map_err(|e| format!("Moderate warn (sendtextmessage) failed: {e}"))?;
+            Ok(None)
+        }
+        ModerateEffect::Mute => {
+            backend
+                .client_set_talker(sid, require_clid()?, false)
+                .await
+                .map_err(|e| format!("Moderate mute (talker flag) failed: {e}"))?;
+            Ok(None)
+        }
+        ModerateEffect::Kick => {
+            backend
+                .clientkick(sid, require_clid()?, 5, Some(reason))
+                .await
+                .map_err(|e| format!("Moderate kick (clientkick) failed: {e}"))?;
+            Ok(None)
+        }
+    }
+}
+
+// ---- `Moderate` → Phase 9.0 case bridge ---------------------------------
+
+/// Per-action automod mode (brief §6.1). Resolved by the §6 safeguards
+/// ([`super::automod`]) in [`ProductionDispatcher::dispatch_moderate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModerationMode {
+    /// Record the case + audit row, apply no TS6 effect.
+    Shadow,
+    /// Apply the TS6 effect and mark the case `actioned`.
+    Enforce,
+}
+
+impl ModerationMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            ModerationMode::Shadow => "shadow",
+            ModerationMode::Enforce => "enforce",
+        }
+    }
+}
+
+/// The automod subject — resolved from the trigger event document, never
+/// from the `Moderate` node config (brief §4.1).
+struct ResolvedSubject {
+    uid: String,
+    nickname: String,
+}
+
+/// Pull the subject UID + nickname snapshot off a trigger event.
+/// `ts6ChatMessage` / `ts6ClientJoined` carry `clientUniqueIdentifier`;
+/// a subject-scoped `ts6Flood` carries the UID in `bucketKey`. A
+/// global-scope flood (`bucketKey == "*"`) has no subject and cannot
+/// drive a `Moderate` node.
+fn resolve_subject(trigger: &JsonValue) -> Result<ResolvedSubject, String> {
+    let uid = trigger
+        .get("clientUniqueIdentifier")
+        .and_then(JsonValue::as_str)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            trigger
+                .get("bucketKey")
+                .and_then(JsonValue::as_str)
+                .filter(|s| !s.is_empty() && *s != "*")
+        })
+        .ok_or("Moderate: the trigger event carries no resolvable subject UID")?;
+    let nickname = trigger
+        .get("clientNickname")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("")
+        .to_string();
+    Ok(ResolvedSubject {
+        uid: uid.to_string(),
+        nickname,
+    })
+}
+
+/// Inputs to [`bridge_to_case`].
+struct CaseBridge<'a> {
+    server_config_id: i64,
+    virtual_server_id: i64,
+    subject: &'a ResolvedSubject,
+    effect: ModerateEffect,
+    reason: &'a str,
+    rule_key: &'a str,
+    flow_id: i64,
+    run_id: i64,
+    trigger_kind: &'a str,
+    observed_count: Option<i64>,
+    mode: ModerationMode,
+    /// Which §6 safeguard suppressed the effect — `None` when enforced.
+    /// Surfaced on the case-action payload (`shadowReason`).
+    shadow_reason: Option<&'static str>,
+    ts_ref: Option<String>,
+}
+
+/// Open or reuse the subject's automod `moderation_case` for this rule,
+/// then append the timeline `moderation_case_action` and the
+/// `admin_audit_log` row (brief §5). Dedup: an open automod case for the
+/// same subject + `originRef` folds the action in rather than spawning a
+/// new case, so a 20-message flood produces one case, not twenty.
+async fn bridge_to_case(db: &Database, b: &CaseBridge<'_>) -> Result<(), String> {
+    let origin_ref = format!("{}:{}", b.rule_key, b.flow_id);
+
+    // Dedup — reuse the subject's open (non-resolved) automod case for
+    // this rule.
+    let existing = moderation_cases::list_for_subject(db, &b.subject.uid)
+        .await
+        .map_err(|e| format!("Moderate: case dedup query failed: {e}"))?
+        .into_iter()
+        .find(|c| {
+            c.origin == "automod"
+                && c.status != "resolved"
+                && c.originRef.as_deref() == Some(origin_ref.as_str())
+        });
+
+    let case_id = match existing {
+        Some(c) => c.id,
+        None => {
+            let case = moderation_cases::insert(
+                db,
+                moderation_cases::NewModerationCase {
+                    serverConfigId: b.server_config_id,
+                    virtualServerId: b.virtual_server_id,
+                    subjectUid: b.subject.uid.clone(),
+                    subjectNicknameSnapshot: b.subject.nickname.clone(),
+                    origin: "automod".to_string(),
+                    originRef: Some(origin_ref.clone()),
+                    reason: b.reason.to_string(),
+                    openedByUserId: None,
+                },
+            )
+            .await
+            .map_err(|e| format!("Moderate: opening the case failed: {e}"))?;
+            // `insert` always lands `open`; an `enforce`-mode action moves
+            // it straight to `actioned` (brief §5). `shadow` stays `open`.
+            if b.mode == ModerationMode::Enforce {
+                moderation_cases::set_status(db, case.id, "actioned", None)
+                    .await
+                    .map_err(|e| format!("Moderate: marking the case actioned failed: {e}"))?;
+            }
+            case.id
+        }
+    };
+
+    let mut payload = json!({
+        "flowId": b.flow_id,
+        "runId": b.run_id,
+        "ruleKey": b.rule_key,
+        "triggerKind": b.trigger_kind,
+        "observedCount": b.observed_count,
+        "mode": b.mode.as_str(),
+    });
+    // Record which §6 safeguard suppressed the effect so the operator
+    // reviewing the would-have-done case stream can see what fired.
+    if let Some(reason) = b.shadow_reason {
+        payload["shadowReason"] = json!(reason);
+    }
+
+    moderation_case_actions::insert(
+        db,
+        moderation_case_actions::NewModerationCaseAction {
+            caseId: case_id,
+            actorUserId: None,
+            actorUsernameSnapshot: "automod".to_string(),
+            actionKind: b.effect.as_action_kind().to_string(),
+            reason: b.reason.to_string(),
+            tsRef: b.ts_ref.clone(),
+            payload: Some(payload.clone()),
+        },
+    )
+    .await
+    .map_err(|e| format!("Moderate: appending the timeline action failed: {e}"))?;
+
+    admin_audit_log::insert(
+        db,
+        admin_audit_log::NewAdminAuditLog {
+            actorUserId: None,
+            actorUsername: "automod".to_string(),
+            kind: AuditKind::ModerationAutomodAction.as_str().to_string(),
+            targetKind: Some("moderationCase".to_string()),
+            targetId: Some(case_id),
+            targetLabel: Some(b.subject.uid.clone()),
+            payload: Some(payload),
+            outcome: "success".to_string(),
+            errorMsg: None,
+            requestIp: None,
+            requestUserAgent: None,
+        },
+    )
+    .await
+    .map_err(|e| format!("Moderate: writing the audit row failed: {e}"))?;
+
+    Ok(())
 }
 
 /// `webhookOut` — SSRF-gated outbound POST. The body carries flow / run
@@ -535,5 +1064,186 @@ mod tests {
         );
         assert_eq!(opt_arg_i64(&obj(json!({})), "n").unwrap(), None);
         assert_eq!(opt_arg_i64(&obj(json!({ "n": 5 })), "n").unwrap(), Some(5));
+    }
+
+    // ---- `Moderate` subject resolution + Phase 9.0 case bridge ----------
+
+    #[test]
+    fn resolve_subject_reads_uid_and_nickname() {
+        let trigger = json!({
+            "kind": "ts6ChatMessage",
+            "clientUniqueIdentifier": "uid-x=",
+            "clientNickname": "Bob",
+        });
+        let s = resolve_subject(&trigger).unwrap();
+        assert_eq!(s.uid, "uid-x=");
+        assert_eq!(s.nickname, "Bob");
+    }
+
+    #[test]
+    fn resolve_subject_falls_back_to_flood_bucket_key() {
+        let trigger = json!({ "kind": "ts6Flood", "bucketKey": "uid-flood=", "count": 5 });
+        let s = resolve_subject(&trigger).unwrap();
+        assert_eq!(s.uid, "uid-flood=");
+        assert_eq!(s.nickname, "", "a flood event carries no nickname");
+    }
+
+    #[test]
+    fn resolve_subject_rejects_global_flood_with_no_subject() {
+        let trigger = json!({ "kind": "ts6Flood", "bucketKey": "*", "count": 9 });
+        assert!(resolve_subject(&trigger).is_err());
+        assert!(resolve_subject(&json!({ "kind": "cron" })).is_err());
+    }
+
+    async fn fresh_db() -> Arc<Database> {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        crate::db::migrations::run(&db).await.unwrap();
+        db
+    }
+
+    fn subject(uid: &str) -> ResolvedSubject {
+        ResolvedSubject {
+            uid: uid.into(),
+            nickname: "Nick".into(),
+        }
+    }
+
+    fn bridge<'a>(
+        subject: &'a ResolvedSubject,
+        effect: ModerateEffect,
+        rule_key: &'a str,
+        mode: ModerationMode,
+    ) -> CaseBridge<'a> {
+        CaseBridge {
+            server_config_id: 1,
+            virtual_server_id: 1,
+            subject,
+            effect,
+            reason: "spam",
+            rule_key,
+            flow_id: 7,
+            run_id: 1,
+            trigger_kind: "ts6ChatMessage",
+            observed_count: None,
+            mode,
+            shadow_reason: None,
+            ts_ref: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn moderate_bridge_opens_one_automod_case() {
+        let db = fresh_db().await;
+        let s = subject("uid-a");
+        bridge_to_case(
+            &db,
+            &bridge(&s, ModerateEffect::Kick, "bad-name", ModerationMode::Enforce),
+        )
+        .await
+        .unwrap();
+
+        let cases = moderation_cases::list_for_subject(&db, "uid-a").await.unwrap();
+        assert_eq!(cases.len(), 1, "exactly one automod case");
+        let case = &cases[0];
+        assert_eq!(case.origin, "automod");
+        assert_eq!(case.status, "actioned", "enforce mode marks the case actioned");
+        assert_eq!(case.originRef.as_deref(), Some("bad-name:7"));
+        assert!(case.openedByUserId.is_none(), "automod case has no operator");
+
+        let actions = moderation_case_actions::list_for_case(&db, case.id)
+            .await
+            .unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].actionKind, "kick");
+        assert_eq!(actions[0].actorUsernameSnapshot, "automod");
+        assert!(actions[0].actorUserId.is_none());
+        let payload = actions[0].payload.as_ref().expect("action payload");
+        assert_eq!(payload["flowId"], 7);
+        assert_eq!(payload["ruleKey"], "bad-name");
+        assert_eq!(payload["mode"], "enforce");
+        assert_eq!(payload["triggerKind"], "ts6ChatMessage");
+
+        let (audit, _) = admin_audit_log::list(&db, &admin_audit_log::ListFilter::default(), 50, 0)
+            .await
+            .unwrap();
+        assert_eq!(audit.len(), 1, "one audit row per automod action");
+        assert_eq!(audit[0].kind, "moderationAutomodAction");
+        assert_eq!(audit[0].targetId, Some(case.id));
+    }
+
+    #[tokio::test]
+    async fn moderate_bridge_dedups_into_open_case() {
+        let db = fresh_db().await;
+        let s = subject("uid-b");
+        let b = bridge(&s, ModerateEffect::Warn, "chat-filter", ModerationMode::Enforce);
+        bridge_to_case(&db, &b).await.unwrap();
+        bridge_to_case(&db, &b).await.unwrap();
+
+        let cases = moderation_cases::list_for_subject(&db, "uid-b").await.unwrap();
+        assert_eq!(cases.len(), 1, "a second trigger folds into the same case");
+        let actions = moderation_case_actions::list_for_case(&db, cases[0].id)
+            .await
+            .unwrap();
+        assert_eq!(actions.len(), 2, "each trigger appends a timeline action");
+    }
+
+    #[tokio::test]
+    async fn moderate_bridge_opens_a_distinct_case_per_rule() {
+        let db = fresh_db().await;
+        let s = subject("uid-c");
+        bridge_to_case(
+            &db,
+            &bridge(&s, ModerateEffect::Warn, "rule-x", ModerationMode::Enforce),
+        )
+        .await
+        .unwrap();
+        bridge_to_case(
+            &db,
+            &bridge(&s, ModerateEffect::Warn, "rule-y", ModerationMode::Enforce),
+        )
+        .await
+        .unwrap();
+        let cases = moderation_cases::list_for_subject(&db, "uid-c").await.unwrap();
+        assert_eq!(cases.len(), 2, "each rule_key keys its own case");
+    }
+
+    #[tokio::test]
+    async fn moderate_bridge_shadow_mode_leaves_case_open() {
+        // Also pins migration 0012: a `warn` actionKind must satisfy the
+        // `moderation_case_action` ASSERT.
+        let db = fresh_db().await;
+        let s = subject("uid-d");
+        bridge_to_case(
+            &db,
+            &bridge(&s, ModerateEffect::Warn, "shadow-rule", ModerationMode::Shadow),
+        )
+        .await
+        .unwrap();
+        let cases = moderation_cases::list_for_subject(&db, "uid-d").await.unwrap();
+        assert_eq!(cases.len(), 1);
+        assert_eq!(cases[0].status, "open", "shadow mode leaves the case open");
+        let actions = moderation_case_actions::list_for_case(&db, cases[0].id)
+            .await
+            .unwrap();
+        assert_eq!(actions[0].actionKind, "warn");
+    }
+
+    #[tokio::test]
+    async fn moderate_bridge_records_shadow_reason_on_payload() {
+        // A shadow-mode action carries the §6 safeguard that suppressed
+        // it so the operator can review the would-have-done stream.
+        let db = fresh_db().await;
+        let s = subject("uid-e");
+        let mut b = bridge(&s, ModerateEffect::Kick, "killed-rule", ModerationMode::Shadow);
+        b.shadow_reason = Some(automod::ShadowReason::CircuitBreakerTripped.as_str());
+        bridge_to_case(&db, &b).await.unwrap();
+
+        let cases = moderation_cases::list_for_subject(&db, "uid-e").await.unwrap();
+        let actions = moderation_case_actions::list_for_case(&db, cases[0].id)
+            .await
+            .unwrap();
+        let payload = actions[0].payload.as_ref().expect("action payload");
+        assert_eq!(payload["mode"], "shadow");
+        assert_eq!(payload["shadowReason"], "circuitBreakerTripped");
     }
 }
