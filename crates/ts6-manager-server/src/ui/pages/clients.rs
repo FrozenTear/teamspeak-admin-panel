@@ -22,7 +22,9 @@ use std::sync::Arc;
 
 use dioxus::prelude::*;
 use serde_json::Value;
-use ts6_manager_shared::control::{ClientListItem, KickKind, KickRequest, MoveRequest, MuteRequest};
+use ts6_manager_shared::control::{
+    ClientListItem, KickKind, KickRequest, MoveRequest, MuteRequest,
+};
 
 use crate::client::api::{self, ApiError};
 use crate::client::dioxus::{use_auth_gate, use_session};
@@ -156,8 +158,7 @@ pub fn ClientsPage() -> Element {
             spawn(async move {
                 // `on=true` → mute (revoke talker flag); `on=false` → unmute.
                 let segment = if on { "mute" } else { "unmute" };
-                let path =
-                    format!("/api/servers/{server_id}/vs/{sid}/clients/{clid}/{segment}");
+                let path = format!("/api/servers/{server_id}/vs/{sid}/clients/{clid}/{segment}");
                 match api::authorized_post_json::<_, ()>(
                     &gate,
                     &api::api_base(),

@@ -672,10 +672,7 @@ async fn mute_revokes_talker_flag() {
     let q = mock.captured_queries.lock().unwrap();
     let last = q.last().unwrap();
     // PURA-299: mute now revokes the talker flag, not client-self muted props.
-    assert_eq!(
-        last.get("client_is_talker").map(|s| s.as_str()),
-        Some("0")
-    );
+    assert_eq!(last.get("client_is_talker").map(|s| s.as_str()), Some("0"));
 }
 
 #[tokio::test]
@@ -700,10 +697,7 @@ async fn unmute_resets_talker_flag() {
     let q = mock.captured_queries.lock().unwrap();
     let last = q.last().unwrap();
     // PURA-299: unmute restores the talker flag.
-    assert_eq!(
-        last.get("client_is_talker").map(|s| s.as_str()),
-        Some("1")
-    );
+    assert_eq!(last.get("client_is_talker").map(|s| s.as_str()), Some("1"));
 }
 
 #[tokio::test]

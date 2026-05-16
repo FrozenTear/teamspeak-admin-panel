@@ -98,7 +98,9 @@ impl ParsedTrigger {
 /// row's `trigger` document.
 #[derive(Debug, Clone)]
 pub enum TriggerEvent {
-    Cron { tick: DateTime<Utc> },
+    Cron {
+        tick: DateTime<Utc>,
+    },
     Manual {
         context: Option<serde_json::Map<String, serde_json::Value>>,
     },
@@ -413,7 +415,9 @@ mod tests {
     fn manual_fire_and_ts6_have_no_self_schedule() {
         for trigger in [
             Trigger::ManualFire,
-            Trigger::Ts6ClientJoined { channel_id: Some(5) },
+            Trigger::Ts6ClientJoined {
+                channel_id: Some(5),
+            },
             Trigger::Ts6ChatMessage {
                 channel_id: None,
                 target_mode: None,

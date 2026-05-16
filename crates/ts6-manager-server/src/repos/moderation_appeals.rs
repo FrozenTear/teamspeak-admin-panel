@@ -168,7 +168,10 @@ pub async fn delete(db: &Database, id: i64) -> Result<bool> {
 
 /// GDPR Art. 15 / 20 — every appeal a subject UID submitted,
 /// newest-first. Backs a subject-data export.
-pub async fn export_for_subject(db: &Database, submitter_uid: &str) -> Result<Vec<ModerationAppeal>> {
+pub async fn export_for_subject(
+    db: &Database,
+    submitter_uid: &str,
+) -> Result<Vec<ModerationAppeal>> {
     let sql = format!(
         "SELECT {PROJECTION} FROM moderation_appeal
             WHERE submitterUid = $uid
@@ -318,7 +321,10 @@ mod tests {
         let a = insert(&db, appeal(case_id, "appellant-d")).await.unwrap();
         assert!(delete(&db, a.id).await.unwrap());
         assert!(find_by_id(&db, a.id).await.unwrap().is_none());
-        assert!(!delete(&db, a.id).await.unwrap(), "second delete is a no-op");
+        assert!(
+            !delete(&db, a.id).await.unwrap(),
+            "second delete is a no-op"
+        );
     }
 
     #[tokio::test]
@@ -333,7 +339,12 @@ mod tests {
 
         let purged = purge_for_subject(&db, "uid-erase").await.unwrap();
         assert_eq!(purged, 2);
-        assert!(export_for_subject(&db, "uid-erase").await.unwrap().is_empty());
+        assert!(
+            export_for_subject(&db, "uid-erase")
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             export_for_subject(&db, "uid-keep").await.unwrap().len(),
             1,

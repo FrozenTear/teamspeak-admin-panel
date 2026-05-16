@@ -624,11 +624,7 @@ impl FlowEngineHandle {
 
     /// Producer entry for `notifyclientmoved`. Feeds flood counters for the
     /// `clientMoved` source (channel-hopping detection).
-    pub async fn on_client_moved(
-        &self,
-        virtual_server_id: i64,
-        client_unique_identifier: String,
-    ) {
+    pub async fn on_client_moved(&self, virtual_server_id: i64, client_unique_identifier: String) {
         self.pump_flood(
             virtual_server_id,
             FloodSource::ClientMoved,

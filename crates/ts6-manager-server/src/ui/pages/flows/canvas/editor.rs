@@ -89,7 +89,12 @@ fn node_summary(kind: &NodeKind) -> String {
                 Some(c) => format!("chat message · channel {c}"),
                 None => "chat message · any channel".into(),
             },
-            Trigger::Ts6Flood { source, threshold, window_secs, .. } => {
+            Trigger::Ts6Flood {
+                source,
+                threshold,
+                window_secs,
+                ..
+            } => {
                 let src = match source {
                     ts6_manager_shared::flows::FloodSource::ClientJoined => "joins",
                     ts6_manager_shared::flows::FloodSource::ChatMessage => "messages",

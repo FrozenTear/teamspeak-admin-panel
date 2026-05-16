@@ -19,9 +19,7 @@
 use dioxus::prelude::*;
 use serde_json::{Map, Value};
 use ts6_manager_shared::flows::v2::{BranchCase, FlowGraph, NodeId, NodeKind, TransformOutput};
-use ts6_manager_shared::flows::{
-    Action, FloodScope, FloodSource, FlowId, ModerateEffect, Trigger,
-};
+use ts6_manager_shared::flows::{Action, FloodScope, FloodSource, FlowId, ModerateEffect, Trigger};
 
 use super::model;
 

@@ -331,7 +331,10 @@ mod tests {
         let r = insert(&db, report("rep-d", "subj-d")).await.unwrap();
         assert!(delete(&db, r.id).await.unwrap());
         assert!(find_by_id(&db, r.id).await.unwrap().is_none());
-        assert!(!delete(&db, r.id).await.unwrap(), "second delete is a no-op");
+        assert!(
+            !delete(&db, r.id).await.unwrap(),
+            "second delete is a no-op"
+        );
     }
 
     #[tokio::test]
@@ -341,11 +344,19 @@ mod tests {
         insert(&db, report("rep-f", "subj-erase")).await.unwrap();
         insert(&db, report("rep-g", "subj-keep")).await.unwrap();
 
-        assert_eq!(export_for_subject(&db, "subj-erase").await.unwrap().len(), 2);
+        assert_eq!(
+            export_for_subject(&db, "subj-erase").await.unwrap().len(),
+            2
+        );
 
         let purged = purge_for_subject(&db, "subj-erase").await.unwrap();
         assert_eq!(purged, 2);
-        assert!(export_for_subject(&db, "subj-erase").await.unwrap().is_empty());
+        assert!(
+            export_for_subject(&db, "subj-erase")
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             export_for_subject(&db, "subj-keep").await.unwrap().len(),
             1,

@@ -363,9 +363,7 @@ impl AutomodSafeguards {
 
         // Enforce — start the subject's cooldown so the next trigger on
         // this subject folds into the case instead of re-actioning.
-        let expiry = now
-            .checked_add(self.config.subject_cooldown)
-            .unwrap_or(now);
+        let expiry = now.checked_add(self.config.subject_cooldown).unwrap_or(now);
         state
             .cooldowns
             .insert(input.subject_uid.to_string(), expiry);
@@ -390,9 +388,7 @@ impl AutomodSafeguards {
 
     /// Operator promote / demote of a single rule (brief §6.1).
     pub fn set_rule_mode(&self, rule_key: &str, mode: RuleMode) {
-        self.lock()
-            .rule_modes
-            .insert(rule_key.to_string(), mode);
+        self.lock().rule_modes.insert(rule_key.to_string(), mode);
     }
 
     /// Current effective mode of a rule — `shadow` for an unknown rule.
@@ -533,7 +529,10 @@ mod tests {
         c.enforce_rules.insert("promoted".to_string());
         let sg = AutomodSafeguards::new(c);
         assert_eq!(sg.gate("promoted"), Gate::EnforceEligible);
-        assert_eq!(sg.gate("other"), Gate::Shadowed(ShadowReason::RuleShadowMode));
+        assert_eq!(
+            sg.gate("other"),
+            Gate::Shadowed(ShadowReason::RuleShadowMode)
+        );
     }
 
     #[test]
@@ -787,9 +786,7 @@ mod tests {
         sg.set_rule_mode("r", RuleMode::Enforce);
 
         let t0 = Instant::now();
-        let d = |t: Instant| {
-            sg.decide(&input("r", "u", &[], ModerateEffect::Kick), t)
-        };
+        let d = |t: Instant| sg.decide(&input("r", "u", &[], ModerateEffect::Kick), t);
         // Three actions fill the window.
         assert_eq!(d(t0), Decision::Enforce);
         assert_eq!(d(t0 + Duration::from_secs(10)), Decision::Enforce);

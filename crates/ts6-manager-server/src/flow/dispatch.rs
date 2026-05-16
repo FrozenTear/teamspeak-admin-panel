@@ -48,7 +48,9 @@ use crate::audit::AuditKind;
 use crate::control::{ControlBackend, ControlBackendPool};
 use crate::db::Database;
 use crate::music_bots::MusicBotService;
-use crate::repos::{admin_audit_log, moderation_case_actions, moderation_cases, server_connections};
+use crate::repos::{
+    admin_audit_log, moderation_case_actions, moderation_cases, server_connections,
+};
 use crate::webquery::BanAddParams;
 
 use super::automod::{self, AutomodSafeguards};
@@ -313,8 +315,7 @@ impl ProductionDispatcher {
             automod::Gate::EnforceEligible => {
                 let backend = self.resolve_backend(ctx).await?;
                 let sid = ctx.virtual_server_id;
-                let presence =
-                    resolve_subject_presence(backend.as_ref(), sid, &subject.uid).await;
+                let presence = resolve_subject_presence(backend.as_ref(), sid, &subject.uid).await;
                 // The prior-case count is only consulted when the
                 // repeat-offender knob is on (disabled by default — §10),
                 // so the query is skipped on the common path.
@@ -467,9 +468,7 @@ impl ProductionDispatcher {
                 targetLabel: Some(rule_key.to_string()),
                 payload: Some(payload),
                 outcome: "failure".to_string(),
-                errorMsg: Some(
-                    "circuit breaker tripped — rule auto-demoted to shadow".to_string(),
-                ),
+                errorMsg: Some("circuit breaker tripped — rule auto-demoted to shadow".to_string()),
                 requestIp: None,
                 requestUserAgent: None,
             },
@@ -553,9 +552,8 @@ async fn apply_effect(
     reason: &str,
     clid: Option<i64>,
 ) -> Result<Option<String>, String> {
-    let require_clid = || {
-        clid.ok_or_else(|| format!("Moderate: subject `{}` is not connected", subject.uid))
-    };
+    let require_clid =
+        || clid.ok_or_else(|| format!("Moderate: subject `{}` is not connected", subject.uid));
     match effect {
         ModerateEffect::Ban => {
             // `banadd` keys on the durable UID, so no `clid` is needed.
@@ -1137,18 +1135,31 @@ mod tests {
         let s = subject("uid-a");
         bridge_to_case(
             &db,
-            &bridge(&s, ModerateEffect::Kick, "bad-name", ModerationMode::Enforce),
+            &bridge(
+                &s,
+                ModerateEffect::Kick,
+                "bad-name",
+                ModerationMode::Enforce,
+            ),
         )
         .await
         .unwrap();
 
-        let cases = moderation_cases::list_for_subject(&db, "uid-a").await.unwrap();
+        let cases = moderation_cases::list_for_subject(&db, "uid-a")
+            .await
+            .unwrap();
         assert_eq!(cases.len(), 1, "exactly one automod case");
         let case = &cases[0];
         assert_eq!(case.origin, "automod");
-        assert_eq!(case.status, "actioned", "enforce mode marks the case actioned");
+        assert_eq!(
+            case.status, "actioned",
+            "enforce mode marks the case actioned"
+        );
         assert_eq!(case.originRef.as_deref(), Some("bad-name:7"));
-        assert!(case.openedByUserId.is_none(), "automod case has no operator");
+        assert!(
+            case.openedByUserId.is_none(),
+            "automod case has no operator"
+        );
 
         let actions = moderation_case_actions::list_for_case(&db, case.id)
             .await
@@ -1175,11 +1186,18 @@ mod tests {
     async fn moderate_bridge_dedups_into_open_case() {
         let db = fresh_db().await;
         let s = subject("uid-b");
-        let b = bridge(&s, ModerateEffect::Warn, "chat-filter", ModerationMode::Enforce);
+        let b = bridge(
+            &s,
+            ModerateEffect::Warn,
+            "chat-filter",
+            ModerationMode::Enforce,
+        );
         bridge_to_case(&db, &b).await.unwrap();
         bridge_to_case(&db, &b).await.unwrap();
 
-        let cases = moderation_cases::list_for_subject(&db, "uid-b").await.unwrap();
+        let cases = moderation_cases::list_for_subject(&db, "uid-b")
+            .await
+            .unwrap();
         assert_eq!(cases.len(), 1, "a second trigger folds into the same case");
         let actions = moderation_case_actions::list_for_case(&db, cases[0].id)
             .await
@@ -1203,7 +1221,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let cases = moderation_cases::list_for_subject(&db, "uid-c").await.unwrap();
+        let cases = moderation_cases::list_for_subject(&db, "uid-c")
+            .await
+            .unwrap();
         assert_eq!(cases.len(), 2, "each rule_key keys its own case");
     }
 
@@ -1215,11 +1235,18 @@ mod tests {
         let s = subject("uid-d");
         bridge_to_case(
             &db,
-            &bridge(&s, ModerateEffect::Warn, "shadow-rule", ModerationMode::Shadow),
+            &bridge(
+                &s,
+                ModerateEffect::Warn,
+                "shadow-rule",
+                ModerationMode::Shadow,
+            ),
         )
         .await
         .unwrap();
-        let cases = moderation_cases::list_for_subject(&db, "uid-d").await.unwrap();
+        let cases = moderation_cases::list_for_subject(&db, "uid-d")
+            .await
+            .unwrap();
         assert_eq!(cases.len(), 1);
         assert_eq!(cases[0].status, "open", "shadow mode leaves the case open");
         let actions = moderation_case_actions::list_for_case(&db, cases[0].id)
@@ -1234,11 +1261,18 @@ mod tests {
         // it so the operator can review the would-have-done stream.
         let db = fresh_db().await;
         let s = subject("uid-e");
-        let mut b = bridge(&s, ModerateEffect::Kick, "killed-rule", ModerationMode::Shadow);
+        let mut b = bridge(
+            &s,
+            ModerateEffect::Kick,
+            "killed-rule",
+            ModerationMode::Shadow,
+        );
         b.shadow_reason = Some(automod::ShadowReason::CircuitBreakerTripped.as_str());
         bridge_to_case(&db, &b).await.unwrap();
 
-        let cases = moderation_cases::list_for_subject(&db, "uid-e").await.unwrap();
+        let cases = moderation_cases::list_for_subject(&db, "uid-e")
+            .await
+            .unwrap();
         let actions = moderation_case_actions::list_for_case(&db, cases[0].id)
             .await
             .unwrap();

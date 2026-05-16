@@ -75,12 +75,19 @@ pub fn trigger_summary(trigger: &wire::Trigger) -> String {
         wire::Trigger::Ts6ClientJoined {
             channel_id: Some(c),
         } => format!("ts6 client joined (channel {c})"),
-        wire::Trigger::Ts6ChatMessage { channel_id: None, .. } => "ts6 chat message".into(),
+        wire::Trigger::Ts6ChatMessage {
+            channel_id: None, ..
+        } => "ts6 chat message".into(),
         wire::Trigger::Ts6ChatMessage {
             channel_id: Some(c),
             ..
         } => format!("ts6 chat message (channel {c})"),
-        wire::Trigger::Ts6Flood { source, threshold, window_secs, .. } => {
+        wire::Trigger::Ts6Flood {
+            source,
+            threshold,
+            window_secs,
+            ..
+        } => {
             let src = match source {
                 wire::FloodSource::ClientJoined => "joins",
                 wire::FloodSource::ChatMessage => "messages",
