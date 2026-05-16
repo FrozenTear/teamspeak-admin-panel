@@ -293,6 +293,19 @@ pub fn BotDetailPage(bot_id: u64) -> Element {
                     } else {
                         p { class: "muted", "Nothing is playing." }
                     }
+                    // PURA-270 — surface the cause of a failed track. The
+                    // backend drops a failed bot back to `Connected`/
+                    // `InChannel` (no `Failed` wire state) and exposes the
+                    // reason as `last_error`; show it only while the bot
+                    // isn't playing so a fresh track's `NowPlaying` (which
+                    // clears `last_error`) hides a stale banner.
+                    if d.last_error.is_some() && !matches!(d.state, wire::BotState::Playing) {
+                        Banner {
+                            variant: BannerVariant::Danger,
+                            title: "Last track failed to play".to_string(),
+                            "{d.last_error.as_deref().unwrap_or_default()}"
+                        }
+                    }
                     PlaybackControls {
                         bot_id,
                         state: d.state,

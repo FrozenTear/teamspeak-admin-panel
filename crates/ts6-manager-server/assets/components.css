@@ -238,6 +238,8 @@
 .bot-badge--pending { background: rgba(224, 169, 59, 0.14); color: var(--warning-fg); }
 .bot-badge--off     { background: rgba(94, 106, 130, 0.20); color: var(--text-secondary); }
 .bot-badge--error   { background: rgba(230, 76, 95, 0.14); color: var(--danger-fg); }
+/* Two pills side by side (PURA-270: state badge + "Failed" chip). */
+.bot-badge + .bot-badge { margin-left: var(--space-3); }
 
 /* Flow glyph icon (PURA-253 §7.1) — decorative; paired with a text label
    everywhere it renders, so the surface stays icon-independent. */

@@ -259,6 +259,20 @@ fn BotsTable(props: BotsTableProps) -> Element {
                                     span { class: state_badge_class(state),
                                         "{state_label(state)}"
                                     }
+                                    // PURA-270 — a failed track leaves no
+                                    // `Failed` wire state, so the row badge
+                                    // alone can't show it. Pair a "Failed"
+                                    // chip beside the state badge when the
+                                    // bot carries a `last_error`; the full
+                                    // cause is on the detail page (and the
+                                    // chip's `title` for a hover preview).
+                                    if let Some(err) = b.last_error.as_deref() {
+                                        span {
+                                            class: "bot-badge bot-badge--error",
+                                            title: "{err}",
+                                            "Failed"
+                                        }
+                                    }
                                 }
                                 td { "{now_playing}" }
                                 td { class: "actions-col",
