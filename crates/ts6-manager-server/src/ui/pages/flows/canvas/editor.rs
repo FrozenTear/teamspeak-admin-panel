@@ -19,15 +19,23 @@
 //! per-node status (`canvas-visual-spec.md` §5) — it simply has no live data
 //! source until PURA-266's `GET …/runs/{runId}` lands to feed it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use dioxus::prelude::*;
-use ts6_manager_shared::flows::v2::{FlowGraph, NodeId, NodeKind, Position};
+use ts6_manager_shared::flows::v2::{FlowGraph, NodeId, NodeKind, Position, ValidateGraphResponse};
 
 use super::geometry::{self, KBD_STEP, NODE_W, ZOOM_MAX, ZOOM_MIN};
 use super::inspector::Inspector;
 use super::model::{self, PaletteKind, RunOverlayStatus};
 use super::style::CANVAS_CSS;
+use crate::client::dioxus::use_auth_gate;
+use crate::client::flows as fl;
+
+/// Debounce, ms, between the last structural edit and the inline
+/// `POST /api/flows/validate` call (`ui-brief.md` §4.4). `use_resource`
+/// cancels the still-sleeping future when the graph changes again, so a
+/// burst of edits collapses to a single validation once activity settles.
+const VALIDATE_DEBOUNCE_MS: u32 = 450;
 
 /// An in-flight node drag — pointer origin + node origin, in their own
 /// coordinate spaces; the delta is applied on every `pointermove`.
@@ -139,11 +147,18 @@ struct OutPortRender {
 /// `GET …/runs/{runId}` poll supplies `Some(map)` to paint a run. As an
 /// `Option` prop it defaults to `None`, so plain-editor call sites are
 /// unaffected.
+/// `on_save` is the optional save hook. When `Some`, the toolbar shows a
+/// Save button — disabled while any validation error is outstanding
+/// (`ui-brief.md` §4.4) — and clicking it hands the current [`FlowGraph`]
+/// to the caller, which owns the create-vs-update API call and the
+/// flow-level fields (name, server). `None` (the dev mount, the
+/// Definition-tab render) shows no Save button.
 #[component]
 pub fn FlowCanvasEditor(
     initial: FlowGraph,
     read_only: bool,
     run_overlay: Option<HashMap<NodeId, RunOverlayStatus>>,
+    on_save: Option<EventHandler<FlowGraph>>,
 ) -> Element {
     let mut graph = use_signal(|| initial.clone());
     let mut selected = use_signal(|| None::<NodeId>);
@@ -155,6 +170,25 @@ pub fn FlowCanvasEditor(
     let mut zoom = use_signal(|| 1.0_f64);
     let mut status = use_signal(|| {
         "Drag a palette chip to add a node · drag a port to wire · scroll to zoom".to_string()
+    });
+
+    // --- inline validation (ui-brief.md §4.4) ---------------------------
+    // A debounced `POST /api/flows/validate` after every edit. `use_resource`
+    // re-runs the closure whenever a signal it reads (`graph`) changes and
+    // cancels the previous, still-sleeping future — so a burst of edits (a
+    // drag, a fast sequence of clicks) collapses to one validation call once
+    // activity settles. `read_only` surfaces skip it: nothing is saved there.
+    let gate = use_auth_gate();
+    let validation = use_resource(move || {
+        let snap = graph();
+        let gate = gate.clone();
+        async move {
+            if read_only || snap.nodes.is_empty() {
+                return None;
+            }
+            gloo_timers::future::TimeoutFuture::new(VALIDATE_DEBOUNCE_MS).await;
+            fl::validate_graph(gate, &snap).await.ok()
+        }
     });
 
     // --- shared mutators ------------------------------------------------
@@ -243,6 +277,81 @@ pub fn FlowCanvasEditor(
         "fc-editor"
     };
 
+    // Validation result for this render: `None` while the first debounced
+    // call is still in flight (or on a read-only surface).
+    let validation_snapshot: Option<ValidateGraphResponse> = validation.read().clone().flatten();
+    let mut err_nodes: HashSet<String> = HashSet::new();
+    let mut err_edges: HashSet<String> = HashSet::new();
+    let mut warn_nodes: HashSet<String> = HashSet::new();
+    let mut warn_edges: HashSet<String> = HashSet::new();
+    if let Some(v) = &validation_snapshot {
+        for e in &v.errors {
+            if let Some(n) = &e.node {
+                err_nodes.insert(n.clone());
+            }
+            for n in &e.nodes {
+                err_nodes.insert(n.clone());
+            }
+            if let Some(ed) = &e.edge {
+                err_edges.insert(ed.clone());
+            }
+        }
+        for w in &v.warnings {
+            if let Some(n) = &w.node {
+                warn_nodes.insert(n.clone());
+            }
+            for n in &w.nodes {
+                warn_nodes.insert(n.clone());
+            }
+            if let Some(ed) = &w.edge {
+                warn_edges.insert(ed.clone());
+            }
+        }
+    }
+    let error_count = validation_snapshot
+        .as_ref()
+        .map(|v| v.errors.len())
+        .unwrap_or(0);
+    let warning_count = validation_snapshot
+        .as_ref()
+        .map(|v| v.warnings.len())
+        .unwrap_or(0);
+    let has_errors = error_count > 0;
+    // The problems summary line + the first few messages for the banner.
+    let problem_messages: Vec<(bool, String)> = validation_snapshot
+        .as_ref()
+        .map(|v| {
+            v.errors
+                .iter()
+                .map(|e| (true, e.message.clone()))
+                .chain(v.warnings.iter().map(|w| (false, w.message.clone())))
+                .take(6)
+                .collect()
+        })
+        .unwrap_or_default();
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+    let validation_summary = if read_only {
+        String::new()
+    } else if validation_snapshot.is_none() {
+        "Checking\u{2026}".to_string()
+    } else if has_errors {
+        format!("{error_count} problem{}", plural(error_count))
+    } else if warning_count > 0 {
+        format!(
+            "Valid \u{00b7} {warning_count} warning{}",
+            plural(warning_count)
+        )
+    } else {
+        "Valid".to_string()
+    };
+    let validation_class = if has_errors {
+        "fc-vstate err"
+    } else if warning_count > 0 {
+        "fc-vstate warn"
+    } else {
+        "fc-vstate ok"
+    };
+
     // Which (node, port) pairs have at least one outgoing edge.
     let connected_ports: std::collections::HashSet<(String, String)> = snapshot
         .edges
@@ -250,7 +359,10 @@ pub fn FlowCanvasEditor(
         .map(|e| (e.from.node.0.clone(), e.from.port.clone()))
         .collect();
 
-    let edge_paths: Vec<(String, String, bool)> = snapshot
+    // Each edge: (id, bezier path, full class). The class folds in the
+    // `err`-port styling and the validation state (`invalid` highlights a
+    // cycle edge red, `warned` an amber type-hint mismatch — ui-brief §4.4).
+    let edge_paths: Vec<(String, String, String)> = snapshot
         .edges
         .iter()
         .filter_map(|e| {
@@ -258,10 +370,18 @@ pub fn FlowCanvasEditor(
             let to = snapshot.nodes.iter().find(|n| n.id == e.to.node)?;
             let ports = model::output_ports(&from.kind);
             let idx = ports.iter().position(|p| p.name == e.from.port)?;
-            let is_err = ports[idx].is_err;
             let (x1, y1) = geometry::out_port_pos(from.position, idx);
             let (x2, y2) = geometry::in_port_pos(to.position);
-            Some((e.id.0.clone(), geometry::bezier(x1, y1, x2, y2), is_err))
+            let mut class = "fc-edge".to_string();
+            if ports[idx].is_err {
+                class.push_str(" err");
+            }
+            if err_edges.contains(&e.id.0) {
+                class.push_str(" invalid");
+            } else if warn_edges.contains(&e.id.0) {
+                class.push_str(" warned");
+            }
+            Some((e.id.0.clone(), geometry::bezier(x1, y1, x2, y2), class))
         })
         .collect();
 
@@ -302,6 +422,13 @@ pub fn FlowCanvasEditor(
                 css_class.push_str(" fc-node--");
                 css_class.push_str(st.class_suffix());
             }
+            // Validation highlight — a cycle/port error rings the node red,
+            // a warning amber (`ui-brief.md` §4.4). Errors win over warnings.
+            if err_nodes.contains(&n.id.0) {
+                css_class.push_str(" invalid");
+            } else if warn_nodes.contains(&n.id.0) {
+                css_class.push_str(" warned");
+            }
             // The overlay status row adds a body line — grow the card so it
             // does not spill past the rounded border.
             let card_h = geometry::node_height(out_ports.len())
@@ -339,6 +466,7 @@ pub fn FlowCanvasEditor(
 
     rsx! {
         style { dangerous_inner_html: CANVAS_CSS }
+        style { dangerous_inner_html: VALIDATION_CSS }
         div { class: "{editor_class}",
 
             // --- palette ---------------------------------------------
@@ -379,10 +507,10 @@ pub fn FlowCanvasEditor(
                     style: "transform: translate({panx}px, {pany}px) scale({z});",
 
                     svg { class: "fc-edges", width: "4000", height: "3000",
-                        for (id , d , is_err) in edge_paths {
+                        for (id , d , class) in edge_paths {
                             path {
                                 key: "{id}",
-                                class: if is_err { "fc-edge err" } else { "fc-edge" },
+                                class: "{class}",
                                 d: "{d}",
                             }
                         }
@@ -612,20 +740,97 @@ pub fn FlowCanvasEditor(
             // --- inspector -------------------------------------------
             Inspector { graph, selected, read_only }
 
+            // --- problems banner (ui-brief.md §4.4) ------------------
+            // Inline lint results — errors block Save, warnings do not.
+            // Rendered only when there is something to say.
+            if !read_only && !problem_messages.is_empty() {
+                div {
+                    class: if has_errors { "fc-problems" } else { "fc-problems warn" },
+                    role: "status",
+                    "aria-live": "polite",
+                    strong {
+                        if has_errors {
+                            "{error_count} problem{plural(error_count)} — fix to save"
+                        } else {
+                            "{warning_count} warning{plural(warning_count)} — save still allowed"
+                        }
+                    }
+                    ul {
+                        for (idx , (is_err , msg)) in problem_messages.iter().enumerate() {
+                            li {
+                                key: "{idx}",
+                                class: if *is_err { "fc-problem err" } else { "fc-problem warn" },
+                                "{msg}"
+                            }
+                        }
+                    }
+                }
+            }
+
             // --- status bar ------------------------------------------
             div { class: "fc-statusbar",
                 span { "Nodes: {node_count} / 64" }
                 span { "Edges: {edge_count} / 128" }
+                if !read_only {
+                    span { class: "{validation_class}", "{validation_summary}" }
+                }
                 span {
                     class: "fc-live",
                     role: "status",
                     "aria-live": "polite",
                     "{status}"
                 }
+                if let Some(handler) = on_save {
+                    button {
+                        class: "fc-save",
+                        r#type: "button",
+                        disabled: read_only || has_errors,
+                        title: if has_errors {
+                            "Fix the outstanding problems before saving"
+                        } else {
+                            "Save this flow"
+                        },
+                        onclick: move |_| {
+                            if !has_errors {
+                                handler.call(graph());
+                                status.set("Saving\u{2026}".to_string());
+                            }
+                        },
+                        "Save"
+                    }
+                }
             }
         }
     }
 }
+
+/// Inline-validation + Save styling (`ui-brief.md` §4.4). Kept separate
+/// from the PURA-276 design sheet (`style.rs`): that file is UXDesigner's,
+/// this is the editor's own behavioural CSS. Token-aligned all the same —
+/// every value resolves from `tokens.css`, scoped under `.fc-*`.
+const VALIDATION_CSS: &str = r#"
+.fc-node.invalid { box-shadow: var(--shadow-md), 0 0 0 2px var(--danger-fg); }
+.fc-node.warned  { box-shadow: var(--shadow-md), 0 0 0 2px var(--warning-fg); }
+.fc-edge.invalid { stroke: var(--danger-fg); stroke-width: 3; }
+.fc-edge.warned  { stroke: var(--warning-fg); stroke-width: 2; stroke-dasharray: 4 3; }
+.fc-vstate { font-weight: var(--weight-semibold); }
+.fc-vstate.err  { color: var(--danger-fg); }
+.fc-vstate.warn { color: var(--warning-fg); }
+.fc-vstate.ok   { color: var(--success-fg); }
+.fc-save { margin-left: auto; padding: var(--space-2) var(--space-5);
+  border: 1px solid var(--accent-fg); border-radius: var(--radius-md);
+  background: var(--accent-fg); color: var(--bg-surface);
+  font: inherit; font-weight: var(--weight-semibold); cursor: pointer; }
+.fc-save:disabled { opacity: .5; cursor: not-allowed; }
+.fc-problems { grid-column: 1 / -1; padding: var(--space-3) var(--space-4);
+  background: var(--danger-bg); color: var(--danger-fg);
+  border-top: 1px solid var(--border-subtle);
+  font-family: var(--font-sans); font-size: var(--text-2xs);
+  line-height: var(--lh-2xs); }
+.fc-problems.warn { background: var(--warning-bg); color: var(--warning-fg); }
+.fc-problems ul { margin: var(--space-1) 0 0; padding-left: var(--space-5); }
+.fc-problems li { margin-top: 2px; }
+"#;
 
 /// A static demo graph for the dev mount — one node of every kind, each
 /// tagged with a run-overlay status. Renders every family colour and every
