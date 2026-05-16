@@ -18,7 +18,8 @@ use crate::ui::pages::active_server;
 use crate::ui::pages::flows::dialog::{ConfirmDialog, DeletePrompt};
 use crate::ui::pages::flows::shared::{
     ADMIN_ONLY_HINT, admin_only_title, enabled_badge_class, enabled_label, format_error,
-    is_run_in_flight_conflict, last_run_cell, trigger_summary,
+    is_run_in_flight_conflict, last_run_meta, run_status_badge_class, run_status_icon,
+    run_status_label, trigger_summary,
 };
 use crate::ui::routes::Route;
 
@@ -340,7 +341,10 @@ fn FlowsTableSkeleton() -> Element {
             span { class: "sr-only", role: "status", "aria-live": "polite",
                 "Loading flows…"
             }
-            table { class: "data-table", aria_hidden: "true",
+            // `data-table--cards` (PURA-246 R1) — reflows to stacked cards
+            // on narrow viewports; the skeleton opts in so it matches the
+            // populated table's shape at every width.
+            table { class: "data-table data-table--cards", aria_hidden: "true",
                 thead {
                     tr {
                         th { scope: "col", "Name" }
@@ -353,11 +357,21 @@ fn FlowsTableSkeleton() -> Element {
                 tbody {
                     for i in 0..4 {
                         tr { key: "{i}",
-                            td { div { class: "skeleton skeleton-line wide" } }
-                            td { div { class: "skeleton skeleton-line" } }
-                            td { div { class: "skeleton skeleton-line narrow" } }
-                            td { div { class: "skeleton skeleton-line" } }
-                            td { div { class: "skeleton skeleton-line narrow" } }
+                            td { "data-label": "Name",
+                                div { class: "skeleton skeleton-line wide" }
+                            }
+                            td { "data-label": "Trigger",
+                                div { class: "skeleton skeleton-line" }
+                            }
+                            td { "data-label": "Status",
+                                div { class: "skeleton skeleton-line narrow" }
+                            }
+                            td { "data-label": "Last run",
+                                div { class: "skeleton skeleton-line" }
+                            }
+                            td { class: "actions-col", "data-label": "Actions",
+                                div { class: "skeleton skeleton-line narrow" }
+                            }
                         }
                     }
                 }
@@ -369,7 +383,10 @@ fn FlowsTableSkeleton() -> Element {
 #[component]
 fn FlowsTable(props: FlowsTableProps) -> Element {
     rsx! {
-        table { class: "data-table",
+        // `data-table--cards` (PURA-246 R1) — on viewports ≤768px each row
+        // reflows into a stacked card so the Actions column is never pushed
+        // off-screen behind a horizontal scrollbar.
+        table { class: "data-table data-table--cards",
             "aria-label": "Flows",
             thead {
                 tr {
@@ -391,7 +408,7 @@ fn FlowsTable(props: FlowsTableProps) -> Element {
                         let on_toggle = props.on_toggle_enabled;
                         let on_delete = props.on_delete;
                         let trig = trigger_summary(&f.definition.trigger);
-                        let last = last_run_cell(f.last_run.as_ref());
+                        let last = last_run_meta(f.last_run.as_ref());
                         rsx! {
                             tr { key: "{id.0}",
                                 td { class: "client-cell",
@@ -404,23 +421,49 @@ fn FlowsTable(props: FlowsTableProps) -> Element {
                                         span { class: "client-uid", "{d}" }
                                     }
                                 }
-                                td { "{trig}" }
-                                td {
+                                td { "data-label": "Trigger", "{trig}" }
+                                td { "data-label": "Status",
                                     span { class: enabled_badge_class(enabled),
                                         "{enabled_label(enabled)}"
                                     }
                                 }
-                                td { "{last}" }
-                                // PURA-248 L1 — the brief sketched a
-                                // `[Fire] [Edit] [⋯]` row with Enable/Disable
-                                // and Delete folded into an overflow menu.
-                                // Divergence rationale: at four actions in a
-                                // dedicated actions column they stay scannable
-                                // in one glance; an overflow menu would add a
-                                // click plus a focus-trap surface for no real
-                                // density win. Revisit if the row grows past
-                                // ~5 actions or the column tightens on mobile.
-                                td { class: "actions-col",
+                                // PURA-246 R2 — the list is the first scan
+                                // surface, so the last-run status carries
+                                // colour here (a `bot-badge` pill + glyph),
+                                // not just a plain word. A failed last run no
+                                // longer looks identical to an ok one.
+                                td { "data-label": "Last run",
+                                    {match last {
+                                        Some((status, caption)) => rsx! {
+                                            span { class: "last-run-cell",
+                                                span { class: run_status_badge_class(status),
+                                                    span { class: "flow-icon", aria_hidden: "true",
+                                                        "{run_status_icon(status)}"
+                                                    }
+                                                    "{run_status_label(status)}"
+                                                }
+                                                span { class: "muted last-run-when", "{caption}" }
+                                            }
+                                        },
+                                        None => rsx! {
+                                            span { class: "muted", "Never run" }
+                                        },
+                                    }}
+                                }
+                                // PURA-248 L1 / PURA-246 R4 — the brief
+                                // sketched a `[Fire] [Edit] [⋯]` row with
+                                // Enable/Disable and Delete folded into an
+                                // overflow menu. Divergence rationale: at four
+                                // actions in a dedicated actions column they
+                                // stay scannable in one glance; an overflow
+                                // menu would add a click plus a focus-trap
+                                // surface for no real density win. The mobile
+                                // crowding the menu would have solved is
+                                // instead handled by the `data-table--cards`
+                                // reflow (R1), which stacks the four buttons
+                                // full-width. Revisit only if the row grows
+                                // past ~5 actions.
+                                td { class: "actions-col", "data-label": "Actions",
                                     Button {
                                         variant: ButtonVariant::Primary,
                                         size: ButtonSize::Small,

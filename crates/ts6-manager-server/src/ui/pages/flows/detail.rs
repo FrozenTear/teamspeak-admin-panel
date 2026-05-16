@@ -502,7 +502,10 @@ fn RunsPanel(props: RunsPanelProps) -> Element {
                     p { "Hit ", strong { "Fire" }, " to make the engine run this flow on demand." }
                 }
             } else {
-                table { class: "data-table",
+                // `data-table--cards` (PURA-246 R1) — the six-column runs
+                // table reflows into stacked cards on viewports ≤768px so the
+                // Details action is never pushed off-screen.
+                table { class: "data-table data-table--cards",
                     "aria-label": "Flow runs",
                     thead {
                         tr {
@@ -537,9 +540,9 @@ fn RunsPanel(props: RunsPanelProps) -> Element {
                                 let action_count = r.action_results.len();
                                 rsx! {
                                     tr { key: "{run_id}",
-                                        td { "{when}" }
-                                        td { "{trig_kind}" }
-                                        td {
+                                        td { "data-label": "When", "{when}" }
+                                        td { "data-label": "Trigger", "{trig_kind}" }
+                                        td { "data-label": "Status",
                                             span { class: run_status_badge_class(r.summary.status),
                                                 title: hint.unwrap_or(""),
                                                 span { class: "flow-icon", aria_hidden: "true",
@@ -548,9 +551,9 @@ fn RunsPanel(props: RunsPanelProps) -> Element {
                                                 "{run_status_label(r.summary.status)}"
                                             }
                                         }
-                                        td { "{dur}" }
-                                        td { class: "muted", "{err}" }
-                                        td { class: "actions-col",
+                                        td { "data-label": "Duration", "{dur}" }
+                                        td { class: "muted", "data-label": "Error", "{err}" }
+                                        td { class: "actions-col", "data-label": "Details",
                                             Button {
                                                 variant: ButtonVariant::Ghost,
                                                 size: ButtonSize::Small,
@@ -567,8 +570,11 @@ fn RunsPanel(props: RunsPanelProps) -> Element {
                 }
             }
             div { class: "actions",
+                // PURA-246 R3 — Secondary (bordered) so Refresh reads as a
+                // button atom, not unstyled text, consistent with the other
+                // controls on the flow surfaces.
                 Button {
-                    variant: ButtonVariant::Ghost,
+                    variant: ButtonVariant::Secondary,
                     size: ButtonSize::Small,
                     onclick: move |_| on_refresh.call(()),
                     loading,

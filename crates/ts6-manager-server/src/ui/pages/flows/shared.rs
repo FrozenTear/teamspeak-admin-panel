@@ -292,23 +292,23 @@ pub fn is_run_in_flight_conflict(err: &ApiError) -> bool {
     )
 }
 
-/// Render a "Last run" cell from a [`wire::FlowRunSummary`]. Empty when
-/// no runs have happened yet.
-pub fn last_run_cell(last: Option<&wire::FlowRunSummary>) -> String {
-    let Some(s) = last else { return "—".into() };
+/// "Last run" cell content for the flow list — `None` when the flow has
+/// never run, otherwise its run status plus a compact caption
+/// ("5m ago" / "5m ago · 123 ms").
+///
+/// PURA-246 R2 — the list is the operator's first scan surface, so the
+/// run status must carry colour here too, not only on the Runs tab. The
+/// caller renders the status as a `bot-badge` pill (see
+/// [`run_status_badge_class`]); this returns only the time/duration
+/// caption so the status word is no longer collapsed into a plain string.
+pub fn last_run_meta(last: Option<&wire::FlowRunSummary>) -> Option<(wire::FlowRunStatus, String)> {
+    let s = last?;
     let when = relative_when(s.started_at);
-    let status_word = match s.status {
-        wire::FlowRunStatus::Ok => "ok",
-        wire::FlowRunStatus::Errored => "errored",
-        wire::FlowRunStatus::InFlight => "running",
-        wire::FlowRunStatus::Interrupted => "interrupted",
-        wire::FlowRunStatus::SkippedDisabled => "skipped",
+    let caption = match s.duration_ms {
+        Some(d) => format!("{when} · {d} ms"),
+        None => when,
     };
-    if let Some(d) = s.duration_ms {
-        format!("{when} — {status_word} ({d} ms)")
-    } else {
-        format!("{when} — {status_word}")
-    }
+    Some((s.status, caption))
 }
 
 /// Compact relative time ("5m ago", "2h ago", "just now"). Falls back to
@@ -395,8 +395,22 @@ mod tests {
     }
 
     #[test]
-    fn last_run_cell_em_dash_when_never_run() {
-        assert_eq!(last_run_cell(None), "—");
+    fn last_run_meta_none_when_never_run() {
+        assert!(last_run_meta(None).is_none());
+    }
+
+    #[test]
+    fn last_run_meta_carries_status_and_duration() {
+        let summary = wire::FlowRunSummary {
+            id: wire::FlowRunId(1),
+            status: wire::FlowRunStatus::Errored,
+            started_at: Utc::now(),
+            finished_at: None,
+            duration_ms: Some(123),
+        };
+        let (status, caption) = last_run_meta(Some(&summary)).expect("populated");
+        assert_eq!(status, wire::FlowRunStatus::Errored);
+        assert!(caption.contains("123 ms"), "got: {caption}");
     }
 
     #[test]

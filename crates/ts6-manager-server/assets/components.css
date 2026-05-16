@@ -17,6 +17,10 @@
               color var(--motion-fast) var(--ease-standard);
   user-select: none;
   white-space: nowrap;
+  /* PURA-246 R3 — `.btn` is also applied to `Link` (anchor) elements; an
+     anchor keeps the default underline otherwise, so a button-styled link
+     reads as a text-link. `.btn-link` re-enables underline explicitly. */
+  text-decoration: none;
 }
 
 .btn-sm { min-height: 28px; padding: var(--space-2) var(--space-4); font-size: var(--text-sm); }
@@ -1319,4 +1323,93 @@
   display: flex;
   gap: var(--space-4);
   align-items: baseline;
+}
+
+/* ─── Flow list "Last run" cell (PURA-246 R2) ────────────
+   The list is the operator's first scan surface, so the last-run
+   status carries a colourised `bot-badge` pill rather than a plain
+   word — a failed run no longer reads the same as an ok one. The
+   relative-time caption sits beside it, de-emphasised. */
+.last-run-cell {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+.last-run-cell .last-run-when {
+  font-size: var(--text-xs);
+  white-space: nowrap;
+}
+
+/* ─── Responsive table → cards (PURA-246 R1) ─────────────
+   Opt-in via `.data-table--cards`. A wide table (the flows list,
+   the per-flow Runs table) overflows horizontally on a phone and
+   pushes the Actions column off-screen behind a scrollbar. This
+   modifier reflows each row into a stacked card with inline
+   `data-label` captions so every cell stays reachable without a
+   horizontal scroll. Only the flows tables opt in; every other
+   `.data-table` page keeps the classic grid unchanged. */
+@media (max-width: 768px) {
+  .data-table--cards {
+    border: 0;
+    background: transparent;
+    border-radius: 0;
+    overflow: visible;
+  }
+  /* The header row is redundant once each cell carries its own
+     `data-label`; hide it visually (kept in the DOM — no markup
+     change) using the `.sr-only` technique. */
+  .data-table--cards thead {
+    position: absolute;
+    width: 1px; height: 1px;
+    padding: 0; margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+  .data-table--cards,
+  .data-table--cards tbody,
+  .data-table--cards tr,
+  .data-table--cards td {
+    display: block;
+    width: 100%;
+  }
+  .data-table--cards tbody tr {
+    background: var(--bg-surface-raised);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    padding: var(--space-2) 0;
+  }
+  .data-table--cards tbody tr + tr { margin-top: var(--space-4); }
+  .data-table--cards td {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: var(--space-5);
+    padding: var(--space-3) var(--space-5);
+    border-bottom: 1px solid var(--border-subtle);
+    text-align: right;
+  }
+  .data-table--cards tr td:last-child { border-bottom: 0; }
+  .data-table--cards td::before {
+    content: attr(data-label);
+    flex: 0 0 auto;
+    text-align: left;
+    font: var(--weight-semibold) var(--text-sm) / var(--lh-sm) var(--font-sans);
+    color: var(--text-secondary);
+  }
+  /* The Name cell is the card title — full-width, left-aligned, no
+     inline label. It keeps its own vertical name/description stack. */
+  .data-table--cards td.client-cell { text-align: left; }
+  .data-table--cards td.client-cell::before { content: none; }
+  /* Actions stack full-width below their label so the buttons are
+     never pushed off-screen (the R1 failure mode). */
+  .data-table--cards td.actions-col {
+    flex-direction: column;
+    align-items: stretch;
+    text-align: left;
+  }
+  .data-table--cards td.actions-col::before { margin-bottom: var(--space-2); }
+  .data-table--cards td.actions-col .btn { width: 100%; }
 }
