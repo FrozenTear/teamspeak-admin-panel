@@ -40,6 +40,7 @@ use crate::repos::moderation_cases::{self, ModerationCase};
 use crate::repos::{server_connections, user_permissions};
 use crate::webquery::BanAddParams;
 
+use super::tokens;
 use super::{
     action_to_wire, conflict, err, internal, not_found, translate_control_error, validation,
 };
@@ -122,11 +123,40 @@ pub(super) async fn append(
         None
     };
 
+    // PURA-306 — every punitive action mints a case-scoped, single-use
+    // appeal token so the subject retains a way to contest it. For
+    // kick / ban / ban_ip the appeal URL is embedded in the reason text
+    // TS6 delivers to the subject, so a disconnected or banned client
+    // keeps the link locally (brief §2). `mute` has no reason channel —
+    // its token is handed out from the operator panel instead. `note` /
+    // `unmute` are not punitive and mint nothing.
+    //
+    // Minting precedes `dispatch` because the URL must be in the reason
+    // string before it is sent. A later `dispatch` failure aborts the
+    // request, orphaning the token — harmless: it is case-bound,
+    // single-use, and swept by `moderation_tokens::delete_expired`.
+    let dispatched_reason: String = if matches!(kind, "kick" | "ban" | "ban_ip" | "mute") {
+        let minted = tokens::mint_appeal(&state.db, case.id).await.map_err(|e| {
+            tracing::error!(err = %e, case_id = case.id, "appeal token mint failed");
+            internal()
+        })?;
+        match kind {
+            "kick" | "ban" | "ban_ip" => {
+                tokens::reason_with_appeal_url(&state.db, reason, &minted.plaintext).await
+            }
+            // `mute` dispatches via the talker flag, which carries no
+            // reason — the minted token is operator-distributed.
+            _ => reason.to_string(),
+        }
+    } else {
+        reason.to_string()
+    };
+
     let ts_ref = dispatch(
         &state,
         &case,
         kind,
-        reason,
+        &dispatched_reason,
         req.clid,
         ip,
         req.ban_duration_secs,
