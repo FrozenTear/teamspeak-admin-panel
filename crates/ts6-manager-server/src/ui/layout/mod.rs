@@ -78,12 +78,6 @@ pub fn AppShell() -> Element {
     let route: Route = use_route();
 
     let is_authed = matches!(*session.state.read(), AuthState::Authenticated { .. });
-    // PURA-237 — gate the admin nav entries on the JWT-claimed role. Purely
-    // visual: `/admin/*` routes + `/api/users` re-check the DB-current role.
-    let is_admin = matches!(
-        &*session.state.read(),
-        AuthState::Authenticated { user, .. } if user.role.eq_ignore_ascii_case("admin")
-    );
     use_effect(move || {
         if !is_authed {
             nav.replace(Route::LoginPage {
