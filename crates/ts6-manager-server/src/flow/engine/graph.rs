@@ -33,7 +33,7 @@ use serde_json::{Map, Value, json};
 use tokio::sync::{Semaphore, mpsc};
 use ts6_manager_shared::flows::v2::{
     BranchCase, Edge, EdgeId, FlowGraph, JoinPolicy, Node, NodeId, NodeKind, NodeResult,
-    NodeStatus, TransformOutput, decode_flow_data,
+    NodeStatus, TransformOutput, ValidationError, ValidationWarning, decode_flow_data,
 };
 use ts6_manager_shared::flows::{Action, FlowId, FlowRunId, FlowRunStatus};
 
@@ -103,26 +103,63 @@ pub async fn run_graph(graph: FlowGraph, trigger_doc: Value, deps: GraphDeps) ->
 }
 
 /// Structural validation (`architecture.md` §3.1). Runs defensively before
-/// every execution; a future routes child reuses it for `POST /api/flows`
-/// and `POST /api/flows/validate`. Sub-flow-reference acyclicity (§3.1.6)
-/// needs the full flow set and stays a write-time check — the engine backs
-/// it with a runtime depth cap ([`MAX_DEPTH`]).
+/// every execution; the HTTP routes layer reuses it for `POST /api/flows`
+/// and `POST /api/flows/validate`. Returns the *first* failure as a flat
+/// string — the engine's pre-run gate. For the structured `errors[]` /
+/// `warnings[]` array the canvas renders inline, see [`validate_graph`].
+///
+/// Sub-flow-reference acyclicity (§3.1.6) needs the full flow set and stays
+/// a write-time check — the engine backs it with a runtime depth cap
+/// ([`MAX_DEPTH`]).
 pub fn validate(graph: &FlowGraph) -> Result<(), String> {
-    if graph.nodes.is_empty() {
-        return Err("graph has no nodes".to_string());
+    match validate_graph(graph).errors.into_iter().next() {
+        Some(e) => Err(e.message),
+        None => Ok(()),
     }
+}
+
+/// The structured structural validation report (`http-api.md` §3.1) — every
+/// failure, not just the first, plus non-blocking advisories.
+pub struct StructuralReport {
+    pub errors: Vec<ValidationError>,
+    pub warnings: Vec<ValidationWarning>,
+}
+
+/// Structured structural validation — collects *all* failures with their
+/// stable `code`s so the canvas can render them inline. The check set is
+/// identical to [`validate`]'s; this variant categorises and accumulates
+/// rather than short-circuiting. Expression / duration parsing is a
+/// separate write-time pass ([`validate_expressions`]) so the engine's
+/// pre-run gate stays purely structural.
+pub fn validate_graph(graph: &FlowGraph) -> StructuralReport {
+    let mut errors: Vec<ValidationError> = Vec::new();
+    let mut warnings: Vec<ValidationWarning> = Vec::new();
+
+    // Size caps (`architecture.md` §3.1).
     if graph.nodes.len() > 64 {
-        return Err(format!("graph has {} nodes (cap 64)", graph.nodes.len()));
+        errors.push(ValidationError::new(
+            "size_exceeded",
+            format!("graph has {} nodes (cap 64)", graph.nodes.len()),
+        ));
     }
     if graph.edges.len() > 128 {
-        return Err(format!("graph has {} edges (cap 128)", graph.edges.len()));
+        errors.push(ValidationError::new(
+            "size_exceeded",
+            format!("graph has {} edges (cap 128)", graph.edges.len()),
+        ));
     }
 
     // Unique node ids.
-    let mut seen = HashSet::new();
+    let mut seen: HashSet<&NodeId> = HashSet::new();
     for node in &graph.nodes {
         if !seen.insert(&node.id) {
-            return Err(format!("duplicate node id `{}`", node.id.0));
+            errors.push(
+                ValidationError::new(
+                    "duplicate_node",
+                    format!("duplicate node id `{}`", node.id.0),
+                )
+                .at_node(&node.id),
+            );
         }
     }
     let by_id: HashMap<&NodeId, &Node> = graph.nodes.iter().map(|n| (&n.id, n)).collect();
@@ -133,50 +170,101 @@ pub fn validate(graph: &FlowGraph) -> Result<(), String> {
         .iter()
         .filter(|n| matches!(n.kind, NodeKind::Trigger { .. }))
         .collect();
-    if triggers.len() != 1 {
-        return Err(format!(
-            "graph must have exactly one trigger node, found {}",
-            triggers.len()
-        ));
+    match triggers.len() {
+        1 => {}
+        0 => errors.push(ValidationError::new(
+            "no_trigger",
+            "graph must have exactly one trigger node, found 0",
+        )),
+        n => errors.push(
+            ValidationError::new(
+                "multiple_triggers",
+                format!("graph must have exactly one trigger node, found {n}"),
+            )
+            .with_nodes(triggers.iter().map(|t| t.id.0.clone()).collect()),
+        ),
     }
-    let trigger_id = &triggers[0].id;
+    let trigger_id: Option<&NodeId> = (triggers.len() == 1).then(|| &triggers[0].id);
 
     // Ports exist and directions match; the trigger has no inbound edge.
     for edge in &graph.edges {
-        let from = by_id
-            .get(&edge.from.node)
-            .ok_or_else(|| format!("edge `{}` from unknown node", edge.id.0))?;
-        let to = by_id
-            .get(&edge.to.node)
-            .ok_or_else(|| format!("edge `{}` to unknown node", edge.id.0))?;
+        let from = by_id.get(&edge.from.node);
+        let to = by_id.get(&edge.to.node);
+        if from.is_none() {
+            errors.push(
+                ValidationError::new(
+                    "unknown_port",
+                    format!(
+                        "edge `{}` from unknown node `{}`",
+                        edge.id.0, edge.from.node.0
+                    ),
+                )
+                .at_edge(&edge.id),
+            );
+        }
+        if to.is_none() {
+            errors.push(
+                ValidationError::new(
+                    "unknown_port",
+                    format!("edge `{}` to unknown node `{}`", edge.id.0, edge.to.node.0),
+                )
+                .at_edge(&edge.id),
+            );
+        }
+        let (Some(from), Some(to)) = (from, to) else {
+            continue;
+        };
         if !output_ports(&from.kind)
             .iter()
             .any(|p| p == &edge.from.port)
         {
-            return Err(format!(
-                "edge `{}`: `{}` is not an output port of node `{}`",
-                edge.id.0, edge.from.port, from.id.0
-            ));
+            errors.push(
+                ValidationError::new(
+                    "unknown_port",
+                    format!(
+                        "edge `{}`: `{}` is not an output port of node `{}`",
+                        edge.id.0, edge.from.port, from.id.0
+                    ),
+                )
+                .at_edge(&edge.id),
+            );
         }
         if !is_input_port(&to.kind, &edge.to.port) {
-            return Err(format!(
-                "edge `{}`: `{}` is not an input port of node `{}`",
-                edge.id.0, edge.to.port, to.id.0
-            ));
+            errors.push(
+                ValidationError::new(
+                    "unknown_port",
+                    format!(
+                        "edge `{}`: `{}` is not an input port of node `{}`",
+                        edge.id.0, edge.to.port, to.id.0
+                    ),
+                )
+                .at_edge(&edge.id),
+            );
         }
-        if &edge.to.node == trigger_id {
-            return Err("the trigger node cannot have an inbound edge".to_string());
+        if Some(&edge.to.node) == trigger_id {
+            errors.push(
+                ValidationError::new(
+                    "unknown_port",
+                    "the trigger node cannot have an inbound edge",
+                )
+                .at_edge(&edge.id),
+            );
         }
     }
 
     // Every non-trigger node has its `in` port connected.
     for node in &graph.nodes {
-        if &node.id == trigger_id {
+        if Some(&node.id) == trigger_id {
             continue;
         }
-        let connected = graph.edges.iter().any(|e| e.to.node == node.id);
-        if !connected {
-            return Err(format!("node `{}` has no inbound edge", node.id.0));
+        if !graph.edges.iter().any(|e| e.to.node == node.id) {
+            errors.push(
+                ValidationError::new(
+                    "port_unconnected",
+                    format!("node `{}` has no inbound edge", node.id.0),
+                )
+                .at_node(&node.id),
+            );
         }
     }
 
@@ -203,29 +291,219 @@ pub fn validate(graph: &FlowGraph) -> Result<(), String> {
         }
     }
     if processed != graph.nodes.len() {
-        return Err("graph contains a cycle".to_string());
+        let path = find_cycle_path(graph);
+        let message = if path.is_empty() {
+            "graph contains a cycle".to_string()
+        } else {
+            format!("graph contains a cycle: {}", path.join(" → "))
+        };
+        // Drop the trailing repeat of the entry node for the `nodes` set.
+        let mut nodes = path;
+        if nodes.len() > 1 && nodes.first() == nodes.last() {
+            nodes.pop();
+        }
+        errors.push(ValidationError::new("graph_cycle", message).with_nodes(nodes));
     }
 
     // Every non-trigger node is reachable from the trigger.
-    let mut reachable: HashSet<&NodeId> = HashSet::new();
-    let mut frontier = vec![trigger_id];
-    while let Some(id) = frontier.pop() {
-        if !reachable.insert(id) {
-            continue;
+    if let Some(trigger_id) = trigger_id {
+        let mut reachable: HashSet<&NodeId> = HashSet::new();
+        let mut frontier = vec![trigger_id];
+        while let Some(id) = frontier.pop() {
+            if !reachable.insert(id) {
+                continue;
+            }
+            for edge in graph.edges.iter().filter(|e| &e.from.node == id) {
+                frontier.push(&edge.to.node);
+            }
         }
-        for edge in graph.edges.iter().filter(|e| &e.from.node == id) {
-            frontier.push(&edge.to.node);
+        for node in &graph.nodes {
+            if !reachable.contains(&node.id) {
+                errors.push(
+                    ValidationError::new(
+                        "unreachable_node",
+                        format!("node `{}` is unreachable from the trigger", node.id.0),
+                    )
+                    .at_node(&node.id),
+                );
+            }
         }
     }
+
+    // Advisory — a named `branch` case port with no outgoing edge is a dead
+    // route. The implicit `default` port is deliberately not flagged: an
+    // unwired `default` is the idiomatic "drop on no match".
     for node in &graph.nodes {
-        if !reachable.contains(&node.id) {
-            return Err(format!(
-                "node `{}` is unreachable from the trigger",
-                node.id.0
-            ));
+        if let NodeKind::Branch { cases } = &node.kind {
+            for case in cases {
+                let wired = graph
+                    .edges
+                    .iter()
+                    .any(|e| e.from.node == node.id && e.from.port == case.label);
+                if !wired {
+                    warnings.push(ValidationWarning::at_node(
+                        "unconnected_case",
+                        format!(
+                            "branch node `{}` case `{}` has no outgoing edge",
+                            node.id.0, case.label
+                        ),
+                        &node.id,
+                    ));
+                }
+            }
         }
     }
-    Ok(())
+
+    StructuralReport { errors, warnings }
+}
+
+/// Write-time expression / duration validation (`http-api.md` §3.1 —
+/// `bad_expression`, `bad_duration`). Kept apart from [`validate_graph`] so
+/// the engine's pre-run [`validate`] gate stays purely structural and never
+/// rejects a graph the v1.1 engine would have run.
+pub fn validate_expressions(graph: &FlowGraph) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+    // Returns the error rather than pushing it, so it captures nothing
+    // mutably — the arms below also push to `errors` directly, and a
+    // closure holding a live `&mut errors` would conflict with that.
+    let bad_expr = |node: &NodeId, label: &str, src: &str| -> Option<ValidationError> {
+        expr::parse_check(src).err().map(|e| {
+            ValidationError::new("bad_expression", format!("node `{}` {label}: {e}", node.0))
+                .at_node(node)
+        })
+    };
+    for node in &graph.nodes {
+        match &node.kind {
+            NodeKind::Branch { cases } => {
+                for case in cases {
+                    errors.extend(bad_expr(
+                        &node.id,
+                        &format!("case `{}` `when`", case.label),
+                        &case.when,
+                    ));
+                }
+            }
+            NodeKind::Transform { output } => match output {
+                TransformOutput::Expr(e) => {
+                    errors.extend(bad_expr(&node.id, "transform expression", e))
+                }
+                TransformOutput::Object(map) => {
+                    for (field, e) in map {
+                        errors.extend(bad_expr(&node.id, &format!("transform field `{field}`"), e));
+                    }
+                }
+            },
+            NodeKind::Parallel { collection, .. } => {
+                errors.extend(bad_expr(&node.id, "parallel collection", collection));
+            }
+            NodeKind::Delay { r#for } => match parse_duration(r#for) {
+                Err(m) => errors.push(
+                    ValidationError::new("bad_duration", format!("node `{}`: {m}", node.id.0))
+                        .at_node(&node.id),
+                ),
+                Ok(d) if d > DELAY_CAP => errors.push(
+                    ValidationError::new(
+                        "bad_duration",
+                        format!(
+                            "node `{}`: delay `{}` exceeds the 15-minute cap",
+                            node.id.0, r#for
+                        ),
+                    )
+                    .at_node(&node.id),
+                ),
+                Ok(_) => {}
+            },
+            NodeKind::Action { config } => {
+                for tmpl in action_templates(config) {
+                    if let Err(e) = expr::template_check(&tmpl) {
+                        errors.push(
+                            ValidationError::new(
+                                "bad_expression",
+                                format!("node `{}` action template: {e}", node.id.0),
+                            )
+                            .at_node(&node.id),
+                        );
+                    }
+                }
+            }
+            NodeKind::Trigger { .. } | NodeKind::Subflow { .. } => {}
+        }
+    }
+    errors
+}
+
+/// Every `{{ … }}`-templated string field of an [`Action`] — the surfaces
+/// [`render_action`] interpolates at run time.
+fn action_templates(action: &Action) -> Vec<String> {
+    match action {
+        Action::LogLine { message } => vec![message.clone()],
+        Action::Ts6Command { args, .. } | Action::MusicBotCommand { args, .. } => args
+            .values()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        Action::WebhookOut { url, headers } => {
+            let mut t = vec![url.clone()];
+            t.extend(headers.iter().flat_map(|(k, v)| [k.clone(), v.clone()]));
+            t
+        }
+    }
+}
+
+/// Depth-first search for one cycle, returned as the node-id path with the
+/// entry node repeated at the end (`a → b → a`). Empty when acyclic.
+fn find_cycle_path(graph: &FlowGraph) -> Vec<String> {
+    let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+    for n in &graph.nodes {
+        adj.entry(n.id.0.clone()).or_default();
+    }
+    for e in &graph.edges {
+        adj.entry(e.from.node.0.clone())
+            .or_default()
+            .push(e.to.node.0.clone());
+    }
+    // 1 = on the current DFS stack, 2 = fully explored.
+    let mut color: HashMap<String, u8> = HashMap::new();
+    let mut path: Vec<String> = Vec::new();
+    for n in &graph.nodes {
+        if dfs_cycle(&n.id.0, &adj, &mut color, &mut path) {
+            return path;
+        }
+    }
+    Vec::new()
+}
+
+fn dfs_cycle(
+    node: &str,
+    adj: &HashMap<String, Vec<String>>,
+    color: &mut HashMap<String, u8>,
+    path: &mut Vec<String>,
+) -> bool {
+    if color.get(node).copied().unwrap_or(0) != 0 {
+        return false;
+    }
+    color.insert(node.to_string(), 1);
+    path.push(node.to_string());
+    for next in adj.get(node).map(Vec::as_slice).unwrap_or(&[]) {
+        match color.get(next).copied().unwrap_or(0) {
+            1 => {
+                // Back-edge — trim `path` to start at the cycle entry.
+                if let Some(pos) = path.iter().position(|p| p == next) {
+                    path.drain(..pos);
+                }
+                path.push(next.clone());
+                return true;
+            }
+            2 => {}
+            _ => {
+                if dfs_cycle(next, adj, color, path) {
+                    return true;
+                }
+            }
+        }
+    }
+    path.pop();
+    color.insert(node.to_string(), 2);
+    false
 }
 
 // ---------------------------------------------------------------------------

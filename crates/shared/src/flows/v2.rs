@@ -27,7 +27,7 @@ use std::fmt;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::{Action, FlowDefinition, FlowId, Trigger};
+use super::{Action, ActionResult, FlowDefinition, FlowId, FlowRunId, FlowRunStatus, Trigger};
 
 /// The persistence envelope version this module writes and the highest it
 /// reads. A `flowData` blob with no `version` key is a legacy v1.1 flow.
@@ -399,6 +399,306 @@ pub fn project_legacy(definition: &FlowDefinition) -> FlowGraph {
     }
 
     FlowGraph { nodes, edges }
+}
+
+// ---------------------------------------------------------------------------
+// HTTP API surface — request / response shapes (http-api.md §2-§3)
+// ---------------------------------------------------------------------------
+
+/// The `flowData`-envelope version a flow row represents on the wire — `1`
+/// for a legacy linear flow, `2` for a graph flow (`http-api.md` §2.2). The
+/// API now always *stores* v2 envelopes; a `1` is only ever a row written
+/// by the pre-v2 engine, upgraded by an explicit `POST /convert`.
+pub type FlowVersion = u8;
+
+/// The mutually-exclusive create / update body shape (`http-api.md` §2.2).
+/// A v2 client sends `{ "graph": … }`; a v1.1-era client (or a script) may
+/// still send `{ "definition": … }` — a one-release back-compat courtesy,
+/// projected to a graph on write. The two are surfaced on the wire as two
+/// optional, mutually-exclusive keys ([`CreateFlowBody`] / [`UpdateFlowBody`])
+/// and resolved into this enum server-side.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum FlowSpec {
+    /// v2 — the canonical graph shape.
+    Graph { graph: FlowGraph },
+    /// v1.1 — a legacy linear definition, projected via [`project_legacy`].
+    Legacy { definition: FlowDefinition },
+}
+
+/// Resolve a `graph` / `definition` optional pair into a [`FlowSpec`].
+/// `graph` wins if (wrongly) both are present is *not* allowed — the doc's
+/// "mutually-exclusive" rule is enforced as an error.
+fn resolve_spec(
+    graph: &Option<FlowGraph>,
+    definition: &Option<FlowDefinition>,
+) -> Result<FlowSpec, &'static str> {
+    match (graph, definition) {
+        (Some(_), Some(_)) => Err("send either `graph` or `definition`, not both"),
+        (Some(g), None) => Ok(FlowSpec::Graph { graph: g.clone() }),
+        (None, Some(d)) => Ok(FlowSpec::Legacy {
+            definition: d.clone(),
+        }),
+        (None, None) => Err("a flow needs a `graph` (v2) or a `definition` (v1.1)"),
+    }
+}
+
+/// `POST /api/flows` body (`http-api.md` §2.2). Keeps every v1.1 field; the
+/// definition is the untagged `graph` / `definition` pair — exactly one is
+/// required. Resolve it with [`CreateFlowBody::spec`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateFlowBody {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    pub server_config_id: i64,
+    pub virtual_server_id: i64,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph: Option<FlowGraph>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition: Option<FlowDefinition>,
+}
+
+impl CreateFlowBody {
+    /// Resolve the create body to its [`FlowSpec`] — `Err` if neither or
+    /// both of `graph` / `definition` were sent.
+    pub fn spec(&self) -> Result<FlowSpec, &'static str> {
+        resolve_spec(&self.graph, &self.definition)
+    }
+}
+
+/// `PATCH /api/flows/{id}` body (`http-api.md` §2.2 / §4). Every field is
+/// optional, including the graph swap (a present `graph` *or* `definition`).
+/// Use [`UpdateFlowBody::spec`] to resolve the swap.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateFlowBody {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::double_option"
+    )]
+    pub description: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub virtual_server_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph: Option<FlowGraph>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition: Option<FlowDefinition>,
+}
+
+impl UpdateFlowBody {
+    /// Resolve the optional graph swap. `Ok(None)` — no spec change;
+    /// `Ok(Some(spec))` — replace the definition; `Err` — both shapes sent.
+    pub fn spec(&self) -> Result<Option<FlowSpec>, &'static str> {
+        match (&self.graph, &self.definition) {
+            (None, None) => Ok(None),
+            (g, d) => resolve_spec(g, d).map(Some),
+        }
+    }
+}
+
+/// One flow as the v2 API returns it (`http-api.md` §2.2): every v1.1
+/// [`super::Flow`] field, an explicit [`FlowVersion`], and the stored spec
+/// shape — `graph` for a v2 flow, `definition` for a legacy one (exactly
+/// one is ever present). PURA-267's canvas consumes this verbatim.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FlowView {
+    pub id: FlowId,
+    pub name: String,
+    pub description: Option<String>,
+    pub server_config_id: i64,
+    pub virtual_server_id: i64,
+    pub enabled: bool,
+    pub flow_version: FlowVersion,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph: Option<FlowGraph>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition: Option<FlowDefinition>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub last_run: Option<FlowRunSummaryView>,
+}
+
+impl FlowView {
+    /// Read the flow's spec back as a [`FlowSpec`] regardless of which key
+    /// carried it.
+    pub fn spec(&self) -> Result<FlowSpec, &'static str> {
+        resolve_spec(&self.graph, &self.definition)
+    }
+}
+
+/// Compact run row — the v1.1 summary plus a [`FlowVersion`] badge
+/// (`http-api.md` §4).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FlowRunSummaryView {
+    pub id: FlowRunId,
+    pub status: FlowRunStatus,
+    pub flow_version: FlowVersion,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub duration_ms: Option<u64>,
+}
+
+/// One run as `GET /api/flows/{id}/runs/{runId}` returns it (`http-api.md`
+/// §3.2): the summary flattened in, plus the trigger document, the v1.1
+/// `actionResults`, and the v2 `nodeResults` array — the canvas run-overlay
+/// source. The list endpoint reuses this type but emits `nodeResults: []`
+/// to stay light; the detail endpoint populates it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FlowRunView {
+    #[serde(flatten)]
+    pub summary: FlowRunSummaryView,
+    pub flow_id: FlowId,
+    pub trigger: serde_json::Value,
+    pub error: Option<String>,
+    pub action_results: Vec<ActionResult>,
+    pub node_results: Vec<NodeResult>,
+}
+
+/// `GET /api/flows` response.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListFlowsView {
+    pub flows: Vec<FlowView>,
+}
+
+/// `GET /api/flows/{id}/runs` response. `nextCursor` is `None` on the last
+/// page.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListRunsView {
+    pub runs: Vec<FlowRunView>,
+    pub next_cursor: Option<FlowRunId>,
+}
+
+/// One structural validation failure (`http-api.md` §3.1). `code` is the
+/// stable discriminant the canvas branches on; the locator fields
+/// (`nodes` / `node` / `edge`) are populated as the `code` warrants and
+/// otherwise omitted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidationError {
+    /// `graph_cycle`, `unreachable_node`, `unknown_port`,
+    /// `port_unconnected`, `multiple_triggers`, `no_trigger`,
+    /// `subflow_cycle`, `subflow_missing`, `size_exceeded`,
+    /// `bad_expression`, `bad_duration`, …
+    pub code: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nodes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge: Option<String>,
+}
+
+impl ValidationError {
+    /// A bare `code` + `message` failure with no locator.
+    pub fn new(code: &str, message: impl Into<String>) -> Self {
+        Self {
+            code: code.to_string(),
+            message: message.into(),
+            nodes: Vec::new(),
+            node: None,
+            edge: None,
+        }
+    }
+
+    /// Builder — attach the offending node id.
+    pub fn at_node(mut self, node: &NodeId) -> Self {
+        self.node = Some(node.0.clone());
+        self
+    }
+
+    /// Builder — attach the offending edge id.
+    pub fn at_edge(mut self, edge: &EdgeId) -> Self {
+        self.edge = Some(edge.0.clone());
+        self
+    }
+
+    /// Builder — attach a node-set (a cycle path).
+    pub fn with_nodes(mut self, nodes: Vec<String>) -> Self {
+        self.nodes = nodes;
+        self
+    }
+}
+
+/// One non-blocking validation advisory (`http-api.md` §3.1). Shares the
+/// shape of [`ValidationError`]; warnings (e.g. type-hint mismatches, a
+/// dead branch case) do not block a save.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidationWarning {
+    pub code: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nodes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge: Option<String>,
+}
+
+impl ValidationWarning {
+    /// A `code` + `message` advisory pinned to a node.
+    pub fn at_node(code: &str, message: impl Into<String>, node: &NodeId) -> Self {
+        Self {
+            code: code.to_string(),
+            message: message.into(),
+            nodes: Vec::new(),
+            node: Some(node.0.clone()),
+            edge: None,
+        }
+    }
+}
+
+/// `POST /api/flows/validate` request body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidateGraphRequest {
+    pub graph: FlowGraph,
+}
+
+/// `POST /api/flows/validate` response (`http-api.md` §3.1). `valid` is
+/// `errors.is_empty()`; warnings never flip it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidateGraphResponse {
+    pub valid: bool,
+    pub errors: Vec<ValidationError>,
+    pub warnings: Vec<ValidationWarning>,
+}
+
+/// The `400` body a graph-validation failure returns on `POST` / `PATCH`
+/// (`http-api.md` §4). Unlike the bare `ErrorBody`, it carries the full
+/// `errors` array so the canvas can render every failure inline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphInvalidBody {
+    /// Always the discriminant `"graph_invalid"`.
+    pub error: String,
+    pub errors: Vec<ValidationError>,
+}
+
+impl GraphInvalidBody {
+    /// Wrap a non-empty `errors` array in the `graph_invalid` envelope.
+    pub fn new(errors: Vec<ValidationError>) -> Self {
+        Self {
+            error: "graph_invalid".to_string(),
+            errors,
+        }
+    }
 }
 
 #[cfg(test)]

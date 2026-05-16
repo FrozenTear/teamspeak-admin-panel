@@ -80,6 +80,30 @@ impl Blackboard {
 // Public entry points
 // ---------------------------------------------------------------------------
 
+/// Parse-check a bare expression without evaluating it. Used by the HTTP
+/// validation surface (`POST /api/flows/validate`) to flag a syntactically
+/// broken `branch` / `transform` / `parallel` expression as `bad_expression`
+/// at write time — a runtime missing-key error is *not* a parse error and
+/// is deliberately not surfaced here.
+pub fn parse_check(expr: &str) -> Result<(), ExprError> {
+    parse(expr).map(|_| ())
+}
+
+/// Parse-check a `{{ … }}` template — every `{{ expr }}` segment must parse.
+/// Mirrors [`interpolate`] but evaluates nothing.
+pub fn template_check(template: &str) -> Result<(), ExprError> {
+    let mut rest = template;
+    while let Some(start) = rest.find("{{") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else {
+            return err("unterminated `{{ … }}` in template");
+        };
+        parse(after[..end].trim())?;
+        rest = &after[end + 2..];
+    }
+    Ok(())
+}
+
 /// Evaluate a bare expression against the blackboard.
 pub fn eval(expr: &str, bb: &Blackboard) -> Result<Value, ExprError> {
     let ast = parse(expr)?;
