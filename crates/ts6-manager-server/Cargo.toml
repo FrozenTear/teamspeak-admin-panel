@@ -37,6 +37,7 @@ server = [
     "dep:bcrypt",
     "dep:governor",
     "dep:hex",
+    "dep:ipnet",
     "dep:jsonwebtoken",
     "dep:rand",
     "dep:scrypt",
@@ -101,6 +102,7 @@ async-trait = { workspace = true, optional = true }
 bcrypt = { workspace = true, optional = true }
 governor = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
+ipnet = { workspace = true, optional = true }
 jsonwebtoken = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 scrypt = { workspace = true, optional = true }

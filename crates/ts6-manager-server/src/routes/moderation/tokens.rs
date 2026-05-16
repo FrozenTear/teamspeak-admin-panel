@@ -253,11 +253,61 @@ pub async fn verify_and_consume(
         return Err(VerifyError::Invalid);
     };
 
-    match consumed.kind.as_str() {
+    classify(&consumed)
+}
+
+/// Verify a wire token **without consuming it** — a read-only check.
+///
+/// The public redacted-case view (`9.2-public-routes`, PURA-307) is opened
+/// with the same `appeal` token the appeal submission later spends, and a
+/// subject may reload that view several times before submitting. So the
+/// view path verifies non-destructively here; the token is burned exactly
+/// once, at submission, via [`verify_and_consume`].
+///
+/// Performs the same parse → indexed fetch → constant-time secret compare
+/// as [`verify_and_consume`], then checks freshness (`usedAt` unset,
+/// `expiresAt` in the future) as a plain read. Every failure — malformed,
+/// unknown, wrong secret, expired, already used — collapses to
+/// [`VerifyError::Invalid`] so the caller is not an enumeration oracle
+/// (spec §4).
+pub async fn verify(db: &Database, wire_token: &str) -> Result<VerifiedToken, VerifyError> {
+    let (lookup_id, secret) = match wire_token.split_once('.') {
+        Some((l, s)) if !l.is_empty() && !s.is_empty() => (l, s),
+        _ => return Err(VerifyError::Invalid),
+    };
+
+    let Some(row) = moderation_tokens::find_by_lookup_id(db, lookup_id).await? else {
+        return Err(VerifyError::Invalid);
+    };
+
+    let supplied_hash = sha256_hex(secret);
+    if supplied_hash
+        .as_bytes()
+        .ct_eq(row.secretHash.as_bytes())
+        .unwrap_u8()
+        != 1
+    {
+        return Err(VerifyError::Invalid);
+    }
+
+    // Freshness, read-only. A consumed-but-unexpired token is `Invalid`
+    // here exactly as it would be to `verify_and_consume`'s atomic check.
+    if row.usedAt.is_some() || row.expiresAt <= Utc::now() {
+        return Err(VerifyError::Invalid);
+    }
+
+    classify(&row)
+}
+
+/// Resolve a verified token row to what it authorises. Shared by the
+/// consuming and non-consuming verify paths; a missing binding field or
+/// unknown `kind` is a row-integrity bug and collapses to `Invalid`.
+fn classify(row: &ModerationToken) -> Result<VerifiedToken, VerifyError> {
+    match row.kind.as_str() {
         KIND_REPORT_CHALLENGE => {
-            let uid = consumed.boundUid.ok_or_else(|| {
+            let uid = row.boundUid.clone().ok_or_else(|| {
                 tracing::error!(
-                    token_id = consumed.id,
+                    token_id = row.id,
                     "report_challenge token row is missing boundUid"
                 );
                 VerifyError::Invalid
@@ -265,14 +315,18 @@ pub async fn verify_and_consume(
             Ok(VerifiedToken::ReportChallenge { uid })
         }
         KIND_APPEAL => {
-            let case_id = consumed.caseId.ok_or_else(|| {
-                tracing::error!(token_id = consumed.id, "appeal token row is missing caseId");
+            let case_id = row.caseId.ok_or_else(|| {
+                tracing::error!(token_id = row.id, "appeal token row is missing caseId");
                 VerifyError::Invalid
             })?;
             Ok(VerifiedToken::Appeal { case_id })
         }
         other => {
-            tracing::error!(token_id = consumed.id, kind = other, "unknown moderation_token kind");
+            tracing::error!(
+                token_id = row.id,
+                kind = other,
+                "unknown moderation_token kind"
+            );
             Err(VerifyError::Invalid)
         }
     }
@@ -385,8 +439,8 @@ pub async fn deliver_report_challenge(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::DateTime;
     use crate::db::{connect_in_memory, migrations};
+    use chrono::DateTime;
     use std::sync::Arc;
 
     async fn setup() -> Arc<Database> {
@@ -452,7 +506,10 @@ mod tests {
             .await
             .unwrap()
             .expect("row exists");
-        assert_ne!(row.secretHash, secret, "stored value must not be the secret");
+        assert_ne!(
+            row.secretHash, secret,
+            "stored value must not be the secret"
+        );
         assert_eq!(
             row.secretHash,
             sha256_hex(secret),
@@ -573,6 +630,67 @@ mod tests {
         assert_eq!(
             verify_and_consume(&db, &appeal.plaintext).await.unwrap(),
             VerifiedToken::Appeal { case_id: 555 }
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_does_not_consume_the_token() {
+        // Non-consuming verify — the redacted-case view may run it many
+        // times, and the token must still be spendable afterwards.
+        let db = setup().await;
+        let minted = mint_appeal(&db, 321).await.unwrap();
+
+        for _ in 0..3 {
+            assert_eq!(
+                verify(&db, &minted.plaintext).await.unwrap(),
+                VerifiedToken::Appeal { case_id: 321 },
+            );
+        }
+        // Still spendable: the consuming path wins exactly once.
+        assert_eq!(
+            verify_and_consume(&db, &minted.plaintext).await.unwrap(),
+            VerifiedToken::Appeal { case_id: 321 },
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_rejects_used_expired_and_wrong_secret() {
+        let db = setup().await;
+
+        // Consumed token — `verify` agrees it is no longer valid.
+        let used = mint_report_challenge(&db, "uid-d").await.unwrap();
+        verify_and_consume(&db, &used.plaintext).await.unwrap();
+        assert!(matches!(
+            verify(&db, &used.plaintext).await,
+            Err(VerifyError::Invalid)
+        ));
+
+        // Expired token.
+        let expired = insert_raw(
+            &db,
+            KIND_APPEAL,
+            "secret-xyz",
+            None,
+            Some(5),
+            Utc::now() - Duration::seconds(1),
+        )
+        .await;
+        assert!(matches!(
+            verify(&db, &expired).await,
+            Err(VerifyError::Invalid)
+        ));
+
+        // Wrong secret on a live token — and the token is left unconsumed.
+        let live = mint_appeal(&db, 654).await.unwrap();
+        let (lookup, _) = live.plaintext.split_once('.').unwrap();
+        assert!(matches!(
+            verify(&db, &format!("{lookup}.deadbeef")).await,
+            Err(VerifyError::Invalid)
+        ));
+        assert_eq!(
+            verify(&db, &live.plaintext).await.unwrap(),
+            VerifiedToken::Appeal { case_id: 654 },
+            "a wrong-secret verify must not burn the token",
         );
     }
 

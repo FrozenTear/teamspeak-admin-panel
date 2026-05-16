@@ -29,6 +29,7 @@ async fn migrations_apply_priority_slice_on_fresh_db() {
             "0013_moderation_unban_action_kind".to_string(),
             "0014_moderation_appeals".to_string(),
             "0015_moderation_token".to_string(),
+            "0016_moderation_appeal_filed_action_kind".to_string(),
         ],
         "first run should apply every migration"
     );

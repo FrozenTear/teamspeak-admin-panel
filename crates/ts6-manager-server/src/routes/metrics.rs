@@ -54,8 +54,35 @@ pub fn router() -> Router<AppState> {
 
 async fn metrics(_admin: RequireAdmin, State(state): State<AppState>) -> Response {
     let snapshot = state.ws_hub.metrics().snapshot();
-    let body = render(&snapshot);
+    let mut body = render(&snapshot);
+    // PURA-307 — append the public moderation surface's submission
+    // counters. Kept as a separate render block because it is the one
+    // labelled metric family in the exposition (the WS hub counters are
+    // label-free by design).
+    body.push_str(&render_public_submissions());
     (StatusCode::OK, [(header::CONTENT_TYPE, CONTENT_TYPE)], body).into_response()
+}
+
+/// Render `moderation_public_submissions_total{kind,outcome}` — the Phase
+/// 9.2 public report/appeal abuse-telemetry counter (PURA-307, brief
+/// §4.8). The label values are a fixed cross-product
+/// ([`crate::routes::public_moderation::metrics`]); none is operator- or
+/// user-supplied, so no PII can reach a label here.
+fn render_public_submissions() -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(512);
+    let _ = writeln!(
+        out,
+        "# HELP moderation_public_submissions_total Public moderation submissions since process start, by flow and outcome."
+    );
+    let _ = writeln!(out, "# TYPE moderation_public_submissions_total counter");
+    for (kind, outcome, count) in crate::routes::public_moderation::metrics::snapshot() {
+        let _ = writeln!(
+            out,
+            "moderation_public_submissions_total{{kind=\"{kind}\",outcome=\"{outcome}\"}} {count}"
+        );
+    }
+    out
 }
 
 /// Render a [`MetricsSnapshot`] as Prometheus text format.

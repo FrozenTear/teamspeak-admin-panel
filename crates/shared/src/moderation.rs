@@ -225,6 +225,108 @@ pub struct AutomodRuleMetrics {
     pub circuit_breaker_trips: i64,
 }
 
+// ---------------------------------------------------------------------
+// Phase 9.2 — public report / appeal surface (`/api/public/moderation/*`,
+// PURA-307). These shapes back the *unauthenticated* routes: a reporter or
+// an appealing subject is not an operator and has no account, so the
+// request bodies carry an opaque single-use token instead of a JWT.
+// ---------------------------------------------------------------------
+
+/// `POST /api/public/moderation/request-report-link` request body.
+///
+/// A connected client asks the server to mint a `report_challenge_token`
+/// and deliver it — over the TS6 control channel — to the client that
+/// holds `uid`. The token is delivered to whoever actually controls the
+/// UID, never to the HTTP caller, so a caller cannot harvest a token for
+/// a UID they do not control (brief §2 / token spec hook 3).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestReportLinkRequest {
+    pub server_config_id: i64,
+    pub virtual_server_id: i64,
+    /// The TS6 `client_unique_identifier` to challenge. The poke is
+    /// re-resolved to a live connection at delivery time.
+    pub uid: String,
+}
+
+/// `POST /api/public/moderation/reports` request body. Requires a valid
+/// `report_challenge_token`; the reporter UID is taken from the token, not
+/// from the body. `evidence_url` is the optional URL field — no file
+/// uploads on the 9.2 public surface (brief §4.5).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicReportRequest {
+    /// The `report_challenge_token` wire string (`lookup.secret`).
+    pub token: String,
+    pub server_config_id: i64,
+    pub virtual_server_id: i64,
+    /// Who is being reported — a UID when known, else a free-text nickname.
+    pub subject_uid_or_nickname: String,
+    /// Report category — `spam` / `harassment` / `other` by convention.
+    pub category: String,
+    pub statement: String,
+    #[serde(default)]
+    pub evidence_url: Option<String>,
+}
+
+/// `POST /api/public/moderation/appeals` request body. Requires a valid
+/// case-scoped `appeal_token`; the case and subject are taken from the
+/// token, not from the body.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicAppealRequest {
+    /// The `appeal_token` wire string (`lookup.secret`).
+    pub token: String,
+    pub statement: String,
+}
+
+/// Response to an accepted public submission (`POST .../reports`,
+/// `POST .../appeals`). `id` is the `moderation_report` / `moderation_appeal`
+/// row id; `status` is its initial state (`pending`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicSubmissionAccepted {
+    pub id: i64,
+    pub status: String,
+}
+
+/// One redacted timeline row in a [`RedactedCase`]. Carries only what the
+/// appealing subject is allowed to see — the action kind, the reason text
+/// shown to them at enforcement time, and when it happened. The operator,
+/// the `payload`, and the TS6 ban-id linkage are all omitted (brief §6
+/// hook 4).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedactedCaseAction {
+    pub action_kind: String,
+    pub reason: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// `GET /api/public/moderation/case?token=…` body — the **redacted** view
+/// of the case an `appeal_token` is scoped to.
+///
+/// Information-disclosure contract (brief §6 hook 4): this shape MUST omit
+/// moderator notes, other subjects' UIDs, the internal `originRef`, the
+/// acting operator, and the server-scope ids. It carries only the action
+/// taken and the public reason — the minimum a subject needs to decide
+/// whether and how to appeal.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedactedCase {
+    pub case_id: i64,
+    /// Case state — `actioned` (appealable) or `appealed` (an appeal is
+    /// already on file).
+    pub status: String,
+    /// The public reason recorded on the case.
+    pub reason: String,
+    pub opened_at: DateTime<Utc>,
+    /// Whether this case can still be appealed — `true` only while
+    /// `status = actioned` and no appeal is pending.
+    pub appealable: bool,
+    pub timeline: Vec<RedactedCaseAction>,
+}
+
 /// Error envelope for the moderation surface. Matches the per-surface
 /// `ErrorBody` shape used by the control and music-bot routes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

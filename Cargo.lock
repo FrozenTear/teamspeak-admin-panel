@@ -9154,6 +9154,7 @@ dependencies = [
  "governor",
  "hex",
  "http-body-util",
+ "ipnet",
  "js-sys",
  "jsonwebtoken 9.3.1",
  "music-bot",
