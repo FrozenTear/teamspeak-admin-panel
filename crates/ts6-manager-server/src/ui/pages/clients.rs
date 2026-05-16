@@ -22,9 +22,7 @@ use std::sync::Arc;
 
 use dioxus::prelude::*;
 use serde_json::Value;
-use ts6_manager_shared::control::{
-    ClientListItem, KickKind, KickRequest, MoveRequest, MuteRequest,
-};
+use ts6_manager_shared::control::{ClientListItem, KickKind, KickRequest, MoveRequest};
 
 use crate::client::api::{self, ApiError};
 use crate::client::dioxus::{use_auth_gate, use_session};

@@ -754,14 +754,18 @@ mod tests {
     #[test]
     fn resolve_clid_matches_uid_and_skips_query_clients() {
         use crate::webquery::models::ClientEntry;
-        let mut voice = ClientEntry::default();
-        voice.clid = 10;
-        voice.client_type = 0;
-        voice.client_unique_identifier = "uid-target".into();
-        let mut query = ClientEntry::default();
-        query.clid = 11;
-        query.client_type = 1; // ServerQuery — never a poke target.
-        query.client_unique_identifier = "uid-target".into();
+        let voice = ClientEntry {
+            clid: 10,
+            client_type: 0,
+            client_unique_identifier: "uid-target".into(),
+            ..Default::default()
+        };
+        let query = ClientEntry {
+            clid: 11,
+            client_type: 1, // ServerQuery — never a poke target.
+            client_unique_identifier: "uid-target".into(),
+            ..Default::default()
+        };
 
         let clients = vec![query, voice];
         assert_eq!(resolve_clid(&clients, "uid-target"), Some(10));

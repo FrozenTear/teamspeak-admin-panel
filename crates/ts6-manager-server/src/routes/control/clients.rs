@@ -33,7 +33,7 @@ use crate::control::{ControlBackend, ControlBackendError};
 use crate::repos::server_connections::ServerConnection;
 use crate::ws::topic::{Topic, TopicKind};
 
-use super::{access, audit, bad_request, translate_control_error};
+use super::{access, audit, translate_control_error};
 
 /// Spec §7.8 — read flag set the FE always wants for the active list.
 /// `-ip` is admin-only and is appended in [`list`] when the caller is admin.
