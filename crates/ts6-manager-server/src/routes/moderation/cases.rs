@@ -18,6 +18,7 @@ use crate::app_state::AppState;
 use crate::audit::{self, AuditKind, Event, Outcome, Target};
 use crate::auth::extractors::{RequestMeta, RequirePermission};
 use crate::auth::permissions::{CaseManage, CaseView};
+use crate::repos::moderation_appeals;
 use crate::repos::moderation_case_actions::{self, NewModerationCaseAction};
 use crate::repos::moderation_cases::{self, CaseFilter, NewModerationCase, ORIGINS};
 
@@ -50,7 +51,7 @@ pub(super) async fn list(
         && !moderation_cases::STATUSES.contains(&s.as_str())
     {
         return Err(validation(
-            "status must be one of open / actioned / resolved",
+            "status must be one of open / actioned / resolved / appealed",
         ));
     }
     if let Some(ref o) = q.origin
@@ -102,9 +103,19 @@ pub(super) async fn detail(
             tracing::error!(err = %e, case_id = id, "moderation case timeline failed");
             internal()
         })?;
+    // Phase 9.2 — appeals lodged against this case (newest-first). Empty
+    // for the common case; the operator decision panel reads it when the
+    // case is in `appealed` status.
+    let appeals = moderation_appeals::list_for_case(&state.db, id)
+        .await
+        .map_err(|e| {
+            tracing::error!(err = %e, case_id = id, "moderation case appeals failed");
+            internal()
+        })?;
     Ok(Json(wire::CaseDetail {
         case: case_to_wire(case),
         timeline: timeline.into_iter().map(super::action_to_wire).collect(),
+        appeals: appeals.into_iter().map(super::appeal_to_wire).collect(),
     }))
 }
 

@@ -68,13 +68,92 @@ pub struct ModerationNote {
     pub updated_at: DateTime<Utc>,
 }
 
-/// `GET /api/moderation/cases/{id}` body — the case plus its full
-/// chronological action timeline.
+/// A report-intake row — Phase 9.2 (PURA-308). Mirrors the
+/// `moderation_report` table (design brief / PURA-269 §5). A reporter
+/// files one; an operator triages it (promote → case, or dismiss).
+///
+/// `sourceIpHash` is deliberately **not** on the wire DTO — it is an
+/// abuse-correlation field with no operator-UI purpose (plan §6 hook 6).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModerationReport {
+    pub id: i64,
+    pub server_config_id: i64,
+    pub virtual_server_id: i64,
+    pub reporter_uid: String,
+    /// The accused — a UID when known, otherwise a free-text nickname.
+    pub subject_uid_or_nickname: String,
+    pub category: String,
+    pub statement: String,
+    pub evidence_url: Option<String>,
+    /// `pending` / `promoted` / `dismissed`.
+    pub status: String,
+    /// Set once the report is promoted to a case.
+    pub case_id: Option<i64>,
+    pub triaged_by_user_id: Option<i64>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// An appeal lodged against a case — Phase 9.2 (PURA-308). Mirrors the
+/// `moderation_appeal` table (PURA-269 §5). `sourceIpHash` is omitted
+/// from the wire DTO for the same reason as [`ModerationReport`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModerationAppeal {
+    pub id: i64,
+    pub case_id: i64,
+    pub submitter_uid: String,
+    pub identity_proof: String,
+    pub statement: String,
+    /// `pending` / `upheld` / `overturned` / `withdrawn`.
+    pub status: String,
+    pub decided_by_user_id: Option<i64>,
+    pub decision_note: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub decided_at: Option<DateTime<Utc>>,
+}
+
+/// `GET /api/moderation/cases/{id}` body — the case, its full
+/// chronological action timeline, and any appeals lodged against it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CaseDetail {
     pub case: ModerationCase,
     pub timeline: Vec<ModerationCaseAction>,
+    /// Appeals against this case, newest-first. Empty for the common
+    /// case; populated once a subject lodges an appeal (Phase 9.2).
+    #[serde(default)]
+    pub appeals: Vec<ModerationAppeal>,
+}
+
+/// `POST /api/moderation/reports/{id}/promote` request body. Promotes a
+/// pending report to a `moderation_case` (`origin='report'`). `reason`
+/// becomes the case's opening reason.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromoteReportRequest {
+    pub reason: String,
+}
+
+/// `POST /api/moderation/reports/{id}/dismiss` request body. The optional
+/// note is recorded on the audit row only — a dismissal closes the
+/// report without opening a case.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DismissReportRequest {
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// `POST /api/moderation/cases/{id}/appeal/{uphold,overturn}` request
+/// body. The optional operator note is stored on the appeal and echoed
+/// onto the `appeal_decided` timeline row.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DecideAppealRequest {
+    #[serde(default)]
+    pub decision_note: Option<String>,
 }
 
 /// `POST /api/moderation/cases` request body. `origin` defaults to
