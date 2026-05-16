@@ -1,4 +1,44 @@
+---
+status: resolved
+---
+
 # Chapter 1 deviation — V6 (flow trigger) cut from v1.0
+
+## Resolution (2026-05-16)
+
+**Status: `resolved`.** V6 is back on the Chapter 1 verification matrix and gated.
+
+The flow engine deferred below was designed, implemented, and gated for v1.1:
+
+- **Design:** [PURA-198](/PURA/issues/PURA-198) — flow-engine design brief
+  (`docs/flows/architecture.md`, `http-api.md`, `ui-brief.md`,
+  [`v1.1-gate.md`](../flows/v1.1-gate.md)).
+- **Implementation:** engine + HTTP routes ([PURA-241](/PURA/issues/PURA-241),
+  [PURA-242](/PURA/issues/PURA-242)), flows UI ([PURA-243](/PURA/issues/PURA-243)),
+  trigger dispatcher ([PURA-249](/PURA/issues/PURA-249)). Surface:
+  `crates/ts6-manager-server/src/flow/{engine,routes,trigger}.rs`,
+  `crates/ts6-manager-server/src/ui/pages/flows/`, `crates/shared/src/flows.rs`.
+- **Gate probe:** `scripts/ws-gate/v6-probe.sh` ([PURA-244](/PURA/issues/PURA-244))
+  — the four-step create → enable → fire → observe probe from
+  [`v1.1-gate.md`](../flows/v1.1-gate.md) §2. It ran **green** against a
+  rootless-Podman deploy of the v1.1-gate image; evidence under
+  `qa-evidence/ws-gate/v6/<ISO8601-UTC>/`.
+- **Matrix:** the V6 row is restored to the Chapter 1 verification matrix in
+  [`docs/phase6/readiness-audit.md`](../phase6/readiness-audit.md) §1, marked `pass`.
+
+Per [`v1.1-gate.md`](../flows/v1.1-gate.md) §1, a green v6-probe is the only
+condition for this reclassification, and it is met. The v1.1 release tag/notes
+are tracked separately under [PURA-255](/PURA/issues/PURA-255) (merge the v1.1
+flow stack to `main`); this note gets the release-tag link once v1.1 ships.
+
+This note is **retained** for historical traceability — same policy class as the
+D6 and D8 deviations — so future readers can see how the v1.0 wedge call was made
+and unwound. It is **not deleted**, per [`v1.1-gate.md`](../flows/v1.1-gate.md) §4
+and `docs/flows/architecture.md` §11.4.
+
+The original v1.0 deviation record follows unchanged.
+
+---
 
 - **Date:** 2026-05-14.
 - **Decision authority:** Board (CEO ratified on [PURA-195](/PURA/issues/PURA-195) [comment-2cd44510](/PURA/issues/PURA-195#comment-2cd44510-0146-4321-bfbb-2c0f4449dc98)).
