@@ -243,6 +243,7 @@ async fn note_action_appends_timeline_and_actions_the_case() {
         action_kind: "note".into(),
         reason: "left a warning in chat".into(),
         clid: None,
+        ip: None,
         ban_duration_secs: None,
     };
     let resp = app
@@ -287,6 +288,7 @@ async fn action_requires_clid_for_kick() {
         action_kind: "kick".into(),
         reason: "flooding".into(),
         clid: None,
+        ip: None,
         ban_duration_secs: None,
     };
     let resp = app
@@ -332,6 +334,7 @@ async fn action_denied_without_the_catalog_permission() {
         action_kind: "note".into(),
         reason: "x".into(),
         clid: None,
+        ip: None,
         ban_duration_secs: None,
     };
     let resp = app
@@ -343,6 +346,89 @@ async fn action_denied_without_the_catalog_permission() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn ban_ip_denied_for_moderator_without_explicit_grant() {
+    let state = fresh_state().await;
+    // A `moderator` holds the role default set — the whole catalog *except*
+    // `moderation.action.ban_ip`. So a `ban_ip` action is forbidden until
+    // the address gate is granted per-user (PURA-290).
+    let mid = seed_user(&state, "mod", "moderator").await;
+    let token = mint(&state, mid, "mod", "moderator");
+    let app = app(state);
+
+    let resp = app
+        .clone()
+        .oneshot(post("/api/moderation/cases", &token, &open_case_req()))
+        .await
+        .unwrap();
+    let case: wire::ModerationCase = read_json(resp).await;
+
+    let ban_ip = wire::AppendActionRequest {
+        action_kind: "ban_ip".into(),
+        reason: "open proxy".into(),
+        clid: None,
+        ip: Some("203.0.113.7".into()),
+        ban_duration_secs: None,
+    };
+    let resp = app
+        .oneshot(post(
+            &format!("/api/moderation/cases/{}/actions", case.id),
+            &token,
+            &ban_ip,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn ban_ip_with_grant_passes_the_gate_and_requires_an_ip() {
+    let state = fresh_state().await;
+    // Granting `moderation.action.ban_ip` lets the request past the
+    // permission gate — it then reaches `ip` validation. A 400 here (rather
+    // than the 403 the un-granted moderator gets above) proves the catalog
+    // permission now gates a real call path.
+    let mid = seed_user(&state, "mod", "moderator").await;
+    user_permissions::replace_all(
+        &state.db,
+        mid,
+        mid,
+        &[
+            "moderation.case.view".to_string(),
+            "moderation.case.manage".to_string(),
+            "moderation.action.ban_ip".to_string(),
+        ],
+    )
+    .await
+    .unwrap();
+    let token = mint(&state, mid, "mod", "moderator");
+    let app = app(state);
+
+    let resp = app
+        .clone()
+        .oneshot(post("/api/moderation/cases", &token, &open_case_req()))
+        .await
+        .unwrap();
+    let case: wire::ModerationCase = read_json(resp).await;
+
+    let ban_ip = wire::AppendActionRequest {
+        action_kind: "ban_ip".into(),
+        reason: "open proxy".into(),
+        clid: None,
+        ip: None,
+        ban_duration_secs: None,
+    };
+    let resp = app
+        .oneshot(post(
+            &format!("/api/moderation/cases/{}/actions", case.id),
+            &token,
+            &ban_ip,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

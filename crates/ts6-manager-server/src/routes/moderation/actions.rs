@@ -14,10 +14,13 @@
 //! that matches `actionKind` via [`permissions::has_permission`] — the
 //! same fail-closed predicate the extractor is built on.
 //!
-//! TS6 server-side bans are always **UID-keyed** (`banadd?uid=`,
-//! `9.0-spike` recommendation 6): a case keys on the durable subject UID,
-//! so the ban is too. `clid` in the request is used only by kick / mute /
-//! unmute, which act on a live connection.
+//! The `ban` kind is **UID-keyed** (`banadd?uid=`, `9.0-spike`
+//! recommendation 6): a case keys on the durable subject UID, so the ban
+//! is too. `ban_ip` is the deliberate exception — it keys on a raw `ip`
+//! supplied in the request and is gated by the separate
+//! `moderation.action.ban_ip` collateral-damage permission (PURA-290).
+//! `clid` in the request is used only by kick / mute / unmute, which act
+//! on a live connection.
 
 use axum::Json;
 use axum::extract::{Path, State};
@@ -29,7 +32,9 @@ use ts6_manager_shared::moderation as wire;
 use crate::app_state::AppState;
 use crate::audit::{self, AuditKind, Event, Outcome, Target};
 use crate::auth::extractors::{RequestMeta, RequireAuth};
-use crate::auth::permissions::{self, ActionBan, ActionKick, ActionMute, ModPermission, NoteWrite};
+use crate::auth::permissions::{
+    self, ActionBan, ActionBanIp, ActionKick, ActionMute, ModPermission, NoteWrite,
+};
 use crate::repos::moderation_case_actions::{self, NewModerationCaseAction};
 use crate::repos::moderation_cases::{self, ModerationCase};
 use crate::repos::{server_connections, user_permissions};
@@ -41,7 +46,7 @@ use super::{
 
 /// Action kinds this endpoint accepts. `resolve` / `reopen` are *not*
 /// here — those are driven by the dedicated lifecycle endpoints.
-const ACTION_KINDS: &[&str] = &["kick", "ban", "mute", "unmute", "note"];
+const ACTION_KINDS: &[&str] = &["kick", "ban", "ban_ip", "mute", "unmute", "note"];
 
 /// TS6 kick reason id for a server kick (`clientkick` `reasonid=5`).
 const SERVER_KICK_REASON_ID: i64 = 5;
@@ -60,15 +65,17 @@ pub(super) async fn append(
     }
     if !ACTION_KINDS.contains(&kind) {
         return Err(validation(
-            "actionKind must be one of kick / ban / mute / unmute / note",
+            "actionKind must be one of kick / ban / ban_ip / mute / unmute / note",
         ));
     }
 
     // Per-kind catalog permission. `note` is gated by note.write — a case
-    // note and a subject note are the same write capability.
+    // note and a subject note are the same write capability. `ban_ip` is
+    // gated by its own collateral-damage permission, distinct from `ban`.
     let wanted = match kind {
         "kick" => ActionKick::PERMISSION,
         "ban" => ActionBan::PERMISSION,
+        "ban_ip" => ActionBanIp::PERMISSION,
         "mute" | "unmute" => ActionMute::PERMISSION,
         "note" => NoteWrite::PERMISSION,
         _ => unreachable!("kind validated against ACTION_KINDS above"),
@@ -99,15 +106,34 @@ pub(super) async fn append(
     }
 
     // `kick` / `mute` / `unmute` act on a live connection; `ban` keys on
-    // the subject UID; `note` touches TS6 not at all.
+    // the subject UID; `ban_ip` keys on a request-supplied IP; `note`
+    // touches TS6 not at all.
     let needs_clid = matches!(kind, "kick" | "mute" | "unmute");
     if needs_clid && req.clid.is_none() {
         return Err(validation("clid is required for kick / mute / unmute"));
     }
+    let ip = if kind == "ban_ip" {
+        let ip = req.ip.as_deref().map(str::trim).unwrap_or_default();
+        if ip.is_empty() {
+            return Err(validation("ip is required for ban_ip"));
+        }
+        Some(ip)
+    } else {
+        None
+    };
 
-    let ts_ref = dispatch(&state, &case, kind, reason, req.clid, req.ban_duration_secs).await?;
+    let ts_ref = dispatch(
+        &state,
+        &case,
+        kind,
+        reason,
+        req.clid,
+        ip,
+        req.ban_duration_secs,
+    )
+    .await?;
 
-    let payload = action_payload(kind, req.clid, req.ban_duration_secs, ts_ref.as_deref());
+    let payload = action_payload(kind, req.clid, ip, req.ban_duration_secs, ts_ref.as_deref());
     let row = moderation_case_actions::insert(
         &state.db,
         NewModerationCaseAction {
@@ -129,7 +155,7 @@ pub(super) async fn append(
     // State machine: a punitive action moves an `open` case to
     // `actioned`. `unmute` (de-escalation) and `note` leave it untouched.
     if case.status == "open"
-        && matches!(kind, "kick" | "ban" | "mute")
+        && matches!(kind, "kick" | "ban" | "ban_ip" | "mute")
         && let Err(e) = moderation_cases::set_status(&state.db, case.id, "actioned", None).await
     {
         tracing::error!(err = %e, case_id = case.id, "moderation case actioned transition failed");
@@ -166,6 +192,7 @@ async fn dispatch(
     kind: &str,
     reason: &str,
     clid: Option<i64>,
+    ip: Option<&str>,
     ban_duration_secs: Option<i64>,
 ) -> Result<Option<String>, Response> {
     if kind == "note" {
@@ -228,6 +255,21 @@ async fn dispatch(
                 .map_err(translate_control_error)?;
             Ok(Some(banid.to_string()))
         }
+        "ban_ip" => {
+            let params = BanAddParams {
+                ip: Some(ip.expect("ip validated for ban_ip")),
+                uid: None,
+                mytsid: None,
+                name: None,
+                banreason: Some(reason),
+                time: ban_duration_secs,
+            };
+            let banid = backend
+                .banadd(sid, &params)
+                .await
+                .map_err(translate_control_error)?;
+            Ok(Some(banid.to_string()))
+        }
         _ => unreachable!("kind validated against ACTION_KINDS"),
     }
 }
@@ -236,6 +278,7 @@ async fn dispatch(
 fn action_payload(
     kind: &str,
     clid: Option<i64>,
+    ip: Option<&str>,
     ban_duration_secs: Option<i64>,
     ts_ref: Option<&str>,
 ) -> serde_json::Value {
@@ -244,6 +287,7 @@ fn action_payload(
         "mute" => json!({ "clid": clid, "inputMuted": true, "outputMuted": true }),
         "unmute" => json!({ "clid": clid, "inputMuted": false, "outputMuted": false }),
         "ban" => json!({ "banId": ts_ref, "durationSecs": ban_duration_secs }),
+        "ban_ip" => json!({ "banId": ts_ref, "ip": ip, "durationSecs": ban_duration_secs }),
         _ => json!({}),
     }
 }

@@ -38,7 +38,8 @@ pub struct ModerationCase {
 }
 
 /// One row of a case's append-only action timeline. `actionKind` is one of
-/// `kick` / `ban` / `mute` / `unmute` / `note` / `resolve` / `reopen`.
+/// `kick` / `ban` / `ban_ip` / `mute` / `unmute` / `note` / `resolve` /
+/// `reopen`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModerationCaseAction {
@@ -94,8 +95,9 @@ pub struct OpenCaseRequest {
 
 /// `POST /api/moderation/cases/{id}/actions` request body. `clid` is
 /// required for `kick` / `mute` / `unmute` (those act on a live client);
-/// `ban` acts on the case subject UID and ignores it. `reason` is always
-/// required — every timeline row carries one (plan §7).
+/// `ban` acts on the case subject UID and ignores it. `ban_ip` requires
+/// `ip` instead. `reason` is always required — every timeline row carries
+/// one (plan §7).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppendActionRequest {
@@ -103,6 +105,10 @@ pub struct AppendActionRequest {
     pub reason: String,
     #[serde(default)]
     pub clid: Option<i64>,
+    /// IP address to ban — required for `ban_ip`, ignored by every other
+    /// kind. A `ban_ip` action keys on the address, not the subject UID.
+    #[serde(default)]
+    pub ip: Option<String>,
     /// Ban duration in seconds. Absent / `0` requests a permanent ban.
     #[serde(default)]
     pub ban_duration_secs: Option<i64>,
@@ -243,11 +249,28 @@ mod tests {
             action_kind: "ban".into(),
             reason: "repeated spam".into(),
             clid: None,
+            ip: None,
             ban_duration_secs: Some(3600),
         };
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["actionKind"], "ban");
         assert_eq!(v["banDurationSecs"], 3600);
+        let back: AppendActionRequest = serde_json::from_value(v).unwrap();
+        assert_eq!(back, req);
+    }
+
+    #[test]
+    fn append_action_request_ban_ip_round_trips() {
+        let req = AppendActionRequest {
+            action_kind: "ban_ip".into(),
+            reason: "open proxy abuse".into(),
+            clid: None,
+            ip: Some("203.0.113.7".into()),
+            ban_duration_secs: None,
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["actionKind"], "ban_ip");
+        assert_eq!(v["ip"], "203.0.113.7");
         let back: AppendActionRequest = serde_json::from_value(v).unwrap();
         assert_eq!(back, req);
     }

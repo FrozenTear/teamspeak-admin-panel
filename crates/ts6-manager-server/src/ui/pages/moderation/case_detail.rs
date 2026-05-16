@@ -16,17 +16,16 @@
 //! ## IP ban
 //!
 //! The moderation action endpoint (`POST …/actions`) bans the case
-//! subject by **UID only** — that is the durable key a case is built on
-//! (`9.0-spike` recommendation 6). An IP ban is a different, blunter
-//! instrument: it is applied through the control ban route
-//! (`POST /api/servers/{id}/vs/{sid}/bans`) with a raw IP, and then a
-//! `note` action is appended to the case so the timeline still records
-//! that it happened. The composer surfaces it behind an explicit
-//! collateral-damage warning and gates it on `moderation.action.ban_ip`
+//! subject by **UID** for a `ban` kind — the durable key a case is built
+//! on (`9.0-spike` recommendation 6). An IP ban is a different, blunter
+//! instrument: it goes through the same endpoint as a `ban_ip` kind with
+//! a raw `ip` (PURA-290), which dispatches `banadd?ip=`, checks
+//! `moderation.action.ban_ip` server-side, and writes a real `ban_ip`
+//! timeline row. The composer surfaces it behind an explicit
+//! collateral-damage warning and gates it on the same permission
 //! (admin-only by role default).
 
 use dioxus::prelude::*;
-use ts6_manager_shared::control::{BanCreateRequest, BanCreated};
 use ts6_manager_shared::moderation::{
     AppendActionRequest, CaseDetail, ModerationCaseAction, ReopenCaseRequest, ResolveCaseRequest,
 };
@@ -45,7 +44,8 @@ use super::{
 };
 
 /// One selectable composer action: `(kind, label, catalog permission)`.
-/// `ban_ip` is in the list but routed specially — see the module docs.
+/// Every kind — including `ban_ip` — posts to the moderation action
+/// endpoint; see the module docs.
 const COMPOSER_ACTIONS: &[(&str, &str, &str)] = &[
     ("note", "Add note", "moderation.note.write"),
     ("kick", "Kick", "moderation.action.kick"),
@@ -285,8 +285,6 @@ fn ComposerPanel(props: ComposerProps) -> Element {
     let is_ip_ban = kind_now == "ban_ip";
 
     let case_id = props.case_id;
-    let server_config_id = props.server_config_id;
-    let sid = props.virtual_server_id;
     let mut reload = props.reload;
 
     let on_submit = {
@@ -335,11 +333,12 @@ fn ComposerPanel(props: ComposerProps) -> Element {
             let toaster = toaster;
             busy.set(true);
 
-            if kind_v == "ban_ip" {
-                // IP ban routes through the control ban surface, then
-                // backfills a `note` so the case timeline still records it.
-                let ip_v = ip.peek().trim().to_string();
-                if ip_v.is_empty() {
+            // `ban_ip` carries a raw IP instead of a clid — validate it up
+            // front so the composer gives immediate feedback. The endpoint
+            // re-checks it server-side (PURA-290).
+            let ip_v = if kind_v == "ban_ip" {
+                let v = ip.peek().trim().to_string();
+                if v.is_empty() {
                     toaster.push(
                         ToastVariant::Warning,
                         "An IP address is required",
@@ -348,84 +347,24 @@ fn ComposerPanel(props: ComposerProps) -> Element {
                     busy.set(false);
                     return;
                 }
-                spawn(async move {
-                    let ban_req = BanCreateRequest {
-                        ip: Some(ip_v.clone()),
-                        uid: None,
-                        my_ts_id: None,
-                        name: None,
-                        reason: Some(reason_v.clone()),
-                        duration: duration_v,
-                    };
-                    let ban_path = format!("/api/servers/{server_config_id}/vs/{sid}/bans");
-                    match api::authorized_post_json::<_, BanCreated>(
-                        &gate,
-                        &api::api_base(),
-                        &ban_path,
-                        Some(&ban_req),
-                    )
-                    .await
-                    {
-                        Ok(BanCreated { banid }) => {
-                            // Backfill the timeline. A failure here is
-                            // non-fatal — the ban already landed — so it
-                            // only warns rather than rolling back.
-                            let note = AppendActionRequest {
-                                action_kind: "note".into(),
-                                reason: format!(
-                                    "IP ban applied to {ip_v} (TeamSpeak ban #{banid}): {reason_v}"
-                                ),
-                                clid: None,
-                                ban_duration_secs: None,
-                            };
-                            let note_path =
-                                format!("/api/moderation/cases/{case_id}/actions");
-                            let backfilled = api::authorized_post_json::<_, ModerationCaseAction>(
-                                &gate,
-                                &api::api_base(),
-                                &note_path,
-                                Some(&note),
-                            )
-                            .await;
-                            busy.set(false);
-                            if backfilled.is_err() {
-                                toaster.push(
-                                    ToastVariant::Warning,
-                                    format!("IP ban #{banid} applied"),
-                                    Some("The ban landed but the case timeline note could not be written.".into()),
-                                );
-                            } else {
-                                toaster.push(
-                                    ToastVariant::Success,
-                                    format!("IP ban #{banid} applied"),
-                                    None,
-                                );
-                            }
-                            reason.set(String::new());
-                            ip.set(String::new());
-                            duration.set(String::new());
-                            reload.with_mut(|n| *n += 1);
-                        }
-                        Err(e) => {
-                            busy.set(false);
-                            toaster.push(
-                                ToastVariant::Danger,
-                                "Could not apply IP ban",
-                                Some(format_error(&e)),
-                            );
-                        }
-                    }
-                });
-                return;
-            }
+                Some(v)
+            } else {
+                None
+            };
 
-            // note / kick / mute / unmute / ban → the moderation action
-            // endpoint.
+            // Every kind — including `ban_ip` — posts to the moderation
+            // action endpoint, which dispatches to TS6 and writes the
+            // timeline row.
             let req = AppendActionRequest {
                 action_kind: kind_v.clone(),
                 reason: reason_v,
                 clid: clid_v,
-                ban_duration_secs: if kind_v == "ban" { duration_v } else { None },
+                ip: ip_v,
+                ban_duration_secs: if matches!(kind_v.as_str(), "ban" | "ban_ip") {
+                    duration_v
+                } else {
+                    None
+                },
             };
             spawn(async move {
                 let path = format!("/api/moderation/cases/{case_id}/actions");
@@ -442,6 +381,7 @@ fn ComposerPanel(props: ComposerProps) -> Element {
                         toaster.push(ToastVariant::Success, "Action recorded", None);
                         reason.set(String::new());
                         clid.set(String::new());
+                        ip.set(String::new());
                         duration.set(String::new());
                         reload.with_mut(|n| *n += 1);
                     }

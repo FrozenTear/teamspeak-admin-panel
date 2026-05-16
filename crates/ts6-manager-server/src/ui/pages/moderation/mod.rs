@@ -143,6 +143,7 @@ pub(crate) fn action_kind_icon(kind: &str) -> &'static str {
     match kind {
         "kick" => "⊗",
         "ban" => "⊘",
+        "ban_ip" => "⊘",
         "mute" => "🔇",
         "unmute" => "🔊",
         "note" => "✎",
@@ -157,6 +158,7 @@ pub(crate) fn action_kind_label(kind: &str) -> &'static str {
     match kind {
         "kick" => "Kicked",
         "ban" => "Banned",
+        "ban_ip" => "Banned (IP)",
         "mute" => "Muted",
         "unmute" => "Unmuted",
         "note" => "Note",
