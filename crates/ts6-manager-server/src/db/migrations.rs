@@ -57,6 +57,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0010_admin_audit_log",
         include_str!("../../migrations/0010_admin_audit_log.surql"),
     ),
+    (
+        "0011_moderation",
+        include_str!("../../migrations/0011_moderation.surql"),
+    ),
 ];
 
 #[derive(Debug, Deserialize, SurrealValue)]
