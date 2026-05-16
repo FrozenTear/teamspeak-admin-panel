@@ -450,6 +450,14 @@ mod tests {
         ) -> ControlResult<()> {
             unimplemented!("not used by dashboard fetch")
         }
+        async fn client_set_talker(
+            &self,
+            _sid: i64,
+            _clid: i64,
+            _can_talk: bool,
+        ) -> ControlResult<()> {
+            unimplemented!("not used by dashboard fetch")
+        }
         async fn client_set_muted(
             &self,
             _sid: i64,

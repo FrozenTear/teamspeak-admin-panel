@@ -299,6 +299,15 @@ impl ControlBackend for SshControlClient {
         Ok(())
     }
 
+    async fn client_set_talker(&self, sid: i64, clid: i64, can_talk: bool) -> ControlResult<()> {
+        // PURA-292: `client_is_talker` is the server-editable talker flag;
+        // unlike `CLIENT_INPUT_MUTED` it is honoured on a live TS6 host.
+        let v = if can_talk { 1 } else { 0 };
+        let line = format!("clientedit clid={clid} client_is_talker={v}");
+        self.run_scoped(sid, &line).await?;
+        Ok(())
+    }
+
     async fn client_set_muted(
         &self,
         sid: i64,

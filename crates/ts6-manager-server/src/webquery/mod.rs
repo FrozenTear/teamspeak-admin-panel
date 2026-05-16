@@ -9,7 +9,7 @@
 //!   `serverinfo`/`hostinfo`/`logview`,
 //!   `channelclientpermlist`.
 //! - **Write** — `clientkick`/`clientpoke`/`clientmove`/`clientedit` (used by
-//!   the mute helper), `banadd`/`bandel`/`bandelall`.
+//!   the talker-flag helper), `banadd`/`bandel`/`bandelall`.
 //!
 //! Cross-cutting:
 //!
@@ -643,8 +643,41 @@ impl WebQueryClient {
         Ok(())
     }
 
+    /// Talker-flag helper — the genuine TS6 6.0 server-side
+    /// voice-suppression primitive (PURA-292). `can_talk == false`
+    /// revokes talk permission ("mute"); `true` restores it ("unmute").
+    ///
+    /// `client_input_muted` / `client_output_muted` are **client-self**
+    /// state — TS6 6.0.0-beta rejects them on `clientedit` for any other
+    /// client with `1538 invalid parameter`, so [`Self::client_set_muted`]
+    /// cannot silence a third party on a live host. `client_is_talker`
+    /// *is* server-editable and is honoured in moderated channels
+    /// (`channel_needed_talk_power > 0`).
+    ///
+    /// TS6 accepts `client_is_talker=0` in any channel, but rejects `=1`
+    /// with `1538` when the target is not in a moderated channel — callers
+    /// that "unmute" must tolerate that code (the client can already speak
+    /// there). `&[(&str, &str)]` keeps this on the audited `clientedit`
+    /// path shared with [`Self::clientedit_raw`].
+    pub async fn client_set_talker(
+        &self,
+        sid: i64,
+        clid: i64,
+        can_talk: bool,
+    ) -> WebQueryResult<()> {
+        self.clientedit_raw(sid, clid, &[("client_is_talker", bool_to_int(can_talk))])
+            .await
+    }
+
     /// Mute helper — sets `CLIENT_INPUT_MUTED` and/or `CLIENT_OUTPUT_MUTED`
     /// on the client via `clientedit`. `None` leaves the field unchanged.
+    ///
+    /// **Caveat (PURA-292):** `CLIENT_INPUT_MUTED` / `CLIENT_OUTPUT_MUTED`
+    /// are client-self properties — live TS6 6.0.0-beta rejects them on
+    /// `clientedit` for a third party (`1538`). The control surface and
+    /// flow engine still call this; see the PURA-292 follow-up child
+    /// issue. For server-side moderation muting use
+    /// [`Self::client_set_talker`].
     pub async fn client_set_muted(
         &self,
         sid: i64,

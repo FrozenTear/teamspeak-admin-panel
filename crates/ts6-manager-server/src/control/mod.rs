@@ -326,9 +326,22 @@ pub trait ControlBackend: Send + Sync + std::fmt::Debug {
         cpw: Option<&str>,
     ) -> ControlResult<()>;
 
+    /// Sets the `client_is_talker` talker flag via `clientedit` — the
+    /// genuine TS6 6.0 server-side voice-suppression primitive (PURA-292).
+    /// `can_talk == false` mutes (revokes talk permission), `true`
+    /// unmutes. Honoured server-side in moderated channels. Unlike
+    /// [`Self::client_set_muted`] — whose `client_*_muted` properties are
+    /// client-self state a live TS6 host will not let you force on a
+    /// third party — this is the call moderation actions dispatch.
+    async fn client_set_talker(&self, sid: i64, clid: i64, can_talk: bool) -> ControlResult<()>;
+
     /// Convenience over `clientedit` — sets `CLIENT_INPUT_MUTED` /
     /// `CLIENT_OUTPUT_MUTED`. `None` leaves the field unchanged. A
     /// fully-`None` call is a no-op (no upstream round-trip).
+    ///
+    /// **PURA-292 caveat:** these are client-self properties; a live TS6
+    /// host rejects them for any other client. For server-side muting
+    /// use [`Self::client_set_talker`].
     async fn client_set_muted(
         &self,
         sid: i64,
@@ -488,6 +501,12 @@ impl ControlBackend for WebQueryClient {
         cpw: Option<&str>,
     ) -> ControlResult<()> {
         self.clientmove(sid, clid, cid, cpw)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn client_set_talker(&self, sid: i64, clid: i64, can_talk: bool) -> ControlResult<()> {
+        self.client_set_talker(sid, clid, can_talk)
             .await
             .map_err(Into::into)
     }

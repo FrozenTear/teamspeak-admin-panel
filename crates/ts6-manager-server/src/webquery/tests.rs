@@ -873,13 +873,18 @@ async fn handler_clientedit(
     if !key_matches(&headers, &state.expected_api_key) {
         return upstream_error(1283, "client_query_login_failed");
     }
-    *state.captured_query.lock().unwrap() = Some((
-        params.get("clid").cloned().unwrap_or_default(),
-        params
-            .get("CLIENT_INPUT_MUTED")
-            .cloned()
-            .unwrap_or_default(),
-    ));
+    // Capture the `clid` plus a deterministic `k=v` join of the property
+    // assignments, so tests can assert exactly which client property a
+    // helper edits (PURA-292 — the talker-flag fix swapped the uppercase
+    // `CLIENT_INPUT_MUTED` self-only property for `client_is_talker`).
+    let clid = params.get("clid").cloned().unwrap_or_default();
+    let mut props: Vec<String> = params
+        .iter()
+        .filter(|(k, _)| k.as_str() != "clid")
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+    props.sort();
+    *state.captured_query.lock().unwrap() = Some((clid, props.join(" ")));
     Json(json!({
         "body": {},
         "status": {"code": 0, "message": "ok"},
@@ -1136,6 +1141,11 @@ async fn servergroupaddclient_passes_sgid_and_cldbid() {
 
 #[tokio::test]
 async fn client_set_muted_writes_input_muted_property() {
+    // NOTE (PURA-292): this asserts the *legacy* `CLIENT_INPUT_MUTED`
+    // wire shape against the mock. That property is client-self state —
+    // a live TS6 host rejects it for a third party (`1538`). Moderation
+    // muting goes through `client_set_talker`; the control surface and
+    // flow engine still call this helper (PURA-292 follow-up child issue).
     let server = MockServer::start("k").await;
     let client = build_client(&server, "k");
 
@@ -1144,7 +1154,35 @@ async fn client_set_muted_writes_input_muted_property() {
         .await
         .unwrap();
     let captured = server.state.captured_query.lock().unwrap().clone().unwrap();
-    assert_eq!(captured, ("10".to_string(), "1".to_string()));
+    assert_eq!(
+        captured,
+        ("10".to_string(), "CLIENT_INPUT_MUTED=1".to_string())
+    );
+}
+
+#[tokio::test]
+async fn client_set_talker_edits_lowercase_talker_property() {
+    let server = MockServer::start("k").await;
+    let client = build_client(&server, "k");
+
+    // mute → revoke the talker flag.
+    client.client_set_talker(1, 10, false).await.unwrap();
+    let captured = server.state.captured_query.lock().unwrap().clone().unwrap();
+    // PURA-292: must be the lowercase, server-editable `client_is_talker`
+    // property. The old uppercase `CLIENT_INPUT_MUTED` self-only form is
+    // rejected by live TS6 6.0.0-beta with `1538 invalid parameter`.
+    assert_eq!(
+        captured,
+        ("10".to_string(), "client_is_talker=0".to_string())
+    );
+
+    // unmute → restore it.
+    client.client_set_talker(1, 11, true).await.unwrap();
+    let captured = server.state.captured_query.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        captured,
+        ("11".to_string(), "client_is_talker=1".to_string())
+    );
 }
 
 #[tokio::test]
@@ -1312,6 +1350,65 @@ async fn integration_against_local_ts6_host_when_env_configured() {
             .await;
         let _ = client.banlist(first.virtualserver_id).await;
     }
+}
+
+// =========================================================================
+// PURA-292 — fixture-backed regression guard for the moderation mute fix.
+//
+// The bug: `client_set_muted` issued `clientedit CLIENT_INPUT_MUTED=…`, a
+// client-self property a live TS6 host rejects for a third party with
+// `1538 invalid parameter`. The mock `MockServer` accepted it, masking the
+// defect. This test exercises the *real* fixture so the mock can't mask a
+// regression again: it dispatches `client_set_talker(.., false)` — the
+// `client_is_talker=0` talker-flag revoke, which live TS6 6.0.0-beta
+// accepts for any client in any channel. If `client_set_talker` is ever
+// reverted to the uppercase self-only property, the live host answers
+// `1538` and this fails.
+//
+// Env-gated like `integration_against_local_ts6_host_when_env_configured`
+// above — no-ops without `TS6_INTEGRATION_HOST` so CI / local dev stay
+// hermetic. The `ts6-fixture-smoke` CI job sets the env.
+// =========================================================================
+#[tokio::test]
+async fn integration_client_set_talker_against_local_ts6() {
+    let Ok(host) = std::env::var("TS6_INTEGRATION_HOST") else {
+        eprintln!("skipping: TS6_INTEGRATION_HOST not set");
+        return;
+    };
+    let api_key = std::env::var("TS6_INTEGRATION_API_KEY")
+        .expect("TS6_INTEGRATION_HOST set without TS6_INTEGRATION_API_KEY");
+    let port: u16 = std::env::var("TS6_INTEGRATION_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10080);
+    let use_https = std::env::var("TS6_INTEGRATION_HTTPS")
+        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let allow_self_signed = std::env::var("TS6_INTEGRATION_ALLOW_SELF_SIGNED")
+        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    let client = WebQueryClient::new(0, &host, port, use_https, api_key, allow_self_signed)
+        .expect("client builds");
+
+    let servers = client.serverlist().await.expect("serverlist ok");
+    let Some(server) = servers.first() else {
+        eprintln!("skipping: no virtual server on the integration host");
+        return;
+    };
+    let sid = server.virtualserver_id;
+    let clients = client.clientlist(sid).await.expect("clientlist ok");
+    let Some(target) = clients.first() else {
+        eprintln!("skipping: no connected client to target");
+        return;
+    };
+
+    // The regression guard: revoking the talker flag must be accepted by
+    // the live host. The old `CLIENT_INPUT_MUTED` path would `1538` here.
+    client
+        .client_set_talker(sid, target.clid, false)
+        .await
+        .expect("client_set_talker(false) must be accepted by live TS6");
 }
 
 // =========================================================================

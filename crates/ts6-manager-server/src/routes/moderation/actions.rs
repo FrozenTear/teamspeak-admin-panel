@@ -227,17 +227,36 @@ async fn dispatch(
             Ok(None)
         }
         "mute" => {
+            // PURA-292: server-side muting is the `client_is_talker`
+            // talker flag, not the client-self `client_*_muted`
+            // properties (those are rejected `1538` on a live TS6 host).
+            // Revoking the flag is accepted in any channel.
             backend
-                .client_set_muted(sid, clid.expect("clid validated"), Some(true), Some(true))
+                .client_set_talker(sid, clid.expect("clid validated"), false)
                 .await
                 .map_err(translate_control_error)?;
             Ok(None)
         }
         "unmute" => {
-            backend
-                .client_set_muted(sid, clid.expect("clid validated"), Some(false), Some(false))
+            // Restoring the talker flag (`client_is_talker=1`) is rejected
+            // with TS6 `1538` when the target is not in a moderated
+            // channel — but there the client can already speak, so the
+            // unmute intent is already satisfied. Treat that one upstream
+            // code as success; surface every other failure.
+            match backend
+                .client_set_talker(sid, clid.expect("clid validated"), true)
                 .await
-                .map_err(translate_control_error)?;
+            {
+                Ok(()) => {}
+                Err(e) if e.upstream_code() == 1538 => {
+                    tracing::info!(
+                        case_id = case.id,
+                        clid = clid,
+                        "unmute: TS6 1538 — target not in a moderated channel, talker flag moot"
+                    );
+                }
+                Err(e) => return Err(translate_control_error(e)),
+            }
             Ok(None)
         }
         "ban" => {
@@ -284,8 +303,8 @@ fn action_payload(
 ) -> serde_json::Value {
     match kind {
         "kick" => json!({ "clid": clid, "reasonId": SERVER_KICK_REASON_ID }),
-        "mute" => json!({ "clid": clid, "inputMuted": true, "outputMuted": true }),
-        "unmute" => json!({ "clid": clid, "inputMuted": false, "outputMuted": false }),
+        "mute" => json!({ "clid": clid, "talker": false }),
+        "unmute" => json!({ "clid": clid, "talker": true }),
         "ban" => json!({ "banId": ts_ref, "durationSecs": ban_duration_secs }),
         "ban_ip" => json!({ "banId": ts_ref, "ip": ip, "durationSecs": ban_duration_secs }),
         _ => json!({}),
