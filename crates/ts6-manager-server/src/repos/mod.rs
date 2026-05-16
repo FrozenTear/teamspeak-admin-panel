@@ -25,6 +25,7 @@ pub mod moderation_case_actions;
 pub mod moderation_cases;
 pub mod moderation_notes;
 pub mod moderation_reports;
+pub mod moderation_tokens;
 pub mod music_bots;
 pub mod music_requests;
 pub mod playlist_songs;
