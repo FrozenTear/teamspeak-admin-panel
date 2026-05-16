@@ -11,6 +11,7 @@
 pub mod audit;
 pub mod control;
 pub mod metrics;
+pub mod moderation;
 pub mod music_bots;
 pub mod servers;
 pub mod settings;

@@ -16,6 +16,7 @@ pub mod control;
 pub mod dashboard;
 pub mod flows;
 pub mod health;
+pub mod moderation;
 pub mod music_bots;
 pub mod servers;
 pub mod setup;

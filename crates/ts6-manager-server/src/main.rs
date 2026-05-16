@@ -335,7 +335,9 @@ mod server_entry {
         // sessions, and `/api/audit` read. Admin-only via the `RequireAdmin`
         // extractor inside each handler.
         let users_router = routes::users::router().with_state(state.clone());
-        let audit_router = routes::audit::router().with_state(state);
+        let audit_router = routes::audit::router().with_state(state.clone());
+        // PURA-286 — Phase 9.0 moderation REST surface (`/api/moderation/*`).
+        let moderation_router = routes::moderation::router().with_state(state);
 
         // PURA-17: `serve_dioxus_application` registers static assets +
         // server functions and adds a fallback that serves the dx-CLI
@@ -378,6 +380,8 @@ mod server_entry {
             // PURA-235 — v1.1 admin management surface.
             .merge(users_router)
             .merge(audit_router)
+            // PURA-286 — Phase 9.0 moderation surface.
+            .merge(moderation_router)
             .serve_dioxus_application(serve_cfg, ui::App)
             .layer(web::cors_layer(&cfg.frontend_url));
         let router = web::security_headers_stack(cfg.node_env).apply(router);

@@ -54,6 +54,12 @@ pub enum AuditKind {
     SelfPasswordChanged,
     SetupCompleted,
     UserPermissionsChanged,
+    /// Phase 9.0 moderation (PURA-286) — case lifecycle + note events.
+    ModerationCaseOpened,
+    ModerationCaseActioned,
+    ModerationCaseResolved,
+    ModerationCaseReopened,
+    ModerationNoteAdded,
 }
 
 impl AuditKind {
@@ -70,6 +76,11 @@ impl AuditKind {
             AuditKind::SelfPasswordChanged => "selfPasswordChanged",
             AuditKind::SetupCompleted => "setupCompleted",
             AuditKind::UserPermissionsChanged => "userPermissionsChanged",
+            AuditKind::ModerationCaseOpened => "moderationCaseOpened",
+            AuditKind::ModerationCaseActioned => "moderationCaseActioned",
+            AuditKind::ModerationCaseResolved => "moderationCaseResolved",
+            AuditKind::ModerationCaseReopened => "moderationCaseReopened",
+            AuditKind::ModerationNoteAdded => "moderationNoteAdded",
         }
     }
 }
@@ -99,6 +110,26 @@ impl Target {
             kind: "session".to_string(),
             id: Some(id),
             label: None,
+        }
+    }
+
+    /// Phase 9.0 — a moderation case. `label` snapshots the subject UID
+    /// so the audit row stays meaningful after the case is deleted.
+    pub fn moderation_case(id: i64, subject_uid: impl Into<String>) -> Self {
+        Self {
+            kind: "moderation_case".to_string(),
+            id: Some(id),
+            label: Some(subject_uid.into()),
+        }
+    }
+
+    /// Phase 9.0 — a moderation subject keyed by UID. `id` is `None`
+    /// because a subject UID is not an integer row id.
+    pub fn moderation_subject(subject_uid: impl Into<String>) -> Self {
+        Self {
+            kind: "moderation_subject".to_string(),
+            id: None,
+            label: Some(subject_uid.into()),
         }
     }
 }
