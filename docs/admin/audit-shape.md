@@ -9,7 +9,7 @@
 
 ### 1.1 Table definition
 
-Migration: `crates/ts6-manager-server/migrations/0009_admin_audit_log.surql`.
+Migration: `crates/ts6-manager-server/migrations/0010_admin_audit_log.surql`.
 
 ```surql
 -- =====================================================================
@@ -37,7 +37,7 @@ DEFINE FIELD kind             ON admin_audit_log TYPE string;
 DEFINE FIELD targetKind       ON admin_audit_log TYPE option<string>;
 DEFINE FIELD targetId         ON admin_audit_log TYPE option<int>;
 DEFINE FIELD targetLabel      ON admin_audit_log TYPE option<string>; -- snapshot
-DEFINE FIELD payload          ON admin_audit_log TYPE option<object>; -- redacted detail
+DEFINE FIELD payload          ON admin_audit_log TYPE option<object> FLEXIBLE; -- redacted detail
 DEFINE FIELD outcome          ON admin_audit_log TYPE string;     -- 'success' | 'failure'
 DEFINE FIELD errorMsg         ON admin_audit_log TYPE option<string>;
 DEFINE FIELD requestIp        ON admin_audit_log TYPE option<string>;

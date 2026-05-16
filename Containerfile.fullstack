@@ -63,6 +63,13 @@ COPY scripts ./scripts
 # `flows_router` mount, so a missing-router regression cannot ship again.
 RUN scripts/check-router.sh flows_router
 
+# PURA-257 — same guard for the v1.1 admin-management REST surface. The
+# `/api/users/*` and `/api/audit` routers are admin-gated and shipped via
+# the PURA-234..239 stack; a lost `.merge()` would silently 404 the whole
+# admin panel exactly like the rc1 `/api/flows` gap.
+RUN scripts/check-router.sh users_router
+RUN scripts/check-router.sh audit_router
+
 # Build both the wasm client and the patched native server binary in one pass.
 # Output layout (impl-plan §10) — written under the workspace target dir:
 #   target/dx/ts6-manager-server/release/web/server

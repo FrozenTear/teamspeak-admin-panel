@@ -134,6 +134,22 @@ pub async fn count(db: &Database) -> Result<i64> {
     Ok(n.unwrap_or(0))
 }
 
+/// PURA-235 — last-enabled-admin protection per architecture.md §5.3.
+/// Counts admins whose row is `enabled = true` and whose id is not
+/// `excluding`. Used by `PATCH/DELETE /api/users/{id}` to refuse a
+/// mutation that would leave zero enabled admins.
+pub async fn count_enabled_admins_excluding(db: &Database, excluding: i64) -> Result<i64> {
+    let sql = "RETURN array::len(SELECT id FROM user
+        WHERE role = 'admin' AND enabled = true AND record::id(id) != $excluding);";
+    let mut resp = db
+        .query(sql)
+        .bind(("excluding", excluding))
+        .await?
+        .check()?;
+    let n: Option<i64> = resp.take(0)?;
+    Ok(n.unwrap_or(0))
+}
+
 pub async fn update(db: &Database, id: i64, patch: UserUpdate) -> Result<Option<User>> {
     // SurrealDB MERGE preserves keys not present in the patch payload, so
     // we build a sparse payload from the optional fields.

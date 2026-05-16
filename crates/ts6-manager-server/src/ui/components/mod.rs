@@ -3,6 +3,7 @@
 #![allow(unused_imports)]
 
 pub mod activity_feed;
+mod badge;
 mod banner;
 mod button;
 pub mod dropdown;
@@ -17,6 +18,7 @@ pub use activity_feed::{
     ActivityEntry, ActivityFeed, ActivityFeedList, ActivityFeedSubscription, provide_activity_feed,
     use_activity_feed,
 };
+pub use badge::{Role, RoleBadge, StatusBadge, UserStatus};
 pub use banner::{Banner, BannerVariant};
 pub use button::{Button, ButtonSize, ButtonType, ButtonVariant};
 pub use dropdown::{
