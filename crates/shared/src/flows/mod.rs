@@ -97,6 +97,34 @@ pub enum Trigger {
     },
 }
 
+/// TS6 effect a [`Action::Moderate`] node applies to its subject. The
+/// wire discriminant doubles as the `moderation_case_action.actionKind`
+/// value (Phase 9.1 automod brief §4.3 / §5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ModerateEffect {
+    /// Private `sendtextmessage` to the subject.
+    Warn,
+    /// Server talker-flag revoke (`client_is_talker = 0`).
+    Mute,
+    /// `clientkick`.
+    Kick,
+    /// `banadd` — temporary when `duration_secs` is set.
+    Ban,
+}
+
+impl ModerateEffect {
+    /// The `moderation_case_action.actionKind` string for this effect.
+    pub fn as_action_kind(self) -> &'static str {
+        match self {
+            ModerateEffect::Warn => "warn",
+            ModerateEffect::Mute => "mute",
+            ModerateEffect::Kick => "kick",
+            ModerateEffect::Ban => "ban",
+        }
+    }
+}
+
 /// One step executed when a run starts. `args` are `serde_json::Value`
 /// containers because the schema differs per command and the engine
 /// validates against its whitelist server-side.
@@ -129,6 +157,24 @@ pub enum Action {
     },
     /// Smoke / debug action — appends one line to the manager log.
     LogLine { message: String },
+    /// Apply an audited moderation effect to the trigger's subject and
+    /// bridge it into the Phase 9.0 case model (Phase 9.1 automod brief
+    /// §4). The subject (UID + nickname snapshot) is resolved from the
+    /// trigger context at dispatch time, so it is not a config field.
+    Moderate {
+        /// The TS6 effect to apply.
+        effect: ModerateEffect,
+        /// Mute / ban duration in seconds. `None` for `warn` / `kick`,
+        /// and for a permanent ban (operator-only policy lands in 9.1.3).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_secs: Option<u32>,
+        /// Templated reason — interpolated by the engine, then stored on
+        /// `moderation_case.reason` and the timeline action row.
+        reason_template: String,
+        /// Stable rule identifier. Drives case dedup (one open automod
+        /// case per subject + rule) and per-rule metrics.
+        rule_key: String,
+    },
 }
 
 /// Trigger + ordered action list — what the engine executes when a run starts.
@@ -373,6 +419,42 @@ mod tests {
         let json = serde_json::to_string(&a).unwrap();
         assert!(json.contains(r#""kind":"logLine""#), "got: {json}");
         assert!(json.contains(r#""message":"hello""#), "got: {json}");
+    }
+
+    #[test]
+    fn action_moderate_round_trips_with_camel_case_fields() {
+        let a = Action::Moderate {
+            effect: ModerateEffect::Ban,
+            duration_secs: Some(3600),
+            reason_template: "flood: ${trigger.count} msgs".into(),
+            rule_key: "chat-flood".into(),
+        };
+        let json = serde_json::to_string(&a).unwrap();
+        assert!(json.contains(r#""kind":"moderate""#), "got: {json}");
+        assert!(json.contains(r#""effect":"ban""#), "got: {json}");
+        assert!(json.contains(r#""durationSecs":3600"#), "got: {json}");
+        assert!(json.contains(r#""reasonTemplate""#), "got: {json}");
+        assert!(json.contains(r#""ruleKey":"chat-flood""#), "got: {json}");
+        assert_eq!(serde_json::from_str::<Action>(&json).unwrap(), a);
+
+        // `durationSecs` is omitted for a `warn` and absent round-trips.
+        let warn = Action::Moderate {
+            effect: ModerateEffect::Warn,
+            duration_secs: None,
+            reason_template: "be nice".into(),
+            rule_key: "chat-filter".into(),
+        };
+        let json = serde_json::to_string(&warn).unwrap();
+        assert!(!json.contains("durationSecs"), "got: {json}");
+        assert_eq!(serde_json::from_str::<Action>(&json).unwrap(), warn);
+    }
+
+    #[test]
+    fn moderate_effect_action_kind_strings() {
+        assert_eq!(ModerateEffect::Warn.as_action_kind(), "warn");
+        assert_eq!(ModerateEffect::Mute.as_action_kind(), "mute");
+        assert_eq!(ModerateEffect::Kick.as_action_kind(), "kick");
+        assert_eq!(ModerateEffect::Ban.as_action_kind(), "ban");
     }
 
     #[test]

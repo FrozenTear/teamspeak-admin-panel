@@ -157,7 +157,8 @@ impl ActionDispatcher for BasicDispatcher {
             }
             Action::Ts6Command { .. }
             | Action::MusicBotCommand { .. }
-            | Action::WebhookOut { .. } => ActionOutcome::Errored(
+            | Action::WebhookOut { .. }
+            | Action::Moderate { .. } => ActionOutcome::Errored(
                 "action dispatcher not wired yet — pending F-impl-routes".to_string(),
             ),
         }

@@ -446,6 +446,9 @@ fn action_templates(action: &Action) -> Vec<String> {
             t.extend(headers.iter().flat_map(|(k, v)| [k.clone(), v.clone()]));
             t
         }
+        Action::Moderate {
+            reason_template, ..
+        } => vec![reason_template.clone()],
     }
 }
 
@@ -1057,6 +1060,17 @@ fn render_action(action: &Action, bb: &Blackboard) -> Result<Action, expr::ExprE
                 .iter()
                 .map(|(k, v)| Ok((k.clone(), expr::interpolate(v, bb)?)))
                 .collect::<Result<Vec<_>, expr::ExprError>>()?,
+        },
+        Action::Moderate {
+            effect,
+            duration_secs,
+            reason_template,
+            rule_key,
+        } => Action::Moderate {
+            effect: *effect,
+            duration_secs: *duration_secs,
+            reason_template: expr::interpolate(reason_template, bb)?,
+            rule_key: rule_key.clone(),
         },
     })
 }

@@ -103,6 +103,9 @@ fn node_summary(kind: &NodeKind) -> String {
             Action::WebhookOut { url, .. } => format!("webhook · {url}"),
             Action::Ts6Command { command, .. } => format!("ts6 · {command}"),
             Action::MusicBotCommand { command, .. } => format!("music bot · {command}"),
+            Action::Moderate {
+                effect, rule_key, ..
+            } => format!("moderate · {} · {rule_key}", effect.as_action_kind()),
         },
         NodeKind::Branch { cases } => format!("{} case(s) + default", cases.len()),
         NodeKind::Parallel { collection, .. } => format!("fan out · {collection}"),

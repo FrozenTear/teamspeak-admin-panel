@@ -63,6 +63,9 @@ pub enum AuditKind {
     /// Phase 9.0 complaint sub-surface (PURA-289) — a TS6 complaint was
     /// dismissed via `complaindel` / `complaindelall`.
     ModerationComplaintResolved,
+    /// Phase 9.1 automod (PURA-301) — a `Moderate` flow node opened or
+    /// reused a case and applied a moderation effect.
+    ModerationAutomodAction,
 }
 
 impl AuditKind {
@@ -85,6 +88,7 @@ impl AuditKind {
             AuditKind::ModerationCaseReopened => "moderationCaseReopened",
             AuditKind::ModerationNoteAdded => "moderationNoteAdded",
             AuditKind::ModerationComplaintResolved => "moderationComplaintResolved",
+            AuditKind::ModerationAutomodAction => "moderationAutomodAction",
         }
     }
 }

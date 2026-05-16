@@ -99,6 +99,7 @@ pub fn action_kind_label(action: &wire::Action) -> &'static str {
         wire::Action::MusicBotCommand { .. } => "Music-bot command",
         wire::Action::WebhookOut { .. } => "Webhook",
         wire::Action::LogLine { .. } => "Log line",
+        wire::Action::Moderate { .. } => "Moderate",
     }
 }
 
@@ -112,6 +113,7 @@ pub fn action_wire_kind_label(kind: &str) -> &str {
         "musicBotCommand" => "Music-bot command",
         "webhookOut" => "Webhook",
         "logLine" => "Log line",
+        "moderate" => "Moderate",
         // An unrecognised kind is surfaced verbatim rather than hidden —
         // a wire/engine drift should be visible, not silently relabelled.
         other => other,
@@ -151,6 +153,7 @@ pub fn action_kind_icon(action: &wire::Action) -> &'static str {
         wire::Action::MusicBotCommand { .. } => "♪",
         wire::Action::WebhookOut { .. } => "↗",
         wire::Action::LogLine { .. } => "≡",
+        wire::Action::Moderate { .. } => "⚠",
     }
 }
 

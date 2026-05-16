@@ -959,6 +959,22 @@ fn ActionSummary(props: ActionSummaryProps) -> Element {
         wire::Action::LogLine { message } => rsx! {
             p { class: "muted", "message: ", code { "{message}" } }
         },
+        wire::Action::Moderate {
+            effect,
+            duration_secs,
+            reason_template,
+            rule_key,
+        } => rsx! {
+            p { class: "muted",
+                "effect: ", code { "{effect.as_action_kind()}" },
+                " · rule: ", code { "{rule_key}" },
+                if let Some(secs) = duration_secs {
+                    " · duration: "
+                    code { "{secs}s" }
+                }
+                " · reason: ", code { "{reason_template}" }
+            }
+        },
     }
 }
 
