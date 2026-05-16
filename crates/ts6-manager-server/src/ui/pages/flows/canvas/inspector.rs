@@ -19,7 +19,7 @@
 use dioxus::prelude::*;
 use serde_json::{Map, Value};
 use ts6_manager_shared::flows::v2::{BranchCase, FlowGraph, NodeId, NodeKind, TransformOutput};
-use ts6_manager_shared::flows::{Action, FlowId, Trigger};
+use ts6_manager_shared::flows::{Action, FloodScope, FloodSource, FlowId, Trigger};
 
 use super::model;
 
@@ -152,6 +152,8 @@ fn TriggerForm(
         Trigger::ManualFire => "manualFire",
         Trigger::Cron { .. } => "cron",
         Trigger::Ts6ClientJoined { .. } => "ts6ClientJoined",
+        Trigger::Ts6ChatMessage { .. } => "ts6ChatMessage",
+        Trigger::Ts6Flood { .. } => "ts6Flood",
     };
     rsx! {
         label { class: "fc-field",
@@ -217,6 +219,29 @@ fn TriggerForm(
                                 );
                             }
                         },
+                    }
+                }
+            },
+            Trigger::Ts6ChatMessage { .. } => rsx! {
+                p { class: "fc-hint",
+                    "Fires on every TS6 chat message. Run context exposes trigger.message, trigger.clientNickname, trigger.channelId."
+                }
+            },
+            Trigger::Ts6Flood { source, threshold, window_secs, scope } => {
+                let src_label = match source {
+                    FloodSource::ClientJoined => "clientJoined",
+                    FloodSource::ChatMessage => "chatMessage",
+                    FloodSource::ClientMoved => "clientMoved",
+                };
+                let scope_label = match scope {
+                    FloodScope::Subject => "subject",
+                    FloodScope::Ip => "ip",
+                    FloodScope::Global => "global",
+                };
+                rsx! {
+                    p { class: "fc-hint",
+                        "Fires when the windowed counter crosses the threshold. "
+                        "Source: {src_label}, threshold: {threshold}, window: {window_secs}s, scope: {scope_label}."
                     }
                 }
             },

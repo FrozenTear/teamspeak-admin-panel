@@ -38,7 +38,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use ts6_manager_shared::flows::v2::{FlowGraph, NodeKind, decode_flow_data};
 use ts6_manager_shared::flows::{
-    Action, FlowDefinition, FlowId, FlowRunId, FlowRunStatus, Trigger,
+    Action, FloodScope, FloodSource, FlowDefinition, FlowId, FlowRunId, FlowRunStatus, Trigger,
 };
 
 use crate::db::Database;
@@ -60,7 +60,7 @@ pub mod graph;
 
 use graph::{GraphDeps, run_graph};
 
-use super::trigger::{ParsedTrigger, TriggerEvent};
+use super::trigger::{FloodRegistry, FloodSourceKey, FloodSpec, ParsedTrigger, TriggerEvent};
 
 /// Dependencies the engine takes at boot. Built by the routes child's
 /// `main.rs` wiring; tests pass a minimal mock dispatcher.
@@ -194,6 +194,9 @@ impl FlowEngine {
             per_flow_locks: StdMutex::new(HashMap::new()),
             drop_counter: StdMutex::new(0),
             ts6_subs: StdMutex::new(Vec::new()),
+            chat_subs: StdMutex::new(Vec::new()),
+            flood_subs: StdMutex::new(Vec::new()),
+            flood_registry: FloodRegistry::new(),
         });
         let handle = FlowEngineHandle {
             inner: inner.clone(),
@@ -239,13 +242,36 @@ impl FlowEngine {
                     cron_tasks.push(task);
                 }
                 ParsedTrigger::Ts6ClientJoined { channel_id } => {
-                    // Producer-driven: the WS hub republisher calls
-                    // `handle.on_client_joined`. Register the subscription
-                    // so the engine knows which flows want the events.
                     lock_or_poisoned(&inner.ts6_subs).push(Ts6Subscription {
                         flow_id: FlowId(flow.id),
                         virtual_server_id: flow.virtualServerId,
                         channel_id: *channel_id,
+                    });
+                }
+                ParsedTrigger::Ts6ChatMessage {
+                    channel_id,
+                    target_mode,
+                } => {
+                    lock_or_poisoned(&inner.chat_subs).push(ChatSubscription {
+                        flow_id: FlowId(flow.id),
+                        virtual_server_id: flow.virtualServerId,
+                        channel_id: *channel_id,
+                        target_mode: target_mode.clone(),
+                    });
+                }
+                ParsedTrigger::Ts6Flood {
+                    source,
+                    threshold,
+                    window_secs,
+                    scope,
+                } => {
+                    lock_or_poisoned(&inner.flood_subs).push(FloodSubscription {
+                        flow_id: FlowId(flow.id),
+                        virtual_server_id: flow.virtualServerId,
+                        source: *source,
+                        threshold: *threshold,
+                        window_secs: *window_secs,
+                        scope: *scope,
                     });
                 }
                 ParsedTrigger::ManualFire => {}
@@ -287,19 +313,16 @@ struct EngineInner {
     db: Arc<Database>,
     dispatcher: Arc<dyn ActionDispatcher>,
     cross_flow_semaphore: Arc<Semaphore>,
-    /// Per-flow `Semaphore::new(1)` slots. Existing semaphores are
-    /// retained so concurrent fires hit the same lock. Created lazily.
     per_flow_locks: StdMutex<HashMap<i64, Arc<Semaphore>>>,
-    /// Dropped-trigger counter. Brief §6.3 counter
-    /// `ts6_flow_runs_dropped_total{reason="busy"}` — `routes::metrics`
-    /// owns the Prometheus exposition; the engine just keeps the raw
-    /// value.
     drop_counter: StdMutex<u64>,
-    /// Per-flow subscriptions for the `ts6ClientJoined` source. Tuple of
-    /// (flow_id, virtual_server_id, optional channel filter). Engine
-    /// rebuilds this set when the routes child calls
-    /// [`FlowEngineHandle::enable`] on create / patch.
+    /// Subscriptions for `ts6ClientJoined`.
     ts6_subs: StdMutex<Vec<Ts6Subscription>>,
+    /// Subscriptions for `ts6ChatMessage`.
+    chat_subs: StdMutex<Vec<ChatSubscription>>,
+    /// Subscriptions for `ts6Flood`.
+    flood_subs: StdMutex<Vec<FloodSubscription>>,
+    /// Shared sliding-window state for all flood triggers.
+    flood_registry: FloodRegistry,
 }
 
 #[derive(Debug, Clone)]
@@ -307,6 +330,24 @@ struct Ts6Subscription {
     flow_id: FlowId,
     virtual_server_id: i64,
     channel_id: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+struct ChatSubscription {
+    flow_id: FlowId,
+    virtual_server_id: i64,
+    channel_id: Option<i64>,
+    target_mode: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct FloodSubscription {
+    flow_id: FlowId,
+    virtual_server_id: i64,
+    source: FloodSource,
+    threshold: u32,
+    window_secs: u32,
+    scope: FloodScope,
 }
 
 /// Fire-time errors visible to the routes layer. The HTTP layer maps
@@ -516,6 +557,143 @@ impl FlowEngineHandle {
                 .fire_event(sub.flow_id, &flow.name, &graph, event, false)
                 .await;
         }
+        // Also pump flood counters for clientJoined source.
+        self.pump_flood(
+            virtual_server_id,
+            FloodSource::ClientJoined,
+            &client_unique_identifier,
+        )
+        .await;
+    }
+
+    /// Producer entry for the `ts6ChatMessage` source. Called by the WS hub
+    /// republisher for every `notifytextmessage` event.
+    pub async fn on_chat_message(
+        &self,
+        virtual_server_id: i64,
+        channel_id: Option<i64>,
+        target_mode: String,
+        client_unique_identifier: String,
+        client_nickname: String,
+        message: String,
+    ) {
+        let subs = lock_or_poisoned(&self.inner.chat_subs).clone();
+        for sub in &subs {
+            if sub.virtual_server_id != virtual_server_id {
+                continue;
+            }
+            if sub.channel_id.is_some_and(|f| channel_id != Some(f)) {
+                continue;
+            }
+            if sub.target_mode.as_deref().is_some_and(|m| m != target_mode) {
+                continue;
+            }
+            let flow = match bot_flows::find_by_id(&self.inner.db, sub.flow_id.0).await {
+                Ok(Some(f)) => f,
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(error = %e, flow.id = sub.flow_id.0, "ts6ChatMessage: read flow failed");
+                    continue;
+                }
+            };
+            let Ok(graph) = decode_flow_data(&flow.flowData) else {
+                continue;
+            };
+            let event = TriggerEvent::Ts6ChatMessage {
+                virtual_server_id,
+                channel_id,
+                target_mode: target_mode.clone(),
+                client_unique_identifier: client_unique_identifier.clone(),
+                client_nickname: client_nickname.clone(),
+                message: message.clone(),
+                ts: Utc::now(),
+            };
+            let _ = self
+                .fire_event(sub.flow_id, &flow.name, &graph, event, false)
+                .await;
+        }
+        // Also pump flood counters for chatMessage source.
+        self.pump_flood(
+            virtual_server_id,
+            FloodSource::ChatMessage,
+            &client_unique_identifier,
+        )
+        .await;
+    }
+
+    /// Producer entry for `notifyclientmoved`. Feeds flood counters for the
+    /// `clientMoved` source (channel-hopping detection).
+    pub async fn on_client_moved(
+        &self,
+        virtual_server_id: i64,
+        client_unique_identifier: String,
+    ) {
+        self.pump_flood(
+            virtual_server_id,
+            FloodSource::ClientMoved,
+            &client_unique_identifier,
+        )
+        .await;
+    }
+
+    /// Internal: record one event against all matching flood subscriptions and
+    /// fire if a counter crosses its threshold.
+    async fn pump_flood(
+        &self,
+        virtual_server_id: i64,
+        source: FloodSource,
+        client_unique_identifier: &str,
+    ) {
+        let subs = lock_or_poisoned(&self.inner.flood_subs).clone();
+        for sub in &subs {
+            if sub.virtual_server_id != virtual_server_id {
+                continue;
+            }
+            let sub_source_key = FloodSourceKey::from(sub.source);
+            let event_source_key = FloodSourceKey::from(source);
+            if sub_source_key != event_source_key {
+                continue;
+            }
+            let bucket_key = match sub.scope {
+                FloodScope::Global => "*".to_string(),
+                FloodScope::Subject | FloodScope::Ip => client_unique_identifier.to_string(),
+            };
+            let spec = FloodSpec {
+                flow_id: sub.flow_id,
+                virtual_server_id,
+                source: FloodSourceKey::from(sub.source),
+                threshold: sub.threshold,
+                window_secs: sub.window_secs,
+                scope: sub.scope,
+            };
+            let Some(count) = self.inner.flood_registry.record(&spec, &bucket_key) else {
+                continue;
+            };
+            // Threshold crossed — fire the flow.
+            let flow = match bot_flows::find_by_id(&self.inner.db, sub.flow_id.0).await {
+                Ok(Some(f)) => f,
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(error = %e, flow.id = sub.flow_id.0, "ts6Flood: read flow failed");
+                    continue;
+                }
+            };
+            let Ok(graph) = decode_flow_data(&flow.flowData) else {
+                continue;
+            };
+            let event = TriggerEvent::Ts6Flood {
+                source,
+                scope: sub.scope,
+                bucket_key,
+                count,
+                threshold: sub.threshold,
+                window_secs: sub.window_secs,
+                ts: Utc::now(),
+            };
+            let _ = self
+                .fire_event(sub.flow_id, &flow.name, &graph, event, false)
+                .await;
+        }
     }
 
     /// Enable a flow — registers the appropriate trigger subscription.
@@ -549,6 +727,36 @@ impl FlowEngineHandle {
                     channel_id,
                 });
             }
+            ParsedTrigger::Ts6ChatMessage {
+                channel_id,
+                target_mode,
+            } => {
+                let mut subs = lock_or_poisoned(&self.inner.chat_subs);
+                subs.retain(|s| s.flow_id != flow_id);
+                subs.push(ChatSubscription {
+                    flow_id,
+                    virtual_server_id: flow.virtualServerId,
+                    channel_id,
+                    target_mode,
+                });
+            }
+            ParsedTrigger::Ts6Flood {
+                source,
+                threshold,
+                window_secs,
+                scope,
+            } => {
+                let mut subs = lock_or_poisoned(&self.inner.flood_subs);
+                subs.retain(|s| s.flow_id != flow_id);
+                subs.push(FloodSubscription {
+                    flow_id,
+                    virtual_server_id: flow.virtualServerId,
+                    source,
+                    threshold,
+                    window_secs,
+                    scope,
+                });
+            }
             ParsedTrigger::ManualFire => {}
         }
         Ok(())
@@ -558,6 +766,9 @@ impl FlowEngineHandle {
     /// runs are NOT cancelled (brief §6.4 — runs always finish).
     pub fn disable(&self, flow_id: FlowId) {
         lock_or_poisoned(&self.inner.ts6_subs).retain(|s| s.flow_id != flow_id);
+        lock_or_poisoned(&self.inner.chat_subs).retain(|s| s.flow_id != flow_id);
+        lock_or_poisoned(&self.inner.flood_subs).retain(|s| s.flow_id != flow_id);
+        self.inner.flood_registry.remove_flow(flow_id);
     }
 
     /// Forces in-flight runs for the given flow into `interrupted`. The

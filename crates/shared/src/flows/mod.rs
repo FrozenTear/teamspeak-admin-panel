@@ -34,6 +34,31 @@ pub struct FlowId(pub i64);
 #[serde(transparent)]
 pub struct FlowRunId(pub i64);
 
+/// Source event that feeds a [`Trigger::Ts6Flood`] windowed counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FloodSource {
+    /// Each `notifycliententerview` increments the counter.
+    ClientJoined,
+    /// Each `notifytextmessage` increments the counter.
+    ChatMessage,
+    /// Each `notifyclientmoved` increments the counter (channel-hopping).
+    ClientMoved,
+}
+
+/// Key domain for the per-`(spec, key)` sliding-window counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FloodScope {
+    /// Counter per unique client identifier.
+    Subject,
+    /// Counter per source IP address (not yet wired — treated as `subject`
+    /// until the SSH bridge surfaces the IP).
+    Ip,
+    /// Single server-wide counter (all clients share one bucket).
+    Global,
+}
+
 /// What event makes the engine create a run for this flow. Wire is
 /// externally-tagged on `kind`, matching the example bodies in
 /// `docs/flows/http-api.md` §3.1.
@@ -51,6 +76,25 @@ pub enum Trigger {
     /// Fired when a TS6 client joins a channel. `channel_id = None` matches
     /// any channel.
     Ts6ClientJoined { channel_id: Option<i64> },
+    /// Fired on each `notifytextmessage`. `channel_id = None` matches any
+    /// channel; `target_mode` mirrors the TS6 `targetmode` parameter
+    /// (`"channel"`, `"private"`, `"server"`). Run context exposes
+    /// `${trigger.message}`, `${trigger.clientUniqueIdentifier}`,
+    /// `${trigger.clientNickname}`, `${trigger.channelId}`.
+    Ts6ChatMessage {
+        channel_id: Option<i64>,
+        /// Optional target-mode filter. `None` matches all modes.
+        target_mode: Option<String>,
+    },
+    /// Windowed flood counter. Fires when `source` events from a single
+    /// `scope` bucket reach `threshold` within a rolling `window_secs`
+    /// window. Channel-hopping = `Ts6Flood { source: clientMoved }`.
+    Ts6Flood {
+        source: FloodSource,
+        threshold: u32,
+        window_secs: u32,
+        scope: FloodScope,
+    },
 }
 
 /// One step executed when a run starts. `args` are `serde_json::Value`
@@ -295,6 +339,30 @@ mod tests {
         let any_channel = Trigger::Ts6ClientJoined { channel_id: None };
         let json = serde_json::to_string(&any_channel).unwrap();
         assert!(json.contains(r#""channelId":null"#), "got: {json}");
+
+        let chat = Trigger::Ts6ChatMessage {
+            channel_id: Some(3),
+            target_mode: Some("channel".into()),
+        };
+        let json = serde_json::to_string(&chat).unwrap();
+        assert!(json.contains(r#""kind":"ts6ChatMessage""#), "got: {json}");
+        assert!(json.contains(r#""channelId":3"#), "got: {json}");
+        assert!(json.contains(r#""targetMode":"channel""#), "got: {json}");
+        assert_eq!(serde_json::from_str::<Trigger>(&json).unwrap(), chat);
+
+        let flood = Trigger::Ts6Flood {
+            source: FloodSource::ChatMessage,
+            threshold: 5,
+            window_secs: 10,
+            scope: FloodScope::Subject,
+        };
+        let json = serde_json::to_string(&flood).unwrap();
+        assert!(json.contains(r#""kind":"ts6Flood""#), "got: {json}");
+        assert!(json.contains(r#""source":"chatMessage""#), "got: {json}");
+        assert!(json.contains(r#""threshold":5"#), "got: {json}");
+        assert!(json.contains(r#""windowSecs":10"#), "got: {json}");
+        assert!(json.contains(r#""scope":"subject""#), "got: {json}");
+        assert_eq!(serde_json::from_str::<Trigger>(&json).unwrap(), flood);
     }
 
     #[test]

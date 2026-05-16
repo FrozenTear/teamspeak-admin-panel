@@ -44,4 +44,4 @@ pub use engine::{
     ActionContext, ActionDispatcher, ActionOutcome, BasicDispatcher, EngineDeps, FireError,
     FlowEngine, FlowEngineHandle,
 };
-pub use trigger::{ParsedTrigger, TriggerEvent};
+pub use trigger::{FloodRegistry, FloodSpec, ParsedTrigger, TriggerEvent};
