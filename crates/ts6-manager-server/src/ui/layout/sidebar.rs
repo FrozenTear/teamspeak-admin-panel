@@ -132,6 +132,15 @@ pub fn Sidebar(props: SidebarProps) -> Element {
     let settings_active = matches!(props.active, Route::SettingsPage {});
     let admin_users_active = matches!(props.active, Route::AdminUsersPage {});
     let audit_active = matches!(props.active, Route::AuditPage {});
+    let permissions_active = matches!(props.active, Route::PermissionGrantsPage {});
+    // PURA-287 — Moderation highlights on the queue plus the case-detail
+    // and per-subject history sub-routes so the operator stays oriented.
+    let moderation_active = matches!(
+        props.active,
+        Route::ModerationQueuePage {}
+            | Route::ModerationCasePage { .. }
+            | Route::SubjectHistoryPage { .. }
+    );
     // PURA-124 WS-6 — Music bots highlight when the route is the index
     // OR any of the per-bot detail / library / playlists / radio
     // surfaces, so the operator stays oriented across the whole flow.
@@ -182,7 +191,8 @@ pub fn Sidebar(props: SidebarProps) -> Element {
                     PlaceholderItem { icon: "⚒", label: "Permissions" }
                     NavItem { icon: "⊘", label: "Bans", to: Route::BansPage {}, active: bans_active }
                     PlaceholderItem { icon: "∘", label: "Tokens" }
-                    PlaceholderItem { icon: "!", label: "Complaints" }
+                    // PURA-287 — moderation case + complaint queue.
+                    NavItem { icon: "⚖", label: "Cases", to: Route::ModerationQueuePage {}, active: moderation_active }
                     PlaceholderItem { icon: "✉", label: "Messages" }
                 }
 
@@ -208,6 +218,11 @@ pub fn Sidebar(props: SidebarProps) -> Element {
                     // 403 surface if they deep-link the route directly.
                     if props.is_admin {
                         NavItem { icon: "⊟", label: "Audit log", to: Route::AuditPage {}, active: audit_active }
+                    }
+                    // PURA-287 — per-user moderation grant editor. Admin-only,
+                    // same suppression contract as Users / Audit log.
+                    if props.is_admin {
+                        NavItem { icon: "⚷", label: "Permission grants", to: Route::PermissionGrantsPage {}, active: permissions_active }
                     }
                     PlaceholderItem { icon: "◯", label: "Instance" }
                     NavItem { icon: "⚙", label: "Settings", to: Route::SettingsPage {}, active: settings_active }
@@ -379,22 +394,23 @@ mod tests {
         let html = render_sidebar_harness();
         // PURA-124 WS-6 has converted "Music bots" into a real nav item.
         // PURA-224 has converted "Settings" into a real nav item.
-        // Remaining placeholders: 1 × Server (Files), 6 × Moderation
-        // (Server groups, Channel groups, Permissions, Tokens,
-        // Complaints, Messages), 1 × Automation (Bots), 1 × Admin
-        // (Instance) = 9. The count is the authoritative signal here —
+        // PURA-287 has converted "Complaints" into the real "Cases" nav
+        // item (the /moderation queue). Remaining placeholders: 1 × Server
+        // (Files), 5 × Moderation (Server groups, Channel groups,
+        // Permissions, Tokens, Messages), 1 × Automation (Bots), 1 × Admin
+        // (Instance) = 8. The count is the authoritative signal here —
         // adding/removing a real route should bump it.
         let disabled = html.matches(r#"aria-disabled="true""#).count();
         let tabindex_minus = html.matches(r#"tabindex="-1""#).count();
-        // 9 placeholders + the `<nav>` itself carries `tabindex=-1` for
-        // the skip-link target, so 10 total `tabindex="-1"` attributes.
+        // 8 placeholders + the `<nav>` itself carries `tabindex=-1` for
+        // the skip-link target, so 9 total `tabindex="-1"` attributes.
         assert_eq!(
-            disabled, 9,
-            "expected 9 aria-disabled placeholders, got {disabled}"
+            disabled, 8,
+            "expected 8 aria-disabled placeholders, got {disabled}"
         );
         assert_eq!(
-            tabindex_minus, 10,
-            "expected 10 tabindex='-1' (9 placeholders + nav landmark), got {tabindex_minus}"
+            tabindex_minus, 9,
+            "expected 9 tabindex='-1' (8 placeholders + nav landmark), got {tabindex_minus}"
         );
     }
 

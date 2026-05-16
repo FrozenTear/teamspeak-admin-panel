@@ -22,8 +22,9 @@ use crate::ui::pages::DevVideoPlayerPage;
 use crate::ui::pages::{
     AdminUsersPage, AuditPage, BansPage, BotDetailPage, BotsIndexPage, ChannelsPage, ClientsPage,
     DashboardPlaceholder, FlowDetailPage, FlowEditPage, FlowFormPage, FlowsListPage, Home,
-    LoginPage, LogsPage, MusicLibraryPage, MusicPlaylistsPage, NotFoundPage, PublicWidgetPage,
-    RadioStationsPage, ServerEditPage, ServerInfoPage, ServersIndexPage, SettingsPage, SetupPage,
+    LoginPage, LogsPage, ModerationCasePage, ModerationQueuePage, MusicLibraryPage,
+    MusicPlaylistsPage, NotFoundPage, PermissionGrantsPage, PublicWidgetPage, RadioStationsPage,
+    ServerEditPage, ServerInfoPage, ServersIndexPage, SettingsPage, SetupPage, SubjectHistoryPage,
     VideoSourcesPage, WidgetsPage,
 };
 
@@ -149,6 +150,26 @@ pub enum Route {
     #[route("/admin/audit")]
     AuditPage {},
 
+    // PURA-287 Phase 9.0-ui — moderation surfaces. `/moderation` is the
+    // operator queue (cases + complaints); the case-detail and per-subject
+    // history routes nest under it so their URLs stay shareable. All three
+    // are role-gated to admin + moderator in-page; `/api/moderation/*`
+    // re-checks the `moderation.*` catalog server-side.
+    #[route("/moderation")]
+    ModerationQueuePage {},
+
+    #[route("/moderation/cases/:case_id")]
+    ModerationCasePage { case_id: i64 },
+
+    #[route("/moderation/subjects/:uid")]
+    SubjectHistoryPage { uid: String },
+
+    // PURA-287 — per-user moderation grant editor. Admin-gated like the
+    // other `/admin/*` surfaces; the sidebar entry is hidden for non-admins
+    // and `PUT /api/users/{id}/permissions` enforces `RequireAdmin`.
+    #[route("/admin/permissions")]
+    PermissionGrantsPage {},
+
     // PURA-213 — catch-all NotFound. Lives outside `AppShell` so the page
     // renders for both authed and anon visitors without an auth bounce
     // (e.g. typo'd URLs shouldn't kick anon users to `/login?next=<bad>`).
@@ -215,6 +236,29 @@ mod tests {
         assert!(matches!(
             Route::from_str("/flows/42/edit").expect("/flows/42/edit parse"),
             Route::FlowEditPage { flow_id: 42 }
+        ));
+    }
+
+    /// PURA-287 — the moderation routes. `/moderation` is static and must
+    /// win over the dynamic case/subject sub-routes; the dynamic segments
+    /// must parse their typed params (`case_id: i64`, `uid: String`).
+    #[test]
+    fn moderation_routes_resolve_with_typed_params() {
+        assert!(matches!(
+            Route::from_str("/moderation").expect("/moderation parse"),
+            Route::ModerationQueuePage {}
+        ));
+        assert!(matches!(
+            Route::from_str("/moderation/cases/7").expect("case parse"),
+            Route::ModerationCasePage { case_id: 7 }
+        ));
+        assert!(matches!(
+            Route::from_str("/moderation/subjects/subject-uid-1").expect("subject parse"),
+            Route::SubjectHistoryPage { uid } if uid == "subject-uid-1"
+        ));
+        assert!(matches!(
+            Route::from_str("/admin/permissions").expect("permissions parse"),
+            Route::PermissionGrantsPage {}
         ));
     }
 

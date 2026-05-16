@@ -304,6 +304,39 @@ where
     result
 }
 
+/// Authorized `PUT` with a JSON body and a typed JSON response — used by
+/// replace-all surfaces (e.g. `PUT /api/users/{id}/permissions`). Mirrors
+/// [`authorized_patch_json`] modulo the HTTP method.
+pub async fn authorized_put_json<B, T>(
+    gate: &RefreshGate,
+    base: &str,
+    path: &str,
+    body: &B,
+) -> Result<T, ApiError>
+where
+    B: serde::Serialize + ?Sized,
+    T: DeserializeOwned,
+{
+    log_api_call_enter("PUT", path);
+    let body_string =
+        serde_json::to_string(body).map_err(|e| ApiError::Deserialise(e.to_string()))?;
+    let (status, body) = gate
+        .run(|snap| {
+            let base = base.to_owned();
+            let path = path.to_owned();
+            let body_string = body_string.clone();
+            async move {
+                authorized_send_raw(HttpMethod::Put, &base, &path, Some(&body_string), &snap).await
+            }
+        })
+        .await
+        .map_err(ApiError::from)?;
+
+    let result = classify_maybe_empty(status, &body);
+    log_api_call_exit("PUT", path, status, &result);
+    result
+}
+
 /// `POST` / `DELETE` body-less variant: `204 No Content` is treated as
 /// success when `T = ()`, and any 2xx body is parsed as JSON otherwise.
 /// Non-2xx responses go through [`classify_response`] for the spec §7.0.2
@@ -365,6 +398,7 @@ struct BadGatewayBody {
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum HttpMethod {
     Post,
+    Put,
     Patch,
     Delete,
 }
@@ -460,6 +494,7 @@ async fn authorized_send_raw(
     let url = format!("{}{}", base.trim_end_matches('/'), path);
     let mut builder = match method {
         HttpMethod::Post => Request::post(&url),
+        HttpMethod::Put => Request::put(&url),
         HttpMethod::Patch => Request::patch(&url),
         HttpMethod::Delete => Request::delete(&url),
     };

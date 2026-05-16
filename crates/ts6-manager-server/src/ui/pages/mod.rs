@@ -17,6 +17,7 @@ mod flows;
 mod home;
 mod login;
 mod logs;
+mod moderation;
 mod music_bots;
 mod not_found;
 mod public_widget;
@@ -39,6 +40,9 @@ pub use flows::{FlowDetailPage, FlowEditPage, FlowFormPage, FlowsListPage};
 pub use home::Home;
 pub use login::LoginPage;
 pub use logs::LogsPage;
+pub use moderation::{
+    ModerationCasePage, ModerationQueuePage, PermissionGrantsPage, SubjectHistoryPage,
+};
 pub use music_bots::{
     BotDetailPage, BotsIndexPage, MusicLibraryPage, MusicPlaylistsPage, RadioStationsPage,
 };

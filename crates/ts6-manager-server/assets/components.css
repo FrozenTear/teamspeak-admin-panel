@@ -1654,3 +1654,220 @@
     max-height: none;
   }
 }
+
+/* ── Moderation surfaces (PURA-287, Phase 9.0-ui) ─────────────────────────
+   The /moderation queue + case detail + per-subject history pages and the
+   /admin/permissions grant editor. Built on the existing primitives
+   (.data-table, .empty, .ban-create, .tabs, Banner, Button); the rules
+   below cover only the moderation-specific composites. */
+
+.mono,
+.mod-grant-key {
+  font-family: var(--font-mono, monospace);
+}
+
+/* Stacked panels — a titled section with internal vertical rhythm. */
+.mod-panel {
+  margin-top: var(--space-6);
+}
+.mod-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  flex-wrap: wrap;
+}
+
+/* Status / metadata badges. */
+.mod-badge {
+  display: inline-block;
+  padding: 1px var(--space-3);
+  border-radius: var(--radius-full);
+  border: 1px solid var(--border-strong);
+  font-size: var(--text-2xs);
+  font-weight: var(--weight-semibold);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+}
+.mod-badge--open {
+  border-color: var(--accent-fg);
+  color: var(--accent-fg);
+}
+.mod-badge--actioned {
+  border-color: var(--warning-fg);
+  color: var(--warning-fg);
+}
+.mod-badge--resolved {
+  border-color: var(--success-fg);
+  color: var(--success-fg);
+}
+.mod-badge--role {
+  border-color: var(--border-subtle);
+  color: var(--text-muted);
+}
+
+/* Case header — subject name beside its status badge. */
+.mod-case-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  flex-wrap: wrap;
+}
+.mod-case-head h1 {
+  margin: 0;
+}
+
+/* Case metadata key/value grid. */
+.mod-kv {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: var(--space-3) var(--space-6);
+  margin: var(--space-5) 0;
+}
+.mod-kv > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.mod-kv dt {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.mod-kv dd {
+  margin: 0;
+  color: var(--text-primary);
+}
+
+/* Action timeline — an ordered list of timeline rows. */
+.mod-timeline {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.mod-timeline-row {
+  display: flex;
+  gap: var(--space-4);
+  padding: var(--space-4) 0;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.mod-timeline-row:last-child {
+  border-bottom: 0;
+}
+.mod-timeline-icon {
+  flex: 0 0 auto;
+  width: 24px;
+  text-align: center;
+  color: var(--text-muted);
+}
+.mod-timeline-body {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.mod-timeline-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+.mod-timeline-when {
+  margin-left: auto;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+.mod-timeline-caselink {
+  font-size: var(--text-xs);
+}
+.mod-timeline-reason {
+  margin: var(--space-2) 0 0;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+}
+
+/* Subject notes. */
+.mod-note-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.mod-note {
+  padding: var(--space-4) 0;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.mod-note:last-child {
+  border-bottom: 0;
+}
+.mod-note-body {
+  margin: 0 0 var(--space-2);
+  white-space: pre-wrap;
+}
+
+/* Permission grant editor. */
+.mod-user-picker {
+  max-width: 420px;
+}
+.mod-grant-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.mod-grant {
+  border-bottom: 1px solid var(--border-subtle);
+}
+.mod-grant:last-child {
+  border-bottom: 0;
+}
+.mod-grant--danger .mod-grant-name span:first-child {
+  color: var(--danger-fg);
+}
+.mod-grant-main {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-4);
+  padding: var(--space-4) 0;
+  cursor: pointer;
+}
+.mod-grant-main input[type="checkbox"] {
+  margin-top: 2px;
+  flex: 0 0 auto;
+}
+.mod-grant-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.mod-grant-name {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  font-weight: var(--weight-semibold);
+  flex-wrap: wrap;
+}
+.mod-grant-desc {
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}
+.mod-grant-key {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+}
+.mod-grant-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  margin-top: var(--space-5);
+}
+
+/* select / textarea reuse the .input primitive's box; these top up the
+   parts the text-input rule does not cover. */
+select.input {
+  cursor: pointer;
+}
+textarea.input {
+  resize: vertical;
+  min-height: 56px;
+  font: inherit;
+}
