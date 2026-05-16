@@ -7,12 +7,12 @@
 //! extractor (`crate::auth::extractors`).
 //!
 //! Resolution — [`effective_permissions`] / [`has_permission`]:
-//!   - `admin`     → implicitly holds the entire catalog (decision 5:
-//!                   "`admin` implicitly holds all").
-//!   - `moderator` → role-default set ∪ explicit `user_permission` grants.
-//!   - `viewer`    → explicit `user_permission` grants only — a viewer holds
-//!                   nothing by default (plan §6: "a `viewer` sees nothing
-//!                   moderation").
+//!  - `admin`     → implicitly holds the entire catalog (decision 5:
+//!    "`admin` implicitly holds all").
+//!  - `moderator` → role-default set ∪ explicit `user_permission` grants.
+//!  - `viewer`    → explicit `user_permission` grants only — a viewer holds
+//!    nothing by default (plan §6: "a `viewer` sees nothing
+//!    moderation").
 //!
 //! Security posture (secure-by-default, least privilege): the `moderator`
 //! default set deliberately **excludes** `moderation.action.ban_ip`. An IP
