@@ -370,6 +370,9 @@
 }
 .banner .body {
   font: var(--weight-regular) var(--text-sm) / var(--lh-md) var(--font-sans);
+  /* PURA-273: long unbreakable tokens (stream URLs in last_error) must wrap
+     so the Danger banner stays inside the card at the 390px viewport. */
+  word-break: break-word;
 }
 .banner .title { font-weight: var(--weight-semibold); }
 .banner.banner-warning {
