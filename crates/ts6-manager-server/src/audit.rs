@@ -53,6 +53,7 @@ pub enum AuditKind {
     SessionRevoked,
     SelfPasswordChanged,
     SetupCompleted,
+    UserPermissionsChanged,
 }
 
 impl AuditKind {
@@ -68,6 +69,7 @@ impl AuditKind {
             AuditKind::SessionRevoked => "sessionRevoked",
             AuditKind::SelfPasswordChanged => "selfPasswordChanged",
             AuditKind::SetupCompleted => "setupCompleted",
+            AuditKind::UserPermissionsChanged => "userPermissionsChanged",
         }
     }
 }

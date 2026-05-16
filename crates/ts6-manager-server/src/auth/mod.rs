@@ -15,6 +15,7 @@ pub mod complexity;
 pub mod extractors;
 pub mod jwt;
 pub mod password;
+pub mod permissions;
 pub mod refresh;
 pub mod routes;
 pub mod ws_handshake;

@@ -42,8 +42,9 @@ use ts6_manager_shared::auth::ErrorResponse;
 use crate::app_state::AppState;
 use crate::audit::{self, AuditKind, Event, Outcome, Target};
 use crate::auth::extractors::{RequestMeta, RequireAdmin};
+use crate::auth::permissions;
 use crate::auth::{complexity, password};
-use crate::repos::{refresh_tokens, users};
+use crate::repos::{refresh_tokens, user_permissions, users};
 
 const VALID_ROLES: &[&str] = &["admin", "moderator", "viewer"];
 const USERNAME_MIN: usize = 1;
@@ -69,6 +70,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/users/{id}/sessions/{sid}",
             axum::routing::delete(revoke_session),
+        )
+        .route(
+            "/api/users/{id}/permissions",
+            axum::routing::get(list_permissions).put(replace_permissions),
         )
 }
 
@@ -694,6 +699,108 @@ fn err(status: StatusCode, body: &str) -> Response {
 
 fn internal() -> Response {
     err(StatusCode::INTERNAL_SERVER_ERROR, "Internal error")
+}
+
+// ── Permission grant surface (PURA-284 / Phase 9.0-rbac) ─────────────────
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UserPermissionsResponse {
+    user_id: i64,
+    effective: Vec<String>,
+    explicit_grants: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct UserPermissionsUpdate {
+    permissions: Vec<String>,
+}
+
+/// `GET /api/users/{id}/permissions` — admin-only.
+///
+/// Returns the resolved effective permission set (role defaults ∪ explicit
+/// grants, intersected with the catalog) and the raw explicit-grant list.
+async fn list_permissions(
+    State(state): State<AppState>,
+    RequireAdmin(_admin): RequireAdmin,
+    Path(id): Path<i64>,
+) -> Result<Json<UserPermissionsResponse>, Response> {
+    let user = users::find_by_id(&state.db, id)
+        .await
+        .map_err(|_| internal())?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "user not found"))?;
+
+    let grants = user_permissions::permissions_for_user(&state.db, id)
+        .await
+        .map_err(|_| internal())?;
+
+    let effective = permissions::effective_permissions(&user.role, &grants)
+        .into_iter()
+        .collect();
+
+    Ok(Json(UserPermissionsResponse {
+        user_id: id,
+        effective,
+        explicit_grants: grants,
+    }))
+}
+
+/// `PUT /api/users/{id}/permissions` — admin-only, replace-all semantics.
+///
+/// The body `{"permissions": [...]}` is validated against the catalog; any
+/// unknown string is rejected 422. On success the grant set is atomically
+/// replaced and a `userPermissionsChanged` audit row is emitted.
+async fn replace_permissions(
+    State(state): State<AppState>,
+    RequireAdmin(admin): RequireAdmin,
+    request_meta: RequestMeta,
+    Path(id): Path<i64>,
+    Json(req): Json<UserPermissionsUpdate>,
+) -> Result<Json<UserPermissionsResponse>, Response> {
+    let user = users::find_by_id(&state.db, id)
+        .await
+        .map_err(|_| internal())?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "user not found"))?;
+
+    for p in &req.permissions {
+        if !permissions::is_known_permission(p) {
+            return Err(err(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &format!("unknown permission: {p}"),
+            ));
+        }
+    }
+
+    user_permissions::replace_all(&state.db, id, admin.id, &req.permissions)
+        .await
+        .map_err(|_| internal())?;
+
+    let grants = user_permissions::permissions_for_user(&state.db, id)
+        .await
+        .map_err(|_| internal())?;
+    let effective: Vec<String> = permissions::effective_permissions(&user.role, &grants)
+        .into_iter()
+        .collect();
+
+    audit::record(
+        &state.db,
+        Event {
+            actor: admin.clone(),
+            kind: AuditKind::UserPermissionsChanged,
+            target: Some(Target::user(id, user.username)),
+            payload: Some(serde_json::json!({ "permissions": &req.permissions })),
+            outcome: Outcome::Success,
+            error_msg: None,
+            request: request_meta.clone(),
+        },
+    )
+    .await;
+
+    Ok(Json(UserPermissionsResponse {
+        user_id: id,
+        effective,
+        explicit_grants: grants,
+    }))
 }
 
 #[cfg(test)]

@@ -148,6 +148,28 @@ pub async fn permissions_for_user(db: &Database, subject_user_id: i64) -> Result
         .collect())
 }
 
+/// Replace-all: atomically set `subject_user_id`'s grants to exactly
+/// `new_permissions`. Called by `PUT /api/users/{id}/permissions`.
+pub async fn replace_all(
+    db: &Database,
+    subject_user_id: i64,
+    granted_by_user_id: i64,
+    new_permissions: &[String],
+) -> Result<()> {
+    let current = permissions_for_user(db, subject_user_id).await?;
+    for p in &current {
+        if !new_permissions.iter().any(|n| n == p) {
+            revoke(db, subject_user_id, p).await?;
+        }
+    }
+    for p in new_permissions {
+        if !current.iter().any(|c| c == p) {
+            grant(db, subject_user_id, p, Some(granted_by_user_id)).await?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

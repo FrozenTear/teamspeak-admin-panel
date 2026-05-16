@@ -12,6 +12,7 @@
 //! REST route does (none exist yet in the Phase 1 surface).
 
 use std::convert::Infallible;
+use std::marker::PhantomData;
 use std::net::SocketAddr;
 
 use axum::Json;
@@ -24,7 +25,8 @@ use ts6_manager_shared::auth::{ErrorResponse, auth_error_strings as msg};
 
 use crate::app_state::AppState;
 use crate::auth::jwt;
-use crate::repos::users;
+use crate::auth::permissions::{self, ModPermission};
+use crate::repos::{user_permissions, users};
 use crate::web::proxy;
 
 /// User context attached to a request after [`RequireAuth`] succeeds.
@@ -219,6 +221,48 @@ where
     }
 }
 
+/// Phase 9.0 / PURA-284 — action-level permission gate layered on the
+/// coarse role gate. `P` is a zero-sized [`ModPermission`] marker from
+/// the `permissions` catalog; the extractor is compile-time safe — you
+/// cannot parameterise it with an arbitrary string.
+///
+/// Resolution order:
+///   1. The request must pass [`RequireAuth`] (JWT + live user row).
+///   2. For `admin` users, every catalog permission is implicitly held.
+///   3. For all other roles, explicit grants are fetched from
+///      `user_permissions` and unioned with the role default set.
+///   4. If the resolved set does not contain `P::PERMISSION`, the request
+///      is rejected with 403 Forbidden.
+pub struct RequirePermission<P: ModPermission>(pub AuthUser, PhantomData<P>);
+
+impl<S, P> FromRequestParts<S> for RequirePermission<P>
+where
+    AppState: FromRef<S>,
+    S: Send + Sync,
+    P: ModPermission,
+{
+    type Rejection = AuthError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let app: AppState = AppState::from_ref(state);
+        let RequireAuth(user) = RequireAuth::from_request_parts(parts, state).await?;
+
+        let grants: Vec<String> = if user.is_admin() {
+            vec![]
+        } else {
+            user_permissions::permissions_for_user(&app.db, user.id)
+                .await
+                .map_err(|_| AuthError::Internal)?
+        };
+
+        if !permissions::has_permission(&user.role, &grants, P::PERMISSION) {
+            return Err(AuthError::Forbidden);
+        }
+
+        Ok(RequirePermission(user, PhantomData))
+    }
+}
+
 /// Rejection responses for the extractors above. Bodies match spec §6.4
 /// verbatim via `auth_error_strings::*`.
 #[derive(Debug, Clone, Copy)]
@@ -227,6 +271,7 @@ pub enum AuthError {
     Invalid,
     Disabled,
     Forbidden,
+    Internal,
 }
 
 impl IntoResponse for AuthError {
@@ -236,6 +281,7 @@ impl IntoResponse for AuthError {
             AuthError::Invalid => (StatusCode::UNAUTHORIZED, msg::INVALID_TOKEN),
             AuthError::Disabled => (StatusCode::UNAUTHORIZED, msg::USER_DISABLED),
             AuthError::Forbidden => (StatusCode::FORBIDDEN, msg::INSUFFICIENT_PERMS),
+            AuthError::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "internal server error"),
         };
         (status, Json(ErrorResponse::new(msg))).into_response()
     }
