@@ -11,7 +11,8 @@
 use std::collections::BTreeMap;
 
 use ts6_manager_shared::flows::v2::{
-    BranchCase, Edge, EdgeId, FlowGraph, Node, NodeId, NodeKind, Position, TransformOutput,
+    BranchCase, Edge, EdgeId, FlowGraph, Node, NodeId, NodeKind, NodeStatus, Position,
+    TransformOutput,
 };
 use ts6_manager_shared::flows::{Action, FlowId, Trigger};
 
@@ -65,13 +66,13 @@ impl PaletteKind {
     /// `docs/flows/v2/canvas-visual-spec.md` §6.
     pub fn glyph(self) -> &'static str {
         match self {
-            PaletteKind::Trigger => "\u{21af}",   // ↯  (was ⚡ U+26A1 — emoji)
-            PaletteKind::Action => "\u{00bb}",    // »
-            PaletteKind::Branch => "\u{22d4}",    // ⋔  (was ⑂ U+2442 — rare)
-            PaletteKind::Parallel => "\u{21c9}",  // ⇉
-            PaletteKind::Delay => "\u{25f7}",     // ◷  (was ⏱ U+23F1 — emoji)
+            PaletteKind::Trigger => "\u{21af}",  // ↯  (was ⚡ U+26A1 — emoji)
+            PaletteKind::Action => "\u{00bb}",   // »
+            PaletteKind::Branch => "\u{22d4}",   // ⋔  (was ⑂ U+2442 — rare)
+            PaletteKind::Parallel => "\u{21c9}", // ⇉
+            PaletteKind::Delay => "\u{25f7}",    // ◷  (was ⏱ U+23F1 — emoji)
             PaletteKind::Transform => "\u{21c4}", // ⇄
-            PaletteKind::Subflow => "\u{25a3}",   // ▣  (was ⧉ U+29C9 — rare)
+            PaletteKind::Subflow => "\u{25a3}",  // ▣  (was ⧉ U+29C9 — rare)
         }
     }
 
@@ -85,6 +86,25 @@ impl PaletteKind {
             PaletteKind::Delay => "Wait, then continue",
             PaletteKind::Transform => "Reshape data, no side effects",
             PaletteKind::Subflow => "Run another flow",
+        }
+    }
+
+    /// The role family this kind belongs to — the `--{family}` suffix of the
+    /// `fc-node--*` / `fc-chip--*` CSS modifier (`canvas-visual-spec.md` §3).
+    ///
+    /// Seven kinds collapse to three families so the canvas stays within the
+    /// design system's ~5 semantic colours and keeps red/amber reserved for
+    /// error roles: the family carries the colour, the glyph and the
+    /// always-present text label carry the specific kind (Gestalt
+    /// similarity — same colour ⇒ same role).
+    pub fn family(self) -> &'static str {
+        match self {
+            // The single entry node.
+            PaletteKind::Trigger => "trigger",
+            // Side-effecting kinds — these carry an `err` port.
+            PaletteKind::Action | PaletteKind::Parallel | PaletteKind::Subflow => "effect",
+            // Path/data shaping, no side effects.
+            PaletteKind::Branch | PaletteKind::Delay | PaletteKind::Transform => "control",
         }
     }
 
@@ -147,6 +167,76 @@ pub struct PortSpec {
     /// The try/catch error seam. Rendered shape/label-distinct, **not**
     /// colour-only (`ui-brief.md` §7, WCAG 1.4.1).
     pub is_err: bool,
+}
+
+/// A node's state in the run overlay (`canvas-visual-spec.md` §5).
+///
+/// Five states, each painted three ways at once — a card-border treatment,
+/// a glyph, and a text label — so none is signalled by colour alone
+/// (WCAG 1.4.1). `Skipped` (dimmed) and `Interrupted` (dashed border) are
+/// further distinguished by treatment, since both are neutral-coloured.
+///
+/// Distinct from the persisted [`NodeStatus`]: `Running` is a transient UI
+/// state — a node the engine has entered but not yet finished — with no
+/// persisted equivalent. The other four map 1:1 from `NodeStatus`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunOverlayStatus {
+    Running,
+    Ok,
+    Errored,
+    Skipped,
+    Interrupted,
+}
+
+impl RunOverlayStatus {
+    /// The `fc-node--{…}` modifier suffix the card class appends.
+    pub fn class_suffix(self) -> &'static str {
+        match self {
+            RunOverlayStatus::Running => "running",
+            RunOverlayStatus::Ok => "ok",
+            RunOverlayStatus::Errored => "errored",
+            RunOverlayStatus::Skipped => "skipped",
+            RunOverlayStatus::Interrupted => "interrupted",
+        }
+    }
+
+    /// The `.fc-node-status` row glyph — the v1.1 icon set (`ui-brief.md`
+    /// §7.1), `aria-hidden`, paired with the text label below so it is never
+    /// the sole carrier of meaning.
+    pub fn glyph(self) -> &'static str {
+        match self {
+            RunOverlayStatus::Running => "\u{27f3}",     // ⟳
+            RunOverlayStatus::Ok => "\u{2713}",          // ✓
+            RunOverlayStatus::Errored => "\u{2715}",     // ✕
+            RunOverlayStatus::Skipped => "\u{21b7}",     // ↷
+            RunOverlayStatus::Interrupted => "\u{2016}", // ‖
+        }
+    }
+
+    /// The `.fc-node-status` row text label — always rendered, the primary
+    /// (non-colour, non-glyph) carrier of the status.
+    pub fn label(self) -> &'static str {
+        match self {
+            RunOverlayStatus::Running => "Running",
+            RunOverlayStatus::Ok => "Ok",
+            RunOverlayStatus::Errored => "Errored",
+            RunOverlayStatus::Skipped => "Skipped",
+            RunOverlayStatus::Interrupted => "Interrupted",
+        }
+    }
+
+    /// Lift a finished node's persisted [`NodeStatus`] into the overlay
+    /// state. A node with no `NodeResult` yet — still executing — is
+    /// `Running`, which has no `NodeStatus` equivalent and so is not produced
+    /// here (`architecture.md` §6.3).
+    pub fn from_node_status(status: NodeStatus) -> Self {
+        match status {
+            NodeStatus::Ok => RunOverlayStatus::Ok,
+            NodeStatus::Errored => RunOverlayStatus::Errored,
+            NodeStatus::Skipped => RunOverlayStatus::Skipped,
+            NodeStatus::Interrupted => RunOverlayStatus::Interrupted,
+        }
+    }
 }
 
 /// The wire `kind` discriminant of an existing node.
@@ -536,10 +626,83 @@ mod tests {
     }
 
     #[test]
+    fn the_seven_kinds_collapse_to_three_role_families() {
+        use std::collections::BTreeSet;
+        // Trigger is its own family; the side-effecting kinds share `effect`;
+        // the path/data-shaping kinds share `control` (canvas-visual-spec §3).
+        assert_eq!(PaletteKind::Trigger.family(), "trigger");
+        for k in [
+            PaletteKind::Action,
+            PaletteKind::Parallel,
+            PaletteKind::Subflow,
+        ] {
+            assert_eq!(k.family(), "effect", "{:?} is an effect kind", k);
+        }
+        for k in [
+            PaletteKind::Branch,
+            PaletteKind::Delay,
+            PaletteKind::Transform,
+        ] {
+            assert_eq!(k.family(), "control", "{:?} is a control kind", k);
+        }
+        // Exactly three families across all seven kinds.
+        let families: BTreeSet<&str> = PaletteKind::ALL.iter().map(|k| k.family()).collect();
+        assert_eq!(families.len(), 3);
+    }
+
+    #[test]
+    fn run_overlay_status_carries_a_distinct_suffix_glyph_and_label() {
+        use std::collections::BTreeSet;
+        let all = [
+            RunOverlayStatus::Running,
+            RunOverlayStatus::Ok,
+            RunOverlayStatus::Errored,
+            RunOverlayStatus::Skipped,
+            RunOverlayStatus::Interrupted,
+        ];
+        // All five suffixes, glyphs, and labels are distinct — the overlay
+        // never relies on colour alone (WCAG 1.4.1).
+        let suffixes: BTreeSet<&str> = all.iter().map(|s| s.class_suffix()).collect();
+        let glyphs: BTreeSet<&str> = all.iter().map(|s| s.glyph()).collect();
+        let labels: BTreeSet<&str> = all.iter().map(|s| s.label()).collect();
+        assert_eq!(suffixes.len(), 5, "suffixes distinct");
+        assert_eq!(glyphs.len(), 5, "glyphs distinct");
+        assert_eq!(labels.len(), 5, "labels distinct");
+        assert_eq!(RunOverlayStatus::Running.class_suffix(), "running");
+        assert_eq!(RunOverlayStatus::Errored.label(), "Errored");
+    }
+
+    #[test]
+    fn run_overlay_status_lifts_every_persisted_node_status() {
+        // The four terminal NodeStatus values map 1:1; `Running` is the only
+        // overlay state with no persisted equivalent.
+        assert_eq!(
+            RunOverlayStatus::from_node_status(NodeStatus::Ok),
+            RunOverlayStatus::Ok
+        );
+        assert_eq!(
+            RunOverlayStatus::from_node_status(NodeStatus::Errored),
+            RunOverlayStatus::Errored
+        );
+        assert_eq!(
+            RunOverlayStatus::from_node_status(NodeStatus::Skipped),
+            RunOverlayStatus::Skipped
+        );
+        assert_eq!(
+            RunOverlayStatus::from_node_status(NodeStatus::Interrupted),
+            RunOverlayStatus::Interrupted
+        );
+    }
+
+    #[test]
     fn tidy_lays_a_path_out_left_to_right_by_longest_depth() {
         let mut graph = starter_graph();
         let trigger = NodeId("trigger_1".into());
-        let a = add_node(&mut graph, PaletteKind::Action, Position { x: 999.0, y: 999.0 });
+        let a = add_node(
+            &mut graph,
+            PaletteKind::Action,
+            Position { x: 999.0, y: 999.0 },
+        );
         let b = add_node(&mut graph, PaletteKind::Delay, Position { x: 5.0, y: 5.0 });
         connect(&mut graph, &trigger, "out", &a);
         connect(&mut graph, &a, "out", &b);

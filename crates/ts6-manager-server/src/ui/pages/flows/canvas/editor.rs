@@ -14,16 +14,19 @@
 //!
 //! Not yet wired (tracked on [PURA-267](/PURA/issues/PURA-267), needs the
 //! v2 HTTP surface from [PURA-266](/PURA/issues/PURA-266)): debounced
-//! `POST /api/flows/validate` inline linting, the run-overlay poll, save,
-//! and the "Tidy" auto-layout. The toolbar carries a disabled Tidy button
-//! as the placement marker.
+//! `POST /api/flows/validate` inline linting, save, and the run-overlay
+//! *poll*. The overlay *rendering* is wired — the `run_overlay` prop paints
+//! per-node status (`canvas-visual-spec.md` §5) — it simply has no live data
+//! source until PURA-266's `GET …/runs/{runId}` lands to feed it.
+
+use std::collections::HashMap;
 
 use dioxus::prelude::*;
 use ts6_manager_shared::flows::v2::{FlowGraph, NodeId, NodeKind, Position};
 
 use super::geometry::{self, KBD_STEP, NODE_W, ZOOM_MAX, ZOOM_MIN};
 use super::inspector::Inspector;
-use super::model::{self, PaletteKind};
+use super::model::{self, PaletteKind, RunOverlayStatus};
 use super::style::CANVAS_CSS;
 
 /// An in-flight node drag — pointer origin + node origin, in their own
@@ -98,11 +101,18 @@ struct NodeRender {
     title: String,
     summary: String,
     aria: String,
-    css_class: &'static str,
+    /// Full `class` attribute — `fc-node`, the `fc-node--{family}` tint, the
+    /// `selected`/`connect-src` state, and the `fc-node--{status}` run
+    /// modifier when the overlay is live. A `String`, since the family and
+    /// status modifiers are data-driven (`canvas-visual-spec.md` §3, §5).
+    css_class: String,
     card_style: String,
     has_input: bool,
     in_port_top: f64,
     out_ports: Vec<OutPortRender>,
+    /// The node's run-overlay status, when a run overlay is being painted.
+    /// Drives the `fc-node--{status}` class and the `.fc-node-status` row.
+    run_status: Option<RunOverlayStatus>,
 }
 
 #[derive(Clone)]
@@ -110,6 +120,11 @@ struct OutPortRender {
     name: String,
     is_err: bool,
     top: f64,
+    /// The visible `.fc-port-label` text. For the `err` port this is the
+    /// literal "on error" — distinct by label as well as shape, never colour
+    /// alone (`canvas-visual-spec.md` §4, WCAG 1.4.1) — while the wire port
+    /// id stays the raw `"err"`.
+    label: String,
     /// `err` port footgun copy (`ui-brief.md` §6.3) — shown only when the
     /// port has no outgoing edge.
     warn_unconnected: bool,
@@ -118,8 +133,18 @@ struct OutPortRender {
 /// The reusable three-pane editor. `read_only` renders the Definition-tab
 /// and run-overlay view: the canvas still pans/zooms and selects, but the
 /// palette, ports, and inspector fields are inert.
+///
+/// `run_overlay` is the optional run-overlay layer — a per-node status map
+/// (`canvas-visual-spec.md` §5). It is `None` for plain editing; PURA-266's
+/// `GET …/runs/{runId}` poll supplies `Some(map)` to paint a run. As an
+/// `Option` prop it defaults to `None`, so plain-editor call sites are
+/// unaffected.
 #[component]
-pub fn FlowCanvasEditor(initial: FlowGraph, read_only: bool) -> Element {
+pub fn FlowCanvasEditor(
+    initial: FlowGraph,
+    read_only: bool,
+    run_overlay: Option<HashMap<NodeId, RunOverlayStatus>>,
+) -> Element {
     let mut graph = use_signal(|| initial.clone());
     let mut selected = use_signal(|| None::<NodeId>);
     let mut drag = use_signal(|| None::<DragState>);
@@ -251,36 +276,59 @@ pub fn FlowCanvasEditor(initial: FlowGraph, read_only: bool) -> Element {
                 .map(|(idx, p)| OutPortRender {
                     warn_unconnected: p.is_err
                         && !connected_ports.contains(&(n.id.0.clone(), p.name.clone())),
+                    // The err port reads "on error" — a label cue, not the
+                    // raw wire id; circles vs the err port's square carry
+                    // the shape cue (canvas-visual-spec §4).
+                    label: if p.is_err {
+                        "on error".to_string()
+                    } else {
+                        p.name.clone()
+                    },
                     name: p.name,
                     is_err: p.is_err,
                     top: geometry::out_port_css_top(idx),
                 })
                 .collect::<Vec<_>>();
-            let css_class = if sel.as_ref() == Some(&n.id) {
-                "fc-node selected"
+            let run_status = run_overlay.as_ref().and_then(|m| m.get(&n.id)).copied();
+            // fc-node · family tint · selection/connect state · run status —
+            // family and status are data-driven, hence the String build.
+            let mut css_class = format!("fc-node fc-node--{}", pk.family());
+            if sel.as_ref() == Some(&n.id) {
+                css_class.push_str(" selected");
             } else if kbd.as_ref().map(|(id, _)| id) == Some(&n.id) {
-                "fc-node connect-src"
-            } else {
-                "fc-node"
-            };
+                css_class.push_str(" connect-src");
+            }
+            if let Some(st) = run_status {
+                css_class.push_str(" fc-node--");
+                css_class.push_str(st.class_suffix());
+            }
+            // The overlay status row adds a body line — grow the card so it
+            // does not spill past the rounded border.
+            let card_h = geometry::node_height(out_ports.len())
+                + if run_status.is_some() { 24.0 } else { 0.0 };
             let title = n.label.clone().unwrap_or_else(|| n.id.0.clone());
+            // The run status rides in the node's accessible name too, so it
+            // is not glyph-/colour-only for assistive tech (WCAG 1.4.1).
+            let aria = match run_status {
+                Some(st) => format!("{} node {} \u{2014} {}", pk.label(), title, st.label()),
+                None => format!("{} node {}", pk.label(), title),
+            };
             NodeRender {
                 id: n.id.clone(),
                 glyph: pk.glyph(),
                 kind_label: pk.label(),
-                aria: format!("{} node {}", pk.label(), title),
+                aria,
                 title,
                 summary: node_summary(&n.kind),
                 css_class,
                 card_style: format!(
-                    "left: {}px; top: {}px; width: {NODE_W}px; height: {}px;",
-                    n.position.x,
-                    n.position.y,
-                    geometry::node_height(out_ports.len()),
+                    "left: {}px; top: {}px; width: {NODE_W}px; height: {card_h}px;",
+                    n.position.x, n.position.y,
                 ),
                 has_input: model::has_input(&n.kind),
                 in_port_top: geometry::in_port_css_top(),
                 out_ports,
+                run_status,
             }
         })
         .collect();
@@ -298,7 +346,7 @@ pub fn FlowCanvasEditor(initial: FlowGraph, read_only: bool) -> Element {
                 p { class: "fc-pane-title", "Palette" }
                 for kind in PaletteKind::ALL {
                     button {
-                        class: "fc-chip",
+                        class: "fc-chip fc-chip--{kind.family()}",
                         r#type: "button",
                         disabled: read_only
                             || (kind == PaletteKind::Trigger && trigger_present),
@@ -446,6 +494,14 @@ pub fn FlowCanvasEditor(initial: FlowGraph, read_only: bool) -> Element {
                             div { class: "fc-node-body",
                                 div { "{nr.kind_label}" }
                                 div { "{nr.summary}" }
+                                // Run-overlay status row — glyph + text label,
+                                // never colour alone (canvas-visual-spec §5).
+                                if let Some(st) = nr.run_status {
+                                    div { class: "fc-node-status", role: "status",
+                                        span { "aria-hidden": "true", "{st.glyph()}" }
+                                        span { "{st.label()}" }
+                                    }
+                                }
                             }
 
                             if nr.has_input {
@@ -515,7 +571,7 @@ pub fn FlowCanvasEditor(initial: FlowGraph, read_only: bool) -> Element {
                                             }
                                         }
                                     },
-                                    span { class: "fc-port-label", "{port.name}" }
+                                    span { class: "fc-port-label", "{port.label}" }
                                 }
                             }
                         }
@@ -571,6 +627,41 @@ pub fn FlowCanvasEditor(initial: FlowGraph, read_only: bool) -> Element {
     }
 }
 
+/// A static demo graph for the dev mount — one node of every kind, each
+/// tagged with a run-overlay status. Renders every family colour and every
+/// overlay state on one screen so QA can run the greyscale / live-font /
+/// both-theme checks (PURA-279 acceptance) without a live run.
+#[cfg(debug_assertions)]
+fn overlay_demo() -> (FlowGraph, HashMap<NodeId, RunOverlayStatus>) {
+    let mut graph = FlowGraph {
+        nodes: Vec::new(),
+        edges: Vec::new(),
+    };
+    let mut overlay = HashMap::new();
+    // Five of the seven get a status — covering all five overlay states;
+    // `transform`/`subflow` stay un-run so the no-overlay card also shows.
+    let demo: [(PaletteKind, Option<RunOverlayStatus>); 7] = [
+        (PaletteKind::Trigger, Some(RunOverlayStatus::Ok)),
+        (PaletteKind::Action, Some(RunOverlayStatus::Running)),
+        (PaletteKind::Branch, Some(RunOverlayStatus::Skipped)),
+        (PaletteKind::Parallel, Some(RunOverlayStatus::Errored)),
+        (PaletteKind::Delay, Some(RunOverlayStatus::Interrupted)),
+        (PaletteKind::Transform, None),
+        (PaletteKind::Subflow, None),
+    ];
+    for (i, (kind, status)) in demo.into_iter().enumerate() {
+        let pos = Position {
+            x: 48.0 + (i % 4) as f64 * 248.0,
+            y: 40.0 + (i / 4) as f64 * 232.0,
+        };
+        let id = model::add_node(&mut graph, kind, pos);
+        if let Some(st) = status {
+            overlay.insert(id, st);
+        }
+    }
+    (graph, overlay)
+}
+
 /// `/dev/flow-canvas` — debug-only mount for the v2 canvas editor while the
 /// v2 HTTP surface ([PURA-266](/PURA/issues/PURA-266)) lands. Gated by
 /// `cfg(debug_assertions)` at the route enum, exactly as the spike route
@@ -579,6 +670,7 @@ pub fn FlowCanvasEditor(initial: FlowGraph, read_only: bool) -> Element {
 #[cfg(debug_assertions)]
 #[component]
 pub fn DevFlowCanvasPage() -> Element {
+    let (demo_graph, demo_overlay) = overlay_demo();
     rsx! {
         main {
             style: "padding: 16px; max-width: 1280px; margin: 0 auto;",
@@ -587,9 +679,23 @@ pub fn DevFlowCanvasPage() -> Element {
             }
             p { style: "font-size: 12px; color: #5a6378; margin: 0 0 12px;",
                 "PURA-267 — three-pane canvas editor on the v2 wire types. "
-                "Save / validate / run-overlay land with PURA-266's HTTP surface."
+                "Save / validate / run-overlay poll land with PURA-266's HTTP surface."
             }
             FlowCanvasEditor { initial: model::starter_graph(), read_only: false }
+
+            h2 { style: "font-size: 15px; margin: 24px 0 4px;",
+                "Run-overlay demo — seven kinds, five statuses"
+            }
+            p { style: "font-size: 12px; color: #5a6378; margin: 0 0 12px;",
+                "Static read-only render for the PURA-279 QA pass: per-kind family "
+                "colour, the err-port \"on error\" label, and all five run statuses "
+                "(greyscale + live-font check)."
+            }
+            FlowCanvasEditor {
+                initial: demo_graph,
+                read_only: true,
+                run_overlay: Some(demo_overlay),
+            }
         }
     }
 }
