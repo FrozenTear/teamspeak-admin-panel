@@ -4,9 +4,12 @@
 //! Resources (every endpoint `RequirePermission`-gated — the action-level
 //! `moderation.*` catalog from `9.0-rbac`, layered on the coarse role gate):
 //!
-//! - `cases` — `GET /cases`, `GET /cases/{id}`, `POST /cases`,
-//!   `POST /cases/{id}/actions`, `POST /cases/{id}/resolve`,
+//! - `cases` — `GET /cases` (filterable by `origin`), `GET /cases/{id}`,
+//!   `POST /cases`, `POST /cases/{id}/actions`, `POST /cases/{id}/resolve`,
 //!   `POST /cases/{id}/reopen`.
+//! - `automod` — `POST /cases/{id}/actions/{actionId}/revert` (one-click
+//!   revert of a `mute` / `ban` automod action) and
+//!   `GET /automod/metrics` (per-`ruleKey` aggregates). Phase 9.1.4.
 //! - `notes` — `GET|POST /subjects/{uid}/notes`.
 //! - `history` — `GET /subjects/{uid}/history`.
 //! - `complaints` — `GET /complaints`, `POST /complaints/resolve` (the
@@ -31,6 +34,7 @@
 //! re-implementing them.
 
 mod actions;
+mod automod;
 mod cases;
 mod complaints;
 mod history;
@@ -59,8 +63,13 @@ pub fn router() -> Router<AppState> {
         .route("/api/moderation/cases", get(cases::list).post(cases::open))
         .route("/api/moderation/cases/{id}", get(cases::detail))
         .route("/api/moderation/cases/{id}/actions", post(actions::append))
+        .route(
+            "/api/moderation/cases/{id}/actions/{actionId}/revert",
+            post(automod::revert_action),
+        )
         .route("/api/moderation/cases/{id}/resolve", post(cases::resolve))
         .route("/api/moderation/cases/{id}/reopen", post(cases::reopen))
+        .route("/api/moderation/automod/metrics", get(automod::metrics))
         .route(
             "/api/moderation/subjects/{uid}/history",
             get(history::subject_history),

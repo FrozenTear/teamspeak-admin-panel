@@ -115,10 +115,18 @@ pub struct AppendActionRequest {
 }
 
 /// `POST /api/moderation/cases/{id}/resolve` request body.
+///
+/// `falsePositive` is the Phase 9.1.4 automod affordance: when an operator
+/// resolves an `origin = automod` case because the rule misfired, setting
+/// it records `payload.falsePositive = true` on the `resolve` timeline
+/// action so the per-rule metrics view can compute a false-positive rate.
+/// It is absent / `false` for an ordinary resolution.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResolveCaseRequest {
     pub resolution_note: String,
+    #[serde(default)]
+    pub false_positive: Option<bool>,
 }
 
 /// `POST /api/moderation/cases/{id}/reopen` request body.
@@ -184,6 +192,37 @@ pub struct ResolveComplaintRequest {
     pub tcldbid: i64,
     #[serde(default)]
     pub fcldbid: Option<i64>,
+}
+
+/// One row of the per-rule automod metrics view
+/// (`GET /api/moderation/automod/metrics`) — Phase 9.1.4.
+///
+/// Aggregated over every `origin = automod` `moderation_case` whose
+/// `originRef` carries this `ruleKey` (the `<ruleKey>:<flowId>` key the
+/// 9.1.2 case bridge writes). This is the surface an operator reads to
+/// decide whether to promote a rule from `shadow` to `enforce`:
+///
+/// - `actionsEnforced` / `shadowHits` — automod timeline actions split by
+///   the safeguard `mode` recorded on each action's payload. A rule with
+///   many shadow hits and few false positives is a promotion candidate.
+/// - `falsePositives` — `resolve` actions flagged `payload.falsePositive`.
+/// - `circuitBreakerTrips` — per-rule breaker trips (brief §6). Breaker
+///   trips are not yet recorded to a queryable store, so this is always
+///   `0` — the field is wired through for when that instrumentation
+///   lands.
+///
+/// The false-positive *rate* is intentionally not on the wire — the view
+/// derives it (`falsePositives / casesTotal`) so the division-by-zero
+/// guard lives in one place.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutomodRuleMetrics {
+    pub rule_key: String,
+    pub cases_total: i64,
+    pub actions_enforced: i64,
+    pub shadow_hits: i64,
+    pub false_positives: i64,
+    pub circuit_breaker_trips: i64,
 }
 
 /// Error envelope for the moderation surface. Matches the per-surface
@@ -329,6 +368,44 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(req.fcldbid, Some(3));
+    }
+
+    #[test]
+    fn resolve_request_false_positive_is_optional() {
+        // Ordinary resolve — no `falsePositive` key.
+        let req: ResolveCaseRequest = serde_json::from_value(serde_json::json!({
+            "resolutionNote": "warned and closed"
+        }))
+        .unwrap();
+        assert!(req.false_positive.is_none());
+        // Automod false-positive resolve.
+        let req = ResolveCaseRequest {
+            resolution_note: "rule misfired".into(),
+            false_positive: Some(true),
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["falsePositive"], true);
+        let back: ResolveCaseRequest = serde_json::from_value(v).unwrap();
+        assert_eq!(back, req);
+    }
+
+    #[test]
+    fn automod_rule_metrics_uses_camelcase_wire_keys() {
+        let m = AutomodRuleMetrics {
+            rule_key: "bad-name".into(),
+            cases_total: 12,
+            actions_enforced: 9,
+            shadow_hits: 3,
+            false_positives: 2,
+            circuit_breaker_trips: 0,
+        };
+        let v = serde_json::to_value(&m).unwrap();
+        assert!(v.get("ruleKey").is_some());
+        assert!(v.get("casesTotal").is_some());
+        assert!(v.get("actionsEnforced").is_some());
+        assert!(v.get("circuitBreakerTrips").is_some());
+        let back: AutomodRuleMetrics = serde_json::from_value(v).unwrap();
+        assert_eq!(back, m);
     }
 
     #[test]

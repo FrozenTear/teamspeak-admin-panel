@@ -64,6 +64,9 @@ pub struct NewModerationCase {
 pub struct CaseFilter {
     pub subjectUid: Option<String>,
     pub status: Option<String>,
+    /// One of [`ORIGINS`] — `operator` / `complaint` / `automod`. Backs
+    /// the Phase 9.1.4 automod-queue preset (`origin = automod`).
+    pub origin: Option<String>,
     pub serverConfigId: Option<i64>,
     pub virtualServerId: Option<i64>,
 }
@@ -143,6 +146,9 @@ fn apply_filter_binds<'a>(
     if let Some(ref v) = filter.status {
         q = q.bind(("status", v.clone()));
     }
+    if let Some(ref v) = filter.origin {
+        q = q.bind(("origin", v.clone()));
+    }
     if let Some(v) = filter.serverConfigId {
         q = q.bind(("serverConfigId", v));
     }
@@ -166,6 +172,9 @@ pub async fn list(
     }
     if filter.status.is_some() {
         clauses.push("status = $status");
+    }
+    if filter.origin.is_some() {
+        clauses.push("origin = $origin");
     }
     if filter.serverConfigId.is_some() {
         clauses.push("serverConfigId = $serverConfigId");
@@ -342,6 +351,31 @@ mod tests {
         let (rows, total) = list(&db, &f, 50, 0).await.unwrap();
         assert_eq!(total, 1);
         assert_eq!(rows[0].subjectUid, "uid-1");
+    }
+
+    #[tokio::test]
+    async fn list_filters_by_origin() {
+        let db = fresh_db().await;
+        insert(&db, new_case("uid-op")).await.unwrap();
+        insert(
+            &db,
+            NewModerationCase {
+                origin: "automod".into(),
+                originRef: Some("bad-name:7".into()),
+                ..new_case("uid-auto")
+            },
+        )
+        .await
+        .unwrap();
+
+        let f = CaseFilter {
+            origin: Some("automod".into()),
+            ..Default::default()
+        };
+        let (rows, total) = list(&db, &f, 50, 0).await.unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(rows[0].subjectUid, "uid-auto");
+        assert_eq!(rows[0].origin, "automod");
     }
 
     #[tokio::test]
