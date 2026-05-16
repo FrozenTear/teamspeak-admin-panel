@@ -25,6 +25,17 @@ use super::{
     format_error, relative_when,
 };
 
+/// Build an API path for a subject sub-resource, percent-encoding the
+/// base64 UID as a single path segment. TS6 client UIDs routinely contain
+/// `/`, `+`, `=`; an unencoded `/` splits the segment, misses the route,
+/// and falls through to the SPA HTML fallback. PURA-293.
+fn subject_api_path(uid: &str, suffix: &str) -> String {
+    format!(
+        "/api/moderation/subjects/{}/{suffix}",
+        urlencoding::encode(uid)
+    )
+}
+
 #[component]
 pub fn SubjectHistoryPage(uid: String) -> Element {
     let session = use_session();
@@ -60,7 +71,7 @@ pub fn SubjectHistoryPage(uid: String) -> Element {
             let uid = uid.clone();
             let _ = *reload.read();
             async move {
-                let path = format!("/api/moderation/subjects/{uid}/history");
+                let path = subject_api_path(&uid, "history");
                 api::authorized_get_json::<SubjectHistory>(&gate, &api::api_base(), &path).await
             }
         }
@@ -276,7 +287,7 @@ fn NoteComposer(props: NoteComposerProps) -> Element {
             busy.set(true);
             spawn(async move {
                 let req = CreateNoteRequest { body: body_v };
-                let path = format!("/api/moderation/subjects/{uid}/notes");
+                let path = subject_api_path(&uid, "notes");
                 let res = api::authorized_post_json::<_, ModerationNote>(
                     &gate,
                     &api::api_base(),
@@ -324,5 +335,35 @@ fn NoteComposer(props: NoteComposerProps) -> Element {
                 "Add note"
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::subject_api_path;
+
+    /// PURA-293 — TS6 base64 client UIDs contain `/`, `+`, `=`; each must be
+    /// percent-encoded so the API path stays a single segment and hits the
+    /// route instead of the SPA HTML fallback.
+    #[test]
+    fn subject_api_path_percent_encodes_base64_uid() {
+        let uid = "aB3/xY+z9w==";
+        assert_eq!(
+            subject_api_path(uid, "history"),
+            "/api/moderation/subjects/aB3%2FxY%2Bz9w%3D%3D/history"
+        );
+        assert_eq!(
+            subject_api_path(uid, "notes"),
+            "/api/moderation/subjects/aB3%2FxY%2Bz9w%3D%3D/notes"
+        );
+    }
+
+    /// A plain alphanumeric UID round-trips unchanged.
+    #[test]
+    fn subject_api_path_leaves_plain_uid_untouched() {
+        assert_eq!(
+            subject_api_path("plainuid123", "history"),
+            "/api/moderation/subjects/plainuid123/history"
+        );
     }
 }
