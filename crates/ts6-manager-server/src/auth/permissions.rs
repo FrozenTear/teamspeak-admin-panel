@@ -312,9 +312,11 @@ mod tests {
     #[test]
     fn admin_denies_a_non_catalog_permission() {
         assert!(!has_permission("admin", EMPTY, "moderation.bogus"));
-        assert!(effective_permissions("admin", EMPTY)
-            .iter()
-            .all(|p| is_known_permission(p)));
+        assert!(
+            effective_permissions("admin", EMPTY)
+                .iter()
+                .all(|p| is_known_permission(p))
+        );
     }
 
     #[test]
@@ -365,10 +367,8 @@ mod tests {
 
     #[test]
     fn unknown_grant_strings_are_ignored() {
-        let eff = effective_permissions(
-            "viewer",
-            ["moderation.removed.legacy", "not-a-permission"],
-        );
+        let eff =
+            effective_permissions("viewer", ["moderation.removed.legacy", "not-a-permission"]);
         assert!(
             eff.is_empty(),
             "unknown grant strings are dropped on resolution"

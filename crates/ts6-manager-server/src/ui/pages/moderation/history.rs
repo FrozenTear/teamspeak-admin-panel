@@ -274,11 +274,7 @@ fn NoteComposer(props: NoteComposerProps) -> Element {
             }
             let body_v = body.peek().trim().to_string();
             if body_v.is_empty() {
-                toaster.push(
-                    ToastVariant::Warning,
-                    "Note text is required",
-                    None,
-                );
+                toaster.push(ToastVariant::Warning, "Note text is required", None);
                 return;
             }
             let gate = gate.clone();
