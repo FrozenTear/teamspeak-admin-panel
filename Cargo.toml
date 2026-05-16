@@ -159,7 +159,11 @@ proptest = "1"
 # `kv-surrealkv` is the production embedded backend; `kv-mem` powers unit tests
 # without spinning up a server. The `protocol-*` features stay off so the binary
 # does not pull in networking client code we are not yet using.
-chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+# `wasmbind` routes `Utc::now()` through JS `Date` on wasm32 — without it the
+# `clock` feature falls back to `SystemTime::now()`, which panics on
+# `wasm32-unknown-unknown`. The flows UI is the first shipped client code to
+# call `Utc::now()` (relative-time rendering); see PURA-246 B4.
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde", "wasmbind"] }
 surrealdb = { version = "3", default-features = false, features = ["kv-surrealkv", "kv-mem"] }
 
 # Phase 1 WEBQUERY (PURA-23) — outbound HTTP client to the per-server TS6
