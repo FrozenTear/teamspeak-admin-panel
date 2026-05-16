@@ -65,6 +65,13 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0012_moderation_warn_action_kind",
         include_str!("../../migrations/0012_moderation_warn_action_kind.surql"),
     ),
+    // 0013 (`moderation_unban_action_kind`) is owned by the concurrent
+    // PURA-303 branch and slots in here on fan-in; this branch was cut
+    // before it landed.
+    (
+        "0014_moderation_appeals",
+        include_str!("../../migrations/0014_moderation_appeals.surql"),
+    ),
 ];
 
 #[derive(Debug, Deserialize, SurrealValue)]
