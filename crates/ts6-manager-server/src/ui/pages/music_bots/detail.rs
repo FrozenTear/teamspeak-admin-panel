@@ -594,16 +594,19 @@ fn apply_event(d: &mut wire::MusicBotDetail, ev: &wire::BotEventWire) {
             ) {
                 d.channel_id = None;
                 d.now_playing = None;
+                d.last_error = None;
             }
         }
         wire::BotEventWire::Connected {
             default_channel, ..
         } => {
             d.channel_id = Some(*default_channel);
+            d.last_error = None;
         }
         wire::BotEventWire::Disconnected { .. } => {
             d.channel_id = None;
             d.now_playing = None;
+            d.last_error = None;
         }
         wire::BotEventWire::JoinedChannel { channel_id } => {
             d.channel_id = Some(*channel_id);
@@ -617,6 +620,8 @@ fn apply_event(d: &mut wire::MusicBotDetail, ev: &wire::BotEventWire) {
             // `QueueChanged` right after `NowPlaying`, but applying it
             // optimistically here lets the row light up instantly.
             d.state = wire::BotState::Playing;
+            // A fresh track supersedes any prior failure (PURA-261).
+            d.last_error = None;
         }
         wire::BotEventWire::QueueEmpty => {
             d.now_playing = None;
@@ -627,11 +632,26 @@ fn apply_event(d: &mut wire::MusicBotDetail, ev: &wire::BotEventWire) {
         wire::BotEventWire::QueueChanged { current, .. } => {
             d.now_playing = current.clone();
         }
-        // PURA-154 — audio pipeline drained. The auto-advance flow
-        // pairs this with a NowPlaying (next track) or QueueEmpty, so
-        // we don't need to mutate the snapshot here.
-        wire::BotEventWire::AudioFinished { .. }
-        | wire::BotEventWire::Error { .. }
+        // PURA-261 — audio pipeline drained. Clear `now_playing` so the
+        // live view stops showing `Playing`; an auto-advance `NowPlaying`
+        // for the next track arrives after this event and re-sets it.
+        // A `failed: ` reason prefix means the pipeline produced no
+        // audio — surface the cause as `last_error` and collapse the
+        // synthesised `Playing` chip back to `InChannel` (a failed track
+        // fires no `StateChanged`, so nothing else would).
+        wire::BotEventWire::AudioFinished { reason } => {
+            d.now_playing = None;
+            match reason.strip_prefix("failed: ") {
+                Some(cause) => {
+                    d.last_error = Some(cause.to_string());
+                    if d.state == wire::BotState::Playing {
+                        d.state = wire::BotState::InChannel;
+                    }
+                }
+                None => d.last_error = None,
+            }
+        }
+        wire::BotEventWire::Error { .. }
         | wire::BotEventWire::PlaylistChanged { .. }
         | wire::BotEventWire::LibraryChanged => {}
     }
@@ -650,6 +670,7 @@ mod tests {
             now_playing: None,
             queue: Vec::new(),
             channel_id: None,
+            last_error: None,
         }
     }
 
@@ -709,6 +730,51 @@ mod tests {
         );
         assert_eq!(d.state, wire::BotState::Playing);
         assert_eq!(d.now_playing.as_ref().map(|t| t.id), Some(wire::TrackId(7)));
+    }
+
+    #[test]
+    fn failed_audio_finish_drops_playing_and_surfaces_last_error() {
+        // PURA-261 — a track that produced no audio must not keep the
+        // live view stuck on `Playing`.
+        let mut d = fixture(wire::BotState::InChannel);
+        apply_event(
+            &mut d,
+            &wire::BotEventWire::NowPlaying {
+                track: track(7, "bad video"),
+            },
+        );
+        assert_eq!(d.state, wire::BotState::Playing);
+
+        apply_event(
+            &mut d,
+            &wire::BotEventWire::AudioFinished {
+                reason: "failed: audio pipeline produced 0 frames — check yt-dlp/ffmpeg logs"
+                    .into(),
+            },
+        );
+        assert!(
+            d.now_playing.is_none(),
+            "failed track must clear now_playing"
+        );
+        assert_ne!(d.state, wire::BotState::Playing, "must drop out of Playing");
+        assert_eq!(
+            d.last_error.as_deref(),
+            Some("audio pipeline produced 0 frames — check yt-dlp/ffmpeg logs"),
+        );
+    }
+
+    #[test]
+    fn clean_audio_finish_clears_now_playing_without_error() {
+        let mut d = fixture(wire::BotState::Playing);
+        d.now_playing = Some(track(7, "Song"));
+        apply_event(
+            &mut d,
+            &wire::BotEventWire::AudioFinished {
+                reason: "end_of_stream".into(),
+            },
+        );
+        assert!(d.now_playing.is_none());
+        assert!(d.last_error.is_none());
     }
 
     #[test]

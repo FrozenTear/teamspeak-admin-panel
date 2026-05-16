@@ -133,6 +133,15 @@ pub struct MusicBotSummary {
     /// `MusicBotStore::queue_current` when the bot is `Playing` /
     /// `Connected`; `None` when the queue is empty.
     pub now_playing: Option<Track>,
+    /// PURA-261 — cause of the most recent playback failure, when the
+    /// bot is *not* currently playing. Populated when an audio pipeline
+    /// ended without producing audio (bad URL, bot-gated video, codec
+    /// error); `None` while a track is playing or after a clean finish.
+    /// Lets the UI show *why* playback stopped instead of a silently
+    /// stuck `Playing` indicator. `#[serde(default)]` keeps it
+    /// backward-compatible with older clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 /// `GET /music-bots/{id}` body. Adds the queue snapshot and the channel
@@ -149,6 +158,10 @@ pub struct MusicBotDetail {
     /// Channel the bot is currently in. `None` when `state` is
     /// `Disconnected` / `Connecting` / `Disconnecting`.
     pub channel_id: Option<u64>,
+    /// PURA-261 — cause of the most recent playback failure. See
+    /// [`MusicBotSummary::last_error`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 /// `POST /music-library` body. Tags default to empty.

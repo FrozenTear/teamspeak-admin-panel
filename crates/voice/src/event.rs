@@ -53,11 +53,17 @@ pub enum BotEvent {
     /// a non-empty queue.
     QueueEmpty,
     /// PURA-154 — the audio pipeline drained for the active source.
-    /// Fires after the worker's `EndOfStream` AND the bot has stopped
+    /// Fires whenever an active pipeline ends, AND the bot has stopped
     /// streaming frames. If the queue still has tracks, the next track's
     /// `NowPlaying` follows; if the queue is empty, this is paired with
     /// a `QueueEmpty`. `reason` is `end_of_stream` for a clean source
-    /// EOF, `stopped` for a `Stop` command, and `skipped` for `SkipNext`.
+    /// EOF, `stopped` for a `Stop` command, `skipped` for `SkipNext`,
+    /// `disconnect` / `shutdown` for those commands.
+    ///
+    /// PURA-261 — a pipeline that ended *without producing audio* uses a
+    /// `reason` with the `failed: ` prefix (`failed: audio pipeline
+    /// produced 0 frames …`). Consumers strip that prefix to surface the
+    /// failure cause to operators; see `LivenessTracker` (`last_error`).
     AudioFinished { reason: String },
     /// PURA-121 WS-3 — a playlist was created / renamed / deleted, or
     /// its contents changed. Subscribers refetch via

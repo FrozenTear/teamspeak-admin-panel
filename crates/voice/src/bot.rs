@@ -390,7 +390,7 @@ async fn handle_audio_msg(
         if audio::tear_down(current_audio) {
             audio::send_voice_stop(con);
             let _ = events.send(BotEvent::AudioFinished {
-                reason: "channel_closed".into(),
+                reason: "failed: audio pipeline channel closed unexpectedly".into(),
             });
         }
         return;
@@ -403,11 +403,11 @@ async fn handle_audio_msg(
             if let Err(err) = audio::send_opus_frame(con, &opus) {
                 error!(?err, "send_audio failed — tearing down pipeline");
                 audio::tear_down(current_audio);
-                let _ = events.send(BotEvent::Error(BotError::Connection(format!(
-                    "send_audio: {err}"
-                ))));
+                // PURA-261 — `failed: ` prefix so `LivenessTracker`
+                // surfaces this as the bot's `last_error` and the
+                // synthesised `Playing` state drops.
                 let _ = events.send(BotEvent::AudioFinished {
-                    reason: "send_audio_failed".into(),
+                    reason: format!("failed: audio send error — {err}"),
                 });
             }
         }
@@ -439,25 +439,28 @@ async fn handle_audio_msg(
         }
         AudioMsg::Finished => {
             audio::send_voice_stop(con);
-            // Pipeline drained; advance the queue and auto-start the
-            // next track if the head is non-empty. If not, emit a
-            // single AudioFinished and let the bot sit idle.
+            // PURA-261 — a pipeline that drained without ever producing
+            // a frame means yt-dlp / ffmpeg failed (bad URL, bot-gated
+            // video, codec error). Flag it with the `failed: ` reason
+            // prefix so `LivenessTracker` records `last_error` and the
+            // synthesised `Playing` state drops — otherwise the bot
+            // reports `Playing` forever with the cause log-only.
             let frames = current_audio.as_ref().map(|a| a.frames_sent).unwrap_or(0);
-            if frames == 0 {
+            let reason = if frames == 0 {
                 warn!(
                     "audio pipeline finished with 0 frames — yt-dlp or ffmpeg likely failed; check yt_dlp/ffmpeg warn logs above"
                 );
-                let _ = events.send(BotEvent::Error(BotError::Internal(
-                    "audio pipeline produced 0 frames — check yt-dlp/ffmpeg logs".into(),
-                )));
-            }
+                "failed: audio pipeline produced 0 frames — check yt-dlp/ffmpeg logs".to_string()
+            } else {
+                "end_of_stream".to_string()
+            };
             audio::tear_down(current_audio);
+            // Emit `AudioFinished` BEFORE the queue advance so it clears
+            // `now_playing` / `last_error` ahead of any `NowPlaying` the
+            // auto-advance fires for the next track (which must win).
+            let _ = events.send(BotEvent::AudioFinished { reason });
             handle_queue_command(bot_id, store, QueueCommand::Advance, events).await;
-            if !auto_start_pending_track(current_audio, store, bot_id, events, yt_cookie).await {
-                let _ = events.send(BotEvent::AudioFinished {
-                    reason: "end_of_stream".into(),
-                });
-            }
+            auto_start_pending_track(current_audio, store, bot_id, events, yt_cookie).await;
         }
     }
 }
@@ -533,17 +536,20 @@ async fn handle_audio_command(
             }
         }
         AudioCommand::SkipNext => {
-            // Advance the queue first so the post-advance head is the
-            // next track. Tear down the current pipeline regardless,
-            // then auto-start from the new head if any.
+            // Tear down the current pipeline, then advance the queue so
+            // the post-advance head is the next track and auto-start it.
             let was_active = audio::tear_down(current_audio);
             if was_active {
                 audio::send_voice_stop(con);
             }
-            handle_queue_command(bot_id, store, QueueCommand::Advance, events).await;
+            // PURA-261 — emit `AudioFinished` BEFORE the queue advance:
+            // `LivenessTracker` clears `now_playing` on `AudioFinished`,
+            // so the next track's `NowPlaying` (fired by the advance)
+            // must come after it to win.
             let _ = events.send(BotEvent::AudioFinished {
                 reason: "skipped".into(),
             });
+            handle_queue_command(bot_id, store, QueueCommand::Advance, events).await;
             auto_start_pending_track(current_audio, store, bot_id, events, yt_cookie).await;
         }
         // SkipPrev / SetVolume / NowPlaying don't have pipeline support

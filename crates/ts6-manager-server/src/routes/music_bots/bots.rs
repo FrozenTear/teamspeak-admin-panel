@@ -51,6 +51,7 @@ async fn list(
             server_addr: info.server_addr,
             state: bot_state_to_wire(liveness.state, liveness.now_playing.is_some()),
             now_playing: liveness.now_playing.as_ref().map(track_to_wire),
+            last_error: liveness.last_error.clone(),
         });
     }
     out.sort_by_key(|b| b.id);
@@ -87,6 +88,7 @@ async fn detail(
         now_playing: liveness.now_playing.as_ref().map(track_to_wire),
         queue: queue.iter().map(track_to_wire).collect(),
         channel_id: liveness.channel_id,
+        last_error: liveness.last_error.clone(),
     }))
 }
 
@@ -139,6 +141,7 @@ async fn create(
             server_addr: req.server_addr,
             state: bot_state_to_wire(liveness.state, liveness.now_playing.is_some()),
             now_playing: liveness.now_playing.as_ref().map(track_to_wire),
+            last_error: liveness.last_error.clone(),
         }),
     ))
 }

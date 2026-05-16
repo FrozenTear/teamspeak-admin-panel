@@ -88,6 +88,13 @@ pub struct BotLiveness {
     pub state: BotState,
     pub now_playing: Option<Track>,
     pub channel_id: Option<ChannelId>,
+    /// PURA-261 — cause of the most recent playback failure, if the bot
+    /// is not currently playing a track. Set when an audio pipeline ends
+    /// without producing audio (bad URL, bot-gated video, codec error);
+    /// cleared when a new track starts or the bot reconnects. The route
+    /// layer surfaces this so operators see *why* playback stopped
+    /// instead of a silently-stuck `Playing` state.
+    pub last_error: Option<String>,
 }
 
 impl Default for BotLiveness {
@@ -96,6 +103,7 @@ impl Default for BotLiveness {
             state: BotState::Disconnected,
             now_playing: None,
             channel_id: None,
+            last_error: None,
         }
     }
 }
@@ -119,16 +127,19 @@ impl LivenessTracker {
                 if matches!(to, BotState::Disconnected | BotState::Disconnecting) {
                     entry.channel_id = None;
                     entry.now_playing = None;
+                    entry.last_error = None;
                 }
             }
             BotEvent::Connected {
                 default_channel, ..
             } => {
                 entry.channel_id = Some(*default_channel);
+                entry.last_error = None;
             }
             BotEvent::Disconnected { .. } => {
                 entry.channel_id = None;
                 entry.now_playing = None;
+                entry.last_error = None;
             }
             BotEvent::JoinedChannel { channel_id } => {
                 entry.channel_id = Some(*channel_id);
@@ -138,6 +149,8 @@ impl LivenessTracker {
             }
             BotEvent::NowPlaying(track) => {
                 entry.now_playing = Some(track.clone());
+                // A fresh track supersedes any prior failure.
+                entry.last_error = None;
             }
             BotEvent::QueueEmpty => {
                 entry.now_playing = None;
@@ -145,12 +158,18 @@ impl LivenessTracker {
             BotEvent::QueueChanged { current, .. } => {
                 entry.now_playing = current.clone();
             }
-            // PURA-154 — when the audio pipeline drains, the bot may
-            // still have a queue head (auto-advance fires NowPlaying
-            // for the next track separately); we don't clear the
-            // snapshot's `now_playing` here. SkipNext / Stop already
-            // pair with a QueueEmpty or NowPlaying event that does.
-            BotEvent::AudioFinished { .. } => {}
+            // PURA-261 — an audio pipeline ended. Clear `now_playing`
+            // so the route layer stops synthesising `Playing`; any
+            // auto-advance `NowPlaying` for the next track is emitted
+            // *after* this event and re-sets it. A `failed: ` reason
+            // prefix means the pipeline produced no audio — surface the
+            // cause as `last_error`; a clean finish clears it.
+            BotEvent::AudioFinished { reason } => {
+                entry.now_playing = None;
+                entry.last_error = reason
+                    .strip_prefix("failed: ")
+                    .map(|cause| cause.to_string());
+            }
             // The remaining variants don't contribute to the snapshot.
             BotEvent::PlaylistChanged(_) | BotEvent::LibraryChanged | BotEvent::Error(_) => {}
         }
@@ -235,5 +254,102 @@ async fn watcher_loop(
             }
             Err(broadcast::error::RecvError::Closed) => break,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use music_bot::{AudioSource, TrackId};
+
+    fn track(title: &str) -> Track {
+        Track {
+            id: TrackId(0),
+            source: AudioSource::Url("https://example.com/x".into()),
+            title: title.into(),
+            duration_secs: None,
+            requested_by: None,
+        }
+    }
+
+    /// PURA-261 — a pipeline that produced no audio must drop the bot
+    /// out of the synthesised `Playing` state and surface the cause.
+    #[tokio::test]
+    async fn failed_audio_finish_clears_now_playing_and_records_last_error() {
+        let tracker = LivenessTracker::default();
+        let bot = BotId(1);
+
+        tracker
+            .record_event(bot, &BotEvent::NowPlaying(track("bad video")))
+            .await;
+        assert!(tracker.snapshot(bot).await.now_playing.is_some());
+
+        tracker
+            .record_event(
+                bot,
+                &BotEvent::AudioFinished {
+                    reason: "failed: audio pipeline produced 0 frames — check yt-dlp/ffmpeg logs"
+                        .into(),
+                },
+            )
+            .await;
+
+        let snap = tracker.snapshot(bot).await;
+        assert!(
+            snap.now_playing.is_none(),
+            "a failed track must not keep reporting Playing"
+        );
+        assert_eq!(
+            snap.last_error.as_deref(),
+            Some("audio pipeline produced 0 frames — check yt-dlp/ffmpeg logs"),
+        );
+    }
+
+    /// A clean end-of-stream clears `now_playing` but leaves no error.
+    #[tokio::test]
+    async fn clean_audio_finish_clears_now_playing_without_error() {
+        let tracker = LivenessTracker::default();
+        let bot = BotId(2);
+
+        tracker
+            .record_event(bot, &BotEvent::NowPlaying(track("good video")))
+            .await;
+        tracker
+            .record_event(
+                bot,
+                &BotEvent::AudioFinished {
+                    reason: "end_of_stream".into(),
+                },
+            )
+            .await;
+
+        let snap = tracker.snapshot(bot).await;
+        assert!(snap.now_playing.is_none());
+        assert!(snap.last_error.is_none());
+    }
+
+    /// A fresh `NowPlaying` (e.g. auto-advance to the next track, or a
+    /// retry) supersedes a prior failure.
+    #[tokio::test]
+    async fn new_track_clears_stale_last_error() {
+        let tracker = LivenessTracker::default();
+        let bot = BotId(3);
+
+        tracker
+            .record_event(
+                bot,
+                &BotEvent::AudioFinished {
+                    reason: "failed: audio send error — boom".into(),
+                },
+            )
+            .await;
+        assert!(tracker.snapshot(bot).await.last_error.is_some());
+
+        tracker
+            .record_event(bot, &BotEvent::NowPlaying(track("next track")))
+            .await;
+        let snap = tracker.snapshot(bot).await;
+        assert!(snap.now_playing.is_some());
+        assert!(snap.last_error.is_none());
     }
 }
