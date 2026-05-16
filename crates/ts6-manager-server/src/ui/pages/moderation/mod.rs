@@ -128,11 +128,12 @@ pub(crate) fn relative_from_unix(secs: i64) -> String {
 // ── shared status / kind presentation ───────────────────────────────────
 
 /// CSS modifier class for a case `status` (`open` / `actioned` /
-/// `resolved`). Unknown values fall back to the neutral base.
+/// `appealed` / `resolved`). Unknown values fall back to the neutral base.
 pub(crate) fn case_status_class(status: &str) -> &'static str {
     match status {
         "open" => "mod-badge mod-badge--open",
         "actioned" => "mod-badge mod-badge--actioned",
+        "appealed" => "mod-badge mod-badge--appealed",
         "resolved" => "mod-badge mod-badge--resolved",
         _ => "mod-badge",
     }
@@ -146,9 +147,12 @@ pub(crate) fn action_kind_icon(kind: &str) -> &'static str {
         "ban_ip" => "⊘",
         "mute" => "🔇",
         "unmute" => "🔊",
+        "unban" => "⊙",
         "note" => "✎",
         "resolve" => "✓",
         "reopen" => "↺",
+        "appeal_filed" => "⚖",
+        "appeal_decided" => "⚖",
         _ => "•",
     }
 }
@@ -161,19 +165,24 @@ pub(crate) fn action_kind_label(kind: &str) -> &'static str {
         "ban_ip" => "Banned (IP)",
         "mute" => "Muted",
         "unmute" => "Unmuted",
+        "unban" => "Unbanned",
         "note" => "Note",
         "resolve" => "Resolved",
         "reopen" => "Reopened",
+        "appeal_filed" => "Appeal filed",
+        "appeal_decided" => "Appeal decided",
         _ => "Action",
     }
 }
 
-/// Human label for a case `origin` (`operator` / `complaint` / `automod`).
+/// Human label for a case `origin` (`operator` / `complaint` / `automod`
+/// / `report`).
 pub(crate) fn origin_label(origin: &str) -> &'static str {
     match origin {
         "operator" => "Operator-opened",
         "complaint" => "From complaint",
         "automod" => "Auto-moderation",
+        "report" => "From report",
         _ => "Unknown origin",
     }
 }

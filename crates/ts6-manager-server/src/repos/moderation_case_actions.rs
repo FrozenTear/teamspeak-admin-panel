@@ -20,12 +20,26 @@ use surrealdb::types::SurrealValue;
 
 use crate::db::Database;
 
-/// Valid `actionKind` values — the schema mirror of migration
-/// `0012_moderation_warn_action_kind`'s `ASSERT`. `warn` is the Phase 9.1
-/// automod kind (PURA-297 §4.3); `ban_ip` is the operator IP-ban kind
-/// (`routes/moderation/actions.rs`). Keep this in sync with that ASSERT.
+/// Valid `actionKind` values — the schema mirror of the
+/// `moderation_case_action.actionKind` `ASSERT`, last extended by
+/// migration `0015_moderation_appeal_action_kinds`. `warn` is the Phase
+/// 9.1 automod kind (PURA-297 §4.3); `ban_ip` is the operator IP-ban kind
+/// (`routes/moderation/actions.rs`); `unban` is the automod-revert kind
+/// (PURA-303); `appeal_filed` / `appeal_decided` are the Phase 9.2 appeal
+/// kinds (PURA-308). Keep this in sync with that ASSERT.
 pub const ACTION_KINDS: &[&str] = &[
-    "warn", "kick", "ban", "ban_ip", "mute", "unmute", "note", "resolve", "reopen",
+    "warn",
+    "kick",
+    "ban",
+    "ban_ip",
+    "mute",
+    "unmute",
+    "unban",
+    "note",
+    "resolve",
+    "reopen",
+    "appeal_filed",
+    "appeal_decided",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]

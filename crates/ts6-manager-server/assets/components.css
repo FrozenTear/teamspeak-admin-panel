@@ -1727,6 +1727,12 @@ a:hover {
   border-color: var(--success-fg);
   color: var(--success-fg);
 }
+/* Phase 9.2 — a case whose subject has lodged an appeal awaiting an
+   operator decision. Distinct from actioned: it needs attention. */
+.mod-badge--appealed {
+  border-color: var(--danger-fg);
+  color: var(--danger-fg);
+}
 .mod-badge--role {
   border-color: var(--border-subtle);
   color: var(--text-muted);

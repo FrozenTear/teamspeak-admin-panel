@@ -696,3 +696,310 @@ async fn complaint_resolve_404_when_server_connection_absent() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
+
+// ── Phase 9.2 — report triage + appeal decisions (PURA-308) ─────────────
+
+/// Seed a `pending` report directly through the repo — the public
+/// submit handler is the 9.2-public-routes workstream, out of scope here.
+async fn seed_report(state: &AppState, subject: &str) -> i64 {
+    crate::repos::moderation_reports::insert(
+        &state.db,
+        crate::repos::moderation_reports::NewModerationReport {
+            serverConfigId: 1,
+            virtualServerId: 1,
+            reporterUid: "reporter-uid".into(),
+            subjectUidOrNickname: subject.into(),
+            category: "harassment".into(),
+            statement: "was abusive in voice chat".into(),
+            evidenceUrl: None,
+            sourceIpHash: "hash-report".into(),
+        },
+    )
+    .await
+    .unwrap()
+    .id
+}
+
+/// Seed an `appealed` case with one `pending` appeal — mirrors the state
+/// the 9.2-public-routes appeal-submit handler leaves behind.
+async fn seed_appealed_case(state: &AppState, subject: &str) -> (i64, i64) {
+    let case = crate::repos::moderation_cases::insert(
+        &state.db,
+        crate::repos::moderation_cases::NewModerationCase {
+            serverConfigId: 1,
+            virtualServerId: 1,
+            subjectUid: subject.into(),
+            subjectNicknameSnapshot: "Subj".into(),
+            origin: "operator".into(),
+            originRef: None,
+            reason: "banned for spam".into(),
+            openedByUserId: Some(1),
+        },
+    )
+    .await
+    .unwrap();
+    crate::repos::moderation_cases::set_status(&state.db, case.id, "appealed", None)
+        .await
+        .unwrap();
+    let appeal = crate::repos::moderation_appeals::insert(
+        &state.db,
+        crate::repos::moderation_appeals::NewModerationAppeal {
+            caseId: case.id,
+            submitterUid: subject.into(),
+            identityProof: "appeal_token tk-1".into(),
+            statement: "I was not the one spamming".into(),
+            sourceIpHash: "hash-appeal".into(),
+        },
+    )
+    .await
+    .unwrap();
+    (case.id, appeal.id)
+}
+
+#[tokio::test]
+async fn viewer_is_forbidden_on_report_list() {
+    let state = fresh_state().await;
+    let vid = seed_user(&state, "view", "viewer").await;
+    let token = mint(&state, vid, "view", "viewer");
+    let resp = app(state)
+        .oneshot(get("/api/moderation/reports", &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn report_list_returns_pending_then_promote_opens_a_case() {
+    let state = fresh_state().await;
+    let aid = seed_user(&state, "admin", "admin").await;
+    let token = mint(&state, aid, "admin", "admin");
+    let report_id = seed_report(&state, "uid-bad").await;
+    let app = app(state);
+
+    let resp = app
+        .clone()
+        .oneshot(get("/api/moderation/reports", &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let reports: Vec<wire::ModerationReport> = read_json(resp).await;
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].status, "pending");
+
+    let resp = app
+        .clone()
+        .oneshot(post(
+            &format!("/api/moderation/reports/{report_id}/promote"),
+            &token,
+            &wire::PromoteReportRequest {
+                reason: "verified harassment".into(),
+            },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let case: wire::ModerationCase = read_json(resp).await;
+    assert_eq!(case.origin, "report");
+    assert_eq!(case.origin_ref, Some(report_id.to_string()));
+    assert_eq!(case.reason, "verified harassment");
+    assert_eq!(case.subject_uid, "uid-bad");
+
+    // The promoted report leaves the pending queue.
+    let resp = app
+        .oneshot(get("/api/moderation/reports", &token))
+        .await
+        .unwrap();
+    let reports: Vec<wire::ModerationReport> = read_json(resp).await;
+    assert!(reports.is_empty(), "promoted report is no longer pending");
+}
+
+#[tokio::test]
+async fn report_dismiss_closes_without_opening_a_case() {
+    let state = fresh_state().await;
+    let aid = seed_user(&state, "admin", "admin").await;
+    let token = mint(&state, aid, "admin", "admin");
+    let report_id = seed_report(&state, "uid-noise").await;
+    let app = app(state);
+
+    let resp = app
+        .clone()
+        .oneshot(post(
+            &format!("/api/moderation/reports/{report_id}/dismiss"),
+            &token,
+            &wire::DismissReportRequest::default(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let report: wire::ModerationReport = read_json(resp).await;
+    assert_eq!(report.status, "dismissed");
+    assert!(report.case_id.is_none());
+
+    // No case was opened.
+    let resp = app
+        .oneshot(get("/api/moderation/cases", &token))
+        .await
+        .unwrap();
+    let page: Page<wire::ModerationCase> = read_json(resp).await;
+    assert_eq!(page.total, 0);
+}
+
+#[tokio::test]
+async fn report_promote_twice_is_a_conflict() {
+    let state = fresh_state().await;
+    let aid = seed_user(&state, "admin", "admin").await;
+    let token = mint(&state, aid, "admin", "admin");
+    let report_id = seed_report(&state, "uid-dup").await;
+    let app = app(state);
+
+    let promote = || {
+        post(
+            &format!("/api/moderation/reports/{report_id}/promote"),
+            &token,
+            &wire::PromoteReportRequest {
+                reason: "first triage".into(),
+            },
+        )
+    };
+    let resp = app.clone().oneshot(promote()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let resp = app.oneshot(promote()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn report_promote_rejects_blank_reason() {
+    let state = fresh_state().await;
+    let aid = seed_user(&state, "admin", "admin").await;
+    let token = mint(&state, aid, "admin", "admin");
+    let report_id = seed_report(&state, "uid-x").await;
+    let resp = app(state)
+        .oneshot(post(
+            &format!("/api/moderation/reports/{report_id}/promote"),
+            &token,
+            &wire::PromoteReportRequest {
+                reason: "   ".into(),
+            },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn appealed_status_filter_surfaces_the_case() {
+    let state = fresh_state().await;
+    let aid = seed_user(&state, "admin", "admin").await;
+    let token = mint(&state, aid, "admin", "admin");
+    let (case_id, _) = seed_appealed_case(&state, "uid-appellant").await;
+
+    let resp = app(state)
+        .oneshot(get("/api/moderation/cases?status=appealed", &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let page: Page<wire::ModerationCase> = read_json(resp).await;
+    assert_eq!(page.total, 1);
+    assert_eq!(page.items[0].id, case_id);
+    assert_eq!(page.items[0].status, "appealed");
+}
+
+#[tokio::test]
+async fn appeal_uphold_resolves_the_case() {
+    let state = fresh_state().await;
+    let aid = seed_user(&state, "admin", "admin").await;
+    let token = mint(&state, aid, "admin", "admin");
+    let (case_id, _) = seed_appealed_case(&state, "uid-up").await;
+    let app = app(state);
+
+    let resp = app
+        .clone()
+        .oneshot(post(
+            &format!("/api/moderation/cases/{case_id}/appeal/uphold"),
+            &token,
+            &wire::DecideAppealRequest::default(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let case: wire::ModerationCase = read_json(resp).await;
+    assert_eq!(case.status, "resolved");
+
+    let resp = app
+        .oneshot(get(&format!("/api/moderation/cases/{case_id}"), &token))
+        .await
+        .unwrap();
+    let detail: wire::CaseDetail = read_json(resp).await;
+    assert_eq!(detail.appeals.len(), 1);
+    assert_eq!(detail.appeals[0].status, "upheld");
+    assert!(
+        detail
+            .timeline
+            .iter()
+            .any(|a| a.action_kind == "appeal_decided"),
+        "uphold appends an appeal_decided timeline row"
+    );
+}
+
+#[tokio::test]
+async fn appeal_overturn_resolves_the_case() {
+    // A case with no ban on its timeline — the overturn records the
+    // decision with no TS6 reversal dispatch (`reversal: none`).
+    let state = fresh_state().await;
+    let aid = seed_user(&state, "admin", "admin").await;
+    let token = mint(&state, aid, "admin", "admin");
+    let (case_id, _) = seed_appealed_case(&state, "uid-over").await;
+    let app = app(state);
+
+    let resp = app
+        .clone()
+        .oneshot(post(
+            &format!("/api/moderation/cases/{case_id}/appeal/overturn"),
+            &token,
+            &wire::DecideAppealRequest {
+                decision_note: Some("evidence did not hold up".into()),
+            },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let case: wire::ModerationCase = read_json(resp).await;
+    assert_eq!(case.status, "resolved");
+
+    let resp = app
+        .oneshot(get(&format!("/api/moderation/cases/{case_id}"), &token))
+        .await
+        .unwrap();
+    let detail: wire::CaseDetail = read_json(resp).await;
+    assert_eq!(detail.appeals[0].status, "overturned");
+    assert_eq!(
+        detail.appeals[0].decision_note.as_deref(),
+        Some("evidence did not hold up")
+    );
+}
+
+#[tokio::test]
+async fn appeal_decision_requires_appealed_status() {
+    let state = fresh_state().await;
+    let aid = seed_user(&state, "admin", "admin").await;
+    let token = mint(&state, aid, "admin", "admin");
+    let app = app(state);
+
+    // A freshly-opened case is `open`, not `appealed`.
+    let resp = app
+        .clone()
+        .oneshot(post("/api/moderation/cases", &token, &open_case_req()))
+        .await
+        .unwrap();
+    let case: wire::ModerationCase = read_json(resp).await;
+
+    let resp = app
+        .oneshot(post(
+            &format!("/api/moderation/cases/{}/appeal/uphold", case.id),
+            &token,
+            &wire::DecideAppealRequest::default(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+}

@@ -31,10 +31,12 @@
 //! re-implementing them.
 
 mod actions;
+mod appeals;
 mod cases;
 mod complaints;
 mod history;
 mod notes;
+mod reports;
 
 #[cfg(test)]
 mod tests;
@@ -48,9 +50,11 @@ use ts6_manager_shared::moderation as wire;
 
 use crate::app_state::AppState;
 use crate::control::ControlBackendError;
+use crate::repos::moderation_appeals::ModerationAppeal;
 use crate::repos::moderation_case_actions::ModerationCaseAction;
 use crate::repos::moderation_cases::ModerationCase;
 use crate::repos::moderation_notes::ModerationNote;
+use crate::repos::moderation_reports::ModerationReport;
 
 /// Build the moderation sub-router. Absolute paths — the caller `merge`s
 /// this into the top-level router so the URIs line up with plan §7.
@@ -73,6 +77,24 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/moderation/complaints/resolve",
             post(complaints::resolve),
+        )
+        // Phase 9.2 (PURA-308) — report intake triage + appeal decisions.
+        .route("/api/moderation/reports", get(reports::list))
+        .route(
+            "/api/moderation/reports/{id}/promote",
+            post(reports::promote),
+        )
+        .route(
+            "/api/moderation/reports/{id}/dismiss",
+            post(reports::dismiss),
+        )
+        .route(
+            "/api/moderation/cases/{id}/appeal/uphold",
+            post(appeals::uphold),
+        )
+        .route(
+            "/api/moderation/cases/{id}/appeal/overturn",
+            post(appeals::overturn),
         )
 }
 
@@ -168,5 +190,43 @@ pub(super) fn note_to_wire(n: ModerationNote) -> wire::ModerationNote {
         author_username_snapshot: n.authorUsernameSnapshot,
         created_at: n.createdAt,
         updated_at: n.updatedAt,
+    }
+}
+
+/// `moderation_report` row → wire DTO. `sourceIpHash` is intentionally
+/// dropped — it is an abuse-correlation field, not operator-UI data
+/// (PURA-269 plan §6 hook 6).
+pub(super) fn report_to_wire(r: ModerationReport) -> wire::ModerationReport {
+    wire::ModerationReport {
+        id: r.id,
+        server_config_id: r.serverConfigId,
+        virtual_server_id: r.virtualServerId,
+        reporter_uid: r.reporterUid,
+        subject_uid_or_nickname: r.subjectUidOrNickname,
+        category: r.category,
+        statement: r.statement,
+        evidence_url: r.evidenceUrl,
+        status: r.status,
+        case_id: r.caseId,
+        triaged_by_user_id: r.triagedByUserId,
+        created_at: r.createdAt,
+        updated_at: r.updatedAt,
+    }
+}
+
+/// `moderation_appeal` row → wire DTO. `sourceIpHash` is dropped for the
+/// same reason as [`report_to_wire`].
+pub(super) fn appeal_to_wire(a: ModerationAppeal) -> wire::ModerationAppeal {
+    wire::ModerationAppeal {
+        id: a.id,
+        case_id: a.caseId,
+        submitter_uid: a.submitterUid,
+        identity_proof: a.identityProof,
+        statement: a.statement,
+        status: a.status,
+        decided_by_user_id: a.decidedByUserId,
+        decision_note: a.decisionNote,
+        created_at: a.createdAt,
+        decided_at: a.decidedAt,
     }
 }

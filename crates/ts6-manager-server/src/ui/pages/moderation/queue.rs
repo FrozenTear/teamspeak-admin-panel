@@ -18,7 +18,10 @@
 
 use dioxus::prelude::*;
 use ts6_manager_shared::admin::Page;
-use ts6_manager_shared::moderation::{Complaint, ModerationCase, OpenCaseRequest};
+use ts6_manager_shared::moderation::{
+    Complaint, DismissReportRequest, ModerationCase, ModerationReport, OpenCaseRequest,
+    PromoteReportRequest,
+};
 
 use crate::client::api::{self};
 use crate::client::dioxus::{use_auth_gate, use_session};
@@ -39,10 +42,12 @@ use super::{
 const CASE_LIMIT: i64 = 100;
 
 /// Status filter options — label + the `?status=` query value (`None` =
-/// unconstrained).
-const STATUS_FILTERS: [(&str, Option<&str>); 4] = [
+/// unconstrained). `Appealed` (Phase 9.2) surfaces cases whose subject
+/// has lodged an appeal awaiting an operator decision.
+const STATUS_FILTERS: [(&str, Option<&str>); 5] = [
     ("Open", Some("open")),
     ("Actioned", Some("actioned")),
+    ("Appealed", Some("appealed")),
     ("Resolved", Some("resolved")),
     ("All", None),
 ];
@@ -137,6 +142,23 @@ pub fn ModerationQueuePage() -> Element {
                     "/api/moderation/complaints?serverConfigId={server_id}&virtualServerId={sid}"
                 );
                 api::authorized_get_json::<Vec<Complaint>>(&gate, &api::api_base(), &path).await
+            }
+        }
+    });
+
+    // ── report intake queue (Phase 9.2) ─────────────────────────────────
+    let mut reports_reload: Signal<u64> = use_signal(|| 0u64);
+    let reports = use_resource({
+        let gate = gate.clone();
+        move || {
+            let gate = gate.clone();
+            let _ = *reports_reload.read();
+            async move {
+                let path = format!(
+                    "/api/moderation/reports?serverConfigId={server_id}&virtualServerId={sid}&status=pending"
+                );
+                api::authorized_get_json::<Vec<ModerationReport>>(&gate, &api::api_base(), &path)
+                    .await
             }
         }
     });
@@ -246,8 +268,75 @@ pub fn ModerationQueuePage() -> Element {
         }
     };
 
+    // Promote a pending report to a case. The report statement becomes
+    // the new case's opening reason; on success we jump straight to the
+    // freshly-opened case.
+    let promote_report = {
+        let gate = gate.clone();
+        move |(report_id, reason): (i64, String)| {
+            let gate = gate.clone();
+            spawn(async move {
+                let req = PromoteReportRequest { reason };
+                let path = format!("/api/moderation/reports/{report_id}/promote");
+                let res = api::authorized_post_json::<_, ModerationCase>(
+                    &gate,
+                    &api::api_base(),
+                    &path,
+                    Some(&req),
+                )
+                .await;
+                match res {
+                    Ok(case) => {
+                        toaster.push(
+                            ToastVariant::Success,
+                            format!("Report promoted — case #{} opened", case.id),
+                            None,
+                        );
+                        reports_reload.with_mut(|n| *n += 1);
+                        nav.push(Route::ModerationCasePage { case_id: case.id });
+                    }
+                    Err(e) => toaster.push(
+                        ToastVariant::Danger,
+                        "Could not promote report",
+                        Some(format_error(&e)),
+                    ),
+                }
+            });
+        }
+    };
+
+    let dismiss_report = {
+        let gate = gate.clone();
+        move |report_id: i64| {
+            let gate = gate.clone();
+            spawn(async move {
+                let req = DismissReportRequest { reason: None };
+                let path = format!("/api/moderation/reports/{report_id}/dismiss");
+                let res = api::authorized_post_json::<_, ModerationReport>(
+                    &gate,
+                    &api::api_base(),
+                    &path,
+                    Some(&req),
+                )
+                .await;
+                match res {
+                    Ok(_) => {
+                        toaster.push(ToastVariant::Success, "Report dismissed", None);
+                        reports_reload.with_mut(|n| *n += 1);
+                    }
+                    Err(e) => toaster.push(
+                        ToastVariant::Danger,
+                        "Could not dismiss report",
+                        Some(format_error(&e)),
+                    ),
+                }
+            });
+        }
+    };
+
     let cases_snapshot = cases.read().clone();
     let complaints_snapshot = complaints.read().clone();
+    let reports_snapshot = reports.read().clone();
     let active_status = *status_idx.read();
 
     rsx! {
@@ -333,6 +422,36 @@ pub fn ModerationQueuePage() -> Element {
                 },
                 Some(Ok(page)) => rsx! {
                     CaseTable { rows: page.items }
+                },
+            }
+        }
+
+        // ── Reports panel (Phase 9.2) ───────────────────────────────────
+        section { class: "stack-md mod-panel",
+            div { class: "mod-panel-head",
+                h2 { "Reports" }
+            }
+            p { class: "info-hint",
+                "Player-filed reports awaiting triage. Promote a report to open a moderation case, or dismiss it without opening one."
+            }
+            match reports_snapshot {
+                None => rsx! {
+                    p { class: "info-hint", "Loading reports…" }
+                },
+                Some(Err(e)) => rsx! {
+                    Banner {
+                        variant: BannerVariant::Danger,
+                        title: "Could not load reports".to_string(),
+                        "{format_error(&e)}"
+                    }
+                },
+                Some(Ok(rows)) => rsx! {
+                    ReportTable {
+                        rows,
+                        can_manage: can_manage_cases,
+                        on_promote: EventHandler::new(promote_report),
+                        on_dismiss: EventHandler::new(dismiss_report),
+                    }
                 },
             }
         }
@@ -486,6 +605,98 @@ fn ComplaintTable(props: ComplaintTableProps) -> Element {
                                             variant: ButtonVariant::Ghost,
                                             size: ButtonSize::Small,
                                             onclick: move |_| on_dismiss.call((tcldbid, fcldbid)),
+                                            "Dismiss"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Props, Clone, PartialEq)]
+struct ReportTableProps {
+    rows: Vec<ModerationReport>,
+    can_manage: bool,
+    /// Carries `(reportId, caseReason)` — the report statement is sent as
+    /// the opening reason of the case the promotion creates.
+    on_promote: EventHandler<(i64, String)>,
+    on_dismiss: EventHandler<i64>,
+}
+
+#[component]
+fn ReportTable(props: ReportTableProps) -> Element {
+    if props.rows.is_empty() {
+        return rsx! {
+            div { class: "empty",
+                div { class: "icon", "✓" }
+                h3 { "No pending reports" }
+                p { "Reports filed by players will appear here for triage." }
+            }
+        };
+    }
+    rsx! {
+        table { class: "data-table", "aria-label": "Pending moderation reports",
+            thead {
+                tr {
+                    th { scope: "col", "Subject" }
+                    th { scope: "col", "Category" }
+                    th { scope: "col", "Report" }
+                    th { scope: "col", "Reporter" }
+                    th { scope: "col", "Filed" }
+                    if props.can_manage {
+                        th { scope: "col", class: "actions-col", "Actions" }
+                    }
+                }
+            }
+            tbody {
+                for r in props.rows.iter() {
+                    {
+                        // All report-derived text below is rendered through
+                        // Dioxus text nodes / attribute bindings, which
+                        // escape by default — no `dangerous_inner_html` on
+                        // this low-trust prose (PURA-269 plan §6 hook 5).
+                        // The evidence URL is shown as inert text, never a
+                        // live `href`, so a `javascript:` / `data:` URL
+                        // cannot execute from a click.
+                        let r = r.clone();
+                        let report_id = r.id;
+                        let statement = r.statement.clone();
+                        let on_promote = props.on_promote;
+                        let on_dismiss = props.on_dismiss;
+                        rsx! {
+                            tr { key: "{report_id}",
+                                td { class: "client-cell",
+                                    span { class: "client-name", "{r.subject_uid_or_nickname}" }
+                                }
+                                td { "{r.category}" }
+                                td {
+                                    p { class: "mod-timeline-reason", "{r.statement}" }
+                                    if let Some(url) = r.evidence_url.as_ref().filter(|u| !u.is_empty()) {
+                                        p { class: "info-hint",
+                                            "Evidence (verify before opening): "
+                                            span { class: "mono", "{url}" }
+                                        }
+                                    }
+                                }
+                                td { class: "mono", "{r.reporter_uid}" }
+                                td { "{fmt_datetime(r.created_at)}" }
+                                if props.can_manage {
+                                    td { class: "actions-col",
+                                        Button {
+                                            variant: ButtonVariant::Primary,
+                                            size: ButtonSize::Small,
+                                            onclick: move |_| on_promote.call((report_id, statement.clone())),
+                                            "Promote"
+                                        }
+                                        Button {
+                                            variant: ButtonVariant::Ghost,
+                                            size: ButtonSize::Small,
+                                            onclick: move |_| on_dismiss.call(report_id),
                                             "Dismiss"
                                         }
                                     }

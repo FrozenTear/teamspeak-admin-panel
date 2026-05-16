@@ -27,7 +27,8 @@
 
 use dioxus::prelude::*;
 use ts6_manager_shared::moderation::{
-    AppendActionRequest, CaseDetail, ModerationCaseAction, ReopenCaseRequest, ResolveCaseRequest,
+    AppendActionRequest, CaseDetail, DecideAppealRequest, ModerationAppeal, ModerationCaseAction,
+    ReopenCaseRequest, ResolveCaseRequest,
 };
 
 use crate::client::api::{self, ApiError};
@@ -142,7 +143,9 @@ struct CaseBodyProps {
 fn CaseBody(props: CaseBodyProps) -> Element {
     let case = props.detail.case.clone();
     let timeline = props.detail.timeline.clone();
+    let appeals = props.detail.appeals.clone();
     let is_resolved = case.status == "resolved";
+    let is_appealed = case.status == "appealed";
     let subject_uid = case.subject_uid.clone();
 
     rsx! {
@@ -181,6 +184,13 @@ fn CaseBody(props: CaseBodyProps) -> Element {
                 role: props.role.clone(),
                 reload: props.reload,
             }
+        } else if is_appealed {
+            AppealPanel {
+                case_id: props.case_id,
+                appeals,
+                role: props.role.clone(),
+                reload: props.reload,
+            }
         } else {
             ComposerPanel {
                 case_id: props.case_id,
@@ -193,6 +203,163 @@ fn CaseBody(props: CaseBodyProps) -> Element {
                 case_id: props.case_id,
                 role: props.role.clone(),
                 reload: props.reload,
+            }
+        }
+    }
+}
+
+// ── appeal decision panel ───────────────────────────────────────────────
+
+#[derive(Props, Clone, PartialEq)]
+struct AppealPanelProps {
+    case_id: i64,
+    /// Appeals lodged against this case (newest-first). The panel acts on
+    /// the single `pending` one.
+    appeals: Vec<ModerationAppeal>,
+    role: String,
+    reload: Signal<u64>,
+}
+
+/// The operator's uphold / overturn surface for a case in `appealed`
+/// status. The appellant's raw statement is quarantined off the case
+/// timeline (plan §4.7) and surfaced only here — rendered through a
+/// Dioxus text node, so it is escaped (plan §6 hook 5).
+#[component]
+fn AppealPanel(props: AppealPanelProps) -> Element {
+    let gate = use_auth_gate();
+    let toaster = use_toaster();
+
+    let Some(appeal) = props
+        .appeals
+        .iter()
+        .find(|a| a.status == "pending")
+        .cloned()
+    else {
+        return rsx! {
+            section { class: "stack-md mod-panel",
+                h2 { "Appeal" }
+                p { class: "info-hint",
+                    "This case is marked appealed but carries no pending appeal. Reload, or resolve it from the timeline."
+                }
+            }
+        };
+    };
+
+    let can_manage = perm::role_holds(&props.role, "moderation.case.manage");
+
+    let mut note = use_signal(String::new);
+    let mut busy = use_signal(|| false);
+    let case_id = props.case_id;
+    let mut reload = props.reload;
+
+    // One `EventHandler` (Copy) drives both buttons; the argument is the
+    // trailing path segment — `"uphold"` or `"overturn"`.
+    let decide = EventHandler::new(move |decision: &'static str| {
+        if *busy.peek() {
+            return;
+        }
+        let note_v = note.peek().trim().to_string();
+        let req = DecideAppealRequest {
+            decision_note: if note_v.is_empty() {
+                None
+            } else {
+                Some(note_v)
+            },
+        };
+        let gate = gate.clone();
+        busy.set(true);
+        spawn(async move {
+            let path = format!("/api/moderation/cases/{case_id}/appeal/{decision}");
+            let res = api::authorized_post_json::<_, serde_json::Value>(
+                &gate,
+                &api::api_base(),
+                &path,
+                Some(&req),
+            )
+            .await;
+            busy.set(false);
+            match res {
+                Ok(_) => {
+                    let label = if decision == "uphold" {
+                        "Appeal upheld — case resolved"
+                    } else {
+                        "Appeal overturned — case resolved"
+                    };
+                    toaster.push(ToastVariant::Success, label, None);
+                    note.set(String::new());
+                    reload.with_mut(|n| *n += 1);
+                }
+                Err(e) => toaster.push(
+                    ToastVariant::Danger,
+                    "Could not record appeal decision",
+                    Some(format_error(&e)),
+                ),
+            }
+        });
+    });
+
+    rsx! {
+        section { class: "stack-md mod-panel",
+            h2 { "Appeal under review" }
+
+            dl { class: "mod-kv",
+                div {
+                    dt { "Appellant UID" }
+                    dd { class: "mono", "{appeal.submitter_uid}" }
+                }
+                div {
+                    dt { "Filed" }
+                    dd { "{fmt_datetime(appeal.created_at)}" }
+                }
+                div {
+                    dt { "Identity proof" }
+                    dd { "{appeal.identity_proof}" }
+                }
+            }
+            // The appellant's raw statement — escaped via a text node.
+            p { class: "info-hint", "Appellant's statement" }
+            p { class: "mod-timeline-reason", "{appeal.statement}" }
+
+            if can_manage {
+                form {
+                    class: "ban-create",
+                    "aria-label": "Decide this appeal",
+                    onsubmit: move |evt| evt.prevent_default(),
+                    div { class: "form-row",
+                        label { r#for: "appeal-note", "Decision note (optional)" }
+                        textarea {
+                            id: "appeal-note",
+                            class: "input",
+                            rows: "2",
+                            placeholder: "Recorded on the appeal and the case timeline",
+                            value: "{note.read()}",
+                            oninput: move |e| note.set(e.value()),
+                        }
+                    }
+                    p { class: "info-hint",
+                        "Overturning lifts any TeamSpeak ban recorded on this case as its own timeline action. Both decisions resolve the case."
+                    }
+                    div { style: "display: flex; gap: var(--space-3); flex-wrap: wrap;",
+                        Button {
+                            variant: ButtonVariant::Danger,
+                            kind: ButtonType::Button,
+                            loading: *busy.read(),
+                            onclick: move |_| decide.call("overturn"),
+                            "Overturn appeal"
+                        }
+                        Button {
+                            variant: ButtonVariant::Primary,
+                            kind: ButtonType::Button,
+                            loading: *busy.read(),
+                            onclick: move |_| decide.call("uphold"),
+                            "Uphold action"
+                        }
+                    }
+                }
+            } else {
+                p { class: "info-hint",
+                    "Deciding an appeal requires the case-manage permission."
+                }
             }
         }
     }

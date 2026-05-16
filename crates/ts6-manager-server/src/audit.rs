@@ -66,6 +66,12 @@ pub enum AuditKind {
     /// Phase 9.1 automod (PURA-301) — a `Moderate` flow node opened or
     /// reused a case and applied a moderation effect.
     ModerationAutomodAction,
+    /// Phase 9.2 appeals (PURA-308) — an operator promoted a
+    /// `moderation_report` to a case, dismissed a report without opening
+    /// one, or decided (upheld / overturned) an appeal.
+    ModerationReportPromoted,
+    ModerationReportDismissed,
+    ModerationAppealDecided,
 }
 
 impl AuditKind {
@@ -89,6 +95,9 @@ impl AuditKind {
             AuditKind::ModerationNoteAdded => "moderationNoteAdded",
             AuditKind::ModerationComplaintResolved => "moderationComplaintResolved",
             AuditKind::ModerationAutomodAction => "moderationAutomodAction",
+            AuditKind::ModerationReportPromoted => "moderationReportPromoted",
+            AuditKind::ModerationReportDismissed => "moderationReportDismissed",
+            AuditKind::ModerationAppealDecided => "moderationAppealDecided",
         }
     }
 }
@@ -138,6 +147,17 @@ impl Target {
             kind: "moderation_subject".to_string(),
             id: None,
             label: Some(subject_uid.into()),
+        }
+    }
+
+    /// Phase 9.2 — a report-intake row (`moderation_report`). `label`
+    /// snapshots the accused subject so the audit row stays meaningful
+    /// after the report is purged.
+    pub fn moderation_report(id: i64, subject: impl Into<String>) -> Self {
+        Self {
+            kind: "moderation_report".to_string(),
+            id: Some(id),
+            label: Some(subject.into()),
         }
     }
 

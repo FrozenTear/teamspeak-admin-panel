@@ -19,11 +19,15 @@ use surrealdb::types::SurrealValue;
 
 use crate::db::Database;
 
-/// Valid `origin` values. `automod` is reserved for Phase 9.1.
-pub const ORIGINS: &[&str] = &["operator", "complaint", "automod"];
+/// Valid `origin` values. `automod` is the Phase 9.1 automod origin;
+/// `report` is the Phase 9.2 report-intake origin (PURA-308) — a case
+/// promoted from a `moderation_report`.
+pub const ORIGINS: &[&str] = &["operator", "complaint", "automod", "report"];
 
-/// Valid `status` values. `appealed` is reserved for Phase 9.2.
-pub const STATUSES: &[&str] = &["open", "actioned", "resolved"];
+/// Valid `status` values. `appealed` is the Phase 9.2 appeal state
+/// (PURA-308): an `actioned` case whose subject has lodged an appeal,
+/// resolved by an operator uphold/overturn decision.
+pub const STATUSES: &[&str] = &["open", "actioned", "resolved", "appealed"];
 
 #[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
 #[surreal(crate = "surrealdb::types")]
