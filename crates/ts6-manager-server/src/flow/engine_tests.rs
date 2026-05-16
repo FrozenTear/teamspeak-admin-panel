@@ -398,6 +398,7 @@ async fn boot_marks_pre_existing_in_flight_rows_interrupted() {
             trigger: serde_json::json!({"kind":"manualFire"}),
             status: FlowRunStatus::InFlight,
             actionResults: vec![],
+            nodeResults: vec![],
         },
     )
     .await
@@ -485,6 +486,7 @@ async fn per_flow_cap_enforced_after_inserts() {
                 trigger: serde_json::json!({"kind":"manualFire"}),
                 status: FlowRunStatus::Ok,
                 actionResults: vec![],
+                nodeResults: vec![],
             },
         )
         .await
@@ -551,6 +553,7 @@ async fn ttl_prune_removes_finished_rows_older_than_cutoff() {
             trigger: serde_json::json!({"kind":"manualFire"}),
             status: FlowRunStatus::Ok,
             actionResults: vec![],
+            nodeResults: vec![],
         },
     )
     .await
@@ -571,6 +574,7 @@ async fn ttl_prune_removes_finished_rows_older_than_cutoff() {
             trigger: serde_json::json!({"kind":"manualFire"}),
             status: FlowRunStatus::Ok,
             actionResults: vec![],
+            nodeResults: vec![],
         },
     )
     .await

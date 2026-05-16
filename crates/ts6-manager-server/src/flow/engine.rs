@@ -361,6 +361,8 @@ impl FlowEngineHandle {
                     trigger: trigger_doc,
                     status: FlowRunStatus::SkippedDisabled,
                     actionResults: action_results,
+                    // v1.1 linear engine — no per-node records (PURA-259).
+                    nodeResults: Vec::new(),
                 },
             )
             .await
@@ -402,6 +404,8 @@ impl FlowEngineHandle {
                 trigger: trigger_doc.clone(),
                 status: FlowRunStatus::InFlight,
                 actionResults: action_results,
+                // v1.1 linear engine — no per-node records (PURA-259).
+                nodeResults: Vec::new(),
             },
         )
         .await
@@ -667,6 +671,8 @@ async fn run_one(
         status: overall_status,
         error: overall_error,
         actionResults: results,
+        // v1.1 linear engine — no per-node records (PURA-259).
+        nodeResults: Vec::new(),
     };
     if let Err(e) = bot_flow_runs::finish(&inner.db, run_id.0, finish).await {
         tracing::error!(

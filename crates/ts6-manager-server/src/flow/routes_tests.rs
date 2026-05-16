@@ -330,6 +330,7 @@ async fn delete_blocked_when_run_in_flight_then_force_succeeds() {
                 duration_ms: 0,
                 error: None,
             }],
+            nodeResults: vec![],
         },
     )
     .await
