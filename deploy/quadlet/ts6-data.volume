@@ -1,0 +1,17 @@
+# Named volume for the manager's state root (/var/lib/ts6-manager).
+#
+# ts6-db and ts6-music mount on top of this as nested volumes; ts6-data
+# additionally persists everything else the server writes under the
+# state root — today the yt-dlp `yt-cookies.txt` written to DATA_DIR
+# (PURA-314). Without this volume the cookie file lands on the
+# container's ephemeral overlay and is wiped on every container
+# recreation, while the `app_setting` upload-timestamp row (in the
+# ts6-db volume) survives — so the UI keeps showing "cookies uploaded"
+# for a file that no longer exists.
+# Backups: `podman volume export ts6-data > data.tar`.
+
+[Unit]
+Description=TS6 Manager state-root volume (/var/lib/ts6-manager)
+
+[Volume]
+VolumeName=ts6-data
