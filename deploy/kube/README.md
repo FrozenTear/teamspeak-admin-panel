@@ -41,8 +41,8 @@ podman kube down deploy/kube/ts6-manager.yaml
 ```
 
 `kube down` stops and removes the pod + containers, but leaves the
-PVC-backed named volumes (`ts6-db`, `ts6-music`) intact so data
-survives. `--force` is the opt-in flag for wiping volumes — do not
+PVC-backed named volumes (`ts6-data`, `ts6-db`, `ts6-music`) intact so
+data survives. `--force` is the opt-in flag for wiping volumes — do not
 pass it during normal redeploys.
 
 > Note: podman's `kube down` output **always** prints a literal
@@ -54,13 +54,13 @@ pass it during normal redeploys.
 > podman volume ls --filter name=^ts6-
 > ```
 >
-> Both `ts6-db` and `ts6-music` should still be listed after `kube
-> down`. (Verified on Podman 5.8.2 rootless.)
+> `ts6-data`, `ts6-db` and `ts6-music` should all still be listed after
+> `kube down`. (Verified on Podman 5.8.2 rootless.)
 
 To wipe data too:
 
 ```bash
-podman volume rm ts6-db ts6-music
+podman volume rm ts6-data ts6-db ts6-music
 ```
 
 ## Image source
@@ -91,6 +91,7 @@ podman kube play /tmp/ts6-manager.kube.yaml
 
 | PVC | Path inside container | Purpose |
 |-----|-----------------------|---------|
+| `ts6-data` | `/var/lib/ts6-manager` | State root — persists `DATA_DIR` operator uploads (yt-dlp cookie file). `ts6-db` / `ts6-music` nest on top. |
 | `ts6-db` | `/var/lib/ts6-manager/db` | SurrealKV embedded store (DATABASE_URL) |
 | `ts6-music` | `/var/lib/ts6-manager/music` | Music-bot library (MUSIC_DIR) |
 
@@ -144,6 +145,7 @@ respects probe semantics from v4.4 onward.
 ```
 Pod ts6-manager
 └── container fullstack  (port 3001, uid 10001, non-root)
+     ├── PVC ts6-data  → /var/lib/ts6-manager       (state root / uploads)
      ├── PVC ts6-db    → /var/lib/ts6-manager/db    (SurrealKV)
      └── PVC ts6-music → /var/lib/ts6-manager/music
 ```
@@ -160,4 +162,4 @@ publishes — at that point, append a second container entry alongside
 - `cat deploy/kube/secrets.yaml deploy/kube/ts6-manager.yaml > /tmp/ts6-manager.kube.yaml && podman kube play /tmp/ts6-manager.kube.yaml` succeeds on a clean rootless Podman ≥ 4.4 host with only the published image (`ghcr.io/frozentear/ts6-manager-fullstack:latest`) available.
 - `curl http://localhost:3001/health` returns 200.
 - `podman kube down deploy/kube/ts6-manager.yaml` cleans up the pod.
-- Data on PVCs `ts6-db` and `ts6-music` survives `kube down` and is reachable on the next `kube play`.
+- Data on PVCs `ts6-data`, `ts6-db` and `ts6-music` survives `kube down` and is reachable on the next `kube play` — including a yt-dlp cookie uploaded via Settings.

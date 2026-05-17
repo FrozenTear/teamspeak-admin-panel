@@ -15,6 +15,7 @@ development, keep using `podman-compose.yml` at the repo root.
 | --- | --- |
 | `ts6-manager.pod`                          | The rootless pod (PublishPort 127.0.0.1:3001). |
 | `ts6-manager-fullstack.container`          | The Dioxus fullstack server (axum + WASM UI). |
+| `ts6-data.volume`                          | Named volume for the manager state root (`/var/lib/ts6-manager`) — persists `DATA_DIR` operator uploads such as the yt-dlp cookie file. |
 | `ts6-db.volume`                            | Named volume for the embedded SurrealKV store. |
 | `ts6-music.volume`                         | Named volume for the music library. |
 | `ts6-manager-sidecar.container.example`    | Inactive template for the MoQ video sidecar (Phase 5). Rename when [PURA-160](/PURA/issues/PURA-160) publishes the image. |
@@ -49,6 +50,7 @@ development, keep using `podman-compose.yml` at the repo root.
    install -m 0644 \
        deploy/quadlet/ts6-manager.pod \
        deploy/quadlet/ts6-manager-fullstack.container \
+       deploy/quadlet/ts6-data.volume \
        deploy/quadlet/ts6-db.volume \
        deploy/quadlet/ts6-music.volume \
        "${XDG_CONFIG_HOME:-$HOME/.config}/containers/systemd/"
@@ -110,6 +112,7 @@ logouts. Disable with `loginctl disable-linger $USER`.
 | Pull a new image and roll | `podman auto-update --dry-run` then `podman auto-update` (Quadlet `AutoUpdate=registry` opts in) |
 | Backup DB | `podman volume export ts6-db -o ts6-db-$(date +%F).tar` |
 | Restore DB | `podman volume import ts6-db ts6-db-YYYY-MM-DD.tar` |
+| Backup uploads (yt-dlp cookie) | `podman volume export ts6-data -o ts6-data-$(date +%F).tar` |
 
 ## Updating the units
 

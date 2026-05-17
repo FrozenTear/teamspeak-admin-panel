@@ -153,7 +153,10 @@ For all three shapes the external smoke is the same: `curl -fsS http://127.0.0.1
 | Compose | `podman-compose up -d fullstack` | `podman-compose down` | `podman-compose restart fullstack` |
 
 Kube `kube down` removes the pod and containers but leaves the named
-volumes (`ts6-db`, `ts6-music`) intact, so data survives a restart.
+volumes (`ts6-data`, `ts6-db`, `ts6-music`) intact, so data survives a
+restart. `ts6-data` backs the manager state root and is what keeps a
+yt-dlp cookie uploaded via Settings from being wiped on redeploy
+([PURA-314](https://github.com/FrozenTear/teamspeak-admin-panel/issues)).
 
 ### 3.2 Volume backup and restore
 
@@ -163,10 +166,12 @@ see [troubleshooting](troubleshooting.md#permission-denied-opening-the-surrealkv
 
 ```sh
 # Backup. Date-stamped tarball in the working directory.
+podman volume export ts6-data  -o ts6-data-$(date +%F).tar
 podman volume export ts6-db    -o ts6-db-$(date +%F).tar
 podman volume export ts6-music -o ts6-music-$(date +%F).tar
 
 # Restore (volume must exist; destroy it first if you want a clean state).
+podman volume import ts6-data  ts6-data-YYYY-MM-DD.tar
 podman volume import ts6-db    ts6-db-YYYY-MM-DD.tar
 podman volume import ts6-music ts6-music-YYYY-MM-DD.tar
 ```

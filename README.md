@@ -72,7 +72,7 @@ podman-compose up --build fullstack
 
 This builds `localhost/ts6-manager-fullstack:dev` from
 [`Containerfile.fullstack`](Containerfile.fullstack) and stores state
-in named volumes (`ts6-db`, `ts6-music`) — not host bind-mounts. See
+in named volumes (`ts6-data`, `ts6-db`, `ts6-music`) — not host bind-mounts. See
 the comment in [`podman-compose.yml`](podman-compose.yml) for the
 rootless-userns rationale.
 
