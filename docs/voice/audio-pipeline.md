@@ -153,7 +153,8 @@ Reasonable inputs: short YouTube videos, SoundCloud tracks, direct .mp3 / .m4a U
 The pipeline shells out to:
 
 - `ffmpeg` (any 4.x+; tested locally against 8.x). Required for everything except the `SyntheticTone` source.
-- `yt-dlp` (recent — must support `-f bestaudio -o -`). Required only for the `YtDlp` source.
+- `yt-dlp` (recent — must support `-f bestaudio -o -`). Required only for the `YtDlp` source. YouTube changes its player cipher often; a yt-dlp more than a few months old will silently stop resolving formats. The `Containerfile.fullstack` pin (`YTDLP_VERSION`) must be bumped when that happens.
+- A JavaScript runtime — **Deno** — on `PATH`. Modern YouTube requires solving a player signature / `n` challenge in JS (yt-dlp's EJS challenge solver). Without a JS runtime, signature solving fails, every real audio/video format is filtered out, and yt-dlp returns only storyboard images — the bot then reports the track as "unavailable" even when cookie auth succeeded. The `Containerfile.fullstack` installs Deno (`DENO_VERSION`); host installs must provide it too. Required only for the `YtDlp` source.
 - `libopus` 1.x — pulled in by `audiopus` at compile time.
 
 These are not provisioned by the workspace; the operator-side `Containerfile.fullstack` and the host package manager handle them. Compose-side runbooks live alongside `docs/ts6-fixture.md`.

@@ -143,7 +143,18 @@ FROM docker.io/debian:bookworm-slim
 # Bump this ARG when YouTube stops working again (keep the pin explicit so a
 # future regression is a deliberate, reviewed change — not a silent `latest`
 # pull at build time).
-ARG YTDLP_VERSION=2025.01.26
+ARG YTDLP_VERSION=2026.03.17
+# yt-dlp needs a JavaScript runtime to solve YouTube's player signature and
+# `n` challenge (the EJS challenge solver). Without one, signature solving
+# fails, every real audio/video format is filtered out, and yt-dlp returns
+# only storyboard images — the music bot then reports the track as
+# "unavailable" even though cookie auth succeeded (PURA-314: the v1.4.1 image
+# shipped no JS runtime, so playback failed for *every* URL regardless of
+# cookies). Deno is the runtime yt-dlp's docs recommend; pin it explicitly
+# like yt-dlp so a future bump is a deliberate, reviewed change. `TARGETARCH`
+# is populated automatically by the OCI builder on multi-arch builds.
+ARG DENO_VERSION=v2.7.14
+ARG TARGETARCH
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         ca-certificates \
@@ -154,7 +165,18 @@ RUN apt-get update \
  && curl -fsSL -o /usr/local/bin/yt-dlp \
         "https://github.com/yt-dlp/yt-dlp/releases/download/${YTDLP_VERSION}/yt-dlp" \
  && chmod 0755 /usr/local/bin/yt-dlp \
+ && case "${TARGETARCH}" in \
+        amd64) deno_arch=x86_64-unknown-linux-gnu ;; \
+        arm64) deno_arch=aarch64-unknown-linux-gnu ;; \
+        *) echo "FATAL: unsupported TARGETARCH '${TARGETARCH}' for Deno install" >&2; exit 1 ;; \
+    esac \
+ && curl -fsSL -o /tmp/deno.zip \
+        "https://github.com/denoland/deno/releases/download/${DENO_VERSION}/deno-${deno_arch}.zip" \
+ && python3 -m zipfile -e /tmp/deno.zip /usr/local/bin \
+ && rm /tmp/deno.zip \
+ && chmod 0755 /usr/local/bin/deno \
  && yt-dlp --version \
+ && deno --version \
  && rm -rf /var/lib/apt/lists/* \
  && groupadd --system --gid 10001 ts6 \
  && useradd --system --uid 10001 --gid ts6 --shell /usr/sbin/nologin --home-dir /var/lib/ts6-manager ts6 \
