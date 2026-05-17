@@ -49,6 +49,37 @@ use ts6_manager_shared::widgets::{
 use crate::client::api::ApiError;
 use crate::ui::components::VideoPlayer;
 
+// PURA-322 — server function that reads the HTTP Host and X-Forwarded-Proto
+// headers to build the page origin (e.g. `https://panel.example.com`). Used
+// to construct absolute og:image URLs at SSR time so link unfurls on Discord,
+// X, and Twitch/Kick chat produce a rich card pointing at the real PNG
+// endpoint. On the client the result comes from SSR hydration data — no
+// extra HTTP call is made. Falls back to `https://localhost` if the context
+// is unavailable (e.g. in test harnesses).
+#[server]
+async fn get_page_origin() -> Result<String, ServerFnError> {
+    if let Some(ctx) = FullstackContext::current() {
+        let parts = ctx.parts_mut();
+        let proto = parts
+            .headers
+            .get("x-forwarded-proto")
+            .or_else(|| parts.headers.get("x-forwarded-scheme"))
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("https")
+            .to_owned();
+        let host = parts
+            .headers
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("localhost")
+            .to_owned();
+        drop(parts);
+        Ok(format!("{proto}://{host}"))
+    } else {
+        Ok("https://localhost".to_string())
+    }
+}
+
 // ── PURA-146 (WS-8) — public video-source view.
 //
 // Mirrors the wire shape returned by `widgets::routes::video_sources_handler`.
@@ -111,6 +142,16 @@ pub enum WsState {
 
 #[component]
 pub fn PublicWidgetPage(token: String) -> Element {
+    // PURA-322 — resolve the page origin so og:image can be an absolute URL.
+    // `use_server_future` awaits this on the server before streaming HTML,
+    // so the meta tags land in the SSR document for unfurl bots. On the
+    // client the value is read from SSR hydration data — no extra round-trip.
+    let og_origin = use_server_future(get_page_origin)?;
+    let img_url = og_origin()
+        .and_then(|r| r.ok())
+        .map(|o| format!("{o}/api/widget/{token}/image.png"))
+        .unwrap_or_else(|| format!("/api/widget/{token}/image.png"));
+
     let token_signal = use_signal(|| token.clone());
 
     // Refetch trigger. Bumping it forces the resource to re-run; the WS
@@ -171,6 +212,20 @@ pub fn PublicWidgetPage(token: String) -> Element {
     };
 
     rsx! {
+        // PURA-322 — OG / Twitter-card meta so pasting the widget link in
+        // Discord, X, or Twitch/Kick chat unfurls a rich card with the
+        // live-ish PNG snapshot. These render into <head> via document::Meta.
+        // og:image uses the absolute URL from the server-side origin resolve.
+        document::Meta { property: "og:type", content: "website" }
+        document::Meta { property: "og:title", content: "TeamSpeak Widget" }
+        document::Meta {
+            property: "og:description",
+            content: "Live TeamSpeak server status",
+        }
+        document::Meta { property: "og:image", content: "{img_url}" }
+        document::Meta { name: "twitter:card", content: "summary_large_image" }
+        document::Meta { name: "twitter:image", content: "{img_url}" }
+
         WidgetStyleBlock {}
         match &*data.read_unchecked() {
             None => rsx! { WidgetLoading {} },
