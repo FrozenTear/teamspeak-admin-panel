@@ -41,8 +41,14 @@ impl AudioPipeline {
         let events_pub = events_tx.clone();
 
         let worker = tokio::spawn(async move {
-            let pacer_start = Instant::now();
-            let mut pacer = WallClockPacer::new(pacer_start);
+            // The pacer is anchored on the *first emitted frame*, not on
+            // worker spawn. yt-dlp/ffmpeg startup latency is multi-second;
+            // anchoring at spawn stamps every slot before the first frame in
+            // the past, so the consumer's wall-clock wait fires instantly and
+            // blasts a multi-second catch-up burst before settling into
+            // real-time — audible as choppy playback at the start of every
+            // track (PURA-314).
+            let mut pacer: Option<WallClockPacer> = None;
             let samples_per_frame = encoder.samples_per_frame();
             // PCM accumulator — holds samples that crossed a `read_samples`
             // boundary. We always emit whole frames; partial leftovers are
@@ -91,7 +97,9 @@ impl AudioPipeline {
                         continue;
                     }
                 };
-                let (index, scheduled_at) = pacer.tick();
+                let (index, scheduled_at) = pacer
+                    .get_or_insert_with(|| WallClockPacer::new(Instant::now()))
+                    .tick();
                 let frame = OpusFrame {
                     bytes: opus,
                     index,

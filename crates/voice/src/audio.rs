@@ -240,6 +240,19 @@ fn spawn_sibling(
                 biased;
                 frame = frames_rx.recv() => match frame {
                     Some(f) => {
+                        // Wall-clock pacing. The pipeline encodes far faster
+                        // than real-time and only the small bounded frame
+                        // channel throttles it; without waiting for each
+                        // frame's `scheduled_at` slot the frames are pushed
+                        // onto the wire in bursts and the TS server's jitter
+                        // buffer plays them choppy and laggy (PURA-314). The
+                        // pacer's `scheduled_at` is the drift-free
+                        // `first-frame anchor + index * 20 ms`; `sleep_until`
+                        // returns immediately once that slot is in the past.
+                        tokio::time::sleep_until(tokio::time::Instant::from_std(
+                            f.scheduled_at,
+                        ))
+                        .await;
                         if tx.send(AudioMsg::Frame(f.bytes)).await.is_err() {
                             return;
                         }
@@ -372,5 +385,58 @@ mod tests {
         let (spec, label) = source_to_spec(&AudioSource::LibraryPath(PathBuf::from("a/b.mp3")));
         assert!(matches!(spec, AudioSourceSpec::Ffmpeg { .. }));
         assert!(label.starts_with("library:"));
+    }
+
+    /// PURA-314 regression — the sibling task must wait for each frame's
+    /// `scheduled_at` slot before forwarding it. Before the fix it forwarded
+    /// every frame the instant the pipeline produced it; the pipeline encodes
+    /// far faster than real-time, so a whole track was blasted onto the wire
+    /// in a sub-second burst, which the TS server's jitter buffer rendered as
+    /// laggy, choppy playback. A 200 ms synthetic tone is 10 frames; paced
+    /// delivery must span most of that 200 ms, not arrive all at once.
+    #[tokio::test]
+    async fn sibling_paces_frames_to_wall_clock() {
+        let mut pipeline = AudioPipeline::spawn(
+            AudioSourceSpec::SyntheticTone {
+                hz: 440.0,
+                amplitude: 0.5,
+                duration_ms: Some(200),
+            },
+            PipelineConfig::default(),
+        )
+        .await
+        .expect("spawn synthetic pipeline");
+        let frames_rx = pipeline.take_frames();
+        let events_rx = pipeline.events();
+        let (_pause_tx, pause_rx) = watch::channel(false);
+        let (msg_tx, mut msg_rx) = mpsc::channel(256);
+
+        let started = std::time::Instant::now();
+        let sibling = spawn_sibling(pipeline, frames_rx, events_rx, pause_rx, msg_tx);
+
+        let mut frame_count = 0usize;
+        let mut last_frame_at = started;
+        while let Some(msg) = msg_rx.recv().await {
+            match msg {
+                AudioMsg::Frame(_) => {
+                    frame_count += 1;
+                    last_frame_at = std::time::Instant::now();
+                }
+                AudioMsg::Finished => break,
+                AudioMsg::PipelineEvent(_) => {}
+            }
+        }
+        sibling.await.expect("sibling task join");
+
+        assert!(
+            frame_count >= 9,
+            "200 ms tone at 20 ms frames should yield ~10 frames, got {frame_count}",
+        );
+        let span = last_frame_at.duration_since(started);
+        assert!(
+            span >= Duration::from_millis(120),
+            "frames arrived within {span:?} — expected real-time pacing (~180 ms for \
+             {frame_count} frames), not an unpaced burst",
+        );
     }
 }
