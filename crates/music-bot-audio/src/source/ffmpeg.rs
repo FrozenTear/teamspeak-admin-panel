@@ -24,6 +24,11 @@ pub struct FfmpegSource {
     channels: u8,
     /// Pending warning events (e.g. ffmpeg startup hiccup).
     events: Vec<PipelineEvent>,
+    /// PURA-330 — process spawn time, used to log time-to-first-PCM so the
+    /// `!play` → first-audio latency can be attributed per stage.
+    spawned_at: std::time::Instant,
+    /// PURA-330 — set once the first non-empty PCM read has been logged.
+    first_pcm_logged: bool,
 }
 
 impl FfmpegSource {
@@ -73,6 +78,8 @@ impl FfmpegSource {
             stdout: BufReader::with_capacity(64 * 1024, stdout),
             channels,
             events: Vec::new(),
+            spawned_at: std::time::Instant::now(),
+            first_pcm_logged: false,
         })
     }
 
@@ -86,6 +93,17 @@ impl FfmpegSource {
             .arg("-loglevel")
             .arg("error")
             .arg("-nostdin")
+            // PURA-330 — cap container probing on the piped yt-dlp stream.
+            // ffmpeg's defaults (5 MB probesize / 5 s analyzeduration) make
+            // it buffer and inspect several seconds of input before it
+            // emits the first PCM byte; for `yt-dlp -f bestaudio` output
+            // (a single webm/opus or m4a/aac elementary stream) a fraction
+            // of that is plenty to detect the format. This trims dead time
+            // from `!play` → first-audio without affecting decode quality.
+            .arg("-probesize")
+            .arg("256k")
+            .arg("-analyzeduration")
+            .arg("1000000")
             .arg("-i")
             .arg("pipe:0")
             .arg("-vn")
@@ -127,6 +145,8 @@ impl FfmpegSource {
                 stdout: BufReader::with_capacity(64 * 1024, stdout),
                 channels,
                 events: Vec::new(),
+                spawned_at: std::time::Instant::now(),
+                first_pcm_logged: false,
             },
             stdin,
         ))
@@ -181,6 +201,18 @@ impl PcmSource for FfmpegSource {
         let whole_samples = filled / 2;
         for i in 0..whole_samples {
             buf[i] = i16::from_le_bytes([byte_buf[i * 2], byte_buf[i * 2 + 1]]);
+        }
+        // PURA-330 — log time-to-first-PCM once. This is the boundary
+        // between "ffmpeg has the input + finished probing" and "decoded
+        // audio is flowing"; attributing the `!play` latency needs it.
+        if whole_samples > 0 && !self.first_pcm_logged {
+            self.first_pcm_logged = true;
+            tracing::info!(
+                target: "music_bot_latency",
+                stage = "ffmpeg_first_pcm",
+                elapsed_ms = self.spawned_at.elapsed().as_millis() as u64,
+                "ffmpeg emitted first decoded PCM",
+            );
         }
         Ok(whole_samples)
     }

@@ -41,6 +41,12 @@ impl YtDlpSource {
     /// call-site so a UI cookie upload takes effect on the *next* track
     /// without a manager restart.
     pub async fn new(url: &str, channels: u8, cookie_file: Option<&Path>) -> io::Result<Self> {
+        // PURA-330 — anchor for the per-stage latency log. yt-dlp URL
+        // resolution (YouTube nsig/signature challenge via Deno on a
+        // datacenter IP) is the dominant unknown in `!play` → first-audio;
+        // logging time-to-first-bytes turns it into a measured number.
+        let spawn_t0 = std::time::Instant::now();
+
         // Spawn ffmpeg first, take its stdin so we can pipe yt-dlp output in.
         let (inner, mut ffmpeg_stdin) = FfmpegSource::from_stdin(channels).await?;
 
@@ -69,6 +75,12 @@ impl YtDlpSource {
             .stderr(Stdio::piped());
 
         let mut yt_dlp = cmd.spawn()?;
+        tracing::info!(
+            target: "music_bot_latency",
+            stage = "yt_dlp_spawned",
+            elapsed_ms = spawn_t0.elapsed().as_millis() as u64,
+            "yt-dlp process spawned — resolving URL",
+        );
         let mut yt_stdout = yt_dlp
             .stdout
             .take()
@@ -98,10 +110,23 @@ impl YtDlpSource {
         // ffmpeg's stdin when yt-dlp finishes so ffmpeg sees clean EOF.
         let bridge = tokio::spawn(async move {
             let mut buf = vec![0u8; 32 * 1024];
+            let mut first_bytes_logged = false;
             loop {
                 match yt_stdout.read(&mut buf).await {
                     Ok(0) => break,
                     Ok(n) => {
+                        // PURA-330 — first bytes out of yt-dlp marks the end
+                        // of URL resolution + the start of the media fetch:
+                        // the single largest latency stage in `!play`.
+                        if !first_bytes_logged {
+                            first_bytes_logged = true;
+                            tracing::info!(
+                                target: "music_bot_latency",
+                                stage = "yt_dlp_first_bytes",
+                                elapsed_ms = spawn_t0.elapsed().as_millis() as u64,
+                                "yt-dlp produced first bytes — URL resolved, fetch started",
+                            );
+                        }
                         if ffmpeg_stdin.write_all(&buf[..n]).await.is_err() {
                             break;
                         }

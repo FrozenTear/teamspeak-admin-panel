@@ -71,6 +71,10 @@ pub(crate) struct ActiveAudio {
     /// Zero at `Finished` means the pipeline produced no audio (e.g. yt-dlp
     /// failed on a YouTube URL and ffmpeg saw empty stdin).
     pub frames_sent: u64,
+    /// PURA-330 — pipeline-spawn time. The connected loop logs total
+    /// `start_pipeline` → first-Opus-frame-on-wire latency against this so
+    /// the `!play` startup delay is attributable end-to-end.
+    pub started_at: std::time::Instant,
     /// PURA-314 — last operator-readable pipeline warning (yt-dlp cookie
     /// gate, private/unavailable video, …). Set from
     /// `PipelineEvent::Warning`; used to build a *specific* `AudioFinished`
@@ -184,6 +188,10 @@ pub(crate) async fn start_pipeline(
     source: &AudioSource,
     yt_cookie_file: Option<PathBuf>,
 ) -> Result<String, PipelineError> {
+    // PURA-330 — latency anchor: captured before teardown so the logged
+    // `!play` → first-audio span includes the previous pipeline's drop.
+    let started_at = std::time::Instant::now();
+
     // Drop the previous pipeline first. `Option::take` here so the old
     // `ActiveAudio`'s `Drop` runs before we spawn the replacement — the
     // ffmpeg / yt-dlp subprocesses the previous pipeline held are killed
@@ -220,6 +228,7 @@ pub(crate) async fn start_pipeline(
         audio_rx: msg_rx,
         pause: pause_tx,
         frames_sent: 0,
+        started_at,
         last_diagnostic: None,
         _sibling: sibling,
     });

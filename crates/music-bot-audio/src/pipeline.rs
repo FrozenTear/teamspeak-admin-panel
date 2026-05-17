@@ -42,6 +42,11 @@ impl AudioPipeline {
 
         let prebuffer_target = cfg.prebuffer_frames;
         let worker = tokio::spawn(async move {
+            // PURA-330 — anchor for the per-stage latency log: time from
+            // worker spawn to the first encoded Opus frame covers the whole
+            // source bring-up (yt-dlp + ffmpeg) plus the first encode.
+            let worker_t0 = Instant::now();
+            let mut first_frame_logged = false;
             // The pacer is anchored on the *first forwarded frame*, not on
             // worker spawn. yt-dlp/ffmpeg startup latency is multi-second;
             // anchoring at spawn stamps every slot before the first frame in
@@ -114,6 +119,15 @@ impl AudioPipeline {
                         continue;
                     }
                 };
+                if !first_frame_logged {
+                    first_frame_logged = true;
+                    tracing::info!(
+                        target: "music_bot_latency",
+                        stage = "pipeline_first_frame",
+                        elapsed_ms = worker_t0.elapsed().as_millis() as u64,
+                        "pipeline encoded first Opus frame (pre-buffering begins)",
+                    );
+                }
                 let drained = eof && pcm.is_empty();
                 match &mut pacer {
                     Some(pacer) => {
@@ -136,6 +150,13 @@ impl AudioPipeline {
                         // shorter than the watermark).
                         prebuffer.push(opus);
                         if prebuffer.len() >= prebuffer_target || drained {
+                            tracing::info!(
+                                target: "music_bot_latency",
+                                stage = "pipeline_prebuffer_full",
+                                elapsed_ms = worker_t0.elapsed().as_millis() as u64,
+                                frames = prebuffer.len(),
+                                "pre-buffer watermark reached — handing frames to consumer",
+                            );
                             let pacer = slot.insert(WallClockPacer::new(Instant::now()));
                             if !flush_prebuffer(&mut prebuffer, pacer, &frames_tx, channels).await {
                                 break;

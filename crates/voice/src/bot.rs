@@ -399,6 +399,18 @@ async fn handle_audio_msg(
         AudioMsg::Frame(opus) => {
             if let Some(active) = current_audio.as_mut() {
                 active.frames_sent += 1;
+                // PURA-330 — the end-to-end latency milestone: this is the
+                // first Opus frame the operator can actually hear. One
+                // INFO line per play closes out the `!play` → first-audio
+                // breakdown started by the `music_bot_latency` stage logs.
+                if active.frames_sent == 1 {
+                    info!(
+                        target: "music_bot_latency",
+                        stage = "first_frame_on_wire",
+                        elapsed_ms = active.started_at.elapsed().as_millis() as u64,
+                        "first Opus frame sent on the wire — playback audible",
+                    );
+                }
             }
             if let Err(err) = audio::send_opus_frame(con, &opus) {
                 error!(?err, "send_audio failed — tearing down pipeline");
@@ -1029,7 +1041,13 @@ async fn dispatch_chat_line(
 ) {
     match chat::parse(&msg.text) {
         Ok(parsed) => {
-            debug!(invoker = %msg.invoker, ?parsed, "chat command");
+            // PURA-330 — INFO so the chat-command-received timestamp is in
+            // the manager log without enabling debug. This is stage 0 of
+            // the `!play` → first-audio latency breakdown: the gap between
+            // this line and `AudioCommand::Play — spawning pipeline` is
+            // the command-dispatch latency the issue calls out as
+            // previously unmeasured.
+            info!(target: "music_bot_latency", invoker = %msg.invoker, command = ?parsed, "chat command received");
             chat::dispatch(bot_id, con, store, events, parsed).await;
         }
         Err(err) => {
