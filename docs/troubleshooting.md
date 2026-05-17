@@ -34,6 +34,7 @@ right command per shape).
 - [Dashboard tick republisher silent / backing off](#dashboard-tick-republisher-silent--backing-off)
 - [Dashboard says "control transport error" after a fresh deploy](#dashboard-says-control-transport-error-after-a-fresh-deploy)
 - [Headless browser probes deadlock against the SPA](#headless-browser-probes-deadlock-against-the-spa)
+- [Kick "About" section does not render the widget snapshot image](#kick-about-section-does-not-render-the-widget-snapshot-image)
 
 ---
 
@@ -611,6 +612,43 @@ every subsequent CDP call hits its budget.
 **Cross-link.**
 [PURA-131](https://github.com/FrozenTear/teamspeak-admin-panel/issues)
 carries the full repro and the QA evidence directory.
+
+---
+
+## Kick "About" section does not render the widget snapshot image
+
+**What the operator sees.** They follow the "Share to Kick" recipe in the
+widget admin page's share modal, paste the `![…](…/api/widget/<token>/image.png)`
+Markdown snippet into their Kick channel's About section, and the widget
+snapshot never appears — the literal Markdown text shows instead, or it is
+stripped.
+
+**Why it happens.** A Kick channel's "About" tab (Bio + Panels) is a
+Twitch-style surface. Its description fields support only a Markdown
+*subset* — links `[text](url)`, bold, italic, lists, blockquotes,
+strikethrough, headers, horizontal rules. The image syntax `![alt](url)`
+is **not** rendered inline. The only image surface a Kick panel has is its
+**dedicated uploaded-image field**: the operator picks a file, Kick uploads
+it and hosts it on Kick's own CDN. There is no remote-image-URL field, so a
+panel image is a **static snapshot frozen at upload time** — it is never
+hot-linked and never re-fetches the panel-origin PNG.
+
+**What to do.** Treat Kick exactly like the Twitch panel recipe:
+
+- Download the widget snapshot PNG from `…/api/widget/<token>/image.png`.
+- Upload it as the Kick panel image.
+- Set the panel link to the live widget page so visitors can open the
+  auto-updating view.
+- To refresh the snapshot, re-download the PNG and re-upload it — there is
+  no automatic re-fetch. The widget PNG endpoint's 45 s cache only matters
+  at the moment of download.
+
+The widget PNG endpoint being "45 s fresh" does **not** make a Kick panel
+image semi-live; that freshness applies only to a fetch made at upload time.
+
+**Cross-link.** [PURA-326](https://github.com/FrozenTear/teamspeak-admin-panel/issues)
+recorded this behaviour; [PURA-322](https://github.com/FrozenTear/teamspeak-admin-panel/issues)
+owns the share-modal copy correction.
 
 ---
 
