@@ -71,6 +71,12 @@ pub(crate) struct ActiveAudio {
     /// Zero at `Finished` means the pipeline produced no audio (e.g. yt-dlp
     /// failed on a YouTube URL and ffmpeg saw empty stdin).
     pub frames_sent: u64,
+    /// PURA-314 — last operator-readable pipeline warning (yt-dlp cookie
+    /// gate, private/unavailable video, …). Set from
+    /// `PipelineEvent::Warning`; used to build a *specific* `AudioFinished`
+    /// failure reason when the pipeline produces 0 frames, instead of the
+    /// generic "check yt-dlp/ffmpeg logs".
+    pub last_diagnostic: Option<String>,
     /// Kept so `Drop` aborts the sibling on teardown. The sibling owns
     /// the [`AudioPipeline`] (whose own `Drop` aborts the worker task),
     /// so this single handle is enough to cancel the whole audio stack.
@@ -203,6 +209,7 @@ pub(crate) async fn start_pipeline(
         audio_rx: msg_rx,
         pause: pause_tx,
         frames_sent: 0,
+        last_diagnostic: None,
         _sibling: sibling,
     });
     Ok(label)

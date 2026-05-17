@@ -428,6 +428,12 @@ async fn handle_audio_msg(
         }
         AudioMsg::PipelineEvent(PipelineEvent::Warning(message)) => {
             warn!(%message, "audio pipeline warning");
+            // PURA-314 — stash the cause so a 0-frame `Finished` can build a
+            // specific failure reason (e.g. the yt-dlp cookie gate) instead
+            // of the generic "check yt-dlp/ffmpeg logs".
+            if let Some(active) = current_audio.as_mut() {
+                active.last_diagnostic = Some(message.clone());
+            }
             let _ = events.send(BotEvent::Error(BotError::Internal(format!(
                 "audio pipeline: {message}"
             ))));
@@ -446,11 +452,23 @@ async fn handle_audio_msg(
             // synthesised `Playing` state drops — otherwise the bot
             // reports `Playing` forever with the cause log-only.
             let frames = current_audio.as_ref().map(|a| a.frames_sent).unwrap_or(0);
+            let diagnostic = current_audio
+                .as_ref()
+                .and_then(|a| a.last_diagnostic.clone());
             let reason = if frames == 0 {
+                // PURA-314 — prefer the captured pipeline diagnostic (yt-dlp
+                // cookie gate, private/unavailable video, …) so the UI's
+                // `last_error` banner tells the operator *why* playback
+                // failed and what to do. Fall back to the generic message
+                // only when nothing classified the failure.
+                let cause = diagnostic.unwrap_or_else(|| {
+                    "audio pipeline produced 0 frames — check yt-dlp/ffmpeg logs".to_string()
+                });
                 warn!(
-                    "audio pipeline finished with 0 frames — yt-dlp or ffmpeg likely failed; check yt_dlp/ffmpeg warn logs above"
+                    %cause,
+                    "audio pipeline finished with 0 frames — yt-dlp or ffmpeg failed"
                 );
-                "failed: audio pipeline produced 0 frames — check yt-dlp/ffmpeg logs".to_string()
+                format!("failed: {cause}")
             } else {
                 "end_of_stream".to_string()
             };

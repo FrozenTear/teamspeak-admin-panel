@@ -23,6 +23,12 @@ use crate::types::PipelineEvent;
 pub struct YtDlpSource {
     yt_dlp: Option<Child>,
     bridge: Option<JoinHandle<()>>,
+    /// Stderr reader task. Returns the `ERROR:` lines yt-dlp printed so the
+    /// pipeline can surface *why* a play failed (PURA-314). Taken (→ `None`)
+    /// once `collect_diagnostics` has drained it.
+    stderr_task: Option<JoinHandle<Vec<String>>>,
+    /// Diagnostic events queued for the next `try_drain_events` call.
+    diagnostics: Vec<PipelineEvent>,
     inner: FfmpegSource,
 }
 
@@ -68,16 +74,24 @@ impl YtDlpSource {
             .take()
             .ok_or_else(|| io::Error::other("yt-dlp child has no stdout"))?;
 
-        // Log yt-dlp stderr so signature/cipher errors are visible to operators.
+        // Log yt-dlp stderr so signature/cipher errors are visible to
+        // operators, AND collect the `ERROR:` lines so the pipeline can
+        // surface the cause to the UI — yt-dlp failures used to be log-only
+        // and the bot just reported a generic "0 frames" (PURA-314).
         let yt_stderr = yt_dlp
             .stderr
             .take()
             .ok_or_else(|| io::Error::other("yt-dlp child has no stderr"))?;
-        tokio::spawn(async move {
+        let stderr_task = tokio::spawn(async move {
             let mut lines = BufReader::new(yt_stderr).lines();
+            let mut errors = Vec::new();
             while let Ok(Some(line)) = lines.next_line().await {
                 tracing::warn!(target: "yt_dlp", "{}", line);
+                if line.contains("ERROR:") {
+                    errors.push(line);
+                }
             }
+            errors
         });
 
         // Bridge yt-dlp.stdout → ffmpeg.stdin in a background task. Closes
@@ -101,14 +115,92 @@ impl YtDlpSource {
         Ok(Self {
             yt_dlp: Some(yt_dlp),
             bridge: Some(bridge),
+            stderr_task: Some(stderr_task),
+            diagnostics: Vec::new(),
             inner,
         })
     }
+
+    /// Drain the yt-dlp stderr task once the pipeline has hit EOF. Called
+    /// from `read_samples` the first time the inner ffmpeg source reports
+    /// EOF — at that point yt-dlp has already exited (its exit is what
+    /// closed ffmpeg's stdin and ended ffmpeg), so awaiting the stderr
+    /// reader is bounded. Each captured `ERROR:` line becomes a
+    /// `PipelineEvent::Warning` carrying an operator-readable cause.
+    async fn collect_diagnostics(&mut self) {
+        let Some(task) = self.stderr_task.take() else {
+            return;
+        };
+        if let Ok(errors) = task.await {
+            for line in errors {
+                self.diagnostics
+                    .push(PipelineEvent::Warning(classify_yt_dlp_error(&line)));
+            }
+        }
+    }
+}
+
+/// Turn a raw yt-dlp `ERROR:` stderr line into an operator-readable cause.
+///
+/// yt-dlp's wire messages are terse and link-heavy; the music-bot UI shows
+/// this string verbatim in the per-bot "playback failed" banner, so known
+/// failure modes get a plain-language rewrite that tells the operator what
+/// to *do*. Unknown errors fall through with just the `ERROR: ` prefix
+/// stripped.
+pub fn classify_yt_dlp_error(raw: &str) -> String {
+    let msg = raw.trim();
+    let lower = msg.to_lowercase();
+
+    // The single most common production failure: YouTube rate-limits the
+    // datacenter IP and demands a signed-in session. The fix is operator
+    // config, not a retry — say so. (PURA-314)
+    if lower.contains("sign in to confirm")
+        || lower.contains("confirm you’re not a bot")
+        || lower.contains("confirm you're not a bot")
+        || (lower.contains("--cookies") && lower.contains("authentication"))
+    {
+        return "YouTube is asking the bot to sign in to confirm it is not a bot. \
+                No YouTube cookies are configured — upload a Netscape cookies.txt in \
+                the manager settings (or set YT_COOKIE_FILE) so yt-dlp can authenticate."
+            .to_string();
+    }
+    if lower.contains("private video") {
+        return "This video is private and cannot be played.".to_string();
+    }
+    if lower.contains("video unavailable") || lower.contains("is not available") {
+        return "This video is unavailable (removed, region-locked, or geo-blocked \
+                for the server's location)."
+            .to_string();
+    }
+    if lower.contains("age") && lower.contains("restrict") {
+        return "This video is age-restricted — yt-dlp needs a signed-in YouTube \
+                cookies.txt to play it."
+            .to_string();
+    }
+    if lower.contains("members-only") || lower.contains("join this channel") {
+        return "This video is members-only and needs a subscribed account's \
+                cookies.txt to play."
+            .to_string();
+    }
+    if lower.contains("unsupported url") {
+        return "yt-dlp does not recognise this URL — check the link is a \
+                supported site."
+            .to_string();
+    }
+
+    // Unknown error — strip the noisy `ERROR: ` prefix and pass it through.
+    msg.strip_prefix("ERROR:")
+        .map(str::trim)
+        .unwrap_or(msg)
+        .to_string()
 }
 
 impl Drop for YtDlpSource {
     fn drop(&mut self) {
         if let Some(handle) = self.bridge.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.stderr_task.take() {
             handle.abort();
         }
         if let Some(mut child) = self.yt_dlp.take()
@@ -122,10 +214,61 @@ impl Drop for YtDlpSource {
 #[async_trait]
 impl PcmSource for YtDlpSource {
     async fn read_samples(&mut self, buf: &mut [i16]) -> io::Result<usize> {
-        self.inner.read_samples(buf).await
+        let n = self.inner.read_samples(buf).await?;
+        if n == 0 {
+            // Inner ffmpeg hit EOF — yt-dlp has already exited. Collect its
+            // stderr diagnostics so `try_drain_events` can surface the
+            // cause before the pipeline emits `EndOfStream` (PURA-314).
+            self.collect_diagnostics().await;
+        }
+        Ok(n)
     }
 
     fn try_drain_events(&mut self) -> Vec<PipelineEvent> {
-        self.inner.try_drain_events()
+        let mut out = std::mem::take(&mut self.diagnostics);
+        out.extend(self.inner.try_drain_events());
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::classify_yt_dlp_error;
+
+    #[test]
+    fn cookie_gate_error_maps_to_actionable_message() {
+        // The exact wording yt-dlp emits in production (PURA-314).
+        let raw = "ERROR: [youtube] cvaIgq5j2Q8: Sign in to confirm you’re not a bot. \
+                   Use --cookies-from-browser or --cookies for the authentication.";
+        let msg = classify_yt_dlp_error(raw);
+        assert!(msg.contains("cookies.txt"), "got: {msg}");
+        assert!(!msg.contains("ERROR:"), "raw prefix leaked: {msg}");
+    }
+
+    #[test]
+    fn private_and_unavailable_videos_are_recognised() {
+        assert!(
+            classify_yt_dlp_error(
+                "ERROR: [youtube] x: Private video. Sign in if you've been granted access"
+            )
+            .contains("private")
+        );
+        assert!(
+            classify_yt_dlp_error("ERROR: [youtube] x: Video unavailable")
+                .to_lowercase()
+                .contains("unavailable")
+        );
+    }
+
+    #[test]
+    fn unknown_error_passes_through_without_prefix() {
+        let msg = classify_yt_dlp_error("ERROR: something nobody has classified yet");
+        assert_eq!(msg, "something nobody has classified yet");
+    }
+
+    #[test]
+    fn line_without_error_prefix_is_returned_verbatim() {
+        let msg = classify_yt_dlp_error("WARNING: just a warning");
+        assert_eq!(msg, "WARNING: just a warning");
     }
 }
