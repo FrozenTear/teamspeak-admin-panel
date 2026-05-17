@@ -20,10 +20,16 @@ services:
       FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
       DATABASE_URL: surrealkv:///var/lib/ts6-manager/db
       MUSIC_DIR: /var/lib/ts6-manager/music
+      # Operator-upload dir (yt-dlp cookie file, PURA-314). Pinned onto
+      # the ts6-data volume below so it is not lost on container recreate.
+      DATA_DIR: /var/lib/ts6-manager/data
     # Named volumes, not host bind-mounts: under rootless podman the in-container
     # uid 10001 maps to a shifted host subuid that doesn't own ./data/*, so
     # SurrealKV can't open the store. Named volumes let podman own the chown.
+    # ts6-data backs the state root so DATA_DIR uploads survive a recreate;
+    # ts6-db / ts6-music nest on top.
     volumes:
+      - ts6-data:/var/lib/ts6-manager:Z
       - ts6-db:/var/lib/ts6-manager/db:Z
       - ts6-music:/var/lib/ts6-manager/music:Z
     restart: unless-stopped
@@ -160,6 +166,7 @@ services:
     restart: unless-stopped
 
 volumes:
+  ts6-data:
   ts6-db:
   ts6-music:
   ts6-fixture-data:

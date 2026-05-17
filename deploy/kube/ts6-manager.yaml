@@ -15,6 +15,24 @@
 # named-volume ownership crosses the rootless userns cleanly
 # (PURA-67).
 ---
+# State root (/var/lib/ts6-manager). ts6-db / ts6-music mount on top as
+# nested volumes; ts6-data additionally persists operator uploads the
+# server writes under DATA_DIR — the yt-dlp cookie file (PURA-314).
+# Without it those uploads sit on the ephemeral overlay and are wiped on
+# every pod recreation while the upload-timestamp row in ts6-db survives.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ts6-data
+  labels:
+    app: ts6-manager
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -96,12 +114,23 @@ spec:
           value: "surrealkv:///var/lib/ts6-manager/db"
         - name: MUSIC_DIR
           value: "/var/lib/ts6-manager/music"
+        # Where the server writes operator uploads not held in the
+        # SurrealKV store (the yt-dlp cookie file, PURA-314). Pinned
+        # explicitly — the server default is the cwd-relative `./data`.
+        # Sits inside the ts6-data volume so the cookie survives pod
+        # recreation.
+        - name: DATA_DIR
+          value: "/var/lib/ts6-manager/data"
         - name: SIDECAR_URL
           value: "http://127.0.0.1:7080"
       envFrom:
         - secretRef:
             name: ts6-manager-secrets
       volumeMounts:
+        # State root — ts6-db / ts6-music nest on top of this. Listed
+        # first; podman kube play orders mounts parent-before-child.
+        - name: ts6-data
+          mountPath: /var/lib/ts6-manager
         - name: ts6-db
           mountPath: /var/lib/ts6-manager/db
         - name: ts6-music
@@ -160,6 +189,9 @@ spec:
         timeoutSeconds: 5
         failureThreshold: 3
   volumes:
+    - name: ts6-data
+      persistentVolumeClaim:
+        claimName: ts6-data
     - name: ts6-db
       persistentVolumeClaim:
         claimName: ts6-db
