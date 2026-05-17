@@ -7,6 +7,9 @@
 //!
 //! - the music-bot's `BotEvent` broadcast reflects the dispatched command
 //!   (queue mutated, now-playing fired);
+//! - chat `!play` on an idle bot actually *starts the audio pipeline*
+//!   (PURA-340/PURA-341 — observed as `AudioFinished` after a short
+//!   synthetic tone), not merely enqueues while reporting `playing`;
 //! - the music-bot replied with a single short channel-chat line that the
 //!   operator can read off its own connection's event stream.
 //!
@@ -29,11 +32,14 @@
 extern crate music_bot as bot_lib;
 
 use std::env;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use bot_lib::{BotConfig, BotEvent, BotId, InMemoryMusicBotStore, MusicBotStore, spawn_bot};
+use bot_lib::{
+    AudioSource, BotConfig, BotEvent, BotId, InMemoryMusicBotStore, MusicBotStore, NewLibraryEntry,
+    spawn_bot,
+};
 use futures::StreamExt;
 use tokio::sync::broadcast;
 use tokio::time::{Instant, timeout};
@@ -95,11 +101,30 @@ async fn run() -> Result<()> {
         .with_handshake_timeout(HANDSHAKE_TIMEOUT)
         .with_auto_connect(true);
     let store: Arc<dyn MusicBotStore> = Arc::new(InMemoryMusicBotStore::new());
-    let bot = spawn_bot(
-        BotId(1, std::sync::Arc::new(std::sync::RwLock::new(None))),
-        bot_config,
-        store,
-    );
+
+    // Seed a library entry whose source is the in-process `synthetic://`
+    // tone (PURA-341). `!play <title>` resolves it via library lookup, so
+    // the chat path drives a real-but-deterministic audio pipeline with
+    // no ffmpeg / yt-dlp involvement and no `is_url` product change.
+    const SYNTH_TITLE: &str = "qa-synth-tone";
+    store
+        .library_add(
+            BotId(1),
+            NewLibraryEntry {
+                source: AudioSource::Url(
+                    "synthetic://?hz=440&duration_ms=300&amplitude=0.5".into(),
+                ),
+                title: SYNTH_TITLE.to_string(),
+                tags: vec![],
+            },
+        )
+        .await
+        .context("seed synthetic library entry")?;
+
+    // `yt_cookie` — PURA-223 live cookie path; `None` disables cookies,
+    // which is correct for this fixture run (no YouTube resolution).
+    let yt_cookie: Arc<RwLock<Option<std::path::PathBuf>>> = Arc::new(RwLock::new(None));
+    let bot = spawn_bot(BotId(1), bot_config, Arc::clone(&store), yt_cookie);
     let mut bot_events = bot.subscribe();
 
     // 2. Wait for the bot's `Connected` event so we know the default channel.
@@ -155,8 +180,12 @@ async fn run() -> Result<()> {
     }
     eprintln!("!np reply: {np_reply}");
 
-    // 6. `!play <url>` enqueues + fires NowPlaying + bot replies with playing:
-    send_chat(&mut operator, "!play https://example.com/test.mp3").context("send !play")?;
+    // 6. `!play <title>` on an idle bot must enqueue, fire NowPlaying,
+    //    reply "playing: …", AND actually start the audio pipeline. The
+    //    pipeline-start half is the PURA-340 regression coverage — before
+    //    that fix chat `!play` only enqueued and the bot reported
+    //    `playing` while silent. We assert it via `AudioFinished` below.
+    send_chat(&mut operator, &format!("!play {SYNTH_TITLE}")).context("send !play")?;
 
     // bot side: QueueChanged then NowPlaying.
     let queue_evt = wait_for_event(&mut bot_events, |ev| match ev {
@@ -190,6 +219,26 @@ async fn run() -> Result<()> {
         bail!("unexpected !play reply: {play_reply:?}");
     }
     eprintln!("!play reply: {play_reply}");
+
+    // 6b. PURA-341 — the core PURA-340 coverage: chat `!play` on an idle
+    //     bot must *start the pipeline*, not just enqueue. The synthetic
+    //     tone is 300 ms, so a healthy pipeline spawns, drains, and emits
+    //     `AudioFinished` well within `EVENT_TIMEOUT`. A stream that ends
+    //     before `AudioFinished` means `!play` enqueued without starting
+    //     playback — exactly the PURA-340 regression.
+    let finish_reason = wait_for_event(&mut bot_events, |ev| match ev {
+        BotEvent::AudioFinished { reason } => Some(reason.clone()),
+        _ => None,
+    })
+    .await
+    .context("waiting for AudioFinished after chat !play")?
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "bot stream ended before AudioFinished — chat !play enqueued but never \
+             started the audio pipeline (PURA-340 regression)"
+        )
+    })?;
+    eprintln!("AudioFinished reason: {finish_reason}");
 
     // 7. `!stop` → queue cleared + reply "stopped".
     send_chat(&mut operator, "!stop").context("send !stop")?;

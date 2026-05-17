@@ -33,7 +33,7 @@
 extern crate music_bot as bot_lib;
 
 use std::env;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -93,11 +93,9 @@ async fn run() -> Result<()> {
         .with_auto_connect(true);
 
     let store: Arc<dyn MusicBotStore> = Arc::new(InMemoryMusicBotStore::new());
-    let handle = spawn_bot(
-        BotId(1, std::sync::Arc::new(std::sync::RwLock::new(None))),
-        config,
-        store,
-    );
+    // `yt_cookie` — PURA-223 live cookie path; `None` disables cookies.
+    let yt_cookie: Arc<RwLock<Option<std::path::PathBuf>>> = Arc::new(RwLock::new(None));
+    let handle = spawn_bot(BotId(1), config, store, yt_cookie);
     let mut events = handle.subscribe();
 
     // 1. Connected event fires with the default channel.

@@ -27,7 +27,7 @@
 extern crate music_bot as bot_lib;
 
 use std::env;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -119,11 +119,11 @@ async fn run() -> Result<()> {
         .with_handshake_timeout(HANDSHAKE_TIMEOUT)
         .with_auto_connect(true);
     let store: Arc<dyn MusicBotStore> = Arc::new(InMemoryMusicBotStore::new());
-    let handle = spawn_bot(
-        BotId(1, std::sync::Arc::new(std::sync::RwLock::new(None))),
-        config,
-        Arc::clone(&store),
-    );
+    // `yt_cookie` — PURA-223 live cookie path; `None` disables cookies.
+    // This test plays a `synthetic://` source, so YouTube resolution
+    // (the only cookie consumer) is never reached.
+    let yt_cookie: Arc<RwLock<Option<std::path::PathBuf>>> = Arc::new(RwLock::new(None));
+    let handle = spawn_bot(BotId(1), config, Arc::clone(&store), yt_cookie);
     let mut bot_events = handle.subscribe();
 
     let (_, _) = match wait_for_bot_event(&mut bot_events, |ev| match ev {
