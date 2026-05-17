@@ -428,15 +428,6 @@ fn EmbedUrlsRow(props: EmbedUrlsRowProps) -> Element {
 // Share to Twitch / Kick (PURA-322)
 // ---------------------------------------------------------------------------
 
-/// Build the Markdown image snippet an operator pastes into a Kick "About"
-/// section. Kick's About renders Markdown; a remote image is re-fetched per
-/// page load, so a hot-linked snapshot is as fresh as the `/image.png`
-/// endpoint's 45 s cache. Kept as a free function so the formatting is
-/// unit-testable without a render harness.
-fn kick_markdown_image(name: &str, absolute_png_url: &str) -> String {
-    format!("![{name} — live status]({absolute_png_url})")
-}
-
 #[derive(Props, Clone, PartialEq)]
 struct ShareWidgetModalProps {
     widget: WidgetSummary,
@@ -457,7 +448,6 @@ fn ShareWidgetModal(props: ShareWidgetModalProps) -> Element {
 
     let abs_png = absolute_url(&widget.embed_urls.png_url);
     let abs_page = absolute_url(&widget.embed_urls.page_url);
-    let kick_md = kick_markdown_image(&widget.name, &abs_png);
 
     // Reusable copy-to-clipboard chip. `value` is already a final, absolute
     // string — unlike `EmbedUrlsRow`, nothing is absolutised on click.
@@ -517,13 +507,12 @@ fn ShareWidgetModal(props: ShareWidgetModalProps) -> Element {
                     section { class: "stack-sm",
                         h3 { "Kick — About section" }
                         ol { class: "share-steps",
-                            li { "Open " strong { "Channel settings → About" } " (it renders Markdown)." }
-                            li { "Paste this Markdown image:" }
-                            li { class: "share-copy-row", {copy_value("Kick Markdown image".to_string(), kick_md.clone())} }
-                            li {
-                                "If Kick hot-links the image it re-fetches on every page visit, so the snapshot stays ~45 s fresh. Add the live page as a link too:"
-                            }
+                            li { "Open your channel → " strong { "About" } " → " strong { "Edit Panels" } " → add a panel." }
+                            li { "Download the snapshot image and upload it as the panel image:" }
+                            li { class: "share-copy-row", {copy_value("snapshot image URL".to_string(), abs_png.clone())} }
+                            li { "Set the panel " strong { "link" } " to the live widget page:" }
                             li { class: "share-copy-row", {copy_value("live page link".to_string(), abs_page.clone())} }
+                            li { "Save. The panel image is a static snapshot — to refresh it, re-download and re-upload. The link always opens the live, auto-updating page." }
                         }
                     }
                 }
@@ -1471,19 +1460,5 @@ mod tests {
         // Smoke: the native path doesn't panic / network. The wasm32 path
         // is exercised by the browser smoke test, not unit tests.
         copy_to_clipboard("anything");
-    }
-
-    #[test]
-    fn kick_markdown_image_wraps_absolute_url() {
-        // PURA-322 — the Kick "About" snippet must be valid Markdown image
-        // syntax pointing at the fully-qualified PNG endpoint.
-        let md = kick_markdown_image(
-            "Lobby",
-            "https://panel.example.com/api/widget/abc/image.png",
-        );
-        assert_eq!(
-            md,
-            "![Lobby — live status](https://panel.example.com/api/widget/abc/image.png)"
-        );
     }
 }
