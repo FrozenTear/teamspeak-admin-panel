@@ -32,6 +32,12 @@ Environment=NODE_ENV=production
 Environment=PORT=3001
 Environment=DATABASE_URL=surrealkv:///var/lib/ts6-manager/db
 Environment=MUSIC_DIR=/var/lib/ts6-manager/music
+# DATA_DIR is where the server writes operator uploads that are NOT in
+# the SurrealKV store — today the yt-dlp cookie file (PURA-314). Pinned
+# explicitly: the server default is the cwd-relative `./data`, and
+# relying on the process cwd is fragile. The path sits inside the
+# ts6-data volume below so the cookie survives container recreation.
+Environment=DATA_DIR=/var/lib/ts6-manager/data
 Environment=LOG_LEVEL=info
 
 # Named-volume backed storage. Rootless podman's uid-shift means the
@@ -40,6 +46,13 @@ Environment=LOG_LEVEL=info
 # host filesystem directly (PURA-67). Named volumes let podman own the
 # chown across the userns boundary. The `Z` flag relabels for SELinux
 # hosts; a no-op elsewhere.
+#
+# ts6-data backs the whole manager state root. Without it, DATA_DIR
+# lands on the container's ephemeral overlay and the uploaded yt-dlp
+# cookie is wiped on every recreation while the `app_setting` upload
+# timestamp (in ts6-db) survives — the UI then shows a cookie that is
+# gone (PURA-314). ts6-db / ts6-music mount on top as nested volumes.
+Volume=ts6-data.volume:/var/lib/ts6-manager:Z
 Volume=ts6-db.volume:/var/lib/ts6-manager/db:Z
 Volume=ts6-music.volume:/var/lib/ts6-manager/music:Z
 
