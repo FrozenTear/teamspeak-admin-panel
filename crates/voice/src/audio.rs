@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use tsclientlib::Connection;
 use tsproto_packets::packets::{AudioData, CodecType, OutAudio};
 
@@ -199,18 +199,31 @@ pub(crate) async fn start_pipeline(
     *current = None;
 
     let (spec, label) = source_to_spec(source);
-    // PURA-329 — the paced sibling drains exactly one frame per 20 ms, so the
-    // frame channel is the only stall runway between a producer hiccup
-    // (network / yt-dlp / ffmpeg) and a gap on the wire. The 8-frame default
-    // is just 160 ms; any stall past that underran the channel and crackled.
-    // 100 frames = 2 s of mid-stream runway; `prebuffer_frames` holds the
-    // first 50 (1 s) before playback starts so a start-up stall is absorbed
-    // too — at the cost of up to ~1 s extra before the first frame (ffmpeg
-    // decodes faster than real-time, so usually far less), which is in the
-    // noise next to yt-dlp download + ffmpeg spin-up.
+    // PURA-329 / PURA-342 — the paced sibling drains exactly one frame per
+    // 20 ms, so the frame channel is the only stall runway between a producer
+    // hiccup (network / yt-dlp / ffmpeg) and a gap on the wire. The 8-frame
+    // default is just 160 ms; any stall past that underran the channel and
+    // crackled.
+    //
+    // Two regimes need cover:
+    //  * Steady state — PURA-329 sized a 2 s mid-stream runway for clean
+    //    long-running playback ("sounds good now" on v1.4.4).
+    //  * Start-up — the opening seconds of a yt-dlp fetch dump a burst, then
+    //    throughput dips while the network connection ramps. A 1 s pre-buffer
+    //    (the PURA-329 watermark) drained faster than the fetch refilled it,
+    //    underrunning the wire for the first 1–2 s (PURA-342 startup crackle).
+    //    The watermark is now 3 s so playback rides out the network ramp.
+    //
+    // 250 frames = 5 s frame-channel depth; `prebuffer_frames` holds the first
+    // 150 (3 s) before playback starts. Cost: up to ~3 s extra before the
+    // first frame in the worst case, but ffmpeg decodes far faster than
+    // real-time (the watermark fills in well under a second in practice — see
+    // PURA-342's `pipeline_prebuffer_full` log), and it is in the noise next
+    // to the ~11 s yt-dlp resolve (PURA-330). `frame_buffer >= prebuffer_frames`
+    // so `flush_prebuffer` never blocks the worker mid-prebuffer.
     let cfg = PipelineConfig {
-        frame_buffer: 100,
-        prebuffer_frames: 50,
+        frame_buffer: 250,
+        prebuffer_frames: 150,
         yt_cookie_file,
         ..PipelineConfig::default()
     };
@@ -235,6 +248,100 @@ pub(crate) async fn start_pipeline(
     Ok(label)
 }
 
+/// PURA-342 — how many opening frames the startup-underrun watchdog
+/// watches. 250 frames × 20 ms = the first 5 s of playback, which spans the
+/// whole reported "first 1–2 s" startup regime with margin.
+const STARTUP_WATCH_FRAMES: u64 = 250;
+
+/// PURA-342 — a frame handed to the wire this far past its paced
+/// `scheduled_at` slot means the frame channel underran while it was being
+/// fetched: the wire just gapped and the gap is audible (crackle). 12 ms is
+/// inside one 20 ms frame and comfortably above tokio/OS scheduler wake
+/// jitter, so it flags a real stall without false-positiving on noise.
+const STARTUP_LATENESS_WARN: Duration = Duration::from_millis(12);
+
+/// PURA-342 — startup-underrun watchdog. The pipeline pre-buffer is sized for
+/// steady-state network jitter; the opening seconds of a yt-dlp fetch can
+/// still drain it faster than the fetch refills before throughput ramps,
+/// gapping the wire (audible startup crackle — distinct from the steady-state
+/// crackle PURA-329 fixed). This samples the frame-channel depth and the
+/// per-frame lateness over the opening [`STARTUP_WATCH_FRAMES`] and emits a
+/// `music_bot_latency` summary — plus a one-shot WARN the moment a frame
+/// lands late — so a startup underrun is diagnosable from logs, not just by
+/// ear (PURA-329 instrumented neither regime).
+struct StartupMonitor {
+    /// Shallowest frame-channel depth seen in the watch window.
+    min_buffer: usize,
+    /// Worst frame lateness seen in the watch window.
+    max_lateness: Duration,
+    /// Frames that arrived at/past [`STARTUP_LATENESS_WARN`].
+    late_frames: u32,
+    /// Whether the one-shot underrun WARN has already fired.
+    warned: bool,
+}
+
+impl StartupMonitor {
+    fn new() -> Self {
+        Self {
+            min_buffer: usize::MAX,
+            max_lateness: Duration::ZERO,
+            late_frames: 0,
+            warned: false,
+        }
+    }
+
+    /// Record one delivered frame's channel depth + lateness. Returns `true`
+    /// once the watch window is complete (the caller then drops the monitor);
+    /// the closing summary is logged before that `true` is returned.
+    fn observe(&mut self, index: u64, buffered: usize, lateness: Duration) -> bool {
+        self.min_buffer = self.min_buffer.min(buffered);
+        self.max_lateness = self.max_lateness.max(lateness);
+        if lateness >= STARTUP_LATENESS_WARN {
+            self.late_frames += 1;
+            if !self.warned {
+                self.warned = true;
+                warn!(
+                    target: "music_bot_latency",
+                    stage = "startup_underrun",
+                    frame_index = index,
+                    lateness_ms = lateness.as_millis() as u64,
+                    buffered_frames = buffered,
+                    "frame delivered late — startup frame-buffer underrun (audible crackle)",
+                );
+            }
+        }
+        if index + 1 >= STARTUP_WATCH_FRAMES {
+            self.log_summary("window");
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Emit the closing summary when playback ends before the watch window
+    /// completes (track shorter than [`STARTUP_WATCH_FRAMES`]).
+    fn finish(mut self) {
+        self.log_summary("eos");
+    }
+
+    fn log_summary(&mut self, ended: &str) {
+        let min_buffer = if self.min_buffer == usize::MAX {
+            0
+        } else {
+            self.min_buffer
+        };
+        info!(
+            target: "music_bot_latency",
+            stage = "startup_buffer_summary",
+            min_buffer_frames = min_buffer,
+            max_lateness_ms = self.max_lateness.as_millis() as u64,
+            late_frames = self.late_frames,
+            ended,
+            "startup frame-buffer watch complete",
+        );
+    }
+}
+
 fn spawn_sibling(
     pipeline: AudioPipeline,
     mut frames_rx: mpsc::Receiver<music_bot_audio::OpusFrame>,
@@ -246,6 +353,11 @@ fn spawn_sibling(
         // Keep `pipeline` alive for the lifetime of the sibling — its
         // `Drop` aborts the worker task. We don't otherwise touch it.
         let _pipeline_guard = pipeline;
+
+        // PURA-342 — startup-underrun watchdog. Live for the opening
+        // `STARTUP_WATCH_FRAMES`, then dropped (steady state is PURA-329's
+        // domain and already verified clean).
+        let mut startup_monitor = Some(StartupMonitor::new());
 
         loop {
             // Park while paused. `changed()` wakes on every flip,
@@ -260,6 +372,21 @@ fn spawn_sibling(
                 biased;
                 frame = frames_rx.recv() => match frame {
                     Some(f) => {
+                        // PURA-342 — sample the startup-underrun watchdog
+                        // *before* the pacing sleep. `frames_rx.len()` is the
+                        // channel depth behind this frame; `lateness` is how
+                        // far past its paced slot the frame arrived — non-zero
+                        // only when the channel underran and `recv()` had to
+                        // block on the producer (a healthy buffered frame pops
+                        // instantly, well ahead of `scheduled_at`).
+                        if let Some(monitor) = startup_monitor.as_mut() {
+                            let buffered = frames_rx.len();
+                            let lateness = std::time::Instant::now()
+                                .saturating_duration_since(f.scheduled_at);
+                            if monitor.observe(f.index, buffered, lateness) {
+                                startup_monitor = None;
+                            }
+                        }
                         // Wall-clock pacing. The pipeline encodes far faster
                         // than real-time and only the small bounded frame
                         // channel throttles it; without waiting for each
@@ -293,6 +420,12 @@ fn spawn_sibling(
                     // gate will park us again if we are now paused.
                 }
             }
+        }
+        // PURA-342 — playback ended before the startup watch window
+        // completed (track shorter than `STARTUP_WATCH_FRAMES`); flush the
+        // summary so even brief plays leave a `music_bot_latency` record.
+        if let Some(monitor) = startup_monitor.take() {
+            monitor.finish();
         }
         // Pipeline drained cleanly — drain any final events without
         // blocking, then send Finished. Best-effort; the bot may have
@@ -405,6 +538,71 @@ mod tests {
         let (spec, label) = source_to_spec(&AudioSource::LibraryPath(PathBuf::from("a/b.mp3")));
         assert!(matches!(spec, AudioSourceSpec::Ffmpeg { .. }));
         assert!(label.starts_with("library:"));
+    }
+
+    /// PURA-342 — a healthy stream delivers every frame ahead of its paced
+    /// slot, so the watchdog records zero lateness, never warns, and reports
+    /// the channel depth it observed.
+    #[test]
+    fn startup_monitor_clean_stream_never_warns() {
+        let mut m = StartupMonitor::new();
+        for index in 0..10u64 {
+            // On-time frames pop instantly: lateness 0, channel well-stocked.
+            let done = m.observe(index, 200 - index as usize, Duration::ZERO);
+            assert!(!done, "10-frame stream never reaches the window boundary");
+        }
+        assert!(!m.warned, "no late frame ⇒ no underrun WARN");
+        assert_eq!(m.late_frames, 0);
+        assert_eq!(m.max_lateness, Duration::ZERO);
+        assert_eq!(m.min_buffer, 191, "shallowest observed depth is retained");
+    }
+
+    /// PURA-342 — a frame past the lateness threshold trips the one-shot
+    /// underrun WARN exactly once, while every late frame still counts toward
+    /// the summary's `late_frames`.
+    #[test]
+    fn startup_monitor_flags_underrun_once() {
+        let mut m = StartupMonitor::new();
+        m.observe(0, 120, Duration::ZERO);
+        assert!(!m.warned);
+        // Two consecutive late frames — the channel underran.
+        m.observe(1, 0, STARTUP_LATENESS_WARN);
+        assert!(m.warned, "a late frame must flip the one-shot WARN");
+        assert_eq!(m.late_frames, 1);
+        m.observe(2, 0, STARTUP_LATENESS_WARN + Duration::from_millis(30));
+        assert_eq!(m.late_frames, 2, "every late frame counts");
+        assert_eq!(
+            m.max_lateness,
+            STARTUP_LATENESS_WARN + Duration::from_millis(30),
+            "worst lateness is retained for the summary",
+        );
+    }
+
+    /// PURA-342 — sub-threshold scheduler jitter must not be mistaken for an
+    /// underrun; it is recorded in `max_lateness` but raises no WARN.
+    #[test]
+    fn startup_monitor_ignores_sub_threshold_jitter() {
+        let mut m = StartupMonitor::new();
+        m.observe(0, 100, STARTUP_LATENESS_WARN - Duration::from_millis(1));
+        assert!(!m.warned, "jitter below the threshold is not an underrun");
+        assert_eq!(m.late_frames, 0);
+        assert!(m.max_lateness > Duration::ZERO, "jitter still recorded");
+    }
+
+    /// PURA-342 — `observe` returns `true` exactly at the watch-window
+    /// boundary so the sibling drops the monitor and stops sampling.
+    #[test]
+    fn startup_monitor_completes_at_window_boundary() {
+        let mut m = StartupMonitor::new();
+        let last = STARTUP_WATCH_FRAMES - 1;
+        assert!(
+            !m.observe(last - 1, 100, Duration::ZERO),
+            "one frame short of the window is not complete",
+        );
+        assert!(
+            m.observe(last, 100, Duration::ZERO),
+            "the {STARTUP_WATCH_FRAMES}th frame completes the window",
+        );
     }
 
     /// PURA-314 regression — the sibling task must wait for each frame's
