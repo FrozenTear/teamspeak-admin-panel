@@ -68,6 +68,8 @@ enum PanelState {
     Edit(i64),
     Regenerate(i64),
     Delete(i64),
+    /// PURA-322 — copy-ready Twitch/Kick share recipe for one widget.
+    Share(i64),
 }
 
 #[component]
@@ -198,6 +200,10 @@ pub fn WidgetsPage() -> Element {
                         let mut panel = panel;
                         EventHandler::new(move |id: i64| panel.set(PanelState::Delete(id)))
                     },
+                    on_share: {
+                        let mut panel = panel;
+                        EventHandler::new(move |id: i64| panel.set(PanelState::Share(id)))
+                    },
                     on_copy: {
                         EventHandler::new(move |label: String| {
                             toaster.push(ToastVariant::Success, format!("Copied {label}"), None);
@@ -274,6 +280,12 @@ pub fn WidgetsPage() -> Element {
                 },
                 None => rsx! { "" },
             },
+            PanelState::Share(id) => match row_for_active(id) {
+                Some(row) => rsx! {
+                    ShareWidgetModal { widget: row, on_close: on_close_panel }
+                },
+                None => rsx! { "" },
+            },
             PanelState::Closed => rsx! { "" },
         }
     }
@@ -289,6 +301,7 @@ struct WidgetsTableProps {
     on_edit: EventHandler<i64>,
     on_regenerate: EventHandler<i64>,
     on_delete: EventHandler<i64>,
+    on_share: EventHandler<i64>,
     on_copy: EventHandler<String>,
 }
 
@@ -314,6 +327,7 @@ fn WidgetsTable(props: WidgetsTableProps) -> Element {
                         let on_edit = props.on_edit;
                         let on_regenerate = props.on_regenerate;
                         let on_delete = props.on_delete;
+                        let on_share = props.on_share;
                         let on_copy = props.on_copy;
                         rsx! {
                             tr { key: "{id}",
@@ -344,6 +358,12 @@ fn WidgetsTable(props: WidgetsTableProps) -> Element {
                                         size: ButtonSize::Small,
                                         onclick: move |_| on_edit.call(id),
                                         "Edit"
+                                    }
+                                    Button {
+                                        variant: ButtonVariant::Secondary,
+                                        size: ButtonSize::Small,
+                                        onclick: move |_| on_share.call(id),
+                                        "Share"
                                     }
                                     Button {
                                         variant: ButtonVariant::Ghost,
@@ -400,6 +420,122 @@ fn EmbedUrlsRow(props: EmbedUrlsRowProps) -> Element {
             {copy_button("data".to_string(), props.urls.data_url.clone())}
             {copy_button("svg".to_string(), props.urls.svg_url.clone())}
             {copy_button("png".to_string(), props.urls.png_url.clone())}
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Share to Twitch / Kick (PURA-322)
+// ---------------------------------------------------------------------------
+
+/// Build the Markdown image snippet an operator pastes into a Kick "About"
+/// section. Kick's About renders Markdown; a remote image is re-fetched per
+/// page load, so a hot-linked snapshot is as fresh as the `/image.png`
+/// endpoint's 45 s cache. Kept as a free function so the formatting is
+/// unit-testable without a render harness.
+fn kick_markdown_image(name: &str, absolute_png_url: &str) -> String {
+    format!("![{name} — live status]({absolute_png_url})")
+}
+
+#[derive(Props, Clone, PartialEq)]
+struct ShareWidgetModalProps {
+    widget: WidgetSummary,
+    on_close: EventHandler<MouseEvent>,
+}
+
+/// Per-widget "Share to Twitch / Kick" recipe. Twitch and Kick strip
+/// `<iframe>`/`<script>` from every profile surface, so this modal hands the
+/// operator the realistic fallback: a snapshot image + the live page link,
+/// with absolute (origin-prefixed) URLs that paste straight into the
+/// platform. See the `widget-live-options` doc on [PURA-322] for the full
+/// per-surface rationale.
+#[component]
+fn ShareWidgetModal(props: ShareWidgetModalProps) -> Element {
+    let toaster = use_toaster();
+    let on_close = props.on_close;
+    let widget = props.widget.clone();
+
+    let abs_png = absolute_url(&widget.embed_urls.png_url);
+    let abs_page = absolute_url(&widget.embed_urls.page_url);
+    let kick_md = kick_markdown_image(&widget.name, &abs_png);
+
+    // Reusable copy-to-clipboard chip. `value` is already a final, absolute
+    // string — unlike `EmbedUrlsRow`, nothing is absolutised on click.
+    let copy_value = move |label: String, value: String| {
+        let toast_label = label.clone();
+        rsx! {
+            button {
+                class: "embed-url",
+                r#type: "button",
+                title: "Copy {label}",
+                onclick: move |_| {
+                    copy_to_clipboard(&value);
+                    toaster.push(ToastVariant::Success, format!("Copied {toast_label}"), None);
+                },
+                span { class: "embed-label", "{label}" }
+                span { class: "embed-path", "{value}" }
+                span { class: "embed-copy", "Copy" }
+            }
+        }
+    };
+
+    rsx! {
+        div { class: "modal-backdrop", onclick: move |evt| on_close.call(evt),
+            div {
+                class: "modal modal-lg",
+                onclick: move |evt| evt.stop_propagation(),
+                "role": "dialog",
+                "aria-modal": "true",
+                "aria-labelledby": "share-widget-title",
+                div { class: "modal-header",
+                    h2 { id: "share-widget-title", "Share “{widget.name}” to Twitch / Kick" }
+                    button {
+                        class: "btn btn-ghost btn-sm",
+                        r#type: "button",
+                        onclick: move |evt| on_close.call(evt),
+                        "aria-label": "Close",
+                        "✕"
+                    }
+                }
+                div { class: "modal-body stack-md",
+                    Banner { variant: BannerVariant::Info, title: "Profiles can't embed a live widget".to_string(),
+                        "Twitch and Kick strip live embeds from every profile surface. These recipes use a snapshot image plus the live page link — the closest the platforms allow."
+                    }
+
+                    section { class: "stack-sm",
+                        h3 { "Twitch — stream panel" }
+                        ol { class: "share-steps",
+                            li { "Open your channel → " strong { "Edit Panels" } " → add a panel." }
+                            li { "Download the snapshot image and upload it as the panel image:" }
+                            li { class: "share-copy-row", {copy_value("snapshot image URL".to_string(), abs_png.clone())} }
+                            li { "Set the panel " strong { "link" } " to the live widget page:" }
+                            li { class: "share-copy-row", {copy_value("live page link".to_string(), abs_page.clone())} }
+                            li { "Save. The panel image is a snapshot; the link always opens the live, auto-updating page." }
+                        }
+                    }
+
+                    section { class: "stack-sm",
+                        h3 { "Kick — About section" }
+                        ol { class: "share-steps",
+                            li { "Open " strong { "Channel settings → About" } " (it renders Markdown)." }
+                            li { "Paste this Markdown image:" }
+                            li { class: "share-copy-row", {copy_value("Kick Markdown image".to_string(), kick_md.clone())} }
+                            li {
+                                "If Kick hot-links the image it re-fetches on every page visit, so the snapshot stays ~45 s fresh. Add the live page as a link too:"
+                            }
+                            li { class: "share-copy-row", {copy_value("live page link".to_string(), abs_page.clone())} }
+                        }
+                    }
+                }
+                div { class: "modal-footer",
+                    Button {
+                        variant: ButtonVariant::Secondary,
+                        kind: ButtonType::Button,
+                        onclick: move |evt| on_close.call(evt),
+                        "Done"
+                    }
+                }
+            }
         }
     }
 }
@@ -1335,5 +1471,19 @@ mod tests {
         // Smoke: the native path doesn't panic / network. The wasm32 path
         // is exercised by the browser smoke test, not unit tests.
         copy_to_clipboard("anything");
+    }
+
+    #[test]
+    fn kick_markdown_image_wraps_absolute_url() {
+        // PURA-322 — the Kick "About" snippet must be valid Markdown image
+        // syntax pointing at the fully-qualified PNG endpoint.
+        let md = kick_markdown_image(
+            "Lobby",
+            "https://panel.example.com/api/widget/abc/image.png",
+        );
+        assert_eq!(
+            md,
+            "![Lobby — live status](https://panel.example.com/api/widget/abc/image.png)"
+        );
     }
 }
