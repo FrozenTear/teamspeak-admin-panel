@@ -81,6 +81,7 @@ mod tests {
             bitrate_bps: Some(64_000),
             application: OpusApplication::Audio,
             frame_buffer: 4,
+            prebuffer_frames: 0,
             event_buffer: 4,
             yt_cookie_file: None,
         }

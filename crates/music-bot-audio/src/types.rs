@@ -56,9 +56,20 @@ pub struct PipelineConfig {
     /// `audiopus::Application::Audio` for music, `Voip` for speech. Music-bot
     /// defaults to `Audio`.
     pub application: OpusApplication,
-    /// Frame channel buffer depth. WS-1 should drain at 20 ms cadence; a
-    /// shallow buffer is fine and keeps us from pre-rolling a big backlog.
+    /// Frame channel buffer depth — the consumer's stall runway. WS-1 drains
+    /// at a fixed 20 ms cadence (PURA-323 wall-clock pacing), so a producer
+    /// stall longer than `frame_buffer * 20 ms` empties the channel and gaps
+    /// the wire — audible crackle (PURA-329). Size it for the worst expected
+    /// network / ffmpeg hiccup: the music bot uses 100 frames (2 s).
     pub frame_buffer: usize,
+    /// Pre-buffer watermark (PURA-329). The pipeline worker holds the first
+    /// `prebuffer_frames` encoded frames before it anchors the pacer and
+    /// forwards anything, so the consumer starts draining against an
+    /// already-filled channel and a transient producer stall during start-up
+    /// cannot immediately underrun. `0` = no pre-buffer (pacer anchors on the
+    /// first frame — legacy behaviour). Should be `<= frame_buffer`; tracks
+    /// shorter than the watermark flush early at EOF.
+    pub prebuffer_frames: usize,
     /// Event broadcast capacity. Subscribers that lag past this are dropped
     /// — events are advisory.
     pub event_buffer: usize,
@@ -76,6 +87,7 @@ impl Default for PipelineConfig {
             bitrate_bps: Some(64_000),
             application: OpusApplication::Audio,
             frame_buffer: 8,
+            prebuffer_frames: 0,
             event_buffer: 32,
             yt_cookie_file: None,
         }

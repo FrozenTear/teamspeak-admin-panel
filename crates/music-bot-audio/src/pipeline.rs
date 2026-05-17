@@ -40,15 +40,23 @@ impl AudioPipeline {
         let (events_tx, _) = broadcast::channel::<PipelineEvent>(cfg.event_buffer);
         let events_pub = events_tx.clone();
 
+        let prebuffer_target = cfg.prebuffer_frames;
         let worker = tokio::spawn(async move {
-            // The pacer is anchored on the *first emitted frame*, not on
+            // The pacer is anchored on the *first forwarded frame*, not on
             // worker spawn. yt-dlp/ffmpeg startup latency is multi-second;
             // anchoring at spawn stamps every slot before the first frame in
             // the past, so the consumer's wall-clock wait fires instantly and
             // blasts a multi-second catch-up burst before settling into
             // real-time — audible as choppy playback at the start of every
             // track (PURA-314).
+            //
+            // PURA-329 — the worker also pre-buffers: it holds the first
+            // `prebuffer_target` encoded frames before anchoring the pacer, so
+            // the paced consumer starts draining against an already-filled
+            // channel and a transient producer stall during start-up cannot
+            // immediately underrun the wire.
             let mut pacer: Option<WallClockPacer> = None;
+            let mut prebuffer: Vec<Vec<u8>> = Vec::with_capacity(prebuffer_target);
             let samples_per_frame = encoder.samples_per_frame();
             // PCM accumulator — holds samples that crossed a `read_samples`
             // boundary. We always emit whole frames; partial leftovers are
@@ -82,6 +90,15 @@ impl AudioPipeline {
                     let _ = events_pub.send(ev);
                 }
                 if pcm.is_empty() && eof {
+                    // Source closed before the pre-buffer watermark — flush
+                    // whatever we held so a short track still plays.
+                    if !prebuffer.is_empty() {
+                        let pacer =
+                            pacer.get_or_insert_with(|| WallClockPacer::new(Instant::now()));
+                        if !flush_prebuffer(&mut prebuffer, pacer, &frames_tx, channels).await {
+                            break;
+                        }
+                    }
                     let _ = events_pub.send(PipelineEvent::EndOfStream);
                     break;
                 }
@@ -97,20 +114,36 @@ impl AudioPipeline {
                         continue;
                     }
                 };
-                let (index, scheduled_at) = pacer
-                    .get_or_insert_with(|| WallClockPacer::new(Instant::now()))
-                    .tick();
-                let frame = OpusFrame {
-                    bytes: opus,
-                    index,
-                    scheduled_at,
-                    channels,
-                };
-                if frames_tx.send(frame).await.is_err() {
-                    // Consumer dropped; we're done.
-                    break;
+                let drained = eof && pcm.is_empty();
+                match &mut pacer {
+                    Some(pacer) => {
+                        let (index, scheduled_at) = pacer.tick();
+                        let frame = OpusFrame {
+                            bytes: opus,
+                            index,
+                            scheduled_at,
+                            channels,
+                        };
+                        if frames_tx.send(frame).await.is_err() {
+                            // Consumer dropped; we're done.
+                            break;
+                        }
+                    }
+                    slot => {
+                        // Still pre-buffering: hold the frame. Anchor the
+                        // pacer and flush once the watermark is reached, or
+                        // immediately if the source drained first (track
+                        // shorter than the watermark).
+                        prebuffer.push(opus);
+                        if prebuffer.len() >= prebuffer_target || drained {
+                            let pacer = slot.insert(WallClockPacer::new(Instant::now()));
+                            if !flush_prebuffer(&mut prebuffer, pacer, &frames_tx, channels).await {
+                                break;
+                            }
+                        }
+                    }
                 }
-                if eof && pcm.is_empty() {
+                if drained {
                     let _ = events_pub.send(PipelineEvent::EndOfStream);
                     break;
                 }
@@ -154,6 +187,31 @@ impl Drop for AudioPipeline {
             handle.abort();
         }
     }
+}
+
+/// Forward every held pre-buffer frame against the (already-anchored) pacer,
+/// stamping each with its drift-free `scheduled_at`. Returns `false` if the
+/// frame consumer has gone away — the worker treats that as its cancel
+/// signal.
+async fn flush_prebuffer(
+    prebuffer: &mut Vec<Vec<u8>>,
+    pacer: &mut WallClockPacer,
+    frames_tx: &mpsc::Sender<OpusFrame>,
+    channels: u8,
+) -> bool {
+    for bytes in prebuffer.drain(..) {
+        let (index, scheduled_at) = pacer.tick();
+        let frame = OpusFrame {
+            bytes,
+            index,
+            scheduled_at,
+            channels,
+        };
+        if frames_tx.send(frame).await.is_err() {
+            return false;
+        }
+    }
+    true
 }
 
 async fn build_source(
@@ -272,6 +330,95 @@ mod tests {
         drop(frames);
         // Give it a tick to notice.
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        pipeline.shutdown().await;
+    }
+
+    /// A PCM source that delivers one 20 ms mono frame of silence per
+    /// `read_samples` call and, on a chosen call, stalls for a fixed
+    /// duration first — a deterministic stand-in for a network / ffmpeg
+    /// hiccup mid-stream.
+    struct StallingSource {
+        reads_remaining: usize,
+        read_count: usize,
+        stall_on_read: usize,
+        stall: std::time::Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::source::PcmSource for StallingSource {
+        async fn read_samples(&mut self, buf: &mut [i16]) -> std::io::Result<usize> {
+            if self.reads_remaining == 0 {
+                return Ok(0);
+            }
+            self.read_count += 1;
+            if self.read_count == self.stall_on_read {
+                tokio::time::sleep(self.stall).await;
+            }
+            self.reads_remaining -= 1;
+            let n = crate::types::SAMPLES_PER_FRAME_MONO.min(buf.len());
+            buf[..n].fill(0);
+            Ok(n)
+        }
+    }
+
+    /// PURA-329 regression — a paced 20 ms consumer must not starve when the
+    /// producer stalls mid-stream. With the legacy `frame_buffer = 8` / no
+    /// pre-buffer config a stall longer than 8 × 20 ms = 160 ms emptied the
+    /// frame channel and gapped the wire (audible crackle). The enlarged
+    /// `frame_buffer` plus the `prebuffer_frames` watermark give the consumer
+    /// a multi-second runway, so a 300 ms stall is absorbed with the channel
+    /// never running dry.
+    #[tokio::test]
+    async fn prebuffer_absorbs_producer_stall_no_underrun() {
+        const TOTAL_FRAMES: usize = 70;
+        const PREBUFFER: usize = 20;
+        const FRAME_BUFFER: usize = 45;
+        const STALL_ON_READ: usize = 50;
+        let stall = std::time::Duration::from_millis(300);
+
+        let source = StallingSource {
+            reads_remaining: TOTAL_FRAMES,
+            read_count: 0,
+            stall_on_read: STALL_ON_READ,
+            stall,
+        };
+        let cfg = PipelineConfig {
+            frame_buffer: FRAME_BUFFER,
+            prebuffer_frames: PREBUFFER,
+            ..PipelineConfig::default()
+        };
+        let mut pipeline = AudioPipeline::spawn_with_source(Box::new(source), cfg).expect("spawn");
+        let mut frames = pipeline.take_frames();
+
+        // First frame marks playback start; the pre-buffer is full by now.
+        let first = frames.recv().await.expect("first frame");
+        assert_eq!(first.index, 0, "first frame is index 0");
+
+        // Drain at the real wire cadence — one frame per 20 ms — and measure
+        // how long each `recv()` blocks. A buffered frame pops instantly; a
+        // non-trivial block means the channel underran.
+        let mut max_block = std::time::Duration::ZERO;
+        let mut count = 1usize;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let t0 = Instant::now();
+            match frames.recv().await {
+                Some(_) => {
+                    max_block = max_block.max(t0.elapsed());
+                    count += 1;
+                }
+                None => break,
+            }
+        }
+
+        assert_eq!(count, TOTAL_FRAMES, "every frame delivered");
+        assert!(
+            max_block < std::time::Duration::from_millis(80),
+            "consumer starved for {max_block:?} — frame-buffer underrun: the \
+             pre-buffer watermark / enlarged frame_buffer did not absorb the \
+             {stall:?} producer stall",
+        );
+
         pipeline.shutdown().await;
     }
 }

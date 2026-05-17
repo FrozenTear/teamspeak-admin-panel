@@ -52,6 +52,7 @@ async fn ffmpeg_fixture_paces_within_tolerance() {
         bitrate_bps: Some(64_000),
         application: OpusApplication::Audio,
         frame_buffer: 16,
+        prebuffer_frames: 0,
         event_buffer: 16,
         yt_cookie_file: None,
     };

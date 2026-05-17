@@ -191,7 +191,18 @@ pub(crate) async fn start_pipeline(
     *current = None;
 
     let (spec, label) = source_to_spec(source);
+    // PURA-329 — the paced sibling drains exactly one frame per 20 ms, so the
+    // frame channel is the only stall runway between a producer hiccup
+    // (network / yt-dlp / ffmpeg) and a gap on the wire. The 8-frame default
+    // is just 160 ms; any stall past that underran the channel and crackled.
+    // 100 frames = 2 s of mid-stream runway; `prebuffer_frames` holds the
+    // first 50 (1 s) before playback starts so a start-up stall is absorbed
+    // too — at the cost of up to ~1 s extra before the first frame (ffmpeg
+    // decodes faster than real-time, so usually far less), which is in the
+    // noise next to yt-dlp download + ffmpeg spin-up.
     let cfg = PipelineConfig {
+        frame_buffer: 100,
+        prebuffer_frames: 50,
         yt_cookie_file,
         ..PipelineConfig::default()
     };
