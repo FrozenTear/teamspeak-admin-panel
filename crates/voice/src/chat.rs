@@ -65,6 +65,38 @@ pub enum ParsedCommand {
     NowPlaying,
 }
 
+/// PURA-340 — what the bot actor must do to the audio pipeline after a
+/// chat command mutated the queue.
+///
+/// The chat bridge does the queue mutation and the chat reply, but it
+/// deliberately knows nothing about the live `current_audio` pipeline
+/// handle — only the connected loop in `bot.rs` owns that. So `dispatch`
+/// returns this plain value and `bot.rs` executes it. Keeping the
+/// *decision* here and the *execution* there preserves the module's
+/// "parser unit-testable without the bot actor" rule (see module docs).
+///
+/// Before PURA-340 there was no such hand-off at all: chat `!play` only
+/// ever enqueued a track, so on an idle bot it was a no-op for audio —
+/// the pipeline never spawned and the bot reported `playing` while
+/// silent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatAudioAction {
+    /// Nothing to do — read-only command (`!np`), an audio-stub path
+    /// (`!pause` / `!vol` / `!prev`), or a command that failed before it
+    /// mutated the queue.
+    None,
+    /// `!play` — a track was appended. Start the queue head iff the bot
+    /// is idle; when a pipeline is already running the new track stays
+    /// queued and plays when the current one finishes.
+    StartIfIdle,
+    /// `!radio` / `!skip` — the queue head changed and a new head exists.
+    /// Tear down any running pipeline and start the new head now.
+    RestartHead,
+    /// `!stop`, or `!skip` past the last track — the queue is now empty.
+    /// Tear down any running pipeline.
+    StopPlayback,
+}
+
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum ParseError {
     /// Line was just whitespace, just `!`, or otherwise empty after the
@@ -148,8 +180,9 @@ pub fn parse(line: &str) -> Result<ParsedCommand, ParseError> {
 }
 
 /// Dispatch a parsed command against the bot. Lowers into store mutations
-/// (queue) and `BotEvent::Error(AudioNotImplemented)` (audio surface), and
-/// returns a single short reply line for the channel.
+/// (queue) and `BotEvent`s, sends a single short reply line for the
+/// channel, and returns the [`ChatAudioAction`] the bot actor must apply
+/// to the audio pipeline.
 ///
 /// `con` is borrowed mutably so the reply can ride the same connection
 /// without a separate channel.
@@ -159,14 +192,31 @@ pub async fn dispatch(
     store: &Arc<dyn MusicBotStore>,
     events: &broadcast::Sender<BotEvent>,
     cmd: ParsedCommand,
-) {
-    let reply = match cmd {
+) -> ChatAudioAction {
+    let (reply, action) = handle_command(bot_id, store, events, cmd).await;
+    send_reply(con, &reply);
+    action
+}
+
+/// Lower a parsed command into store mutations + `BotEvent`s, returning
+/// the operator-facing reply line and the [`ChatAudioAction`] the bot
+/// actor must apply.
+///
+/// Split out from [`dispatch`] so it is unit-testable without a live
+/// `Connection` — the only thing `dispatch` adds is `send_reply`.
+async fn handle_command(
+    bot_id: BotId,
+    store: &Arc<dyn MusicBotStore>,
+    events: &broadcast::Sender<BotEvent>,
+    cmd: ParsedCommand,
+) -> (String, ChatAudioAction) {
+    match cmd {
         ParsedCommand::Radio { arg } => handle_radio(bot_id, store, events, arg).await,
         ParsedCommand::Play { arg } => handle_play(bot_id, store, events, arg).await,
         ParsedCommand::Stop => handle_stop(bot_id, store, events).await,
         ParsedCommand::Pause => {
             emit_audio_stub_event(events, "Pause");
-            "pause".to_string()
+            ("pause".to_string(), ChatAudioAction::None)
         }
         ParsedCommand::Skip => handle_skip(bot_id, store, events).await,
         ParsedCommand::Prev => {
@@ -174,18 +224,20 @@ pub async fn dispatch(
             // into the audio stub so WS-2 can wire it up later; today the
             // chat reply is honest about the limitation.
             emit_audio_stub_event(events, "SkipPrev");
-            "previous track not yet supported (queue history lands with WS-2)".to_string()
+            (
+                "previous track not yet supported (queue history lands with WS-2)".to_string(),
+                ChatAudioAction::None,
+            )
         }
         ParsedCommand::Volume(v) => {
-            // Audio pipeline isn't wired yet — emit the stub so REST/UI
-            // subscribers see the dispatched intent. Reply optimistically
-            // so the operator knows the value parsed.
+            // Per-bot volume isn't wired into the pipeline yet — emit the
+            // stub so REST/UI subscribers see the dispatched intent.
+            // Reply optimistically so the operator knows the value parsed.
             emit_audio_stub_event(events, &format!("SetVolume({})", v));
-            format!("volume {}", v)
+            (format!("volume {}", v), ChatAudioAction::None)
         }
-        ParsedCommand::NowPlaying => handle_np(bot_id, store).await,
-    };
-    send_reply(con, &reply);
+        ParsedCommand::NowPlaying => (handle_np(bot_id, store).await, ChatAudioAction::None),
+    }
 }
 
 /// Emit a single short chat reply for a parse error. The bridge calls
@@ -207,15 +259,15 @@ async fn handle_radio(
     store: &Arc<dyn MusicBotStore>,
     events: &broadcast::Sender<BotEvent>,
     arg: String,
-) -> String {
+) -> (String, ChatAudioAction) {
     let (track, label) = match resolve_source(bot_id, store, &arg).await {
         Ok(pair) => pair,
-        Err(reply) => return reply,
+        Err(reply) => return (reply, ChatAudioAction::None),
     };
     // !radio replaces the queue: clear then enqueue.
     if let Err(err) = store.queue_clear(bot_id).await {
         warn!(?err, "queue_clear during !radio");
-        return format!("radio failed: {err}");
+        return (format!("radio failed: {err}"), ChatAudioAction::None);
     }
     let _ = events.send(BotEvent::QueueChanged {
         len: 0,
@@ -229,11 +281,13 @@ async fn handle_radio(
                 current: Some(stored.clone()),
             });
             let _ = events.send(BotEvent::NowPlaying(stored));
-            format!("radio: {}", label)
+            // The queue head is now the radio track — the actor must tear
+            // down whatever was playing and start it.
+            (format!("radio: {}", label), ChatAudioAction::RestartHead)
         }
         Err(err) => {
             warn!(?err, "queue_enqueue during !radio");
-            format!("radio failed: {err}")
+            (format!("radio failed: {err}"), ChatAudioAction::None)
         }
     }
 }
@@ -243,10 +297,10 @@ async fn handle_play(
     store: &Arc<dyn MusicBotStore>,
     events: &broadcast::Sender<BotEvent>,
     arg: String,
-) -> String {
+) -> (String, ChatAudioAction) {
     let (track, label) = match resolve_source(bot_id, store, &arg).await {
         Ok(pair) => pair,
-        Err(reply) => return reply,
+        Err(reply) => return (reply, ChatAudioAction::None),
     };
     let was_empty = store
         .queue_peek(bot_id)
@@ -260,16 +314,23 @@ async fn handle_play(
                 len: queue.len(),
                 current: queue.first().cloned(),
             });
-            if was_empty {
+            let reply = if was_empty {
                 let _ = events.send(BotEvent::NowPlaying(stored));
                 format!("playing: {}", label)
             } else {
                 format!("queued: {} (#{})", label, queue.len())
-            }
+            };
+            // PURA-340 — the core fix: ask the actor to start the queue
+            // head if the bot is idle. `StartIfIdle` is a no-op when a
+            // pipeline is already running (the new track stays queued),
+            // so it is correct to return it unconditionally — including
+            // the `queued:` branch, where an idle bot with a pre-staged
+            // queue still gets started from its head.
+            (reply, ChatAudioAction::StartIfIdle)
         }
         Err(err) => {
             warn!(?err, "queue_enqueue during !play");
-            format!("play failed: {err}")
+            (format!("play failed: {err}"), ChatAudioAction::None)
         }
     }
 }
@@ -278,10 +339,9 @@ async fn handle_stop(
     bot_id: BotId,
     store: &Arc<dyn MusicBotStore>,
     events: &broadcast::Sender<BotEvent>,
-) -> String {
-    // Lower into the audio stub so REST/UI subscribers see the dispatched
-    // intent; clear the queue so the state is honest about "stopped".
-    emit_audio_stub_event(events, "Stop");
+) -> (String, ChatAudioAction) {
+    // Clear the queue so the state is honest about "stopped"; the actor
+    // tears the live pipeline down via the returned `StopPlayback`.
     let was_non_empty = store
         .queue_peek(bot_id)
         .await
@@ -296,11 +356,11 @@ async fn handle_stop(
             if was_non_empty {
                 let _ = events.send(BotEvent::QueueEmpty);
             }
-            "stopped".to_string()
+            ("stopped".to_string(), ChatAudioAction::StopPlayback)
         }
         Err(err) => {
             warn!(?err, "queue_clear during !stop");
-            format!("stop failed: {err}")
+            (format!("stop failed: {err}"), ChatAudioAction::None)
         }
     }
 }
@@ -309,7 +369,7 @@ async fn handle_skip(
     bot_id: BotId,
     store: &Arc<dyn MusicBotStore>,
     events: &broadcast::Sender<BotEvent>,
-) -> String {
+) -> (String, ChatAudioAction) {
     match store.queue_dequeue_head(bot_id).await {
         Ok(Some(_popped)) => {
             let queue = store.queue_peek(bot_id).await.unwrap_or_default();
@@ -322,18 +382,24 @@ async fn handle_skip(
                 Some(track) => {
                     let title = track.title.clone();
                     let _ = events.send(BotEvent::NowPlaying(track));
-                    format!("skipped → {}", title)
+                    // A new head exists — restart the pipeline onto it.
+                    (format!("skipped → {}", title), ChatAudioAction::RestartHead)
                 }
                 None => {
                     let _ = events.send(BotEvent::QueueEmpty);
-                    "skipped → queue empty".to_string()
+                    // Nothing left to play — but a pipeline may still be
+                    // running the just-skipped track, so tear it down.
+                    (
+                        "skipped → queue empty".to_string(),
+                        ChatAudioAction::StopPlayback,
+                    )
                 }
             }
         }
-        Ok(None) => "queue is empty".to_string(),
+        Ok(None) => ("queue is empty".to_string(), ChatAudioAction::None),
         Err(err) => {
             warn!(?err, "queue_dequeue_head during !skip");
-            format!("skip failed: {err}")
+            (format!("skip failed: {err}"), ChatAudioAction::None)
         }
     }
 }
@@ -528,5 +594,118 @@ mod parser_tests {
     fn unknown_verb_is_unknown() {
         assert_eq!(parse("!foo"), Err(ParseError::Unknown));
         assert_eq!(parse("!playlist add"), Err(ParseError::Unknown));
+    }
+}
+
+/// PURA-340 — dispatch-level tests for the audio-action hand-off. These
+/// exercise [`handle_command`] (the `Connection`-free half of `dispatch`)
+/// so chat `!play` etc. can be verified without a live TS6 fixture.
+#[cfg(test)]
+mod dispatch_tests {
+    use super::*;
+    use crate::store::InMemoryMusicBotStore;
+
+    fn store() -> Arc<dyn MusicBotStore> {
+        Arc::new(InMemoryMusicBotStore::new())
+    }
+
+    async fn run(store: &Arc<dyn MusicBotStore>, cmd: ParsedCommand) -> (String, ChatAudioAction) {
+        // Buffer is generous; the receiver is kept alive so `events.send`
+        // inside the handlers never short-circuits on "no subscribers".
+        let (events, _rx) = broadcast::channel(64);
+        handle_command(BotId(1), store, &events, cmd).await
+    }
+
+    /// The regression: chat `!play` on an idle bot must ask the actor to
+    /// start the pipeline. Before the fix `handle_play` only enqueued the
+    /// track and returned a reply — `!play` was a no-op for audio, so the
+    /// pipeline never spawned and the bot reported `playing` while silent.
+    #[tokio::test]
+    async fn play_on_idle_requests_pipeline_start() {
+        let store = store();
+        let (reply, action) = run(
+            &store,
+            ParsedCommand::Play {
+                arg: "https://example.com/a.mp3".into(),
+            },
+        )
+        .await;
+        assert!(reply.starts_with("playing:"), "reply was {reply:?}");
+        assert_eq!(action, ChatAudioAction::StartIfIdle);
+    }
+
+    /// A second `!play` while the queue is non-empty still returns
+    /// `StartIfIdle` — it is a no-op when a pipeline is live, and keeps an
+    /// *idle* bot with a pre-staged queue startable.
+    #[tokio::test]
+    async fn play_behind_a_queued_track_still_requests_start() {
+        let store = store();
+        let _ = run(
+            &store,
+            ParsedCommand::Play {
+                arg: "https://example.com/a.mp3".into(),
+            },
+        )
+        .await;
+        let (reply, action) = run(
+            &store,
+            ParsedCommand::Play {
+                arg: "https://example.com/b.mp3".into(),
+            },
+        )
+        .await;
+        assert!(reply.starts_with("queued:"), "reply was {reply:?}");
+        assert_eq!(action, ChatAudioAction::StartIfIdle);
+    }
+
+    #[tokio::test]
+    async fn radio_restarts_the_head() {
+        let store = store();
+        let (_reply, action) = run(
+            &store,
+            ParsedCommand::Radio {
+                arg: "https://r.example/lofi.mp3".into(),
+            },
+        )
+        .await;
+        assert_eq!(action, ChatAudioAction::RestartHead);
+    }
+
+    #[tokio::test]
+    async fn stop_tears_playback_down() {
+        let store = store();
+        let (_reply, action) = run(&store, ParsedCommand::Stop).await;
+        assert_eq!(action, ChatAudioAction::StopPlayback);
+    }
+
+    #[tokio::test]
+    async fn skip_restarts_when_a_track_follows_else_stops() {
+        let store = store();
+        for url in ["https://example.com/a.mp3", "https://example.com/b.mp3"] {
+            let _ = run(&store, ParsedCommand::Play { arg: url.into() }).await;
+        }
+        // A track follows the head → restart onto it.
+        let (_r, restart) = run(&store, ParsedCommand::Skip).await;
+        assert_eq!(restart, ChatAudioAction::RestartHead);
+        // Skipping the last track empties the queue → tear playback down.
+        let (_r, stop) = run(&store, ParsedCommand::Skip).await;
+        assert_eq!(stop, ChatAudioAction::StopPlayback);
+        // Skipping an empty queue touches nothing.
+        let (_r, none) = run(&store, ParsedCommand::Skip).await;
+        assert_eq!(none, ChatAudioAction::None);
+    }
+
+    #[tokio::test]
+    async fn read_only_and_stub_commands_are_audio_inert() {
+        let store = store();
+        for cmd in [
+            ParsedCommand::NowPlaying,
+            ParsedCommand::Pause,
+            ParsedCommand::Prev,
+            ParsedCommand::Volume(50),
+        ] {
+            let (_reply, action) = run(&store, cmd).await;
+            assert_eq!(action, ChatAudioAction::None);
+        }
     }
 }

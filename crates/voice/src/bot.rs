@@ -285,7 +285,19 @@ async fn run_connected_loop(
                             let _ = events.send(BotEvent::JoinedChannel { channel_id: channel });
                         }
                     for msg in chat_msgs {
-                        dispatch_chat_line(con, bot_id, store, events, &msg).await;
+                        // PURA-340 — `current_audio` + `yt_cookie` are
+                        // threaded in so a queue-mutating chat command
+                        // (`!play` etc.) can actually start the pipeline.
+                        dispatch_chat_line(
+                            con,
+                            &mut current_audio,
+                            bot_id,
+                            store,
+                            events,
+                            &yt_cookie,
+                            &msg,
+                        )
+                        .await;
                     }
                 }
                 Some(Err(err)) => {
@@ -614,9 +626,17 @@ async fn auto_start_pending_track(
     let cookie = yt_cookie.read().unwrap().clone();
     if let Err(err) = audio::start_pipeline(current_audio, &next.source, cookie).await {
         warn!(?err, "auto-start audio pipeline failed");
-        let _ = events.send(BotEvent::Error(BotError::Internal(format!(
-            "audio pipeline spawn: {err}"
-        ))));
+        // PURA-340 — emit `AudioFinished` with the `failed: ` prefix, not
+        // a bare `Error`. Every caller of this function (chat `!play`,
+        // `!radio`, `!skip`, and the queue auto-advance after a track
+        // ends) has already emitted a `NowPlaying` for the head track, so
+        // a bare `Error` — which `LivenessTracker` ignores — would leave
+        // the bot reporting `playing` forever. `AudioFinished` clears
+        // `now_playing` and records the cause as `last_error`, the same
+        // contract a 0-frame pipeline finish uses.
+        let _ = events.send(BotEvent::AudioFinished {
+            reason: format!("failed: audio pipeline spawn — {err}"),
+        });
         return false;
     }
     true
@@ -1032,11 +1052,19 @@ fn extract_channel_chat(item: &StreamItem, con: &Connection) -> Vec<ChatLine> {
 /// Parse a chat line, then either dispatch it (real command) or send a
 /// short error reply (parse error with a user-visible cause). Empty /
 /// unknown lines are silently dropped per the issue spec.
+///
+/// PURA-340 — a queue-mutating command (`!play` / `!radio` / `!skip` /
+/// `!stop`) returns a [`chat::ChatAudioAction`]; this function applies it
+/// to the live pipeline. Before the fix the chat bridge had no path to
+/// `current_audio` at all, so chat `!play` could only ever enqueue.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_chat_line(
     con: &mut Connection,
+    current_audio: &mut Option<ActiveAudio>,
     bot_id: BotId,
     store: &Arc<dyn MusicBotStore>,
     events: &broadcast::Sender<BotEvent>,
+    yt_cookie: &Arc<RwLock<Option<PathBuf>>>,
     msg: &ChatLine,
 ) {
     match chat::parse(&msg.text) {
@@ -1048,11 +1076,136 @@ async fn dispatch_chat_line(
             // the command-dispatch latency the issue calls out as
             // previously unmeasured.
             info!(target: "music_bot_latency", invoker = %msg.invoker, command = ?parsed, "chat command received");
-            chat::dispatch(bot_id, con, store, events, parsed).await;
+            let action = chat::dispatch(bot_id, con, store, events, parsed).await;
+            apply_chat_audio_action(con, current_audio, bot_id, store, events, yt_cookie, action)
+                .await;
         }
         Err(err) => {
             debug!(invoker = %msg.invoker, line = %msg.text, ?err, "chat parse outcome");
             chat::reply_for_parse_error(con, &err);
         }
+    }
+}
+
+/// PURA-340 — execute the [`chat::ChatAudioAction`] a chat command
+/// produced. The chat bridge mutates the queue and decides *what* should
+/// happen to playback; only the connected loop owns `current_audio`, so
+/// the actual pipeline spawn / teardown happens here.
+#[allow(clippy::too_many_arguments)]
+async fn apply_chat_audio_action(
+    con: &mut Connection,
+    current_audio: &mut Option<ActiveAudio>,
+    bot_id: BotId,
+    store: &Arc<dyn MusicBotStore>,
+    events: &broadcast::Sender<BotEvent>,
+    yt_cookie: &Arc<RwLock<Option<PathBuf>>>,
+    action: chat::ChatAudioAction,
+) {
+    use chat::ChatAudioAction;
+    match action {
+        ChatAudioAction::None => {}
+        ChatAudioAction::StartIfIdle => {
+            // `!play` — start the queue head. A no-op when a pipeline is
+            // already live: the enqueued track stays queued and plays
+            // when the current one finishes (`AudioMsg::Finished` →
+            // `auto_start_pending_track`).
+            auto_start_pending_track(current_audio, store, bot_id, events, yt_cookie).await;
+        }
+        ChatAudioAction::RestartHead => {
+            // `!radio` / `!skip` replaced the queue head. Tear the old
+            // pipeline down WITHOUT emitting `AudioFinished`: the chat
+            // handler already emitted `NowPlaying` for the new head, and
+            // `AudioFinished` would clear that fresh `now_playing`.
+            if audio::tear_down(current_audio) {
+                audio::send_voice_stop(con);
+                debug!("chat command replaced the queue head — restarting pipeline");
+            }
+            auto_start_pending_track(current_audio, store, bot_id, events, yt_cookie).await;
+        }
+        ChatAudioAction::StopPlayback => {
+            // `!stop` / `!skip` past the last track. The chat handler
+            // already drained the queue; tear the pipeline down and emit
+            // `AudioFinished` so `LivenessTracker` drops the `Playing`
+            // state. Mirrors `AudioCommand::Stop`.
+            if audio::tear_down(current_audio) {
+                audio::send_voice_stop(con);
+                let _ = events.send(BotEvent::AudioFinished {
+                    reason: "stopped".into(),
+                });
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{InMemoryMusicBotStore, NewTrack};
+
+    /// PURA-340 regression — the second half of the chat `!play` fix.
+    /// `chat::dispatch` returns `StartIfIdle`; the connected loop applies
+    /// it by calling `auto_start_pending_track`, which must turn a queued
+    /// head into a live pipeline when the bot is idle. The bug was that
+    /// nothing ever called this after a chat enqueue, so an idle bot's
+    /// `!play` produced no audio.
+    ///
+    /// Uses the `synthetic://` source seam so a real pipeline spawns with
+    /// no network / yt-dlp (see `audio::source_to_spec`).
+    #[tokio::test]
+    async fn auto_start_spawns_pipeline_for_queued_head() {
+        let store: Arc<dyn MusicBotStore> = Arc::new(InMemoryMusicBotStore::new());
+        let bot_id = BotId(1);
+        store
+            .queue_enqueue(
+                bot_id,
+                NewTrack {
+                    source: AudioSource::Url(
+                        "synthetic://?hz=440&duration_ms=200&amplitude=0.5".into(),
+                    ),
+                    title: "test tone".into(),
+                    duration_secs: None,
+                    requested_by: None,
+                },
+            )
+            .await
+            .expect("enqueue synthetic head");
+
+        let (events, _rx) = broadcast::channel(64);
+        let yt_cookie: Arc<RwLock<Option<PathBuf>>> = Arc::new(RwLock::new(None));
+        let mut current_audio: Option<ActiveAudio> = None;
+
+        let started =
+            auto_start_pending_track(&mut current_audio, &store, bot_id, &events, &yt_cookie).await;
+        assert!(
+            started,
+            "an idle bot with a queued head must spawn a pipeline"
+        );
+        assert!(
+            current_audio.is_some(),
+            "current_audio must hold the live pipeline after a spawn",
+        );
+
+        // Idempotency: a second call must not spawn a competing pipeline
+        // while one is already running — this is what makes `StartIfIdle`
+        // safe to return from `!play` unconditionally.
+        let again =
+            auto_start_pending_track(&mut current_audio, &store, bot_id, &events, &yt_cookie).await;
+        assert!(!again, "no second pipeline while one is already live");
+    }
+
+    /// An idle bot with an empty queue has nothing to start — `!play`
+    /// that failed to resolve must not leave a phantom pipeline.
+    #[tokio::test]
+    async fn auto_start_is_a_noop_on_empty_queue() {
+        let store: Arc<dyn MusicBotStore> = Arc::new(InMemoryMusicBotStore::new());
+        let (events, _rx) = broadcast::channel(64);
+        let yt_cookie: Arc<RwLock<Option<PathBuf>>> = Arc::new(RwLock::new(None));
+        let mut current_audio: Option<ActiveAudio> = None;
+
+        let started =
+            auto_start_pending_track(&mut current_audio, &store, BotId(1), &events, &yt_cookie)
+                .await;
+        assert!(!started);
+        assert!(current_audio.is_none());
     }
 }
