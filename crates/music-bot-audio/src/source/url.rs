@@ -55,6 +55,20 @@ impl YtDlpSource {
             .arg("--quiet")
             .arg("--no-warnings")
             .arg("--no-playlist")
+            // PURA-361 — cold-path tail hardening. PURA-355 caught a
+            // watch-page HTTP request stalling ~41 s silently (no 429, no
+            // log line) on this `!play` resolution path. `--socket-timeout`
+            // bounds every outbound request (watch page, player JS) to
+            // ~6× the ~1.7 s healthy network cost (PURA-355), and
+            // `--extractor-retries 1` lets yt-dlp reissue a timed-out
+            // watch-page fetch once on a fresh request. Worst case the
+            // resolution now fails in ~20 s with a clear error (surfaced
+            // via the stderr `ERROR:` capture below) instead of hanging
+            // the `!play` indefinitely.
+            .arg("--socket-timeout")
+            .arg(crate::resolve::SOCKET_TIMEOUT_SECS.to_string())
+            .arg("--extractor-retries")
+            .arg("1")
             .arg("-f")
             .arg("bestaudio")
             .arg("-o")
