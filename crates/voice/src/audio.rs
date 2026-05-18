@@ -30,7 +30,7 @@ use tsclientlib::Connection;
 use tsproto_packets::packets::{AudioData, CodecType, OutAudio};
 
 use music_bot_audio::source::AudioSourceSpec;
-use music_bot_audio::{AudioPipeline, PipelineConfig, PipelineError, PipelineEvent};
+use music_bot_audio::{AudioPipeline, PipelineConfig, PipelineError, PipelineEvent, VolumeHandle};
 
 use crate::command::AudioSource;
 
@@ -266,10 +266,15 @@ fn build_active(
 /// drains it. Replaces any existing pipeline (dropping it aborts the
 /// previous worker + sibling). Returns the operator-facing source label
 /// so the caller can log it.
+/// `volume` is the bot actor's shared output-gain handle (PURA-351). The
+/// same handle is passed to every pipeline the bot spawns, so an operator's
+/// volume setting persists across track changes and reconnects and a
+/// mid-track change is picked up by the live pipeline without a respawn.
 pub(crate) async fn start_pipeline(
     current: &mut Option<ActiveAudio>,
     source: &AudioSource,
     yt_cookie_file: Option<PathBuf>,
+    volume: &VolumeHandle,
 ) -> Result<String, PipelineError> {
     // PURA-330 — latency anchor: captured before teardown so the logged
     // `!play` → first-audio span includes the previous pipeline's drop.
@@ -283,8 +288,8 @@ pub(crate) async fn start_pipeline(
 
     let (spec, label) = source_to_spec(source);
     let cfg = pipeline_config(yt_cookie_file.clone());
-    debug!(label = %label, ?cfg, "spawning audio pipeline");
-    let pipeline = AudioPipeline::spawn(spec, cfg).await?;
+    debug!(label = %label, ?cfg, gain = volume.get(), "spawning audio pipeline");
+    let pipeline = AudioPipeline::spawn(spec, cfg, volume.clone()).await?;
 
     // PURA-352 — set up seek retention for the new track. A library file
     // is seekable the moment it starts; a URL source needs a one-off
@@ -342,6 +347,7 @@ pub(crate) async fn start_pipeline(
 pub(crate) async fn seek_to(
     current: &mut Option<ActiveAudio>,
     secs: u64,
+    volume: &VolumeHandle,
 ) -> Result<bool, PipelineError> {
     let Some(active) = current.as_ref() else {
         return Ok(false);
@@ -367,8 +373,12 @@ pub(crate) async fn seek_to(
     // The seek path decodes a resolved URL / local file directly — no
     // yt-dlp involvement, so no cookie file is needed.
     let cfg = pipeline_config(None);
-    debug!(secs, "PURA-352 seek: re-spawning decoder at offset");
-    let pipeline = AudioPipeline::spawn(spec, cfg).await?;
+    debug!(
+        secs,
+        gain = volume.get(),
+        "PURA-352 seek: re-spawning decoder at offset"
+    );
+    let pipeline = AudioPipeline::spawn(spec, cfg, volume.clone()).await?;
 
     *current = Some(build_active(
         pipeline,
@@ -807,6 +817,7 @@ mod tests {
                 duration_ms: Some(200),
             },
             PipelineConfig::default(),
+            VolumeHandle::default(),
         )
         .await
         .expect("spawn synthetic pipeline");

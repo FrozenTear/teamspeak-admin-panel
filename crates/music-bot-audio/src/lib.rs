@@ -18,9 +18,11 @@ pub mod pipeline;
 pub mod resolve;
 pub mod source;
 pub mod types;
+pub mod volume;
 
 pub use pipeline::AudioPipeline;
 pub use types::{
     OpusFrame, PipelineConfig, PipelineError, PipelineEvent, SAMPLE_RATE_HZ,
     SAMPLES_PER_FRAME_MONO, frame_duration,
 };
+pub use volume::{MAX_GAIN, MIN_GAIN, UNITY_GAIN, VolumeHandle};

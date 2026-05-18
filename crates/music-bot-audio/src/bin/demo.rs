@@ -120,7 +120,7 @@ async fn main() -> Result<()> {
         pace = cli.pace,
         "starting pipeline"
     );
-    let mut pipeline = AudioPipeline::spawn(spec, cfg)
+    let mut pipeline = AudioPipeline::spawn(spec, cfg, music_bot_audio::VolumeHandle::default())
         .await
         .context("AudioPipeline::spawn")?;
     let mut frames = pipeline.take_frames();

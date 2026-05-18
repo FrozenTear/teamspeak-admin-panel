@@ -81,11 +81,12 @@ pub enum ParsedCommand {
 /// ever enqueued a track, so on an idle bot it was a no-op for audio —
 /// the pipeline never spawned and the bot reported `playing` while
 /// silent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// `Eq` is intentionally absent — `SetVolume` carries an `f32`. Tests
+// compare with `assert_eq!`, which needs only `PartialEq`.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ChatAudioAction {
     /// Nothing to do — read-only command (`!np`), an audio-stub path
-    /// (`!vol` / `!prev`), or a command that failed before it
-    /// mutated the queue.
+    /// (`!prev`), or a command that failed before it mutated the queue.
     None,
     /// `!pause` — park the live pipeline so playback halts without
     /// tearing it down. A no-op when nothing is playing.
@@ -93,6 +94,10 @@ pub enum ChatAudioAction {
     /// `!resume` — un-park a paused pipeline. A no-op when nothing is
     /// playing or the pipeline is already running.
     Resume,
+    /// PURA-351 — `!vol <0..100>` set the output gain. The carried value
+    /// is the linear multiplier (`0.0..=1.0`); the connected loop applies
+    /// it to the bot's shared [`VolumeHandle`](music_bot_audio::VolumeHandle).
+    SetVolume(f32),
     /// `!play` — a track was appended. Start the queue head iff the bot
     /// is idle; when a pipeline is already running the new track stays
     /// queued and plays when the current one finishes.
@@ -242,11 +247,12 @@ async fn handle_command(
             )
         }
         ParsedCommand::Volume(v) => {
-            // Per-bot volume isn't wired into the pipeline yet — emit the
-            // stub so REST/UI subscribers see the dispatched intent.
-            // Reply optimistically so the operator knows the value parsed.
-            emit_audio_stub_event(events, &format!("SetVolume({})", v));
-            (format!("volume {}", v), ChatAudioAction::None)
+            // PURA-351 — `!vol 0..100` lowers to a linear-gain multiplier
+            // `0.0..=1.0`. The connected loop applies it to the bot's
+            // shared `VolumeHandle`, so it lands on the live track and
+            // every later one.
+            let gain = f32::from(v) / 100.0;
+            (format!("volume {v}%"), ChatAudioAction::SetVolume(gain))
         }
         ParsedCommand::NowPlaying => (handle_np(bot_id, store).await, ChatAudioAction::None),
     }
@@ -756,11 +762,7 @@ mod dispatch_tests {
     #[tokio::test]
     async fn read_only_and_stub_commands_are_audio_inert() {
         let store = store();
-        for cmd in [
-            ParsedCommand::NowPlaying,
-            ParsedCommand::Prev,
-            ParsedCommand::Volume(50),
-        ] {
+        for cmd in [ParsedCommand::NowPlaying, ParsedCommand::Prev] {
             let (_reply, action) = run(&store, cmd).await;
             assert_eq!(action, ChatAudioAction::None);
         }
@@ -816,5 +818,22 @@ mod dispatch_tests {
         let (reply, action) = run(&store, ParsedCommand::Resume).await;
         assert_eq!(reply, "resumed");
         assert_eq!(action, ChatAudioAction::Resume);
+    }
+
+    /// PURA-351 — `!vol N` lowers to a `SetVolume` action carrying the
+    /// linear-gain multiplier `N / 100`, and the chat reply echoes the
+    /// percent the operator typed.
+    #[tokio::test]
+    async fn volume_command_lowers_to_set_volume_action() {
+        let store = store();
+        let (reply, action) = run(&store, ParsedCommand::Volume(50)).await;
+        assert_eq!(action, ChatAudioAction::SetVolume(0.5));
+        assert_eq!(reply, "volume 50%");
+
+        let (_r, muted) = run(&store, ParsedCommand::Volume(0)).await;
+        assert_eq!(muted, ChatAudioAction::SetVolume(0.0));
+
+        let (_r, full) = run(&store, ParsedCommand::Volume(100)).await;
+        assert_eq!(full, ChatAudioAction::SetVolume(1.0));
     }
 }

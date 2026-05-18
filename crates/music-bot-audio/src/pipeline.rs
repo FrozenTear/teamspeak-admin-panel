@@ -13,6 +13,7 @@ use crate::source::{
     AudioSourceSpec, FfmpegSource, IcyRadioSource, PcmSource, SyntheticToneSource, YtDlpSource,
 };
 use crate::types::{OpusFrame, PipelineConfig, PipelineError, PipelineEvent};
+use crate::volume::{VolumeHandle, apply_gain};
 
 /// The handle WS-1 talks to. Drop = cancel.
 pub struct AudioPipeline {
@@ -24,16 +25,27 @@ pub struct AudioPipeline {
 impl AudioPipeline {
     /// Spawn the pipeline. The frame receiver is taken once via
     /// [`take_frames`]; events can be subscribed to repeatedly.
-    pub async fn spawn(spec: AudioSourceSpec, cfg: PipelineConfig) -> Result<Self, PipelineError> {
+    ///
+    /// `volume` is the shared output-gain handle (PURA-351) — the caller
+    /// keeps a clone and `set`s it from the REST / chat surfaces; the
+    /// worker reads it once per frame and scales the PCM before encode.
+    /// Pass [`VolumeHandle::default`] for unity-gain pass-through.
+    pub async fn spawn(
+        spec: AudioSourceSpec,
+        cfg: PipelineConfig,
+        volume: VolumeHandle,
+    ) -> Result<Self, PipelineError> {
         let source = build_source(spec, &cfg).await?;
-        Self::spawn_with_source(source, cfg)
+        Self::spawn_with_source(source, cfg, volume)
     }
 
     /// Construct a pipeline from a caller-built source. Useful for tests
     /// (synthetic source) and for sources WS-1 wants to inject directly.
+    /// See [`spawn`](Self::spawn) for the `volume` handle contract.
     pub fn spawn_with_source(
         mut source: Box<dyn PcmSource>,
         cfg: PipelineConfig,
+        volume: VolumeHandle,
     ) -> Result<Self, PipelineError> {
         let mut encoder = OpusFrameEncoder::new(&cfg)?;
         let (frames_tx, frames_rx) = mpsc::channel::<OpusFrame>(cfg.frame_buffer);
@@ -111,7 +123,12 @@ impl AudioPipeline {
                 if pcm.len() < samples_per_frame {
                     pcm.resize(samples_per_frame, 0);
                 }
-                let frame_pcm: Vec<i16> = pcm.drain(..samples_per_frame).collect();
+                let mut frame_pcm: Vec<i16> = pcm.drain(..samples_per_frame).collect();
+                // PURA-351 — apply the operator's output gain to the raw
+                // PCM before the Opus encode. Read once per frame so a
+                // mid-track slider move is picked up on the next 20 ms
+                // boundary; unity gain is a no-op fast path.
+                apply_gain(&mut frame_pcm, volume.get());
                 let opus = match encoder.encode_frame(&frame_pcm) {
                     Ok(b) => b,
                     Err(e) => {
@@ -295,6 +312,7 @@ mod tests {
                 duration_ms: Some(200),
             },
             cfg,
+            VolumeHandle::default(),
         )
         .await
         .expect("spawn");
@@ -348,6 +366,7 @@ mod tests {
                 duration_ms: None, // infinite
             },
             cfg,
+            VolumeHandle::default(),
         )
         .await
         .expect("spawn");
@@ -416,7 +435,9 @@ mod tests {
             prebuffer_frames: PREBUFFER,
             ..PipelineConfig::default()
         };
-        let mut pipeline = AudioPipeline::spawn_with_source(Box::new(source), cfg).expect("spawn");
+        let mut pipeline =
+            AudioPipeline::spawn_with_source(Box::new(source), cfg, VolumeHandle::default())
+                .expect("spawn");
         let mut frames = pipeline.take_frames();
 
         // First frame marks playback start; the pre-buffer is full by now.

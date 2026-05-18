@@ -1,0 +1,167 @@
+//! Shared output-gain control — the runtime-mutable volume seam (PURA-351).
+//!
+//! The music-bot dashboard's volume slider and the `!vol` chat command both
+//! lower into a single linear-gain multiplier applied to PCM samples just
+//! before the Opus encode. A [`VolumeHandle`] is an `Arc`-backed, lock-free
+//! cell: the bot actor owns the canonical handle, hands a clone to each
+//! [`AudioPipeline`](crate::AudioPipeline) it spawns, and `set`s it from the
+//! REST / chat surfaces. Because every pipeline the bot spawns shares the
+//! *same* handle, a volume change takes effect on the current track
+//! immediately, is inherited by every later track, and survives a
+//! reconnect — all without extra plumbing or a DB round-trip.
+//!
+//! ## Unit
+//!
+//! `gain` is a **linear amplitude multiplier**, not decibels: `1.0` = unity
+//! (bit-exact pass-through), `0.0` = silence, `0.5` ≈ −6 dBFS. The dashboard
+//! slider maps 0–100 % directly onto `0.0..=1.0`; the `!vol 0..100` chat
+//! command divides by 100. Values are clamped to [`MIN_GAIN`]..=[`MAX_GAIN`];
+//! `MAX_GAIN` leaves headroom for a modest boost of a quiet source while
+//! bounding hard-clip distortion.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+/// Minimum gain — full silence.
+pub const MIN_GAIN: f32 = 0.0;
+
+/// Maximum gain. 2.0 (+6 dB) lets an operator lift a quiet source; the
+/// dashboard slider caps the operator-facing range at 1.0 (100 %).
+pub const MAX_GAIN: f32 = 2.0;
+
+/// Unity gain — bit-exact pass-through, the default for a fresh pipeline.
+pub const UNITY_GAIN: f32 = 1.0;
+
+/// A shared, lock-free linear-gain cell. Cheap to clone (an `Arc` bump);
+/// the pipeline worker reads it once per 20 ms frame.
+#[derive(Clone, Debug)]
+pub struct VolumeHandle(Arc<AtomicU32>);
+
+impl VolumeHandle {
+    /// Create a handle at `gain` (clamped to the valid range).
+    pub fn new(gain: f32) -> Self {
+        Self(Arc::new(AtomicU32::new(clamp_gain(gain).to_bits())))
+    }
+
+    /// Overwrite the gain. Clamped to [`MIN_GAIN`]..=[`MAX_GAIN`]; a `NaN`
+    /// argument is rejected (the previous value is kept) so a malformed
+    /// wire value can never silence or blast a live stream.
+    pub fn set(&self, gain: f32) {
+        if gain.is_nan() {
+            return;
+        }
+        self.0.store(clamp_gain(gain).to_bits(), Ordering::Relaxed);
+    }
+
+    /// Current gain.
+    pub fn get(&self) -> f32 {
+        f32::from_bits(self.0.load(Ordering::Relaxed))
+    }
+}
+
+impl Default for VolumeHandle {
+    /// Unity gain — a pipeline spawned without an explicit volume plays at
+    /// the source's native level.
+    fn default() -> Self {
+        Self::new(UNITY_GAIN)
+    }
+}
+
+/// Clamp an arbitrary `f32` into the valid gain range. `NaN` callers are
+/// filtered upstream by [`VolumeHandle::set`]; a `NaN` reaching here folds
+/// to [`UNITY_GAIN`] defensively.
+fn clamp_gain(gain: f32) -> f32 {
+    if gain.is_nan() {
+        return UNITY_GAIN;
+    }
+    gain.clamp(MIN_GAIN, MAX_GAIN)
+}
+
+/// Apply `gain` to one PCM frame in place. Unity gain (within
+/// `f32::EPSILON`) is a no-op fast path — the common case while the
+/// operator leaves the slider alone. Otherwise each `i16` sample is scaled
+/// and clamped to the `i16` range, so a boost above unity hard-limits
+/// instead of wrapping into noise.
+pub(crate) fn apply_gain(pcm: &mut [i16], gain: f32) {
+    if (gain - UNITY_GAIN).abs() <= f32::EPSILON {
+        return;
+    }
+    for sample in pcm.iter_mut() {
+        let scaled = *sample as f32 * gain;
+        *sample = scaled.clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_is_unity() {
+        assert_eq!(VolumeHandle::default().get(), UNITY_GAIN);
+    }
+
+    #[test]
+    fn set_get_roundtrips() {
+        let v = VolumeHandle::default();
+        v.set(0.42);
+        assert_eq!(v.get(), 0.42);
+    }
+
+    #[test]
+    fn clones_share_one_cell() {
+        let a = VolumeHandle::default();
+        let b = a.clone();
+        a.set(0.25);
+        assert_eq!(b.get(), 0.25, "clone observes the writer's update");
+    }
+
+    #[test]
+    fn set_clamps_out_of_range() {
+        let v = VolumeHandle::default();
+        v.set(-3.0);
+        assert_eq!(v.get(), MIN_GAIN, "negative gain clamps to silence");
+        v.set(99.0);
+        assert_eq!(v.get(), MAX_GAIN, "excessive gain clamps to the ceiling");
+    }
+
+    #[test]
+    fn set_rejects_nan() {
+        let v = VolumeHandle::new(0.6);
+        v.set(f32::NAN);
+        assert_eq!(v.get(), 0.6, "NaN leaves the previous value untouched");
+    }
+
+    #[test]
+    fn unity_gain_is_a_no_op() {
+        let mut pcm = [-12345i16, 0, 12345, i16::MIN, i16::MAX];
+        let original = pcm;
+        apply_gain(&mut pcm, UNITY_GAIN);
+        assert_eq!(pcm, original, "unity gain leaves PCM bit-exact");
+    }
+
+    #[test]
+    fn half_gain_halves_samples() {
+        let mut pcm = [-1000i16, 2000, 4000];
+        apply_gain(&mut pcm, 0.5);
+        assert_eq!(pcm, [-500, 1000, 2000]);
+    }
+
+    #[test]
+    fn zero_gain_silences() {
+        let mut pcm = [i16::MIN, -1, 1, i16::MAX];
+        apply_gain(&mut pcm, 0.0);
+        assert_eq!(pcm, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn boost_hard_limits_instead_of_wrapping() {
+        let mut pcm = [20000i16, -20000];
+        apply_gain(&mut pcm, 2.0);
+        assert_eq!(
+            pcm,
+            [i16::MAX, i16::MIN],
+            "a boost past full-scale clamps, never wraps",
+        );
+    }
+}

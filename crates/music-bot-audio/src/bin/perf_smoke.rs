@@ -227,7 +227,7 @@ async fn main() -> Result<()> {
         yt_cookie_file: None,
     };
 
-    let mut pipeline = AudioPipeline::spawn(spec, cfg)
+    let mut pipeline = AudioPipeline::spawn(spec, cfg, music_bot_audio::VolumeHandle::default())
         .await
         .context("AudioPipeline::spawn")?;
     let mut frames = pipeline.take_frames();

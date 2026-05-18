@@ -38,7 +38,7 @@ use tsclientlib::prelude::*;
 
 use ts6_voice_fixture::{load_or_create_identity, wait_for_connected};
 
-use music_bot_audio::PipelineEvent;
+use music_bot_audio::{PipelineEvent, VolumeHandle};
 
 use crate::audio::{self, ActiveAudio, AudioMsg};
 use crate::backoff::ExponentialBackoff;
@@ -75,6 +75,11 @@ pub(crate) async fn run_bot(
 
     let mut state = BotState::Disconnected;
     let mut backoff = ExponentialBackoff::new(config.backoff);
+    // PURA-351 — the canonical output-gain handle. Owned by the actor so
+    // an operator's volume setting survives reconnects (the connected loop
+    // is re-entered on each handshake); cloned into every pipeline the bot
+    // spawns so a change applies to the live track and every later one.
+    let bot_volume = VolumeHandle::default();
     // Re-armed on every successful handshake; consumed by the connected loop.
     let mut connection: Option<Connection> = None;
     let mut shutdown_requested = false;
@@ -146,6 +151,7 @@ pub(crate) async fn run_bot(
                             bot_id,
                             &store,
                             Arc::clone(&yt_cookie),
+                            bot_volume.clone(),
                         )
                         .await;
                         match outcome {
@@ -267,6 +273,7 @@ async fn run_connected_loop(
     bot_id: BotId,
     store: &Arc<dyn MusicBotStore>,
     yt_cookie: Arc<RwLock<Option<PathBuf>>>,
+    bot_volume: VolumeHandle,
 ) -> ConnectedExit {
     // PURA-154 — `current_audio` is `Some` while a pipeline is spawned.
     // The connected loop is the sole owner: the actor's lifecycle owns
@@ -300,6 +307,7 @@ async fn run_connected_loop(
                     store,
                     events,
                     &yt_cookie,
+                    &bot_volume,
                 ).await;
             },
             ev = async { con.events().next().await } => match ev {
@@ -326,6 +334,7 @@ async fn run_connected_loop(
                             store,
                             events,
                             &yt_cookie,
+                            &bot_volume,
                             &msg,
                         )
                         .await;
@@ -386,6 +395,7 @@ async fn run_connected_loop(
                         store,
                         events,
                         &yt_cookie,
+                        &bot_volume,
                     ).await;
                 }
                 Some(BotCommand::Queue(qc)) => {
@@ -398,6 +408,7 @@ async fn run_connected_loop(
 }
 
 /// PURA-154 — drain a message from the audio sibling task.
+#[allow(clippy::too_many_arguments)]
 async fn handle_audio_msg(
     con: &mut Connection,
     msg: Option<AudioMsg>,
@@ -406,6 +417,7 @@ async fn handle_audio_msg(
     store: &Arc<dyn MusicBotStore>,
     events: &broadcast::Sender<BotEvent>,
     yt_cookie: &Arc<RwLock<Option<PathBuf>>>,
+    bot_volume: &VolumeHandle,
 ) {
     let Some(msg) = msg else {
         // Sibling closed without sending Finished — treat as a hard stop.
@@ -531,7 +543,8 @@ async fn handle_audio_msg(
             // auto-advance fires for the next track (which must win).
             let _ = events.send(BotEvent::AudioFinished { reason });
             handle_queue_command(bot_id, store, QueueCommand::Advance, events).await;
-            auto_start_pending_track(current_audio, store, bot_id, events, yt_cookie).await;
+            auto_start_pending_track(current_audio, store, bot_id, events, yt_cookie, bot_volume)
+                .await;
         }
     }
 }
@@ -539,6 +552,7 @@ async fn handle_audio_msg(
 /// PURA-154 — dispatch one `AudioCommand`. Returns once the requested
 /// state mutation has happened; the actual streaming continues on the
 /// sibling task.
+#[allow(clippy::too_many_arguments)]
 async fn handle_audio_command(
     con: &mut Connection,
     cmd: AudioCommand,
@@ -547,6 +561,7 @@ async fn handle_audio_command(
     store: &Arc<dyn MusicBotStore>,
     events: &broadcast::Sender<BotEvent>,
     yt_cookie: &Arc<RwLock<Option<PathBuf>>>,
+    bot_volume: &VolumeHandle,
 ) {
     match cmd {
         AudioCommand::Play { source } => {
@@ -562,7 +577,9 @@ async fn handle_audio_command(
             // UI-uploaded cookie takes effect without a manager restart.
             let cookie = yt_cookie.read().unwrap().clone();
             info!(?source, "AudioCommand::Play — spawning pipeline");
-            if let Err(err) = audio::start_pipeline(current_audio, &source, cookie).await {
+            if let Err(err) =
+                audio::start_pipeline(current_audio, &source, cookie, bot_volume).await
+            {
                 warn!(?err, "audio pipeline spawn failed");
                 let _ = events.send(BotEvent::Error(BotError::Internal(format!(
                     "audio pipeline spawn: {err}"
@@ -621,12 +638,13 @@ async fn handle_audio_command(
                 reason: "skipped".into(),
             });
             handle_queue_command(bot_id, store, QueueCommand::Advance, events).await;
-            auto_start_pending_track(current_audio, store, bot_id, events, yt_cookie).await;
+            auto_start_pending_track(current_audio, store, bot_id, events, yt_cookie, bot_volume)
+                .await;
         }
         AudioCommand::Seek { secs } => {
             // PURA-352 — re-spawn the decoder for the current track at the
             // offset, reusing the resolved stream URL (no yt-dlp re-run).
-            match audio::seek_to(current_audio, secs).await {
+            match audio::seek_to(current_audio, secs, bot_volume).await {
                 Ok(true) => {
                     info!(secs, "AudioCommand::Seek — re-spawned pipeline at offset");
                     // Flush the wire so the TS jitter buffer drops the gap
@@ -650,10 +668,18 @@ async fn handle_audio_command(
                 }
             }
         }
-        // SkipPrev / SetVolume / NowPlaying don't have pipeline support
-        // yet — leave them on the stub path so REST/UI subscribers see
-        // a dispatched-but-unsupported event. PURA-154 acceptance scoped
-        // only Play / Pause / Resume / Stop / SkipNext.
+        AudioCommand::SetVolume(gain) => {
+            // PURA-351 — apply the operator's output gain. `bot_volume` is
+            // the shared handle every pipeline this bot spawns holds a
+            // clone of, so the change lands on the live track immediately
+            // and is inherited by every later track and reconnect. No
+            // pipeline need be active — the value is staged for next play.
+            bot_volume.set(gain);
+            debug!(gain = bot_volume.get(), "AudioCommand::SetVolume applied");
+        }
+        // SkipPrev / NowPlaying don't have pipeline support yet — leave
+        // them on the stub path so REST/UI subscribers see a
+        // dispatched-but-unsupported event.
         other => emit_audio_stub(events, &other),
     }
 }
@@ -667,6 +693,7 @@ async fn auto_start_pending_track(
     bot_id: BotId,
     events: &broadcast::Sender<BotEvent>,
     yt_cookie: &Arc<RwLock<Option<PathBuf>>>,
+    bot_volume: &VolumeHandle,
 ) -> bool {
     if current_audio.is_some() {
         return false;
@@ -680,7 +707,7 @@ async fn auto_start_pending_track(
         }
     };
     let cookie = yt_cookie.read().unwrap().clone();
-    if let Err(err) = audio::start_pipeline(current_audio, &next.source, cookie).await {
+    if let Err(err) = audio::start_pipeline(current_audio, &next.source, cookie, bot_volume).await {
         warn!(?err, "auto-start audio pipeline failed");
         // PURA-340 — emit `AudioFinished` with the `failed: ` prefix, not
         // a bare `Error`. Every caller of this function (chat `!play`,
@@ -1032,13 +1059,12 @@ fn emit_store_error(events: &broadcast::Sender<BotEvent>, op: &str, err: StoreEr
 }
 
 /// PURA-154 — stub for audio sub-commands the pipeline doesn't cover
-/// today. Only `SkipPrev` / `SetVolume` / `NowPlaying` route through
-/// here; Play / Stop / Pause / Resume / SkipNext flow into the real
+/// today. Only `SkipPrev` / `NowPlaying` route through here; Play / Stop /
+/// Pause / Resume / SkipNext / SetVolume (PURA-351) flow into the real
 /// pipeline dispatch in `handle_audio_command`.
 fn emit_audio_stub(events: &broadcast::Sender<BotEvent>, cmd: &AudioCommand) {
     let label = match cmd {
         AudioCommand::SkipPrev => "SkipPrev".into(),
-        AudioCommand::SetVolume(v) => format!("SetVolume({v})"),
         AudioCommand::NowPlaying(s) => format!("NowPlaying({s})"),
         // The wired-up commands should never land here; if they do,
         // it's a routing bug — log loudly.
@@ -1121,6 +1147,7 @@ async fn dispatch_chat_line(
     store: &Arc<dyn MusicBotStore>,
     events: &broadcast::Sender<BotEvent>,
     yt_cookie: &Arc<RwLock<Option<PathBuf>>>,
+    bot_volume: &VolumeHandle,
     msg: &ChatLine,
 ) {
     match chat::parse(&msg.text) {
@@ -1133,8 +1160,17 @@ async fn dispatch_chat_line(
             // previously unmeasured.
             info!(target: "music_bot_latency", invoker = %msg.invoker, command = ?parsed, "chat command received");
             let action = chat::dispatch(bot_id, con, store, events, parsed).await;
-            apply_chat_audio_action(con, current_audio, bot_id, store, events, yt_cookie, action)
-                .await;
+            apply_chat_audio_action(
+                con,
+                current_audio,
+                bot_id,
+                store,
+                events,
+                yt_cookie,
+                bot_volume,
+                action,
+            )
+            .await;
         }
         Err(err) => {
             debug!(invoker = %msg.invoker, line = %msg.text, ?err, "chat parse outcome");
@@ -1155,6 +1191,7 @@ async fn apply_chat_audio_action(
     store: &Arc<dyn MusicBotStore>,
     events: &broadcast::Sender<BotEvent>,
     yt_cookie: &Arc<RwLock<Option<PathBuf>>>,
+    bot_volume: &VolumeHandle,
     action: chat::ChatAudioAction,
 ) {
     use chat::ChatAudioAction;
@@ -1177,12 +1214,19 @@ async fn apply_chat_audio_action(
                 debug!("chat !resume ignored — no active pipeline");
             }
         }
+        ChatAudioAction::SetVolume(gain) => {
+            // PURA-351 — `!vol` lowers here. Same shared handle the REST
+            // `SetVolume` command and every pipeline use; applies live.
+            bot_volume.set(gain);
+            debug!(gain = bot_volume.get(), "chat !vol applied");
+        }
         ChatAudioAction::StartIfIdle => {
             // `!play` — start the queue head. A no-op when a pipeline is
             // already live: the enqueued track stays queued and plays
             // when the current one finishes (`AudioMsg::Finished` →
             // `auto_start_pending_track`).
-            auto_start_pending_track(current_audio, store, bot_id, events, yt_cookie).await;
+            auto_start_pending_track(current_audio, store, bot_id, events, yt_cookie, bot_volume)
+                .await;
         }
         ChatAudioAction::RestartHead => {
             // `!radio` / `!skip` replaced the queue head. Tear the old
@@ -1193,7 +1237,8 @@ async fn apply_chat_audio_action(
                 audio::send_voice_stop(con);
                 debug!("chat command replaced the queue head — restarting pipeline");
             }
-            auto_start_pending_track(current_audio, store, bot_id, events, yt_cookie).await;
+            auto_start_pending_track(current_audio, store, bot_id, events, yt_cookie, bot_volume)
+                .await;
         }
         ChatAudioAction::StopPlayback => {
             // `!stop` / `!skip` past the last track. The chat handler
@@ -1247,8 +1292,15 @@ mod tests {
         let yt_cookie: Arc<RwLock<Option<PathBuf>>> = Arc::new(RwLock::new(None));
         let mut current_audio: Option<ActiveAudio> = None;
 
-        let started =
-            auto_start_pending_track(&mut current_audio, &store, bot_id, &events, &yt_cookie).await;
+        let started = auto_start_pending_track(
+            &mut current_audio,
+            &store,
+            bot_id,
+            &events,
+            &yt_cookie,
+            &VolumeHandle::default(),
+        )
+        .await;
         assert!(
             started,
             "an idle bot with a queued head must spawn a pipeline"
@@ -1261,8 +1313,15 @@ mod tests {
         // Idempotency: a second call must not spawn a competing pipeline
         // while one is already running — this is what makes `StartIfIdle`
         // safe to return from `!play` unconditionally.
-        let again =
-            auto_start_pending_track(&mut current_audio, &store, bot_id, &events, &yt_cookie).await;
+        let again = auto_start_pending_track(
+            &mut current_audio,
+            &store,
+            bot_id,
+            &events,
+            &yt_cookie,
+            &VolumeHandle::default(),
+        )
+        .await;
         assert!(!again, "no second pipeline while one is already live");
     }
 
@@ -1275,9 +1334,15 @@ mod tests {
         let yt_cookie: Arc<RwLock<Option<PathBuf>>> = Arc::new(RwLock::new(None));
         let mut current_audio: Option<ActiveAudio> = None;
 
-        let started =
-            auto_start_pending_track(&mut current_audio, &store, BotId(1), &events, &yt_cookie)
-                .await;
+        let started = auto_start_pending_track(
+            &mut current_audio,
+            &store,
+            BotId(1),
+            &events,
+            &yt_cookie,
+            &VolumeHandle::default(),
+        )
+        .await;
         assert!(!started);
         assert!(current_audio.is_none());
     }

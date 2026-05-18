@@ -575,6 +575,7 @@ fn PlayerControls(bot_id: u64, detail: Signal<Option<wire::MusicBotDetail>>) -> 
                 "⏭"
             }
             div { class: "player-controls__spacer" }
+            VolumeSlider { bot_id, disabled: !in_channel }
             Button {
                 variant: ButtonVariant::Danger,
                 disabled: !in_channel || !has_track || busy,
@@ -749,6 +750,73 @@ fn PlayNowComposer(bot_id: u64, state: wire::BotState) -> Element {
                     "{msg}"
                 }
             }
+        }
+    }
+}
+
+/// PURA-351 — output-volume slider for the transport bar. Posts a linear
+/// gain (`0.0..=1.0`) to `POST /api/music-bots/{id}/volume` when the
+/// operator releases the slider. Optimistic: the thumb and the percent
+/// label track the drag immediately; a failed POST reverts to the last
+/// confirmed value and toasts.
+///
+/// The bot snapshot does not echo the current gain, so the slider opens
+/// at 100 % on every page load. The music bot itself defaults to unity
+/// gain, so that is truthful for a fresh bot; restoring a non-default
+/// level after a reload is a follow-up (would need the gain in
+/// `MusicBotDetail`).
+#[component]
+fn VolumeSlider(bot_id: u64, disabled: bool) -> Element {
+    let bot = wire::BotId(bot_id);
+    let gate = use_auth_gate();
+    let toaster = use_toaster();
+    // Operator-facing volume as a whole percent (0–100); 100 = unity gain.
+    let mut volume: Signal<u8> = use_signal(|| 100);
+
+    let on_change = move |evt: FormEvent| {
+        let Ok(pct) = evt.value().parse::<u8>() else {
+            return;
+        };
+        let pct = pct.min(100);
+        let prev = *volume.peek();
+        if pct == prev {
+            return;
+        }
+        // Optimistic — the label moves with the thumb; the SSE stream
+        // carries no volume event, so this local signal is authoritative
+        // for the control's own display.
+        volume.set(pct);
+        let gate = gate.clone();
+        let toaster = toaster;
+        spawn(async move {
+            let gain = f32::from(pct) / 100.0;
+            if let Err(e) = mb::set_volume(gate, bot, gain).await {
+                // Revert to the last value the server accepted.
+                volume.set(prev);
+                toaster.push(
+                    ToastVariant::Danger,
+                    "Volume change failed",
+                    Some(format_error(&e)),
+                );
+            }
+        });
+    };
+
+    rsx! {
+        div { class: "volume-control",
+            span { class: "volume-control__glyph", aria_hidden: "true", "🔊" }
+            input {
+                class: "volume-control__slider",
+                r#type: "range",
+                min: "0",
+                max: "100",
+                step: "1",
+                value: "{volume}",
+                disabled,
+                aria_label: "Output volume",
+                onchange: on_change,
+            }
+            span { class: "volume-control__value", "{volume}%" }
         }
     }
 }

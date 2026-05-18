@@ -2139,6 +2139,34 @@ textarea.input {
 }
 .player-controls__spacer { flex: 1 1 auto; }
 
+/* PURA-351 — output-volume slider in the transport bar. */
+.volume-control {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex: 0 0 auto;
+}
+.volume-control__glyph {
+  font-size: 1rem;
+  line-height: 1;
+}
+.volume-control__slider {
+  width: 7rem;
+  accent-color: var(--c-accent-500);
+  cursor: pointer;
+}
+.volume-control__slider:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+.volume-control__value {
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  min-width: 2.75rem;
+  text-align: right;
+}
+
 .queue {
   list-style: none;
   margin: 0;
@@ -2234,6 +2262,7 @@ textarea.input {
   .player-controls .btn-lg { order: 2; flex: 1 1 100%; }
   .player-controls__spacer { display: none; }
   .player-controls .btn-danger { order: 3; flex: 1 1 100%; }
+  .volume-control { order: 4; flex: 1 1 100%; justify-content: center; }
   .queue-row { flex-wrap: wrap; }
   .queue-row__actions { flex: 1 1 100%; justify-content: flex-end; }
   .icon-btn {

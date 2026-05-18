@@ -255,9 +255,10 @@ pub struct PlayRequest {
     pub source: AudioSource,
 }
 
-/// `POST /music-bots/{id}/volume` body. `gain` is the same dBFS-ish unit
-/// that `music_bot::AudioCommand::SetVolume(f32)` uses (PURA-126 WS-6
-/// follow-up).
+/// `POST /music-bots/{id}/volume` body (PURA-351). `gain` is a **linear
+/// amplitude multiplier**: `1.0` = unity (the source's native level),
+/// `0.0` = silence, `0.5` ≈ −6 dBFS. The dashboard slider maps 0–100 %
+/// directly onto `0.0..=1.0`; the backend clamps to `0.0..=2.0`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetVolumeRequest {

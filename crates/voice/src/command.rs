@@ -69,8 +69,11 @@ pub enum AudioCommand {
     /// yt-dlp re-resolution is paid. A no-op when nothing is playing or
     /// the current track is not yet seekable (URL resolve still pending).
     Seek { secs: u64 },
-    /// Set output volume in dBFS-ish floating-point gain. WS-2 picks the
-    /// exact unit.
+    /// Set output volume (PURA-351). The payload is a **linear amplitude
+    /// multiplier**: `1.0` = unity pass-through, `0.0` = silence,
+    /// `0.5` ≈ −6 dBFS. Clamped to `0.0..=2.0` by the pipeline's
+    /// `VolumeHandle`. Applied to PCM just before the Opus encode and
+    /// shared across every track the bot plays.
     SetVolume(f32),
     /// Update the now-playing metadata (used by ICY tag / chat surface).
     NowPlaying(String),
