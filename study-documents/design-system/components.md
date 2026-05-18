@@ -901,5 +901,120 @@ Suggested Rust component names, for handoff:
 | §13 Dropdown | `Dropdown`, `Menu`, `MenuItem`, `MenuSection`, `MenuFilter`, `MenuDivider`, `MenuEmpty`, `MenuFooter` (full prop signatures in §13.10) |
 | §14 Spinner | `Spinner { size }` |
 | §15 Steps | `Steps`, `Step { state, label }` |
+| §18 Switch | `Switch { label, checked, disabled, onchange }` |
+| §19 Tabs | `Tabs { tabs, active, onselect }`, `TabPanel`, `TabItem` |
+
+---
+
+## 18. Switch / Toggle
+
+2-state boolean control. CSS class: `.switch`. Used for every boolean (`b_*`) permission row and the boolean group settings in the moderation group editors, and for any future on/off setting. For a choice between two *mutually exclusive labelled options* (not on/off), use a segmented control or radios — not a Switch (§13.6).
+
+### 18.1 Spec
+
+| Token | Value |
+|---|---|
+| Role | `role="switch"` on a `<button>`; `aria-checked` reflects state |
+| Hit target | `--touch-min` (40px) min-height on the whole row |
+| Track (off) | `--c-neutral-300` |
+| Track (on) | `--accent-bg` |
+| Thumb | `--text-primary`, `--shadow-sm`, 16px circle |
+| Track size | 36×20px, `--radius-full` |
+| Label | always present, to the **left** of the track |
+| Slide | `transform` over `--motion-fast`, `--ease-standard` |
+| Focus | `--shadow-focus` on the track |
+| Disabled | `opacity: 0.5`, `cursor: not-allowed` |
+
+### 18.2 Anatomy
+
+The whole row is one `<button role="switch">`: the visible label is the button's content, so the label *is* the accessible name and clicking anywhere on the row toggles. The track + thumb are decorative spans (`aria-hidden`).
+
+No "pure white" token exists, so the thumb uses `--text-primary` — it contrasts both the off track (`--c-neutral-300`) and the on track (`--accent-bg`) in light and dark themes, and reads as a solid knob. If a dedicated `--switch-thumb` surface token is later added, swap to it.
+
+### 18.3 Behavior
+
+- `<button>` answers Space and Enter natively, so `role="switch"` needs no extra keyboard handler.
+- Reduced motion: the `prefers-reduced-motion` block in `tokens.css` collapses every transition to ~0ms, so the thumb swaps instantly with no slide. No component-level override needed.
+- The label must read as a name on its own (e.g. "Can kick clients", not "Kick").
+
+### 18.4 Rust component contract (for DioxusLead)
+
+```rust
+#[component]
+pub fn Switch(
+    /// Visible label; doubles as the button's accessible name.
+    label: String,
+    /// Current on/off state. Host-owned — Switch never mutates it.
+    checked: bool,
+    #[props(default)] disabled: bool,
+    /// Optional element id, so a Field label can target the control.
+    #[props(default)] id: Option<String>,
+    /// Optional aria-describedby target (helper / error text id).
+    #[props(default)] described_by: Option<String>,
+    /// Fired with the requested next state.
+    #[props(default)] onchange: EventHandler<bool>,
+) -> Element { /* … */ }
+```
+
+State ownership: the **host** owns `checked`. `Switch` reports the requested next value through `onchange` and the host writes its signal.
+
+---
+
+## 19. Tabs
+
+Horizontal underline tab bar for splitting a detail surface into sections — built for the moderation group-detail Permissions / Members / Settings split, reusable for any ≤~6-tab detail page. CSS classes: `.tabs`, `.tab`, `.tab-panel`.
+
+### 19.1 Spec
+
+| Token | Value |
+|---|---|
+| Roles | `role="tablist"` / `tab` / `tabpanel` |
+| Tab font | `--weight-medium` `--text-sm` |
+| Tab color | `--text-secondary`, `--text-primary` on hover |
+| Active tab | `--accent-fg` text, 2px `--accent-fg` underline |
+| Tablist border | 1px `--border-subtle` bottom edge |
+| Tab focus | 2px `--accent-bg` outline, `-2px` offset |
+| Tabindex | roving — active tab `0`, others `-1` |
+
+### 19.2 Behavior
+
+- **Automatic activation**: arrow keys move the cursor *and* select the tab it lands on (WAI-ARIA "tabs with automatic activation"). Suits a detail page where every panel is cheap to mount.
+- Keyboard: `←` / `→` move with wrap, `Home` / `End` jump to first / last. Tab into the bar lands on the active tab (roving tabindex).
+- `aria-selected="true"` on the active tab; `aria-controls` points at its panel; the panel's `aria-labelledby` points back.
+- Inactive panels stay in the DOM with the `hidden` attribute so the `aria-controls` target always resolves.
+
+### 19.3 Rust component contract (for DioxusLead)
+
+```rust
+#[derive(Clone, PartialEq, Eq)]
+pub struct TabItem { pub id: String, pub label: String }
+
+#[component]
+pub fn Tabs(
+    /// Tab descriptors, in display order.
+    tabs: Vec<TabItem>,
+    /// Currently-selected tab id. Host-owned.
+    active: String,
+    /// Id stem shared with the paired TabPanels; default "tabs".
+    #[props(default = String::from("tabs"))] id: String,
+    /// Optional aria-label for the tablist.
+    #[props(default)] aria_label: Option<String>,
+    /// Fired with the requested tab id on click or arrow-key move.
+    onselect: EventHandler<String>,
+) -> Element { /* … */ }
+
+#[component]
+pub fn TabPanel(
+    /// Tab id this panel belongs to — matches a TabItem::id.
+    id: String,
+    /// Id stem — must match the paired Tabs `id`; default "tabs".
+    #[props(default = String::from("tabs"))] tabs_id: String,
+    /// Whether this panel's tab is selected.
+    active: bool,
+    children: Element,
+) -> Element { /* … */ }
+```
+
+State ownership: the **host** owns `active`. The host renders one `TabPanel` per tab and drives each panel's `active`. `Tabs` reports the requested selection through `onselect` and never mutates it.
 
 All components accept a `class` / `style` prop (escape hatch) but must NOT require it for any documented use case.

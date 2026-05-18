@@ -1313,11 +1313,86 @@ a:hover {
 .tab:hover { color: var(--text-primary); }
 .tab.is-active {
   color: var(--accent-fg);
-  border-bottom-color: var(--accent-bg);
+  /* §19: the active underline matches the active label colour. */
+  border-bottom-color: var(--accent-fg);
 }
 .tab:focus-visible {
   outline: 2px solid var(--accent-bg);
   outline-offset: -2px;
+}
+/* §19: tabpanel body. Inactive panels stay in the DOM with `hidden` so the
+   tab's aria-controls target always resolves. */
+.tab-panel {
+  padding-top: var(--space-5);
+}
+.tab-panel[hidden] {
+  display: none;
+}
+.tab-panel:focus-visible {
+  outline: 2px solid var(--accent-bg);
+  outline-offset: 2px;
+  border-radius: var(--radius-md);
+}
+
+/* Switch / Toggle — 2-state boolean control. components.md §18.
+   The whole row is the button: label left, track right, ≥40px hit target. */
+.switch {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-4);
+  width: 100%;
+  min-height: var(--touch-min);
+  padding: var(--space-2) 0;
+  background: none;
+  border: 0;
+  cursor: pointer;
+  color: var(--text-primary);
+  font: var(--weight-medium) var(--text-sm) / var(--lh-sm) var(--font-sans);
+  text-align: left;
+}
+.switch-label {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.switch-track {
+  flex: 0 0 auto;
+  position: relative;
+  width: 36px;
+  height: 20px;
+  border-radius: var(--radius-full);
+  background: var(--c-neutral-300);
+  transition: background var(--motion-fast) var(--ease-standard);
+}
+.switch.is-on .switch-track {
+  background: var(--accent-bg);
+}
+.switch-thumb {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: var(--radius-full);
+  /* No "pure white" token exists; --text-primary always contrasts both the
+     off track (--c-neutral-300) and the on track (--accent-bg) in either
+     theme, and reads as a solid knob. See §18.2. */
+  background: var(--text-primary);
+  box-shadow: var(--shadow-sm);
+  transition: transform var(--motion-fast) var(--ease-standard);
+}
+.switch.is-on .switch-thumb {
+  transform: translateX(16px);
+}
+.switch:focus-visible {
+  outline: none;
+}
+.switch:focus-visible .switch-track {
+  box-shadow: var(--shadow-focus);
+}
+.switch:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 /* Preset chips — cron presets on the create form. */
