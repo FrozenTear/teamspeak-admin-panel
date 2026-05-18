@@ -2722,3 +2722,74 @@ textarea.input {
   .perm-num-input { width: 5rem; }
   .sg-add-member-row { flex-wrap: wrap; }
 }
+
+/* ── PURA-379 permissions reference — inert catalog rows + lookup ───── */
+.perm-row-toggle {
+  width: 100%;
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  background: none;
+  border: none;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  padding: 0;
+  cursor: pointer;
+}
+.perm-row-toggle:focus-visible {
+  outline: none;
+  box-shadow: var(--shadow-focus);
+  border-radius: var(--radius-sm);
+}
+.perm-row-toggle .perm-row-main {
+  flex-flow: row wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+.perm-row-chevron {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  margin-top: 2px;
+}
+.perm-catalog-detail { margin-left: var(--space-7); }
+.perm-catalog-desc {
+  margin: 0 0 var(--space-3);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}
+.perm-catalog-meta {
+  margin: 0;
+  display: grid;
+  gap: var(--space-2);
+}
+.perm-catalog-meta > div {
+  display: grid;
+  grid-template-columns: 120px 1fr;
+  gap: var(--space-3);
+}
+.perm-catalog-meta dt {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.perm-catalog-meta dd {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+}
+
+/* Client permission lookup panel — picker row + effective-perm table. */
+.perm-lookup { display: grid; gap: var(--space-4); }
+.perm-lookup-pickers {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-4);
+}
+@media (max-width: 540px) {
+  .perm-lookup-pickers { grid-template-columns: 1fr; }
+  .perm-catalog-detail { margin-left: 0; }
+  .perm-catalog-meta > div { grid-template-columns: 1fr; gap: 2px; }
+}

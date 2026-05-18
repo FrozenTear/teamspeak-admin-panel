@@ -26,9 +26,9 @@ use crate::ui::pages::{
     ChannelsPage, ClientsPage, DashboardPlaceholder, FlowDetailPage, FlowEditPage, FlowFormPage,
     FlowsListPage, Home, LoginPage, LogsPage, MessagesPage, ModerationCasePage,
     ModerationQueuePage, MusicLibraryPage, MusicPlaylistsPage, NotFoundPage, PermissionGrantsPage,
-    PublicWidgetPage, RadioStationsPage, ServerEditPage, ServerGroupDetailPage, ServerGroupsPage,
-    ServerInfoPage, ServersIndexPage, SettingsPage, SetupPage, SubjectHistoryPage,
-    VideoSourcesPage, WidgetsPage,
+    PermissionsCatalogPage, PublicWidgetPage, RadioStationsPage, ServerEditPage,
+    ServerGroupDetailPage, ServerGroupsPage, ServerInfoPage, ServersIndexPage, SettingsPage,
+    SetupPage, SubjectHistoryPage, VideoSourcesPage, WidgetsPage,
 };
 
 #[rustfmt::skip]
@@ -202,6 +202,14 @@ pub enum Route {
     #[route("/moderation/server-groups/:sgid")]
     ServerGroupDetailPage { sgid: i64 },
 
+    // PURA-379 (PURA-369 Phase C) — read-only permissions reference. The
+    // `permissions` literal is a static segment, more specific than the
+    // `/moderation/cases|subjects/:param` dynamic routes, so it never
+    // collides. `permsid` is an optional deep-link query param: a group
+    // editor links here with `?permsid=` to pre-seed the catalog search.
+    #[route("/moderation/permissions?:permsid")]
+    PermissionsCatalogPage { permsid: Option<String> },
+
     // PURA-287 — per-user moderation grant editor. Admin-gated like the
     // other `/admin/*` surfaces; the sidebar entry is hidden for non-admins
     // and `PUT /api/users/{id}/permissions` enforces `RequireAdmin`.
@@ -323,6 +331,20 @@ mod tests {
         assert!(matches!(
             Route::from_str("/admin/permissions").expect("permissions parse"),
             Route::PermissionGrantsPage {}
+        ));
+        // PURA-379 — the read-only permissions reference. Static segment,
+        // must win over the dynamic `/moderation/cases|subjects/:param`
+        // routes; the deep-link query param is absent here.
+        assert!(matches!(
+            Route::from_str("/moderation/permissions").expect("perm catalog parse"),
+            Route::PermissionsCatalogPage { permsid: None }
+        ));
+        // The `?permsid=` deep link parses into the typed query param.
+        assert!(matches!(
+            Route::from_str("/moderation/permissions?permsid=b_client_kick_from_server")
+                .expect("perm catalog deep-link parse"),
+            Route::PermissionsCatalogPage { permsid: Some(p) }
+                if p == "b_client_kick_from_server"
         ));
     }
 
