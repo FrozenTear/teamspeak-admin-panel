@@ -278,3 +278,268 @@ pub struct LogLine {
     /// running curl gets the spec-shaped response.
     pub text: String,
 }
+
+// =====================================================================
+// PURA-373 — moderation completion: server-group / channel-group /
+// permission / token / message wire types (spec §7.9–7.16).
+//
+// Response rows preserve the TS WebQuery JSON keys verbatim (snake_case)
+// — the spec treats those as the external contract. Request bodies use
+// camelCase, matching the rest of the §7 surface.
+// =====================================================================
+
+/// `GET /server-groups` row — `servergrouplist` projection.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ServerGroupItem {
+    pub sgid: i64,
+    pub name: String,
+    /// `0` regular / `1` template / `2` ServerQuery.
+    #[serde(rename = "type")]
+    pub group_type: i64,
+    pub iconid: i64,
+    pub savedb: i64,
+    pub sortid: i64,
+    pub namemode: i64,
+    pub n_modifyp: i64,
+    pub n_member_addp: i64,
+    pub n_member_removep: i64,
+}
+
+/// `GET /channel-groups` row — `channelgrouplist` projection.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ChannelGroupItem {
+    pub cgid: i64,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub group_type: i64,
+    pub iconid: i64,
+    pub savedb: i64,
+    pub sortid: i64,
+    pub namemode: i64,
+    pub n_modifyp: i64,
+    pub n_member_addp: i64,
+    pub n_member_removep: i64,
+}
+
+/// `POST /server-groups` / `POST /channel-groups` body.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupCreateRequest {
+    pub name: String,
+    /// Optional group type; upstream default applies when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<i64>,
+}
+
+/// `PUT /server-groups/:sgid` / `PUT /channel-groups/:cgid` body.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupRenameRequest {
+    pub name: String,
+}
+
+/// `POST /server-groups/:sgid/copy` body.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerGroupCopyRequest {
+    pub name: String,
+    /// Type of the new copy; defaults to `1` (regular) when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<i64>,
+}
+
+/// `POST /server-groups` / `:sgid/copy` 201 response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerGroupCreated {
+    pub sgid: i64,
+}
+
+/// `POST /channel-groups` 201 response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelGroupCreated {
+    pub cgid: i64,
+}
+
+/// `GET /server-groups/:sgid/members` row — `servergroupclientlist -names`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ServerGroupMember {
+    pub cldbid: i64,
+    pub client_nickname: String,
+    pub client_unique_identifier: String,
+}
+
+/// `POST /server-groups/:sgid/members` body.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupMemberAddRequest {
+    pub cldbid: i64,
+}
+
+/// `GET /channel-groups/:cgid/clients` row — `channelgroupclientlist`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ChannelGroupClientItem {
+    pub cid: i64,
+    pub cldbid: i64,
+    pub cgid: i64,
+}
+
+/// `POST /channel-groups/:cgid/assign` body — `setclientchannelgroup`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelGroupAssignRequest {
+    pub cid: i64,
+    pub cldbid: i64,
+}
+
+/// Group permission row — `servergrouppermlist` / `channelgrouppermlist`
+/// (requested with `-permsid`). `permsid` is the stable internal id.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct GroupPermItem {
+    pub permid: i64,
+    pub permsid: String,
+    pub permvalue: i64,
+    pub permnegated: i64,
+    pub permskip: i64,
+}
+
+/// `PUT /server-groups/:sgid/permissions` / `PUT /channel-groups/:cgid/permissions`
+/// body — upserts one permission. `permnegated` / `permskip` are ignored
+/// on the channel-group path (TS6 channel-group perms carry only a value).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupPermSetRequest {
+    pub permsid: String,
+    pub permvalue: i64,
+    #[serde(default)]
+    pub permnegated: bool,
+    #[serde(default)]
+    pub permskip: bool,
+}
+
+/// `DELETE /…/permissions` query — the permission to drop.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupPermDeleteQuery {
+    pub permsid: String,
+}
+
+/// `GET /permissions` row — `permissionlist` catalog entry (read-only).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PermissionCatalogItem {
+    pub permid: i64,
+    pub permname: String,
+    pub permdesc: String,
+}
+
+/// `GET /permissions/find` query — exactly one selector should be set.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermFindQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permid: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permsid: Option<String>,
+}
+
+/// `GET /permissions/find` row — `permfind` assignment.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PermFindItem {
+    /// Assignment kind: `0` server group, `1` client, `2` channel,
+    /// `3` channel group.
+    pub t: i64,
+    pub id1: i64,
+    pub id2: i64,
+    /// Numeric `permid`.
+    pub p: i64,
+}
+
+/// `GET /permissions/overview/:cldbid` query (`cid` / `permid` default 0).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermOverviewQuery {
+    #[serde(default)]
+    pub cid: i64,
+    #[serde(default)]
+    pub permid: i64,
+}
+
+/// `GET /permissions/overview/:cldbid` row — `permoverview`. `t` / `id1`
+/// tag the origin of the permission (the §6.2 SOURCE column).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PermOverviewItem {
+    pub t: i64,
+    pub id1: i64,
+    pub id2: i64,
+    pub p: i64,
+    pub v: i64,
+    pub n: i64,
+    pub s: i64,
+}
+
+/// `GET /tokens` row — `privilegekeylist`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TokenItem {
+    pub token: String,
+    /// `0` server-group token, `1` channel-group token.
+    pub token_type: i64,
+    pub token_id1: i64,
+    pub token_id2: i64,
+    pub token_description: String,
+    pub token_created: i64,
+    pub token_customset: String,
+}
+
+/// `POST /tokens` body — `privilegekeyadd`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenCreateRequest {
+    /// `0` server-group token (`tokenId1 = sgid`), `1` channel-group
+    /// token (`tokenId1 = cgid`, `tokenId2 = cid`).
+    pub token_type: i64,
+    pub token_id1: i64,
+    #[serde(default)]
+    pub token_id2: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub customset: Option<String>,
+}
+
+/// `POST /tokens` 201 response — the minted privilege key.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenCreated {
+    pub token: String,
+}
+
+/// `GET /messages` row — `messagelist` inbox entry.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MessageListItem {
+    pub msgid: i64,
+    pub cluid: String,
+    pub subject: String,
+    pub timestamp: i64,
+    pub flag_read: i64,
+}
+
+/// `GET /messages/:msgid` body — `messageget` (includes the body text).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MessageDetailResponse {
+    pub msgid: i64,
+    pub cluid: String,
+    pub subject: String,
+    pub message: String,
+    pub timestamp: i64,
+}
+
+/// `POST /messages` body — `messageadd`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageCreateRequest {
+    /// Recipient's unique identifier (`client_unique_identifier`).
+    pub cluid: String,
+    pub subject: String,
+    pub message: String,
+}
