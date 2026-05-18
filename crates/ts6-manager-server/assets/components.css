@@ -2722,3 +2722,31 @@ textarea.input {
   .perm-num-input { width: 5rem; }
   .sg-add-member-row { flex-wrap: wrap; }
 }
+
+/* ─── PURA-376 — privilege keys (tokens) ─────────────────────────────── */
+/* Layout-only rules; compose existing design tokens, no new values. */
+.token-key-masked {
+  font-family: var(--font-mono, monospace);
+  color: var(--text-muted);
+  letter-spacing: 0.06em;
+}
+.token-key-actions {
+  display: flex;
+  gap: var(--space-3);
+  margin-top: var(--space-2);
+}
+.token-result-key {
+  padding: var(--space-5) var(--space-6);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface-raised);
+  border: 1px solid var(--border-subtle);
+  font-family: var(--font-mono, monospace);
+  font-size: var(--text-lg);
+  color: var(--text-primary);
+  word-break: break-all;
+  text-align: center;
+}
+.token-result-copy {
+  display: flex;
+  justify-content: center;
+}

@@ -28,7 +28,7 @@ use crate::ui::pages::{
     MessagesPage, ModerationCasePage, ModerationQueuePage, MusicLibraryPage, MusicPlaylistsPage,
     NotFoundPage, PermissionGrantsPage, PublicWidgetPage, RadioStationsPage, ServerEditPage,
     ServerGroupDetailPage, ServerGroupsPage, ServerInfoPage, ServersIndexPage, SettingsPage,
-    SetupPage, SubjectHistoryPage, VideoSourcesPage, WidgetsPage,
+    SetupPage, SubjectHistoryPage, TokensPage, VideoSourcesPage, WidgetsPage,
 };
 
 #[rustfmt::skip]
@@ -214,6 +214,14 @@ pub enum Route {
     #[route("/moderation/channel-groups/:cgid")]
     ChannelGroupDetailPage { cgid: i64 },
 
+    // PURA-376 (PURA-369 Phase B) — privilege keys (tokens). Static
+    // segment, so it never collides with the `/moderation/cases|subjects/*`
+    // dynamic routes. Read = any operator with server access; write (mint
+    // / delete) = admin, enforced server-side by the `/tokens` route's
+    // `check_admin`.
+    #[route("/moderation/tokens")]
+    TokensPage {},
+
     // PURA-287 — per-user moderation grant editor. Admin-gated like the
     // other `/admin/*` surfaces; the sidebar entry is hidden for non-admins
     // and `PUT /api/users/{id}/permissions` enforces `RequireAdmin`.
@@ -346,6 +354,12 @@ mod tests {
         assert!(matches!(
             Route::from_str("/moderation/messages").expect("messages parse"),
             Route::MessagesPage {}
+        ));
+        // PURA-376 — the static tokens route wins over the dynamic
+        // `/moderation/cases|subjects/*` matchers.
+        assert!(matches!(
+            Route::from_str("/moderation/tokens").expect("tokens parse"),
+            Route::TokensPage {}
         ));
         assert!(matches!(
             Route::from_str("/admin/permissions").expect("permissions parse"),

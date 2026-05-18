@@ -45,6 +45,7 @@ pub(crate) mod permeditor;
 mod queue;
 mod server_group_detail;
 mod server_groups;
+mod tokens;
 
 pub use case_detail::ModerationCasePage;
 pub use channel_group_detail::ChannelGroupDetailPage;
@@ -56,6 +57,7 @@ pub use metrics::AutomodMetricsPage;
 pub use queue::ModerationQueuePage;
 pub use server_group_detail::ServerGroupDetailPage;
 pub use server_groups::ServerGroupsPage;
+pub use tokens::TokensPage;
 
 use chrono::{DateTime, Utc};
 use dioxus::prelude::*;
