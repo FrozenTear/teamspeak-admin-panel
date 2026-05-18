@@ -12,6 +12,11 @@ This script is embedded in the manager binary (``include_str!``) and written
 to disk + spawned by ``crates/music-bot-audio/src/resolver.rs``, so the
 script and the binary that supervises it never drift.
 
+PURA-360 additionally turns on yt-dlp's per-player-revision preprocessed-player
+cache (``_enable_preprocessed_player_cache`` below) so the expensive YouTube
+``base.js`` parse is paid once per player revision rather than once per
+``!play``.
+
 Protocol — one JSON request per connection, one JSON response, newline
 terminated, connection then closed by the server:
 
@@ -53,6 +58,78 @@ def _load_yt_dlp():
 
 
 yt_dlp = _load_yt_dlp()
+
+
+def _enable_preprocessed_player_cache():
+    """PURA-360 — turn on the per-player-revision preprocessed-player cache.
+
+    Every ``!play`` of a YouTube URL runs a JS challenge: yt-dlp's EJS
+    provider hands the player ``base.js`` (~2.7 MB) to ``deno``, which parses
+    and *preprocesses* it before solving the ``n`` / signature transforms.
+    PURA-355 measured that solve as the largest phase of the resolution
+    floor. The preprocessing — not deno's process start (~60 ms) — is the
+    cost: parsing a 2.7 MB script in V8 on every track.
+
+    yt-dlp's ``_real_bulk_solve`` *already* knows how to cache the
+    preprocessed player, keyed by player URL, and skip the parse on a hit —
+    but ships it disabled (``_ENABLE_PREPROCESSED_PLAYER_CACHE = False``,
+    upstream rationale: "files are large and we do not support rotation").
+
+    For a long-lived resolver the trade-off inverts:
+
+      * The player revision is embedded in the cache key (the player URL is
+        ``.../s/player/<rev>/...base.js``), so a revision bump is automatic
+        invalidation — a new key, never a stale solve. "Rotation" is free.
+      * The revision is stable for days, so after the first ``!play`` every
+        later one reuses the cached preprocessed player.
+      * The ~3.7 MB cache files are bounded: one per player revision, on the
+        container's ephemeral fs, and the manager restarts on every image
+        upgrade — a handful of files per container lifetime.
+
+    Measured on contabo-dev, same player, warm process: enabling this cut
+    the deno JS-challenge phase ~2.4 s -> ~1.1 s and the whole resolve
+    ~5.1 s -> ~2.4 s on a cache hit.
+
+    Flipping the class flag reuses yt-dlp's own tested load/store path — no
+    fork of the solver. ``YT_NSIG_CACHE_DISABLE`` pins playback back to the
+    stock cold-solve behaviour. A future yt-dlp that renames or drops the
+    flag degrades to stock behaviour rather than erroring: we only set an
+    attribute that already exists.
+    """
+    if os.environ.get("YT_NSIG_CACHE_DISABLE"):
+        print(
+            "yt-resolver: preprocessed-player cache disabled (YT_NSIG_CACHE_DISABLE)",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+    try:
+        from yt_dlp.extractor.youtube.jsc._builtin.ejs import EJSBaseJCP
+    except Exception as exc:  # noqa: BLE001 — any import failure → stay on stock behaviour
+        print(
+            "yt-resolver: EJS JS-challenge provider not importable (%s) — "
+            "preprocessed-player cache not enabled" % (exc,),
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+    if not hasattr(EJSBaseJCP, "_ENABLE_PREPROCESSED_PLAYER_CACHE"):
+        print(
+            "yt-resolver: yt-dlp has no _ENABLE_PREPROCESSED_PLAYER_CACHE flag — "
+            "preprocessed-player cache not enabled (yt-dlp internals changed?)",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+    EJSBaseJCP._ENABLE_PREPROCESSED_PLAYER_CACHE = True
+    print(
+        "yt-resolver: per-player-revision preprocessed-player cache enabled (PURA-360)",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+_enable_preprocessed_player_cache()
 
 
 def _yt_dlp_version():
