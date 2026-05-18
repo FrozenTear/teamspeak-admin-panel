@@ -282,6 +282,40 @@ async fn build_source(
             Ok(Box::new(src))
         }
         AudioSourceSpec::YtDlp { url } => {
+            // PURA-359 — try the warm resolver service first: it returns a
+            // direct `bestaudio` URL from a process that already imported
+            // yt-dlp, so `ffmpeg` consumes the URL directly and the ~2 s
+            // per-`!play` yt-dlp process startup (PURA-355) is skipped.
+            // Every failure path below degrades to the proven `yt-dlp`
+            // subprocess — a broken resolver slows `!play` but never breaks
+            // it.
+            if let Some(resolver) = crate::resolver::shared() {
+                let t0 = Instant::now();
+                match resolver.resolve(&url, cfg.yt_cookie_file.as_deref()).await {
+                    Ok(track) => {
+                        tracing::info!(
+                            target: "music_bot_latency",
+                            stage = "resolver_resolved",
+                            elapsed_ms = t0.elapsed().as_millis() as u64,
+                            title = track.title.as_deref().unwrap_or(""),
+                            "warm yt-dlp resolver returned direct media URL",
+                        );
+                        match FfmpegSource::from_input(&track.direct_url, cfg.channels, None).await
+                        {
+                            Ok(src) => return Ok(Box::new(src)),
+                            Err(e) => tracing::warn!(
+                                error = %e,
+                                "ffmpeg rejected resolver direct URL — \
+                                 falling back to yt-dlp subprocess",
+                            ),
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "warm resolver did not resolve — falling back to yt-dlp subprocess",
+                    ),
+                }
+            }
             let src = YtDlpSource::new(&url, cfg.channels, cfg.yt_cookie_file.as_deref())
                 .await
                 .map_err(|e| PipelineError::Source(format!("yt-dlp spawn: {e}")))?;

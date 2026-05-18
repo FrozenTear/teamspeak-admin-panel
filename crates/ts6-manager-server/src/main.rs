@@ -190,6 +190,13 @@ mod server_entry {
             }
         }
 
+        // PURA-359 — start the persistent yt-dlp resolver service now, at
+        // boot, so its one-time `import yt_dlp` cost (~2 s, PURA-355) is
+        // paid well before the first `!play` instead of on the critical
+        // path of a track. Best-effort and self-supervising: if it cannot
+        // start, playback transparently uses the yt-dlp subprocess path.
+        music_bot::warm_resolver();
+
         // PURA-357 — rehydrate persisted music bots. WS-5 (PURA-123)
         // shipped the music-bot supervisor as in-memory only, so every
         // configured bot vanished on the process restart an image

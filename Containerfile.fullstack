@@ -134,10 +134,17 @@ FROM docker.io/debian:bookworm-slim
 #                           `Command::new("ffmpeg").spawn()` ENOENTs and the
 #                           music-bot supervisor never advances past
 #                           `Connected` — V5 (audible audio) cannot pass.
-#   * `yt-dlp`            — subprocess invoked by `YtDlpSource::new` for every
-#                           HTTP(S) `AudioSource::Url` (the only path the
-#                           `/api/music-bots/{id}/play` REST surface exercises;
-#                           see `crates/voice/src/audio.rs::source_to_spec`).
+#   * `yt-dlp`            — the curl'd release file below is the yt-dlp
+#                           *zipapp* (a zip-importable Python archive). It
+#                           serves both the subprocess fallback
+#                           (`YtDlpSource::new`, run as `yt-dlp …`) and the
+#                           PURA-359 persistent resolver service, which
+#                           `import`s `yt_dlp` straight out of the same
+#                           zipapp (`YT_DLP_ZIPAPP` env below) so the warm
+#                           resolver and the fallback never drift versions.
+#   * `python3`           — interpreter for both the yt-dlp zipapp and the
+#                           persistent resolver service (`yt_resolver.py`,
+#                           embedded in the server binary).
 # Pin yt-dlp to a known-good upstream release. The Debian Bookworm apt package
 # is pinned at 2023.03.04 — too old for YouTube's current cipher/sig mechanism.
 # Bump this ARG when YouTube stops working again (keep the pin explicit so a
@@ -210,7 +217,8 @@ WORKDIR /var/lib/ts6-manager
 ENV PORT=3001 \
     NODE_ENV=production \
     DATABASE_URL=surrealkv:///var/lib/ts6-manager/db \
-    MUSIC_DIR=/var/lib/ts6-manager/music
+    MUSIC_DIR=/var/lib/ts6-manager/music \
+    YT_DLP_ZIPAPP=/usr/local/bin/yt-dlp
 
 EXPOSE 3001
 

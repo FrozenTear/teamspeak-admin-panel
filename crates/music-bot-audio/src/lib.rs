@@ -16,6 +16,7 @@ pub mod icy;
 pub mod pacer;
 pub mod pipeline;
 pub mod resolve;
+pub mod resolver;
 pub mod source;
 pub mod types;
 pub mod volume;

@@ -31,3 +31,9 @@ pub use store::{
     PlaylistName, SNAPSHOT_VERSION, StoreError, StoreResult, Track, TrackId,
 };
 pub use supervisor::{BotHandle, BotInfo, BotSupervisor, SendError, spawn_bot};
+
+/// PURA-359 — start the persistent yt-dlp resolver service so it is warm
+/// (extractors imported) by the first `!play`. Call once at server boot.
+/// Re-exported from `music-bot-audio` so the server crate can warm the
+/// resolver without taking a direct dependency on the audio crate.
+pub use music_bot_audio::resolver::warm_up as warm_resolver;

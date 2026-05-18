@@ -80,10 +80,33 @@ pipeline.shutdown().await;
 | ------------------------- | ---------------------------------------------- | --------------------------------------------------- |
 | `SyntheticTone`           | Tests, demo, sanity checks                     | In-process sine generator                           |
 | `Ffmpeg { input }`        | Local files, simple HTTP, anything ffmpeg `-i` accepts | `ffmpeg` subprocess                                 |
-| `YtDlp { url }`           | YouTube, SoundCloud, generic media URLs        | `yt-dlp` → `ffmpeg` subprocess pipeline             |
+| `YtDlp { url }`           | YouTube, SoundCloud, generic media URLs        | warm resolver → direct URL → `ffmpeg`; falls back to `yt-dlp` → `ffmpeg` subprocess pipeline |
 | `IcyRadio { url }`        | Shoutcast / Icecast streams; raises `NowPlaying` | reqwest HTTP fetch → ICY splitter → `ffmpeg` stdin |
 
 ICY metadata is only surfaced for the `IcyRadio` variant. yt-dlp / file / generic ffmpeg inputs do not see ICY.
+
+## Persistent yt-dlp resolver (PURA-359)
+
+`YtDlp { url }` no longer spawns a fresh `yt-dlp` subprocess on every `!play`.
+[PURA-355](/PURA/issues/PURA-355) measured ~2 s of every resolution as pure
+yt-dlp *process startup* — importing the extractor registry — re-paid per
+track. `crates/music-bot-audio/src/resolver.rs` instead runs a long-lived
+Python process (`yt_resolver.py`, embedded via `include_str!`) that imports
+`yt_dlp` once at boot and resolves tracks over a unix-domain socket; the warm
+process returns the direct `bestaudio` URL and `ffmpeg` consumes it directly.
+Measured on contabo-dev: ~6.5 s cold subprocess vs ~3.8 s warm — **−~2.7 s**.
+
+- The manager warms the resolver at boot (`music_bot::warm_resolver()` in
+  `main.rs`), so the `import yt_dlp` cost is paid before the first `!play`.
+- A background supervisor restarts the process on exit; after repeated fast
+  crashes it gives up and leaves the subprocess fallback in effect.
+- **Every failure path falls back to the `yt-dlp` subprocess** — service down,
+  mid-restart, malformed reply, or a genuine resolution failure. A broken
+  resolver can slow `!play` but cannot break it.
+- `YT_RESOLVER_DISABLE=1` pins playback to the subprocess path.
+- The container imports `yt_dlp` straight out of the same `yt-dlp` zipapp the
+  subprocess fallback runs (`YT_DLP_ZIPAPP`), so the two never drift versions;
+  a manager restart after an image upgrade re-imports the new zipapp for free.
 
 ## Subprocess hygiene
 

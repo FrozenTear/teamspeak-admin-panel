@@ -35,7 +35,7 @@ audiopus = "0.3.0-rc.0"
 # byte-arithmetic ourselves; reqwest::get + bytes_stream is the right shape.
 reqwest = { workspace = true, features = ["stream"] }
 
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process", "io-util", "time", "sync", "fs", "signal"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process", "io-util", "time", "sync", "fs", "signal", "net"] }
 async-trait = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
