@@ -190,6 +190,46 @@ mod server_entry {
             }
         }
 
+        // PURA-357 — rehydrate persisted music bots. WS-5 (PURA-123)
+        // shipped the music-bot supervisor as in-memory only, so every
+        // configured bot vanished on the process restart an image
+        // upgrade performs (`podman kube down` / `kube play`). Bot
+        // config is now persisted to `music_bot_runtime`; re-spawn each
+        // bot here under its original id — after the `yt_cookie` load
+        // above so rehydrated actors see the operator's cookie — so
+        // REST / FE references and chat-bridge wiring survive the
+        // restart. Best-effort: a rehydration failure must not gate
+        // startup, and an `auto_connect=false` bot is restored idle.
+        match crate::repos::music_bot_runtime::list(&database).await {
+            Ok(rows) => {
+                let count = rows.len();
+                for row in rows {
+                    let id = music_bot::BotId(row.id as u64);
+                    let config = music_bot::BotConfig::new(
+                        row.name,
+                        std::path::PathBuf::from(row.identityPath),
+                    )
+                    .with_server_addr(row.serverAddr)
+                    .with_auto_connect(row.autoConnect);
+                    state
+                        .music_bots
+                        .supervisor
+                        .spawn_with_id(id, config, state.yt_cookie.clone())
+                        .await;
+                    state.music_bots.watch(id).await;
+                }
+                if count > 0 {
+                    tracing::info!(count, "rehydrated music bots from music_bot_runtime");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "music-bot rehydration query failed; configured bots not restored this boot"
+                );
+            }
+        }
+
         // PURA-81 — periodic dashboard tick republisher. Spawns one
         // worker per enabled `server_connection`; each pushes a
         // `dashboard:tick` envelope onto the WS hub every 5 s. The

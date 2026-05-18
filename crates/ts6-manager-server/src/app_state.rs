@@ -61,8 +61,9 @@ pub struct AppState {
     pub widget_cache: WidgetCache,
     /// PURA-123 WS-5: music-bot supervisor + per-bot store + request log.
     /// One process-wide instance; the route layer in
-    /// [`crate::routes::music_bots`] is the only consumer. Persistence
-    /// is in-memory for WS-5; the SurrealDB-backed swap is a follow-up.
+    /// [`crate::routes::music_bots`] is the only consumer. The supervisor
+    /// is in-memory, but bot *config* is persisted to `music_bot_runtime`
+    /// (PURA-357) and rehydrated at boot so bots survive a restart.
     pub music_bots: MusicBotService,
     /// PURA-144 (WS-6): HTTP client for `ts6-media-sidecar`. `None` when
     /// the operator has not set `SIDECAR_URL` — the `/api/video-sources`
@@ -113,12 +114,16 @@ impl AppState {
         let control = ControlBackendPool::new(cfg.ts_allow_self_signed, db.clone())
             .with_known_hosts(cfg.ssh_known_hosts_path.clone())
             .with_tofu(tofu_sink);
-        // PURA-123 — bots without an explicit `identityPath` get a file
-        // under `<config-dir>/music-bots/`. Default uses the system temp
-        // dir so unit tests don't collide on a shared on-disk file; the
-        // real binary swap-points to `~/.config/ts6-manager/music-bots`
-        // can land alongside the SurrealDB persistence ticket.
-        let music_bot_identity_dir: PathBuf = std::env::temp_dir().join("ts6-manager-music-bots");
+        // PURA-123 / PURA-357 — bots without an explicit `identityPath`
+        // get a file under `<DATA_DIR>/music-bot-identities/`. This MUST
+        // be a persistent location: a music bot's TS identity is the
+        // file at that path, so a rehydrated bot (PURA-357) only keeps
+        // its server-side identity — permissions, groups, ban history —
+        // if the file survives the restart. `DATA_DIR` is the operator-
+        // upload state root and is volume-backed in every production
+        // deploy shape (see `deploy/kube/ts6-manager.yaml`); the dev
+        // default `./data` is equally stable across `cargo run`s.
+        let music_bot_identity_dir: PathBuf = cfg.data_dir.join("music-bot-identities");
         let sidecar = cfg
             .sidecar_url
             .as_deref()

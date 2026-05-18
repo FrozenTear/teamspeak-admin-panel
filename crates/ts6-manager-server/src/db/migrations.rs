@@ -85,6 +85,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0017_moderation_appeal_action_kinds",
         include_str!("../../migrations/0017_moderation_appeal_action_kinds.surql"),
     ),
+    (
+        "0018_music_bot_runtime",
+        include_str!("../../migrations/0018_music_bot_runtime.surql"),
+    ),
 ];
 
 #[derive(Debug, Deserialize, SurrealValue)]

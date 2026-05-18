@@ -130,14 +130,36 @@ async fn create(
         ))
     };
 
+    // `auto_connect` is omittable on the wire; `BotConfig` defaults it
+    // to `true`, so an absent field resolves to the same value.
+    let auto_connect = req.auto_connect.unwrap_or(true);
+    let identity_path_str = identity_path.to_string_lossy().into_owned();
+
     let mut config = BotConfig::new(req.name.clone(), identity_path);
     config = config.with_server_addr(req.server_addr.clone());
-    if let Some(auto) = req.auto_connect {
-        config = config.with_auto_connect(auto);
-    }
+    config = config.with_auto_connect(auto_connect);
 
     let id = supervisor.spawn(config, state.yt_cookie.clone()).await;
     state.music_bots.watch(id).await;
+
+    // PURA-357 — persist the bot's runtime config so it survives a
+    // process restart / image upgrade (the `kube down` / `kube play`
+    // cycle a deploy performs). Best-effort: the bot is already live
+    // this session, so a DB hiccup must not fail the create — but it is
+    // logged at `warn` because the bot will not be rehydrated next boot.
+    if let Err(err) = crate::repos::music_bot_runtime::upsert(
+        &state.db,
+        id.0 as i64,
+        &req.name,
+        &req.server_addr,
+        &identity_path_str,
+        auto_connect,
+    )
+    .await
+    {
+        warn!(bot = %id, ?err, "failed to persist music-bot config — bot will not survive a restart");
+    }
+
     info!(bot = %id, name = %req.name, "music-bot created");
 
     let liveness = state.music_bots.liveness.snapshot(id).await;
@@ -179,6 +201,14 @@ async fn shutdown(
         .shutdown_bot(bot)
         .await
         .map_err(translate_send_error)?;
+
+    // PURA-357 — drop the persisted config so a deleted bot does not
+    // come back on the next boot. Best-effort: the bot is already torn
+    // down, so a DB error here is logged rather than surfaced.
+    if let Err(err) = crate::repos::music_bot_runtime::delete(&state.db, id as i64).await {
+        warn!(bot = %bot, ?err, "failed to remove persisted music-bot config");
+    }
+
     Ok(StatusCode::NO_CONTENT)
 }
 

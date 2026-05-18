@@ -199,6 +199,29 @@ impl BotSupervisor {
         id
     }
 
+    /// Spawn a bot under a caller-chosen `id` instead of a freshly-minted
+    /// one. Used by the manager's boot-time rehydration path (PURA-357):
+    /// persisted bots are re-spawned under their original ids so REST /
+    /// FE references survive a process restart or image upgrade.
+    ///
+    /// The monotonic id counter is bumped past `id` so a subsequent
+    /// [`spawn`](Self::spawn) cannot mint a colliding id, regardless of
+    /// the order rehydrated ids arrive in.
+    pub async fn spawn_with_id(
+        &self,
+        id: BotId,
+        config: BotConfig,
+        yt_cookie: Arc<RwLock<Option<PathBuf>>>,
+    ) -> BotId {
+        let name = config.name.clone();
+        let handle = spawn_bot(id, config, Arc::clone(&self.store), yt_cookie);
+        self.bots.lock().await.insert(id, handle);
+        // Keep the minted-id counter ahead of every rehydrated id.
+        self.next_id.fetch_max(id.0 + 1, Ordering::Relaxed);
+        info!(%id, %name, "rehydrated bot");
+        id
+    }
+
     /// Send a command to a tracked bot.
     pub async fn send(&self, id: BotId, cmd: BotCommand) -> Result<(), SendError> {
         let bots = self.bots.lock().await;
@@ -371,4 +394,43 @@ pub struct BotInfo {
     pub id: BotId,
     pub name: String,
     pub server_addr: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn idle_config(name: &str) -> BotConfig {
+        // `auto_connect = false` keeps the spawned actor in `Disconnected`
+        // so the test never touches the network.
+        BotConfig::new(name, std::env::temp_dir().join(format!("{name}.identity")))
+            .with_auto_connect(false)
+    }
+
+    /// PURA-357 — a rehydrated bot keeps its persisted id, and a bot
+    /// spawned afterwards must not collide with it even though the
+    /// rehydrated id is higher than the supervisor's fresh counter.
+    #[tokio::test]
+    async fn spawn_with_id_preserves_id_and_advances_the_counter() {
+        let sup = BotSupervisor::new();
+        let cookie = Arc::new(RwLock::new(None));
+
+        let rehydrated = sup
+            .spawn_with_id(BotId(5), idle_config("rehydrated"), Arc::clone(&cookie))
+            .await;
+        assert_eq!(rehydrated, BotId(5), "rehydration must keep the stored id");
+
+        // A fresh spawn must land past every rehydrated id, not at 1.
+        let fresh = sup.spawn(idle_config("fresh"), Arc::clone(&cookie)).await;
+        assert_eq!(fresh, BotId(6), "fresh spawn must not collide with id 5");
+
+        let ids: Vec<u64> = {
+            let mut v: Vec<u64> = sup.list().await.into_iter().map(|i| i.id.0).collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(ids, vec![5, 6]);
+
+        sup.shutdown_all().await;
+    }
 }

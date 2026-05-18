@@ -91,8 +91,8 @@ podman kube play /tmp/ts6-manager.kube.yaml
 
 | PVC | Path inside container | Purpose |
 |-----|-----------------------|---------|
-| `ts6-data` | `/var/lib/ts6-manager` | State root — persists `DATA_DIR` operator uploads (yt-dlp cookie file). `ts6-db` / `ts6-music` nest on top. |
-| `ts6-db` | `/var/lib/ts6-manager/db` | SurrealKV embedded store (DATABASE_URL) |
+| `ts6-data` | `/var/lib/ts6-manager` | State root — persists `DATA_DIR` operator uploads (yt-dlp cookie file) and music-bot TS identity files (PURA-357). `ts6-db` / `ts6-music` nest on top. |
+| `ts6-db` | `/var/lib/ts6-manager/db` | SurrealKV embedded store (DATABASE_URL). Holds all configured bots, flows, rules, users, widgets — losing this volume loses that state across an upgrade. |
 | `ts6-music` | `/var/lib/ts6-manager/music` | Music-bot library (MUSIC_DIR) |
 
 PVCs map to Podman named volumes. Rootless Podman owns the chown

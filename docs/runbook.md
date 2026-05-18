@@ -199,6 +199,30 @@ log path off the manager itself.
 
 ### 3.4 Image upgrade
 
+> **Persistence requirement (PURA-357).** An image upgrade *recreates the
+> container*. Everything an operator configures — TeamSpeak server
+> connections, music bots, automation flows and their automod rules,
+> users, widgets — lives in the SurrealDB store on the **`ts6-db`**
+> volume, and music-bot TS identity files live under `DATA_DIR` on the
+> **`ts6-data`** volume. Both volumes MUST survive the upgrade or that
+> state is lost. Concretely:
+>
+> - Never pass `--force` to `podman kube down` during a redeploy — it
+>   wipes the named volumes. Confirm with
+>   `podman volume ls --filter name=^ts6-` after `kube down` (see
+>   [`deploy/kube/README.md`](../deploy/kube/README.md#bring-down)).
+> - The manifest must keep `DATABASE_URL` pointed at a path on the
+>   `ts6-db` volume and `DATA_DIR` at a path on the `ts6-data` volume.
+>   The committed [`deploy/kube/ts6-manager.yaml`](../deploy/kube/ts6-manager.yaml)
+>   does this; a hand-edited manifest must not drop those env vars.
+> - Music bots are re-spawned at boot from the `music_bot_runtime` DB
+>   table (the supervisor itself is in-memory), so a bot only returns
+>   after an upgrade if the `ts6-db` volume persisted. An
+>   `autoConnect=false` bot is restored idle.
+>
+> If bots/flows/rules vanish after an upgrade, the `ts6-db` volume was
+> lost — restore it from a § 3.2 backup.
+
 The Quadlet and Kube manifests pin `ghcr.io/frozentear/ts6-manager-fullstack:v0.1.0-rc1`
 (release candidate; floats to `:v1.0.0` on the next signed cut). Two
 documented upgrade paths:
