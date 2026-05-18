@@ -61,6 +61,27 @@ pub async fn check_write(
     check_read(state, user, config_id).await
 }
 
+/// Admin-only write access — used by the PURA-373 moderation surfaces
+/// (server groups, channel groups, tokens, messages). Spec §7.9–7.16 mark
+/// every mutating row "Y+admin"; unlike [`check_write`] a moderator with a
+/// grant is **not** sufficient here. Reads on those surfaces still go
+/// through [`check_read`] (any operator with server access).
+///
+/// Resolves the row first so a non-admin poking a non-existent server
+/// still gets `404` rather than `403`, matching the rest of the §7.0.2
+/// surface.
+pub async fn check_admin(
+    state: &AppState,
+    user: &AuthUser,
+    config_id: i64,
+) -> Result<ServerConnection, Response> {
+    let connection = resolve_connection(state, config_id).await?;
+    if !user.is_admin() {
+        return Err(err(StatusCode::FORBIDDEN, "Insufficient permissions"));
+    }
+    Ok(connection)
+}
+
 async fn resolve_connection(
     state: &AppState,
     config_id: i64,
@@ -219,6 +240,30 @@ mod tests {
         let sid = seed_server(&state, "S").await;
         let resp = check_write(&state, &modr, sid).await.unwrap_err();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn check_admin_allows_admin_rejects_moderator() {
+        // PURA-373 — moderation writes are admin-only; a moderator with a
+        // grant (which `check_write` would accept) is rejected here.
+        let state = fresh_state().await;
+        let admin = seed_user(&state, "a", "admin").await;
+        let modr = seed_user(&state, "m", "moderator").await;
+        let sid = seed_server(&state, "S").await;
+        server_user_grants::insert(&state.db, modr.id, sid)
+            .await
+            .unwrap();
+        check_admin(&state, &admin, sid).await.unwrap();
+        let resp = check_admin(&state, &modr, sid).await.unwrap_err();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn check_admin_missing_server_yields_404_before_403() {
+        let state = fresh_state().await;
+        let modr = seed_user(&state, "m", "moderator").await;
+        let resp = check_admin(&state, &modr, 9999).await.unwrap_err();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

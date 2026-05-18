@@ -33,6 +33,11 @@ pub enum TopicKind {
     /// fan-out keyed on the same `serverConfigId` the rest of the
     /// operator topics use.
     VideoSources,
+    /// PURA-373 (PURA-369 moderation completion) — operator-facing live
+    /// fan-out for server-group / channel-group / token / message
+    /// mutations. Auth = JWT user; per-server keyed like the other
+    /// operator topics.
+    Moderation,
 }
 
 impl TopicKind {
@@ -43,6 +48,7 @@ impl TopicKind {
             TopicKind::Logs => "logs",
             TopicKind::Widget => "widget",
             TopicKind::VideoSources => "video_sources",
+            TopicKind::Moderation => "moderation",
         }
     }
 
@@ -51,7 +57,8 @@ impl TopicKind {
             TopicKind::Clients
             | TopicKind::Channels
             | TopicKind::Logs
-            | TopicKind::VideoSources => AuthRequirement::JwtUser,
+            | TopicKind::VideoSources
+            | TopicKind::Moderation => AuthRequirement::JwtUser,
             TopicKind::Widget => AuthRequirement::WidgetToken,
         }
     }
@@ -138,6 +145,7 @@ impl FromStr for Topic {
             "logs" => TopicKind::Logs,
             "widget" => TopicKind::Widget,
             "video_sources" => TopicKind::VideoSources,
+            "moderation" => TopicKind::Moderation,
             _ => return Err(TopicParseError::UnknownKind),
         };
         Ok(Topic { server_id, kind })
@@ -156,6 +164,7 @@ mod tests {
             TopicKind::Logs,
             TopicKind::Widget,
             TopicKind::VideoSources,
+            TopicKind::Moderation,
         ] {
             let t = Topic::new(7, kind);
             let s = t.to_string();
