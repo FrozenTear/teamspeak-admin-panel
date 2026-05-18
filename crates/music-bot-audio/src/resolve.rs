@@ -194,7 +194,9 @@ mod tests {
         assert!(!stderr_is_transient(
             "ERROR: [youtube] x: Private video. Sign in if you've been granted access"
         ));
-        assert!(!stderr_is_transient("ERROR: [youtube] x: Video unavailable"));
+        assert!(!stderr_is_transient(
+            "ERROR: [youtube] x: Video unavailable"
+        ));
         assert!(!stderr_is_transient(
             "ERROR: Unsupported URL: https://example.com/not-a-video"
         ));
