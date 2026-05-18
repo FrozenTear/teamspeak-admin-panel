@@ -87,6 +87,12 @@ pub struct LivenessTracker {
 pub struct BotLiveness {
     pub state: BotState,
     pub now_playing: Option<Track>,
+    /// PURA-347 — elapsed playback position of `now_playing`, in whole
+    /// seconds. Mirrored from `BotEvent::Progress` (the truthful play
+    /// clock); reset to `Some(0)` on a fresh `NowPlaying` and cleared to
+    /// `None` whenever playback stops. `None` while no track is playing
+    /// or before the first one-second tick.
+    pub now_playing_elapsed_secs: Option<u64>,
     pub channel_id: Option<ChannelId>,
     /// PURA-261 — cause of the most recent playback failure, if the bot
     /// is not currently playing a track. Set when an audio pipeline ends
@@ -102,6 +108,7 @@ impl Default for BotLiveness {
         Self {
             state: BotState::Disconnected,
             now_playing: None,
+            now_playing_elapsed_secs: None,
             channel_id: None,
             last_error: None,
         }
@@ -127,6 +134,7 @@ impl LivenessTracker {
                 if matches!(to, BotState::Disconnected | BotState::Disconnecting) {
                     entry.channel_id = None;
                     entry.now_playing = None;
+                    entry.now_playing_elapsed_secs = None;
                     entry.last_error = None;
                 }
             }
@@ -139,6 +147,7 @@ impl LivenessTracker {
             BotEvent::Disconnected { .. } => {
                 entry.channel_id = None;
                 entry.now_playing = None;
+                entry.now_playing_elapsed_secs = None;
                 entry.last_error = None;
             }
             BotEvent::JoinedChannel { channel_id } => {
@@ -149,14 +158,32 @@ impl LivenessTracker {
             }
             BotEvent::NowPlaying(track) => {
                 entry.now_playing = Some(track.clone());
+                // PURA-347 — a fresh track restarts the play clock at 0.
+                // `BotEvent::Progress` ticks bump it once per second.
+                entry.now_playing_elapsed_secs = Some(0);
                 // A fresh track supersedes any prior failure.
                 entry.last_error = None;
             }
+            // PURA-347 — playback-progress tick. Only meaningful while a
+            // track is playing; the surrounding `NowPlaying` /
+            // `AudioFinished` events bracket it, so a stray tick after a
+            // finish is harmless (the next finish clears it again).
+            BotEvent::Progress { elapsed_secs } => {
+                if entry.now_playing.is_some() {
+                    entry.now_playing_elapsed_secs = Some(*elapsed_secs);
+                }
+            }
             BotEvent::QueueEmpty => {
                 entry.now_playing = None;
+                entry.now_playing_elapsed_secs = None;
             }
             BotEvent::QueueChanged { current, .. } => {
                 entry.now_playing = current.clone();
+                // Drop a stale elapsed when the queue head clears; a new
+                // head's clock resets when its `NowPlaying` fires.
+                if current.is_none() {
+                    entry.now_playing_elapsed_secs = None;
+                }
             }
             // PURA-261 — an audio pipeline ended. Clear `now_playing`
             // so the route layer stops synthesising `Playing`; any
@@ -166,6 +193,7 @@ impl LivenessTracker {
             // cause as `last_error`; a clean finish clears it.
             BotEvent::AudioFinished { reason } => {
                 entry.now_playing = None;
+                entry.now_playing_elapsed_secs = None;
                 entry.last_error = reason
                     .strip_prefix("failed: ")
                     .map(|cause| cause.to_string());
@@ -351,5 +379,57 @@ mod tests {
         let snap = tracker.snapshot(bot).await;
         assert!(snap.now_playing.is_some());
         assert!(snap.last_error.is_none());
+    }
+
+    /// PURA-347 — a fresh `NowPlaying` anchors the play clock at 0,
+    /// `Progress` ticks bump it, and a finish clears it back to `None`.
+    #[tokio::test]
+    async fn progress_ticks_track_elapsed_and_clear_on_finish() {
+        let tracker = LivenessTracker::default();
+        let bot = BotId(4);
+
+        tracker
+            .record_event(bot, &BotEvent::NowPlaying(track("a song")))
+            .await;
+        assert_eq!(
+            tracker.snapshot(bot).await.now_playing_elapsed_secs,
+            Some(0),
+            "a fresh track starts the elapsed clock at 0",
+        );
+
+        tracker
+            .record_event(bot, &BotEvent::Progress { elapsed_secs: 7 })
+            .await;
+        assert_eq!(
+            tracker.snapshot(bot).await.now_playing_elapsed_secs,
+            Some(7),
+        );
+
+        tracker
+            .record_event(
+                bot,
+                &BotEvent::AudioFinished {
+                    reason: "end_of_stream".into(),
+                },
+            )
+            .await;
+        assert_eq!(
+            tracker.snapshot(bot).await.now_playing_elapsed_secs,
+            None,
+            "elapsed clears when playback stops",
+        );
+    }
+
+    /// A `Progress` tick with nothing playing is ignored — it cannot
+    /// resurrect a stale elapsed after a finish.
+    #[tokio::test]
+    async fn progress_without_now_playing_is_ignored() {
+        let tracker = LivenessTracker::default();
+        let bot = BotId(5);
+
+        tracker
+            .record_event(bot, &BotEvent::Progress { elapsed_secs: 3 })
+            .await;
+        assert_eq!(tracker.snapshot(bot).await.now_playing_elapsed_secs, None);
     }
 }

@@ -133,6 +133,14 @@ pub struct MusicBotSummary {
     /// `MusicBotStore::queue_current` when the bot is `Playing` /
     /// `Connected`; `None` when the queue is empty.
     pub now_playing: Option<Track>,
+    /// PURA-347 — elapsed playback position of `now_playing`, in whole
+    /// seconds. Truthful play clock (frames sent on the wire — stalls
+    /// across a pause, never drifts), refreshed by `BotEvent::Progress`.
+    /// `None` when nothing is playing or before the first one-second
+    /// tick; the FE renders a left-anchored progress bar from it against
+    /// `now_playing.durationSecs`. Additive — old clients ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub now_playing_elapsed_secs: Option<u64>,
     /// PURA-261 — cause of the most recent playback failure, when the
     /// bot is *not* currently playing. Populated when an audio pipeline
     /// ended without producing audio (bad URL, bot-gated video, codec
@@ -154,6 +162,10 @@ pub struct MusicBotDetail {
     pub server_addr: String,
     pub state: BotState,
     pub now_playing: Option<Track>,
+    /// PURA-347 — elapsed playback position of `now_playing`, in whole
+    /// seconds. See [`MusicBotSummary::now_playing_elapsed_secs`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub now_playing_elapsed_secs: Option<u64>,
     pub queue: Vec<Track>,
     /// Channel the bot is currently in. `None` when `state` is
     /// `Disconnected` / `Connecting` / `Disconnecting`.
@@ -404,6 +416,16 @@ pub enum BotEventWire {
     AudioFinished {
         reason: String,
     },
+    /// PURA-347 — coarse playback-progress tick, emitted roughly once per
+    /// second while a track plays. `elapsed_secs` is the truthful play
+    /// clock (frames sent on the wire, not wall time — it stalls across a
+    /// pause and never drifts). The FE reduces these into the now-playing
+    /// progress bar; a fresh `NowPlaying` restarts the clock from 0. The
+    /// field stays snake_case to match the other `BotEventWire` variants
+    /// (`Connected`, `JoinedChannel`).
+    Progress {
+        elapsed_secs: u64,
+    },
     PlaylistChanged {
         name: String,
     },
@@ -564,5 +586,49 @@ mod tests {
         assert!(json.contains(r#""type":"stateChanged""#), "got: {json}");
         assert!(json.contains(r#""from":"disconnected""#));
         assert!(json.contains(r#""to":"connecting""#));
+    }
+
+    #[test]
+    fn progress_event_carries_elapsed_secs() {
+        // `BotEventWire`'s enum-level `rename_all` camelCases the variant
+        // *tag* (`"progress"`), not struct-variant fields — so `Progress`
+        // keeps the snake_case `elapsed_secs` field, matching the
+        // existing `Connected { client_id, default_channel }` shape.
+        let ev = BotEventWire::Progress { elapsed_secs: 42 };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains(r#""type":"progress""#), "got: {json}");
+        assert!(json.contains(r#""elapsed_secs":42"#), "got: {json}");
+        let back: BotEventWire = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, BotEventWire::Progress { elapsed_secs: 42 }));
+    }
+
+    #[test]
+    fn music_bot_detail_now_playing_elapsed_is_camel_case_and_optional() {
+        // Omitted when `None` — additive, old clients see no new key.
+        let detail = MusicBotDetail {
+            id: BotId(1),
+            name: "DJ".into(),
+            server_addr: "127.0.0.1:9987".into(),
+            state: BotState::InChannel,
+            now_playing: None,
+            now_playing_elapsed_secs: None,
+            queue: Vec::new(),
+            channel_id: None,
+            last_error: None,
+        };
+        let json = serde_json::to_string(&detail).unwrap();
+        assert!(!json.contains("nowPlayingElapsedSecs"), "got: {json}");
+
+        let detail = MusicBotDetail {
+            now_playing_elapsed_secs: Some(12),
+            ..detail
+        };
+        let json = serde_json::to_string(&detail).unwrap();
+        assert!(
+            json.contains(r#""nowPlayingElapsedSecs":12"#),
+            "got: {json}"
+        );
+        let back: MusicBotDetail = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, detail);
     }
 }

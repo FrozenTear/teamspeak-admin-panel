@@ -296,14 +296,20 @@ fn PlayerCard(bot_id: u64, detail: Signal<Option<wire::MusicBotDetail>>) -> Elem
     };
     let playing = matches!(d.state, wire::BotState::Playing);
     let eq_class = if playing { "np-eq is-playing" } else { "np-eq" };
+    // PURA-349 — whole-percent fill for the now-playing progress bar.
+    // `None` when the play clock or duration is unknown; in that case
+    // the equalizer is shown instead of a bar that can't be filled.
+    let progress_pct = track_progress(&d).map(|ratio| (ratio * 100.0).round() as u32);
 
     rsx! {
         div { class: "card player-card",
             div { class: "np-eyebrow", "Now playing" }
             if let Some(track) = d.now_playing.as_ref() {
                 div { class: "now-playing",
-                    span { class: eq_class, aria_hidden: "true",
-                        span {} span {} span {}
+                    if progress_pct.is_none() {
+                        span { class: eq_class, aria_hidden: "true",
+                            span {} span {} span {}
+                        }
                     }
                     div { class: "np-body",
                         div {
@@ -325,6 +331,24 @@ fn PlayerCard(bot_id: u64, detail: Signal<Option<wire::MusicBotDetail>>) -> Elem
                             span { "{d.name}" }
                         }
                         div { class: "np-duration", "{format_duration(track.duration_secs)}" }
+                        // PURA-349 — left-anchored playback progress.
+                        // Advances only on a ~1 Hz `Progress` SSE tick
+                        // (no client-side timer); falls back to the
+                        // equalizer above when it can't be filled.
+                        if let Some(pct) = progress_pct {
+                            div {
+                                class: "np-progress",
+                                role: "progressbar",
+                                "aria-label": "Playback progress",
+                                "aria-valuemin": "0",
+                                "aria-valuemax": "100",
+                                "aria-valuenow": "{pct}",
+                                div {
+                                    class: "np-progress__fill",
+                                    style: "width: {pct}%;",
+                                }
+                            }
+                        }
                     }
                 }
             } else {
@@ -350,6 +374,20 @@ fn PlayerCard(bot_id: u64, detail: Signal<Option<wire::MusicBotDetail>>) -> Elem
             PlayerControls { bot_id, detail }
         }
     }
+}
+
+/// PURA-349 — fill ratio (`0.0..=1.0`) for the now-playing progress
+/// bar. Returns `None` when either the play clock or the track duration
+/// is unknown (ICY radio streams, id=0 tracks, or a zero-length
+/// duration): the caller renders the 3-bar equalizer instead, rather
+/// than a bar it can't fill truthfully.
+fn track_progress(d: &wire::MusicBotDetail) -> Option<f64> {
+    let duration = d.now_playing.as_ref()?.duration_secs?;
+    if duration == 0 {
+        return None;
+    }
+    let elapsed = d.now_playing_elapsed_secs?;
+    Some((elapsed as f64 / duration as f64).clamp(0.0, 1.0))
 }
 
 /// One stateful Play/Pause control + Prev/Skip/Stop. Per PURA-343 §5:
@@ -998,6 +1036,7 @@ fn apply_event(d: &mut wire::MusicBotDetail, ev: &wire::BotEventWire) {
             ) {
                 d.channel_id = None;
                 d.now_playing = None;
+                d.now_playing_elapsed_secs = None;
                 d.last_error = None;
             }
         }
@@ -1010,6 +1049,7 @@ fn apply_event(d: &mut wire::MusicBotDetail, ev: &wire::BotEventWire) {
         wire::BotEventWire::Disconnected { .. } => {
             d.channel_id = None;
             d.now_playing = None;
+            d.now_playing_elapsed_secs = None;
             d.last_error = None;
         }
         wire::BotEventWire::JoinedChannel { channel_id } => {
@@ -1024,17 +1064,32 @@ fn apply_event(d: &mut wire::MusicBotDetail, ev: &wire::BotEventWire) {
             // `QueueChanged` right after `NowPlaying`, but applying it
             // optimistically here lets the row light up instantly.
             d.state = wire::BotState::Playing;
+            // PURA-347 — a fresh track restarts the play clock at 0;
+            // `Progress` ticks bump it once per second.
+            d.now_playing_elapsed_secs = Some(0);
             // A fresh track supersedes any prior failure (PURA-261).
             d.last_error = None;
         }
+        // PURA-347 — playback-progress tick. Advance the elapsed clock
+        // only while a track is playing so a stray tick can't resurrect
+        // a stale value after a finish.
+        wire::BotEventWire::Progress { elapsed_secs } => {
+            if d.now_playing.is_some() {
+                d.now_playing_elapsed_secs = Some(*elapsed_secs);
+            }
+        }
         wire::BotEventWire::QueueEmpty => {
             d.now_playing = None;
+            d.now_playing_elapsed_secs = None;
             d.queue.clear();
             // The lifecycle FSM doesn't carry "Playing" — collapse back
             // to a connected/in_channel state via the next StateChanged.
         }
         wire::BotEventWire::QueueChanged { current, .. } => {
             d.now_playing = current.clone();
+            if current.is_none() {
+                d.now_playing_elapsed_secs = None;
+            }
         }
         // PURA-261 — audio pipeline drained. Clear `now_playing` so the
         // live view stops showing `Playing`; an auto-advance `NowPlaying`
@@ -1045,6 +1100,7 @@ fn apply_event(d: &mut wire::MusicBotDetail, ev: &wire::BotEventWire) {
         // fires no `StateChanged`, so nothing else would).
         wire::BotEventWire::AudioFinished { reason } => {
             d.now_playing = None;
+            d.now_playing_elapsed_secs = None;
             match reason.strip_prefix("failed: ") {
                 Some(cause) => {
                     d.last_error = Some(cause.to_string());
@@ -1072,6 +1128,7 @@ mod tests {
             server_addr: "127.0.0.1:9987".into(),
             state,
             now_playing: None,
+            now_playing_elapsed_secs: None,
             queue: Vec::new(),
             channel_id: None,
             last_error: None,
@@ -1285,5 +1342,59 @@ mod tests {
         // wrapping — the disabled button shouldn't fire, but guard anyway.
         let out = reorder_swap(&q, 0, usize::MAX);
         assert_eq!(out, q);
+    }
+
+    #[test]
+    fn track_progress_is_elapsed_over_duration() {
+        let mut d = fixture(wire::BotState::Playing);
+        d.now_playing = Some(track(7, "Song")); // duration_secs: Some(180)
+        d.now_playing_elapsed_secs = Some(90);
+        assert_eq!(track_progress(&d), Some(0.5));
+    }
+
+    #[test]
+    fn track_progress_clamps_overrun_to_one() {
+        // A `Progress` tick can land past the reported duration (the
+        // duration is an estimate); the fill must not overflow its track.
+        let mut d = fixture(wire::BotState::Playing);
+        d.now_playing = Some(track(7, "Song"));
+        d.now_playing_elapsed_secs = Some(900);
+        assert_eq!(track_progress(&d), Some(1.0));
+    }
+
+    #[test]
+    fn track_progress_none_without_duration() {
+        // ICY radio / id=0 tracks carry no duration — the caller falls
+        // back to the equalizer rather than a bar it can't fill.
+        let mut d = fixture(wire::BotState::Playing);
+        let mut t = track(0, "Live radio");
+        t.duration_secs = None;
+        d.now_playing = Some(t);
+        d.now_playing_elapsed_secs = Some(42);
+        assert_eq!(track_progress(&d), None);
+    }
+
+    #[test]
+    fn track_progress_none_without_play_clock() {
+        let mut d = fixture(wire::BotState::Playing);
+        d.now_playing = Some(track(7, "Song"));
+        d.now_playing_elapsed_secs = None;
+        assert_eq!(track_progress(&d), None);
+    }
+
+    #[test]
+    fn track_progress_none_for_zero_duration() {
+        let mut d = fixture(wire::BotState::Playing);
+        let mut t = track(7, "Song");
+        t.duration_secs = Some(0);
+        d.now_playing = Some(t);
+        d.now_playing_elapsed_secs = Some(0);
+        assert_eq!(track_progress(&d), None);
+    }
+
+    #[test]
+    fn track_progress_none_without_now_playing() {
+        let d = fixture(wire::BotState::InChannel);
+        assert_eq!(track_progress(&d), None);
     }
 }
