@@ -22,8 +22,8 @@ the web UI.
 
 | Command            | Effect                                              | Today's behaviour                                                                                                |
 | ------------------ | --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| `!radio <name|url>`| Replace queue with a radio source; auto-play         | Clears queue, enqueues (URL or library lookup by title), emits `QueueChanged` + `NowPlaying`. Replies `radio: …` |
-| `!play <url|search>` | Enqueue + start if idle                            | Enqueues (URL or library lookup); search → library lookup. Empty queue → `NowPlaying`. Replies `playing:` / `queued:` |
+| `!radio <name|url|yt:…>`| Replace queue with a radio source; auto-play     | Clears queue, enqueues (URL, `yt:` search, or library lookup by title), emits `QueueChanged` + `NowPlaying`. Replies `radio: …` |
+| `!play <url|yt:…|name>` | Enqueue + start if idle                           | Enqueues (URL, `yt:` YouTube search, or library lookup). Empty queue → `NowPlaying`. Replies `playing:` / `queued:` |
 | `!stop`            | Stop playback, clear queue                          | Tears down the live pipeline + clears queue + `QueueEmpty`. Replies `stopped`                                    |
 | `!pause`           | Pause current track                                 | Parks the live pipeline (sibling stops sending frames; pipeline stays spawned). Replies `paused`                 |
 | `!resume` / `!unpause` | Resume a paused track                           | Un-parks the live pipeline. Replies `resumed`                                                                    |
@@ -34,14 +34,19 @@ the web UI.
 
 ### Source resolution
 
-`!radio` and `!play` accept either:
+`!radio` and `!play` accept one of:
 
 - a URL — anything starting with `http://` or `https://` (case-insensitive)
   is enqueued as `AudioSource::Url(...)` verbatim;
+- a YouTube search — `yt:` or `youtube:` followed by free-text (e.g.
+  `!play yt: red leather last call`). The query is wrapped as
+  `ytsearch1:<query>`, which yt-dlp resolves to the top YouTube hit and
+  streams through the normal URL path — no link needed (PURA-353). An
+  empty query (`yt:` with nothing after it) gets a single error reply;
 - a name — looked up against the bot's library (`MusicBotStore::library_list`)
-  by exact case-insensitive title match. No fuzzy / prefix search yet —
-  full search lands with the WS-2 source pipeline. If no entry matches,
-  the bot replies `no library entry titled `<arg>``.
+  by exact case-insensitive title match. No fuzzy / prefix search on the
+  library yet. If no entry matches, the bot replies
+  `no library entry titled `<arg>``.
 
 ## Parser tolerances
 

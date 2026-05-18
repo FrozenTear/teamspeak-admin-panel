@@ -427,8 +427,12 @@ async fn handle_np(bot_id: BotId, store: &Arc<dyn MusicBotStore>) -> String {
     }
 }
 
-/// Turn an arg into a `NewTrack` — URL passes through, anything else is
-/// looked up against the bot's library by title (case-insensitive).
+/// Turn an arg into a `NewTrack`. Resolution order:
+///  1. A bare `http(s)://` link passes straight through to yt-dlp.
+///  2. A `yt:`/`youtube:` prefix is a YouTube search — the rest of the arg
+///     is the query, resolved via yt-dlp's `ytsearch1:` (PURA-353).
+///  3. Anything else is looked up against the bot's library by exact
+///     title (case-insensitive).
 async fn resolve_source(
     bot_id: BotId,
     store: &Arc<dyn MusicBotStore>,
@@ -443,6 +447,24 @@ async fn resolve_source(
                 requested_by: None,
             },
             arg.to_string(),
+        ))
+    } else if let Some(query) = parse_yt_search(arg) {
+        if query.is_empty() {
+            return Err(
+                "what should I search YouTube for? e.g. !play yt: artist - song".to_string(),
+            );
+        }
+        // yt-dlp treats `ytsearch1:<query>` as a one-result YouTube search
+        // and streams the top hit, so it flows through the same URL path
+        // as a real link — no pipeline change needed.
+        Ok((
+            NewTrack {
+                source: AudioSource::Url(format!("ytsearch1:{query}")),
+                title: query.to_string(),
+                duration_secs: None,
+                requested_by: None,
+            },
+            format!("youtube search: {query}"),
         ))
     } else {
         match store.library_list(bot_id, None).await {
@@ -483,6 +505,16 @@ async fn resolve_source(
 fn is_url(s: &str) -> bool {
     let lc = s.to_ascii_lowercase();
     lc.starts_with("http://") || lc.starts_with("https://")
+}
+
+/// Detect a `yt:` / `youtube:` search prefix and return the trimmed query
+/// after it. Returns `None` when the arg carries no such prefix (PURA-353).
+fn parse_yt_search(arg: &str) -> Option<&str> {
+    let lc = arg.to_ascii_lowercase();
+    ["yt:", "youtube:"]
+        .into_iter()
+        .find(|p| lc.starts_with(p))
+        .map(|p| arg[p.len()..].trim())
 }
 
 /// Best-effort send a chat reply to the bot's current channel. We don't
@@ -609,6 +641,18 @@ mod parser_tests {
         assert_eq!(parse("!foo"), Err(ParseError::Unknown));
         assert_eq!(parse("!playlist add"), Err(ParseError::Unknown));
     }
+
+    /// PURA-353 — the `yt:` / `youtube:` prefix is detected case-insensitively
+    /// and the query is trimmed; anything else carries no prefix.
+    #[test]
+    fn yt_search_prefix_detection() {
+        assert_eq!(parse_yt_search("yt: red leather"), Some("red leather"));
+        assert_eq!(parse_yt_search("YT:red leather"), Some("red leather"));
+        assert_eq!(parse_yt_search("youtube:  spaced  "), Some("spaced"));
+        assert_eq!(parse_yt_search("yt:"), Some(""));
+        assert_eq!(parse_yt_search("https://x/y.mp3"), None);
+        assert_eq!(parse_yt_search("some library title"), None);
+    }
 }
 
 /// PURA-340 — dispatch-level tests for the audio-action hand-off. These
@@ -720,6 +764,42 @@ mod dispatch_tests {
             let (_reply, action) = run(&store, cmd).await;
             assert_eq!(action, ChatAudioAction::None);
         }
+    }
+
+    /// PURA-353 — `!play yt: <query>` searches YouTube instead of needing
+    /// a link. The query is wrapped as `ytsearch1:<query>`, which yt-dlp
+    /// resolves to the top hit and streams through the normal URL path.
+    #[tokio::test]
+    async fn play_yt_search_enqueues_ytsearch_source() {
+        let store = store();
+        let (reply, action) = run(
+            &store,
+            ParsedCommand::Play {
+                arg: "yt: red leather last call".into(),
+            },
+        )
+        .await;
+        assert!(reply.starts_with("playing:"), "reply was {reply:?}");
+        assert!(
+            reply.contains("youtube search: red leather last call"),
+            "reply was {reply:?}",
+        );
+        assert_eq!(action, ChatAudioAction::StartIfIdle);
+        let queue = store.queue_peek(BotId(1)).await.unwrap();
+        assert_eq!(
+            queue.first().map(|t| &t.source),
+            Some(&AudioSource::Url("ytsearch1:red leather last call".into())),
+        );
+    }
+
+    /// PURA-353 — a `yt:` prefix with no query is a user-visible error,
+    /// not an empty search.
+    #[tokio::test]
+    async fn play_yt_search_without_query_is_rejected() {
+        let store = store();
+        let (reply, action) = run(&store, ParsedCommand::Play { arg: "yt:".into() }).await;
+        assert!(reply.contains("search YouTube for"), "reply was {reply:?}");
+        assert_eq!(action, ChatAudioAction::None);
     }
 
     /// PURA-353 — `!pause` / `!resume` must hand the connected loop a
