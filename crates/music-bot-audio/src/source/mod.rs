@@ -47,6 +47,12 @@ pub enum AudioSourceSpec {
     /// passed as `-i <path>`; works for local files, HTTP URLs that ffmpeg
     /// understands, etc. No yt-dlp involvement.
     Ffmpeg { input: String },
+    /// PURA-352 — decode via `ffmpeg` directly, starting `start_secs` into
+    /// the input (`ffmpeg -ss`). The right shape for a seek: `input` is a
+    /// local file path or an already-resolved direct media URL (see
+    /// [`crate::resolve`]), so the decoder re-spawns at the offset without
+    /// re-running yt-dlp resolution.
+    FfmpegAt { input: String, start_secs: u64 },
     /// `yt-dlp -f bestaudio -o - <url>` piped into ffmpeg. The right shape
     /// for YouTube / SoundCloud / arbitrary "play this URL" inputs.
     YtDlp { url: String },

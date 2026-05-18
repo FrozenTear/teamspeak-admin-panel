@@ -341,6 +341,15 @@ pub async fn set_volume(
     api::authorized_post_json::<_, ()>(&gate, &api::api_base(), &path, Some(&body)).await
 }
 
+/// PURA-352 — scrub the current track to `secs` seconds from its start.
+/// Fire-and-forget: the audible jump + the reset progress clock arrive
+/// via the SSE `Progress` event.
+pub async fn seek(gate: Arc<RefreshGate>, bot: wire::BotId, secs: u64) -> Result<(), ApiError> {
+    let path = format!("/api/music-bots/{}/seek", bot.0);
+    let body = wire::SeekRequest { secs };
+    api::authorized_post_json::<_, ()>(&gate, &api::api_base(), &path, Some(&body)).await
+}
+
 // ---- Direct queue mutation (PURA-126 WS-6 follow-up) --------------------
 //
 // `enqueue_track` / `clear_queue` / `remove_queue_track` / `advance_queue`

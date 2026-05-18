@@ -251,9 +251,17 @@ async fn build_source(
             duration_ms,
         ))),
         AudioSourceSpec::Ffmpeg { input } => {
-            let src = FfmpegSource::from_input(&input, cfg.channels)
+            let src = FfmpegSource::from_input(&input, cfg.channels, None)
                 .await
                 .map_err(|e| PipelineError::Source(format!("ffmpeg spawn: {e}")))?;
+            Ok(Box::new(src))
+        }
+        // PURA-352 — seek: decode directly from the (already-resolved)
+        // input at an offset. No yt-dlp resolution.
+        AudioSourceSpec::FfmpegAt { input, start_secs } => {
+            let src = FfmpegSource::from_input(&input, cfg.channels, Some(start_secs))
+                .await
+                .map_err(|e| PipelineError::Source(format!("ffmpeg seek spawn: {e}")))?;
             Ok(Box::new(src))
         }
         AudioSourceSpec::YtDlp { url } => {

@@ -192,6 +192,48 @@ async fn ffmpeg_subprocess_cleanup_on_cancel() {
     );
 }
 
+/// PURA-352 — `FfmpegAt { start_secs }` must reach ffmpeg as `-ss`, so a
+/// seek decodes the input *from the offset* rather than from zero. The
+/// fixture is exactly 1 s (50 frames): a seek to 0 yields the whole
+/// fixture, a seek to 1 s lands at/after EOF and yields (near) nothing.
+#[tokio::test]
+#[ignore = "shells out to ffmpeg; run with `--ignored`"]
+async fn ffmpeg_at_seeks_input_to_offset() {
+    if !ffmpeg_available() {
+        panic!("ffmpeg not on PATH");
+    }
+
+    async fn frame_count(start_secs: u64) -> usize {
+        let mut pipeline = AudioPipeline::spawn(
+            AudioSourceSpec::FfmpegAt {
+                input: FIXTURE_PATH.to_string(),
+                start_secs,
+            },
+            PipelineConfig::default(),
+        )
+        .await
+        .expect("spawn FfmpegAt");
+        let mut frames = pipeline.take_frames();
+        let mut n = 0usize;
+        while frames.recv().await.is_some() {
+            n += 1;
+        }
+        n
+    }
+
+    let from_zero = frame_count(0).await;
+    let from_end = frame_count(1).await;
+    assert_eq!(
+        from_zero, EXPECTED_FRAMES,
+        "seek to 0 s should decode the whole 1 s fixture",
+    );
+    assert!(
+        from_end < EXPECTED_FRAMES / 2,
+        "seek to 1 s should land at/after EOF — got {from_end} frames, \
+         expected near zero ({EXPECTED_FRAMES} is the full fixture)",
+    );
+}
+
 fn pgrep_fixture() -> Vec<u32> {
     let out = Command::new("pgrep")
         .arg("-f")

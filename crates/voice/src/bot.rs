@@ -441,9 +441,15 @@ async fn handle_audio_msg(
                 // delivered, so the elapsed clock stalls across a `Pause`
                 // and never drifts. The FE reduces these into the
                 // now-playing progress bar.
+                //
+                // PURA-352 — after a seek the pipeline restarts with
+                // `frames_sent` back at 0, so the reported elapsed clock
+                // is offset by `seek_base_secs` (the position the seek
+                // jumped to).
                 if active.frames_sent % FRAMES_PER_PROGRESS_TICK == 0 {
                     let _ = events.send(BotEvent::Progress {
-                        elapsed_secs: active.frames_sent / FRAMES_PER_PROGRESS_TICK,
+                        elapsed_secs: active.seek_base_secs
+                            + active.frames_sent / FRAMES_PER_PROGRESS_TICK,
                     });
                 }
             }
@@ -616,6 +622,33 @@ async fn handle_audio_command(
             });
             handle_queue_command(bot_id, store, QueueCommand::Advance, events).await;
             auto_start_pending_track(current_audio, store, bot_id, events, yt_cookie).await;
+        }
+        AudioCommand::Seek { secs } => {
+            // PURA-352 — re-spawn the decoder for the current track at the
+            // offset, reusing the resolved stream URL (no yt-dlp re-run).
+            match audio::seek_to(current_audio, secs).await {
+                Ok(true) => {
+                    info!(secs, "AudioCommand::Seek — re-spawned pipeline at offset");
+                    // Flush the wire so the TS jitter buffer drops the gap
+                    // between the old and the post-seek frames cleanly.
+                    audio::send_voice_stop(con);
+                    // Snap the FE progress clock to the seek target now —
+                    // the next `Progress` tick (offset + frames/50) only
+                    // lands a second into the post-seek pre-buffer.
+                    let _ = events.send(BotEvent::Progress { elapsed_secs: secs });
+                }
+                Ok(false) => {
+                    debug!(
+                        secs,
+                        "Seek ignored — no active pipeline or track not yet seekable"
+                    );
+                }
+                Err(err) => {
+                    warn!(?err, "seek pipeline respawn failed");
+                    let _ =
+                        events.send(BotEvent::Error(BotError::Internal(format!("seek: {err}"))));
+                }
+            }
         }
         // SkipPrev / SetVolume / NowPlaying don't have pipeline support
         // yet — leave them on the stub path so REST/UI subscribers see

@@ -30,6 +30,7 @@ pub(super) fn router() -> Router<AppState> {
         .route("/api/music-bots/{id}/skip-next", post(skip_next))
         .route("/api/music-bots/{id}/skip-prev", post(skip_prev))
         .route("/api/music-bots/{id}/volume", post(volume))
+        .route("/api/music-bots/{id}/seek", post(seek))
 }
 
 async fn play(
@@ -119,6 +120,18 @@ async fn volume(
     Json(req): Json<wire::SetVolumeRequest>,
 ) -> Result<StatusCode, Response> {
     dispatch_audio(state, id, AudioCommand::SetVolume(req.gain)).await
+}
+
+/// PURA-352 — scrub the current track to a position. Lowers to
+/// `AudioCommand::Seek`; the bot re-spawns the decoder at the offset
+/// reusing the already-resolved stream URL (no yt-dlp re-resolution).
+async fn seek(
+    State(state): State<AppState>,
+    RequireAuth(_user): RequireAuth,
+    Path(id): Path<u64>,
+    Json(req): Json<wire::SeekRequest>,
+) -> Result<StatusCode, Response> {
+    dispatch_audio(state, id, AudioCommand::Seek { secs: req.secs }).await
 }
 
 async fn dispatch_audio(

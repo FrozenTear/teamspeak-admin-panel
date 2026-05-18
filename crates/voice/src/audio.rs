@@ -20,7 +20,8 @@
 //!    worker — clean teardown on `Stop` / `SkipNext` / `Play(replace)`.
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
@@ -81,6 +82,25 @@ pub(crate) struct ActiveAudio {
     /// failure reason when the pipeline produces 0 frames, instead of the
     /// generic "check yt-dlp/ffmpeg logs".
     pub last_diagnostic: Option<String>,
+    /// PURA-352 — playback offset this pipeline was (re)started at, in
+    /// whole seconds. The connected loop reports elapsed playback as
+    /// `seek_base_secs + frames_sent / FRAMES_PER_PROGRESS_TICK`, so the
+    /// FE progress clock stays correct after a seek. Zero for a normal
+    /// start-at-zero play.
+    pub seek_base_secs: u64,
+    /// PURA-352 — the ffmpeg input a [`seek_to`] respawn decodes from,
+    /// without re-running yt-dlp resolution. `Some` once known:
+    /// immediately for a library file, or after the background
+    /// `yt-dlp -g` resolve completes for a URL source. `None` while a URL
+    /// is still resolving (or never, for synthetic / unseekable sources)
+    /// — in which case a seek is a graceful no-op. Shared with the
+    /// background resolve task, hence `Arc<Mutex<_>>`.
+    pub seek_input: Arc<Mutex<Option<String>>>,
+    /// PURA-352 — the background `yt-dlp -g` resolve task, kept so `Drop`
+    /// aborts it if the track is torn down before resolution finishes.
+    /// `None` for sources that need no resolve (library / synthetic) and
+    /// for a [`seek_to`] respawn (the input is already resolved).
+    _resolve: Option<JoinHandle<()>>,
     /// Kept so `Drop` aborts the sibling on teardown. The sibling owns
     /// the [`AudioPipeline`] (whose own `Drop` aborts the worker task),
     /// so this single handle is enough to cancel the whole audio stack.
@@ -179,6 +199,69 @@ fn parse_synthetic_url(url: &str) -> SyntheticParams {
     }
 }
 
+/// PURA-329 / PURA-342 — pipeline buffering config shared by a normal
+/// play and a [`seek_to`] respawn.
+///
+/// The paced sibling drains exactly one frame per 20 ms, so the frame
+/// channel is the only stall runway between a producer hiccup (network /
+/// yt-dlp / ffmpeg) and a gap on the wire. The 8-frame default is just
+/// 160 ms; any stall past that underran the channel and crackled.
+///
+/// Two regimes need cover:
+///  * Steady state — PURA-329 sized a 2 s mid-stream runway for clean
+///    long-running playback ("sounds good now" on v1.4.4).
+///  * Start-up — the opening seconds of a yt-dlp fetch dump a burst, then
+///    throughput dips while the network connection ramps. A 1 s pre-buffer
+///    (the PURA-329 watermark) drained faster than the fetch refilled it,
+///    underrunning the wire for the first 1–2 s (PURA-342 startup crackle).
+///    The watermark is now 3 s so playback rides out the network ramp.
+///
+/// 250 frames = 5 s frame-channel depth; `prebuffer_frames` holds the first
+/// 150 (3 s) before playback starts. Cost: up to ~3 s extra before the
+/// first frame in the worst case, but ffmpeg decodes far faster than
+/// real-time (the watermark fills in well under a second in practice — see
+/// PURA-342's `pipeline_prebuffer_full` log), and it is in the noise next
+/// to the ~11 s yt-dlp resolve (PURA-330). `frame_buffer >= prebuffer_frames`
+/// so `flush_prebuffer` never blocks the worker mid-prebuffer.
+fn pipeline_config(yt_cookie_file: Option<PathBuf>) -> PipelineConfig {
+    PipelineConfig {
+        frame_buffer: 250,
+        prebuffer_frames: 150,
+        yt_cookie_file,
+        ..PipelineConfig::default()
+    }
+}
+
+/// Assemble an [`ActiveAudio`] around a freshly-spawned pipeline: take its
+/// frame + event channels, spawn the draining sibling, and wire up the
+/// per-bot audio state. Shared by [`start_pipeline`] and [`seek_to`].
+fn build_active(
+    mut pipeline: AudioPipeline,
+    source_label: String,
+    started_at: Instant,
+    seek_base_secs: u64,
+    seek_input: Arc<Mutex<Option<String>>>,
+    resolve: Option<JoinHandle<()>>,
+) -> ActiveAudio {
+    let frames_rx = pipeline.take_frames();
+    let events_rx = pipeline.events();
+    let (msg_tx, msg_rx) = mpsc::channel(AUDIO_MSG_BUFFER);
+    let (pause_tx, pause_rx) = watch::channel(false);
+    let sibling = spawn_sibling(pipeline, frames_rx, events_rx, pause_rx, msg_tx);
+    ActiveAudio {
+        source_label,
+        audio_rx: msg_rx,
+        pause: pause_tx,
+        frames_sent: 0,
+        started_at,
+        last_diagnostic: None,
+        seek_base_secs,
+        seek_input,
+        _resolve: resolve,
+        _sibling: sibling,
+    }
+}
+
 /// Spawn the audio pipeline for `source` and the sibling task that
 /// drains it. Replaces any existing pipeline (dropping it aborts the
 /// previous worker + sibling). Returns the operator-facing source label
@@ -190,7 +273,7 @@ pub(crate) async fn start_pipeline(
 ) -> Result<String, PipelineError> {
     // PURA-330 — latency anchor: captured before teardown so the logged
     // `!play` → first-audio span includes the previous pipeline's drop.
-    let started_at = std::time::Instant::now();
+    let started_at = Instant::now();
 
     // Drop the previous pipeline first. `Option::take` here so the old
     // `ActiveAudio`'s `Drop` runs before we spawn the replacement — the
@@ -199,53 +282,103 @@ pub(crate) async fn start_pipeline(
     *current = None;
 
     let (spec, label) = source_to_spec(source);
-    // PURA-329 / PURA-342 — the paced sibling drains exactly one frame per
-    // 20 ms, so the frame channel is the only stall runway between a producer
-    // hiccup (network / yt-dlp / ffmpeg) and a gap on the wire. The 8-frame
-    // default is just 160 ms; any stall past that underran the channel and
-    // crackled.
-    //
-    // Two regimes need cover:
-    //  * Steady state — PURA-329 sized a 2 s mid-stream runway for clean
-    //    long-running playback ("sounds good now" on v1.4.4).
-    //  * Start-up — the opening seconds of a yt-dlp fetch dump a burst, then
-    //    throughput dips while the network connection ramps. A 1 s pre-buffer
-    //    (the PURA-329 watermark) drained faster than the fetch refilled it,
-    //    underrunning the wire for the first 1–2 s (PURA-342 startup crackle).
-    //    The watermark is now 3 s so playback rides out the network ramp.
-    //
-    // 250 frames = 5 s frame-channel depth; `prebuffer_frames` holds the first
-    // 150 (3 s) before playback starts. Cost: up to ~3 s extra before the
-    // first frame in the worst case, but ffmpeg decodes far faster than
-    // real-time (the watermark fills in well under a second in practice — see
-    // PURA-342's `pipeline_prebuffer_full` log), and it is in the noise next
-    // to the ~11 s yt-dlp resolve (PURA-330). `frame_buffer >= prebuffer_frames`
-    // so `flush_prebuffer` never blocks the worker mid-prebuffer.
-    let cfg = PipelineConfig {
-        frame_buffer: 250,
-        prebuffer_frames: 150,
-        yt_cookie_file,
-        ..PipelineConfig::default()
-    };
+    let cfg = pipeline_config(yt_cookie_file.clone());
     debug!(label = %label, ?cfg, "spawning audio pipeline");
-    let mut pipeline = AudioPipeline::spawn(spec, cfg).await?;
-    let frames_rx = pipeline.take_frames();
-    let events_rx = pipeline.events();
+    let pipeline = AudioPipeline::spawn(spec, cfg).await?;
 
-    let (msg_tx, msg_rx) = mpsc::channel(AUDIO_MSG_BUFFER);
-    let (pause_tx, pause_rx) = watch::channel(false);
-    let sibling = spawn_sibling(pipeline, frames_rx, events_rx, pause_rx, msg_tx);
+    // PURA-352 — set up seek retention for the new track. A library file
+    // is seekable the moment it starts; a URL source needs a one-off
+    // `yt-dlp -g` resolve, kicked off in the background so it never
+    // delays first audio. Synthetic test tones are left unseekable.
+    let seek_input: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let mut resolve: Option<JoinHandle<()>> = None;
+    match source {
+        AudioSource::LibraryPath(p) => {
+            *seek_input.lock().unwrap() = Some(p.to_string_lossy().into_owned());
+        }
+        AudioSource::Url(u) if !u.starts_with("synthetic:") => {
+            let slot = Arc::clone(&seek_input);
+            let url = u.clone();
+            resolve = Some(tokio::spawn(async move {
+                match music_bot_audio::resolve::resolve_direct_url(&url, yt_cookie_file.as_deref())
+                    .await
+                {
+                    Ok(direct) => {
+                        debug!("PURA-352 seek: resolved direct media URL for current track");
+                        *slot.lock().unwrap() = Some(direct);
+                    }
+                    Err(err) => {
+                        warn!(
+                            ?err,
+                            "PURA-352 seek: yt-dlp URL resolve failed — seek unavailable for this track"
+                        );
+                    }
+                }
+            }));
+        }
+        _ => {}
+    }
 
-    *current = Some(ActiveAudio {
-        source_label: label.clone(),
-        audio_rx: msg_rx,
-        pause: pause_tx,
-        frames_sent: 0,
+    *current = Some(build_active(
+        pipeline,
+        label.clone(),
         started_at,
-        last_diagnostic: None,
-        _sibling: sibling,
-    });
+        0,
+        seek_input,
+        resolve,
+    ));
     Ok(label)
+}
+
+/// PURA-352 — re-spawn the decoder for the current track at `secs`
+/// seconds from its start, reusing the retained seekable input (library
+/// path, or the yt-dlp media URL resolved at play time) so no yt-dlp
+/// resolution is re-run.
+///
+/// Returns `Ok(true)` when the pipeline was respawned at the offset, or
+/// `Ok(false)` when seeking is not (yet) possible — no pipeline is
+/// active, or the URL resolve has not finished. The caller treats
+/// `Ok(false)` as a graceful no-op.
+pub(crate) async fn seek_to(
+    current: &mut Option<ActiveAudio>,
+    secs: u64,
+) -> Result<bool, PipelineError> {
+    let Some(active) = current.as_ref() else {
+        return Ok(false);
+    };
+    // The retained input is shared with the background resolve task; clone
+    // the `Arc` so it survives the teardown below, and snapshot its value.
+    let seek_input = Arc::clone(&active.seek_input);
+    let input = seek_input.lock().unwrap().clone();
+    let Some(input) = input else {
+        return Ok(false);
+    };
+    let source_label = active.source_label.clone();
+
+    // Drop the current pipeline before spawning the replacement so the old
+    // ffmpeg subprocess is killed synchronously — mirrors `start_pipeline`.
+    let started_at = Instant::now();
+    *current = None;
+
+    let spec = AudioSourceSpec::FfmpegAt {
+        input,
+        start_secs: secs,
+    };
+    // The seek path decodes a resolved URL / local file directly — no
+    // yt-dlp involvement, so no cookie file is needed.
+    let cfg = pipeline_config(None);
+    debug!(secs, "PURA-352 seek: re-spawning decoder at offset");
+    let pipeline = AudioPipeline::spawn(spec, cfg).await?;
+
+    *current = Some(build_active(
+        pipeline,
+        source_label,
+        started_at,
+        secs,
+        seek_input,
+        None,
+    ));
+    Ok(true)
 }
 
 /// PURA-342 — how many opening frames count as the "startup" regime.

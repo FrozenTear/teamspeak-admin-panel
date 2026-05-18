@@ -35,14 +35,41 @@ impl FfmpegSource {
     /// Spawn `ffmpeg -i <input>` with the output reformatted to `s16le` at
     /// 48 kHz with `channels` channels. `input` can be any string ffmpeg's
     /// `-i` accepts: a local path, an `http://` URL, an `icecast://` URL, etc.
-    pub async fn from_input(input: &str, channels: u8) -> io::Result<Self> {
+    ///
+    /// PURA-352 — `start_secs`, when `Some`, places `-ss <secs>` *before*
+    /// `-i` so ffmpeg seeks the *input* (a fast HTTP range request on a
+    /// remote URL, a container index seek on a local file) rather than
+    /// decoding and discarding from the start.
+    pub async fn from_input(
+        input: &str,
+        channels: u8,
+        start_secs: Option<u64>,
+    ) -> io::Result<Self> {
         let mut cmd = Command::new("ffmpeg");
         cmd.kill_on_drop(true)
             .arg("-hide_banner")
             .arg("-loglevel")
             .arg("error")
-            .arg("-nostdin")
-            .arg("-i")
+            .arg("-nostdin");
+        // PURA-352 — input-side seek. Must precede `-i` to apply to the
+        // next input. Omitted (no `-ss`) for a normal start-at-zero play.
+        if let Some(secs) = start_secs {
+            cmd.arg("-ss").arg(secs.to_string());
+        }
+        // PURA-352 — a seek re-spawns ffmpeg directly on a resolved media
+        // URL, so ffmpeg's HTTP client now serves the rest of the track.
+        // Let it ride out transient drops instead of ending playback.
+        // `-reconnect*` are http(s)-protocol options — only valid for an
+        // http input, and ffmpeg errors if they are passed for a local file.
+        if input.starts_with("http://") || input.starts_with("https://") {
+            cmd.arg("-reconnect")
+                .arg("1")
+                .arg("-reconnect_streamed")
+                .arg("1")
+                .arg("-reconnect_delay_max")
+                .arg("2");
+        }
+        cmd.arg("-i")
             .arg(input)
             .arg("-vn")
             .arg("-f")

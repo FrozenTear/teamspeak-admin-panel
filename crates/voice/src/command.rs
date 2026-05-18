@@ -63,6 +63,12 @@ pub enum AudioCommand {
     SkipNext,
     /// Skip to the previous track in the queue.
     SkipPrev,
+    /// PURA-352 — seek the current track to `secs` seconds from its
+    /// start. The pipeline re-spawns the decoder at the offset
+    /// (`ffmpeg -ss`) reusing the already-resolved stream URL, so no
+    /// yt-dlp re-resolution is paid. A no-op when nothing is playing or
+    /// the current track is not yet seekable (URL resolve still pending).
+    Seek { secs: u64 },
     /// Set output volume in dBFS-ish floating-point gain. WS-2 picks the
     /// exact unit.
     SetVolume(f32),
@@ -131,6 +137,7 @@ mod tests {
             }),
             BotCommand::Audio(AudioCommand::Stop),
             BotCommand::Audio(AudioCommand::SetVolume(0.5)),
+            BotCommand::Audio(AudioCommand::Seek { secs: 90 }),
             BotCommand::Queue(QueueCommand::Enqueue(NewTrack::url(
                 "demo",
                 "https://example.com/demo.mp3",

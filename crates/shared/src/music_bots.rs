@@ -264,6 +264,15 @@ pub struct SetVolumeRequest {
     pub gain: f32,
 }
 
+/// `POST /music-bots/{id}/seek` body — scrub the current track to `secs`
+/// seconds from its start (PURA-352). Lowers to
+/// `music_bot::AudioCommand::Seek`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeekRequest {
+    pub secs: u64,
+}
+
 /// `POST /music-bots/{id}/queue` body — append a single track to the
 /// bot's queue without going through a playlist (PURA-126 WS-6 follow-up).
 /// Same shape as [`AddTrackRequest`] but renamed for the queue surface so
