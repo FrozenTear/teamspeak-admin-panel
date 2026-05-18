@@ -255,7 +255,10 @@ impl Hub {
                         self.deny()
                     }
                 }
-                TopicKind::Clients | TopicKind::Channels | TopicKind::VideoSources => {
+                TopicKind::Clients
+                | TopicKind::Channels
+                | TopicKind::VideoSources
+                | TopicKind::Moderation => {
                     if u.is_admin {
                         Ok(())
                     } else {

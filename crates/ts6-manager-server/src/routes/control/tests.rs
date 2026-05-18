@@ -27,7 +27,8 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 use ts6_manager_shared::control::{
     BanCreateRequest, BanCreated, BanListItem, ChannelTreeNode, ClientDetail, ClientListItem,
-    KickKind, KickRequest, MoveRequest, MuteRequest, ServerInfoResponse,
+    GroupCreateRequest, GroupPermSetRequest, KickKind, KickRequest, MessageListItem, MoveRequest,
+    MuteRequest, PermissionCatalogItem, ServerGroupCreated, ServerGroupItem, ServerInfoResponse,
 };
 
 use crate::app_state::AppState;
@@ -191,8 +192,73 @@ async fn handler_dispatch(
             }
         ]),
         "banadd" => json!({ "banid": "42" }),
+        // PURA-373 — moderation surface reads.
+        "servergrouplist" => json!([
+            { "sgid": "6", "name": "Server Admin", "type": "1", "iconid": "300",
+              "savedb": "1", "sortid": "0", "namemode": "0", "n_modifyp": "100",
+              "n_member_addp": "100", "n_member_removep": "100" },
+            { "sgid": "8", "name": "Guest", "type": "0", "savedb": "0" }
+        ]),
+        "servergroupadd" => json!({ "sgid": "13" }),
+        "servergroupcopy" => json!({ "sgid": "14" }),
+        "servergroupclientlist" => json!([
+            { "cldbid": "100", "client_nickname": "Alice", "client_unique_identifier": "uid-A=" }
+        ]),
+        "servergrouppermlist" => json!([
+            { "permsid": "b_virtualserver_info_view", "permvalue": "1",
+              "permnegated": "0", "permskip": "0" }
+        ]),
+        "channelgrouplist" => json!([
+            { "cgid": "2", "name": "Operator", "type": "0" }
+        ]),
+        "channelgroupadd" => json!({ "cgid": "15" }),
+        "channelgroupclientlist" => json!([
+            { "cid": "1", "cldbid": "100", "cgid": "2" }
+        ]),
+        "channelgrouppermlist" => json!([
+            { "permsid": "i_channel_needed_modify_power", "permvalue": "75" }
+        ]),
+        "permissionlist" => json!([
+            { "permid": "8470", "permname": "b_serverinstance_help_view", "permdesc": "Help" }
+        ]),
+        "permfind" => json!([ { "t": "0", "id1": "6", "id2": "0", "p": "8470" } ]),
+        "permoverview" => json!([
+            { "t": "0", "id1": "6", "id2": "0", "p": "8470", "v": "1", "n": "0", "s": "0" }
+        ]),
+        "permidgetbyname" => json!({ "permsid": "b_virtualserver_info_view", "permid": "4353" }),
+        "privilegekeylist" => json!([
+            { "token": "tok-1", "token_type": "0", "token_id1": "6", "token_id2": "0",
+              "token_description": "default", "token_created": "1700000000", "token_customset": "" }
+        ]),
+        "privilegekeyadd" => json!({ "token": "new-token-XYZ" }),
+        "messagelist" => json!([
+            { "msgid": "7", "cluid": "uid-A=", "subject": "hi",
+              "timestamp": "1700000000", "flag_read": "0" }
+        ]),
+        "messageget" => json!({
+            "msgid": "7", "cluid": "uid-A=", "subject": "hi",
+            "message": "body", "timestamp": "1700000000"
+        }),
         // Write commands return a status-only envelope with body `{}`.
-        "clientkick" | "clientmove" | "clientedit" | "bandel" | "bandelall" => json!({}),
+        "clientkick"
+        | "clientmove"
+        | "clientedit"
+        | "bandel"
+        | "bandelall"
+        | "servergrouprename"
+        | "servergroupdel"
+        | "servergroupaddclient"
+        | "servergroupdelclient"
+        | "servergroupaddperm"
+        | "servergroupdelperm"
+        | "channelgrouprename"
+        | "channelgroupdel"
+        | "setclientchannelgroup"
+        | "channelgroupaddperm"
+        | "channelgroupdelperm"
+        | "privilegekeydelete"
+        | "messageadd"
+        | "messagedel" => json!({}),
         // Anything we didn't pre-load — surface as a generic upstream
         // mismatch so the test fails loud.
         other => json!({ "_mock_unknown_command": other }),
@@ -888,6 +954,202 @@ async fn transport_error_details_carry_typed_class_prefix() {
         details.contains(&format!("127.0.0.1:{dead_port}")),
         "details must name the dial target, got `{details}`"
     );
+}
+
+// ---------------------------------------------------------------------
+// PURA-373 — moderation surface (server / channel groups, permissions,
+// tokens, messages). Confirms route registration, the admin-only write
+// gate (spec §7.9–7.16), the read-access gate, and empty-result
+// normalisation.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn server_groups_list_returns_projection() {
+    let (port, _mock) = boot_mock_webquery("API-KEY").await;
+    let state = fresh_state().await;
+    let server = seed_server(&state, port, "API-KEY").await;
+    let (_admin, atoken) = seed_user_with_token(&state, "alice", "admin").await;
+
+    let resp = app(state)
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/servers/{}/vs/1/server-groups", server.id))
+                .header("authorization", auth_header(&atoken))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let rows: Vec<ServerGroupItem> = read_json(resp).await;
+    assert_eq!(rows.len(), 2);
+    let admin_group = rows.iter().find(|g| g.sgid == 6).unwrap();
+    assert_eq!(admin_group.name, "Server Admin");
+    assert_eq!(admin_group.group_type, 1);
+}
+
+#[tokio::test]
+async fn server_groups_create_admin_ok() {
+    let (port, _mock) = boot_mock_webquery("API-KEY").await;
+    let state = fresh_state().await;
+    let server = seed_server(&state, port, "API-KEY").await;
+    let (_admin, atoken) = seed_user_with_token(&state, "alice", "admin").await;
+
+    let resp = app(state)
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/servers/{}/vs/1/server-groups", server.id))
+                .header("authorization", auth_header(&atoken))
+                .header("content-type", "application/json")
+                .body(json_body(&GroupCreateRequest {
+                    name: "Mods".into(),
+                    r#type: None,
+                }))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let created: ServerGroupCreated = read_json(resp).await;
+    assert_eq!(created.sgid, 13);
+}
+
+#[tokio::test]
+async fn server_groups_create_rejects_moderator() {
+    // PURA-373 — moderation writes are admin-only; a moderator WITH a
+    // grant (which `check_write` / the §7.8 client actions accept) is
+    // still rejected by `check_admin`.
+    let (port, _mock) = boot_mock_webquery("API-KEY").await;
+    let state = fresh_state().await;
+    let server = seed_server(&state, port, "API-KEY").await;
+    let (modr, mtoken) = seed_user_with_token(&state, "mod", "moderator").await;
+    server_user_grants::insert(&state.db, modr.id, server.id)
+        .await
+        .unwrap();
+
+    let resp = app(state)
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/servers/{}/vs/1/server-groups", server.id))
+                .header("authorization", auth_header(&mtoken))
+                .header("content-type", "application/json")
+                .body(json_body(&GroupCreateRequest {
+                    name: "Mods".into(),
+                    r#type: None,
+                }))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn permissions_catalog_readable_by_granted_viewer() {
+    let (port, _mock) = boot_mock_webquery("API-KEY").await;
+    let state = fresh_state().await;
+    let server = seed_server(&state, port, "API-KEY").await;
+    let (viewer, vtoken) = seed_user_with_token(&state, "viewer", "viewer").await;
+    server_user_grants::insert(&state.db, viewer.id, server.id)
+        .await
+        .unwrap();
+
+    let resp = app(state)
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/servers/{}/vs/1/permissions", server.id))
+                .header("authorization", auth_header(&vtoken))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let rows: Vec<PermissionCatalogItem> = read_json(resp).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].permname, "b_serverinstance_help_view");
+}
+
+#[tokio::test]
+async fn tokens_list_unauthenticated_is_401() {
+    let (port, _mock) = boot_mock_webquery("API-KEY").await;
+    let state = fresh_state().await;
+    let server = seed_server(&state, port, "API-KEY").await;
+    let resp = app(state)
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/servers/{}/vs/1/tokens", server.id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn messages_empty_inbox_normalises_1281_to_empty_list() {
+    // PURA-373 deliverable — an empty TS6 inbox surfaces as upstream
+    // code 1281; the route must return `[]`, not a 502.
+    let (port, mock) = boot_mock_webquery("API-KEY").await;
+    *mock.behavior.force_upstream_error.lock().unwrap() =
+        Some((1281, "database empty result set".into()));
+    let state = fresh_state().await;
+    let server = seed_server(&state, port, "API-KEY").await;
+    let (_admin, atoken) = seed_user_with_token(&state, "alice", "admin").await;
+
+    let resp = app(state)
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/servers/{}/vs/1/messages", server.id))
+                .header("authorization", auth_header(&atoken))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let rows: Vec<MessageListItem> = read_json(resp).await;
+    assert!(rows.is_empty(), "1281 must normalise to an empty list");
+}
+
+#[tokio::test]
+async fn channel_group_set_permission_rejects_moderator() {
+    let (port, _mock) = boot_mock_webquery("API-KEY").await;
+    let state = fresh_state().await;
+    let server = seed_server(&state, port, "API-KEY").await;
+    let (modr, mtoken) = seed_user_with_token(&state, "mod", "moderator").await;
+    server_user_grants::insert(&state.db, modr.id, server.id)
+        .await
+        .unwrap();
+
+    let resp = app(state)
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri(format!(
+                    "/api/servers/{}/vs/1/channel-groups/2/permissions",
+                    server.id
+                ))
+                .header("authorization", auth_header(&mtoken))
+                .header("content-type", "application/json")
+                .body(json_body(&GroupPermSetRequest {
+                    permsid: "i_channel_needed_modify_power".into(),
+                    permvalue: 75,
+                    permnegated: false,
+                    permskip: false,
+                }))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
 // Silence unused-helper lints when individual tests are toggled.

@@ -34,17 +34,32 @@
 //!   re-checks every call regardless.
 
 mod case_detail;
+mod channel_group_detail;
+mod channel_groups;
 mod grants;
 mod history;
+mod messages;
 mod metrics;
 pub(crate) mod perm;
+pub(crate) mod permeditor;
+mod permissions;
 mod queue;
+mod server_group_detail;
+mod server_groups;
+mod tokens;
 
 pub use case_detail::ModerationCasePage;
+pub use channel_group_detail::ChannelGroupDetailPage;
+pub use channel_groups::ChannelGroupsPage;
 pub use grants::PermissionGrantsPage;
 pub use history::SubjectHistoryPage;
+pub use messages::MessagesPage;
 pub use metrics::AutomodMetricsPage;
+pub use permissions::PermissionsCatalogPage;
 pub use queue::ModerationQueuePage;
+pub use server_group_detail::ServerGroupDetailPage;
+pub use server_groups::ServerGroupsPage;
+pub use tokens::TokensPage;
 
 use chrono::{DateTime, Utc};
 use dioxus::prelude::*;

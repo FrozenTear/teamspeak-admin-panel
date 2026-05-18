@@ -23,11 +23,13 @@ use crate::ui::pages::DevFlowCanvasPage;
 use crate::ui::pages::DevVideoPlayerPage;
 use crate::ui::pages::{
     AdminUsersPage, AuditPage, AutomodMetricsPage, BansPage, BotDetailPage, BotsIndexPage,
-    ChannelsPage, ClientsPage, DashboardPlaceholder, FlowDetailPage, FlowEditPage, FlowFormPage,
-    FlowsListPage, Home, LoginPage, LogsPage, ModerationCasePage, ModerationQueuePage,
-    MusicLibraryPage, MusicPlaylistsPage, NotFoundPage, PermissionGrantsPage, PublicWidgetPage,
-    RadioStationsPage, ServerEditPage, ServerInfoPage, ServersIndexPage, SettingsPage, SetupPage,
-    SubjectHistoryPage, VideoSourcesPage, WidgetsPage,
+    ChannelGroupDetailPage, ChannelGroupsPage, ChannelsPage, ClientsPage, DashboardPlaceholder,
+    FlowDetailPage, FlowEditPage, FlowFormPage, FlowsListPage, Home, LoginPage, LogsPage,
+    MessagesPage, ModerationCasePage, ModerationQueuePage, MusicLibraryPage, MusicPlaylistsPage,
+    NotFoundPage, PermissionGrantsPage, PermissionsCatalogPage, PublicWidgetPage,
+    RadioStationsPage, ServerEditPage, ServerGroupDetailPage, ServerGroupsPage, ServerInfoPage,
+    ServersIndexPage, SettingsPage, SetupPage, SubjectHistoryPage, TokensPage, VideoSourcesPage,
+    WidgetsPage,
 };
 
 #[rustfmt::skip]
@@ -182,6 +184,53 @@ pub enum Route {
     #[route("/moderation/automod")]
     AutomodMetricsPage {},
 
+    // PURA-377 (PURA-369 Phase B) — TS6 offline-message inbox. Static
+    // segment, so it never collides with the `/moderation/cases|subjects/*`
+    // dynamic routes. Reading the inbox needs server access; the compose +
+    // delete affordances are admin-only and the route layer re-checks.
+    #[route("/moderation/messages")]
+    MessagesPage {},
+
+    // PURA-375 (PURA-369 Phase B) — server-group surfaces. The list route
+    // is two static segments and the detail route appends one dynamic
+    // `sgid`; neither collides with the `/moderation/cases|subjects/*`
+    // dynamic routes (the `server-groups` literal is more specific). Read
+    // needs server access; create/edit/delete are admin-only in-page and
+    // the `/api/.../server-groups` routes re-check `check_admin`.
+    #[route("/moderation/server-groups")]
+    ServerGroupsPage {},
+
+    #[route("/moderation/server-groups/:sgid")]
+    ServerGroupDetailPage { sgid: i64 },
+
+    // PURA-378 (PURA-369 Phase C) — channel-group surfaces. Same shape as
+    // the server-group routes: a two-static-segment list and a detail route
+    // with a typed `cgid`. The `channel-groups` literal is more specific
+    // than the `/moderation/cases|subjects/*` dynamic routes, so neither
+    // collides. Read needs server access; create/edit/delete are admin-only
+    // in-page and the `/api/.../channel-groups` routes re-check `check_admin`.
+    #[route("/moderation/channel-groups")]
+    ChannelGroupsPage {},
+
+    #[route("/moderation/channel-groups/:cgid")]
+    ChannelGroupDetailPage { cgid: i64 },
+
+    // PURA-376 (PURA-369 Phase B) — privilege keys (tokens). Static
+    // segment, so it never collides with the `/moderation/cases|subjects/*`
+    // dynamic routes. Read = any operator with server access; write (mint
+    // / delete) = admin, enforced server-side by the `/tokens` route's
+    // `check_admin`.
+    #[route("/moderation/tokens")]
+    TokensPage {},
+
+    // PURA-379 (PURA-369 Phase C) — read-only permissions reference. The
+    // `permissions` literal is a static segment, more specific than the
+    // `/moderation/cases|subjects/:param` dynamic routes, so it never
+    // collides. `permsid` is an optional deep-link query param: a group
+    // editor links here with `?permsid=` to pre-seed the catalog search.
+    #[route("/moderation/permissions?:permsid")]
+    PermissionsCatalogPage { permsid: Option<String> },
+
     // PURA-287 — per-user moderation grant editor. Admin-gated like the
     // other `/admin/*` surfaces; the sidebar entry is hidden for non-admins
     // and `PUT /api/users/{id}/permissions` enforces `RequireAdmin`.
@@ -233,6 +282,36 @@ mod tests {
         assert!(matches!(route, Route::BotsIndexPage {}));
     }
 
+    /// PURA-375 — the server-group routes. The list path is two static
+    /// segments; the detail path appends a typed `sgid`. Both must parse,
+    /// and the list must not be swallowed by the detail's dynamic segment.
+    #[test]
+    fn server_group_routes_resolve_with_typed_params() {
+        assert!(matches!(
+            Route::from_str("/moderation/server-groups").expect("server-groups list parse"),
+            Route::ServerGroupsPage {}
+        ));
+        assert!(matches!(
+            Route::from_str("/moderation/server-groups/9").expect("server-group detail parse"),
+            Route::ServerGroupDetailPage { sgid: 9 }
+        ));
+    }
+
+    /// PURA-378 — the channel-group routes. Same contract as the
+    /// server-group routes: the list path must not be swallowed by the
+    /// detail's dynamic `cgid` segment.
+    #[test]
+    fn channel_group_routes_resolve_with_typed_params() {
+        assert!(matches!(
+            Route::from_str("/moderation/channel-groups").expect("channel-groups list parse"),
+            Route::ChannelGroupsPage {}
+        ));
+        assert!(matches!(
+            Route::from_str("/moderation/channel-groups/4").expect("channel-group detail parse"),
+            Route::ChannelGroupDetailPage { cgid: 4 }
+        ));
+    }
+
     /// PURA-243 — the static `/flows/new` route must win over the dynamic
     /// `/flows/:flow_id` route. Without the explicit ordering in the enum,
     /// `/flows/new` would parse `new` as a `flow_id` and fail (or, if the
@@ -279,9 +358,35 @@ mod tests {
             Route::from_str("/moderation/automod").expect("automod parse"),
             Route::AutomodMetricsPage {}
         ));
+        // PURA-377 — the offline-message inbox. Static segment, must win
+        // over the dynamic `/moderation/cases|subjects/:param` routes.
+        assert!(matches!(
+            Route::from_str("/moderation/messages").expect("messages parse"),
+            Route::MessagesPage {}
+        ));
+        // PURA-376 — the static tokens route wins over the dynamic
+        // `/moderation/cases|subjects/*` matchers.
+        assert!(matches!(
+            Route::from_str("/moderation/tokens").expect("tokens parse"),
+            Route::TokensPage {}
+        ));
         assert!(matches!(
             Route::from_str("/admin/permissions").expect("permissions parse"),
             Route::PermissionGrantsPage {}
+        ));
+        // PURA-379 — the read-only permissions reference. Static segment,
+        // must win over the dynamic `/moderation/cases|subjects/:param`
+        // routes; the deep-link query param is absent here.
+        assert!(matches!(
+            Route::from_str("/moderation/permissions").expect("perm catalog parse"),
+            Route::PermissionsCatalogPage { permsid: None }
+        ));
+        // The `?permsid=` deep link parses into the typed query param.
+        assert!(matches!(
+            Route::from_str("/moderation/permissions?permsid=b_client_kick_from_server")
+                .expect("perm catalog deep-link parse"),
+            Route::PermissionsCatalogPage { permsid: Some(p) }
+                if p == "b_client_kick_from_server"
         ));
     }
 

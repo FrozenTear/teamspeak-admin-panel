@@ -10,6 +10,8 @@ pub mod dropdown;
 mod field;
 mod input;
 mod server_selector;
+mod switch;
+mod tabs;
 pub mod toast;
 pub mod video_player;
 pub mod ws_banner;
@@ -28,6 +30,8 @@ pub use dropdown::{
 pub use field::Field;
 pub use input::{PasswordInput, TextInput};
 pub use server_selector::{ServerSelector, ServerSelectorVariant};
+pub use switch::Switch;
+pub use tabs::{TabItem, TabPanel, Tabs};
 pub use toast::{Toaster, ToasterRegion, provide_toaster, use_toaster};
 pub use video_player::{PlayerState, VideoPlayer};
 pub use ws_banner::WsReconnectBanner;

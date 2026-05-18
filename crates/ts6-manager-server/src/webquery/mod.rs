@@ -59,9 +59,12 @@ use crate::crypto;
 use crate::repos::server_connections::ServerConnection;
 
 pub use models::{
-    BanAddResponse, BanEntry, ChannelClientPerm, ChannelEntry, ChannelInfo, ClientDbEntry,
-    ClientEntry, ClientInfo, ComplaintEntry, ConnectionInfo, HostInfo, LogEntry, ServerInfo,
-    VersionInfo, VirtualServerEntry,
+    BanAddResponse, BanEntry, ChannelClientPerm, ChannelEntry, ChannelGroupClient,
+    ChannelGroupEntry, ChannelGroupIdResponse, ChannelInfo, ClientDbEntry, ClientEntry, ClientInfo,
+    ComplaintEntry, ConnectionInfo, GroupPermEntry, HostInfo, LogEntry, MessageDetail,
+    MessageEntry, PermFindEntry, PermIdEntry, PermOverviewEntry, PermissionEntry,
+    PrivilegeKeyAddResponse, PrivilegeKeyEntry, ServerGroupClient, ServerGroupEntry,
+    ServerGroupIdResponse, ServerInfo, VersionInfo, VirtualServerEntry,
 };
 pub use transport_class::{
     ClassifiedTransport, WebQueryTransportKind, other_static as other_transport,
@@ -408,6 +411,25 @@ impl WebQueryClient {
     ) -> WebQueryResult<Vec<T>> {
         match self.get::<Vec<T>>(path, params).await {
             Ok(v) => Ok(v),
+            Err(WebQueryError::Upstream { code, .. }) if code == DATABASE_EMPTY_RESULT => {
+                Ok(Vec::new())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// List read that tolerates the two TS6 "no rows" shapes: upstream
+    /// code `1281` (`database_empty_result`) **and** an `ok` envelope with
+    /// no `body` at all (`servergroupclientlist` on an empty group). Both
+    /// collapse to `[]` per spec §7.9 / §7.16 (PURA-373). Decoding through
+    /// `Option<Vec<T>>` lets the absent-body case land as `None`.
+    async fn list_lenient<T: for<'de> Deserialize<'de>>(
+        &self,
+        path: &str,
+        params: &[(&str, &str)],
+    ) -> WebQueryResult<Vec<T>> {
+        match self.get::<Option<Vec<T>>>(path, params).await {
+            Ok(v) => Ok(v.unwrap_or_default()),
             Err(WebQueryError::Upstream { code, .. }) if code == DATABASE_EMPTY_RESULT => {
                 Ok(Vec::new())
             }
@@ -839,6 +861,470 @@ impl WebQueryClient {
         .await?;
         Ok(())
     }
+
+    // =====================================================================
+    // PURA-373 — server-group command surface (spec §7.9)
+    // =====================================================================
+
+    /// `servergrouplist` (sid scope).
+    pub async fn servergrouplist(&self, sid: i64) -> WebQueryResult<Vec<ServerGroupEntry>> {
+        self.get::<Vec<ServerGroupEntry>>(&format!("/{sid}/servergrouplist"), &[])
+            .await
+    }
+
+    /// `servergroupadd` (sid scope) — create a server group. `group_type`
+    /// is left to the upstream default when `None` (a regular group).
+    pub async fn servergroupadd(
+        &self,
+        sid: i64,
+        name: &str,
+        group_type: Option<i64>,
+    ) -> WebQueryResult<i64> {
+        let type_s;
+        let mut q: Vec<(&str, &str)> = vec![("name", name)];
+        if let Some(t) = group_type {
+            type_s = t.to_string();
+            q.push(("type", type_s.as_str()));
+        }
+        let resp: ServerGroupIdResponse =
+            self.get_one(&format!("/{sid}/servergroupadd"), &q).await?;
+        Ok(resp.sgid)
+    }
+
+    /// `servergrouprename` (sid scope).
+    pub async fn servergrouprename(&self, sid: i64, sgid: i64, name: &str) -> WebQueryResult<()> {
+        let sgid_s = sgid.to_string();
+        self.get::<UnitBody>(
+            &format!("/{sid}/servergrouprename"),
+            &[("sgid", sgid_s.as_str()), ("name", name)],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// `servergroupdel` (sid scope). Always passes `force=1` per spec §7.9
+    /// so a non-empty group is removed in a single call.
+    pub async fn servergroupdel(&self, sid: i64, sgid: i64) -> WebQueryResult<()> {
+        let sgid_s = sgid.to_string();
+        self.get::<UnitBody>(
+            &format!("/{sid}/servergroupdel"),
+            &[("sgid", sgid_s.as_str()), ("force", "1")],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// `servergroupcopy` (sid scope) — copy `ssgid` into a brand-new group
+    /// (`tsgid=0`) named `name`. Returns the new `sgid`.
+    pub async fn servergroupcopy(
+        &self,
+        sid: i64,
+        ssgid: i64,
+        name: &str,
+        group_type: i64,
+    ) -> WebQueryResult<i64> {
+        let ssgid_s = ssgid.to_string();
+        let type_s = group_type.to_string();
+        let resp: ServerGroupIdResponse = self
+            .get_one(
+                &format!("/{sid}/servergroupcopy"),
+                &[
+                    ("ssgid", ssgid_s.as_str()),
+                    ("tsgid", "0"),
+                    ("name", name),
+                    ("type", type_s.as_str()),
+                ],
+            )
+            .await?;
+        Ok(resp.sgid)
+    }
+
+    /// `servergroupclientlist -names` (sid scope) — group members. An empty
+    /// group returns a body-less `ok` envelope; collapsed to `[]`.
+    pub async fn servergroupclientlist(
+        &self,
+        sid: i64,
+        sgid: i64,
+    ) -> WebQueryResult<Vec<ServerGroupClient>> {
+        let sgid_s = sgid.to_string();
+        self.list_lenient::<ServerGroupClient>(
+            &format!("/{sid}/servergroupclientlist{}", flag_suffix(&["names"])),
+            &[("sgid", sgid_s.as_str())],
+        )
+        .await
+    }
+
+    /// `servergroupdelclient` (sid scope) — remove a member from a group.
+    pub async fn servergroupdelclient(
+        &self,
+        sid: i64,
+        sgid: i64,
+        cldbid: i64,
+    ) -> WebQueryResult<()> {
+        let sgid_s = sgid.to_string();
+        let cldbid_s = cldbid.to_string();
+        self.get::<UnitBody>(
+            &format!("/{sid}/servergroupdelclient"),
+            &[("sgid", sgid_s.as_str()), ("cldbid", cldbid_s.as_str())],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// `servergrouppermlist -permsid` (sid scope) — per-group permission
+    /// rows keyed by the stable string `permsid`.
+    pub async fn servergrouppermlist(
+        &self,
+        sid: i64,
+        sgid: i64,
+    ) -> WebQueryResult<Vec<GroupPermEntry>> {
+        let sgid_s = sgid.to_string();
+        self.list_lenient::<GroupPermEntry>(
+            &format!("/{sid}/servergrouppermlist{}", flag_suffix(&["permsid"])),
+            &[("sgid", sgid_s.as_str())],
+        )
+        .await
+    }
+
+    /// `servergroupaddperm` (sid scope) — upsert one permission on a group.
+    /// `permsid` is accepted directly — no numeric `permid` bridge is
+    /// needed for group writes (PURA-370 §2).
+    pub async fn servergroupaddperm(
+        &self,
+        sid: i64,
+        sgid: i64,
+        perm: &GroupPermWrite<'_>,
+    ) -> WebQueryResult<()> {
+        let sgid_s = sgid.to_string();
+        let value_s = perm.permvalue.to_string();
+        self.get::<UnitBody>(
+            &format!("/{sid}/servergroupaddperm"),
+            &[
+                ("sgid", sgid_s.as_str()),
+                ("permsid", perm.permsid),
+                ("permvalue", value_s.as_str()),
+                ("permnegated", bool_to_int(perm.permnegated)),
+                ("permskip", bool_to_int(perm.permskip)),
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// `servergroupdelperm` (sid scope) — drop one permission from a group.
+    pub async fn servergroupdelperm(
+        &self,
+        sid: i64,
+        sgid: i64,
+        permsid: &str,
+    ) -> WebQueryResult<()> {
+        let sgid_s = sgid.to_string();
+        self.get::<UnitBody>(
+            &format!("/{sid}/servergroupdelperm"),
+            &[("sgid", sgid_s.as_str()), ("permsid", permsid)],
+        )
+        .await?;
+        Ok(())
+    }
+
+    // =====================================================================
+    // PURA-373 — channel-group command surface (spec §7.10)
+    // =====================================================================
+
+    /// `channelgrouplist` (sid scope).
+    pub async fn channelgrouplist(&self, sid: i64) -> WebQueryResult<Vec<ChannelGroupEntry>> {
+        self.get::<Vec<ChannelGroupEntry>>(&format!("/{sid}/channelgrouplist"), &[])
+            .await
+    }
+
+    /// `channelgroupadd` (sid scope).
+    pub async fn channelgroupadd(
+        &self,
+        sid: i64,
+        name: &str,
+        group_type: Option<i64>,
+    ) -> WebQueryResult<i64> {
+        let type_s;
+        let mut q: Vec<(&str, &str)> = vec![("name", name)];
+        if let Some(t) = group_type {
+            type_s = t.to_string();
+            q.push(("type", type_s.as_str()));
+        }
+        let resp: ChannelGroupIdResponse =
+            self.get_one(&format!("/{sid}/channelgroupadd"), &q).await?;
+        Ok(resp.cgid)
+    }
+
+    /// `channelgrouprename` (sid scope).
+    pub async fn channelgrouprename(&self, sid: i64, cgid: i64, name: &str) -> WebQueryResult<()> {
+        let cgid_s = cgid.to_string();
+        self.get::<UnitBody>(
+            &format!("/{sid}/channelgrouprename"),
+            &[("cgid", cgid_s.as_str()), ("name", name)],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// `channelgroupdel` (sid scope) — always passes `force=1`.
+    pub async fn channelgroupdel(&self, sid: i64, cgid: i64) -> WebQueryResult<()> {
+        let cgid_s = cgid.to_string();
+        self.get::<UnitBody>(
+            &format!("/{sid}/channelgroupdel"),
+            &[("cgid", cgid_s.as_str()), ("force", "1")],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// `channelgroupclientlist` (sid scope) — the `(cid, cldbid, cgid)`
+    /// assignments for one channel group.
+    pub async fn channelgroupclientlist(
+        &self,
+        sid: i64,
+        cgid: i64,
+    ) -> WebQueryResult<Vec<ChannelGroupClient>> {
+        let cgid_s = cgid.to_string();
+        self.list_lenient::<ChannelGroupClient>(
+            &format!("/{sid}/channelgroupclientlist"),
+            &[("cgid", cgid_s.as_str())],
+        )
+        .await
+    }
+
+    /// `setclientchannelgroup` (sid scope) — assign `cldbid` to channel
+    /// group `cgid` within channel `cid`.
+    pub async fn setclientchannelgroup(
+        &self,
+        sid: i64,
+        cgid: i64,
+        cid: i64,
+        cldbid: i64,
+    ) -> WebQueryResult<()> {
+        let cgid_s = cgid.to_string();
+        let cid_s = cid.to_string();
+        let cldbid_s = cldbid.to_string();
+        self.get::<UnitBody>(
+            &format!("/{sid}/setclientchannelgroup"),
+            &[
+                ("cgid", cgid_s.as_str()),
+                ("cid", cid_s.as_str()),
+                ("cldbid", cldbid_s.as_str()),
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// `channelgrouppermlist -permsid` (sid scope).
+    pub async fn channelgrouppermlist(
+        &self,
+        sid: i64,
+        cgid: i64,
+    ) -> WebQueryResult<Vec<GroupPermEntry>> {
+        let cgid_s = cgid.to_string();
+        self.list_lenient::<GroupPermEntry>(
+            &format!("/{sid}/channelgrouppermlist{}", flag_suffix(&["permsid"])),
+            &[("cgid", cgid_s.as_str())],
+        )
+        .await
+    }
+
+    /// `channelgroupaddperm` (sid scope). TS6 channel-group permissions
+    /// carry only a value — `permnegated` / `permskip` are server-group /
+    /// client concepts and are not part of this command.
+    pub async fn channelgroupaddperm(
+        &self,
+        sid: i64,
+        cgid: i64,
+        permsid: &str,
+        permvalue: i64,
+    ) -> WebQueryResult<()> {
+        let cgid_s = cgid.to_string();
+        let value_s = permvalue.to_string();
+        self.get::<UnitBody>(
+            &format!("/{sid}/channelgroupaddperm"),
+            &[
+                ("cgid", cgid_s.as_str()),
+                ("permsid", permsid),
+                ("permvalue", value_s.as_str()),
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// `channelgroupdelperm` (sid scope).
+    pub async fn channelgroupdelperm(
+        &self,
+        sid: i64,
+        cgid: i64,
+        permsid: &str,
+    ) -> WebQueryResult<()> {
+        let cgid_s = cgid.to_string();
+        self.get::<UnitBody>(
+            &format!("/{sid}/channelgroupdelperm"),
+            &[("cgid", cgid_s.as_str()), ("permsid", permsid)],
+        )
+        .await?;
+        Ok(())
+    }
+
+    // =====================================================================
+    // PURA-373 — permission catalog command surface (spec §7.11, read-only)
+    // =====================================================================
+
+    /// `permissionlist` — the full permission catalog (spec §7.11). Scoped
+    /// under `sid` so the WebQuery session has a server selected; the
+    /// command itself is instance-global.
+    pub async fn permissionlist(&self, sid: i64) -> WebQueryResult<Vec<PermissionEntry>> {
+        self.get::<Vec<PermissionEntry>>(&format!("/{sid}/permissionlist"), &[])
+            .await
+    }
+
+    /// `permfind` — locate every assignment of a permission, selected by
+    /// numeric `permid` or string `permsid`.
+    pub async fn permfind(
+        &self,
+        sid: i64,
+        selector: PermSelector<'_>,
+    ) -> WebQueryResult<Vec<PermFindEntry>> {
+        let permid_s;
+        let params: Vec<(&str, &str)> = match selector {
+            PermSelector::Id(id) => {
+                permid_s = id.to_string();
+                vec![("permid", permid_s.as_str())]
+            }
+            PermSelector::Sid(s) => vec![("permsid", s)],
+        };
+        self.list_lenient::<PermFindEntry>(&format!("/{sid}/permfind"), &params)
+            .await
+    }
+
+    /// `permidgetbyname` — bridge a `permsid` string to its numeric
+    /// `permid` (spec §7.8 client-perm writes).
+    pub async fn permidgetbyname(&self, sid: i64, permsid: &str) -> WebQueryResult<i64> {
+        let resp: PermIdEntry = self
+            .get_one(&format!("/{sid}/permidgetbyname"), &[("permsid", permsid)])
+            .await?;
+        Ok(resp.permid)
+    }
+
+    /// `permoverview` — every permission in effect for a client, each row
+    /// tagged with its origin (`t` / `id1`). `cid` and `permid` default to
+    /// `0` per spec §7.11 (whole-catalog overview for the client).
+    pub async fn permoverview(
+        &self,
+        sid: i64,
+        cldbid: i64,
+        cid: i64,
+        permid: i64,
+    ) -> WebQueryResult<Vec<PermOverviewEntry>> {
+        let cldbid_s = cldbid.to_string();
+        let cid_s = cid.to_string();
+        let permid_s = permid.to_string();
+        self.list_lenient::<PermOverviewEntry>(
+            &format!("/{sid}/permoverview"),
+            &[
+                ("cldbid", cldbid_s.as_str()),
+                ("cid", cid_s.as_str()),
+                ("permid", permid_s.as_str()),
+            ],
+        )
+        .await
+    }
+
+    // =====================================================================
+    // PURA-373 — token (privilege key) command surface (spec §7.13)
+    // =====================================================================
+
+    /// `privilegekeylist` (sid scope).
+    pub async fn privilegekeylist(&self, sid: i64) -> WebQueryResult<Vec<PrivilegeKeyEntry>> {
+        self.list_lenient::<PrivilegeKeyEntry>(&format!("/{sid}/privilegekeylist"), &[])
+            .await
+    }
+
+    /// `privilegekeyadd` (sid scope) — mint a privilege key. `token_type`
+    /// is `0` for a server-group key (`id1 = sgid`, `id2 = 0`) or `1` for
+    /// a channel-group key (`id1 = cgid`, `id2 = cid`). Returns the key.
+    pub async fn privilegekeyadd(
+        &self,
+        sid: i64,
+        params: &PrivilegeKeyAddParams<'_>,
+    ) -> WebQueryResult<String> {
+        let type_s = params.token_type.to_string();
+        let id1_s = params.token_id1.to_string();
+        let id2_s = params.token_id2.to_string();
+        let mut q: Vec<(&str, &str)> = vec![
+            ("tokentype", type_s.as_str()),
+            ("tokenid1", id1_s.as_str()),
+            ("tokenid2", id2_s.as_str()),
+        ];
+        if let Some(d) = params.description {
+            q.push(("tokendescription", d));
+        }
+        if let Some(c) = params.customset {
+            q.push(("tokencustomset", c));
+        }
+        let resp: PrivilegeKeyAddResponse =
+            self.get_one(&format!("/{sid}/privilegekeyadd"), &q).await?;
+        Ok(resp.token)
+    }
+
+    /// `privilegekeydelete` (sid scope).
+    pub async fn privilegekeydelete(&self, sid: i64, token: &str) -> WebQueryResult<()> {
+        self.get::<UnitBody>(&format!("/{sid}/privilegekeydelete"), &[("token", token)])
+            .await?;
+        Ok(())
+    }
+
+    // =====================================================================
+    // PURA-373 — offline-message command surface (spec §7.16)
+    // =====================================================================
+
+    /// `messagelist` (sid scope) — the offline-message inbox. An empty
+    /// inbox surfaces as upstream code 1281; collapsed to `[]`.
+    pub async fn messagelist(&self, sid: i64) -> WebQueryResult<Vec<MessageEntry>> {
+        self.list_lenient::<MessageEntry>(&format!("/{sid}/messagelist"), &[])
+            .await
+    }
+
+    /// `messageget` (sid scope) — one message including its body.
+    pub async fn messageget(&self, sid: i64, msgid: i64) -> WebQueryResult<MessageDetail> {
+        let msgid_s = msgid.to_string();
+        self.get_one::<MessageDetail>(
+            &format!("/{sid}/messageget"),
+            &[("msgid", msgid_s.as_str())],
+        )
+        .await
+    }
+
+    /// `messageadd` (sid scope) — leave an offline message for `cluid`.
+    pub async fn messageadd(
+        &self,
+        sid: i64,
+        cluid: &str,
+        subject: &str,
+        message: &str,
+    ) -> WebQueryResult<()> {
+        self.get::<UnitBody>(
+            &format!("/{sid}/messageadd"),
+            &[("cluid", cluid), ("subject", subject), ("message", message)],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// `messagedel` (sid scope).
+    pub async fn messagedel(&self, sid: i64, msgid: i64) -> WebQueryResult<()> {
+        let msgid_s = msgid.to_string();
+        self.get::<UnitBody>(
+            &format!("/{sid}/messagedel"),
+            &[("msgid", msgid_s.as_str())],
+        )
+        .await?;
+        Ok(())
+    }
 }
 
 /// Sentinel for write commands that only carry a `status` envelope. TS
@@ -893,6 +1379,38 @@ pub struct BanAddParams<'a> {
     /// Ban duration in seconds. `Some(0)` is permanent per §7.12; `None`
     /// omits the field entirely (upstream defaults apply).
     pub time: Option<i64>,
+}
+
+/// Parameters for a server-group permission upsert
+/// ([`WebQueryClient::servergroupaddperm`]). `permsid` is the stable
+/// string id; `permnegated` / `permskip` are the tri-state flags TS6
+/// server-group permissions carry (PURA-373).
+#[derive(Debug, Clone)]
+pub struct GroupPermWrite<'a> {
+    pub permsid: &'a str,
+    pub permvalue: i64,
+    pub permnegated: bool,
+    pub permskip: bool,
+}
+
+/// Selector for [`WebQueryClient::permfind`] — TS `permfind` takes
+/// exactly one of `permid` / `permsid`.
+#[derive(Debug, Clone, Copy)]
+pub enum PermSelector<'a> {
+    Id(i64),
+    Sid(&'a str),
+}
+
+/// Parameters for [`WebQueryClient::privilegekeyadd`]. `token_type` is
+/// `0` (server group) or `1` (channel group); `token_id1` / `token_id2`
+/// are the target group / channel ids per spec §7.13.
+#[derive(Debug, Clone)]
+pub struct PrivilegeKeyAddParams<'a> {
+    pub token_type: i64,
+    pub token_id1: i64,
+    pub token_id2: i64,
+    pub description: Option<&'a str>,
+    pub customset: Option<&'a str>,
 }
 
 /// Unwrap the TS6 singleton-wrap shape into a bare JSON value suitable for
