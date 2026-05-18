@@ -76,7 +76,7 @@ pub fn MessagesPage() -> Element {
     let server = active_server::resolve(&servers_ctx.data.read(), &*storage);
     let Some(server) = server else {
         return rsx! {
-            div { class: "crumb", "Messages" }
+            div { class: "crumb", "Moderation · Messages" }
             h1 { "Messages" }
             div { class: "empty",
                 div { class: "icon", "✉" }
@@ -239,7 +239,7 @@ pub fn MessagesPage() -> Element {
     };
 
     rsx! {
-        div { class: "crumb", "Messages · {server_name}" }
+        div { class: "crumb", "Moderation · Messages · {server_name}" }
         div { class: "msg-head",
             h1 { "Messages" }
             if is_admin {
