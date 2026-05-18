@@ -40,6 +40,38 @@ pub fn audio_source_summary(source: &wire::AudioSource) -> String {
     }
 }
 
+/// Compact source label for the now-playing widget and queue rows: the
+/// URL host only (so a long query-string URL doesn't blow out the row),
+/// or the `library:` path. Falls back to the full summary if a URL has
+/// no recognisable host.
+pub fn audio_source_host(source: &wire::AudioSource) -> String {
+    match source {
+        wire::AudioSource::LibraryPath { path } => format!("library:{path}"),
+        wire::AudioSource::Url { url } => {
+            let after_scheme = url.split("://").nth(1).unwrap_or(url.as_str());
+            let host = after_scheme
+                .split(['/', '?', '#'])
+                .next()
+                .unwrap_or(after_scheme);
+            let host = host.strip_prefix("www.").unwrap_or(host);
+            if host.is_empty() {
+                url.clone()
+            } else {
+                host.to_string()
+            }
+        }
+    }
+}
+
+/// Glyph signifying the source type — gives information scent in the
+/// now-playing widget without the operator parsing the URL.
+pub fn source_glyph(source: &wire::AudioSource) -> &'static str {
+    match source {
+        wire::AudioSource::Url { .. } => "▶",
+        wire::AudioSource::LibraryPath { .. } => "🗀",
+    }
+}
+
 /// Build an `AudioSource` from a free-form URL string. Anything that
 /// doesn't start with `library:` is treated as a URL (yt-dlp resolves
 /// most things including direct stream URLs).
@@ -132,6 +164,23 @@ mod tests {
         assert!(parse_audio_source("   ").is_none());
         assert!(parse_audio_source("library:").is_none());
         assert!(parse_audio_source("library:   ").is_none());
+    }
+
+    #[test]
+    fn audio_source_host_strips_scheme_path_and_www() {
+        let host = |u: &str| audio_source_host(&wire::AudioSource::Url { url: u.into() });
+        assert_eq!(host("https://www.youtube.com/watch?v=abc"), "youtube.com");
+        assert_eq!(
+            host("http://stream.example.com:8000/live"),
+            "stream.example.com:8000"
+        );
+        assert_eq!(host("not-a-url"), "not-a-url");
+        assert_eq!(
+            audio_source_host(&wire::AudioSource::LibraryPath {
+                path: "lo-fi/x.mp3".into()
+            }),
+            "library:lo-fi/x.mp3"
+        );
     }
 
     #[test]

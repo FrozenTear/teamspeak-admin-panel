@@ -20,8 +20,8 @@ use crate::client::store::AuthState;
 use crate::ui::components::toast::{ToastVariant, use_toaster};
 use crate::ui::components::{Banner, BannerVariant, Button, ButtonSize, ButtonType, ButtonVariant};
 use crate::ui::pages::music_bots::shared::{
-    audio_source_summary, format_duration, format_error, parse_audio_source, state_badge_class,
-    state_label,
+    audio_source_host, format_duration, format_error, parse_audio_source, source_glyph,
+    state_badge_class, state_label,
 };
 use crate::ui::routes::Route;
 
@@ -277,160 +277,208 @@ pub fn BotDetailPage(bot_id: u64) -> Element {
 
                 PlayNowComposer { bot_id, state: d.state }
 
-                div { class: "card",
-                    h3 { "Now playing" }
-                    if let Some(track) = d.now_playing.as_ref() {
-                        div { class: "now-playing",
-                            div { class: "now-playing-title", "{track.title}" }
-                            div { class: "now-playing-source", "{audio_source_summary(&track.source)}" }
-                            div { class: "now-playing-meta",
-                                "{format_duration(track.duration_secs)}"
-                                if let Some(by) = track.requested_by.as_deref() {
-                                    " · requested by {by}"
-                                }
-                            }
-                        }
-                    } else {
-                        p { class: "muted", "Nothing is playing." }
-                    }
-                    // PURA-270 — surface the cause of a failed track. The
-                    // backend drops a failed bot back to `Connected`/
-                    // `InChannel` (no `Failed` wire state) and exposes the
-                    // reason as `last_error`; show it only while the bot
-                    // isn't playing so a fresh track's `NowPlaying` (which
-                    // clears `last_error`) hides a stale banner.
-                    if d.last_error.is_some() && !matches!(d.state, wire::BotState::Playing) {
-                        Banner {
-                            variant: BannerVariant::Danger,
-                            title: "Last track failed to play".to_string(),
-                            "{d.last_error.as_deref().unwrap_or_default()}"
-                        }
-                    }
-                    PlaybackControls {
-                        bot_id,
-                        state: d.state,
-                        has_track: d.now_playing.is_some(),
-                    }
-                }
+                PlayerCard { bot_id, detail }
 
-                div { class: "card",
-                    div { class: "card-header",
-                        h3 { "Queue" }
-                        span { class: "muted", "{d.queue.len()} tracks" }
-                    }
-                    if d.queue.is_empty() {
-                        p { class: "muted",
-                            "Queue is empty. Enqueue tracks from the "
-                            Link { to: Route::MusicPlaylistsPage { bot_id }, "Playlists" }
-                            " page."
-                        }
-                    } else {
-                        QueueList { tracks: d.queue.clone() }
-                    }
-                }
+                QueueCard { bot_id, detail }
             }
         }
     }
 }
 
+/// PURA-344 — the "Player card": now-playing widget + transport controls
+/// fused into one perceptual unit (Gestalt common region — the transport
+/// acts on the track shown directly above it). Reads the live `detail`
+/// signal so SSE reductions land without a prop round-trip.
 #[component]
-fn PlaybackControls(bot_id: u64, state: wire::BotState, has_track: bool) -> Element {
+fn PlayerCard(bot_id: u64, detail: Signal<Option<wire::MusicBotDetail>>) -> Element {
+    let Some(d) = detail.read().clone() else {
+        return rsx! {};
+    };
+    let playing = matches!(d.state, wire::BotState::Playing);
+    let eq_class = if playing { "np-eq is-playing" } else { "np-eq" };
+
+    rsx! {
+        div { class: "card player-card",
+            div { class: "np-eyebrow", "Now playing" }
+            if let Some(track) = d.now_playing.as_ref() {
+                div { class: "now-playing",
+                    span { class: eq_class, aria_hidden: "true",
+                        span {} span {} span {}
+                    }
+                    div { class: "np-body",
+                        div {
+                            class: "np-title",
+                            title: "{track.title}",
+                            "aria-live": "polite",
+                            "{track.title}"
+                        }
+                        div { class: "np-meta",
+                            span { class: "np-glyph", aria_hidden: "true",
+                                "{source_glyph(&track.source)}"
+                            }
+                            span { "{audio_source_host(&track.source)}" }
+                            if let Some(by) = track.requested_by.as_deref() {
+                                span { class: "np-dot", "·" }
+                                span { "requested by {by}" }
+                            }
+                            span { class: "np-dot", "·" }
+                            span { "{d.name}" }
+                        }
+                        div { class: "np-duration", "{format_duration(track.duration_secs)}" }
+                    }
+                }
+            } else {
+                div { class: "now-playing now-playing--empty",
+                    p { class: "muted", "Nothing playing" }
+                    p { class: "muted small",
+                        "Use Play now above or enqueue a track to start."
+                    }
+                }
+            }
+            // PURA-270 — surface the cause of a failed track. The backend
+            // drops a failed bot back to `Connected`/`InChannel` (no
+            // `Failed` wire state) and exposes the reason as `last_error`;
+            // show it only while the bot isn't playing so a fresh track's
+            // `NowPlaying` (which clears `last_error`) hides a stale banner.
+            if d.last_error.is_some() && !playing {
+                Banner {
+                    variant: BannerVariant::Danger,
+                    title: "Last track failed to play".to_string(),
+                    "{d.last_error.as_deref().unwrap_or_default()}"
+                }
+            }
+            PlayerControls { bot_id, detail }
+        }
+    }
+}
+
+/// One stateful Play/Pause control + Prev/Skip/Stop. Per PURA-343 §5:
+/// optimistic state flip on click, whole-bar disable while a command is
+/// in flight, spinner only past ~400ms, revert on error.
+#[component]
+fn PlayerControls(bot_id: u64, detail: Signal<Option<wire::MusicBotDetail>>) -> Element {
     let bot = wire::BotId(bot_id);
     let gate = use_auth_gate();
     let toaster = use_toaster();
+    let mut detail = detail;
+    // The command currently awaiting its REST round-trip, if any. Drives
+    // the whole-bar disable; `slow` only flips the spinner on past 400ms.
+    let mut pending: Signal<Option<AudioAction>> = use_signal(|| None);
+    let mut slow: Signal<bool> = use_signal(|| false);
 
+    let Some(d) = detail.read().clone() else {
+        return rsx! {};
+    };
     // Audio commands are meaningless when the bot isn't on a server — the
-    // backend would 404 the dispatch with `bot not found` (translated by
-    // `translate_send_error` for an `ActorGone` actor). Disable the row
-    // wholesale so the chrome reflects what the operator can actually do.
-    let in_channel = matches!(state, wire::BotState::InChannel | wire::BotState::Playing);
+    // backend would 404 the dispatch. Disable the row wholesale so the
+    // chrome reflects what the operator can actually do.
+    let in_channel = matches!(d.state, wire::BotState::InChannel | wire::BotState::Playing);
+    let has_track = d.now_playing.is_some();
+    let busy = pending.read().is_some();
+    let transport = transport_action(d.state, has_track, d.queue.len());
 
-    let dispatch = {
-        let gate = gate.clone();
-        move |kind: AudioAction| {
-            let gate = gate.clone();
-            let toaster = toaster;
-            spawn(async move {
-                let res = match kind {
-                    AudioAction::SkipPrev => mb::skip_prev(gate, bot).await,
-                    AudioAction::Resume => mb::resume_bot(gate, bot).await,
-                    AudioAction::Pause => mb::pause_bot(gate, bot).await,
-                    AudioAction::SkipNext => mb::skip_next(gate, bot).await,
-                    AudioAction::Stop => mb::stop_bot(gate, bot).await,
-                };
-                match res {
-                    Ok(()) => {
-                        toaster.push(ToastVariant::Success, kind.success_label(), None);
-                    }
-                    Err(e) => {
-                        toaster.push(
-                            ToastVariant::Danger,
-                            kind.failure_label(),
-                            Some(format_error(&e)),
-                        );
-                    }
-                }
-            });
+    let dispatch = move |action: AudioAction| {
+        if pending.read().is_some() {
+            return;
         }
+        let prev = detail.read().clone();
+        detail.with_mut(|opt| {
+            if let Some(s) = opt.as_mut() {
+                apply_optimistic(s, action);
+            }
+        });
+        pending.set(Some(action));
+        slow.set(false);
+        // Doherty threshold — only show a spinner if the round-trip is
+        // still outstanding after ~400ms; a fast command never flickers.
+        spawn(async move {
+            gloo_timers::future::TimeoutFuture::new(400).await;
+            if *pending.read() == Some(action) {
+                slow.set(true);
+            }
+        });
+        let gate = gate.clone();
+        spawn(async move {
+            let res = match action {
+                AudioAction::SkipPrev => mb::skip_prev(gate, bot).await,
+                AudioAction::Resume => mb::resume_bot(gate, bot).await,
+                AudioAction::Pause => mb::pause_bot(gate, bot).await,
+                AudioAction::SkipNext => mb::skip_next(gate, bot).await,
+                AudioAction::Stop => mb::stop_bot(gate, bot).await,
+            };
+            pending.set(None);
+            slow.set(false);
+            match res {
+                Ok(()) => toaster.push(ToastVariant::Success, action.success_label(), None),
+                Err(e) => {
+                    // Revert the optimistic flip to the last server-
+                    // confirmed snapshot. The SSE stream remains the
+                    // authoritative reconciler on the success path.
+                    detail.set(prev);
+                    toaster.push(
+                        ToastVariant::Danger,
+                        action.failure_label(),
+                        Some(format_error(&e)),
+                    );
+                }
+            }
+        });
     };
 
-    let on_skip_prev = {
-        let dispatch = dispatch.clone();
+    let spinner_for = move |action: AudioAction| *slow.read() && *pending.read() == Some(action);
+
+    let on_prev = {
+        let mut dispatch = dispatch.clone();
         move |_| dispatch(AudioAction::SkipPrev)
     };
-    let on_resume = {
-        let dispatch = dispatch.clone();
-        move |_| dispatch(AudioAction::Resume)
+    let on_play_pause = {
+        let mut dispatch = dispatch.clone();
+        let action = transport.action;
+        move |_| dispatch(action)
     };
-    let on_pause = {
-        let dispatch = dispatch.clone();
-        move |_| dispatch(AudioAction::Pause)
-    };
-    let on_skip_next = {
-        let dispatch = dispatch.clone();
+    let on_skip = {
+        let mut dispatch = dispatch.clone();
         move |_| dispatch(AudioAction::SkipNext)
     };
     let on_stop = {
-        let dispatch = dispatch;
+        let mut dispatch = dispatch;
         move |_| dispatch(AudioAction::Stop)
     };
 
     rsx! {
-        div { class: "playback-controls",
+        div { class: "player-controls",
             Button {
                 variant: ButtonVariant::Ghost,
-                size: ButtonSize::Small,
-                disabled: !in_channel,
-                onclick: on_skip_prev,
-                "« Prev"
+                disabled: !in_channel || busy,
+                loading: spinner_for(AudioAction::SkipPrev),
+                aria_label: "Previous track".to_string(),
+                onclick: on_prev,
+                "⏮"
             }
             Button {
                 variant: ButtonVariant::Primary,
-                size: ButtonSize::Small,
-                disabled: !in_channel || !has_track,
-                onclick: on_resume,
-                "Play"
-            }
-            Button {
-                variant: ButtonVariant::Secondary,
-                size: ButtonSize::Small,
-                disabled: !in_channel || !has_track,
-                onclick: on_pause,
-                "Pause"
+                size: ButtonSize::Large,
+                disabled: !in_channel || transport.disabled || busy,
+                loading: spinner_for(AudioAction::Resume) || spinner_for(AudioAction::Pause),
+                aria_label: transport.aria.to_string(),
+                onclick: on_play_pause,
+                "{transport.label}"
             }
             Button {
                 variant: ButtonVariant::Ghost,
-                size: ButtonSize::Small,
-                disabled: !in_channel,
-                onclick: on_skip_next,
-                "Skip »"
+                disabled: !in_channel || busy,
+                loading: spinner_for(AudioAction::SkipNext),
+                aria_label: "Skip to next track".to_string(),
+                onclick: on_skip,
+                "⏭"
             }
+            div { class: "player-controls__spacer" }
             Button {
                 variant: ButtonVariant::Danger,
-                size: ButtonSize::Small,
-                disabled: !in_channel || !has_track,
+                disabled: !in_channel || !has_track || busy,
+                loading: spinner_for(AudioAction::Stop),
                 onclick: on_stop,
-                "Stop"
+                "⏹ Stop"
             }
         }
         if !in_channel {
@@ -438,6 +486,75 @@ fn PlaybackControls(bot_id: u64, state: wire::BotState, has_track: bool) -> Elem
                 "Bot must be in a channel to control playback. Connect and join a channel first."
             }
         }
+    }
+}
+
+/// Resolved Play/Pause control for a given bot state — single stateful
+/// button per PURA-343 §5.2 (no `aria-pressed` toggle; the accessible
+/// *name* tracks state instead).
+struct Transport {
+    label: &'static str,
+    aria: &'static str,
+    action: AudioAction,
+    disabled: bool,
+}
+
+fn transport_action(state: wire::BotState, has_track: bool, queue_len: usize) -> Transport {
+    match state {
+        wire::BotState::Playing => Transport {
+            label: "⏸ Pause",
+            aria: "Pause",
+            action: AudioAction::Pause,
+            disabled: false,
+        },
+        wire::BotState::InChannel if has_track => Transport {
+            label: "▶ Resume",
+            aria: "Resume",
+            action: AudioAction::Resume,
+            disabled: false,
+        },
+        wire::BotState::InChannel if queue_len > 0 => Transport {
+            label: "▶ Play",
+            aria: "Play",
+            action: AudioAction::Resume,
+            disabled: false,
+        },
+        wire::BotState::InChannel => Transport {
+            label: "▶ Play",
+            aria: "Play (queue is empty)",
+            action: AudioAction::Resume,
+            disabled: true,
+        },
+        _ => Transport {
+            label: "▶ Play",
+            aria: "Play",
+            action: AudioAction::Resume,
+            disabled: true,
+        },
+    }
+}
+
+/// Optimistic local flip applied the instant a transport button is
+/// clicked, before the REST round-trip resolves. Reconciled by the SSE
+/// `StateChanged` / `NowPlaying` event on success, reverted on error.
+fn apply_optimistic(d: &mut wire::MusicBotDetail, action: AudioAction) {
+    match action {
+        AudioAction::Pause => {
+            if d.state == wire::BotState::Playing {
+                d.state = wire::BotState::InChannel;
+            }
+        }
+        AudioAction::Resume => {
+            if d.state == wire::BotState::InChannel {
+                d.state = wire::BotState::Playing;
+            }
+        }
+        AudioAction::Stop => {
+            if d.state == wire::BotState::Playing {
+                d.state = wire::BotState::InChannel;
+            }
+        }
+        AudioAction::SkipPrev | AudioAction::SkipNext => {}
     }
 }
 
@@ -534,7 +651,7 @@ fn PlayNowComposer(bot_id: u64, state: wire::BotState) -> Element {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum AudioAction {
     SkipPrev,
     Resume,
@@ -565,29 +682,303 @@ impl AudioAction {
     }
 }
 
-#[derive(Props, Clone, PartialEq)]
-struct QueueListProps {
-    tracks: Vec<wire::Track>,
+/// Return `queue` with the entries at `a` and `b` swapped. Out-of-range
+/// indices are a no-op so a disabled first-row `↑` (or last-row `↓`) that
+/// still fires can't panic.
+fn reorder_swap(queue: &[wire::Track], a: usize, b: usize) -> Vec<wire::Track> {
+    let mut v = queue.to_vec();
+    if a < v.len() && b < v.len() {
+        v.swap(a, b);
+    }
+    v
+}
+
+/// PURA-344 — the Queue card: upcoming tracks with keyboard-operable
+/// up/down reorder (PURA-343 §7.2 chose buttons over drag-and-drop),
+/// per-row remove, and a confirmed "Clear queue". All three mutations
+/// apply optimistically to the live `detail` signal, then reconcile from
+/// the `QueueChanged` SSE event (or revert on error).
+#[component]
+fn QueueCard(bot_id: u64, detail: Signal<Option<wire::MusicBotDetail>>) -> Element {
+    let bot = wire::BotId(bot_id);
+    let gate = use_auth_gate();
+    let toaster = use_toaster();
+    let mut detail = detail;
+    let mut confirm_clear: Signal<bool> = use_signal(|| false);
+    // A queue mutation is in flight — lock the action buttons so a second
+    // reorder/remove can't race the first against a stale permutation.
+    let mut busy: Signal<bool> = use_signal(|| false);
+
+    let Some(d) = detail.read().clone() else {
+        return rsx! {};
+    };
+    let queue = d.queue.clone();
+    let len = queue.len();
+    let locked = *busy.read();
+
+    let snapshot_queue = move || -> Vec<wire::Track> {
+        detail
+            .read()
+            .as_ref()
+            .map(|d| d.queue.clone())
+            .unwrap_or_default()
+    };
+
+    let do_reorder = {
+        let gate = gate.clone();
+        move |a: usize, b: usize| {
+            if *busy.read() {
+                return;
+            }
+            let prev = snapshot_queue();
+            let next = reorder_swap(&prev, a, b);
+            if next == prev {
+                return;
+            }
+            let track_ids: Vec<wire::TrackId> = next.iter().map(|t| t.id).collect();
+            detail.with_mut(|opt| {
+                if let Some(s) = opt.as_mut() {
+                    s.queue = next;
+                }
+            });
+            busy.set(true);
+            let gate = gate.clone();
+            spawn(async move {
+                let res = mb::reorder_queue(gate, bot, track_ids).await;
+                busy.set(false);
+                match res {
+                    Ok(tracks) => detail.with_mut(|opt| {
+                        if let Some(s) = opt.as_mut() {
+                            s.queue = tracks;
+                        }
+                    }),
+                    Err(e) => {
+                        detail.with_mut(|opt| {
+                            if let Some(s) = opt.as_mut() {
+                                s.queue = prev;
+                            }
+                        });
+                        toaster.push(
+                            ToastVariant::Danger,
+                            "Reorder failed",
+                            Some(format_error(&e)),
+                        );
+                    }
+                }
+            });
+        }
+    };
+
+    let do_remove = {
+        let gate = gate.clone();
+        move |track: wire::TrackId| {
+            if *busy.read() {
+                return;
+            }
+            let prev = snapshot_queue();
+            detail.with_mut(|opt| {
+                if let Some(s) = opt.as_mut() {
+                    s.queue.retain(|t| t.id != track);
+                }
+            });
+            busy.set(true);
+            let gate = gate.clone();
+            spawn(async move {
+                let res = mb::remove_queue_track(gate, bot, track).await;
+                busy.set(false);
+                match res {
+                    Ok(()) => toaster.push(ToastVariant::Success, "Removed from queue", None),
+                    Err(e) => {
+                        detail.with_mut(|opt| {
+                            if let Some(s) = opt.as_mut() {
+                                s.queue = prev;
+                            }
+                        });
+                        toaster.push(
+                            ToastVariant::Danger,
+                            "Remove failed",
+                            Some(format_error(&e)),
+                        );
+                    }
+                }
+            });
+        }
+    };
+
+    let on_clear = {
+        let gate = gate.clone();
+        move |_| {
+            let prev = snapshot_queue();
+            detail.with_mut(|opt| {
+                if let Some(s) = opt.as_mut() {
+                    s.queue.clear();
+                }
+            });
+            confirm_clear.set(false);
+            busy.set(true);
+            let gate = gate.clone();
+            spawn(async move {
+                let res = mb::clear_queue(gate, bot).await;
+                busy.set(false);
+                match res {
+                    Ok(()) => toaster.push(ToastVariant::Success, "Queue cleared", None),
+                    Err(e) => {
+                        detail.with_mut(|opt| {
+                            if let Some(s) = opt.as_mut() {
+                                s.queue = prev;
+                            }
+                        });
+                        toaster.push(ToastVariant::Danger, "Clear failed", Some(format_error(&e)));
+                    }
+                }
+            });
+        }
+    };
+
+    rsx! {
+        div { class: "card queue-card",
+            div { class: "card-header",
+                h3 { "Up next" }
+                div { class: "card-header__aside",
+                    span { class: "muted", "{len} tracks" }
+                    if len > 0 {
+                        Button {
+                            variant: ButtonVariant::Secondary,
+                            size: ButtonSize::Small,
+                            disabled: locked,
+                            onclick: move |_| confirm_clear.set(true),
+                            "Clear queue"
+                        }
+                    }
+                }
+            }
+            if queue.is_empty() {
+                div { class: "empty",
+                    div { class: "icon", aria_hidden: "true", "♪" }
+                    h3 { "Queue is empty" }
+                    p {
+                        "Enqueue tracks from the "
+                        Link { to: Route::MusicPlaylistsPage { bot_id }, "Playlists" }
+                        " page, or use Play now above."
+                    }
+                }
+            } else {
+                ol { class: "queue",
+                    for (idx, track) in queue.iter().cloned().enumerate() {
+                        QueueRow {
+                            key: "{track.id.0}",
+                            track: track.clone(),
+                            position: idx + 1,
+                            is_first: idx == 0,
+                            is_last: idx + 1 == len,
+                            locked,
+                            on_up: {
+                                let mut do_reorder = do_reorder.clone();
+                                move |_| do_reorder(idx, idx - 1)
+                            },
+                            on_down: {
+                                let mut do_reorder = do_reorder.clone();
+                                move |_| do_reorder(idx, idx + 1)
+                            },
+                            on_remove: {
+                                let mut do_remove = do_remove.clone();
+                                let id = track.id;
+                                move |_| do_remove(id)
+                            },
+                        }
+                    }
+                }
+            }
+        }
+        if *confirm_clear.read() {
+            div { class: "modal-backdrop", onclick: move |_| confirm_clear.set(false),
+                div {
+                    class: "modal modal-sm",
+                    onclick: move |evt| evt.stop_propagation(),
+                    role: "dialog",
+                    "aria-modal": "true",
+                    "aria-labelledby": "clear-queue-title",
+                    div { class: "modal-header",
+                        h2 { id: "clear-queue-title", "Clear the queue?" }
+                        button {
+                            r#type: "button",
+                            class: "modal-close",
+                            "aria-label": "Close",
+                            onclick: move |_| confirm_clear.set(false),
+                            "×"
+                        }
+                    }
+                    div { class: "modal-body",
+                        p {
+                            "This removes all {len} tracks. The current track keeps playing."
+                        }
+                    }
+                    div { class: "modal-actions",
+                        Button {
+                            variant: ButtonVariant::Ghost,
+                            onclick: move |_| confirm_clear.set(false),
+                            "Cancel"
+                        }
+                        Button {
+                            variant: ButtonVariant::Danger,
+                            onclick: on_clear,
+                            "Clear queue"
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[component]
-fn QueueList(props: QueueListProps) -> Element {
+fn QueueRow(
+    track: wire::Track,
+    position: usize,
+    is_first: bool,
+    is_last: bool,
+    locked: bool,
+    on_up: EventHandler<MouseEvent>,
+    on_down: EventHandler<MouseEvent>,
+    on_remove: EventHandler<MouseEvent>,
+) -> Element {
     rsx! {
-        ol { class: "queue-list",
-            for (idx, track) in props.tracks.iter().enumerate() {
-                {
-                    let track = track.clone();
-                    let pos = idx + 1;
-                    rsx! {
-                        li { key: "{track.id.0}", class: "queue-item",
-                            span { class: "queue-pos", "{pos}." }
-                            div { class: "queue-meta",
-                                span { class: "queue-title", "{track.title}" }
-                                span { class: "queue-source", "{audio_source_summary(&track.source)}" }
-                            }
-                            span { class: "queue-duration", "{format_duration(track.duration_secs)}" }
-                        }
+        li { class: "queue-row",
+            span { class: "queue-row__pos", "{position}." }
+            div { class: "queue-row__body",
+                span { class: "queue-row__title", title: "{track.title}", "{track.title}" }
+                span { class: "queue-row__sub",
+                    "{audio_source_host(&track.source)}"
+                    if let Some(by) = track.requested_by.as_deref() {
+                        " · requested by {by}"
                     }
+                }
+            }
+            span { class: "queue-row__duration", "{format_duration(track.duration_secs)}" }
+            div { class: "queue-row__actions",
+                button {
+                    r#type: "button",
+                    class: "icon-btn",
+                    disabled: locked || is_first,
+                    "aria-label": "Move {track.title} up",
+                    onclick: move |e| on_up.call(e),
+                    "↑"
+                }
+                button {
+                    r#type: "button",
+                    class: "icon-btn",
+                    disabled: locked || is_last,
+                    "aria-label": "Move {track.title} down",
+                    onclick: move |e| on_down.call(e),
+                    "↓"
+                }
+                button {
+                    r#type: "button",
+                    class: "icon-btn icon-btn--danger",
+                    disabled: locked,
+                    "aria-label": "Remove {track.title} from queue",
+                    onclick: move |e| on_remove.call(e),
+                    "✕"
                 }
             }
         }
@@ -813,5 +1204,86 @@ mod tests {
             },
         );
         assert_eq!(d, before);
+    }
+
+    #[test]
+    fn transport_playing_offers_pause() {
+        let t = transport_action(wire::BotState::Playing, true, 3);
+        assert_eq!(t.action, AudioAction::Pause);
+        assert!(!t.disabled);
+        assert_eq!(t.aria, "Pause");
+    }
+
+    #[test]
+    fn transport_in_channel_with_track_offers_resume() {
+        let t = transport_action(wire::BotState::InChannel, true, 0);
+        assert_eq!(t.action, AudioAction::Resume);
+        assert!(!t.disabled);
+        assert_eq!(t.aria, "Resume");
+    }
+
+    #[test]
+    fn transport_in_channel_no_track_but_queue_offers_play() {
+        let t = transport_action(wire::BotState::InChannel, false, 2);
+        assert_eq!(t.action, AudioAction::Resume);
+        assert!(!t.disabled);
+        assert_eq!(t.label, "▶ Play");
+    }
+
+    #[test]
+    fn transport_in_channel_empty_queue_disables_play() {
+        let t = transport_action(wire::BotState::InChannel, false, 0);
+        assert!(t.disabled);
+        assert_eq!(t.aria, "Play (queue is empty)");
+    }
+
+    #[test]
+    fn transport_disconnected_disables_play() {
+        for state in [
+            wire::BotState::Disconnected,
+            wire::BotState::Connecting,
+            wire::BotState::Connected,
+            wire::BotState::Disconnecting,
+        ] {
+            assert!(transport_action(state, false, 5).disabled, "{state:?}");
+        }
+    }
+
+    #[test]
+    fn optimistic_pause_drops_playing_to_in_channel() {
+        let mut d = fixture(wire::BotState::Playing);
+        apply_optimistic(&mut d, AudioAction::Pause);
+        assert_eq!(d.state, wire::BotState::InChannel);
+    }
+
+    #[test]
+    fn optimistic_resume_promotes_in_channel_to_playing() {
+        let mut d = fixture(wire::BotState::InChannel);
+        apply_optimistic(&mut d, AudioAction::Resume);
+        assert_eq!(d.state, wire::BotState::Playing);
+    }
+
+    #[test]
+    fn optimistic_skip_leaves_state_untouched() {
+        let mut d = fixture(wire::BotState::Playing);
+        apply_optimistic(&mut d, AudioAction::SkipNext);
+        assert_eq!(d.state, wire::BotState::Playing);
+    }
+
+    #[test]
+    fn reorder_swap_moves_a_row_up() {
+        let q = vec![track(1, "a"), track(2, "b"), track(3, "c")];
+        let out = reorder_swap(&q, 1, 0);
+        let ids: Vec<u64> = out.iter().map(|t| t.id.0).collect();
+        assert_eq!(ids, vec![2, 1, 3]);
+    }
+
+    #[test]
+    fn reorder_swap_out_of_range_is_noop() {
+        let q = vec![track(1, "a"), track(2, "b")];
+        // first-row `↑` would compute target `usize::MAX` via `idx - 1`
+        // wrapping — the disabled button shouldn't fire, but guard anyway.
+        let out = reorder_swap(&q, 0, usize::MAX);
+        assert_eq!(out, q);
     }
 }

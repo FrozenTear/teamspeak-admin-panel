@@ -1970,3 +1970,225 @@ textarea.input {
   min-height: 56px;
   font: inherit;
 }
+
+/* ─── Music-bot player + queue (PURA-344) ──────────────────────
+   Player card = now-playing widget + transport controls fused as
+   one perceptual unit (Gestalt common region). Queue card carries
+   keyboard-operable up/down reorder + remove. Also defines the
+   .card-header / .card-row / .card-actions primitives that the
+   music-bot detail page referenced before they existed. */
+.card-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-4);
+  margin-bottom: var(--space-5);
+}
+.card-header h3 { margin: 0; }
+.card-header__aside {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+}
+.card-row {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  margin-top: var(--space-4);
+}
+.card-row .input { flex: 1 1 auto; }
+.card-actions {
+  display: flex;
+  gap: var(--space-3);
+  margin-top: var(--space-4);
+}
+
+.player-card,
+.queue-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+.np-eyebrow {
+  font: var(--weight-semibold) var(--text-2xs) / var(--lh-2xs) var(--font-sans);
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.now-playing {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-4);
+}
+.now-playing--empty {
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.np-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+}
+.np-title {
+  font: var(--weight-semibold) var(--text-lg) / var(--lh-lg) var(--font-sans);
+  color: var(--text-primary);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.np-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+.np-glyph { color: var(--accent-fg); }
+.np-dot { color: var(--text-muted); }
+.np-duration {
+  font-variant-numeric: tabular-nums;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+/* 3-bar equalizer — a truthful playing/paused signal. `elapsedSecs`
+   is not on the wire yet, so a real progress bar would have to lie;
+   the equalizer animates only while Playing and is static otherwise. */
+.np-eq {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 2px;
+  width: 18px;
+  height: 22px;
+  flex: 0 0 auto;
+}
+.np-eq span {
+  flex: 1 1 0;
+  height: 35%;
+  background: var(--accent-fg);
+  border-radius: var(--radius-sm);
+}
+.np-eq.is-playing span { animation: np-eq-bounce 900ms ease-in-out infinite; }
+.np-eq.is-playing span:nth-child(2) { animation-delay: 150ms; }
+.np-eq.is-playing span:nth-child(3) { animation-delay: 300ms; }
+@keyframes np-eq-bounce {
+  0%, 100% { height: 30%; }
+  50%      { height: 100%; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .np-eq span,
+  .np-eq.is-playing span { animation: none; height: 55%; }
+}
+
+.player-controls {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+}
+.player-controls__spacer { flex: 1 1 auto; }
+
+.queue {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+.queue-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  padding: var(--space-4) var(--space-5);
+  border-bottom: 1px solid var(--border-subtle);
+}
+.queue-row:last-child { border-bottom: none; }
+.queue-row:hover { background: var(--bg-hover); }
+.queue-row__pos {
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+  flex: 0 0 auto;
+  min-width: 1.5em;
+}
+.queue-row__body {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.queue-row__title {
+  font-size: var(--text-sm);
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.queue-row__sub {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.queue-row__duration {
+  font-variant-numeric: tabular-nums;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+  flex: 0 0 auto;
+}
+.queue-row__actions {
+  display: flex;
+  gap: var(--space-2);
+  flex: 0 0 auto;
+}
+
+/* Square icon button — used for the queue row ↑/↓/✕ cluster. */
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--touch-min);
+  height: var(--touch-min);
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: var(--text-md);
+  cursor: pointer;
+  transition: background var(--motion-fast) ease, color var(--motion-fast) ease;
+}
+.icon-btn:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+.icon-btn:focus-visible {
+  outline: none;
+  box-shadow: var(--shadow-focus);
+}
+.icon-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.icon-btn--danger:hover:not(:disabled) { color: var(--danger-fg); }
+
+.modal.modal-sm { width: min(420px, calc(100vw - var(--space-8))); }
+
+/* Mobile (≤540px) — stack the player; Play/Pause spans full width as
+   the dominant target, Stop kept on its own row below. */
+@media (max-width: 540px) {
+  .player-controls { flex-wrap: wrap; }
+  .player-controls .btn-lg { order: 2; flex: 1 1 100%; }
+  .player-controls__spacer { display: none; }
+  .player-controls .btn-danger { order: 3; flex: 1 1 100%; }
+  .queue-row { flex-wrap: wrap; }
+  .queue-row__actions { flex: 1 1 100%; justify-content: flex-end; }
+  .icon-btn {
+    width: var(--touch-comfortable);
+    height: var(--touch-comfortable);
+  }
+}
