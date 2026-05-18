@@ -74,6 +74,9 @@ pub struct EventSourceDeps {
     pub db: Arc<Database>,
     pub hub: Hub,
     pub control: ControlBackendPool,
+    /// Flow-engine handle — the worker bridges join/chat/move notify
+    /// frames into the automod trigger surface (PURA-300).
+    pub flow_engine: crate::flow::FlowEngineHandle,
 }
 
 /// Drop-guard returned by [`spawn`]. Holding it keeps the watch sender
@@ -246,6 +249,14 @@ async fn run_worker(
         );
     }
 
+    // Per-worker clid→UID cache for the flow-engine bridge. `notifyclientmoved`
+    // frames carry only the numeric client id, so the UID a subject-scoped
+    // flood window needs is recovered from the `enterview` the client sent on
+    // join. Reset on worker restart — acceptable: flood windows are
+    // seconds-to-minutes and a restart simply forgives an in-flight burst
+    // (automod brief §3.3).
+    let mut clid_uid: HashMap<String, String> = HashMap::new();
+
     loop {
         tokio::select! {
             biased;
@@ -289,7 +300,10 @@ async fn run_worker(
 
             recv = notify_rx.recv() => {
                 match recv {
-                    Ok(frame) => publish_notify(&deps.hub, config_id, &frame).await,
+                    Ok(frame) => {
+                        publish_notify(&deps.hub, config_id, &frame).await;
+                        bridge_to_flow_engine(&deps.flow_engine, &mut clid_uid, &frame).await;
+                    }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         // Slow consumer. Each lagged item is one missed
                         // notify line; bump the dropped counter the
@@ -426,6 +440,144 @@ fn record_to_value(record: &HashMap<String, String>) -> Value {
     Value::Object(obj)
 }
 
+// ---------------------------------------------------------------------------
+// Flow-engine bridge (PURA-300 — automod triggers)
+// ---------------------------------------------------------------------------
+
+/// The manager connects one TS6 virtual server per SSH `server_connection`
+/// (the widget principal and dashboard tick both assume vserver id 1), so
+/// the automod trigger surface keys flows on this id.
+const FLOW_VIRTUAL_SERVER_ID: i64 = 1;
+
+/// A notify frame translated into a flow-engine producer call. Kept as a
+/// pure value so [`parse_bridge_event`] is unit-testable without a DB or a
+/// live engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BridgeEvent {
+    ClientJoined {
+        channel_id: i64,
+        uid: String,
+        nickname: String,
+        clid: Option<String>,
+    },
+    ClientLeft {
+        clid: String,
+    },
+    ChatMessage {
+        target_mode: String,
+        uid: String,
+        nickname: String,
+        message: String,
+    },
+    ClientMoved {
+        clid: String,
+    },
+}
+
+/// Extract a [`BridgeEvent`] from a parsed notify frame. Returns `None` for
+/// events the automod trigger surface does not consume, or when a required
+/// field is missing.
+fn parse_bridge_event(frame: &NotifyFrame) -> Option<BridgeEvent> {
+    let rec = frame.records.first()?;
+    match frame.event.as_str() {
+        "notifycliententer" | "notifycliententerview" => {
+            let uid = rec.get("client_unique_identifier")?.clone();
+            let channel_id = rec.get("ctid")?.parse::<i64>().ok()?;
+            Some(BridgeEvent::ClientJoined {
+                channel_id,
+                uid,
+                nickname: rec.get("client_nickname").cloned().unwrap_or_default(),
+                clid: rec.get("clid").cloned(),
+            })
+        }
+        "notifyclientleftview" => Some(BridgeEvent::ClientLeft {
+            clid: rec.get("clid")?.clone(),
+        }),
+        "notifytextmessage" => {
+            // TS6 `targetmode`: 1 = private, 2 = channel, 3 = server. The
+            // notify frame carries no channel id, so a channel-scoped chat
+            // trigger filter cannot be matched — chat triggers run with
+            // `channel_id = None` (the seed filters are mode/content based).
+            let target_mode = match rec.get("targetmode").map(String::as_str) {
+                Some("1") => "private",
+                Some("2") => "channel",
+                Some("3") => "server",
+                other => other.unwrap_or("unknown"),
+            }
+            .to_string();
+            Some(BridgeEvent::ChatMessage {
+                target_mode,
+                uid: rec.get("invokeruid")?.clone(),
+                nickname: rec.get("invokername").cloned().unwrap_or_default(),
+                message: rec.get("msg")?.clone(),
+            })
+        }
+        "notifyclientmoved" => Some(BridgeEvent::ClientMoved {
+            clid: rec.get("clid")?.clone(),
+        }),
+        _ => None,
+    }
+}
+
+/// Bridge a parsed notify frame into the flow engine's automod trigger
+/// surface. Runs alongside [`publish_notify`] — WS-topic republishing is
+/// unaffected; this is a parallel fan-out so `Ts6ClientJoined` /
+/// `Ts6ChatMessage` / `Ts6Flood` flows fire from real TS6 events.
+async fn bridge_to_flow_engine(
+    engine: &crate::flow::FlowEngineHandle,
+    clid_uid: &mut HashMap<String, String>,
+    frame: &NotifyFrame,
+) {
+    let Some(event) = parse_bridge_event(frame) else {
+        return;
+    };
+    match event {
+        BridgeEvent::ClientJoined {
+            channel_id,
+            uid,
+            nickname,
+            clid,
+        } => {
+            if let Some(clid) = clid {
+                clid_uid.insert(clid, uid.clone());
+            }
+            engine
+                .on_client_joined(FLOW_VIRTUAL_SERVER_ID, channel_id, uid, nickname)
+                .await;
+        }
+        BridgeEvent::ClientLeft { clid } => {
+            clid_uid.remove(&clid);
+        }
+        BridgeEvent::ChatMessage {
+            target_mode,
+            uid,
+            nickname,
+            message,
+        } => {
+            engine
+                .on_chat_message(
+                    FLOW_VIRTUAL_SERVER_ID,
+                    None,
+                    target_mode,
+                    uid,
+                    nickname,
+                    message,
+                )
+                .await;
+        }
+        BridgeEvent::ClientMoved { clid } => {
+            // `notifyclientmoved` carries no UID — recover it from the
+            // join cache. A move for a client that joined before this
+            // worker started is skipped; channel-hop flood tolerates the
+            // gap (windows are seconds-to-minutes).
+            let Some(uid) = clid_uid.get(&clid).cloned() else {
+                return;
+            };
+            engine.on_client_moved(FLOW_VIRTUAL_SERVER_ID, uid).await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -524,6 +676,88 @@ mod tests {
         assert_eq!(arr.len(), 3);
         assert_eq!(arr[0]["clid"], "5");
         assert_eq!(arr[2]["clid"], "7");
+    }
+
+    fn notify(event: &str, pairs: &[(&str, &str)]) -> NotifyFrame {
+        NotifyFrame {
+            event: event.to_string(),
+            records: vec![record(pairs)],
+        }
+    }
+
+    #[test]
+    fn parse_bridge_event_extracts_client_joined() {
+        let frame = notify(
+            "notifycliententerview",
+            &[
+                ("ctid", "7"),
+                ("clid", "42"),
+                ("client_unique_identifier", "uid-abc="),
+                ("client_nickname", "Alice"),
+            ],
+        );
+        assert_eq!(
+            parse_bridge_event(&frame),
+            Some(BridgeEvent::ClientJoined {
+                channel_id: 7,
+                uid: "uid-abc=".into(),
+                nickname: "Alice".into(),
+                clid: Some("42".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_bridge_event_extracts_chat_message_with_target_mode() {
+        let frame = notify(
+            "notifytextmessage",
+            &[
+                ("targetmode", "2"),
+                ("msg", "buy followers now"),
+                ("invokeruid", "uid-spammer="),
+                ("invokername", "Spammer"),
+            ],
+        );
+        assert_eq!(
+            parse_bridge_event(&frame),
+            Some(BridgeEvent::ChatMessage {
+                target_mode: "channel".into(),
+                uid: "uid-spammer=".into(),
+                nickname: "Spammer".into(),
+                message: "buy followers now".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_bridge_event_extracts_client_moved_and_left() {
+        assert_eq!(
+            parse_bridge_event(&notify("notifyclientmoved", &[("ctid", "5"), ("clid", "12")])),
+            Some(BridgeEvent::ClientMoved { clid: "12".into() })
+        );
+        assert_eq!(
+            parse_bridge_event(&notify("notifyclientleftview", &[("clid", "12")])),
+            Some(BridgeEvent::ClientLeft { clid: "12".into() })
+        );
+    }
+
+    #[test]
+    fn parse_bridge_event_ignores_unrelated_and_incomplete_frames() {
+        // Channel events are not part of the automod trigger surface.
+        assert_eq!(
+            parse_bridge_event(&notify("notifychannelcreated", &[("cid", "9")])),
+            None
+        );
+        // Enterview without a UID cannot key a trigger.
+        assert_eq!(
+            parse_bridge_event(&notify("notifycliententerview", &[("ctid", "7")])),
+            None
+        );
+        // Text message without an invoker UID is dropped.
+        assert_eq!(
+            parse_bridge_event(&notify("notifytextmessage", &[("msg", "hi")])),
+            None
+        );
     }
 
     #[tokio::test]
