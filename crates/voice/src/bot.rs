@@ -1127,6 +1127,23 @@ async fn apply_chat_audio_action(
     use chat::ChatAudioAction;
     match action {
         ChatAudioAction::None => {}
+        ChatAudioAction::Pause => {
+            // PURA-353 — `!pause` parks the live pipeline's sibling, the
+            // same `watch` flip the REST `pause_bot` control uses via
+            // `AudioCommand::Pause`. A no-op when nothing is playing.
+            if let Some(active) = current_audio.as_ref() {
+                active.set_paused(true);
+            } else {
+                debug!("chat !pause ignored — no active pipeline");
+            }
+        }
+        ChatAudioAction::Resume => {
+            if let Some(active) = current_audio.as_ref() {
+                active.set_paused(false);
+            } else {
+                debug!("chat !resume ignored — no active pipeline");
+            }
+        }
         ChatAudioAction::StartIfIdle => {
             // `!play` — start the queue head. A no-op when a pipeline is
             // already live: the enqueued track stays queued and plays

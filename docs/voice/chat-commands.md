@@ -24,8 +24,9 @@ the web UI.
 | ------------------ | --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
 | `!radio <name|url>`| Replace queue with a radio source; auto-play         | Clears queue, enqueues (URL or library lookup by title), emits `QueueChanged` + `NowPlaying`. Replies `radio: …` |
 | `!play <url|search>` | Enqueue + start if idle                            | Enqueues (URL or library lookup); search → library lookup. Empty queue → `NowPlaying`. Replies `playing:` / `queued:` |
-| `!stop`            | Stop playback, clear queue                          | Emits `AudioCommand::Stop` stub + clears queue + `QueueEmpty`. Replies `stopped`                                 |
-| `!pause`           | Pause current track                                 | Emits `AudioCommand::Pause` stub. Replies `pause`. (Audio pipeline lands in WS-2.)                               |
+| `!stop`            | Stop playback, clear queue                          | Tears down the live pipeline + clears queue + `QueueEmpty`. Replies `stopped`                                    |
+| `!pause`           | Pause current track                                 | Parks the live pipeline (sibling stops sending frames; pipeline stays spawned). Replies `paused`                 |
+| `!resume` / `!unpause` | Resume a paused track                           | Un-parks the live pipeline. Replies `resumed`                                                                    |
 | `!skip` / `!next`  | Drop current track, advance                         | Pops queue head, fires `QueueChanged` + `NowPlaying` / `QueueEmpty`. Replies `skipped → …`                        |
 | `!prev`            | Replay previous track if available                  | No queue history yet (forward-only queue ships in PURA-121). Replies "previous track not yet supported"          |
 | `!vol <0..100>`    | Per-bot volume                                      | Emits `AudioCommand::SetVolume(v/100)` stub. Replies `volume <v>`. (Real volume control lands in WS-2.)          |

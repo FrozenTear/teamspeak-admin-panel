@@ -53,8 +53,10 @@ pub enum ParsedCommand {
     Play { arg: String },
     /// `!stop` — stop playback and drain the queue.
     Stop,
-    /// `!pause` — pause the current track.
+    /// `!pause` — pause the current track (the pipeline stays spawned).
     Pause,
+    /// `!resume` / `!unpause` — resume a paused track.
+    Resume,
     /// `!skip` / `!next` — drop the current track, advance the queue.
     Skip,
     /// `!prev` — replay the previous track if available.
@@ -82,9 +84,15 @@ pub enum ParsedCommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatAudioAction {
     /// Nothing to do — read-only command (`!np`), an audio-stub path
-    /// (`!pause` / `!vol` / `!prev`), or a command that failed before it
+    /// (`!vol` / `!prev`), or a command that failed before it
     /// mutated the queue.
     None,
+    /// `!pause` — park the live pipeline so playback halts without
+    /// tearing it down. A no-op when nothing is playing.
+    Pause,
+    /// `!resume` — un-park a paused pipeline. A no-op when nothing is
+    /// playing or the pipeline is already running.
+    Resume,
     /// `!play` — a track was appended. Start the queue head iff the bot
     /// is idle; when a pipeline is already running the new track stays
     /// queued and plays when the current one finishes.
@@ -157,6 +165,7 @@ pub fn parse(line: &str) -> Result<ParsedCommand, ParseError> {
         }
         "stop" => Ok(ParsedCommand::Stop),
         "pause" => Ok(ParsedCommand::Pause),
+        "resume" | "unpause" => Ok(ParsedCommand::Resume),
         "skip" | "next" => Ok(ParsedCommand::Skip),
         "prev" => Ok(ParsedCommand::Prev),
         "vol" => {
@@ -214,10 +223,13 @@ async fn handle_command(
         ParsedCommand::Radio { arg } => handle_radio(bot_id, store, events, arg).await,
         ParsedCommand::Play { arg } => handle_play(bot_id, store, events, arg).await,
         ParsedCommand::Stop => handle_stop(bot_id, store, events).await,
-        ParsedCommand::Pause => {
-            emit_audio_stub_event(events, "Pause");
-            ("pause".to_string(), ChatAudioAction::None)
-        }
+        // PURA-353 — `!pause` / `!resume` now drive the live pipeline
+        // (`apply_chat_audio_action` flips its pause `watch`), the same
+        // path the REST `pause_bot` / `resume_bot` controls already use.
+        // Before, chat `!pause` only emitted an `AudioNotImplemented`
+        // stub, so it replied `pause` in chat but never halted playback.
+        ParsedCommand::Pause => ("paused".to_string(), ChatAudioAction::Pause),
+        ParsedCommand::Resume => ("resumed".to_string(), ChatAudioAction::Resume),
         ParsedCommand::Skip => handle_skip(bot_id, store, events).await,
         ParsedCommand::Prev => {
             // No queue history yet (PURA-121 ships forward-only). Lower
@@ -509,6 +521,8 @@ mod parser_tests {
     fn happy_path_no_args() {
         assert_eq!(parse("!stop"), Ok(ParsedCommand::Stop));
         assert_eq!(parse("!pause"), Ok(ParsedCommand::Pause));
+        assert_eq!(parse("!resume"), Ok(ParsedCommand::Resume));
+        assert_eq!(parse("!unpause"), Ok(ParsedCommand::Resume));
         assert_eq!(parse("!skip"), Ok(ParsedCommand::Skip));
         assert_eq!(parse("!next"), Ok(ParsedCommand::Skip));
         assert_eq!(parse("!prev"), Ok(ParsedCommand::Prev));
@@ -700,12 +714,27 @@ mod dispatch_tests {
         let store = store();
         for cmd in [
             ParsedCommand::NowPlaying,
-            ParsedCommand::Pause,
             ParsedCommand::Prev,
             ParsedCommand::Volume(50),
         ] {
             let (_reply, action) = run(&store, cmd).await;
             assert_eq!(action, ChatAudioAction::None);
         }
+    }
+
+    /// PURA-353 — `!pause` / `!resume` must hand the connected loop a
+    /// real audio action so it flips the live pipeline's pause `watch`.
+    /// The regression was `ParsedCommand::Pause` returning
+    /// `ChatAudioAction::None` (an `AudioNotImplemented` stub) — chat
+    /// replied `pause` but playback never halted.
+    #[tokio::test]
+    async fn pause_and_resume_drive_the_pipeline() {
+        let store = store();
+        let (reply, action) = run(&store, ParsedCommand::Pause).await;
+        assert_eq!(reply, "paused");
+        assert_eq!(action, ChatAudioAction::Pause);
+        let (reply, action) = run(&store, ParsedCommand::Resume).await;
+        assert_eq!(reply, "resumed");
+        assert_eq!(action, ChatAudioAction::Resume);
     }
 }
