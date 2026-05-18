@@ -45,7 +45,15 @@ pub fn NavGroup(props: NavGroupProps) -> Element {
 pub struct NavItemProps {
     pub icon: String,
     pub label: String,
-    pub to: Route,
+    /// Navigation target. `#[props(into)]` lets callers pass a `Route`
+    /// directly (it `Into`s a `NavigationTarget`), but the field is the
+    /// `NavigationTarget` so a caller can also hand in a bare internal path.
+    /// PURA-392: a `Route` with an *optional* query param serializes its
+    /// `None` case with a trailing `?` (`/moderation/permissions?`), which
+    /// never exact-matches the query-less current URL, so `Link` never emits
+    /// `aria-current`. Such callers pass the bare path instead.
+    #[props(into)]
+    pub to: NavigationTarget,
     /// `true` when this item maps to the currently active route. Driven from
     /// the parent — keeping the comparison close to the route enum avoids
     /// every nav item re-running the route matcher.
@@ -210,7 +218,18 @@ pub fn Sidebar(props: SidebarProps) -> Element {
                     // the `/api/.../*` routes re-check server-side.
                     NavItem { icon: "⚐", label: "Server groups", to: Route::ServerGroupsPage {}, active: server_groups_active }
                     NavItem { icon: "⚑", label: "Channel groups", to: Route::ChannelGroupsPage {}, active: channel_groups_active }
-                    NavItem { icon: "⚒", label: "Permissions", to: Route::PermissionsCatalogPage { permsid: None }, active: perm_catalog_active }
+                    // PURA-392 — pass the bare internal path, NOT
+                    // `Route::PermissionsCatalogPage { permsid: None }`. The
+                    // optional `?:permsid` query param makes the `None` route
+                    // serialize as `/moderation/permissions?` (trailing `?`),
+                    // which never exact-matches the query-less current URL, so
+                    // `Link` would never emit `aria-current="page"`.
+                    NavItem {
+                        icon: "⚒",
+                        label: "Permissions",
+                        to: NavigationTarget::Internal("/moderation/permissions".to_string()),
+                        active: perm_catalog_active,
+                    }
                     NavItem { icon: "⊘", label: "Bans", to: Route::BansPage {}, active: bans_active }
                     NavItem { icon: "∘", label: "Tokens", to: Route::TokensPage {}, active: tokens_active }
                     // PURA-287 — moderation case + complaint queue.
@@ -485,6 +504,55 @@ mod tests {
         assert!(
             !html.contains("/admin/users"),
             "non-admin sidebar must not surface the admin nav link: {html}"
+        );
+    }
+
+    // ── PURA-392 — Permissions nav `aria-current` ─────────────────────────
+
+    /// Harness enum whose seedable path is `/moderation/permissions`, so the
+    /// `MemoryHistory` seed below resolves and `router.full_route_string()`
+    /// (what `Link` compares its `href` against) reports the query-less URL.
+    #[derive(Clone, Routable, Debug, PartialEq)]
+    #[rustfmt::skip]
+    enum PermTestRoute {
+        #[route("/moderation/permissions")]
+        PermSidebarHarness {},
+    }
+
+    #[component]
+    fn PermSidebarHarness() -> Element {
+        rsx! { Sidebar { active: Route::PermissionsCatalogPage { permsid: None } } }
+    }
+
+    fn render_perm_sidebar() -> String {
+        let history: Rc<dyn History> =
+            Rc::new(MemoryHistory::with_initial_path("/moderation/permissions"));
+        fn root() -> Element {
+            rsx! { Router::<PermTestRoute> {} }
+        }
+        let mut dom = VirtualDom::new(root).with_root_context(history);
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    /// PURA-392 acceptance: at `/moderation/permissions`, the Permissions nav
+    /// item must emit `aria-current="page"`. The item links to the bare
+    /// internal path rather than `Route::PermissionsCatalogPage { permsid:
+    /// None }`, which would serialize as `/moderation/permissions?` (trailing
+    /// `?` from the optional `?:permsid` query param) and never exact-match
+    /// the query-less current URL. Pinning the `?`-free `href` keeps the
+    /// regression a unit-test failure rather than a silent a11y bug.
+    #[test]
+    fn permissions_nav_item_emits_aria_current_at_permissions_route() {
+        let html = render_perm_sidebar();
+        assert!(
+            html.contains(r#"href="/moderation/permissions""#),
+            "Permissions link must use the bare path with no trailing `?`: {html}"
+        );
+        let count = html.matches(r#"aria-current="page""#).count();
+        assert_eq!(
+            count, 1,
+            "expected aria-current='page' exactly once at /moderation/permissions, got {count} in {html}"
         );
     }
 }
