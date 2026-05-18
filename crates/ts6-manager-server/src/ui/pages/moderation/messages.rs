@@ -38,7 +38,7 @@ use crate::client::ws::use_ws_hub;
 use crate::ui::components::dropdown::{
     Dropdown, Menu, MenuEmpty, MenuFilter, MenuItem, MenuItemKind,
 };
-use crate::ui::components::toast::{use_toaster, ToastVariant};
+use crate::ui::components::toast::{ToastVariant, use_toaster};
 use crate::ui::components::{
     Banner, BannerVariant, Button, ButtonSize, ButtonType, ButtonVariant, Field,
 };
