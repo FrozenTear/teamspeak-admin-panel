@@ -23,12 +23,12 @@ use crate::ui::pages::DevFlowCanvasPage;
 use crate::ui::pages::DevVideoPlayerPage;
 use crate::ui::pages::{
     AdminUsersPage, AuditPage, AutomodMetricsPage, BansPage, BotDetailPage, BotsIndexPage,
-    ChannelsPage, ClientsPage, DashboardPlaceholder, FlowDetailPage, FlowEditPage, FlowFormPage,
-    FlowsListPage, Home, LoginPage, LogsPage, MessagesPage, ModerationCasePage,
-    ModerationQueuePage, MusicLibraryPage, MusicPlaylistsPage, NotFoundPage, PermissionGrantsPage,
-    PublicWidgetPage, RadioStationsPage, ServerEditPage, ServerGroupDetailPage, ServerGroupsPage,
-    ServerInfoPage, ServersIndexPage, SettingsPage, SetupPage, SubjectHistoryPage,
-    VideoSourcesPage, WidgetsPage,
+    ChannelGroupDetailPage, ChannelGroupsPage, ChannelsPage, ClientsPage, DashboardPlaceholder,
+    FlowDetailPage, FlowEditPage, FlowFormPage, FlowsListPage, Home, LoginPage, LogsPage,
+    MessagesPage, ModerationCasePage, ModerationQueuePage, MusicLibraryPage, MusicPlaylistsPage,
+    NotFoundPage, PermissionGrantsPage, PublicWidgetPage, RadioStationsPage, ServerEditPage,
+    ServerGroupDetailPage, ServerGroupsPage, ServerInfoPage, ServersIndexPage, SettingsPage,
+    SetupPage, SubjectHistoryPage, VideoSourcesPage, WidgetsPage,
 };
 
 #[rustfmt::skip]
@@ -202,6 +202,18 @@ pub enum Route {
     #[route("/moderation/server-groups/:sgid")]
     ServerGroupDetailPage { sgid: i64 },
 
+    // PURA-378 (PURA-369 Phase C) — channel-group surfaces. Same shape as
+    // the server-group routes: a two-static-segment list and a detail route
+    // with a typed `cgid`. The `channel-groups` literal is more specific
+    // than the `/moderation/cases|subjects/*` dynamic routes, so neither
+    // collides. Read needs server access; create/edit/delete are admin-only
+    // in-page and the `/api/.../channel-groups` routes re-check `check_admin`.
+    #[route("/moderation/channel-groups")]
+    ChannelGroupsPage {},
+
+    #[route("/moderation/channel-groups/:cgid")]
+    ChannelGroupDetailPage { cgid: i64 },
+
     // PURA-287 — per-user moderation grant editor. Admin-gated like the
     // other `/admin/*` surfaces; the sidebar entry is hidden for non-admins
     // and `PUT /api/users/{id}/permissions` enforces `RequireAdmin`.
@@ -265,6 +277,21 @@ mod tests {
         assert!(matches!(
             Route::from_str("/moderation/server-groups/9").expect("server-group detail parse"),
             Route::ServerGroupDetailPage { sgid: 9 }
+        ));
+    }
+
+    /// PURA-378 — the channel-group routes. Same contract as the
+    /// server-group routes: the list path must not be swallowed by the
+    /// detail's dynamic `cgid` segment.
+    #[test]
+    fn channel_group_routes_resolve_with_typed_params() {
+        assert!(matches!(
+            Route::from_str("/moderation/channel-groups").expect("channel-groups list parse"),
+            Route::ChannelGroupsPage {}
+        ));
+        assert!(matches!(
+            Route::from_str("/moderation/channel-groups/4").expect("channel-group detail parse"),
+            Route::ChannelGroupDetailPage { cgid: 4 }
         ));
     }
 

@@ -34,6 +34,8 @@
 //!   re-checks every call regardless.
 
 mod case_detail;
+mod channel_group_detail;
+mod channel_groups;
 mod grants;
 mod history;
 mod messages;
@@ -45,6 +47,8 @@ mod server_group_detail;
 mod server_groups;
 
 pub use case_detail::ModerationCasePage;
+pub use channel_group_detail::ChannelGroupDetailPage;
+pub use channel_groups::ChannelGroupsPage;
 pub use grants::PermissionGrantsPage;
 pub use history::SubjectHistoryPage;
 pub use messages::MessagesPage;
