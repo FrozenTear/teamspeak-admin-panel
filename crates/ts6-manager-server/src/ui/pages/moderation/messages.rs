@@ -38,7 +38,7 @@ use crate::client::ws::use_ws_hub;
 use crate::ui::components::dropdown::{
     Dropdown, Menu, MenuEmpty, MenuFilter, MenuItem, MenuItemKind,
 };
-use crate::ui::components::toast::{ToastVariant, use_toaster};
+use crate::ui::components::toast::{use_toaster, ToastVariant};
 use crate::ui::components::{
     Banner, BannerVariant, Button, ButtonSize, ButtonType, ButtonVariant, Field,
 };
@@ -124,7 +124,10 @@ pub fn MessagesPage() -> Element {
                 let _drop_guard = handle;
                 use futures::stream::StreamExt;
                 while let Some(env) = rx.next().await {
-                    if matches!(env.kind.as_str(), "ts:message:created" | "ts:message:deleted") {
+                    if matches!(
+                        env.kind.as_str(),
+                        "ts:message:created" | "ts:message:deleted"
+                    ) {
                         messages_resource.restart();
                     }
                 }
@@ -409,11 +412,7 @@ pub fn MessagesPage() -> Element {
 /// the operator's own inbox copy, so this is a plain `confirm` (primary
 /// button), not a destructive `btn-danger` escalation (spec §8.1).
 #[component]
-fn DeleteConfirm(
-    busy: bool,
-    on_cancel: EventHandler<()>,
-    on_confirm: EventHandler<()>,
-) -> Element {
+fn DeleteConfirm(busy: bool, on_cancel: EventHandler<()>, on_confirm: EventHandler<()>) -> Element {
     rsx! {
         div {
             class: "modal-backdrop",
@@ -465,11 +464,7 @@ fn DeleteConfirm(
 /// nickname to its UID. A raw-UID escape-hatch field stays editable for
 /// recipients not in the online client list (Postel's Law — spec §8.2).
 #[component]
-fn ComposeModal(
-    config_id: i64,
-    sid: i64,
-    on_close: EventHandler<()>,
-) -> Element {
+fn ComposeModal(config_id: i64, sid: i64, on_close: EventHandler<()>) -> Element {
     let gate = use_auth_gate();
     let toaster = use_toaster();
 
