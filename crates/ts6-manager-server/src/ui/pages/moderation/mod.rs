@@ -36,6 +36,7 @@
 mod case_detail;
 mod grants;
 mod history;
+mod messages;
 mod metrics;
 pub(crate) mod perm;
 mod queue;
@@ -43,6 +44,7 @@ mod queue;
 pub use case_detail::ModerationCasePage;
 pub use grants::PermissionGrantsPage;
 pub use history::SubjectHistoryPage;
+pub use messages::MessagesPage;
 pub use metrics::AutomodMetricsPage;
 pub use queue::ModerationQueuePage;
 

@@ -24,10 +24,10 @@ use crate::ui::pages::DevVideoPlayerPage;
 use crate::ui::pages::{
     AdminUsersPage, AuditPage, AutomodMetricsPage, BansPage, BotDetailPage, BotsIndexPage,
     ChannelsPage, ClientsPage, DashboardPlaceholder, FlowDetailPage, FlowEditPage, FlowFormPage,
-    FlowsListPage, Home, LoginPage, LogsPage, ModerationCasePage, ModerationQueuePage,
-    MusicLibraryPage, MusicPlaylistsPage, NotFoundPage, PermissionGrantsPage, PublicWidgetPage,
-    RadioStationsPage, ServerEditPage, ServerInfoPage, ServersIndexPage, SettingsPage, SetupPage,
-    SubjectHistoryPage, VideoSourcesPage, WidgetsPage,
+    FlowsListPage, Home, LoginPage, LogsPage, MessagesPage, ModerationCasePage,
+    ModerationQueuePage, MusicLibraryPage, MusicPlaylistsPage, NotFoundPage, PermissionGrantsPage,
+    PublicWidgetPage, RadioStationsPage, ServerEditPage, ServerInfoPage, ServersIndexPage,
+    SettingsPage, SetupPage, SubjectHistoryPage, VideoSourcesPage, WidgetsPage,
 };
 
 #[rustfmt::skip]
@@ -182,6 +182,13 @@ pub enum Route {
     #[route("/moderation/automod")]
     AutomodMetricsPage {},
 
+    // PURA-377 (PURA-369 Phase B) — TS6 offline-message inbox. Static
+    // segment, so it never collides with the `/moderation/cases|subjects/*`
+    // dynamic routes. Reading the inbox needs server access; the compose +
+    // delete affordances are admin-only and the route layer re-checks.
+    #[route("/moderation/messages")]
+    MessagesPage {},
+
     // PURA-287 — per-user moderation grant editor. Admin-gated like the
     // other `/admin/*` surfaces; the sidebar entry is hidden for non-admins
     // and `PUT /api/users/{id}/permissions` enforces `RequireAdmin`.
@@ -278,6 +285,12 @@ mod tests {
         assert!(matches!(
             Route::from_str("/moderation/automod").expect("automod parse"),
             Route::AutomodMetricsPage {}
+        ));
+        // PURA-377 — the offline-message inbox. Static segment, must win
+        // over the dynamic `/moderation/cases|subjects/:param` routes.
+        assert!(matches!(
+            Route::from_str("/moderation/messages").expect("messages parse"),
+            Route::MessagesPage {}
         ));
         assert!(matches!(
             Route::from_str("/admin/permissions").expect("permissions parse"),
