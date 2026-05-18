@@ -33,15 +33,16 @@ use tracing::info;
 
 /// Worker threads for the dedicated voice runtime.
 ///
-/// Two is deliberately small. The per-bot hot tasks are the connected
-/// loop and the `tsclientlib` connection task (incoming-packet decode);
-/// those two want to run concurrently, and two threads cover that. The
-/// audio sibling spends ~all its time parked in `sleep_until`, the
-/// pipeline worker is back-pressured idle once the frame buffer fills,
-/// and the resolve task is one-shot — none of them need a reserved core.
-/// Keeping the count low leaves the host's remaining cores to the main
-/// app runtime instead of oversubscribing them.
-const VOICE_WORKER_THREADS: usize = 2;
+/// Four covers the per-bot hot tasks with margin: the connected loop,
+/// the tsclientlib connection task (incoming-packet decode), the audio
+/// sibling (parked in `sleep_until`, wakes every 20 ms), and the pipeline
+/// worker. The extra headroom matters because `con.send_audio` is a
+/// synchronous call (packet framing + encryption + UDP write) that can
+/// hold a worker thread for 12–130 ms; with fewer workers the sibling
+/// task can stall waiting for a free thread while the connected loop is
+/// occupied, producing the same frame-underrun pattern the dedicated
+/// runtime was meant to cure.
+const VOICE_WORKER_THREADS: usize = 4;
 
 /// Process-wide dedicated voice runtime, built lazily on first use. Held
 /// in a `static` so it is never dropped from an async context (dropping a
