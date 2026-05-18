@@ -998,6 +998,7 @@ fn apply_event(d: &mut wire::MusicBotDetail, ev: &wire::BotEventWire) {
             ) {
                 d.channel_id = None;
                 d.now_playing = None;
+                d.now_playing_elapsed_secs = None;
                 d.last_error = None;
             }
         }
@@ -1010,6 +1011,7 @@ fn apply_event(d: &mut wire::MusicBotDetail, ev: &wire::BotEventWire) {
         wire::BotEventWire::Disconnected { .. } => {
             d.channel_id = None;
             d.now_playing = None;
+            d.now_playing_elapsed_secs = None;
             d.last_error = None;
         }
         wire::BotEventWire::JoinedChannel { channel_id } => {
@@ -1024,17 +1026,32 @@ fn apply_event(d: &mut wire::MusicBotDetail, ev: &wire::BotEventWire) {
             // `QueueChanged` right after `NowPlaying`, but applying it
             // optimistically here lets the row light up instantly.
             d.state = wire::BotState::Playing;
+            // PURA-347 — a fresh track restarts the play clock at 0;
+            // `Progress` ticks bump it once per second.
+            d.now_playing_elapsed_secs = Some(0);
             // A fresh track supersedes any prior failure (PURA-261).
             d.last_error = None;
         }
+        // PURA-347 — playback-progress tick. Advance the elapsed clock
+        // only while a track is playing so a stray tick can't resurrect
+        // a stale value after a finish.
+        wire::BotEventWire::Progress { elapsed_secs } => {
+            if d.now_playing.is_some() {
+                d.now_playing_elapsed_secs = Some(*elapsed_secs);
+            }
+        }
         wire::BotEventWire::QueueEmpty => {
             d.now_playing = None;
+            d.now_playing_elapsed_secs = None;
             d.queue.clear();
             // The lifecycle FSM doesn't carry "Playing" — collapse back
             // to a connected/in_channel state via the next StateChanged.
         }
         wire::BotEventWire::QueueChanged { current, .. } => {
             d.now_playing = current.clone();
+            if current.is_none() {
+                d.now_playing_elapsed_secs = None;
+            }
         }
         // PURA-261 — audio pipeline drained. Clear `now_playing` so the
         // live view stops showing `Playing`; an auto-advance `NowPlaying`
@@ -1045,6 +1062,7 @@ fn apply_event(d: &mut wire::MusicBotDetail, ev: &wire::BotEventWire) {
         // fires no `StateChanged`, so nothing else would).
         wire::BotEventWire::AudioFinished { reason } => {
             d.now_playing = None;
+            d.now_playing_elapsed_secs = None;
             match reason.strip_prefix("failed: ") {
                 Some(cause) => {
                     d.last_error = Some(cause.to_string());
@@ -1072,6 +1090,7 @@ mod tests {
             server_addr: "127.0.0.1:9987".into(),
             state,
             now_playing: None,
+            now_playing_elapsed_secs: None,
             queue: Vec::new(),
             channel_id: None,
             last_error: None,

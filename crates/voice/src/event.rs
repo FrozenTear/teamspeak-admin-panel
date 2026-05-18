@@ -65,6 +65,15 @@ pub enum BotEvent {
     /// produced 0 frames …`). Consumers strip that prefix to surface the
     /// failure cause to operators; see `LivenessTracker` (`last_error`).
     AudioFinished { reason: String },
+    /// PURA-347 — coarse playback-progress tick. Emitted roughly once per
+    /// second of audio actually sent on the wire while a track is
+    /// playing. `elapsed_secs` is derived from the connected loop's frame
+    /// counter (the truthful play clock — it advances only on frames
+    /// delivered, so it stalls across a `Pause` and never drifts),
+    /// **not** wall time. Subscribers (`LivenessTracker`, the SSE stream)
+    /// reduce these into the now-playing progress bar. A fresh
+    /// `NowPlaying` restarts the clock from 0.
+    Progress { elapsed_secs: u64 },
     /// PURA-121 WS-3 — a playlist was created / renamed / deleted, or
     /// its contents changed. Subscribers refetch via
     /// `MusicBotStore::playlist_list_tracks`. `name` is the post-mutation

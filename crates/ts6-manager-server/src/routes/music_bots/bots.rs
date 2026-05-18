@@ -51,6 +51,10 @@ async fn list(
             server_addr: info.server_addr,
             state: bot_state_to_wire(liveness.state, liveness.now_playing.is_some()),
             now_playing: liveness.now_playing.as_ref().map(track_to_wire),
+            now_playing_elapsed_secs: liveness
+                .now_playing
+                .as_ref()
+                .and(liveness.now_playing_elapsed_secs),
             last_error: liveness.last_error.clone(),
         });
     }
@@ -86,6 +90,10 @@ async fn detail(
         server_addr: info.server_addr,
         state: bot_state_to_wire(liveness.state, liveness.now_playing.is_some()),
         now_playing: liveness.now_playing.as_ref().map(track_to_wire),
+        now_playing_elapsed_secs: liveness
+            .now_playing
+            .as_ref()
+            .and(liveness.now_playing_elapsed_secs),
         queue: queue.iter().map(track_to_wire).collect(),
         channel_id: liveness.channel_id,
         last_error: liveness.last_error.clone(),
@@ -141,6 +149,10 @@ async fn create(
             server_addr: req.server_addr,
             state: bot_state_to_wire(liveness.state, liveness.now_playing.is_some()),
             now_playing: liveness.now_playing.as_ref().map(track_to_wire),
+            now_playing_elapsed_secs: liveness
+                .now_playing
+                .as_ref()
+                .and(liveness.now_playing_elapsed_secs),
             last_error: liveness.last_error.clone(),
         }),
     ))
@@ -300,6 +312,11 @@ fn wire_event(ev: &DomainBotEvent) -> Option<wire::BotEventWire> {
         DomainBotEvent::QueueEmpty => wire::BotEventWire::QueueEmpty,
         DomainBotEvent::AudioFinished { reason } => wire::BotEventWire::AudioFinished {
             reason: reason.clone(),
+        },
+        // PURA-347 — playback-progress tick forwarded verbatim; the FE
+        // reduces it into the now-playing progress bar.
+        DomainBotEvent::Progress { elapsed_secs } => wire::BotEventWire::Progress {
+            elapsed_secs: *elapsed_secs,
         },
         DomainBotEvent::PlaylistChanged(name) => wire::BotEventWire::PlaylistChanged {
             name: name.0.clone(),

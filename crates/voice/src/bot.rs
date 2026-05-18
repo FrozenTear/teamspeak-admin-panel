@@ -49,6 +49,12 @@ use crate::event::{BotError, BotEvent, DisconnectKind};
 use crate::state::BotState;
 use crate::store::{MusicBotStore, StoreError, Track, TrackId};
 
+/// PURA-347 — frames per playback-progress tick. Opus frames carry 20 ms
+/// of audio each, so 50 frames is exactly one second sent on the wire.
+/// The connected loop emits a `BotEvent::Progress` every time
+/// `frames_sent` crosses a multiple of this.
+const FRAMES_PER_PROGRESS_TICK: u64 = 50;
+
 /// Run the bot actor to completion. Exits when a `Shutdown` command has
 /// been processed and the disconnect has flushed.
 ///
@@ -422,6 +428,16 @@ async fn handle_audio_msg(
                         elapsed_ms = active.started_at.elapsed().as_millis() as u64,
                         "first Opus frame sent on the wire — playback audible",
                     );
+                }
+                // PURA-347 — emit a once-per-second playback-progress
+                // tick. `frames_sent` advances only on frames actually
+                // delivered, so the elapsed clock stalls across a `Pause`
+                // and never drifts. The FE reduces these into the
+                // now-playing progress bar.
+                if active.frames_sent % FRAMES_PER_PROGRESS_TICK == 0 {
+                    let _ = events.send(BotEvent::Progress {
+                        elapsed_secs: active.frames_sent / FRAMES_PER_PROGRESS_TICK,
+                    });
                 }
             }
             if let Err(err) = audio::send_opus_frame(con, &opus) {
