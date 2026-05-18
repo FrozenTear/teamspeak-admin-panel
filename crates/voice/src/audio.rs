@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{broadcast, mpsc, watch};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, block_in_place};
 use tracing::{debug, info, warn};
 use tsclientlib::Connection;
 use tsproto_packets::packets::{AudioData, CodecType, OutAudio};
@@ -627,7 +627,11 @@ pub(crate) fn send_opus_frame(con: &mut Connection, opus: &[u8]) -> Result<(), t
         codec: CodecType::OpusVoice,
         data: opus,
     });
-    con.send_audio(pkt)
+    // block_in_place: con.send_audio does synchronous packet framing +
+    // encryption + UDP write (12–130 ms observed). Marking it blocking
+    // lets the voice runtime keep other tasks (sibling, connection task)
+    // scheduled while the send occupies a worker thread.
+    block_in_place(|| con.send_audio(pkt))
 }
 
 /// Best-effort voice-stop = same packet shape with an empty Opus

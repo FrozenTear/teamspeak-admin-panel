@@ -38,6 +38,13 @@ const COMMAND_BUFFER: usize = 16;
 /// `yt_cookie` is the live-updated cookie-file path (PURA-223). The bot
 /// actor reads it at track-play time so UI uploads take effect without a
 /// manager restart. Pass `Arc::new(RwLock::new(None))` to disable cookies.
+///
+/// PURA-367 — the actor runs on the dedicated [`crate::runtime`] voice
+/// runtime, not the caller's runtime, so its 20 ms audio-frame cadence is
+/// isolated from web/DB scheduler latency. The returned `JoinHandle` is
+/// still awaitable from the caller's runtime (tokio handles are
+/// runtime-agnostic), and the `BotCommand` / `BotEvent` channels cross
+/// the runtime boundary unchanged.
 pub fn spawn_bot(
     id: BotId,
     config: BotConfig,
@@ -49,7 +56,7 @@ pub fn spawn_bot(
     let event_tx_for_actor = event_tx.clone();
     let cfg_for_actor = config.clone();
     let store_for_actor = Arc::clone(&store);
-    let join = tokio::spawn(async move {
+    let join = crate::runtime::voice_runtime().spawn(async move {
         run_bot(
             id,
             cfg_for_actor,
