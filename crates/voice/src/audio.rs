@@ -71,7 +71,13 @@ pub(crate) struct ActiveAudio {
     #[allow(dead_code)]
     pub source_label: String,
     /// Drained by the connected loop on every `select!` iteration.
-    pub audio_rx: mpsc::Receiver<AudioMsg>,
+    ///
+    /// PURA-396 — `Option` so the split-wire-task control loop can
+    /// `take()` the receiver and hand it to the wire task (via
+    /// `WireCmd::InstallAudio`); the single-loop path leaves it `Some`
+    /// and drains it in place. Always `Some` immediately after
+    /// [`build_active`].
+    pub audio_rx: Option<mpsc::Receiver<AudioMsg>>,
     /// Flipped by `Pause` / `Resume`. The sibling parks on
     /// `pause_rx.changed()` while `*pause_rx.borrow()` is true.
     pub pause: watch::Sender<bool>,
@@ -263,7 +269,7 @@ fn build_active(
     let sibling = spawn_sibling(pipeline, frames_rx, events_rx, pause_rx, msg_tx);
     ActiveAudio {
         source_label,
-        audio_rx: msg_rx,
+        audio_rx: Some(msg_rx),
         pause: pause_tx,
         frames_sent: 0,
         started_at,
@@ -830,9 +836,17 @@ impl SendTimingMonitor {
 /// voice-id = 0). Errors are surfaced to the caller so the connected
 /// loop can decide whether to keep the bot online.
 ///
-/// PURA-389a — instrumentation-only: `enqueued_at` (stamped by the audio
-/// sibling) and `monitor` feed the A/B/C send-stall attribution. The send
-/// behaviour itself is unchanged.
+/// PURA-389a — `enqueued_at` (stamped by the audio sibling) and `monitor`
+/// feed the A/B/C send-stall attribution.
+///
+/// PURA-396 2b — `use_block_in_place` selects whether the (microsecond)
+/// `con.send_audio` call is wrapped in `tokio::task::block_in_place`. The
+/// single-loop path passes `true` (unchanged behaviour); the split wire
+/// task passes `false` — PURA-389a measured the `block_in_place` entry/exit
+/// churn as candidate A (~11–18 % of the residual stall budget) and the
+/// wire task does nothing but wire I/O, so wrapping a non-blocking call
+/// buys only churn. The A/B/C timers stay live either way (with the flag
+/// off `block_in_place` they simply measure the bare send wall).
 // `tsclientlib::Error` is 136 B — over clippy's 128 B threshold for
 // `result_large_err`. Boxing the upstream error type just to please the
 // lint isn't worth the API churn for a single in-crate caller.
@@ -842,6 +856,7 @@ pub(crate) fn send_opus_frame(
     opus: &[u8],
     enqueued_at: Instant,
     monitor: &mut SendTimingMonitor,
+    use_block_in_place: bool,
 ) -> Result<(), tsclientlib::Error> {
     let pkt = OutAudio::new(&AudioData::C2S {
         id: 0,
@@ -859,23 +874,27 @@ pub(crate) fn send_opus_frame(
     // whole send. Snapshot the thread CPU clock just before the send span.
     let cpu_start = thread_cpu_now();
 
-    // block_in_place: con.send_audio does synchronous packet framing +
-    // encryption. Marking it blocking lets the voice runtime keep other
-    // tasks (sibling, connection task) scheduled while the send occupies a
-    // worker thread.
+    // `con.send_audio` does synchronous packet framing + (optional)
+    // encryption, then a `VecDeque` enqueue — no UDP syscall (PURA-389
+    // tsclientlib `04aa249` source read). When `use_block_in_place` is set
+    // the call is marked blocking so the voice runtime keeps other tasks
+    // scheduled; the split wire task passes `false` (PURA-396 2b).
     //
     // PURA-389a candidate A — `t_blockinplace` wraps the whole
-    // `block_in_place`; `t_send` wraps only the inner `con.send_audio`.
-    // Their difference is the `block_in_place` entry/exit churn. (The old
-    // "12–130 ms observed" cost the v1.5.5 verdict attributed to this call
-    // is exactly what this instrumentation re-measures — PURA-389's
-    // tsclientlib source read predicts microseconds.)
+    // (optionally `block_in_place`-wrapped) span; `t_send` wraps only the
+    // inner `con.send_audio`. Their difference is the `block_in_place`
+    // entry/exit churn — ~zero when `use_block_in_place` is false.
     let blockinplace_start = Instant::now();
-    let (send_result, t_send) = block_in_place(|| {
+    let send_once = || {
         let send_start = Instant::now();
         let result = con.send_audio(pkt);
         (result, send_start.elapsed())
-    });
+    };
+    let (send_result, t_send) = if use_block_in_place {
+        block_in_place(send_once)
+    } else {
+        send_once()
+    };
     let t_blockinplace = blockinplace_start.elapsed();
     let cpu = thread_cpu_now().saturating_sub(cpu_start);
 

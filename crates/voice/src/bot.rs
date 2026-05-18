@@ -84,6 +84,17 @@ pub(crate) async fn run_bot(
     let mut connection: Option<Connection> = None;
     let mut shutdown_requested = false;
 
+    // PURA-396 — pick the connected-loop implementation once, up front. The
+    // config flag is `OR`-ed with the `VOICE_SPLIT_WIRE_TASK` env var so a
+    // contabo-dev A/B is a pod env flip with no DB write. Default is the
+    // single-loop path; `true` selects the PURA-389 §2a/2b wire/control
+    // split.
+    let split_wire = config.voice_split_wire_task || env_split_wire_task();
+    info!(
+        split_wire,
+        "PURA-396 — connected-loop mode selected (split wire/control task = {split_wire})",
+    );
+
     if config.auto_connect {
         debug!("auto_connect=true — queuing initial Connect");
     }
@@ -130,7 +141,7 @@ pub(crate) async fn run_bot(
             }
             BotState::Connecting => {
                 match attempt_connect(&config).await {
-                    Ok((mut con, client_id, default_channel)) => {
+                    Ok((con, client_id, default_channel)) => {
                         backoff.reset();
                         transition(&mut state, BotState::Connected, &events);
                         let _ = events.send(BotEvent::Connected {
@@ -142,18 +153,42 @@ pub(crate) async fn run_bot(
                             channel_id: default_channel,
                         });
                         // Drive the connected loop until disconnected.
-                        let outcome = run_connected_loop(
-                            &mut con,
-                            &mut state,
-                            &mut current_channel,
-                            &mut rx,
-                            &events,
-                            bot_id,
-                            &store,
-                            Arc::clone(&yt_cookie),
-                            bot_volume.clone(),
-                        )
-                        .await;
+                        //
+                        // PURA-396 — the split path moves `con` into the
+                        // spawned wire task and clean-disconnects it there,
+                        // so `con_after` comes back `None`; the single-loop
+                        // path keeps `con` and disconnects it below.
+                        let (outcome, mut con_after): (ConnectedExit, Option<Connection>) =
+                            if split_wire {
+                                let outcome = run_split_connected_loop(
+                                    con,
+                                    &mut state,
+                                    &mut current_channel,
+                                    &mut rx,
+                                    &events,
+                                    bot_id,
+                                    &store,
+                                    Arc::clone(&yt_cookie),
+                                    bot_volume.clone(),
+                                )
+                                .await;
+                                (outcome, None)
+                            } else {
+                                let mut con = con;
+                                let outcome = run_connected_loop(
+                                    &mut con,
+                                    &mut state,
+                                    &mut current_channel,
+                                    &mut rx,
+                                    &events,
+                                    bot_id,
+                                    &store,
+                                    Arc::clone(&yt_cookie),
+                                    bot_volume.clone(),
+                                )
+                                .await;
+                                (outcome, Some(con))
+                            };
                         match outcome {
                             ConnectedExit::Shutdown => {
                                 shutdown_requested = true;
@@ -162,7 +197,9 @@ pub(crate) async fn run_bot(
                                 // Disconnecting; honour both transitions
                                 // so the public event log is correct.
                                 transition(&mut state, BotState::Disconnecting, &events);
-                                clean_disconnect(&mut con, "shutdown").await;
+                                if let Some(con) = con_after.as_mut() {
+                                    clean_disconnect(con, "shutdown").await;
+                                }
                                 transition(&mut state, BotState::Disconnected, &events);
                                 let _ = events.send(BotEvent::Disconnected {
                                     kind: DisconnectKind::ShutdownRequested,
@@ -172,7 +209,9 @@ pub(crate) async fn run_bot(
                             }
                             ConnectedExit::Disconnect => {
                                 transition(&mut state, BotState::Disconnecting, &events);
-                                clean_disconnect(&mut con, "disconnect").await;
+                                if let Some(con) = con_after.as_mut() {
+                                    clean_disconnect(con, "disconnect").await;
+                                }
                                 transition(&mut state, BotState::Disconnected, &events);
                                 let _ = events.send(BotEvent::Disconnected {
                                     kind: DisconnectKind::Clean,
@@ -182,7 +221,7 @@ pub(crate) async fn run_bot(
                             }
                             ConnectedExit::Dropped(reason) => {
                                 warn!(%reason, "connection dropped — auto-reconnect");
-                                drop(con);
+                                drop(con_after);
                                 let _ = events.send(BotEvent::Disconnected {
                                     kind: DisconnectKind::Dropped,
                                     reason,
@@ -356,15 +395,17 @@ async fn run_connected_loop(
             // The frame buffer is not underrunning when this happens — it
             // stays full; the connected loop simply wasn't polling this arm.
             audio_msg = async {
-                // Unwrap is sound because the guard below gates entry.
-                current_audio.as_mut().unwrap().audio_rx.recv().await
+                // Unwrap is sound because the guard below gates entry;
+                // `audio_rx` is `Some` for the whole life of `current_audio`
+                // on this single-loop path (only the split path `take`s it).
+                current_audio.as_mut().unwrap().audio_rx.as_mut().unwrap().recv().await
             }, if current_audio.is_some() => {
                 // PURA-358 — time the audio-arm body. `send_audio`
                 // contention on a `frame`, or an ~11 s yt-dlp auto-advance
                 // on a `finished`, both stall the loop here.
                 let arm_start = Instant::now();
                 let kind = handle_audio_msg(
-                    con,
+                    &mut WireSink::Direct(&mut *con),
                     audio_msg,
                     &mut current_audio,
                     bot_id,
@@ -399,7 +440,7 @@ async fn run_connected_loop(
                         // threaded in so a queue-mutating chat command
                         // (`!play` etc.) can actually start the pipeline.
                         dispatch_chat_line(
-                            con,
+                            &mut WireSink::Direct(&mut *con),
                             &mut current_audio,
                             bot_id,
                             store,
@@ -466,7 +507,7 @@ async fn run_connected_loop(
                     // command-driven stall is attributed, not just guessed.
                     let arm_start = Instant::now();
                     handle_audio_command(
-                        con,
+                        &mut WireSink::Direct(&mut *con),
                         audio_cmd,
                         &mut current_audio,
                         bot_id,
@@ -490,6 +531,551 @@ async fn run_connected_loop(
     }
 }
 
+// ===========================================================================
+// PURA-396 / PURA-389 §2a+2b — split wire/control connected loop.
+//
+// The single-loop `run_connected_loop` above polls audio, protocol events,
+// and commands from one `select!`. PURA-389a measured that ~79 % of the
+// residual `arm=audio` stall is candidate C — a paced frame waiting in the
+// sibling→loop mpsc behind a busy event/command arm (book bursts, chat
+// dispatch, an ~11 s yt-dlp resolve). The fix is to give the connection a
+// dedicated **wire task** whose every loop iteration is structurally bounded
+// to one frame / one event / one command, and move all the heavy work to a
+// **control task**. `tsclientlib::Connection` is single-owner, so the wire
+// task owns it outright and the control task reaches the wire only through
+// the `WireCmd` channel.
+//
+// Gated behind `BotConfig::voice_split_wire_task` (default off) — the
+// single-loop path above is the untouched rollback.
+// ===========================================================================
+
+/// PURA-396 — is the `VOICE_SPLIT_WIRE_TASK` env override set truthy? Lets a
+/// contabo-dev A/B flip the split loop on per pod without a DB write.
+fn env_split_wire_task() -> bool {
+    split_flag_truthy(std::env::var("VOICE_SPLIT_WIRE_TASK").ok().as_deref())
+}
+
+/// PURA-396 — parse a truthy env-flag value: trimmed, case-insensitive on the
+/// common spellings. Pure so it is unit-testable without touching the
+/// process environment.
+fn split_flag_truthy(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on"),
+    )
+}
+
+/// PURA-396 — a command for the wire task: an operation that needs
+/// `&mut Connection`. The control task produces these; the wire task is the
+/// sole executor. A single FIFO `mpsc` keeps audio vs. voice-stop ordering:
+/// `ClearAudio`/`VoiceStop` issued on teardown are dequeued in send order.
+enum WireCmd {
+    /// Install a freshly-spawned pipeline's frame receiver. `epoch` tags the
+    /// pipeline generation so a stale teardown event from a since-replaced
+    /// pipeline can be discarded by the control task.
+    InstallAudio {
+        rx: mpsc::Receiver<AudioMsg>,
+        started_at: std::time::Instant,
+        seek_base_secs: u64,
+        epoch: u64,
+    },
+    /// Drop the installed frame receiver — discards any frames still buffered
+    /// behind it (teardown with no replacement, e.g. `!stop`).
+    ClearAudio,
+    /// Empty-payload voice packet — flushes listener jitter buffers.
+    VoiceStop,
+    /// `clientmove` to a channel.
+    ChannelMove(ChannelId),
+    /// A channel-chat reply line.
+    ChatReply(String),
+    /// Clean-disconnect the connection and exit the wire task.
+    Disconnect { shutdown: bool },
+}
+
+/// PURA-396 — an event from the wire task back to the control task. The
+/// audio-lifecycle variants carry the pipeline-generation `epoch` so the
+/// control task can ignore an event from a pipeline it has already replaced.
+enum WireEvent {
+    /// Own client's channel per the latest book update.
+    Channel(ChannelId),
+    /// Channel-chat lines extracted from a `BookEvents` item.
+    Chat(Vec<ChatLine>),
+    /// A pipeline out-of-band event (ICY metadata, warning, EOS).
+    Pipeline(PipelineEvent),
+    /// The sibling drained cleanly and sent `Finished`; `frames_sent` is the
+    /// wire task's count, used for the 0-frame failure detection.
+    AudioFinished { frames_sent: u64, epoch: u64 },
+    /// The sibling channel closed without a `Finished` (crash path).
+    SiblingClosed { epoch: u64 },
+    /// `send_audio` returned an error for a frame.
+    SendFailed { error: String, epoch: u64 },
+    /// The connection event stream errored or ended.
+    Dropped(String),
+}
+
+/// PURA-396 — the sink for the handful of operations that need
+/// `&mut Connection`. The single-loop path wraps the connection directly; the
+/// split path forwards a [`WireCmd`] to the wire task. One `WireSink` lets
+/// `handle_audio_msg` / `handle_audio_command` / `dispatch_chat_line` /
+/// `apply_chat_audio_action` serve both paths unchanged.
+enum WireSink<'a> {
+    Direct(&'a mut Connection),
+    Split(&'a mpsc::UnboundedSender<WireCmd>),
+}
+
+impl WireSink<'_> {
+    /// Send an empty-payload voice packet (jitter-buffer flush).
+    fn voice_stop(&mut self) {
+        match self {
+            WireSink::Direct(con) => audio::send_voice_stop(con),
+            WireSink::Split(tx) => {
+                let _ = tx.send(WireCmd::VoiceStop);
+            }
+        }
+    }
+
+    /// Drop the wire task's installed frame receiver. No-op on the
+    /// single-loop path — there the receiver lives inside `ActiveAudio` and
+    /// is already gone with the `audio::tear_down` the caller just ran.
+    fn clear_audio(&mut self) {
+        if let WireSink::Split(tx) = self {
+            let _ = tx.send(WireCmd::ClearAudio);
+        }
+    }
+
+    /// `clientmove` to `target`.
+    fn channel_move(&mut self, target: ChannelId) -> Result<()> {
+        match self {
+            WireSink::Direct(con) => send_channel_move(con, target),
+            WireSink::Split(tx) => {
+                let _ = tx.send(WireCmd::ChannelMove(target));
+                Ok(())
+            }
+        }
+    }
+
+    /// Send a channel-chat reply line.
+    fn chat_reply(&mut self, line: String) {
+        match self {
+            WireSink::Direct(con) => chat::send_reply(con, &line),
+            WireSink::Split(tx) => {
+                let _ = tx.send(WireCmd::ChatReply(line));
+            }
+        }
+    }
+
+    /// Send one paced Opus frame. Only the single-loop path reaches this — in
+    /// the split path the wire task owns frame sends, so the control task
+    /// never routes an `AudioMsg::Frame` through `handle_audio_msg`.
+    #[allow(clippy::result_large_err)]
+    fn send_opus_frame(
+        &mut self,
+        opus: &[u8],
+        enqueued_at: std::time::Instant,
+        monitor: &mut audio::SendTimingMonitor,
+    ) -> Result<(), tsclientlib::Error> {
+        match self {
+            // Single-loop path keeps `block_in_place` (rollback fidelity).
+            WireSink::Direct(con) => audio::send_opus_frame(con, opus, enqueued_at, monitor, true),
+            WireSink::Split(_) => {
+                unreachable!("split path: the wire task owns frame sends")
+            }
+        }
+    }
+}
+
+/// PURA-396 — per-play frame-side state owned by the wire task. The
+/// control-side counterpart stays in `ActiveAudio`.
+struct WirePlay {
+    /// Paced Opus frames + pipeline events from the audio sibling.
+    rx: mpsc::Receiver<AudioMsg>,
+    /// Frames sent on the wire so far (drives the progress tick).
+    frames_sent: u64,
+    /// Pipeline-spawn instant — `first_frame_on_wire` latency anchor.
+    started_at: std::time::Instant,
+    /// Playback offset this pipeline (re)started at (PURA-352 seek).
+    seek_base_secs: u64,
+    /// A/B/C send-path attribution accumulator (PURA-389a), per play.
+    send_monitor: audio::SendTimingMonitor,
+    /// Pipeline generation — echoed on the lifecycle `WireEvent`s.
+    epoch: u64,
+}
+
+/// PURA-396 §2a — the **wire task**. Sole owner of `&mut Connection`. Its
+/// `select!` has exactly three arms — a paced frame, a protocol event, a wire
+/// command — and every arm body is bounded to one cheap operation, so the
+/// 20 ms audio cadence is structurally isolated from the control task's chat
+/// / queue / yt-dlp work. Consumes the `Connection`; clean-disconnects it on
+/// a `WireCmd::Disconnect`.
+async fn run_wire_task(
+    mut con: Connection,
+    mut wire_cmd_rx: mpsc::UnboundedReceiver<WireCmd>,
+    wire_evt_tx: mpsc::UnboundedSender<WireEvent>,
+    events: broadcast::Sender<BotEvent>,
+) {
+    let mut play: Option<WirePlay> = None;
+
+    loop {
+        tokio::select! {
+            biased;
+            // Paced audio frames first — the 20 ms cadence must win the race.
+            msg = async { play.as_mut().unwrap().rx.recv().await }, if play.is_some() => {
+                let arm_start = Instant::now();
+                match msg {
+                    Some(AudioMsg::Frame { bytes, enqueued_at }) => {
+                        let p = play.as_mut().unwrap();
+                        p.frames_sent += 1;
+                        // PURA-330 — first audible frame; closes the
+                        // `!play` → first-audio latency breakdown.
+                        if p.frames_sent == 1 {
+                            info!(
+                                target: "music_bot_latency",
+                                stage = "first_frame_on_wire",
+                                elapsed_ms = p.started_at.elapsed().as_millis() as u64,
+                                "first Opus frame sent on the wire — playback audible",
+                            );
+                        }
+                        // PURA-347 — once-per-second playback-progress tick,
+                        // offset by the PURA-352 seek base.
+                        if p.frames_sent.is_multiple_of(FRAMES_PER_PROGRESS_TICK) {
+                            let _ = events.send(BotEvent::Progress {
+                                elapsed_secs: p.seek_base_secs
+                                    + p.frames_sent / FRAMES_PER_PROGRESS_TICK,
+                            });
+                        }
+                        // PURA-396 2b — `false`: no `block_in_place`. The
+                        // wire task does nothing but wire I/O, so wrapping
+                        // the microsecond send buys only churn (candidate A).
+                        if let Err(err) = audio::send_opus_frame(
+                            &mut con,
+                            &bytes,
+                            enqueued_at,
+                            &mut p.send_monitor,
+                            false,
+                        ) {
+                            error!(?err, "send_audio failed on the wire task");
+                            let epoch = p.epoch;
+                            play = None;
+                            let _ = wire_evt_tx.send(WireEvent::SendFailed {
+                                error: err.to_string(),
+                                epoch,
+                            });
+                        }
+                    }
+                    Some(AudioMsg::PipelineEvent(ev)) => {
+                        let _ = wire_evt_tx.send(WireEvent::Pipeline(ev));
+                    }
+                    Some(AudioMsg::Finished) => {
+                        let p = play.take().expect("guard ensures Some");
+                        let _ = wire_evt_tx.send(WireEvent::AudioFinished {
+                            frames_sent: p.frames_sent,
+                            epoch: p.epoch,
+                        });
+                    }
+                    None => {
+                        // Sibling channel closed without a `Finished`.
+                        let epoch = play.take().expect("guard ensures Some").epoch;
+                        let _ = wire_evt_tx.send(WireEvent::SiblingClosed { epoch });
+                    }
+                }
+                // Should never trip — the body is one send / one channel
+                // push. Logged so the A/B can prove the wire task is clean.
+                log_loop_stall("wire_audio", arm_start, || "frame".to_string());
+            },
+            cmd = wire_cmd_rx.recv() => match cmd {
+                Some(WireCmd::InstallAudio { rx, started_at, seek_base_secs, epoch }) => {
+                    play = Some(WirePlay {
+                        rx,
+                        frames_sent: 0,
+                        started_at,
+                        seek_base_secs,
+                        send_monitor: audio::SendTimingMonitor::new(),
+                        epoch,
+                    });
+                }
+                Some(WireCmd::ClearAudio) => {
+                    play = None;
+                }
+                Some(WireCmd::VoiceStop) => audio::send_voice_stop(&mut con),
+                Some(WireCmd::ChannelMove(target)) => {
+                    if let Err(err) = send_channel_move(&mut con, target) {
+                        let _ = events.send(BotEvent::Error(BotError::Connection(format!(
+                            "{err:#}"
+                        ))));
+                    }
+                }
+                Some(WireCmd::ChatReply(line)) => chat::send_reply(&mut con, &line),
+                Some(WireCmd::Disconnect { shutdown }) => {
+                    clean_disconnect(&mut con, if shutdown { "shutdown" } else { "disconnect" })
+                        .await;
+                    return;
+                }
+                None => {
+                    // Control task gone — exit without a clean disconnect
+                    // (the actor is already tearing down).
+                    return;
+                }
+            },
+            ev = async { con.events().next().await } => {
+                let arm_start = Instant::now();
+                match ev {
+                    Some(Ok(item)) => {
+                        let item_label = stream_item_label(&item);
+                        // Extract chat (borrows `&item`) before the
+                        // channel-update logic consumes the item.
+                        let chat_msgs = extract_channel_chat(&item, &con);
+                        let chat_lines = chat_msgs.len();
+                        if !chat_msgs.is_empty() {
+                            let _ = wire_evt_tx.send(WireEvent::Chat(chat_msgs));
+                        }
+                        if let Some(channel) = handle_stream_item(item, &con) {
+                            let _ = wire_evt_tx.send(WireEvent::Channel(channel));
+                        }
+                        log_loop_stall("wire_event", arm_start, || {
+                            format!("item={item_label} chat_lines={chat_lines}")
+                        });
+                    }
+                    Some(Err(err)) => {
+                        let _ = wire_evt_tx.send(WireEvent::Dropped(format!("stream error: {err}")));
+                        return;
+                    }
+                    None => {
+                        let _ = wire_evt_tx.send(WireEvent::Dropped("stream ended".into()));
+                        return;
+                    }
+                }
+            },
+        }
+    }
+}
+
+/// PURA-396 — hand any freshly-spawned pipeline's frame receiver to the wire
+/// task. Centralised at the top of the control loop so every spawn site
+/// (direct `Play`, chat `!play`, queue auto-advance, seek) is covered by one
+/// call. Bumps the pipeline-generation `epoch` so a later teardown event from
+/// this generation is attributable.
+fn install_pending_audio(
+    current_audio: &mut Option<ActiveAudio>,
+    epoch: &mut u64,
+    wire_cmd_tx: &mpsc::UnboundedSender<WireCmd>,
+) {
+    let Some(active) = current_audio.as_mut() else {
+        return;
+    };
+    let Some(rx) = active.audio_rx.take() else {
+        return;
+    };
+    *epoch += 1;
+    let _ = wire_cmd_tx.send(WireCmd::InstallAudio {
+        rx,
+        started_at: active.started_at,
+        seek_base_secs: active.seek_base_secs,
+        epoch: *epoch,
+    });
+}
+
+/// PURA-396 §2a — the **control loop**. Spawns the [`run_wire_task`] and then
+/// runs in place doing all the heavy work: chat dispatch, queue DB, pipeline
+/// lifecycle, `BotEvent` broadcast. It no longer holds `&mut Connection`, so
+/// it may stall freely — an ~11 s yt-dlp resolve here never gaps the wire,
+/// because paced frames flow sibling → wire task directly and never traverse
+/// this loop (the candidate-C fix).
+///
+/// Consumes `con` (moved into the wire task). Returns the same
+/// [`ConnectedExit`] contract as `run_connected_loop`; the clean disconnect
+/// happens inside the wire task on the caller-driven exits.
+#[allow(clippy::too_many_arguments)]
+async fn run_split_connected_loop(
+    con: Connection,
+    state: &mut BotState,
+    current_channel: &mut Option<ChannelId>,
+    rx: &mut mpsc::Receiver<BotCommand>,
+    events: &broadcast::Sender<BotEvent>,
+    bot_id: BotId,
+    store: &Arc<dyn MusicBotStore>,
+    yt_cookie: Arc<RwLock<Option<PathBuf>>>,
+    bot_volume: VolumeHandle,
+) -> ConnectedExit {
+    let (wire_cmd_tx, wire_cmd_rx) = mpsc::unbounded_channel::<WireCmd>();
+    let (wire_evt_tx, mut wire_evt_rx) = mpsc::unbounded_channel::<WireEvent>();
+    let wire_handle = tokio::spawn(run_wire_task(con, wire_cmd_rx, wire_evt_tx, events.clone()));
+
+    // Control-side audio state. `current_audio` is the pipeline lifecycle
+    // handle (pause / seek / teardown); the frame-side counterpart lives in
+    // the wire task's `WirePlay`. `audio_epoch` is the current pipeline
+    // generation — see `install_pending_audio`.
+    let mut current_audio: Option<ActiveAudio> = None;
+    let mut audio_epoch: u64 = 0;
+
+    let exit = loop {
+        // Install any pipeline the previous iteration spawned.
+        install_pending_audio(&mut current_audio, &mut audio_epoch, &wire_cmd_tx);
+
+        tokio::select! {
+            wevt = wire_evt_rx.recv() => match wevt {
+                Some(WireEvent::Channel(channel)) => {
+                    if Some(channel) != *current_channel {
+                        *current_channel = Some(channel);
+                        transition(state, BotState::InChannel, events);
+                        let _ = events.send(BotEvent::JoinedChannel { channel_id: channel });
+                    }
+                }
+                Some(WireEvent::Chat(lines)) => {
+                    for msg in lines {
+                        dispatch_chat_line(
+                            &mut WireSink::Split(&wire_cmd_tx),
+                            &mut current_audio,
+                            bot_id,
+                            store,
+                            events,
+                            &yt_cookie,
+                            &bot_volume,
+                            &msg,
+                        )
+                        .await;
+                    }
+                }
+                Some(WireEvent::Pipeline(ev)) => {
+                    handle_audio_msg(
+                        &mut WireSink::Split(&wire_cmd_tx),
+                        Some(AudioMsg::PipelineEvent(ev)),
+                        &mut current_audio,
+                        bot_id,
+                        store,
+                        events,
+                        &yt_cookie,
+                        &bot_volume,
+                    )
+                    .await;
+                }
+                Some(WireEvent::AudioFinished { frames_sent, epoch }) => {
+                    // Ignore a `Finished` from a pipeline we have since
+                    // replaced (epoch mismatch).
+                    if epoch == audio_epoch {
+                        // The control-side `frames_sent` is never incremented
+                        // in the split path (the wire task counts) — surface
+                        // the wire count so `handle_audio_msg`'s 0-frame
+                        // failure detection still works.
+                        if let Some(active) = current_audio.as_mut() {
+                            active.frames_sent = frames_sent;
+                        }
+                        handle_audio_msg(
+                            &mut WireSink::Split(&wire_cmd_tx),
+                            Some(AudioMsg::Finished),
+                            &mut current_audio,
+                            bot_id,
+                            store,
+                            events,
+                            &yt_cookie,
+                            &bot_volume,
+                        )
+                        .await;
+                    }
+                }
+                Some(WireEvent::SiblingClosed { epoch }) => {
+                    if epoch == audio_epoch {
+                        handle_audio_msg(
+                            &mut WireSink::Split(&wire_cmd_tx),
+                            None,
+                            &mut current_audio,
+                            bot_id,
+                            store,
+                            events,
+                            &yt_cookie,
+                            &bot_volume,
+                        )
+                        .await;
+                    }
+                }
+                Some(WireEvent::SendFailed { error, epoch }) => {
+                    if epoch == audio_epoch {
+                        error!(error, "send_audio failed — tearing down pipeline");
+                        audio::tear_down(&mut current_audio);
+                        // PURA-261 — `failed: ` prefix so `LivenessTracker`
+                        // records `last_error` and drops the `Playing` state.
+                        let _ = events.send(BotEvent::AudioFinished {
+                            reason: format!("failed: audio send error — {error}"),
+                        });
+                    }
+                }
+                Some(WireEvent::Dropped(reason)) => break ConnectedExit::Dropped(reason),
+                None => break ConnectedExit::Dropped("wire task ended".into()),
+            },
+            cmd = rx.recv() => match cmd {
+                Some(BotCommand::Disconnect) => {
+                    if audio::tear_down(&mut current_audio) {
+                        let _ = wire_cmd_tx.send(WireCmd::ClearAudio);
+                        let _ = wire_cmd_tx.send(WireCmd::VoiceStop);
+                        let _ = events.send(BotEvent::AudioFinished {
+                            reason: "disconnect".into(),
+                        });
+                    }
+                    break ConnectedExit::Disconnect;
+                }
+                Some(BotCommand::Shutdown) => {
+                    if audio::tear_down(&mut current_audio) {
+                        let _ = wire_cmd_tx.send(WireCmd::ClearAudio);
+                        let _ = wire_cmd_tx.send(WireCmd::VoiceStop);
+                        let _ = events.send(BotEvent::AudioFinished {
+                            reason: "shutdown".into(),
+                        });
+                    }
+                    break ConnectedExit::Shutdown;
+                }
+                Some(BotCommand::Connect) => {
+                    debug!("Connect ignored — already online");
+                }
+                Some(BotCommand::JoinChannel(target)) => {
+                    // `channel_move` on a `Split` sink cannot fail (it just
+                    // enqueues a `WireCmd`); the wire task logs any real
+                    // send error and emits a `BotEvent::Error`.
+                    let _ = WireSink::Split(&wire_cmd_tx).channel_move(target);
+                }
+                Some(BotCommand::LeaveChannel) => {
+                    let _ = events.send(BotEvent::LeftChannel);
+                    if let Some(id) = *current_channel {
+                        debug!(channel_id = id, "LeaveChannel — staying in current channel until WS-3 default-channel tracking lands");
+                    }
+                }
+                Some(BotCommand::Audio(audio_cmd)) => {
+                    handle_audio_command(
+                        &mut WireSink::Split(&wire_cmd_tx),
+                        audio_cmd,
+                        &mut current_audio,
+                        bot_id,
+                        store,
+                        events,
+                        &yt_cookie,
+                        &bot_volume,
+                    )
+                    .await;
+                }
+                Some(BotCommand::Queue(qc)) => {
+                    handle_queue_command(bot_id, store, qc, events).await;
+                }
+                None => break ConnectedExit::Dropped("command channel closed".into()),
+            },
+        }
+    };
+
+    // Caller-driven exits: tell the wire task to clean-disconnect, then wait
+    // for it so the disconnect actually flushed before the actor's state
+    // machine moves on. On a `Dropped` exit the wire task has already
+    // returned; dropping `wire_cmd_tx` lets a blocked `recv` fall through.
+    match &exit {
+        ConnectedExit::Disconnect => {
+            let _ = wire_cmd_tx.send(WireCmd::Disconnect { shutdown: false });
+        }
+        ConnectedExit::Shutdown => {
+            let _ = wire_cmd_tx.send(WireCmd::Disconnect { shutdown: true });
+        }
+        ConnectedExit::Dropped(_) => {}
+    }
+    drop(wire_cmd_tx);
+    let _ = wire_handle.await;
+    exit
+}
+
 /// PURA-154 — drain a message from the audio sibling task.
 ///
 /// PURA-358 — returns a `&'static str` naming the message kind handled, so
@@ -498,7 +1084,7 @@ async fn run_connected_loop(
 /// `send_audio` contention on a `frame`).
 #[allow(clippy::too_many_arguments)]
 async fn handle_audio_msg(
-    con: &mut Connection,
+    wire: &mut WireSink<'_>,
     msg: Option<AudioMsg>,
     current_audio: &mut Option<ActiveAudio>,
     bot_id: BotId,
@@ -513,7 +1099,8 @@ async fn handle_audio_msg(
         // Finished before its task body returns.
         warn!("audio sibling channel closed without Finished — tearing down");
         if audio::tear_down(current_audio) {
-            audio::send_voice_stop(con);
+            wire.clear_audio();
+            wire.voice_stop();
             let _ = events.send(BotEvent::AudioFinished {
                 reason: "failed: audio pipeline channel closed unexpectedly".into(),
             });
@@ -556,13 +1143,14 @@ async fn handle_audio_msg(
                             + active.frames_sent / FRAMES_PER_PROGRESS_TICK,
                     });
                 }
-                audio::send_opus_frame(con, &bytes, enqueued_at, &mut active.send_monitor)
+                wire.send_opus_frame(&bytes, enqueued_at, &mut active.send_monitor)
             } else {
                 Ok(())
             };
             if let Err(err) = send_result {
                 error!(?err, "send_audio failed — tearing down pipeline");
                 audio::tear_down(current_audio);
+                wire.clear_audio();
                 // PURA-261 — `failed: ` prefix so `LivenessTracker`
                 // surfaces this as the bot's `last_error` and the
                 // synthesised `Playing` state drops.
@@ -608,7 +1196,7 @@ async fn handle_audio_msg(
             "end_of_stream"
         }
         AudioMsg::Finished => {
-            audio::send_voice_stop(con);
+            wire.voice_stop();
             // PURA-261 — a pipeline that drained without ever producing
             // a frame means yt-dlp / ffmpeg failed (bad URL, bot-gated
             // video, codec error). Flag it with the `failed: ` reason
@@ -654,7 +1242,7 @@ async fn handle_audio_msg(
 /// sibling task.
 #[allow(clippy::too_many_arguments)]
 async fn handle_audio_command(
-    con: &mut Connection,
+    wire: &mut WireSink<'_>,
     cmd: AudioCommand,
     current_audio: &mut Option<ActiveAudio>,
     bot_id: BotId,
@@ -703,7 +1291,8 @@ async fn handle_audio_command(
         }
         AudioCommand::Stop => {
             if audio::tear_down(current_audio) {
-                audio::send_voice_stop(con);
+                wire.clear_audio();
+                wire.voice_stop();
                 let _ = events.send(BotEvent::AudioFinished {
                     reason: "stopped".into(),
                 });
@@ -728,7 +1317,8 @@ async fn handle_audio_command(
             // the post-advance head is the next track and auto-start it.
             let was_active = audio::tear_down(current_audio);
             if was_active {
-                audio::send_voice_stop(con);
+                wire.clear_audio();
+                wire.voice_stop();
             }
             // PURA-261 — emit `AudioFinished` BEFORE the queue advance:
             // `LivenessTracker` clears `now_playing` on `AudioFinished`,
@@ -749,7 +1339,7 @@ async fn handle_audio_command(
                     info!(secs, "AudioCommand::Seek — re-spawned pipeline at offset");
                     // Flush the wire so the TS jitter buffer drops the gap
                     // between the old and the post-seek frames cleanly.
-                    audio::send_voice_stop(con);
+                    wire.voice_stop();
                     // Snap the FE progress clock to the seek target now —
                     // the next `Progress` tick (offset + frames/50) only
                     // lands a second into the post-seek pre-buffer.
@@ -1233,7 +1823,7 @@ fn extract_channel_chat(item: &StreamItem, con: &Connection) -> Vec<ChatLine> {
 /// `current_audio` at all, so chat `!play` could only ever enqueue.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_chat_line(
-    con: &mut Connection,
+    wire: &mut WireSink<'_>,
     current_audio: &mut Option<ActiveAudio>,
     bot_id: BotId,
     store: &Arc<dyn MusicBotStore>,
@@ -1251,9 +1841,13 @@ async fn dispatch_chat_line(
             // the command-dispatch latency the issue calls out as
             // previously unmeasured.
             info!(target: "music_bot_latency", invoker = %msg.invoker, command = ?parsed, "chat command received");
-            let action = chat::dispatch(bot_id, con, store, events, parsed).await;
+            // PURA-396 — `chat::handle_command` is `Connection`-free; the
+            // reply rides the `WireSink` (a direct `send_reply`, or a
+            // `WireCmd::ChatReply` to the wire task in the split path).
+            let (reply, action) = chat::handle_command(bot_id, store, events, parsed).await;
+            wire.chat_reply(reply);
             apply_chat_audio_action(
-                con,
+                wire,
                 current_audio,
                 bot_id,
                 store,
@@ -1266,7 +1860,9 @@ async fn dispatch_chat_line(
         }
         Err(err) => {
             debug!(invoker = %msg.invoker, line = %msg.text, ?err, "chat parse outcome");
-            chat::reply_for_parse_error(con, &err);
+            if let Some(reply) = chat::parse_error_reply(&err) {
+                wire.chat_reply(reply);
+            }
         }
     }
 }
@@ -1277,7 +1873,7 @@ async fn dispatch_chat_line(
 /// the actual pipeline spawn / teardown happens here.
 #[allow(clippy::too_many_arguments)]
 async fn apply_chat_audio_action(
-    con: &mut Connection,
+    wire: &mut WireSink<'_>,
     current_audio: &mut Option<ActiveAudio>,
     bot_id: BotId,
     store: &Arc<dyn MusicBotStore>,
@@ -1326,7 +1922,8 @@ async fn apply_chat_audio_action(
             // handler already emitted `NowPlaying` for the new head, and
             // `AudioFinished` would clear that fresh `now_playing`.
             if audio::tear_down(current_audio) {
-                audio::send_voice_stop(con);
+                wire.clear_audio();
+                wire.voice_stop();
                 debug!("chat command replaced the queue head — restarting pipeline");
             }
             auto_start_pending_track(current_audio, store, bot_id, events, yt_cookie, bot_volume)
@@ -1338,7 +1935,8 @@ async fn apply_chat_audio_action(
             // `AudioFinished` so `LivenessTracker` drops the `Playing`
             // state. Mirrors `AudioCommand::Stop`.
             if audio::tear_down(current_audio) {
-                audio::send_voice_stop(con);
+                wire.clear_audio();
+                wire.voice_stop();
                 let _ = events.send(BotEvent::AudioFinished {
                     reason: "stopped".into(),
                 });
@@ -1479,5 +2077,106 @@ mod tests {
             !cell.get(),
             "a sub-threshold iteration must not even format the stall detail",
         );
+    }
+
+    /// PURA-396 — the `VOICE_SPLIT_WIRE_TASK` env override is parsed
+    /// trimmed and case-insensitive on the common truthy spellings;
+    /// anything else (incl. absent) is off.
+    #[test]
+    fn split_flag_truthy_accepts_the_common_spellings() {
+        for v in ["1", "true", "TRUE", " yes ", "On", "tRuE"] {
+            assert!(split_flag_truthy(Some(v)), "{v:?} should be truthy");
+        }
+        for v in ["0", "false", "", "no", "off", "2"] {
+            assert!(!split_flag_truthy(Some(v)), "{v:?} should be falsy");
+        }
+        assert!(!split_flag_truthy(None), "an unset var is off");
+    }
+
+    /// PURA-396 — the acceptance criterion: a single FIFO `mpsc<WireCmd>`
+    /// orders audio teardown vs. voice-stop. A `WireSink::Split` issues
+    /// each command in call order, so `clear_audio()` (drop buffered
+    /// frames) lands before `voice_stop()` on the wire.
+    #[test]
+    fn wire_sink_split_preserves_command_fifo() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<WireCmd>();
+        {
+            let mut wire = WireSink::Split(&tx);
+            wire.clear_audio();
+            wire.voice_stop();
+            wire.chat_reply("hello".to_string());
+            assert!(
+                wire.channel_move(7).is_ok(),
+                "a split channel_move never fails"
+            );
+        }
+        assert!(matches!(rx.try_recv(), Ok(WireCmd::ClearAudio)));
+        assert!(matches!(rx.try_recv(), Ok(WireCmd::VoiceStop)));
+        assert!(matches!(rx.try_recv(), Ok(WireCmd::ChatReply(line)) if line == "hello"),);
+        assert!(matches!(rx.try_recv(), Ok(WireCmd::ChannelMove(7))));
+        assert!(rx.try_recv().is_err(), "exactly four commands issued");
+    }
+
+    /// PURA-396 — `install_pending_audio` hands a freshly-spawned
+    /// pipeline's frame receiver to the wire task exactly once, bumping
+    /// the pipeline-generation `epoch`; a second call with the receiver
+    /// already taken is an epoch-stable no-op. The `epoch` is what lets
+    /// the control task discard a teardown event from a replaced
+    /// pipeline. Uses the `synthetic://` seam — no network / yt-dlp.
+    #[tokio::test]
+    async fn install_pending_audio_ships_receiver_once_and_bumps_epoch() {
+        let store: Arc<dyn MusicBotStore> = Arc::new(InMemoryMusicBotStore::new());
+        let bot_id = BotId(1);
+        store
+            .queue_enqueue(
+                bot_id,
+                NewTrack {
+                    source: AudioSource::Url(
+                        "synthetic://?hz=440&duration_ms=200&amplitude=0.5".into(),
+                    ),
+                    title: "tone".into(),
+                    duration_secs: None,
+                    requested_by: None,
+                },
+            )
+            .await
+            .expect("enqueue synthetic head");
+        let (events, _rx) = broadcast::channel(64);
+        let yt_cookie: Arc<RwLock<Option<PathBuf>>> = Arc::new(RwLock::new(None));
+        let mut current_audio: Option<ActiveAudio> = None;
+        auto_start_pending_track(
+            &mut current_audio,
+            &store,
+            bot_id,
+            &events,
+            &yt_cookie,
+            &VolumeHandle::default(),
+        )
+        .await;
+        assert!(
+            current_audio.as_ref().is_some_and(|a| a.audio_rx.is_some()),
+            "a freshly-spawned pipeline carries an un-taken frame receiver",
+        );
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<WireCmd>();
+        let mut epoch = 0u64;
+        install_pending_audio(&mut current_audio, &mut epoch, &tx);
+        assert_eq!(epoch, 1, "the first install bumps the generation epoch");
+        assert!(
+            matches!(rx.try_recv(), Ok(WireCmd::InstallAudio { epoch: 1, .. })),
+            "the receiver is shipped to the wire task tagged with the epoch",
+        );
+        assert!(
+            current_audio.as_ref().unwrap().audio_rx.is_none(),
+            "the receiver was taken — the control task no longer drains frames",
+        );
+
+        // No fresh pipeline ⇒ the receiver is already gone ⇒ no-op.
+        install_pending_audio(&mut current_audio, &mut epoch, &tx);
+        assert_eq!(
+            epoch, 1,
+            "a second call with nothing pending is epoch-stable"
+        );
+        assert!(rx.try_recv().is_err(), "and ships no further WireCmd");
     }
 }

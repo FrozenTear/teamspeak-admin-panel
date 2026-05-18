@@ -32,6 +32,17 @@ pub struct BotConfig {
     /// late-subscriber tolerance, more memory. Default 64 events is
     /// plenty for the WS-5 / WS-6 surfaces.
     pub event_buffer: usize,
+    /// PURA-396 — run the connected loop as a split **wire task** (sole
+    /// `&mut Connection` owner, bounded per-iteration cost) + **control
+    /// task** (chat / queue / pipeline lifecycle). Default `false` keeps
+    /// the single-loop path; `true` is the PURA-389 §2a/2b refactor.
+    ///
+    /// `#[serde(default)]` so configs persisted before this field (the
+    /// PURA-357 `music_bot_runtime` rows) still deserialize. The effective
+    /// value is `OR`-ed with the `VOICE_SPLIT_WIRE_TASK` env var at actor
+    /// start, so a contabo-dev A/B is a pod env flip with no DB write.
+    #[serde(default)]
+    pub voice_split_wire_task: bool,
 }
 
 impl BotConfig {
@@ -46,7 +57,14 @@ impl BotConfig {
             backoff: BackoffConfig::default(),
             handshake_timeout: Duration::from_secs(30),
             event_buffer: 64,
+            voice_split_wire_task: false,
         }
+    }
+
+    /// PURA-396 — opt into the split wire/control loop (default off).
+    pub fn with_voice_split_wire_task(mut self, on: bool) -> Self {
+        self.voice_split_wire_task = on;
+        self
     }
 
     pub fn with_server_addr(mut self, addr: impl Into<String>) -> Self {
@@ -79,5 +97,43 @@ pub struct BotId(pub u64);
 impl std::fmt::Display for BotId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "bot-{:08x}", self.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PURA-396 — the split wire/control loop is opt-in: `false` by
+    /// default, flipped by the builder.
+    #[test]
+    fn voice_split_wire_task_defaults_off() {
+        let cfg = BotConfig::new("bot", "/tmp/bot.identity");
+        assert!(
+            !cfg.voice_split_wire_task,
+            "default must be the single-loop path"
+        );
+        assert!(
+            BotConfig::new("bot", "/tmp/bot.identity")
+                .with_voice_split_wire_task(true)
+                .voice_split_wire_task,
+        );
+    }
+
+    /// PURA-396 — `#[serde(default)]` keeps configs persisted before this
+    /// field (the PURA-357 `music_bot_runtime` rows) deserializable: a
+    /// JSON object with no `voice_split_wire_task` key loads as `false`.
+    #[test]
+    fn legacy_config_json_without_the_field_deserializes() {
+        let mut value = serde_json::to_value(BotConfig::new("bot", "/tmp/bot.identity"))
+            .expect("serialize BotConfig");
+        value
+            .as_object_mut()
+            .expect("config serializes as a JSON object")
+            .remove("voice_split_wire_task")
+            .expect("the field is present in a fresh config");
+        let restored: BotConfig =
+            serde_json::from_value(value).expect("legacy JSON without the field must load");
+        assert!(!restored.voice_split_wire_task);
     }
 }
