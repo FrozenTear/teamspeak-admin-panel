@@ -39,7 +39,10 @@ mod history;
 mod messages;
 mod metrics;
 pub(crate) mod perm;
+pub(crate) mod permeditor;
 mod queue;
+mod server_group_detail;
+mod server_groups;
 
 pub use case_detail::ModerationCasePage;
 pub use grants::PermissionGrantsPage;
@@ -47,6 +50,8 @@ pub use history::SubjectHistoryPage;
 pub use messages::MessagesPage;
 pub use metrics::AutomodMetricsPage;
 pub use queue::ModerationQueuePage;
+pub use server_group_detail::ServerGroupDetailPage;
+pub use server_groups::ServerGroupsPage;
 
 use chrono::{DateTime, Utc};
 use dioxus::prelude::*;

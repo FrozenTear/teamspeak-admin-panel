@@ -44,7 +44,7 @@ pub use login::LoginPage;
 pub use logs::LogsPage;
 pub use moderation::{
     AutomodMetricsPage, MessagesPage, ModerationCasePage, ModerationQueuePage,
-    PermissionGrantsPage, SubjectHistoryPage,
+    PermissionGrantsPage, ServerGroupDetailPage, ServerGroupsPage, SubjectHistoryPage,
 };
 pub use music_bots::{
     BotDetailPage, BotsIndexPage, MusicLibraryPage, MusicPlaylistsPage, RadioStationsPage,

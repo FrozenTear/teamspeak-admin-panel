@@ -26,8 +26,9 @@ use crate::ui::pages::{
     ChannelsPage, ClientsPage, DashboardPlaceholder, FlowDetailPage, FlowEditPage, FlowFormPage,
     FlowsListPage, Home, LoginPage, LogsPage, MessagesPage, ModerationCasePage,
     ModerationQueuePage, MusicLibraryPage, MusicPlaylistsPage, NotFoundPage, PermissionGrantsPage,
-    PublicWidgetPage, RadioStationsPage, ServerEditPage, ServerInfoPage, ServersIndexPage,
-    SettingsPage, SetupPage, SubjectHistoryPage, VideoSourcesPage, WidgetsPage,
+    PublicWidgetPage,
+    RadioStationsPage, ServerEditPage, ServerGroupDetailPage, ServerGroupsPage, ServerInfoPage,
+    ServersIndexPage, SettingsPage, SetupPage, SubjectHistoryPage, VideoSourcesPage, WidgetsPage,
 };
 
 #[rustfmt::skip]
@@ -189,6 +190,18 @@ pub enum Route {
     #[route("/moderation/messages")]
     MessagesPage {},
 
+    // PURA-375 (PURA-369 Phase B) — server-group surfaces. The list route
+    // is two static segments and the detail route appends one dynamic
+    // `sgid`; neither collides with the `/moderation/cases|subjects/*`
+    // dynamic routes (the `server-groups` literal is more specific). Read
+    // needs server access; create/edit/delete are admin-only in-page and
+    // the `/api/.../server-groups` routes re-check `check_admin`.
+    #[route("/moderation/server-groups")]
+    ServerGroupsPage {},
+
+    #[route("/moderation/server-groups/:sgid")]
+    ServerGroupDetailPage { sgid: i64 },
+
     // PURA-287 — per-user moderation grant editor. Admin-gated like the
     // other `/admin/*` surfaces; the sidebar entry is hidden for non-admins
     // and `PUT /api/users/{id}/permissions` enforces `RequireAdmin`.
@@ -238,6 +251,21 @@ mod tests {
 
         let route = Route::from_str("/music-bots").expect("bots index parse");
         assert!(matches!(route, Route::BotsIndexPage {}));
+    }
+
+    /// PURA-375 — the server-group routes. The list path is two static
+    /// segments; the detail path appends a typed `sgid`. Both must parse,
+    /// and the list must not be swallowed by the detail's dynamic segment.
+    #[test]
+    fn server_group_routes_resolve_with_typed_params() {
+        assert!(matches!(
+            Route::from_str("/moderation/server-groups").expect("server-groups list parse"),
+            Route::ServerGroupsPage {}
+        ));
+        assert!(matches!(
+            Route::from_str("/moderation/server-groups/9").expect("server-group detail parse"),
+            Route::ServerGroupDetailPage { sgid: 9 }
+        ));
     }
 
     /// PURA-243 — the static `/flows/new` route must win over the dynamic
