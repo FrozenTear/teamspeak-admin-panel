@@ -26,9 +26,9 @@ use crate::ui::pages::{
     ChannelsPage, ClientsPage, DashboardPlaceholder, FlowDetailPage, FlowEditPage, FlowFormPage,
     FlowsListPage, Home, LoginPage, LogsPage, MessagesPage, ModerationCasePage,
     ModerationQueuePage, MusicLibraryPage, MusicPlaylistsPage, NotFoundPage, PermissionGrantsPage,
-    PublicWidgetPage,
-    RadioStationsPage, ServerEditPage, ServerGroupDetailPage, ServerGroupsPage, ServerInfoPage,
-    ServersIndexPage, SettingsPage, SetupPage, SubjectHistoryPage, VideoSourcesPage, WidgetsPage,
+    PublicWidgetPage, RadioStationsPage, ServerEditPage, ServerGroupDetailPage, ServerGroupsPage,
+    ServerInfoPage, ServersIndexPage, SettingsPage, SetupPage, SubjectHistoryPage,
+    VideoSourcesPage, WidgetsPage,
 };
 
 #[rustfmt::skip]
