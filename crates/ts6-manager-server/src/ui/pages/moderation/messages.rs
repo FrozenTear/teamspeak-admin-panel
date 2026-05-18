@@ -548,8 +548,7 @@ fn ComposeModal(
     let filtered: Vec<ClientListItem> = clients_snapshot
         .iter()
         .filter(|c| {
-            filter_text.is_empty()
-                || c.client_nickname.to_lowercase().contains(&filter_text)
+            filter_text.is_empty() || c.client_nickname.to_lowercase().contains(&filter_text)
         })
         .cloned()
         .collect();
