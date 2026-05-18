@@ -259,6 +259,66 @@ enum ConnectedExit {
     Dropped(String),
 }
 
+/// PURA-358 — a single `run_connected_loop` iteration that runs longer
+/// than this starves the audio-drain arm. The audio sibling paces frames
+/// on a 20 ms cadence; the `biased` select polls the audio arm first, but
+/// once a *non-audio* arm body is executing nothing drains audio until it
+/// returns. A body past this threshold means the next frame reaches the
+/// wire late — the sporadic mid-song `frame_underrun` (with the frame
+/// buffer still full, so consumer-side starvation) reported in PURA-358.
+///
+/// 10 ms sits below `audio::LATENESS_WARN` (12 ms) so a stalling handler
+/// is logged *before* it tips into an audible crackle, yet well above the
+/// sub-millisecond cost of normal event/command handling — so it flags a
+/// real stall without false-positiving on routine iterations.
+const LOOP_STALL_WARN: Duration = Duration::from_millis(10);
+
+/// PURA-358 — emit a `connected_loop_stall` WARN when a select-arm body
+/// outran [`LOOP_STALL_WARN`]. `detail` is only formatted when the stall
+/// actually fired, so the hot path pays nothing on a healthy iteration.
+fn log_loop_stall(arm: &'static str, arm_start: Instant, detail: impl FnOnce() -> String) {
+    let elapsed = arm_start.elapsed();
+    if elapsed >= LOOP_STALL_WARN {
+        warn!(
+            target: "music_bot_latency",
+            stage = "connected_loop_stall",
+            arm,
+            detail = %detail(),
+            elapsed_ms = elapsed.as_millis() as u64,
+            "connected-loop arm body outran the 20 ms audio-frame cadence — the \
+             audio-drain arm was starved this long; correlate with a mid-song \
+             frame_underrun (buffered_frames full) to confirm it reached the wire",
+        );
+    }
+}
+
+/// Stable `&'static str` name for a [`BotCommand`] — used by
+/// rejected-command logging and the connected-loop stall watchdog.
+fn command_label(cmd: &BotCommand) -> &'static str {
+    match cmd {
+        BotCommand::Connect => "Connect",
+        BotCommand::Disconnect => "Disconnect",
+        BotCommand::JoinChannel(_) => "JoinChannel",
+        BotCommand::LeaveChannel => "LeaveChannel",
+        BotCommand::Shutdown => "Shutdown",
+        BotCommand::Audio(_) => "Audio",
+        BotCommand::Queue(_) => "Queue",
+    }
+}
+
+/// PURA-358 — stable `&'static str` name for a [`StreamItem`] variant, so
+/// the connected-loop stall watchdog can attribute a slow event-arm
+/// iteration to the kind of protocol event that held the loop.
+fn stream_item_label(item: &StreamItem) -> &'static str {
+    match item {
+        StreamItem::BookEvents(_) => "BookEvents",
+        StreamItem::DisconnectedTemporarily(_) => "DisconnectedTemporarily",
+        StreamItem::IdentityLevelIncreasing(_) => "IdentityLevelIncreasing",
+        StreamItem::IdentityLevelIncreased => "IdentityLevelIncreased",
+        _ => "other",
+    }
+}
+
 /// Drive the event stream + command queue while the bot is online.
 /// Mirrors `ts6-voice-prototype`'s borrow-checker dance: build the events
 /// future inline as the select arm so it gets dropped at each iteration,
@@ -299,7 +359,11 @@ async fn run_connected_loop(
                 // Unwrap is sound because the guard below gates entry.
                 current_audio.as_mut().unwrap().audio_rx.recv().await
             }, if current_audio.is_some() => {
-                handle_audio_msg(
+                // PURA-358 — time the audio-arm body. `send_audio`
+                // contention on a `frame`, or an ~11 s yt-dlp auto-advance
+                // on a `finished`, both stall the loop here.
+                let arm_start = Instant::now();
+                let kind = handle_audio_msg(
                     con,
                     audio_msg,
                     &mut current_audio,
@@ -309,14 +373,21 @@ async fn run_connected_loop(
                     &yt_cookie,
                     &bot_volume,
                 ).await;
+                log_loop_stall("audio", arm_start, || format!("audio_msg={kind}"));
             },
             ev = async { con.events().next().await } => match ev {
                 Some(Ok(item)) => {
+                    // PURA-358 — time the event-arm body. A heavy TS6
+                    // event handler, or a chat command that runs a
+                    // synchronous network round-trip, stalls the loop here.
+                    let arm_start = Instant::now();
+                    let item_label = stream_item_label(&item);
                     // PURA-122 WS-4 — pull any in-channel chat messages
                     // out of `BookEvents` BEFORE the channel-update logic
                     // consumes the item. Cheap because we only clone the
                     // event vector when chat is actually present.
                     let chat_msgs = extract_channel_chat(&item, con);
+                    let chat_lines = chat_msgs.len();
                     if let Some(channel) = handle_stream_item(item, con)
                         && Some(channel) != *current_channel {
                             *current_channel = Some(channel);
@@ -339,6 +410,9 @@ async fn run_connected_loop(
                         )
                         .await;
                     }
+                    log_loop_stall("event", arm_start, || {
+                        format!("item={item_label} chat_lines={chat_lines}")
+                    });
                 }
                 Some(Err(err)) => {
                     return ConnectedExit::Dropped(format!("stream error: {err}"));
@@ -387,6 +461,10 @@ async fn run_connected_loop(
                     }
                 }
                 Some(BotCommand::Audio(audio_cmd)) => {
+                    // PURA-358 — `AudioCommand::Play` / `Seek` resolve via
+                    // yt-dlp (~11 s) inline on this loop; time the body so a
+                    // command-driven stall is attributed, not just guessed.
+                    let arm_start = Instant::now();
                     handle_audio_command(
                         con,
                         audio_cmd,
@@ -397,9 +475,14 @@ async fn run_connected_loop(
                         &yt_cookie,
                         &bot_volume,
                     ).await;
+                    log_loop_stall("command", arm_start, || "cmd=Audio".to_string());
                 }
                 Some(BotCommand::Queue(qc)) => {
+                    // PURA-358 — queue mutations hit the store (DB round
+                    // trips); time the body so a slow store call is logged.
+                    let arm_start = Instant::now();
                     handle_queue_command(bot_id, store, qc, events).await;
+                    log_loop_stall("command", arm_start, || "cmd=Queue".to_string());
                 }
                 None => return ConnectedExit::Dropped("command channel closed".into()),
             },
@@ -408,6 +491,11 @@ async fn run_connected_loop(
 }
 
 /// PURA-154 — drain a message from the audio sibling task.
+///
+/// PURA-358 — returns a `&'static str` naming the message kind handled, so
+/// the connected loop's stall watchdog can attribute a slow audio-arm
+/// iteration (e.g. a `finished` that ran an ~11 s yt-dlp auto-advance, or
+/// `send_audio` contention on a `frame`).
 #[allow(clippy::too_many_arguments)]
 async fn handle_audio_msg(
     con: &mut Connection,
@@ -418,7 +506,7 @@ async fn handle_audio_msg(
     events: &broadcast::Sender<BotEvent>,
     yt_cookie: &Arc<RwLock<Option<PathBuf>>>,
     bot_volume: &VolumeHandle,
-) {
+) -> &'static str {
     let Some(msg) = msg else {
         // Sibling closed without sending Finished — treat as a hard stop.
         // This shouldn't happen in practice; the sibling always sends
@@ -430,7 +518,7 @@ async fn handle_audio_msg(
                 reason: "failed: audio pipeline channel closed unexpectedly".into(),
             });
         }
-        return;
+        return "sibling_closed";
     };
     match msg {
         AudioMsg::Frame(opus) => {
@@ -475,6 +563,7 @@ async fn handle_audio_msg(
                     reason: format!("failed: audio send error — {err}"),
                 });
             }
+            "frame"
         }
         AudioMsg::PipelineEvent(PipelineEvent::NowPlaying { title, source }) => {
             // Synthesize an ephemeral `Track` so the wire surface (which
@@ -490,6 +579,7 @@ async fn handle_audio_msg(
                 requested_by: None,
             };
             let _ = events.send(BotEvent::NowPlaying(track));
+            "now_playing"
         }
         AudioMsg::PipelineEvent(PipelineEvent::Warning(message)) => {
             warn!(%message, "audio pipeline warning");
@@ -502,11 +592,13 @@ async fn handle_audio_msg(
             let _ = events.send(BotEvent::Error(BotError::Internal(format!(
                 "audio pipeline: {message}"
             ))));
+            "pipeline_warning"
         }
         AudioMsg::PipelineEvent(PipelineEvent::EndOfStream) => {
             // Informational — the sibling will follow with `Finished`
             // once the frame channel drains.
             debug!("audio pipeline end-of-stream");
+            "end_of_stream"
         }
         AudioMsg::Finished => {
             audio::send_voice_stop(con);
@@ -545,6 +637,7 @@ async fn handle_audio_msg(
             handle_queue_command(bot_id, store, QueueCommand::Advance, events).await;
             auto_start_pending_track(current_audio, store, bot_id, events, yt_cookie, bot_volume)
                 .await;
+            "finished"
         }
     }
 }
@@ -892,15 +985,7 @@ fn transition(state: &mut BotState, to: BotState, events: &broadcast::Sender<Bot
 }
 
 fn emit_rejected(events: &broadcast::Sender<BotEvent>, cmd: &BotCommand, state: BotState) {
-    let label = match cmd {
-        BotCommand::Connect => "Connect",
-        BotCommand::Disconnect => "Disconnect",
-        BotCommand::JoinChannel(_) => "JoinChannel",
-        BotCommand::LeaveChannel => "LeaveChannel",
-        BotCommand::Shutdown => "Shutdown",
-        BotCommand::Audio(_) => "Audio",
-        BotCommand::Queue(_) => "Queue",
-    };
+    let label = command_label(cmd);
     warn!(
         command = label,
         ?state,
@@ -1345,5 +1430,47 @@ mod tests {
         .await;
         assert!(!started);
         assert!(current_audio.is_none());
+    }
+
+    /// PURA-358 — `command_label` is the stable name the connected-loop
+    /// stall watchdog and rejected-command logging report. Every
+    /// `BotCommand` variant must map to its expected label so a logged
+    /// `connected_loop_stall arm=command` is unambiguous.
+    #[test]
+    fn command_label_covers_every_variant() {
+        let cases: [(BotCommand, &str); 7] = [
+            (BotCommand::Connect, "Connect"),
+            (BotCommand::Disconnect, "Disconnect"),
+            (BotCommand::JoinChannel(0), "JoinChannel"),
+            (BotCommand::LeaveChannel, "LeaveChannel"),
+            (BotCommand::Shutdown, "Shutdown"),
+            (BotCommand::Audio(AudioCommand::Stop), "Audio"),
+            (BotCommand::Queue(QueueCommand::Clear), "Queue"),
+        ];
+        for (cmd, expect) in cases {
+            assert_eq!(command_label(&cmd), expect);
+        }
+    }
+
+    /// PURA-358 — the stall watchdog must fire *below* the 20 ms audio-frame
+    /// cadence. A threshold at or above the cadence would only log a stall
+    /// after it had already gapped the wire, defeating the early-warning
+    /// intent that lets an operator attribute a `frame_underrun`.
+    #[test]
+    fn loop_stall_warn_is_below_the_frame_cadence() {
+        assert!(
+            LOOP_STALL_WARN < Duration::from_millis(20),
+            "a stall watchdog at/above the 20 ms frame cadence cannot warn early",
+        );
+        // `log_loop_stall`'s detail closure must not run on a fast iteration.
+        let cell = std::cell::Cell::new(false);
+        log_loop_stall("event", Instant::now(), || {
+            cell.set(true);
+            String::new()
+        });
+        assert!(
+            !cell.get(),
+            "a sub-threshold iteration must not even format the stall detail",
+        );
     }
 }
