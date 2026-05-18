@@ -359,12 +359,17 @@ async fn build_source(
             // it.
             if let Some(resolver) = crate::resolver::shared() {
                 let t0 = Instant::now();
+                // PURA-368 — a `ytsearch<N>:` URL is a `!play yt:` search
+                // query (PURA-353); a watch URL is a direct `!play`. Tag the
+                // latency log so the two resolve paths can be measured apart.
+                let is_search = url.starts_with("ytsearch");
                 match resolver.resolve(&url, cfg.yt_cookie_file.as_deref()).await {
                     Ok(track) => {
                         tracing::info!(
                             target: "music_bot_latency",
                             stage = "resolver_resolved",
                             elapsed_ms = t0.elapsed().as_millis() as u64,
+                            search = is_search,
                             title = track.title.as_deref().unwrap_or(""),
                             "warm yt-dlp resolver returned direct media URL",
                         );
@@ -380,6 +385,7 @@ async fn build_source(
                     }
                     Err(e) => tracing::warn!(
                         error = %e,
+                        search = is_search,
                         "warm resolver did not resolve — falling back to yt-dlp subprocess",
                     ),
                 }

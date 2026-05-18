@@ -139,11 +139,57 @@ def _yt_dlp_version():
         return "unknown"
 
 
+def _extract_track(info):
+    """Pull a direct ``bestaudio`` URL + metadata out of an extract_info result.
+
+    PURA-368 — a watch URL (``https://youtu.be/<id>``) resolves to a video
+    info dict carrying a top-level ``url``. A YouTube *search* query
+    (``!play yt:`` → ``ytsearch1:<query>``, PURA-353) or a playlist URL
+    resolves instead to a ``_type: playlist`` dict whose per-video info
+    dicts live under ``entries``. yt-dlp processes search/playlist entries
+    fully — the nsig/signature challenge runs on the picked video as part
+    of ``extract_info`` — so the first non-empty entry already carries the
+    resolved direct URL; descend into it rather than re-resolving.
+
+    Before this fix the search path looked only at the playlist's
+    (absent) top-level ``url``, raised "no direct media URL", and the
+    caller fell back to a cold ``yt-dlp`` subprocess that re-ran the whole
+    search — the warm resolver did the full (multi-second) work and threw
+    it away. Returns ``None`` when no entry yields a playable URL.
+    """
+    if info is None:
+        return None
+    entries = info.get("entries")
+    if entries is not None:
+        for entry in entries:
+            track = _extract_track(entry)
+            if track is not None:
+                return track
+        return None
+    direct = info.get("url")
+    if not direct:
+        # Some extractors surface the picked format under requested_formats /
+        # requested_downloads rather than the top-level `url`.
+        picked = info.get("requested_formats") or info.get("requested_downloads")
+        if picked:
+            direct = picked[0].get("url")
+    if not direct:
+        return None
+    return {
+        "ok": True,
+        "direct_url": direct,
+        "title": info.get("title"),
+        "duration": info.get("duration"),
+    }
+
+
 def resolve(url, cookie_file):
     """Resolve ``url`` to a direct, ffmpeg-consumable ``bestaudio`` URL.
 
     Mirrors the subprocess fallback's ``yt-dlp -f bestaudio -g``: extraction
     (including YouTube's nsig/signature challenge) without the download.
+    Handles both a direct watch URL and a search/playlist result — see
+    [`_extract_track`].
     """
     opts = {
         "format": "bestaudio",
@@ -156,21 +202,10 @@ def resolve(url, cookie_file):
         opts["cookiefile"] = cookie_file
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.sanitize_info(ydl.extract_info(url, download=False))
-    direct = info.get("url")
-    if not direct:
-        # Some extractors surface the picked format under requested_formats /
-        # requested_downloads rather than the top-level `url`.
-        picked = info.get("requested_formats") or info.get("requested_downloads")
-        if picked:
-            direct = picked[0].get("url")
-    if not direct:
+    track = _extract_track(info)
+    if track is None:
         raise RuntimeError("yt-dlp returned no direct media URL")
-    return {
-        "ok": True,
-        "direct_url": direct,
-        "title": info.get("title"),
-        "duration": info.get("duration"),
-    }
+    return track
 
 
 def dispatch(payload):
