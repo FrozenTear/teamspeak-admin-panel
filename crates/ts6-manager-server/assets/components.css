@@ -1456,6 +1456,7 @@ a:hover {
   }
   .data-table--cards td.actions-col::before { margin-bottom: var(--space-2); }
   .data-table--cards td.actions-col .btn { width: 100%; }
+}
 /* ─── Admin user management (PURA-237) ───────────────────────────────── */
 /* Icon glyph paired with the colour + text label on every role / status
  * badge — colour is never the sole differentiator (ui-brief §6). */
