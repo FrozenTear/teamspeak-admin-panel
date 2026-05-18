@@ -144,6 +144,21 @@ pub fn Sidebar(props: SidebarProps) -> Element {
     // PURA-303 — the per-rule automod metrics surface highlights its own
     // nav entry, distinct from the case queue.
     let automod_active = matches!(props.active, Route::AutomodMetricsPage {});
+    // PURA-380 (PURA-369 Phase D) — the five moderation control surfaces.
+    // Each group entry highlights on its list route plus, where it has one,
+    // the typed detail sub-route so the operator stays oriented while
+    // drilled into a single group / token / message.
+    let server_groups_active = matches!(
+        props.active,
+        Route::ServerGroupsPage {} | Route::ServerGroupDetailPage { .. }
+    );
+    let channel_groups_active = matches!(
+        props.active,
+        Route::ChannelGroupsPage {} | Route::ChannelGroupDetailPage { .. }
+    );
+    let perm_catalog_active = matches!(props.active, Route::PermissionsCatalogPage { .. });
+    let tokens_active = matches!(props.active, Route::TokensPage {});
+    let messages_active = matches!(props.active, Route::MessagesPage {});
     // PURA-124 WS-6 — Music bots highlight when the route is the index
     // OR any of the per-bot detail / library / playlists / radio
     // surfaces, so the operator stays oriented across the whole flow.
@@ -189,16 +204,20 @@ pub fn Sidebar(props: SidebarProps) -> Element {
                 }
 
                 NavGroup { label: "Moderation",
-                    PlaceholderItem { icon: "⚐", label: "Server groups" }
-                    PlaceholderItem { icon: "⚑", label: "Channel groups" }
-                    PlaceholderItem { icon: "⚒", label: "Permissions" }
+                    // PURA-380 — the five moderation control surfaces, live
+                    // as of PURA-369 Phase D. Reads need only server access;
+                    // each page gates its write affordances on `admin` and
+                    // the `/api/.../*` routes re-check server-side.
+                    NavItem { icon: "⚐", label: "Server groups", to: Route::ServerGroupsPage {}, active: server_groups_active }
+                    NavItem { icon: "⚑", label: "Channel groups", to: Route::ChannelGroupsPage {}, active: channel_groups_active }
+                    NavItem { icon: "⚒", label: "Permissions", to: Route::PermissionsCatalogPage { permsid: None }, active: perm_catalog_active }
                     NavItem { icon: "⊘", label: "Bans", to: Route::BansPage {}, active: bans_active }
-                    PlaceholderItem { icon: "∘", label: "Tokens" }
+                    NavItem { icon: "∘", label: "Tokens", to: Route::TokensPage {}, active: tokens_active }
                     // PURA-287 — moderation case + complaint queue.
                     NavItem { icon: "⚖", label: "Cases", to: Route::ModerationQueuePage {}, active: moderation_active }
                     // PURA-303 — per-rule automod metrics.
                     NavItem { icon: "🤖", label: "Automod", to: Route::AutomodMetricsPage {}, active: automod_active }
-                    PlaceholderItem { icon: "✉", label: "Messages" }
+                    NavItem { icon: "✉", label: "Messages", to: Route::MessagesPage {}, active: messages_active }
                 }
 
                 NavGroup { label: "Automation",
@@ -400,22 +419,23 @@ mod tests {
         // PURA-124 WS-6 has converted "Music bots" into a real nav item.
         // PURA-224 has converted "Settings" into a real nav item.
         // PURA-287 has converted "Complaints" into the real "Cases" nav
-        // item (the /moderation queue). Remaining placeholders: 1 × Server
-        // (Files), 5 × Moderation (Server groups, Channel groups,
-        // Permissions, Tokens, Messages), 1 × Automation (Bots), 1 × Admin
-        // (Instance) = 8. The count is the authoritative signal here —
-        // adding/removing a real route should bump it.
+        // item (the /moderation queue). PURA-380 has converted the five
+        // Moderation placeholders (Server groups, Channel groups,
+        // Permissions, Tokens, Messages) into real nav items. Remaining
+        // placeholders: 1 × Server (Files), 1 × Automation (Bots), 1 ×
+        // Admin (Instance) = 3. The count is the authoritative signal here
+        // — adding/removing a real route should bump it.
         let disabled = html.matches(r#"aria-disabled="true""#).count();
         let tabindex_minus = html.matches(r#"tabindex="-1""#).count();
-        // 8 placeholders + the `<nav>` itself carries `tabindex=-1` for
-        // the skip-link target, so 9 total `tabindex="-1"` attributes.
+        // 3 placeholders + the `<nav>` itself carries `tabindex=-1` for
+        // the skip-link target, so 4 total `tabindex="-1"` attributes.
         assert_eq!(
-            disabled, 8,
-            "expected 8 aria-disabled placeholders, got {disabled}"
+            disabled, 3,
+            "expected 3 aria-disabled placeholders, got {disabled}"
         );
         assert_eq!(
-            tabindex_minus, 9,
-            "expected 9 tabindex='-1' (8 placeholders + nav landmark), got {tabindex_minus}"
+            tabindex_minus, 4,
+            "expected 4 tabindex='-1' (3 placeholders + nav landmark), got {tabindex_minus}"
         );
     }
 
