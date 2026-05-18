@@ -404,6 +404,239 @@ pub struct ChannelClientPerm {
     pub permskip: i64,
 }
 
+// =====================================================================
+// PURA-373 — server-group / channel-group / permission / token / message
+// command surface. Wire keys are preserved verbatim per spec §7.9–7.16
+// and the PURA-370 research §2 command map.
+// =====================================================================
+
+/// `servergrouplist` row. `type` is `0` regular / `1` template / `2`
+/// ServerQuery; `savedb` is `1` when membership persists to the TS
+/// database (PURA-370 §1.1).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ServerGroupEntry {
+    #[serde(deserialize_with = "stringy::deserialize")]
+    pub sgid: i64,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub r#type: i64,
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub iconid: i64,
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub savedb: i64,
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub sortid: i64,
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub namemode: i64,
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub n_modifyp: i64,
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub n_member_addp: i64,
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub n_member_removep: i64,
+}
+
+/// `channelgrouplist` row — mirrors [`ServerGroupEntry`] with `cgid`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ChannelGroupEntry {
+    #[serde(deserialize_with = "stringy::deserialize")]
+    pub cgid: i64,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub r#type: i64,
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub iconid: i64,
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub savedb: i64,
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub sortid: i64,
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub namemode: i64,
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub n_modifyp: i64,
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub n_member_addp: i64,
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub n_member_removep: i64,
+}
+
+/// `servergroupadd` / `servergroupcopy` (`tsgid=0`) response.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ServerGroupIdResponse {
+    #[serde(deserialize_with = "stringy::deserialize")]
+    pub sgid: i64,
+}
+
+/// `channelgroupadd` response.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ChannelGroupIdResponse {
+    #[serde(deserialize_with = "stringy::deserialize")]
+    pub cgid: i64,
+}
+
+/// `servergroupclientlist -names` row — one member of a server group.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ServerGroupClient {
+    #[serde(deserialize_with = "stringy::deserialize")]
+    pub cldbid: i64,
+    #[serde(default)]
+    pub client_nickname: String,
+    #[serde(default)]
+    pub client_unique_identifier: String,
+}
+
+/// `channelgroupclientlist` row — a `(cid, cldbid, cgid)` assignment.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ChannelGroupClient {
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub cid: i64,
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub cldbid: i64,
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub cgid: i64,
+}
+
+/// `servergrouppermlist` / `channelgrouppermlist` row (requested with the
+/// `-permsid` flag so `permsid` carries the stable string id). Channel
+/// group permissions never set `permnegated` / `permskip` — they default
+/// to `0` there.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GroupPermEntry {
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub permid: i64,
+    #[serde(default)]
+    pub permsid: String,
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub permvalue: i64,
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub permnegated: i64,
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub permskip: i64,
+}
+
+/// `permissionlist` row — one entry of the read-only permission catalog
+/// (spec §7.11). The companion `i_needed_*` permissions carry an empty
+/// `permdesc`; the UI hides them by default (PURA-370 §1.2).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PermissionEntry {
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub permid: i64,
+    #[serde(default)]
+    pub permname: String,
+    #[serde(default)]
+    pub permdesc: String,
+}
+
+/// `permfind` row — one assignment of the searched permission. `t` is the
+/// assignment kind (`0` server group, `1` client, `2` channel, `3` channel
+/// group); `id1` / `id2` are the kind-specific ids; `p` is the numeric
+/// `permid`. Every field defaults so a fixture-specific column omission
+/// degrades gracefully rather than failing the whole decode.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PermFindEntry {
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub t: i64,
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub id1: i64,
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub id2: i64,
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub p: i64,
+}
+
+/// `permoverview` row. `t` tags the origin (`0` server group, `1` client,
+/// `2` channel) and `id1` carries the origin `sgid` / `cid` — this answers
+/// the §6.2 "why does this client have this permission" SOURCE column
+/// without a second lookup. `v` / `n` / `s` are value / negated / skip.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PermOverviewEntry {
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub t: i64,
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub id1: i64,
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub id2: i64,
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub p: i64,
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub v: i64,
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub n: i64,
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub s: i64,
+}
+
+/// `permidgetbyname` response — bridges a `permsid` string to the numeric
+/// `permid` for the write paths that need it (spec §7.8 client perms).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PermIdEntry {
+    #[serde(default)]
+    pub permsid: String,
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub permid: i64,
+}
+
+/// `privilegekeylist` row — one TS6 privilege key (token). `token_type` is
+/// `0` for a server-group token, `1` for a channel-group token (PURA-370
+/// §1.3).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PrivilegeKeyEntry {
+    #[serde(default)]
+    pub token: String,
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub token_type: i64,
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub token_id1: i64,
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub token_id2: i64,
+    #[serde(default)]
+    pub token_description: String,
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub token_created: i64,
+    #[serde(default)]
+    pub token_customset: String,
+}
+
+/// `privilegekeyadd` response — the freshly minted key string.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PrivilegeKeyAddResponse {
+    #[serde(default)]
+    pub token: String,
+}
+
+/// `messagelist` row — an offline-message inbox entry. `cluid` is the
+/// recipient's unique id; `flag_read` is `1` once delivered/read.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MessageEntry {
+    #[serde(deserialize_with = "stringy::deserialize")]
+    pub msgid: i64,
+    #[serde(default)]
+    pub cluid: String,
+    #[serde(default)]
+    pub subject: String,
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub timestamp: i64,
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub flag_read: i64,
+}
+
+/// `messageget` response — a single offline message including its body.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MessageDetail {
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub msgid: i64,
+    #[serde(default)]
+    pub cluid: String,
+    #[serde(default)]
+    pub subject: String,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub timestamp: i64,
+}
+
 /// String-or-number tolerance for TS WebQuery numeric fields.
 mod stringy {
     use super::*;
@@ -763,5 +996,167 @@ mod tests {
         assert_eq!(info.virtualserver_uptime, 12_345);
         assert!((info.virtualserver_total_packetloss_total - 0.0042).abs() < 1e-9);
         assert!((info.virtualserver_total_ping - 12.5).abs() < 1e-9);
+    }
+
+    // ---- PURA-373 group / permission / token / message models ----
+
+    #[test]
+    fn server_group_entry_parses_stringy_payload() {
+        let raw = serde_json::json!({
+            "sgid": "6",
+            "name": "Server Admin",
+            "type": "1",
+            "iconid": "300",
+            "savedb": "1",
+            "sortid": "0",
+            "namemode": "0",
+            "n_modifyp": "100",
+            "n_member_addp": "100",
+            "n_member_removep": "100",
+        });
+        let g: ServerGroupEntry = serde_json::from_value(raw).unwrap();
+        assert_eq!(g.sgid, 6);
+        assert_eq!(g.name, "Server Admin");
+        assert_eq!(g.r#type, 1);
+        assert_eq!(g.savedb, 1);
+        assert_eq!(g.n_member_addp, 100);
+    }
+
+    #[test]
+    fn channel_group_entry_parses() {
+        let raw = serde_json::json!({"cgid": "2", "name": "Operator", "type": "0"});
+        let g: ChannelGroupEntry = serde_json::from_value(raw).unwrap();
+        assert_eq!(g.cgid, 2);
+        assert_eq!(g.name, "Operator");
+    }
+
+    #[test]
+    fn group_id_responses_parse() {
+        let s: ServerGroupIdResponse =
+            serde_json::from_value(serde_json::json!({"sgid": "13"})).unwrap();
+        assert_eq!(s.sgid, 13);
+        let c: ChannelGroupIdResponse =
+            serde_json::from_value(serde_json::json!({"cgid": "14"})).unwrap();
+        assert_eq!(c.cgid, 14);
+    }
+
+    #[test]
+    fn server_group_client_parses() {
+        let raw = serde_json::json!({
+            "cldbid": "1000",
+            "client_nickname": "Alice",
+            "client_unique_identifier": "uid=",
+        });
+        let m: ServerGroupClient = serde_json::from_value(raw).unwrap();
+        assert_eq!(m.cldbid, 1000);
+        assert_eq!(m.client_nickname, "Alice");
+    }
+
+    #[test]
+    fn channel_group_client_parses() {
+        let raw = serde_json::json!({"cid": "5", "cldbid": "1000", "cgid": "2"});
+        let m: ChannelGroupClient = serde_json::from_value(raw).unwrap();
+        assert_eq!(m.cid, 5);
+        assert_eq!(m.cldbid, 1000);
+        assert_eq!(m.cgid, 2);
+    }
+
+    #[test]
+    fn group_perm_entry_parses_with_permsid() {
+        let raw = serde_json::json!({
+            "permsid": "b_virtualserver_info_view",
+            "permvalue": "1",
+            "permnegated": "0",
+            "permskip": "0",
+        });
+        let p: GroupPermEntry = serde_json::from_value(raw).unwrap();
+        assert_eq!(p.permsid, "b_virtualserver_info_view");
+        assert_eq!(p.permvalue, 1);
+        assert_eq!(p.permid, 0); // omitted under -permsid
+    }
+
+    #[test]
+    fn permission_entry_parses() {
+        let raw = serde_json::json!({
+            "permid": "8470",
+            "permname": "b_serverinstance_help_view",
+            "permdesc": "Retrieve information about ServerQuery commands",
+        });
+        let p: PermissionEntry = serde_json::from_value(raw).unwrap();
+        assert_eq!(p.permid, 8470);
+        assert_eq!(p.permname, "b_serverinstance_help_view");
+        assert!(p.permdesc.starts_with("Retrieve"));
+    }
+
+    #[test]
+    fn perm_find_and_overview_parse() {
+        let f: PermFindEntry = serde_json::from_value(
+            serde_json::json!({"t": "0", "id1": "6", "id2": "0", "p": "8470"}),
+        )
+        .unwrap();
+        assert_eq!(f.t, 0);
+        assert_eq!(f.id1, 6);
+        assert_eq!(f.p, 8470);
+
+        let o: PermOverviewEntry = serde_json::from_value(serde_json::json!({
+            "t": "0", "id1": "6", "id2": "0", "p": "8470", "v": "1", "n": "0", "s": "0",
+        }))
+        .unwrap();
+        assert_eq!(o.t, 0);
+        assert_eq!(o.id1, 6);
+        assert_eq!(o.v, 1);
+    }
+
+    #[test]
+    fn perm_id_entry_parses() {
+        let raw =
+            serde_json::json!({"permsid": "i_channel_needed_modify_power", "permid": "12345"});
+        let p: PermIdEntry = serde_json::from_value(raw).unwrap();
+        assert_eq!(p.permsid, "i_channel_needed_modify_power");
+        assert_eq!(p.permid, 12_345);
+    }
+
+    #[test]
+    fn privilege_key_entry_parses() {
+        let raw = serde_json::json!({
+            "token": "abcDEF123",
+            "token_type": "0",
+            "token_id1": "6",
+            "token_id2": "0",
+            "token_description": "default serveradmin",
+            "token_created": "1700000000",
+            "token_customset": "",
+        });
+        let t: PrivilegeKeyEntry = serde_json::from_value(raw).unwrap();
+        assert_eq!(t.token, "abcDEF123");
+        assert_eq!(t.token_type, 0);
+        assert_eq!(t.token_id1, 6);
+        assert_eq!(t.token_description, "default serveradmin");
+    }
+
+    #[test]
+    fn privilege_key_add_response_parses() {
+        let r: PrivilegeKeyAddResponse =
+            serde_json::from_value(serde_json::json!({"token": "newKEY="})).unwrap();
+        assert_eq!(r.token, "newKEY=");
+    }
+
+    #[test]
+    fn message_entry_and_detail_parse() {
+        let e: MessageEntry = serde_json::from_value(serde_json::json!({
+            "msgid": "7", "cluid": "uid=", "subject": "hi", "timestamp": "1700000000", "flag_read": "0",
+        }))
+        .unwrap();
+        assert_eq!(e.msgid, 7);
+        assert_eq!(e.subject, "hi");
+        assert_eq!(e.flag_read, 0);
+
+        let d: MessageDetail = serde_json::from_value(serde_json::json!({
+            "msgid": "7", "cluid": "uid=", "subject": "hi", "message": "body text",
+            "timestamp": "1700000000",
+        }))
+        .unwrap();
+        assert_eq!(d.msgid, 7);
+        assert_eq!(d.message, "body text");
     }
 }
