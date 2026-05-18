@@ -4,6 +4,7 @@
 
 use std::time::Instant;
 
+use async_trait::async_trait;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
@@ -35,7 +36,16 @@ impl AudioPipeline {
         cfg: PipelineConfig,
         volume: VolumeHandle,
     ) -> Result<Self, PipelineError> {
-        let source = build_source(spec, &cfg).await?;
+        // PURA-358 — wrap the spec in a `LazySource` instead of resolving
+        // it here. Source bring-up (yt-dlp resolution of a YouTube URL is
+        // ~5 s) used to run on this `await`; the music bot's connected
+        // loop spawns the pipeline inline from its event/command arm, so
+        // every `!play` / queue-advance froze the audio-drain arm for the
+        // whole resolve — a multi-second mid-song gap on the wire. The
+        // `LazySource` defers bring-up to the worker task's first
+        // `read_samples`, which already runs off the connected loop, so
+        // this call now returns in microseconds.
+        let source: Box<dyn PcmSource> = Box::new(LazySource::new(spec, cfg.clone()));
         Self::spawn_with_source(source, cfg, volume)
     }
 
@@ -252,6 +262,64 @@ async fn flush_prebuffer(
     true
 }
 
+/// PURA-358 — a [`PcmSource`] that defers source bring-up (yt-dlp / ffmpeg
+/// resolution) to its first [`read_samples`](PcmSource::read_samples) call.
+///
+/// Bring-up of a YouTube URL takes ~5 s. The music bot's connected loop
+/// spawns the pipeline inline from its event/command arm, so running the
+/// resolve there froze audio-frame delivery for the whole resolve — the
+/// sporadic mid-song crackle PURA-358 chases. The pipeline worker is
+/// already a separate task off the connected loop; deferring the resolve
+/// into the worker's first `read_samples` moves the stall there.
+///
+/// A resolve failure surfaces as an `io::Error` from `read_samples`, which
+/// the worker already turns into a `Warning` event + a 0-frame finish —
+/// the path the bot reports as `last_error` (PURA-314). The spec is kept
+/// until the resolve *succeeds*, so a `read_samples` future dropped
+/// mid-resolve (consumer teardown) leaves the source uncorrupted, per the
+/// [`PcmSource`] cancel-safety contract.
+struct LazySource {
+    spec: Option<AudioSourceSpec>,
+    cfg: PipelineConfig,
+    inner: Option<Box<dyn PcmSource>>,
+}
+
+impl LazySource {
+    fn new(spec: AudioSourceSpec, cfg: PipelineConfig) -> Self {
+        Self {
+            spec: Some(spec),
+            cfg,
+            inner: None,
+        }
+    }
+}
+
+#[async_trait]
+impl PcmSource for LazySource {
+    async fn read_samples(&mut self, buf: &mut [i16]) -> std::io::Result<usize> {
+        if self.inner.is_none() {
+            let Some(spec) = self.spec.clone() else {
+                return Err(std::io::Error::other(
+                    "LazySource: source bring-up already failed",
+                ));
+            };
+            let src = build_source(spec, &self.cfg)
+                .await
+                .map_err(std::io::Error::other)?;
+            self.spec = None;
+            self.inner = Some(src);
+        }
+        self.inner.as_mut().unwrap().read_samples(buf).await
+    }
+
+    fn try_drain_events(&mut self) -> Vec<PipelineEvent> {
+        match self.inner.as_mut() {
+            Some(src) => src.try_drain_events(),
+            None => Vec::new(),
+        }
+    }
+}
+
 async fn build_source(
     spec: AudioSourceSpec,
     cfg: &PipelineConfig,
@@ -333,6 +401,36 @@ async fn build_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PURA-358 — `LazySource` must not bring its inner source up until the
+    /// first `read_samples`. `try_drain_events` before any read sees no
+    /// inner source and returns empty; the first read resolves it and from
+    /// then on the source produces samples. This is the property that keeps
+    /// the resolve off the connected loop: `AudioPipeline::spawn` only
+    /// builds a `LazySource`, never resolves.
+    #[tokio::test]
+    async fn lazy_source_defers_bring_up_to_first_read() {
+        let cfg = PipelineConfig::default();
+        let mut lazy = LazySource::new(
+            AudioSourceSpec::SyntheticTone {
+                hz: 440.0,
+                amplitude: 0.5,
+                duration_ms: Some(200),
+            },
+            cfg,
+        );
+        // Not yet resolved: spec retained, inner absent, no events.
+        assert!(lazy.inner.is_none(), "inner unresolved before first read");
+        assert!(lazy.spec.is_some(), "spec retained before first read");
+        assert!(lazy.try_drain_events().is_empty());
+
+        // First read resolves the inner source and yields samples.
+        let mut buf = [0i16; 960];
+        let n = lazy.read_samples(&mut buf).await.expect("read");
+        assert!(n > 0, "resolved source produces samples");
+        assert!(lazy.inner.is_some(), "inner resolved after first read");
+        assert!(lazy.spec.is_none(), "spec cleared once resolved");
+    }
 
     /// Pipeline drains the synthetic source and emits valid Opus frames with
     /// drift-free `scheduled_at` indices. Pure logic — no wall-clock waits.
