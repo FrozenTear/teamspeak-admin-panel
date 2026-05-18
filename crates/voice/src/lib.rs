@@ -16,6 +16,7 @@ mod chat;
 mod command;
 mod config;
 mod event;
+mod runtime;
 mod state;
 mod store;
 mod supervisor;
