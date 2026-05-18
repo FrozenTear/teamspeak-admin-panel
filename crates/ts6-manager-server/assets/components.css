@@ -2106,6 +2106,31 @@ textarea.input {
 @media (prefers-reduced-motion: reduce) {
   .np-progress__fill { transition: none; }
 }
+/* PURA-352 — interactive seek. A transparent range input is stretched
+   over the progress bar (and a little above/below it, so the 4px-tall
+   bar is still easy to grab) — a click or drag on it scrubs the track,
+   while the .np-progress__fill underneath shows the resulting position.
+   overflow is opened up so the oversized hit area is not clipped. */
+.np-progress--seekable {
+  position: relative;
+  overflow: visible;
+  cursor: pointer;
+}
+.np-progress__seek {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: -8px;
+  bottom: -8px;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  opacity: 0;
+  cursor: pointer;
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+}
 
 .player-controls {
   display: flex;

@@ -300,6 +300,54 @@ fn PlayerCard(bot_id: u64, detail: Signal<Option<wire::MusicBotDetail>>) -> Elem
     // `None` when the play clock or duration is unknown; in that case
     // the equalizer is shown instead of a bar that can't be filled.
     let progress_pct = track_progress(&d).map(|ratio| (ratio * 100.0).round() as u32);
+    // PURA-352 — raw values for the interactive seek slider. Both are
+    // `Some` exactly when `progress_pct` is (`track_progress` requires a
+    // known duration > 0 and a play clock), so the seekable bar renders
+    // on the same condition as the read-only one.
+    let duration_secs = d.now_playing.as_ref().and_then(|t| t.duration_secs);
+    let elapsed_secs = d.now_playing_elapsed_secs.unwrap_or(0);
+
+    // PURA-352 — seek dispatch. `oninput` fires continuously while the
+    // operator drags, so it only moves the fill optimistically; the
+    // actual `POST /seek` is sent once on `onchange` (drag release or a
+    // track click). On failure the optimistic position is reverted and
+    // the SSE stream stays the authoritative reconciler.
+    let bot = wire::BotId(bot_id);
+    let gate = use_auth_gate();
+    let toaster = use_toaster();
+    let mut detail = detail;
+    let on_seek_input = move |e: FormEvent| {
+        // Drag in progress — move the fill optimistically, no POST yet.
+        if let Ok(secs) = e.value().parse::<u64>() {
+            detail.with_mut(|opt| {
+                if let Some(s) = opt.as_mut() {
+                    s.now_playing_elapsed_secs = Some(secs);
+                }
+            });
+        }
+    };
+    let on_seek_commit = move |e: FormEvent| {
+        let Ok(secs) = e.value().parse::<u64>() else {
+            return;
+        };
+        let prev = detail.read().clone();
+        detail.with_mut(|opt| {
+            if let Some(s) = opt.as_mut() {
+                s.now_playing_elapsed_secs = Some(secs);
+            }
+        });
+        let gate = gate.clone();
+        spawn(async move {
+            if let Err(err) = mb::seek(gate, bot, secs).await {
+                detail.set(prev);
+                toaster.push(
+                    ToastVariant::Danger,
+                    "Seek failed".to_string(),
+                    Some(format_error(&err)),
+                );
+            }
+        });
+    };
 
     rsx! {
         div { class: "card player-card",
@@ -335,9 +383,14 @@ fn PlayerCard(bot_id: u64, detail: Signal<Option<wire::MusicBotDetail>>) -> Elem
                         // Advances only on a ~1 Hz `Progress` SSE tick
                         // (no client-side timer); falls back to the
                         // equalizer above when it can't be filled.
+                        // PURA-352 — the bar is now seekable: a transparent
+                        // range input sits over the fill so a click or drag
+                        // scrubs the track. The fill underneath shows the
+                        // position; `oninput` tracks the drag optimistically
+                        // and `onchange` posts the seek.
                         if let Some(pct) = progress_pct {
                             div {
-                                class: "np-progress",
+                                class: "np-progress np-progress--seekable",
                                 role: "progressbar",
                                 "aria-label": "Playback progress",
                                 "aria-valuemin": "0",
@@ -346,6 +399,17 @@ fn PlayerCard(bot_id: u64, detail: Signal<Option<wire::MusicBotDetail>>) -> Elem
                                 div {
                                     class: "np-progress__fill",
                                     style: "width: {pct}%;",
+                                }
+                                input {
+                                    class: "np-progress__seek",
+                                    r#type: "range",
+                                    min: "0",
+                                    max: "{duration_secs.unwrap_or(0)}",
+                                    step: "1",
+                                    value: "{elapsed_secs}",
+                                    "aria-label": "Seek within the current track",
+                                    oninput: on_seek_input,
+                                    onchange: on_seek_commit,
                                 }
                             }
                         }
