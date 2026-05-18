@@ -61,6 +61,13 @@ async-trait = { workspace = true }
 # Already a workspace dep (used by the lifecycle E2E test), so this is a
 # free pull.
 serde_json = { workspace = true }
+# PURA-389a — `clock_gettime(CLOCK_THREAD_CPUTIME_ID)` for per-thread CPU
+# time in the voice send-path instrumentation: comparing thread CPU with
+# wall time across `block_in_place` is what distinguishes OS preemption of
+# the `voice-rt` thread (candidate B) from real on-CPU send cost. `libc` is
+# already deep in the dep tree (tokio, surrealdb, …) so this pulls nothing
+# new; it just promotes it to a first-class dep so `audio.rs` can call it.
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync", "test-util"] }

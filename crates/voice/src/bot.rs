@@ -521,8 +521,12 @@ async fn handle_audio_msg(
         return "sibling_closed";
     };
     match msg {
-        AudioMsg::Frame(opus) => {
-            if let Some(active) = current_audio.as_mut() {
+        AudioMsg::Frame { bytes, enqueued_at } => {
+            // PURA-389a — the send + its A/B/C timing happen inside this
+            // `if let` so `active` (and its `send_monitor`) is borrowed only
+            // here; `send_result` owns its data, freeing `current_audio` for
+            // the teardown branch below.
+            let send_result = if let Some(active) = current_audio.as_mut() {
                 active.frames_sent += 1;
                 // PURA-330 — the end-to-end latency milestone: this is the
                 // first Opus frame the operator can actually hear. One
@@ -552,8 +556,11 @@ async fn handle_audio_msg(
                             + active.frames_sent / FRAMES_PER_PROGRESS_TICK,
                     });
                 }
-            }
-            if let Err(err) = audio::send_opus_frame(con, &opus) {
+                audio::send_opus_frame(con, &bytes, enqueued_at, &mut active.send_monitor)
+            } else {
+                Ok(())
+            };
+            if let Err(err) = send_result {
                 error!(?err, "send_audio failed — tearing down pipeline");
                 audio::tear_down(current_audio);
                 // PURA-261 — `failed: ` prefix so `LivenessTracker`

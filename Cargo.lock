@@ -5084,6 +5084,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "futures",
+ "libc",
  "music-bot-audio",
  "serde",
  "serde_json",
