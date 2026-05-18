@@ -797,6 +797,29 @@ a:hover {
   .np-eq.is-playing span { animation: none; height: 55%; }
 }
 
+/* Now-playing progress bar (PURA-349) — left-anchored fill that
+   advances only on a ~1 Hz `Progress` SSE tick (no client-side timer).
+   Shown only when the track has a known duration and a play clock;
+   otherwise the .np-eq equalizer takes its place — a bar that can't be
+   filled truthfully is worse than none. The short transition smooths
+   the ~1 Hz step; it never interpolates a full second ahead. */
+.np-progress {
+  margin-top: var(--space-1);
+  height: 4px;
+  border-radius: var(--radius-full);
+  background: var(--border-subtle);
+  overflow: hidden;
+}
+.np-progress__fill {
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent-fg);
+  transition: width 240ms ease-out;
+}
+@media (prefers-reduced-motion: reduce) {
+  .np-progress__fill { transition: none; }
+}
+
 .player-controls {
   display: flex;
   align-items: center;
