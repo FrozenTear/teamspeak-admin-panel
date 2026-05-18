@@ -255,10 +255,13 @@ pub(crate) async fn start_pipeline(
 const STARTUP_WATCH_FRAMES: u64 = 250;
 
 /// PURA-342 — a frame handed to the wire this far past its paced
-/// `scheduled_at` slot means the frame channel underran while it was being
-/// fetched: the wire just gapped and the gap is audible (crackle). 12 ms is
-/// inside one 20 ms frame and comfortably above tokio/OS scheduler wake
-/// jitter, so it flags a real stall without false-positiving on noise.
+/// `scheduled_at` slot means delivery stalled somewhere on the path to the
+/// wire: the wire just gapped and the gap is audible (crackle). The stall is
+/// either the frame channel draining (producer too slow) *or* the connected
+/// loop not polling the audio arm in time (consumer starved) — the logged
+/// `buffered_frames` distinguishes them. 12 ms is inside one 20 ms frame and
+/// comfortably above tokio/OS scheduler wake jitter, so it flags a real stall
+/// without false-positiving on noise.
 const LATENESS_WARN: Duration = Duration::from_millis(12);
 
 /// PURA-342 — frame-buffer underrun watchdog for the *whole* of a play. The
@@ -326,7 +329,9 @@ impl PlaybackMonitor {
                     frame_index = index,
                     lateness_ms = lateness.as_millis() as u64,
                     buffered_frames = buffered,
-                    "frame delivered late — frame-buffer underrun (audible crackle)",
+                    "frame delivered late — wire-send stall (audible crackle); \
+                     check buffered_frames: a high value means the consumer \
+                     was starved, not the frame buffer drained",
                 );
             }
         }

@@ -277,6 +277,31 @@ async fn run_connected_loop(
     loop {
         tokio::select! {
             biased;
+            // PURA-342 — audio frames first. The sibling paces frames at a
+            // 20 ms cadence, so this arm becomes ready at most once per 20 ms;
+            // the gap between frames still belongs to the event stream below.
+            // But when a frame *is* due it must reach the wire before the next
+            // protocol event is processed. The connect/book-sync handshake
+            // streams a burst of TS6 events — exactly the startup window —
+            // and with the event arm first that burst monopolised the loop:
+            // audio frames piled in `audio_rx`, the sibling blocked on its
+            // send, and the wire gapped (audible startup crackle, PURA-342).
+            // The frame buffer is not underrunning when this happens — it
+            // stays full; the connected loop simply wasn't polling this arm.
+            audio_msg = async {
+                // Unwrap is sound because the guard below gates entry.
+                current_audio.as_mut().unwrap().audio_rx.recv().await
+            }, if current_audio.is_some() => {
+                handle_audio_msg(
+                    con,
+                    audio_msg,
+                    &mut current_audio,
+                    bot_id,
+                    store,
+                    events,
+                    &yt_cookie,
+                ).await;
+            },
             ev = async { con.events().next().await } => match ev {
                 Some(Ok(item)) => {
                     // PURA-122 WS-4 — pull any in-channel chat messages
@@ -310,24 +335,6 @@ async fn run_connected_loop(
                     return ConnectedExit::Dropped(format!("stream error: {err}"));
                 }
                 None => return ConnectedExit::Dropped("stream ended".into()),
-            },
-            // PURA-154 — drain the audio sibling task. The `if` guard
-            // makes this arm a no-op when no pipeline is active; that
-            // also keeps `current_audio` from being borrowed when other
-            // arms need to mutate it (Play / Stop / SkipNext).
-            audio_msg = async {
-                // Unwrap is sound because the guard below gates entry.
-                current_audio.as_mut().unwrap().audio_rx.recv().await
-            }, if current_audio.is_some() => {
-                handle_audio_msg(
-                    con,
-                    audio_msg,
-                    &mut current_audio,
-                    bot_id,
-                    store,
-                    events,
-                    &yt_cookie,
-                ).await;
             },
             cmd = rx.recv() => match cmd {
                 Some(BotCommand::Disconnect) => {
