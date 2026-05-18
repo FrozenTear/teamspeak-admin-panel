@@ -39,12 +39,14 @@ mod history;
 mod metrics;
 pub(crate) mod perm;
 mod queue;
+mod tokens;
 
 pub use case_detail::ModerationCasePage;
 pub use grants::PermissionGrantsPage;
 pub use history::SubjectHistoryPage;
 pub use metrics::AutomodMetricsPage;
 pub use queue::ModerationQueuePage;
+pub use tokens::TokensPage;
 
 use chrono::{DateTime, Utc};
 use dioxus::prelude::*;
