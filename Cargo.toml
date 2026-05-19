@@ -23,8 +23,14 @@ members = [
 # same versions in both `moq-spike/Cargo.toml` and
 # `crates/ts6-media-sidecar/Cargo.toml`. Bumping is a single-PR change
 # touching both files. See ADR-0007 + crates/ts6-media-sidecar/README.md.
+# `vendor/tsclientlib/` is a locally vendored copy of the upstream
+# `ReSpeak/tsclientlib` repo at git rev `04aa24917abbf6a0c8442a79742d6d2d40ecf71e`
+# (PURA-402, board-authorized via accepted confirmation `6e10ef4e`). It keeps
+# its own `[workspace]`, so it is excluded here and consumed only through the
+# `[patch."https://github.com/ReSpeak/tsclientlib"]` block below.
 exclude = [
     "crates/ts6-media-sidecar",
+    "vendor/tsclientlib",
 ]
 
 [workspace.package]
@@ -218,6 +224,21 @@ tiny-skia = { version = "0.11", default-features = false, features = ["std", "pn
 # architecture brief §10 recommended the `cron` crate; pinning the minor
 # matches our convention.
 cron = "0.12"
+
+# PURA-402 (PURA-389d.1) — vendored fork override. The five voice crates
+# (`voice`, `ts6-voice-fixture`, `ts6-voice-prototype`, `ts6-voice-translator`,
+# and `ts6-manager-server` transitively) pin `tsclientlib` + `tsproto-packets`
+# to the upstream git rev `04aa24917abbf6a0c8442a79742d6d2d40ecf71e`. This
+# `[patch]` redirects that exact git source to the local vendored copy under
+# `vendor/tsclientlib/` so we can carry internal fixes (e.g. the PURA-399
+# `poll_send_acks` change) without an upstream PR. The per-crate `git = "...",
+# rev = "04aa249..."` lines are left in place; this block overrides them and
+# cargo dedupes on the shared source. Pure source relocation — no behavior
+# change. tsproto-packets lives at `utils/tsproto-packets` in the upstream
+# repo layout, which the vendored copy preserves verbatim.
+[patch."https://github.com/ReSpeak/tsclientlib"]
+tsclientlib = { path = "vendor/tsclientlib/tsclientlib" }
+tsproto-packets = { path = "vendor/tsclientlib/utils/tsproto-packets" }
 
 [profile.release]
 lto = "thin"

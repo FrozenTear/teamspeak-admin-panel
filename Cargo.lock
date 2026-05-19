@@ -9117,7 +9117,6 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 [[package]]
 name = "ts-bookkeeping"
 version = "0.1.0"
-source = "git+https://github.com/ReSpeak/tsclientlib?rev=04aa24917abbf6a0c8442a79742d6d2d40ecf71e#04aa24917abbf6a0c8442a79742d6d2d40ecf71e"
 dependencies = [
  "base64 0.22.1",
  "heck 0.5.0",
@@ -9267,7 +9266,6 @@ dependencies = [
 [[package]]
 name = "tsclientlib"
 version = "0.2.0"
-source = "git+https://github.com/ReSpeak/tsclientlib?rev=04aa24917abbf6a0c8442a79742d6d2d40ecf71e#04aa24917abbf6a0c8442a79742d6d2d40ecf71e"
 dependencies = [
  "audiopus",
  "base64 0.22.1",
@@ -9295,7 +9293,6 @@ dependencies = [
 [[package]]
 name = "tsproto"
 version = "0.2.0"
-source = "git+https://github.com/ReSpeak/tsclientlib?rev=04aa24917abbf6a0c8442a79742d6d2d40ecf71e#04aa24917abbf6a0c8442a79742d6d2d40ecf71e"
 dependencies = [
  "aes 0.8.4",
  "base64 0.22.1",
@@ -9325,7 +9322,6 @@ dependencies = [
 [[package]]
 name = "tsproto-packets"
 version = "0.1.0"
-source = "git+https://github.com/ReSpeak/tsclientlib?rev=04aa24917abbf6a0c8442a79742d6d2d40ecf71e#04aa24917abbf6a0c8442a79742d6d2d40ecf71e"
 dependencies = [
  "base64 0.22.1",
  "bitflags 2.11.1",
@@ -9340,7 +9336,6 @@ dependencies = [
 [[package]]
 name = "tsproto-structs"
 version = "0.2.0"
-source = "git+https://github.com/ReSpeak/tsclientlib?rev=04aa24917abbf6a0c8442a79742d6d2d40ecf71e#04aa24917abbf6a0c8442a79742d6d2d40ecf71e"
 dependencies = [
  "base64 0.22.1",
  "csv",
@@ -9353,7 +9348,6 @@ dependencies = [
 [[package]]
 name = "tsproto-types"
 version = "0.1.0"
-source = "git+https://github.com/ReSpeak/tsclientlib?rev=04aa24917abbf6a0c8442a79742d6d2d40ecf71e#04aa24917abbf6a0c8442a79742d6d2d40ecf71e"
 dependencies = [
  "base64 0.22.1",
  "bitflags 2.11.1",
