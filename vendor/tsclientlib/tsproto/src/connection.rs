@@ -27,6 +27,13 @@ pub trait Socket {
 		&self, cx: &mut Context, buf: &[u8], target: SocketAddr,
 	) -> Poll<io::Result<usize>>;
 	fn local_addr(&self) -> io::Result<SocketAddr>;
+
+	/// PURA-403 fix — duplicate the underlying fd into a **blocking**
+	/// `std::net::UdpSocket` so ack sends can be offloaded to a background
+	/// thread.  The default returns `None` (test simulated sockets, non-unix
+	/// builds).  Only `impl Socket for UdpSocket` overrides this.
+	#[cfg(unix)]
+	fn clone_blocking(&self) -> Option<std::net::UdpSocket> { None }
 }
 
 /// A cache for the key and nonce for a generation id.
@@ -111,6 +118,18 @@ pub struct Connection {
 	/// If it gets too long, we don't poll from the `udp_socket` anymore.
 	acks_to_send: VecDeque<OutUdpPacket>,
 
+	/// PURA-403 fix — channel to the background ack-sender thread.
+	///
+	/// Ack sends (`poll_send_acks`) were blocking the connected loop for 8–57 ms
+	/// each (confirmed `wall ≈ cpu` on 90% of 425 stall events — genuine kernel
+	/// work, not preemption). By offloading to a dedicated thread the connected
+	/// loop — and thus the 20 ms audio cadence — is never stalled by an ack send.
+	///
+	/// `None` on non-unix builds and when the socket does not support fd-dup
+	/// (e.g. test `SimulatedSocket`), in which case we fall back to the original
+	/// in-line send path.
+	ack_thread_tx: Option<std::sync::mpsc::SyncSender<(Vec<u8>, SocketAddr)>>,
+
 	pub event_listeners: Vec<EventListener>,
 }
 
@@ -126,6 +145,29 @@ impl Socket for UdpSocket {
 	}
 
 	fn local_addr(&self) -> io::Result<SocketAddr> { self.local_addr() }
+
+	/// PURA-403 — dup the tokio UdpSocket fd into a blocking std socket so the
+	/// background ack-sender thread can call `send_to` without touching the
+	/// tokio reactor at all. `set_nonblocking(false)` is applied to the dup'd fd.
+	#[cfg(unix)]
+	fn clone_blocking(&self) -> Option<std::net::UdpSocket> {
+		use std::os::unix::io::{AsRawFd, FromRawFd};
+		// SAFETY: `dup(2)` is always safe on a valid fd; `from_raw_fd` on the
+		// resulting fd is safe because we just created it and take ownership.
+		let dup_fd = unsafe { libc::dup(self.as_raw_fd()) };
+		if dup_fd < 0 {
+			return None;
+		}
+		let sock = unsafe { std::net::UdpSocket::from_raw_fd(dup_fd) };
+		// The tokio socket's fd is O_NONBLOCK; set the dup to blocking so the
+		// background thread's `send_to` calls block until the kernel accepts the
+		// packet (which is instant for UDP with space in the TX buffer, and a
+		// bounded wait otherwise — all fine on a dedicated thread).
+		if sock.set_nonblocking(false).is_err() {
+			return None;
+		}
+		Some(sock)
+	}
 }
 
 impl Default for CachedKey {
@@ -153,6 +195,28 @@ impl Connection {
 		let span = info_span!("connection", local_addr = %udp_socket.local_addr().unwrap(),
 			remote_addr = %address);
 
+		// PURA-403 fix — spawn a blocking ack-sender thread when the socket
+		// supports fd-dup (tokio UdpSocket on unix). The thread owns a blocking
+		// clone of the socket and drains a bounded channel, calling `send_to` on
+		// each ack packet. Capacity-256 matches `UDP_SINK_CAPACITY`; try_send in
+		// `poll_send_acks` drops excess acks (UDP semantics — sender retransmits).
+		#[cfg(unix)]
+		let ack_thread_tx = udp_socket.clone_blocking().map(|sock| {
+			let (tx, rx) =
+				std::sync::mpsc::sync_channel::<(Vec<u8>, SocketAddr)>(256);
+			std::thread::Builder::new()
+				.name("tsproto-ack-sender".into())
+				.spawn(move || {
+					while let Ok((data, addr)) = rx.recv() {
+						let _ = sock.send_to(&data, addr);
+					}
+				})
+				.expect("spawn tsproto-ack-sender");
+			tx
+		});
+		#[cfg(not(unix))]
+		let ack_thread_tx: Option<std::sync::mpsc::SyncSender<(Vec<u8>, SocketAddr)>> = None;
+
 		let mut res = Self {
 			is_client,
 			span,
@@ -165,6 +229,7 @@ impl Connection {
 
 			stream_items: Default::default(),
 			acks_to_send: Default::default(),
+			ack_thread_tx,
 			event_listeners: Default::default(),
 		};
 		if is_client {
@@ -224,13 +289,33 @@ impl Connection {
 
 	/// Flush the queued ack packets onto the wire.
 	///
-	/// Returns the number of acks actually flushed this call. PURA-403 — the
-	/// caller ([`Connection::poll_next`]) uses the count to attribute a
-	/// connected-loop stall to this leg: a non-blocking `poll_send_to` cannot
-	/// itself freeze, so a slow `send_acks` leg must mean a deep ack backlog.
+	/// Returns the number of acks actually flushed this call. PURA-403 — when
+	/// the background ack-sender thread is available (`ack_thread_tx.is_some()`)
+	/// this path is O(queue_depth) channel-pushes and never calls `poll_send_to`
+	/// itself, so it cannot stall the connected loop regardless of kernel send
+	/// latency. The thread drains the channel with blocking `send_to` calls on
+	/// a dedicated OS thread, isolated from the voice-rt workers.
 	fn poll_send_acks(&mut self, cx: &mut Context) -> Result<usize> {
-		// Poll acks_to_send
 		let mut flushed = 0usize;
+
+		// PURA-403 fast path — channel-push to the background ack-sender thread.
+		// `try_send` is non-blocking; if the channel is full (256 cap) we drop the
+		// ack (UDP reliability: the remote will retransmit the unack'd command).
+		if let Some(tx) = &self.ack_thread_tx {
+			while let Some(packet) = self.acks_to_send.front() {
+				let data = packet.data().data().to_vec();
+				// Fire the event while we still hold the packet reference.
+				self.send_event(&Event::SendUdpPacket(packet));
+				self.resender.handle_loss_outgoing(packet);
+				self.acks_to_send.pop_front();
+				// Drop excess acks rather than blocking the connected loop.
+				let _ = tx.try_send((data, self.address));
+				flushed += 1;
+			}
+			return Ok(flushed);
+		}
+
+		// Fallback — original inline send path (non-unix, tests).
 		while let Some(packet) = self.acks_to_send.front() {
 			match self.poll_send_udp_packet(cx, packet) {
 				Poll::Ready(Ok(())) => {
