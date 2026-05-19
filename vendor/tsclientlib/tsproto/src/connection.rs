@@ -203,8 +203,10 @@ impl Connection {
 		// `send_to` is non-blocking — a rare `WouldBlock` drops the ack. Capacity
 		// 256 matches `UDP_SINK_CAPACITY`; try_send in `poll_send_acks` likewise
 		// drops excess acks (UDP semantics — the resender retransmits).
+		// A thread-spawn failure degrades gracefully to `None` — `poll_send_acks`
+		// then uses the inline fallback path rather than panicking the connection.
 		#[cfg(unix)]
-		let ack_thread_tx = udp_socket.try_clone_socket().map(|sock| {
+		let ack_thread_tx = udp_socket.try_clone_socket().and_then(|sock| {
 			let (tx, rx) =
 				std::sync::mpsc::sync_channel::<(Vec<u8>, SocketAddr)>(256);
 			std::thread::Builder::new()
@@ -214,8 +216,8 @@ impl Connection {
 						let _ = sock.send_to(&data, addr);
 					}
 				})
-				.expect("spawn tsproto-ack-sender");
-			tx
+				.ok()
+				.map(|_| tx)
 		});
 		#[cfg(not(unix))]
 		let ack_thread_tx: Option<std::sync::mpsc::SyncSender<(Vec<u8>, SocketAddr)>> = None;
@@ -308,6 +310,10 @@ impl Connection {
 			while let Some(packet) = self.acks_to_send.front() {
 				let data = packet.data().data().to_vec();
 				// Fire the event while we still hold the packet reference.
+				// NOTE: on a channel-full drop the `try_send` below fails but
+				// these side-effects have already run, so the ack is reported
+				// as sent. Harmless — the remote retransmits the unack'd
+				// command — but the event is then slightly optimistic.
 				self.send_event(&Event::SendUdpPacket(packet));
 				self.resender.handle_loss_outgoing(packet);
 				self.acks_to_send.pop_front();
