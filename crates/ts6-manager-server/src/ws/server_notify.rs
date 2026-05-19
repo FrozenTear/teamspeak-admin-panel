@@ -732,7 +732,10 @@ mod tests {
     #[test]
     fn parse_bridge_event_extracts_client_moved_and_left() {
         assert_eq!(
-            parse_bridge_event(&notify("notifyclientmoved", &[("ctid", "5"), ("clid", "12")])),
+            parse_bridge_event(&notify(
+                "notifyclientmoved",
+                &[("ctid", "5"), ("clid", "12")]
+            )),
             Some(BridgeEvent::ClientMoved { clid: "12".into() })
         );
         assert_eq!(
