@@ -541,6 +541,237 @@ impl PlaybackMonitor {
     }
 }
 
+/// PURA-408b — frames between `pacer_wakeup` summary emissions. Matched to
+/// [`SEND_SUMMARY_INTERVAL`] (1500 frames ≈ 30 s at the 20 ms cadence) so a
+/// `pacer_wakeup` window lines up 1:1 with its `audio_send_summary` window
+/// in the logs.
+const PACER_SUMMARY_INTERVAL: u64 = SEND_SUMMARY_INTERVAL;
+
+/// PURA-408b — a paced `sleep_until` that returns this far past its
+/// `scheduled_at` slot counts as a genuine oversleep. tokio's timer wheel
+/// has ~1 ms granularity and the OS adds a little wake jitter; 3 ms clears
+/// both, so `overslept_frames` counts real misses, not noise.
+const PACER_OVERSLEEP_WARN: Duration = Duration::from_millis(3);
+
+/// PURA-408b — one process-/host-level CPU-contention sample, read once per
+/// `pacer_wakeup` window. The window delta of these splits a pacer
+/// oversleep into its two causes:
+///
+///  * **2a — tokio worker-queue contention**: `runqueue_wait_ns`, from
+///    `/proc/self/schedstat` field 2 — ns this process was runnable but
+///    waiting for a CPU. Rises when the voice runtime's own tasks (or
+///    other process threads) crowd the worker the sibling needs.
+///  * **2b — host vCPU steal**: `host_steal_jiffies`, from the `/proc/stat`
+///    `cpu` aggregate `steal` field — time the hypervisor ran another
+///    guest instead of this VM. Rises when the contabo host is oversold.
+#[derive(Clone, Copy)]
+struct StealSample {
+    /// `/proc/stat` `cpu` line `steal` field, in USER_HZ jiffies.
+    host_steal_jiffies: u64,
+    /// `/proc/self/schedstat` field 2 — ns spent runnable-but-waiting.
+    runqueue_wait_ns: u64,
+}
+
+impl StealSample {
+    /// Host vCPU steal accrued since `prev`, in milliseconds.
+    fn host_steal_ms_since(&self, prev: &StealSample) -> u64 {
+        jiffies_to_ms(
+            self.host_steal_jiffies
+                .saturating_sub(prev.host_steal_jiffies),
+        )
+    }
+
+    /// Process runqueue-wait accrued since `prev`, in milliseconds.
+    fn runqueue_wait_ms_since(&self, prev: &StealSample) -> u64 {
+        self.runqueue_wait_ns.saturating_sub(prev.runqueue_wait_ns) / 1_000_000
+    }
+}
+
+/// PURA-408b — convert USER_HZ jiffies to milliseconds.
+fn jiffies_to_ms(jiffies: u64) -> u64 {
+    // SAFETY: `_SC_CLK_TCK` is a valid sysconf name and the call takes no
+    // pointer arguments. A non-positive return (never observed on Linux)
+    // falls back to the conventional 100 Hz.
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    let hz = if hz > 0 { hz as u64 } else { 100 };
+    jiffies.saturating_mul(1000) / hz
+}
+
+/// PURA-408b — `/proc/stat` aggregate `cpu` line `steal` field, in jiffies.
+/// `None` off Linux or on any parse failure.
+fn read_proc_stat_steal() -> Option<u64> {
+    let stat = std::fs::read_to_string("/proc/stat").ok()?;
+    // `cpu  user nice system idle iowait irq softirq steal guest guest_nice`
+    let mut fields = stat.lines().next()?.split_whitespace();
+    if fields.next()? != "cpu" {
+        return None;
+    }
+    // `steal` is the 8th numeric field after the `cpu` label.
+    fields.nth(7)?.parse().ok()
+}
+
+/// PURA-408b — `/proc/self/schedstat` field 2 (runnable-but-waiting ns).
+/// `None` off Linux or on parse failure; a kernel built without
+/// `CONFIG_SCHEDSTATS` reports a live `0`, which is fine — the delta is 0.
+fn read_self_schedstat_wait() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/self/schedstat").ok()?;
+    // `<time-on-cpu ns> <time-waiting ns> <timeslices>`
+    s.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// PURA-408b — sample host steal + process runqueue-wait. `None` only when
+/// `/proc/stat` is unreadable (non-Linux): without it the 2a/2b split has
+/// no baseline. `schedstat` is best-effort and defaults to 0.
+fn read_steal_sample() -> Option<StealSample> {
+    Some(StealSample {
+        host_steal_jiffies: read_proc_stat_steal()?,
+        runqueue_wait_ns: read_self_schedstat_wait().unwrap_or(0),
+    })
+}
+
+/// PURA-408b — pacer-wakeup oversleep tracker for the audio sibling.
+///
+/// The 20 ms pacing `sleep_until` in [`spawn_sibling`] is meant to return
+/// exactly at a frame's `scheduled_at` slot. When the tokio timer or the OS
+/// wakes the sibling task *late*, the frame is forwarded past its slot and
+/// the wire gaps — the residual `frame_underrun` events that log
+/// `buffered_frames ≈ 249` (the frame channel was full, so the producer was
+/// never the problem). `frame_underrun` samples lateness *before* this
+/// sleep and `dequeue_gap` is stamped *after* it, so neither sees the
+/// oversleep itself. This monitor closes that gap.
+///
+/// Per frame: `pacer_oversleep` = the `sleep_until` return instant minus
+/// the requested `scheduled_at`, recorded only for frames that genuinely
+/// slept. A frame whose slot had already passed when the sibling reached
+/// the sleep returns immediately — that is an already-late frame (cumulative
+/// drift), not a timer that overslept, and `frame_underrun` already counts
+/// it.
+///
+/// Per window: a `pacer_wakeup` INFO every [`PACER_SUMMARY_INTERVAL`]
+/// frames, carrying the window oversleep max/mean/count plus the host vCPU
+/// steal + process runqueue-wait deltas — the (2a) tokio-contention vs (2b)
+/// host-steal split (see [`StealSample`]).
+struct PacerMonitor {
+    /// Frames observed across the whole play.
+    total_frames: u64,
+    /// Frames observed since the last summary.
+    window_frames: u64,
+    /// Window frames that genuinely slept (slot still in the future).
+    window_slept_frames: u32,
+    /// Window frames whose slot had already passed before the sleep.
+    window_already_late_frames: u32,
+    /// Window slept-frames whose oversleep reached [`PACER_OVERSLEEP_WARN`].
+    window_overslept_frames: u32,
+    /// Worst single oversleep this window.
+    window_max_oversleep: Duration,
+    /// Sum of oversleep over slept frames this window — for the window mean.
+    window_sum_oversleep: Duration,
+    /// Previous steal sample, for the per-window delta. `None` only off
+    /// Linux or before the first successful read.
+    last_steal: Option<StealSample>,
+}
+
+impl PacerMonitor {
+    fn new() -> Self {
+        Self {
+            total_frames: 0,
+            window_frames: 0,
+            window_slept_frames: 0,
+            window_already_late_frames: 0,
+            window_overslept_frames: 0,
+            window_max_oversleep: Duration::ZERO,
+            window_sum_oversleep: Duration::ZERO,
+            last_steal: read_steal_sample(),
+        }
+    }
+
+    /// Record one paced frame. `recv_at` is when the sibling popped the
+    /// frame from the channel (before the sleep); `woke_at` is when the
+    /// paced `sleep_until(scheduled_at)` actually returned.
+    fn observe(&mut self, scheduled_at: Instant, recv_at: Instant, woke_at: Instant) {
+        self.total_frames += 1;
+        self.window_frames += 1;
+
+        if recv_at < scheduled_at {
+            // Genuinely slept — the slot was in the future. Oversleep is how
+            // far past the slot the timer actually fired.
+            let oversleep = woke_at.saturating_duration_since(scheduled_at);
+            self.window_slept_frames += 1;
+            self.window_max_oversleep = self.window_max_oversleep.max(oversleep);
+            self.window_sum_oversleep += oversleep;
+            if oversleep >= PACER_OVERSLEEP_WARN {
+                self.window_overslept_frames += 1;
+            }
+        } else {
+            // Slot already in the past — `sleep_until` returned immediately.
+            self.window_already_late_frames += 1;
+        }
+
+        if self.window_frames >= PACER_SUMMARY_INTERVAL {
+            self.log_summary();
+            self.reset_window();
+        }
+    }
+
+    /// Emit the per-window `pacer_wakeup` summary and refresh the steal
+    /// baseline for the next window.
+    fn log_summary(&mut self) {
+        let steal = read_steal_sample();
+        let (host_steal_ms, proc_runqueue_wait_ms) = match (self.last_steal, steal) {
+            (Some(prev), Some(cur)) => (
+                cur.host_steal_ms_since(&prev),
+                cur.runqueue_wait_ms_since(&prev),
+            ),
+            _ => (0, 0),
+        };
+        let mean_oversleep_us = if self.window_slept_frames > 0 {
+            (self.window_sum_oversleep.as_micros() / self.window_slept_frames as u128) as u64
+        } else {
+            0
+        };
+        info!(
+            target: "music_bot_latency",
+            stage = "pacer_wakeup",
+            total_frames = self.total_frames,
+            window_frames = self.window_frames,
+            slept_frames = self.window_slept_frames,
+            already_late_frames = self.window_already_late_frames,
+            overslept_frames = self.window_overslept_frames,
+            max_pacer_oversleep_us = self.window_max_oversleep.as_micros() as u64,
+            mean_pacer_oversleep_us = mean_oversleep_us,
+            host_steal_ms,
+            proc_runqueue_wait_ms,
+            "pacer-wakeup timing window — 20 ms tick oversleep + host vCPU \
+             steal; oversleep with low host_steal_ms ⇒ tokio worker-queue \
+             contention (2a), oversleep tracking host_steal_ms ⇒ host vCPU \
+             steal (2b)",
+        );
+        // Carry the current sample forward; keep the old baseline if this
+        // read failed so the next window can still delta against it.
+        if steal.is_some() {
+            self.last_steal = steal;
+        }
+    }
+
+    fn reset_window(&mut self) {
+        self.window_frames = 0;
+        self.window_slept_frames = 0;
+        self.window_already_late_frames = 0;
+        self.window_overslept_frames = 0;
+        self.window_max_oversleep = Duration::ZERO;
+        self.window_sum_oversleep = Duration::ZERO;
+    }
+
+    /// Flush a final partial-window `pacer_wakeup` summary when the play
+    /// ends, so a track shorter than [`PACER_SUMMARY_INTERVAL`] frames still
+    /// leaves a record for PURA-408c.
+    fn finish(mut self) {
+        if self.window_frames > 0 {
+            self.log_summary();
+        }
+    }
+}
+
 fn spawn_sibling(
     pipeline: AudioPipeline,
     mut frames_rx: mpsc::Receiver<music_bot_audio::OpusFrame>,
@@ -558,6 +789,11 @@ fn spawn_sibling(
         // regime and everything after as `midsong`, so an occasional
         // mid-song crackle is diagnosable from logs too.
         let mut monitor = PlaybackMonitor::new();
+
+        // PURA-408b — pacer-wakeup oversleep tracker. Sees how far past its
+        // `scheduled_at` slot the paced `sleep_until` below actually woke —
+        // the attribution `frame_underrun` and `dequeue_gap` both miss.
+        let mut pacer = PacerMonitor::new();
 
         loop {
             // Park while paused. `changed()` wakes on every flip,
@@ -580,8 +816,9 @@ fn spawn_sibling(
                         // on the producer (a healthy buffered frame pops
                         // instantly, well ahead of `scheduled_at`).
                         let buffered = frames_rx.len();
-                        let lateness = std::time::Instant::now()
-                            .saturating_duration_since(f.scheduled_at);
+                        let recv_at = std::time::Instant::now();
+                        let lateness =
+                            recv_at.saturating_duration_since(f.scheduled_at);
                         monitor.observe(f.index, buffered, lateness);
                         // Wall-clock pacing. The pipeline encodes far faster
                         // than real-time and only the small bounded frame
@@ -596,6 +833,16 @@ fn spawn_sibling(
                             f.scheduled_at,
                         ))
                         .await;
+                        // PURA-408b — the paced `sleep_until` is meant to
+                        // return exactly at `scheduled_at`; sample how far
+                        // past it the sibling task actually woke. `recv_at`
+                        // tells the monitor whether this frame genuinely
+                        // slept or its slot had already passed.
+                        pacer.observe(
+                            f.scheduled_at,
+                            recv_at,
+                            std::time::Instant::now(),
+                        );
                         // PURA-389a — stamp the hand-off instant so the
                         // connected loop's send path can measure how long
                         // this frame waited for the audio arm to be polled.
@@ -631,6 +878,9 @@ fn spawn_sibling(
         // (startup + whole-play) so every play leaves a `music_bot_latency`
         // record even when no underrun fired.
         monitor.finish();
+        // PURA-408b — flush the final (partial) pacer-wakeup window so a
+        // short track still leaves a `pacer_wakeup` record.
+        pacer.finish();
         // Pipeline drained cleanly — drain any final events without
         // blocking, then send Finished. Best-effort; the bot may have
         // already torn us down.
@@ -1177,6 +1427,90 @@ mod tests {
             m.window_max_preempt_b,
             Duration::from_millis(2) - Duration::from_micros(150),
         );
+    }
+
+    /// PURA-408b — a frame that slept and woke past `scheduled_at` records
+    /// its oversleep; the per-window max/count track it.
+    #[test]
+    fn pacer_monitor_records_oversleep() {
+        let mut p = PacerMonitor::new();
+        let base = Instant::now();
+        // Slot 1 s out; popped now (well before it), woke 5 ms late.
+        let scheduled = base + Duration::from_secs(1);
+        p.observe(scheduled, base, scheduled + Duration::from_millis(5));
+        assert_eq!(p.window_slept_frames, 1);
+        assert_eq!(p.window_overslept_frames, 1, "5 ms ≥ the 3 ms warn floor");
+        assert_eq!(p.window_max_oversleep, Duration::from_millis(5));
+        assert_eq!(p.window_already_late_frames, 0);
+    }
+
+    /// PURA-408b — a frame whose slot had already passed when it was popped
+    /// is an already-late frame, not a pacer oversleep, and is excluded
+    /// from the oversleep stats.
+    #[test]
+    fn pacer_monitor_excludes_already_late_frames() {
+        let mut p = PacerMonitor::new();
+        let base = Instant::now();
+        // The slot is 1 s behind the pop instant.
+        let scheduled = base;
+        let recv_at = base + Duration::from_secs(1);
+        p.observe(scheduled, recv_at, recv_at);
+        assert_eq!(p.window_already_late_frames, 1);
+        assert_eq!(p.window_slept_frames, 0, "already-late ⇒ not a slept frame");
+        assert_eq!(p.window_overslept_frames, 0);
+        assert_eq!(p.window_max_oversleep, Duration::ZERO);
+    }
+
+    /// PURA-408b — sub-threshold timer jitter is kept in the oversleep
+    /// max/mean but does not count toward `overslept_frames`.
+    #[test]
+    fn pacer_monitor_ignores_sub_threshold_jitter() {
+        let mut p = PacerMonitor::new();
+        let base = Instant::now();
+        let scheduled = base + Duration::from_secs(1);
+        p.observe(scheduled, base, scheduled + Duration::from_millis(1));
+        assert_eq!(p.window_slept_frames, 1);
+        assert_eq!(p.window_overslept_frames, 0, "1 ms is below the 3 ms floor");
+        assert_eq!(p.window_max_oversleep, Duration::from_millis(1));
+    }
+
+    /// PURA-408b — the window summary fires every `PACER_SUMMARY_INTERVAL`
+    /// frames and clears the per-window state; `total_frames` survives.
+    #[test]
+    fn pacer_monitor_summary_resets_window() {
+        let mut p = PacerMonitor::new();
+        let base = Instant::now();
+        let scheduled = base + Duration::from_secs(1);
+        for _ in 0..PACER_SUMMARY_INTERVAL {
+            p.observe(scheduled, base, scheduled + Duration::from_millis(5));
+        }
+        assert_eq!(p.window_frames, 0, "window resets after a summary");
+        assert_eq!(p.window_slept_frames, 0);
+        assert_eq!(p.window_max_oversleep, Duration::ZERO);
+        assert_eq!(
+            p.total_frames, PACER_SUMMARY_INTERVAL,
+            "cumulative frame count survives the reset",
+        );
+    }
+
+    /// PURA-408b — `StealSample` deltas are monotonic and saturate rather
+    /// than underflow when a counter appears to move backwards.
+    #[test]
+    fn pacer_steal_delta_saturates() {
+        let prev = StealSample {
+            host_steal_jiffies: 100,
+            runqueue_wait_ns: 5_000_000,
+        };
+        let cur = StealSample {
+            host_steal_jiffies: 250,
+            runqueue_wait_ns: 9_000_000,
+        };
+        assert_eq!(cur.runqueue_wait_ms_since(&prev), 4, "9 ms − 5 ms");
+        // 150 steal jiffies → a non-zero ms figure at any CLK_TCK.
+        assert!(cur.host_steal_ms_since(&prev) > 0);
+        // A backwards counter saturates to 0, never underflows.
+        assert_eq!(prev.host_steal_ms_since(&cur), 0);
+        assert_eq!(prev.runqueue_wait_ms_since(&cur), 0);
     }
 
     /// PURA-389a — the window summary fires every `SEND_SUMMARY_INTERVAL`
