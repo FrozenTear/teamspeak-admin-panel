@@ -9301,6 +9301,7 @@ dependencies = [
  "futures",
  "generic-array 0.14.7",
  "git-testament",
+ "libc",
  "num-bigint",
  "num-derive",
  "num-traits",

@@ -406,6 +406,36 @@ impl Connection {
 	pub fn is_send_queue_empty(&self) -> bool { self.resender.is_empty() }
 }
 
+/// PURA-403 — thread CPU time consumed by the *calling* thread so far, via
+/// `CLOCK_THREAD_CPUTIME_ID`.
+///
+/// [`PollLegTimer`] measures wall-clock elapsed, which structurally cannot tell
+/// apart two very different stalls (CTO review on PURA-403):
+///
+/// * `wall ≈ cpu` — the thread was genuinely on-CPU the whole leg (busy work or
+///   a blocking syscall). The decouple-ack-sends fix is warranted.
+/// * `wall ≫ cpu` — the thread was *descheduled* (preempted) mid-leg. Moving
+///   the work to another task on the same runtime would not help; this routes
+///   to the voice-runtime scheduling work in PURA-367.
+///
+/// Bracketing a leg with this lets the WARN log the off-CPU fraction so the
+/// freeze is *diagnosed*, not guessed.
+#[cfg(unix)]
+fn thread_cpu_time() -> std::time::Duration {
+	let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+	// SAFETY: `ts` is a valid, writable `timespec`; `CLOCK_THREAD_CPUTIME_ID` is
+	// a valid POSIX clock id. `clock_gettime` only writes `ts` and returns 0 on
+	// success — on the (not expected) error path we fall back to ZERO.
+	let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+	if rc != 0 {
+		return std::time::Duration::ZERO;
+	}
+	std::time::Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+}
+
+#[cfg(not(unix))]
+fn thread_cpu_time() -> std::time::Duration { std::time::Duration::ZERO }
+
 /// PURA-403 — per-leg timing for one [`Connection::poll_next`] call.
 ///
 /// The voice connected loop (`crates/voice`) drives this `Stream` on a
@@ -425,7 +455,11 @@ impl Connection {
 /// through each one.
 struct PollLegTimer {
 	start: std::time::Instant,
+	/// Thread CPU time at `poll_next` entry — see [`thread_cpu_time`].
+	cpu_start: std::time::Duration,
 	send_acks: std::time::Duration,
+	/// Thread CPU time consumed *by the `send_acks` leg* (the PURA-399 suspect).
+	send_acks_cpu: std::time::Duration,
 	send_acks_flushed: usize,
 	resend: std::time::Duration,
 	ping: std::time::Duration,
@@ -441,10 +475,18 @@ impl Drop for PollLegTimer {
 	fn drop(&mut self) {
 		let total = self.start.elapsed();
 		if total >= POLL_LEG_WARN {
+			// PURA-403 finding-#5 disambiguation. `off_cpu = wall − cpu`: a
+			// large off-CPU fraction means the voice-rt thread was descheduled
+			// mid-poll (preemption ⇒ PURA-367), not stuck in a syscall.
+			let total_cpu = thread_cpu_time().saturating_sub(self.cpu_start);
+			let off_cpu = total.saturating_sub(total_cpu);
 			tracing::warn!(
 				target: "voice_poll_leg",
 				total_us = total.as_micros() as u64,
+				total_cpu_us = total_cpu.as_micros() as u64,
+				off_cpu_us = off_cpu.as_micros() as u64,
 				send_acks_us = self.send_acks.as_micros() as u64,
+				send_acks_cpu_us = self.send_acks_cpu.as_micros() as u64,
 				send_acks_flushed = self.send_acks_flushed,
 				resend_us = self.resend.as_micros() as u64,
 				ping_us = self.ping.as_micros() as u64,
@@ -472,7 +514,9 @@ impl Stream for Connection {
 		// path, so no early return needs to be touched.
 		let mut timer = PollLegTimer {
 			start: std::time::Instant::now(),
+			cpu_start: thread_cpu_time(),
 			send_acks: std::time::Duration::ZERO,
+			send_acks_cpu: std::time::Duration::ZERO,
 			send_acks_flushed: 0,
 			resend: std::time::Duration::ZERO,
 			ping: std::time::Duration::ZERO,
@@ -480,11 +524,13 @@ impl Stream for Connection {
 		};
 
 		let leg = std::time::Instant::now();
+		let leg_cpu = thread_cpu_time();
 		match self.poll_send_acks(cx) {
 			Ok(flushed) => timer.send_acks_flushed = flushed,
 			Err(e) => return Poll::Ready(Some(Err(e))),
 		}
 		timer.send_acks = leg.elapsed();
+		timer.send_acks_cpu = thread_cpu_time().saturating_sub(leg_cpu);
 
 		if self.resender.get_state() == ResenderState::Disconnected {
 			// Send all ack packets and return `None` afterwards

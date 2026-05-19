@@ -42,6 +42,10 @@ tsproto-packets = { path = "../utils/tsproto-packets", version = "0.1" }
 tsproto-types = { path = "../utils/tsproto-types", version = "0.1" }
 quicklz = "0.3"
 
+# PURA-403 — `CLOCK_THREAD_CPUTIME_ID` for the voice_poll_leg CPU-vs-wall split.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 anyhow = "1"
 criterion = "0.8"
