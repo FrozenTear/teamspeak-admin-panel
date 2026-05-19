@@ -222,8 +222,15 @@ impl Connection {
 		}
 	}
 
-	fn poll_send_acks(&mut self, cx: &mut Context) -> Result<()> {
+	/// Flush the queued ack packets onto the wire.
+	///
+	/// Returns the number of acks actually flushed this call. PURA-403 — the
+	/// caller ([`Connection::poll_next`]) uses the count to attribute a
+	/// connected-loop stall to this leg: a non-blocking `poll_send_to` cannot
+	/// itself freeze, so a slow `send_acks` leg must mean a deep ack backlog.
+	fn poll_send_acks(&mut self, cx: &mut Context) -> Result<usize> {
 		// Poll acks_to_send
+		let mut flushed = 0usize;
 		while let Some(packet) = self.acks_to_send.front() {
 			match self.poll_send_udp_packet(cx, packet) {
 				Poll::Ready(Ok(())) => {
@@ -233,8 +240,9 @@ impl Connection {
 				Poll::Pending => break,
 			}
 			self.acks_to_send.pop_front();
+			flushed += 1;
 		}
-		Ok(())
+		Ok(flushed)
 	}
 
 	fn poll_incoming_udp_packet(&mut self, cx: &mut Context) -> Poll<Result<StreamItem>> {
@@ -398,6 +406,55 @@ impl Connection {
 	pub fn is_send_queue_empty(&self) -> bool { self.resender.is_empty() }
 }
 
+/// PURA-403 — per-leg timing for one [`Connection::poll_next`] call.
+///
+/// The voice connected loop (`crates/voice`) drives this `Stream` on a
+/// `tokio::select!` arm. The select runs every arm's future on one task, so a
+/// *synchronous* stall anywhere inside `poll_next` freezes the whole voice
+/// runtime — including the 20 ms audio cadence — for the stall's duration.
+/// PURA-399 caught 25–87 ms `connected_loop_stall arm=audio` events with no
+/// companion per-frame `audio_send_attribution`: the freeze is structurally
+/// invisible to the send-path instrumentation because it happens while the
+/// select is polling *this* stream, not the audio arm.
+///
+/// This guard times each leg of `poll_next` and, via `Drop`, emits exactly
+/// one WARN (`target: "voice_poll_leg"`) when the combined poll crosses
+/// [`POLL_LEG_WARN`] — so the freeze can be *attributed* to a concrete leg
+/// (PURA-403 requirement: measure the leg, do not guess it). `Drop` covers
+/// every early-return path in `poll_next` without threading a log call
+/// through each one.
+struct PollLegTimer {
+	start: std::time::Instant,
+	send_acks: std::time::Duration,
+	send_acks_flushed: usize,
+	resend: std::time::Duration,
+	ping: std::time::Duration,
+	incoming: std::time::Duration,
+}
+
+/// Combined-poll duration above which [`PollLegTimer`] logs a leg breakdown.
+/// Well under the 20 ms audio frame budget so any stall that can drop a frame
+/// is captured, while steady-state sub-millisecond polls stay silent.
+const POLL_LEG_WARN: std::time::Duration = std::time::Duration::from_millis(8);
+
+impl Drop for PollLegTimer {
+	fn drop(&mut self) {
+		let total = self.start.elapsed();
+		if total >= POLL_LEG_WARN {
+			tracing::warn!(
+				target: "voice_poll_leg",
+				total_us = total.as_micros() as u64,
+				send_acks_us = self.send_acks.as_micros() as u64,
+				send_acks_flushed = self.send_acks_flushed,
+				resend_us = self.resend.as_micros() as u64,
+				ping_us = self.ping.as_micros() as u64,
+				incoming_us = self.incoming.as_micros() as u64,
+				"PURA-403 connection poll_next leg stall — synchronous freeze of the voice runtime"
+			);
+		}
+	}
+}
+
 /// Pull for events.
 ///
 /// `Ok(StreamItem::Error)` is recoverable, `Err()` is not.
@@ -410,9 +467,24 @@ impl Stream for Connection {
 	type Item = Result<StreamItem>;
 	fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
 		let _span = self.span.clone().entered();
-		if let Err(e) = self.poll_send_acks(cx) {
-			return Poll::Ready(Some(Err(e)));
+		// PURA-403 — `timer` times each leg below and logs a breakdown on
+		// `Drop` if the combined poll stalls. `Drop` fires on every return
+		// path, so no early return needs to be touched.
+		let mut timer = PollLegTimer {
+			start: std::time::Instant::now(),
+			send_acks: std::time::Duration::ZERO,
+			send_acks_flushed: 0,
+			resend: std::time::Duration::ZERO,
+			ping: std::time::Duration::ZERO,
+			incoming: std::time::Duration::ZERO,
+		};
+
+		let leg = std::time::Instant::now();
+		match self.poll_send_acks(cx) {
+			Ok(flushed) => timer.send_acks_flushed = flushed,
+			Err(e) => return Poll::Ready(Some(Err(e))),
 		}
+		timer.send_acks = leg.elapsed();
 
 		if self.resender.get_state() == ResenderState::Disconnected {
 			// Send all ack packets and return `None` afterwards
@@ -422,16 +494,20 @@ impl Stream for Connection {
 		}
 
 		// Use the resender to resend packets
+		let leg = std::time::Instant::now();
 		match Resender::poll_resend(&mut self, cx) {
 			Ok(()) => {}
 			Err(e) => return Poll::Ready(Some(Err(e))),
 		}
+		timer.resend = leg.elapsed();
 
 		// Use the resender to send pings
+		let leg = std::time::Instant::now();
 		match Resender::poll_ping(&mut self, cx) {
 			Ok(()) => {}
 			Err(e) => return Poll::Ready(Some(Err(e))),
 		}
+		timer.ping = leg.elapsed();
 
 		// Return existing stream_items
 		if let Some(item) = self.stream_items.pop_front() {
@@ -439,7 +515,10 @@ impl Stream for Connection {
 		}
 
 		// Check for new udp packets
-		match self.poll_incoming_udp_packet(cx) {
+		let leg = std::time::Instant::now();
+		let incoming = self.poll_incoming_udp_packet(cx);
+		timer.incoming = leg.elapsed();
+		match incoming {
 			Poll::Ready(r) => return Poll::Ready(Some(r)),
 			Poll::Pending => {}
 		}
