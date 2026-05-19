@@ -28,12 +28,12 @@ pub trait Socket {
 	) -> Poll<io::Result<usize>>;
 	fn local_addr(&self) -> io::Result<SocketAddr>;
 
-	/// PURA-403 fix — duplicate the underlying fd into a **blocking**
-	/// `std::net::UdpSocket` so ack sends can be offloaded to a background
-	/// thread.  The default returns `None` (test simulated sockets, non-unix
-	/// builds).  Only `impl Socket for UdpSocket` overrides this.
+	/// PURA-403 fix — duplicate the underlying fd into a second
+	/// `std::net::UdpSocket` handle so ack sends can be offloaded to a
+	/// background thread.  The default returns `None` (test simulated sockets,
+	/// non-unix builds).  Only `impl Socket for UdpSocket` overrides this.
 	#[cfg(unix)]
-	fn clone_blocking(&self) -> Option<std::net::UdpSocket> { None }
+	fn try_clone_socket(&self) -> Option<std::net::UdpSocket> { None }
 }
 
 /// A cache for the key and nonce for a generation id.
@@ -146,11 +146,19 @@ impl Socket for UdpSocket {
 
 	fn local_addr(&self) -> io::Result<SocketAddr> { self.local_addr() }
 
-	/// PURA-403 — dup the tokio UdpSocket fd into a blocking std socket so the
-	/// background ack-sender thread can call `send_to` without touching the
-	/// tokio reactor at all. `set_nonblocking(false)` is applied to the dup'd fd.
+	/// PURA-403 — dup the tokio UdpSocket fd so the background ack-sender thread
+	/// can call `send_to` without touching the tokio reactor at all.
+	///
+	/// IMPORTANT: `dup(2)` shares the *open file description* — `O_NONBLOCK` is a
+	/// property of that description, not the fd, so the dup is non-blocking too
+	/// and **must stay that way**. Calling `set_nonblocking(false)` here would
+	/// clear `O_NONBLOCK` on the description the tokio reactor still uses,
+	/// turning the connected loop's `poll_recv_from` into a blocking `recvfrom`
+	/// that freezes the whole voice runtime between inbound packets. The
+	/// ack-sender thread therefore does a non-blocking `send_to`; a rare
+	/// `WouldBlock` simply drops the ack (the resender retransmits the command).
 	#[cfg(unix)]
-	fn clone_blocking(&self) -> Option<std::net::UdpSocket> {
+	fn try_clone_socket(&self) -> Option<std::net::UdpSocket> {
 		use std::os::unix::io::{AsRawFd, FromRawFd};
 		// SAFETY: `dup(2)` is always safe on a valid fd; `from_raw_fd` on the
 		// resulting fd is safe because we just created it and take ownership.
@@ -158,15 +166,8 @@ impl Socket for UdpSocket {
 		if dup_fd < 0 {
 			return None;
 		}
-		let sock = unsafe { std::net::UdpSocket::from_raw_fd(dup_fd) };
-		// The tokio socket's fd is O_NONBLOCK; set the dup to blocking so the
-		// background thread's `send_to` calls block until the kernel accepts the
-		// packet (which is instant for UDP with space in the TX buffer, and a
-		// bounded wait otherwise — all fine on a dedicated thread).
-		if sock.set_nonblocking(false).is_err() {
-			return None;
-		}
-		Some(sock)
+		// SAFETY: `dup_fd` is freshly created and owned exclusively here.
+		Some(unsafe { std::net::UdpSocket::from_raw_fd(dup_fd) })
 	}
 }
 
@@ -195,13 +196,15 @@ impl Connection {
 		let span = info_span!("connection", local_addr = %udp_socket.local_addr().unwrap(),
 			remote_addr = %address);
 
-		// PURA-403 fix — spawn a blocking ack-sender thread when the socket
-		// supports fd-dup (tokio UdpSocket on unix). The thread owns a blocking
-		// clone of the socket and drains a bounded channel, calling `send_to` on
-		// each ack packet. Capacity-256 matches `UDP_SINK_CAPACITY`; try_send in
-		// `poll_send_acks` drops excess acks (UDP semantics — sender retransmits).
+		// PURA-403 fix — spawn an ack-sender thread when the socket supports
+		// fd-dup (tokio UdpSocket on unix). The thread owns a dup'd handle of
+		// the socket and drains a bounded channel, calling `send_to` on each ack
+		// packet. The dup shares the non-blocking open file description, so the
+		// `send_to` is non-blocking — a rare `WouldBlock` drops the ack. Capacity
+		// 256 matches `UDP_SINK_CAPACITY`; try_send in `poll_send_acks` likewise
+		// drops excess acks (UDP semantics — the resender retransmits).
 		#[cfg(unix)]
-		let ack_thread_tx = udp_socket.clone_blocking().map(|sock| {
+		let ack_thread_tx = udp_socket.try_clone_socket().map(|sock| {
 			let (tx, rx) =
 				std::sync::mpsc::sync_channel::<(Vec<u8>, SocketAddr)>(256);
 			std::thread::Builder::new()
