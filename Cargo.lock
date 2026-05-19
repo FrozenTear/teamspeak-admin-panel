@@ -9296,6 +9296,7 @@ version = "0.2.0"
 dependencies = [
  "aes 0.8.4",
  "base64 0.22.1",
+ "crossbeam-channel",
  "curve25519-dalek-ng",
  "eax",
  "futures",

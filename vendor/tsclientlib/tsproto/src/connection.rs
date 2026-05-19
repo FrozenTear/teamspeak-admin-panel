@@ -125,10 +125,18 @@ pub struct Connection {
 	/// work, not preemption). By offloading to a dedicated thread the connected
 	/// loop — and thus the 20 ms audio cadence — is never stalled by an ack send.
 	///
+	/// PURA-406 — this is a `crossbeam-channel` sender, not `std::sync::mpsc`.
+	/// `mpsc::SyncSender::try_send` unconditionally issues a `FUTEX_WAKE` on
+	/// every push even when the receiver is mid-`send_to`; on the CachyOS BORE
+	/// scheduler that wake took 10–12 ms to land, re-stalling the connected loop
+	/// (residual 7 `voice_poll_leg` warns/min after PURA-403). `crossbeam`'s
+	/// `try_send` is lock-free and only `unpark`s the receiver when it is
+	/// actually parked, eliminating the spurious futex wake.
+	///
 	/// `None` on non-unix builds and when the socket does not support fd-dup
 	/// (e.g. test `SimulatedSocket`), in which case we fall back to the original
 	/// in-line send path.
-	ack_thread_tx: Option<std::sync::mpsc::SyncSender<(Vec<u8>, SocketAddr)>>,
+	ack_thread_tx: Option<crossbeam_channel::Sender<(Vec<u8>, SocketAddr)>>,
 
 	pub event_listeners: Vec<EventListener>,
 }
@@ -207,8 +215,11 @@ impl Connection {
 		// then uses the inline fallback path rather than panicking the connection.
 		#[cfg(unix)]
 		let ack_thread_tx = udp_socket.try_clone_socket().and_then(|sock| {
+			// PURA-406 — `crossbeam_channel::bounded` instead of
+			// `mpsc::sync_channel`: lock-free `try_send`, no spurious
+			// `FUTEX_WAKE` on every push (see `ack_thread_tx` field docs).
 			let (tx, rx) =
-				std::sync::mpsc::sync_channel::<(Vec<u8>, SocketAddr)>(256);
+				crossbeam_channel::bounded::<(Vec<u8>, SocketAddr)>(256);
 			std::thread::Builder::new()
 				.name("tsproto-ack-sender".into())
 				.spawn(move || {
@@ -220,7 +231,7 @@ impl Connection {
 				.map(|_| tx)
 		});
 		#[cfg(not(unix))]
-		let ack_thread_tx: Option<std::sync::mpsc::SyncSender<(Vec<u8>, SocketAddr)>> = None;
+		let ack_thread_tx: Option<crossbeam_channel::Sender<(Vec<u8>, SocketAddr)>> = None;
 
 		let mut res = Self {
 			is_client,
