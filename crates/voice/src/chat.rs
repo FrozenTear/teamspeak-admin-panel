@@ -193,32 +193,15 @@ pub fn parse(line: &str) -> Result<ParsedCommand, ParseError> {
     }
 }
 
-/// Dispatch a parsed command against the bot. Lowers into store mutations
-/// (queue) and `BotEvent`s, sends a single short reply line for the
-/// channel, and returns the [`ChatAudioAction`] the bot actor must apply
-/// to the audio pipeline.
-///
-/// `con` is borrowed mutably so the reply can ride the same connection
-/// without a separate channel.
-pub async fn dispatch(
-    bot_id: BotId,
-    con: &mut Connection,
-    store: &Arc<dyn MusicBotStore>,
-    events: &broadcast::Sender<BotEvent>,
-    cmd: ParsedCommand,
-) -> ChatAudioAction {
-    let (reply, action) = handle_command(bot_id, store, events, cmd).await;
-    send_reply(con, &reply);
-    action
-}
-
 /// Lower a parsed command into store mutations + `BotEvent`s, returning
 /// the operator-facing reply line and the [`ChatAudioAction`] the bot
 /// actor must apply.
 ///
-/// Split out from [`dispatch`] so it is unit-testable without a live
-/// `Connection` — the only thing `dispatch` adds is `send_reply`.
-async fn handle_command(
+/// `Connection`-free by design: the bot actor pairs this with a wire-side
+/// [`send_reply`] (single-loop path) or a `WireCmd::ChatReply` (PURA-396
+/// split path). Keeping the lowering `Connection`-free also makes it
+/// unit-testable without a live `Connection`.
+pub(crate) async fn handle_command(
     bot_id: BotId,
     store: &Arc<dyn MusicBotStore>,
     events: &broadcast::Sender<BotEvent>,
@@ -258,17 +241,17 @@ async fn handle_command(
     }
 }
 
-/// Emit a single short chat reply for a parse error. The bridge calls
-/// this only for "user-visible" errors (`MissingArg`, `BadVolume`);
-/// `Empty` and `Unknown` are silent per the issue spec.
-pub fn reply_for_parse_error(con: &mut Connection, err: &ParseError) {
+/// The single short chat reply for a parse error, or `None` when the
+/// error must stay silent. Only "user-visible" errors (`MissingArg`,
+/// `BadVolume`) get a reply; `Empty` and `Unknown` are chat noise / typos
+/// and are dropped per the issue spec.
+///
+/// `Connection`-free for the same reason as [`handle_command`] — the bot
+/// actor decides how the line reaches the wire.
+pub(crate) fn parse_error_reply(err: &ParseError) -> Option<String> {
     match err {
-        ParseError::Empty | ParseError::Unknown => {
-            // Silent — these are chat noise / typos.
-        }
-        ParseError::MissingArg { .. } | ParseError::BadVolume { .. } => {
-            send_reply(con, &err.to_string());
-        }
+        ParseError::Empty | ParseError::Unknown => None,
+        ParseError::MissingArg { .. } | ParseError::BadVolume { .. } => Some(err.to_string()),
     }
 }
 
@@ -526,7 +509,10 @@ fn parse_yt_search(arg: &str) -> Option<&str> {
 /// Best-effort send a chat reply to the bot's current channel. We don't
 /// surface the failure to the caller — chat replies are advisory, and a
 /// transient send error is logged at `warn!` only.
-fn send_reply(con: &mut Connection, line: &str) {
+///
+/// PURA-396 — `pub(crate)` so the split wire task can run it on the
+/// `WireCmd::ChatReply` it receives from the control task.
+pub(crate) fn send_reply(con: &mut Connection, line: &str) {
     let cmd = match con.get_state() {
         Ok(book) => book.send_message(MessageTarget::Channel, line),
         Err(err) => {

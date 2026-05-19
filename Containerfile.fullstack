@@ -40,6 +40,16 @@ COPY Cargo.toml ./
 COPY rust-toolchain.toml ./
 COPY crates ./crates
 
+# PURA-403 — the workspace-root `Cargo.toml` carries a
+# `[patch."https://github.com/ReSpeak/tsclientlib"]` block (added by
+# PURA-402) that redirects `tsclientlib` / `tsproto-packets` to the locally
+# vendored copy under `vendor/tsclientlib/`. Cargo must load that path's
+# manifests to resolve the patch, so the directory has to be present in the
+# build context — without this COPY the stage-1 `dx bundle` fails with
+# `failed to load source for dependency 'tsclientlib'`. PURA-402 landed the
+# vendoring + patch but did not update this Containerfile.
+COPY vendor ./vendor
+
 # Cargo.lock may not exist on a fresh checkout; tolerate either case.
 COPY Cargo.loc[k] ./
 

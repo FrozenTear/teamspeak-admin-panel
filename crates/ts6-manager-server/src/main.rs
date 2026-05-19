@@ -250,17 +250,41 @@ mod server_entry {
                 control: state.control.clone(),
             });
 
+        // PURA-242 / PURA-249 — v1.1 flow engine + REST surface. The
+        // engine boots before the listener opens so the boot-time
+        // in-flight-run sweep and cron registration (PURA-241 engine
+        // §6.1) complete first. PURA-249 swaps the `BasicDispatcher`
+        // stand-in for `ProductionDispatcher`: `ts6Command` lowers onto
+        // a typed `ControlBackend` call, `musicBotCommand` onto a
+        // `BotCommand`, `webhookOut` onto an SSRF-gated `reqwest` POST,
+        // and `logLine` keeps its behaviour. The handle is bound
+        // `_flow_engine` so the `FlowEngine`'s cron + TTL tasks live for
+        // the whole serve scope and abort on shutdown via its `Drop`.
+        // It boots before `server_notify` so the event bridge below can
+        // hand the engine handle to the notify worker (PURA-300).
+        let _flow_engine = crate::flow::FlowEngine::start(crate::flow::EngineDeps::new(
+            database.clone(),
+            std::sync::Arc::new(crate::flow::dispatch::ProductionDispatcher::new(&state)),
+        ))
+        .await
+        .context("flow engine boot")?;
+        let flow_api_state =
+            crate::flow::routes::FlowApiState::new(state.clone(), _flow_engine.handle());
+
         // PURA-80 — TS server-notify event source. Spawns one worker
         // per enabled SSH-controlled `server_connection`; each
         // subscribes to the SSH transport's `notify*` broadcast,
         // registers for server/channel/textserver/textchannel events,
         // and re-publishes them onto the matching WS hub topic. Held
-        // as a drop-guard alongside the dashboard tick.
+        // as a drop-guard alongside the dashboard tick. PURA-300 — the
+        // worker also bridges join/chat/move events into the flow
+        // engine's automod trigger surface.
         let _server_notify =
             crate::ws::server_notify::spawn(crate::ws::server_notify::EventSourceDeps {
                 db: database.clone(),
                 hub: state.ws_hub.clone(),
                 control: state.control.clone(),
+                flow_engine: _flow_engine.handle(),
             });
 
         // PURA-144 (WS-6) — sidecar `/stats` poller + per-server
@@ -275,25 +299,6 @@ mod server_entry {
                 sidecar: sidecar.clone(),
             })
         });
-
-        // PURA-242 / PURA-249 — v1.1 flow engine + REST surface. The
-        // engine boots before the listener opens so the boot-time
-        // in-flight-run sweep and cron registration (PURA-241 engine
-        // §6.1) complete first. PURA-249 swaps the `BasicDispatcher`
-        // stand-in for `ProductionDispatcher`: `ts6Command` lowers onto
-        // a typed `ControlBackend` call, `musicBotCommand` onto a
-        // `BotCommand`, `webhookOut` onto an SSRF-gated `reqwest` POST,
-        // and `logLine` keeps its behaviour. The handle is bound
-        // `_flow_engine` so the `FlowEngine`'s cron + TTL tasks live for
-        // the whole serve scope and abort on shutdown via its `Drop`.
-        let _flow_engine = crate::flow::FlowEngine::start(crate::flow::EngineDeps::new(
-            database.clone(),
-            std::sync::Arc::new(crate::flow::dispatch::ProductionDispatcher::new(&state)),
-        ))
-        .await
-        .context("flow engine boot")?;
-        let flow_api_state =
-            crate::flow::routes::FlowApiState::new(state.clone(), _flow_engine.handle());
 
         // Phase 1 SECURITY (slice 4b): per-IP rate limit on the auth
         // surface. One bucket shared across `/login` and `/refresh` per

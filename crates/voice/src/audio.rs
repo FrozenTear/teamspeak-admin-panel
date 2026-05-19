@@ -42,9 +42,16 @@ const AUDIO_MSG_BUFFER: usize = 32;
 /// One message from the audio sibling task to the bot's connected loop.
 #[derive(Debug)]
 pub(crate) enum AudioMsg {
-    /// Opus payload bytes for one 20 ms frame. The connected loop wraps
-    /// these in `OutAudio::new(AudioData::C2S { codec: OpusVoice, .. })`.
-    Frame(Vec<u8>),
+    /// Opus payload bytes for one 20 ms frame, plus the instant the audio
+    /// sibling handed it onto this mpsc. The connected loop wraps the bytes
+    /// in `OutAudio::new(AudioData::C2S { codec: OpusVoice, .. })`.
+    /// PURA-389a — `enqueued_at` lets the send path measure how long the
+    /// frame waited for the connected loop to poll the audio arm (the
+    /// candidate-C "loop deferral" leg of the residual stall).
+    Frame {
+        bytes: Vec<u8>,
+        enqueued_at: Instant,
+    },
     /// Out-of-band event from the pipeline (ICY `NowPlaying`, warnings,
     /// end-of-stream). The connected loop forwards these onto the bot's
     /// `BotEvent` broadcast.
@@ -64,7 +71,13 @@ pub(crate) struct ActiveAudio {
     #[allow(dead_code)]
     pub source_label: String,
     /// Drained by the connected loop on every `select!` iteration.
-    pub audio_rx: mpsc::Receiver<AudioMsg>,
+    ///
+    /// PURA-396 — `Option` so the split-wire-task control loop can
+    /// `take()` the receiver and hand it to the wire task (via
+    /// `WireCmd::InstallAudio`); the single-loop path leaves it `Some`
+    /// and drains it in place. Always `Some` immediately after
+    /// [`build_active`].
+    pub audio_rx: Option<mpsc::Receiver<AudioMsg>>,
     /// Flipped by `Pause` / `Resume`. The sibling parks on
     /// `pause_rx.changed()` while `*pause_rx.borrow()` is true.
     pub pause: watch::Sender<bool>,
@@ -96,6 +109,12 @@ pub(crate) struct ActiveAudio {
     /// — in which case a seek is a graceful no-op. Shared with the
     /// background resolve task, hence `Arc<Mutex<_>>`.
     pub seek_input: Arc<Mutex<Option<String>>>,
+    /// PURA-389a — per-frame voice send-path timing accumulator. Fed one
+    /// [`SendSample`] per Opus frame by [`send_opus_frame`]; emits the
+    /// `audio_send_attribution` / `audio_send_summary` `music_bot_latency`
+    /// records that attribute the residual `arm=audio` stall to candidate
+    /// A / B / C. Per-play state, so it resets on every track change.
+    pub send_monitor: SendTimingMonitor,
     /// PURA-352 — the background `yt-dlp -g` resolve task, kept so `Drop`
     /// aborts it if the track is torn down before resolution finishes.
     /// `None` for sources that need no resolve (library / synthetic) and
@@ -250,13 +269,14 @@ fn build_active(
     let sibling = spawn_sibling(pipeline, frames_rx, events_rx, pause_rx, msg_tx);
     ActiveAudio {
         source_label,
-        audio_rx: msg_rx,
+        audio_rx: Some(msg_rx),
         pause: pause_tx,
         frames_sent: 0,
         started_at,
         last_diagnostic: None,
         seek_base_secs,
         seek_input,
+        send_monitor: SendTimingMonitor::new(),
         _resolve: resolve,
         _sibling: sibling,
     }
@@ -576,7 +596,17 @@ fn spawn_sibling(
                             f.scheduled_at,
                         ))
                         .await;
-                        if tx.send(AudioMsg::Frame(f.bytes)).await.is_err() {
+                        // PURA-389a — stamp the hand-off instant so the
+                        // connected loop's send path can measure how long
+                        // this frame waited for the audio arm to be polled.
+                        if tx
+                            .send(AudioMsg::Frame {
+                                bytes: f.bytes,
+                                enqueued_at: std::time::Instant::now(),
+                            })
+                            .await
+                            .is_err()
+                        {
                             return;
                         }
                     }
@@ -613,25 +643,269 @@ fn spawn_sibling(
     })
 }
 
+/// PURA-389a — frames between `audio_send_summary` emissions. 1500 frames
+/// at the 20 ms cadence is one summary every ~30 s: fine-grained enough to
+/// see a stall cluster across the ~30-min contabo sample without flooding.
+const SEND_SUMMARY_INTERVAL: u64 = 1500;
+
+/// PURA-389a — a frame whose observable budget (`dequeue_gap` +
+/// `t_blockinplace`) reaches this gets a per-frame `audio_send_attribution`
+/// WARN carrying the full A/B/C breakdown. 10 ms matches the connected
+/// loop's `LOOP_STALL_WARN` so every `connected_loop_stall arm=audio` has a
+/// companion attribution line. The PURA-389 design (tsclientlib `04aa249`
+/// source read) predicts a healthy `con.send_audio` is microseconds, so on
+/// a clean run this fires only on the residual stalls we are hunting.
+const SEND_ATTRIBUTION_WARN: Duration = Duration::from_millis(10);
+
+/// PURA-389a — per-thread consumed CPU time (`CLOCK_THREAD_CPUTIME_ID`).
+///
+/// Compared with wall time across the `block_in_place` send: `wall ≫ cpu`
+/// means the `voice-rt` worker thread spent the gap *off* a CPU — the OS
+/// preempted it (candidate B) — rather than actually computing.
+fn thread_cpu_now() -> Duration {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a live, writable `timespec`; `CLOCK_THREAD_CPUTIME_ID`
+    // is a valid POSIX clock id. On the (Linux-unexpected) non-zero return
+    // we fall back to `ZERO`, which simply mutes the candidate-B signal for
+    // this one frame instead of corrupting the attribution.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+    if rc != 0 {
+        return Duration::ZERO;
+    }
+    Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+}
+
+/// PURA-389a — one Opus frame's send-path timing, fed to
+/// [`SendTimingMonitor::observe`].
+struct SendSample {
+    /// Candidate C — wall the frame waited in the sibling→loop mpsc before
+    /// the connected loop polled the audio arm and reached this send.
+    dequeue_gap: Duration,
+    /// Wall around the inner `con.send_audio` call only.
+    t_send: Duration,
+    /// Wall around the whole `block_in_place(...)`, entry/exit included.
+    t_blockinplace: Duration,
+    /// Thread CPU time consumed across the `t_blockinplace` span.
+    cpu: Duration,
+}
+
+/// PURA-389a — name the largest of the three PURA-389 send-stall
+/// candidates for one frame. A heuristic hint only; the raw `*_us` fields
+/// on the log record stay authoritative — A and B genuinely overlap when
+/// the thread is preempted *inside* the `block_in_place` machinery, and
+/// the aggregate sample is what the attribution comment reasons over.
+fn dominant_candidate(c: Duration, a: Duration, b: Duration) -> &'static str {
+    if c >= a && c >= b {
+        "C_loop_deferral"
+    } else if b >= a {
+        "B_os_preemption"
+    } else {
+        "A_block_in_place_churn"
+    }
+}
+
+/// PURA-389a — aggregates per-frame voice send-path timing and attributes
+/// the residual `arm=audio` stall across the three PURA-389 candidates:
+///
+///  * **A — `block_in_place` churn**: `t_blockinplace − t_send`. Wall spent
+///    in tokio's `block_in_place` entry/exit machinery, outside the actual
+///    `con.send_audio` call.
+///  * **B — OS preemption**: `t_blockinplace − cpu`. Send-span wall during
+///    which the `voice-rt` thread was not on a CPU.
+///  * **C — loop deferral**: `dequeue_gap`. Wall the frame sat in the
+///    sibling→loop mpsc waiting for the connected loop to poll the audio
+///    arm — the in-crate-visible leg of "flush deferral behind a busy
+///    event arm". The deeper `poll_send_acks` flush leg lives inside
+///    `tsclientlib` and would need an upstream shim, deliberately left out
+///    of PURA-389a scope (moratorium-gated — see the issue).
+///
+/// Per frame: a WARN (`audio_send_attribution`) on any frame past
+/// [`SEND_ATTRIBUTION_WARN`], naming the dominant candidate. Per window: an
+/// INFO (`audio_send_summary`) every [`SEND_SUMMARY_INTERVAL`] frames with
+/// the window maxes. Both under the `music_bot_latency` target so they
+/// line up with `frame_underrun` / `connected_loop_stall`.
+pub(crate) struct SendTimingMonitor {
+    /// Frames observed across the whole play — also the per-frame index in
+    /// the `audio_send_attribution` records.
+    total_frames: u64,
+    /// Frames observed since the last summary.
+    window_frames: u64,
+    /// Per-window maxes (reset by [`Self::reset_window`] after a summary).
+    window_max_dequeue_gap: Duration,
+    window_max_t_send: Duration,
+    window_max_t_blockinplace: Duration,
+    /// Worst candidate-A churn (`t_blockinplace − t_send`) this window.
+    window_max_churn_a: Duration,
+    /// Worst candidate-B preemption gap (`t_blockinplace − cpu`) this window.
+    window_max_preempt_b: Duration,
+    /// Attribution WARNs raised this window.
+    window_attributions: u32,
+}
+
+impl SendTimingMonitor {
+    pub(crate) fn new() -> Self {
+        Self {
+            total_frames: 0,
+            window_frames: 0,
+            window_max_dequeue_gap: Duration::ZERO,
+            window_max_t_send: Duration::ZERO,
+            window_max_t_blockinplace: Duration::ZERO,
+            window_max_churn_a: Duration::ZERO,
+            window_max_preempt_b: Duration::ZERO,
+            window_attributions: 0,
+        }
+    }
+
+    /// Record one frame's send-path timing: update the window maxes, raise
+    /// a per-frame attribution WARN if it stalled, and flush the window
+    /// summary every [`SEND_SUMMARY_INTERVAL`] frames.
+    fn observe(&mut self, s: SendSample) {
+        self.total_frames += 1;
+        self.window_frames += 1;
+
+        // A and B are both subsets of the `t_blockinplace` span (a region
+        // split vs a thread-state split), so they can overlap; `saturating_sub`
+        // keeps a near-zero candidate from underflowing.
+        let churn_a = s.t_blockinplace.saturating_sub(s.t_send);
+        let preempt_b = s.t_blockinplace.saturating_sub(s.cpu);
+
+        self.window_max_dequeue_gap = self.window_max_dequeue_gap.max(s.dequeue_gap);
+        self.window_max_t_send = self.window_max_t_send.max(s.t_send);
+        self.window_max_t_blockinplace = self.window_max_t_blockinplace.max(s.t_blockinplace);
+        self.window_max_churn_a = self.window_max_churn_a.max(churn_a);
+        self.window_max_preempt_b = self.window_max_preempt_b.max(preempt_b);
+
+        if s.dequeue_gap + s.t_blockinplace >= SEND_ATTRIBUTION_WARN {
+            self.window_attributions += 1;
+            warn!(
+                target: "music_bot_latency",
+                stage = "audio_send_attribution",
+                frame_index = self.total_frames,
+                dominant = dominant_candidate(s.dequeue_gap, churn_a, preempt_b),
+                c_loop_deferral_us = s.dequeue_gap.as_micros() as u64,
+                b_preempt_us = preempt_b.as_micros() as u64,
+                a_blockinplace_churn_us = churn_a.as_micros() as u64,
+                t_send_us = s.t_send.as_micros() as u64,
+                t_blockinplace_us = s.t_blockinplace.as_micros() as u64,
+                send_cpu_us = s.cpu.as_micros() as u64,
+                "audio send-path stall — A/B/C breakdown for this frame; \
+                 `dominant` names the largest PURA-389 candidate, raw \
+                 `*_us` fields are authoritative",
+            );
+        }
+
+        if self.window_frames >= SEND_SUMMARY_INTERVAL {
+            self.log_summary();
+            self.reset_window();
+        }
+    }
+
+    fn log_summary(&self) {
+        info!(
+            target: "music_bot_latency",
+            stage = "audio_send_summary",
+            total_frames = self.total_frames,
+            window_frames = self.window_frames,
+            window_attributions = self.window_attributions,
+            max_c_loop_deferral_us = self.window_max_dequeue_gap.as_micros() as u64,
+            max_b_preempt_us = self.window_max_preempt_b.as_micros() as u64,
+            max_a_blockinplace_churn_us = self.window_max_churn_a.as_micros() as u64,
+            max_t_send_us = self.window_max_t_send.as_micros() as u64,
+            max_t_blockinplace_us = self.window_max_t_blockinplace.as_micros() as u64,
+            "audio send-path timing window — per-window maxes for the \
+             PURA-389 A/B/C residual-stall attribution",
+        );
+    }
+
+    fn reset_window(&mut self) {
+        self.window_frames = 0;
+        self.window_max_dequeue_gap = Duration::ZERO;
+        self.window_max_t_send = Duration::ZERO;
+        self.window_max_t_blockinplace = Duration::ZERO;
+        self.window_max_churn_a = Duration::ZERO;
+        self.window_max_preempt_b = Duration::ZERO;
+        self.window_attributions = 0;
+    }
+}
+
 /// Send one 20 ms Opus frame on the wire. Wraps the bytes in the C2S
 /// `OutAudio` shape the prototype proved against TS6 (codec = OpusVoice,
 /// voice-id = 0). Errors are surfaced to the caller so the connected
 /// loop can decide whether to keep the bot online.
+///
+/// PURA-389a — `enqueued_at` (stamped by the audio sibling) and `monitor`
+/// feed the A/B/C send-stall attribution.
+///
+/// PURA-396 2b — `use_block_in_place` selects whether the (microsecond)
+/// `con.send_audio` call is wrapped in `tokio::task::block_in_place`. The
+/// single-loop path passes `true` (unchanged behaviour); the split wire
+/// task passes `false` — PURA-389a measured the `block_in_place` entry/exit
+/// churn as candidate A (~11–18 % of the residual stall budget) and the
+/// wire task does nothing but wire I/O, so wrapping a non-blocking call
+/// buys only churn. The A/B/C timers stay live either way (with the flag
+/// off `block_in_place` they simply measure the bare send wall).
 // `tsclientlib::Error` is 136 B — over clippy's 128 B threshold for
 // `result_large_err`. Boxing the upstream error type just to please the
 // lint isn't worth the API churn for a single in-crate caller.
 #[allow(clippy::result_large_err)]
-pub(crate) fn send_opus_frame(con: &mut Connection, opus: &[u8]) -> Result<(), tsclientlib::Error> {
+pub(crate) fn send_opus_frame(
+    con: &mut Connection,
+    opus: &[u8],
+    enqueued_at: Instant,
+    monitor: &mut SendTimingMonitor,
+    use_block_in_place: bool,
+) -> Result<(), tsclientlib::Error> {
     let pkt = OutAudio::new(&AudioData::C2S {
         id: 0,
         codec: CodecType::OpusVoice,
         data: opus,
     });
-    // block_in_place: con.send_audio does synchronous packet framing +
-    // encryption + UDP write (12–130 ms observed). Marking it blocking
-    // lets the voice runtime keep other tasks (sibling, connection task)
-    // scheduled while the send occupies a worker thread.
-    block_in_place(|| con.send_audio(pkt))
+
+    // PURA-389a candidate C — how long this frame waited in the sibling→
+    // loop mpsc before the connected loop polled the audio arm and reached
+    // this send. Measured before any send work so it is a clean pre-send
+    // figure.
+    let dequeue_gap = enqueued_at.elapsed();
+
+    // PURA-389a candidate B — thread CPU consumed vs wall elapsed across the
+    // whole send. Snapshot the thread CPU clock just before the send span.
+    let cpu_start = thread_cpu_now();
+
+    // `con.send_audio` does synchronous packet framing + (optional)
+    // encryption, then a `VecDeque` enqueue — no UDP syscall (PURA-389
+    // tsclientlib `04aa249` source read). When `use_block_in_place` is set
+    // the call is marked blocking so the voice runtime keeps other tasks
+    // scheduled; the split wire task passes `false` (PURA-396 2b).
+    //
+    // PURA-389a candidate A — `t_blockinplace` wraps the whole
+    // (optionally `block_in_place`-wrapped) span; `t_send` wraps only the
+    // inner `con.send_audio`. Their difference is the `block_in_place`
+    // entry/exit churn — ~zero when `use_block_in_place` is false.
+    let blockinplace_start = Instant::now();
+    let send_once = || {
+        let send_start = Instant::now();
+        let result = con.send_audio(pkt);
+        (result, send_start.elapsed())
+    };
+    let (send_result, t_send) = if use_block_in_place {
+        block_in_place(send_once)
+    } else {
+        send_once()
+    };
+    let t_blockinplace = blockinplace_start.elapsed();
+    let cpu = thread_cpu_now().saturating_sub(cpu_start);
+
+    monitor.observe(SendSample {
+        dequeue_gap,
+        t_send,
+        t_blockinplace,
+        cpu,
+    });
+
+    send_result
 }
 
 /// Best-effort voice-stop = same packet shape with an empty Opus
@@ -837,7 +1111,7 @@ mod tests {
         let mut last_frame_at = started;
         while let Some(msg) = msg_rx.recv().await {
             match msg {
-                AudioMsg::Frame(_) => {
+                AudioMsg::Frame { .. } => {
                     frame_count += 1;
                     last_frame_at = std::time::Instant::now();
                 }
@@ -856,6 +1130,78 @@ mod tests {
             span >= Duration::from_millis(120),
             "frames arrived within {span:?} — expected real-time pacing (~180 ms for \
              {frame_count} frames), not an unpaced burst",
+        );
+    }
+
+    /// PURA-389a — `dominant_candidate` names whichever of C / B / A is the
+    /// largest for a frame.
+    #[test]
+    fn dominant_candidate_picks_the_largest() {
+        let big = Duration::from_millis(50);
+        let small = Duration::from_millis(5);
+        assert_eq!(dominant_candidate(big, small, small), "C_loop_deferral");
+        assert_eq!(dominant_candidate(small, small, big), "B_os_preemption");
+        assert_eq!(
+            dominant_candidate(small, big, small),
+            "A_block_in_place_churn",
+        );
+    }
+
+    /// PURA-389a — a frame well under the 10 ms budget raises no
+    /// attribution WARN; a stalled frame raises exactly one and the window
+    /// maxes retain its figures.
+    #[test]
+    fn send_monitor_counts_only_stalled_frames() {
+        let mut m = SendTimingMonitor::new();
+        // Healthy frame — microsecond send, no wait. No attribution.
+        m.observe(SendSample {
+            dequeue_gap: Duration::from_micros(40),
+            t_send: Duration::from_micros(70),
+            t_blockinplace: Duration::from_micros(110),
+            cpu: Duration::from_micros(100),
+        });
+        assert_eq!(m.window_attributions, 0, "healthy frame raises nothing");
+        assert_eq!(m.total_frames, 1);
+        // Stalled frame — 40 ms stuck in the mpsc (candidate C). One WARN.
+        m.observe(SendSample {
+            dequeue_gap: Duration::from_millis(40),
+            t_send: Duration::from_micros(90),
+            t_blockinplace: Duration::from_millis(2),
+            cpu: Duration::from_micros(150),
+        });
+        assert_eq!(m.window_attributions, 1, "stalled frame raises one WARN");
+        assert_eq!(m.window_max_dequeue_gap, Duration::from_millis(40));
+        assert_eq!(m.window_max_t_blockinplace, Duration::from_millis(2));
+        // Candidate-B max is `t_blockinplace − cpu` of the stalled frame.
+        assert_eq!(
+            m.window_max_preempt_b,
+            Duration::from_millis(2) - Duration::from_micros(150),
+        );
+    }
+
+    /// PURA-389a — the window summary fires every `SEND_SUMMARY_INTERVAL`
+    /// frames and resets the per-window state, while the cumulative
+    /// `total_frames` counter survives.
+    #[test]
+    fn send_monitor_summary_resets_window() {
+        let mut m = SendTimingMonitor::new();
+        for _ in 0..SEND_SUMMARY_INTERVAL {
+            m.observe(SendSample {
+                dequeue_gap: Duration::from_micros(10),
+                t_send: Duration::from_micros(20),
+                t_blockinplace: Duration::from_micros(30),
+                cpu: Duration::from_micros(28),
+            });
+        }
+        assert_eq!(m.window_frames, 0, "window resets after a summary");
+        assert_eq!(
+            m.total_frames, SEND_SUMMARY_INTERVAL,
+            "cumulative frame count survives the reset",
+        );
+        assert_eq!(
+            m.window_max_t_blockinplace,
+            Duration::ZERO,
+            "per-window maxes are cleared by the reset",
         );
     }
 }
