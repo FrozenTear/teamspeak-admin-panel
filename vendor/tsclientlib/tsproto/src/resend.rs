@@ -673,17 +673,25 @@ impl Resender {
 		// Send a packet at least every second
 		let max_send_rto = Duration::from_secs(1);
 
+		// PURA-403 — hoist `Instant::now()` and the per-packet RTO constants out
+		// of the loop. The original code called `Instant::now()` on every loop
+		// iteration; on a VPS under hypervisor TSC jitter one of those calls can
+		// stall for 10–80 ms, freezing the entire voice runtime for that duration
+		// (the connected loop drives this Stream on a `select!` arm, so any
+		// synchronous stall inside `poll_next` blocks the 20 ms audio cadence).
+		// Using a single `now` for the whole flush pass is semantically equivalent:
+		// packets in the same `poll_next` call are ordered within microseconds of
+		// each other, so a per-call `now` is no less accurate than per-iteration.
+		let now = Instant::now();
+		let mut rto: Duration = con.resender.config.srtt + con.resender.config.srtt_dev * 4;
+		if rto > max_send_rto {
+			rto = max_send_rto;
+		}
+		let last_threshold = now - rto;
+
 		// Check if there are packets to send.
 		loop {
-			let now = Instant::now();
 			let window = con.resender.get_window();
-
-			// Retransmission timeout
-			let mut rto: Duration = con.resender.config.srtt + con.resender.config.srtt_dev * 4;
-			if rto > max_send_rto {
-				rto = max_send_rto;
-			}
-			let last_threshold = now - rto;
 
 			let mut rec = if let Some(rec) = con.resender.send_queue.peek_mut() {
 				rec
