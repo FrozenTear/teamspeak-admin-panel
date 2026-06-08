@@ -22,6 +22,10 @@ terminated, connection then closed by the server:
 
     request  : {"op":"resolve","url":"...","cookie_file":"/path"|null}
                {"op":"ping"}
+    partial  : {"ok":true,"partial":true,"video_id":"...","phase":"search_fetch","ms":N}
+               (THE-942 — a search streams this the moment phase 1 resolves the
+                video_id, before phase 2 runs; zero or more partials precede the
+                final reply. A non-streaming client ignores it.)
     response : {"ok":true,"direct_url":"...","title":"...","duration":N}
                {"ok":true,"pong":true,"yt_dlp_version":"..."}
                {"ok":false,"error":"..."}
@@ -184,7 +188,7 @@ def _extract_track(info):
     }
 
 
-def resolve(url, cookie_file):
+def resolve(url, cookie_file, send_partial=None):
     """Resolve ``url`` to a direct, ffmpeg-consumable ``bestaudio`` URL.
 
     Mirrors the subprocess fallback's ``yt-dlp -f bestaudio -g``: extraction
@@ -214,6 +218,16 @@ def resolve(url, cookie_file):
     supervisor can hand it to the ``yt-dlp`` subprocess fallback as a direct
     URL instead of re-running the search query from scratch — cutting the
     worst-case fallback from ~25 s down to the single-video resolve floor.
+
+    THE-942 — for a search, the ``video_id`` is *streamed* as a partial reply
+    the moment phase 1 (``search_fetch``) resolves it, **before** phase 2
+    (``nsig_solve``) runs. ``send_partial`` (when supplied) is called with a
+    ``{"ok":true,"partial":true,"video_id":...}`` line. This is the THE-931
+    failure mode's escape hatch: if phase 2 then stalls and the Rust caller's
+    phase-2 budget fires, it already holds the ``video_id`` and hands the
+    subprocess a direct watch URL instead of re-running ``ytsearch1:``. The
+    final reply still carries ``video_id`` too, so a non-streaming client (or
+    a direct-URL resolve) is unaffected.
     """
     base_opts = {
         "format": "bestaudio",
@@ -255,6 +269,21 @@ def resolve(url, cookie_file):
         if not video_id:
             raise RuntimeError("ytsearch returned no entries")
 
+        # THE-942 — stream the video_id as a partial reply *before* phase 2.
+        # If nsig_solve then stalls and the caller's phase-2 budget fires, it
+        # already holds the video_id and can hand the subprocess a direct
+        # watch URL instead of re-running the search.
+        if send_partial is not None:
+            send_partial(
+                {
+                    "ok": True,
+                    "partial": True,
+                    "video_id": video_id,
+                    "phase": "search_fetch",
+                    "ms": search_ms,
+                }
+            )
+
         # --- Phase 2: nsig_solve ---
         watch_url = "https://www.youtube.com/watch?v=%s" % video_id
         t1 = time.monotonic()
@@ -286,7 +315,7 @@ def resolve(url, cookie_file):
     return track
 
 
-def dispatch(payload):
+def dispatch(payload, send_partial=None):
     op = payload.get("op", "resolve")
     if op == "ping":
         return {"ok": True, "pong": True, "yt_dlp_version": _yt_dlp_version()}
@@ -295,7 +324,7 @@ def dispatch(payload):
         if not url:
             return {"ok": False, "error": "request has no url"}
         try:
-            return resolve(url, payload.get("cookie_file"))
+            return resolve(url, payload.get("cookie_file"), send_partial)
         except Exception as exc:  # noqa: BLE001 — any extractor failure → error reply
             return {"ok": False, "error": str(exc)}
     return {"ok": False, "error": "unknown op %r" % (op,)}
@@ -306,12 +335,20 @@ class Handler(socketserver.StreamRequestHandler):
         line = self.rfile.readline()
         if not line:
             return
+
+        def send_partial(obj):
+            # THE-942 — write one newline-terminated partial line and flush it
+            # immediately so the Rust caller can read the streamed video_id
+            # while phase 2 (nsig_solve) is still running.
+            self.wfile.write((json.dumps(obj) + "\n").encode())
+            self.wfile.flush()
+
         try:
             payload = json.loads(line)
         except json.JSONDecodeError as exc:
             resp = {"ok": False, "error": "bad json: %s" % (exc,)}
         else:
-            resp = dispatch(payload)
+            resp = dispatch(payload, send_partial)
         self.wfile.write((json.dumps(resp) + "\n").encode())
 
 

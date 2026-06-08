@@ -35,7 +35,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::process::Command;
 
@@ -57,6 +57,24 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// the worst-case failure-path delay from 40 s to 15 s before the subprocess
 /// fallback fires.
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// THE-942 — budget for phase 2 (`nsig_solve`) *after* a search has streamed
+/// its phase-1 `video_id` partial.
+///
+/// THE-931's failure mode is a stalled socket inside the nsig/player-JS fetch
+/// — i.e. phase 2 wedging after phase 1 already produced the video_id. Once we
+/// hold that video_id there is no reason to wait the full [`RESOLVE_TIMEOUT`]
+/// for the direct URL: the subprocess fallback can resolve the same single
+/// watch URL itself. So once the partial arrives we cap the remaining wait at
+/// this shorter budget and, on expiry, bail to the subprocess carrying the
+/// video_id (a direct watch URL, *not* a re-run of `ytsearch1:`).
+///
+/// 6 s comfortably clears a healthy phase 2 (warm preprocessed-player cache
+/// ~1.1 s, cold ~2.4 s — PURA-360) so it does not trip a slow-but-successful
+/// resolve, while bounding the warm-side failure latency to roughly
+/// `search_fetch (~1–3 s) + 6 s ≈ 9 s`, under the ~12 s cap THE-942 targets and
+/// well below the pre-fix `15 s + subprocess re-search` tail.
+const PHASE2_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// A resolved track — the warm resolver's answer for one URL.
 #[derive(Debug, Clone)]
@@ -90,6 +108,15 @@ pub enum ResolverError {
     /// The service answered with something we could not parse.
     #[error("resolver protocol error: {0}")]
     Protocol(String),
+    /// THE-942 — the resolve exceeded its budget before a final reply.
+    ///
+    /// `partial_video_id` carries the phase-1 `video_id` when a search had
+    /// already streamed it (i.e. phase 2 / `nsig_solve` is what stalled). The
+    /// caller hands it to the subprocess as a direct watch URL instead of
+    /// re-running the original `ytsearch1:` query. `None` when the timeout
+    /// fired before any partial arrived (e.g. a phase-1 / search-API stall).
+    #[error("resolve timed out (partial video_id: {partial_video_id:?})")]
+    TimedOut { partial_video_id: Option<String> },
 }
 
 /// One timing phase emitted by the Python resolver (THE-932).
@@ -103,6 +130,11 @@ pub struct ResolvePhase {
 #[derive(Debug, Deserialize)]
 struct WireResponse {
     ok: bool,
+    /// THE-942 — `true` on a streamed progress line (carries `video_id` from
+    /// phase 1) that precedes the final reply. Absent/`false` on the final
+    /// reply and on every response from a non-streaming resolver.
+    #[serde(default)]
+    partial: bool,
     #[serde(default)]
     error: Option<String>,
     #[serde(default)]
@@ -140,6 +172,12 @@ struct SupervisorState {
 pub struct ResolverHandle {
     socket_path: PathBuf,
     state: Arc<SupervisorState>,
+    /// Overall round-trip budget. Defaults to [`RESOLVE_TIMEOUT`]; a test
+    /// shrinks it so the failure paths can be exercised without real waits.
+    resolve_timeout: Duration,
+    /// Budget for the final reply once a phase-1 `video_id` partial has
+    /// arrived. Defaults to [`PHASE2_TIMEOUT`] (THE-942).
+    phase2_timeout: Duration,
 }
 
 impl ResolverHandle {
@@ -159,6 +197,8 @@ impl ResolverHandle {
         Ok(Self {
             socket_path,
             state,
+            resolve_timeout: RESOLVE_TIMEOUT,
+            phase2_timeout: PHASE2_TIMEOUT,
         })
     }
 
@@ -169,6 +209,8 @@ impl ResolverHandle {
         Self {
             socket_path,
             state: Arc::new(SupervisorState::default()),
+            resolve_timeout: RESOLVE_TIMEOUT,
+            phase2_timeout: PHASE2_TIMEOUT,
         }
     }
 
@@ -177,7 +219,29 @@ impl ResolverHandle {
     /// touching the socket.
     #[cfg(test)]
     fn for_socket_with_state(socket_path: PathBuf, state: Arc<SupervisorState>) -> Self {
-        Self { socket_path, state }
+        Self {
+            socket_path,
+            state,
+            resolve_timeout: RESOLVE_TIMEOUT,
+            phase2_timeout: PHASE2_TIMEOUT,
+        }
+    }
+
+    /// Construct a handle with shrunk timeouts. Test-only seam so the
+    /// streamed-partial / phase-2-stall paths (THE-942) can be exercised
+    /// without paying the real multi-second budgets.
+    #[cfg(test)]
+    fn for_socket_with_timeouts(
+        socket_path: PathBuf,
+        resolve_timeout: Duration,
+        phase2_timeout: Duration,
+    ) -> Self {
+        Self {
+            socket_path,
+            state: Arc::new(SupervisorState::default()),
+            resolve_timeout,
+            phase2_timeout,
+        }
     }
 
     /// Resolve `url` to a direct `bestaudio` media URL via the warm process.
@@ -225,9 +289,24 @@ impl ResolverHandle {
         Ok(resp.yt_dlp_version.unwrap_or_else(|| "unknown".into()))
     }
 
-    /// One request → one response over a fresh connection. The Python
-    /// server reads a single newline-terminated JSON line then writes one
-    /// reply and closes, so the protocol needs no length framing.
+    /// One request → one final response over a fresh connection.
+    ///
+    /// The server writes newline-terminated JSON: zero or more streamed
+    /// `partial` lines (THE-942 — a search emits one carrying the phase-1
+    /// `video_id`) followed by exactly one final reply, then closes.
+    ///
+    /// Timeout discipline (THE-942):
+    /// * Until a partial arrives, the whole exchange is bounded by
+    ///   [`resolve_timeout`](Self::resolve_timeout) ([`RESOLVE_TIMEOUT`]).
+    /// * Once a `video_id` partial arrives, the wait for the final reply is
+    ///   re-bounded to [`phase2_timeout`](Self::phase2_timeout)
+    ///   ([`PHASE2_TIMEOUT`]) — a stalled `nsig_solve` no longer holds the
+    ///   caller for the full budget; we bail to the subprocess fallback
+    ///   carrying the captured `video_id`.
+    ///
+    /// On any timeout this returns [`ResolverError::TimedOut`] with the last
+    /// `video_id` seen (if any), so the caller can hand the subprocess a
+    /// direct watch URL instead of re-running the search.
     async fn round_trip(&self, req: &serde_json::Value) -> Result<WireResponse, ResolverError> {
         // Supervisor gave up — no server is bound, so connecting would just
         // burn `CONNECT_TIMEOUT` per call. Fail fast straight to subprocess.
@@ -247,22 +326,53 @@ impl ResolverHandle {
                 .map_err(|_| ResolverError::Unavailable("connect timed out".into()))?
                 .map_err(|e| ResolverError::Unavailable(format!("connect: {e}")))?;
 
-        let exchange = async {
-            stream.write_all(&line).await?;
-            // Half-close the write side so the server sees a clean EOF even
-            // if a future protocol revision drops the newline delimiter.
-            stream.shutdown().await?;
-            let mut buf = Vec::with_capacity(4096);
-            stream.read_to_end(&mut buf).await?;
-            Ok::<_, std::io::Error>(buf)
-        };
-        let buf = tokio::time::timeout(RESOLVE_TIMEOUT, exchange)
+        stream
+            .write_all(&line)
             .await
-            .map_err(|_| ResolverError::Unavailable("resolve timed out".into()))?
+            .map_err(|e| ResolverError::Unavailable(format!("io: {e}")))?;
+        // Half-close the write side so the server sees a clean EOF even if a
+        // future protocol revision drops the newline delimiter.
+        stream
+            .shutdown()
+            .await
             .map_err(|e| ResolverError::Unavailable(format!("io: {e}")))?;
 
-        serde_json::from_slice(&buf)
-            .map_err(|e| ResolverError::Protocol(format!("undecodable reply: {e}")))
+        let mut lines = BufReader::new(stream).lines();
+        let mut partial_video_id: Option<String> = None;
+        // Deadline for the *next* line. Starts at the overall budget; tightens
+        // to `phase2_timeout` once a partial hands us the video_id.
+        let mut deadline = Instant::now() + self.resolve_timeout;
+
+        loop {
+            let now = Instant::now();
+            let remaining = deadline.saturating_duration_since(now);
+            let next = match tokio::time::timeout(remaining, lines.next_line()).await {
+                Err(_) => return Err(ResolverError::TimedOut { partial_video_id }),
+                Ok(Ok(next)) => next,
+                Ok(Err(e)) => return Err(ResolverError::Unavailable(format!("io: {e}"))),
+            };
+            let Some(text) = next else {
+                // EOF before a final reply.
+                return Err(ResolverError::Protocol(
+                    "connection closed before a final reply".into(),
+                ));
+            };
+            if text.trim().is_empty() {
+                continue;
+            }
+            let resp: WireResponse = serde_json::from_str(&text)
+                .map_err(|e| ResolverError::Protocol(format!("undecodable reply: {e}")))?;
+            if resp.partial {
+                // Streamed progress line: capture the video_id and tighten the
+                // deadline for the (possibly stalling) final reply.
+                if let Some(vid) = resp.video_id {
+                    partial_video_id = Some(vid);
+                    deadline = Instant::now() + self.phase2_timeout;
+                }
+                continue;
+            }
+            return Ok(resp);
+        }
     }
 }
 
@@ -401,6 +511,7 @@ pub fn warm_up() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
     use tokio::net::UnixListener;
 
     /// Spawn a one-shot mock resolver: bind `path`, accept one connection,
@@ -426,6 +537,42 @@ mod tests {
             }
             stream.write_all(reply.as_bytes()).await.unwrap();
             stream.shutdown().await.unwrap();
+        });
+    }
+
+    /// THE-942 — a mock resolver that streams `lines` (e.g. a partial then a
+    /// final reply), then optionally hangs for `hang_after` before closing.
+    /// `hang_after = Some(_)` after a single partial line models the THE-931
+    /// failure mode: phase 1 streamed the video_id, phase 2 (`nsig_solve`)
+    /// wedged and never produced a final reply.
+    fn mock_streaming(path: PathBuf, lines: Vec<&'static str>, hang_after: Option<Duration>) {
+        tokio::spawn(async move {
+            let listener = UnixListener::bind(&path).unwrap();
+            let (mut stream, _) = listener.accept().await.unwrap();
+            // Drain the request line (the client half-closes its write side).
+            let mut byte = [0u8; 1];
+            loop {
+                match stream.read(&mut byte).await {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if byte[0] == b'\n' {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            for line in lines {
+                if stream.write_all(line.as_bytes()).await.is_err() {
+                    return;
+                }
+                let _ = stream.flush().await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            if let Some(d) = hang_after {
+                tokio::time::sleep(d).await;
+            }
+            let _ = stream.shutdown().await;
         });
     }
 
@@ -507,6 +654,130 @@ mod tests {
         assert!(
             elapsed < Duration::from_millis(50),
             "dead-flag short-circuit must not block on connect: took {elapsed:?}",
+        );
+    }
+
+    /// THE-942 — a streamed phase-1 partial is consumed transparently: the
+    /// caller still gets the final track, and the partial does not corrupt the
+    /// reply. Proves the success streaming path is backward-compatible.
+    #[tokio::test]
+    async fn streamed_partial_then_final_returns_track() {
+        let path = sock("stream-ok");
+        let _ = std::fs::remove_file(&path);
+        mock_streaming(
+            path.clone(),
+            vec![
+                "{\"ok\":true,\"partial\":true,\"video_id\":\"VID123\",\"phase\":\"search_fetch\",\"ms\":900}\n",
+                "{\"ok\":true,\"direct_url\":\"https://cdn/x.webm\",\"title\":\"Song\",\"video_id\":\"VID123\"}\n",
+            ],
+            None,
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let handle = ResolverHandle::for_socket(path.clone());
+        let track = handle
+            .resolve("ytsearch1:song", None)
+            .await
+            .expect("final reply after a partial");
+        assert_eq!(track.direct_url, "https://cdn/x.webm");
+        assert_eq!(track.video_id.as_deref(), Some("VID123"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// THE-942 acceptance — a warm-resolver timeout *after* a search streamed
+    /// its phase-1 `video_id` (the THE-931 nsig-stall mode) returns the
+    /// `video_id` in `TimedOut`, and bails on the short `phase2_timeout`
+    /// rather than holding the caller for the full `resolve_timeout`. This is
+    /// what lets `pipeline.rs` hand the subprocess a direct watch URL instead
+    /// of re-running `ytsearch1:`.
+    #[tokio::test]
+    async fn warm_timeout_after_partial_carries_video_id() {
+        let path = sock("stream-stall");
+        let _ = std::fs::remove_file(&path);
+        // Stream the partial, then hang far longer than phase2_timeout.
+        mock_streaming(
+            path.clone(),
+            vec![
+                "{\"ok\":true,\"partial\":true,\"video_id\":\"VID123\",\"phase\":\"search_fetch\",\"ms\":900}\n",
+            ],
+            Some(Duration::from_secs(3)),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // resolve_timeout deliberately generous (10 s) so a return before it
+        // proves the *phase-2* budget fired, not the overall one.
+        let handle = ResolverHandle::for_socket_with_timeouts(
+            path.clone(),
+            Duration::from_secs(10),
+            Duration::from_millis(300),
+        );
+
+        let start = Instant::now();
+        let err = handle.resolve("ytsearch1:song", None).await.unwrap_err();
+        let elapsed = start.elapsed();
+
+        match err {
+            ResolverError::TimedOut { partial_video_id } => {
+                assert_eq!(
+                    partial_video_id.as_deref(),
+                    Some("VID123"),
+                    "video_id from the phase-1 partial must survive the timeout",
+                );
+            }
+            other => panic!("expected TimedOut, got: {other:?}"),
+        }
+        // Bailed on phase2_timeout (~300 ms), nowhere near resolve_timeout (10 s).
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "phase-2 stall must bail on phase2_timeout, took {elapsed:?}",
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// THE-942 — a timeout *before* any partial (a phase-1 / search-API stall)
+    /// yields `TimedOut { None }`: we never fabricate a video_id, so the
+    /// caller correctly falls back to the original URL.
+    #[tokio::test]
+    async fn warm_timeout_before_partial_has_no_video_id() {
+        let path = sock("stall-no-partial");
+        let _ = std::fs::remove_file(&path);
+        // Accept, read the request, then hang without ever replying.
+        mock_streaming(path.clone(), vec![], Some(Duration::from_secs(3)));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let handle = ResolverHandle::for_socket_with_timeouts(
+            path.clone(),
+            Duration::from_millis(300),
+            Duration::from_millis(300),
+        );
+        let err = handle.resolve("ytsearch1:song", None).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ResolverError::TimedOut {
+                    partial_video_id: None
+                }
+            ),
+            "got: {err:?}",
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// THE-942 — guard the production budgets so a future bump can't silently
+    /// push the warm-side failure path back over the ~12 s cap. Once phase 1
+    /// streams the video_id, the warm-side failure latency is
+    /// `search_fetch + PHASE2_TIMEOUT`; `search_fetch` is typically ~1–3 s
+    /// warm (bounded by yt-dlp's 10 s socket_timeout), so PHASE2_TIMEOUT must
+    /// stay small enough that the sum lands under ~12 s.
+    #[test]
+    fn phase2_timeout_keeps_failure_path_under_cap() {
+        assert!(
+            PHASE2_TIMEOUT <= Duration::from_secs(6),
+            "PHASE2_TIMEOUT too large to keep the warm-side failure path under ~12 s",
+        );
+        assert!(
+            PHASE2_TIMEOUT < RESOLVE_TIMEOUT,
+            "phase-2 budget must be shorter than the overall budget",
         );
     }
 }
