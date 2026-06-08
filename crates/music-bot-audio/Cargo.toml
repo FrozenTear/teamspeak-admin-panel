@@ -49,3 +49,6 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 hound = "3.5"
+# THE-898 — `tokio::time::pause` / `#[tokio::test(start_paused = true)]` for
+# the ICY reconnect tests so the backoff ladder does not actually sleep.
+tokio = { workspace = true, features = ["test-util"] }
