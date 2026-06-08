@@ -408,11 +408,26 @@ async fn build_source(
                             }
                         }
                     }
-                    Err(e) => tracing::warn!(
-                        error = %e,
-                        search = is_search,
-                        "warm resolver did not resolve — falling back to yt-dlp subprocess",
-                    ),
+                    Err(e) => {
+                        // THE-942: a warm-resolver *timeout* on a search may
+                        // still have streamed the phase-1 video_id (the
+                        // THE-931 nsig-stall mode). Carry it to the subprocess
+                        // as a direct watch URL so the fallback resolves a
+                        // single video instead of re-running the ytsearch
+                        // query from scratch (worst case ~25 s + retry).
+                        if let crate::resolver::ResolverError::TimedOut {
+                            partial_video_id: Some(vid),
+                        } = &e
+                        {
+                            fallback_url = format!("https://www.youtube.com/watch?v={vid}");
+                        }
+                        tracing::warn!(
+                            error = %e,
+                            search = is_search,
+                            fallback_url = %fallback_url,
+                            "warm resolver did not resolve — falling back to yt-dlp subprocess",
+                        );
+                    }
                 }
             }
             let src = YtDlpSource::new(&fallback_url, cfg.channels, cfg.yt_cookie_file.as_deref())
