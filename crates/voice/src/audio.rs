@@ -115,15 +115,36 @@ pub(crate) struct ActiveAudio {
     /// records that attribute the residual `arm=audio` stall to candidate
     /// A / B / C. Per-play state, so it resets on every track change.
     pub send_monitor: SendTimingMonitor,
-    /// PURA-352 — the background `yt-dlp -g` resolve task, kept so `Drop`
-    /// aborts it if the track is torn down before resolution finishes.
-    /// `None` for sources that need no resolve (library / synthetic) and
-    /// for a [`seek_to`] respawn (the input is already resolved).
+    /// PURA-352 / THE-896 — the background `yt-dlp -g` resolve task, kept
+    /// so [`Drop`] can `.abort()` it if the track is torn down before
+    /// resolution finishes. The abort drops the future, which drops the
+    /// [`tokio::process::Child`] inside `resolve_direct_url`, which has
+    /// `kill_on_drop(true)` set, so the orphan `yt-dlp -g` gets SIGKILL
+    /// instead of running to its 25 s `PROCESS_TIMEOUT`. `None` for
+    /// sources that need no resolve (library / synthetic) and for a
+    /// [`seek_to`] respawn (the input is already resolved).
     _resolve: Option<JoinHandle<()>>,
-    /// Kept so `Drop` aborts the sibling on teardown. The sibling owns
-    /// the [`AudioPipeline`] (whose own `Drop` aborts the worker task),
-    /// so this single handle is enough to cancel the whole audio stack.
+    /// The paced sibling task. **Not** aborted on [`Drop`]; it self-cleans
+    /// when the [`ActiveAudio`]'s `audio_rx` is dropped above as part of
+    /// this struct, which closes the sibling's `msg_tx` and lets it return
+    /// normally — flushing the PURA-342 / PURA-408b end-of-play summaries
+    /// on the way out. Aborting it would cut those summaries off. The
+    /// sibling owns the [`AudioPipeline`], whose own `Drop` aborts the
+    /// worker task, so this single handle is enough to keep the audio
+    /// stack alive for the duration of one track.
     _sibling: JoinHandle<()>,
+}
+
+impl Drop for ActiveAudio {
+    /// THE-896 — abort the background `yt-dlp -g` resolve task so it does
+    /// not outlive the track. See [`ActiveAudio::_resolve`] for the chain
+    /// of drops that ends in the `yt-dlp` SIGKILL. `_sibling` is left to
+    /// self-clean via mpsc-close (see [`ActiveAudio::_sibling`]).
+    fn drop(&mut self) {
+        if let Some(h) = self._resolve.take() {
+            h.abort();
+        }
+    }
 }
 
 impl ActiveAudio {
@@ -1327,6 +1348,59 @@ mod tests {
         // The monitor keeps running for the mid-song regime.
         m.observe(STARTUP_WATCH_FRAMES + 1, 100, Duration::ZERO);
         assert_eq!(m.frames, STARTUP_WATCH_FRAMES + 2);
+    }
+
+    /// THE-896 regression — dropping an [`ActiveAudio`] must abort the
+    /// background `yt-dlp -g` resolve task it owns. Before the fix the
+    /// `_resolve` JoinHandle was merely detached on drop, so under
+    /// `!skip` spam each replaced track leaked one orphan `yt-dlp -g` for
+    /// up to its 25 s `PROCESS_TIMEOUT`. We observe the abort via an
+    /// `AbortHandle` snapshot taken before the drop — no need to expose
+    /// the private `_resolve` field.
+    #[tokio::test]
+    async fn drop_aborts_resolve_join_handle() {
+        let pipeline = AudioPipeline::spawn(
+            AudioSourceSpec::SyntheticTone {
+                hz: 440.0,
+                amplitude: 0.5,
+                duration_ms: Some(50),
+            },
+            PipelineConfig::default(),
+            VolumeHandle::default(),
+        )
+        .await
+        .expect("spawn synthetic pipeline");
+
+        // A stand-in for the real `yt-dlp -g` resolve task: loops well
+        // past the test's lifetime, so only an explicit abort cancels it.
+        let resolve = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        let resolve_abort = resolve.abort_handle();
+        assert!(
+            !resolve_abort.is_finished(),
+            "stub resolve task is running before drop",
+        );
+
+        let active = build_active(
+            pipeline,
+            "synthetic://test".to_string(),
+            Instant::now(),
+            0,
+            Arc::new(Mutex::new(None)),
+            Some(resolve),
+        );
+
+        drop(active);
+        // `JoinHandle::abort` is non-blocking — give the runtime one tick
+        // to propagate the cancel to the task.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert!(
+            resolve_abort.is_finished(),
+            "Drop must abort the _resolve JoinHandle (THE-896 regression)",
+        );
     }
 
     /// PURA-314 regression — the sibling task must wait for each frame's
