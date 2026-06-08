@@ -285,12 +285,12 @@ async fn handle_radio(
             // THE-927 — radio reaches yt-dlp through the same resolve path
             // as !play, so a `yt:`/`youtube:` station hits the same ~17 s
             // startup wait. Light the dashboard pill for the same reason.
-            if let Some(query) = parse_yt_search(&arg) {
-                if !query.is_empty() {
-                    let _ = events.send(BotEvent::Resolving {
-                        query: query.to_string(),
-                    });
-                }
+            if let Some(query) = parse_yt_search(&arg)
+                && !query.is_empty()
+            {
+                let _ = events.send(BotEvent::Resolving {
+                    query: query.to_string(),
+                });
             }
             // The queue head is now the radio track — the actor must tear
             // down whatever was playing and start it.
@@ -338,14 +338,13 @@ async fn handle_play(
             // `BotEvent::FirstFrameOnWire` when the first Opus frame
             // lands. Only emit on the idle path — a queued track sits
             // behind whatever is playing and doesn't drive the wait.
-            if was_empty {
-                if let Some(query) = parse_yt_search(&arg) {
-                    if !query.is_empty() {
-                        let _ = events.send(BotEvent::Resolving {
-                            query: query.to_string(),
-                        });
-                    }
-                }
+            if was_empty
+                && let Some(query) = parse_yt_search(&arg)
+                && !query.is_empty()
+            {
+                let _ = events.send(BotEvent::Resolving {
+                    query: query.to_string(),
+                });
             }
             // PURA-340 — the core fix: ask the actor to start the queue
             // head if the bot is idle. `StartIfIdle` is a no-op when a

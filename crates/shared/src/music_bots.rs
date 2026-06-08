@@ -649,7 +649,9 @@ mod tests {
             "got: {json}",
         );
         let back: BotEventWire = serde_json::from_str(&json).unwrap();
-        assert!(matches!(back, BotEventWire::Resolving { query } if query == "red leather last call"));
+        assert!(
+            matches!(back, BotEventWire::Resolving { query } if query == "red leather last call")
+        );
 
         let ev = BotEventWire::FirstFrameOnWire;
         let json = serde_json::to_string(&ev).unwrap();

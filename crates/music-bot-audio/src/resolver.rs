@@ -156,10 +156,7 @@ impl ResolverHandle {
         std::fs::write(&script_path, RESOLVER_SCRIPT)?;
         let state = Arc::new(SupervisorState::default());
         tokio::spawn(supervise(script_path, socket_path.clone(), state.clone()));
-        Ok(Self {
-            socket_path,
-            state,
-        })
+        Ok(Self { socket_path, state })
     }
 
     /// Construct a handle bound to an externally-managed socket. Test-only:
