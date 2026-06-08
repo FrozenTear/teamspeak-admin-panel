@@ -3,6 +3,8 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
+
 /// Opus voice frames are pinned to 48 kHz per RFC 7587 / TS6 §19.10.
 pub const SAMPLE_RATE_HZ: u32 = 48_000;
 
@@ -18,8 +20,11 @@ pub const fn frame_duration() -> Duration {
 /// One paced Opus frame ready for `tsclientlib`'s `OutAudio::new(AudioData::C2S {…})`.
 #[derive(Debug, Clone)]
 pub struct OpusFrame {
-    /// Raw Opus packet bytes (no TS6 voice header — WS-1 wraps it).
-    pub bytes: Vec<u8>,
+    /// Raw Opus packet bytes (no TS6 voice header — WS-1 wraps it). Backed
+    /// by a `Bytes` slice carved from the encoder's reused `BytesMut`
+    /// scratch — see [`crate::encoder::OpusFrameEncoder::encode_frame`] for
+    /// the per-frame ownership contract.
+    pub bytes: Bytes,
     /// Monotonic frame index, starting at 0.
     pub index: u64,
     /// `Instant` the frame was *intended* to play at, derived from the pipeline
