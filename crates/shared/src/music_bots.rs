@@ -174,6 +174,14 @@ pub struct MusicBotDetail {
     /// [`MusicBotSummary::last_error`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// THE-927 — the YouTube query string the bot is currently resolving.
+    /// `Some` between `BotEventWire::Resolving` and the matching
+    /// `FirstFrameOnWire` / failure event; the FE renders a transient
+    /// "Resolving YouTube…" pill while it is set. `None` outside that
+    /// window, and elided from the wire by `skip_serializing_if` so the
+    /// steady-state snapshot stays unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolving_query: Option<String>,
 }
 
 /// `POST /music-library` body. Tags default to empty.
@@ -440,6 +448,18 @@ pub enum BotEventWire {
         name: String,
     },
     LibraryChanged,
+    /// THE-927 — a chat `!play yt:<query>` (or `!radio yt:<query>`)
+    /// landed on an idle bot and the audio pipeline is now resolving the
+    /// YouTube source + filling the prebuffer (~17 s median). The FE
+    /// renders a transient "Resolving YouTube…" pill against `query`
+    /// until `FirstFrameOnWire` arrives.
+    Resolving {
+        query: String,
+    },
+    /// THE-927 — the first Opus frame for the current track was just sent
+    /// on the wire (the audible milestone). Subscribers clear any in-
+    /// flight `Resolving` pill on this event.
+    FirstFrameOnWire,
     Error {
         message: String,
     },
@@ -612,6 +632,65 @@ mod tests {
         assert!(matches!(back, BotEventWire::Progress { elapsed_secs: 42 }));
     }
 
+    /// THE-927 — the resolving pill events ride the same `type`-tagged
+    /// SSE envelope as the rest of `BotEventWire`, so a `Resolving`
+    /// emits the query verbatim and `FirstFrameOnWire` is a bare
+    /// discriminant. Locking both formats so a wire shift requires an
+    /// intentional test flip.
+    #[test]
+    fn resolving_and_first_frame_round_trip() {
+        let ev = BotEventWire::Resolving {
+            query: "red leather last call".into(),
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains(r#""type":"resolving""#), "got: {json}");
+        assert!(
+            json.contains(r#""query":"red leather last call""#),
+            "got: {json}",
+        );
+        let back: BotEventWire = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, BotEventWire::Resolving { query } if query == "red leather last call"));
+
+        let ev = BotEventWire::FirstFrameOnWire;
+        let json = serde_json::to_string(&ev).unwrap();
+        assert_eq!(json, r#"{"type":"firstFrameOnWire"}"#);
+        let back: BotEventWire = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, BotEventWire::FirstFrameOnWire));
+    }
+
+    /// THE-927 — the new `resolvingQuery` field is additive and elided
+    /// on the wire when absent so existing FE clients see no change in
+    /// the steady-state detail snapshot.
+    #[test]
+    fn music_bot_detail_resolving_query_is_camel_case_and_optional() {
+        let detail = MusicBotDetail {
+            id: BotId(1),
+            name: "DJ".into(),
+            server_addr: "127.0.0.1:9987".into(),
+            state: BotState::InChannel,
+            now_playing: None,
+            now_playing_elapsed_secs: None,
+            queue: Vec::new(),
+            channel_id: None,
+            last_error: None,
+            resolving_query: None,
+        };
+        let json = serde_json::to_string(&detail).unwrap();
+        assert!(!json.contains("resolvingQuery"), "got: {json}");
+
+        let detail = MusicBotDetail {
+            resolving_query: Some("the killers - mr brightside".into()),
+            ..detail
+        };
+        let json = serde_json::to_string(&detail).unwrap();
+        assert!(
+            json.contains(r#""resolvingQuery":"the killers - mr brightside""#),
+            "got: {json}",
+        );
+        let back: MusicBotDetail = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, detail);
+    }
+
     #[test]
     fn music_bot_detail_now_playing_elapsed_is_camel_case_and_optional() {
         // Omitted when `None` — additive, old clients see no new key.
@@ -625,6 +704,7 @@ mod tests {
             queue: Vec::new(),
             channel_id: None,
             last_error: None,
+            resolving_query: None,
         };
         let json = serde_json::to_string(&detail).unwrap();
         assert!(!json.contains("nowPlayingElapsedSecs"), "got: {json}");
