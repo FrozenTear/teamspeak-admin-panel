@@ -734,6 +734,9 @@ async fn run_wire_task(
                                 elapsed_ms = p.started_at.elapsed().as_millis() as u64,
                                 "first Opus frame sent on the wire — playback audible",
                             );
+                            // THE-927 — clear any dashboard "Resolving
+                            // YouTube…" pill the chat command lit up.
+                            let _ = events.send(BotEvent::FirstFrameOnWire);
                         }
                         // PURA-347 — once-per-second playback-progress tick,
                         // offset by the PURA-352 seek base.
@@ -1126,6 +1129,9 @@ async fn handle_audio_msg(
                         elapsed_ms = active.started_at.elapsed().as_millis() as u64,
                         "first Opus frame sent on the wire — playback audible",
                     );
+                    // THE-927 — clear any dashboard "Resolving
+                    // YouTube…" pill the chat command lit up.
+                    let _ = events.send(BotEvent::FirstFrameOnWire);
                 }
                 // PURA-347 — emit a once-per-second playback-progress
                 // tick. `frames_sent` advances only on frames actually

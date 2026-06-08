@@ -352,6 +352,22 @@ fn PlayerCard(bot_id: u64, detail: Signal<Option<wire::MusicBotDetail>>) -> Elem
     rsx! {
         div { class: "card player-card",
             div { class: "np-eyebrow", "Now playing" }
+            // THE-927 — transient "Resolving YouTube…" pill. Lives between
+            // `BotEventWire::Resolving { query }` (chat `!play yt:<query>`
+            // accepted, ~17 s yt-dlp + prebuffer wait per THE-901) and
+            // `FirstFrameOnWire` (audible frame on the wire). Sits above
+            // the now-playing row so it's visible regardless of whether a
+            // previous track still occupies the title strip.
+            if let Some(query) = d.resolving_query.as_deref() {
+                div {
+                    class: "np-resolving",
+                    role: "status",
+                    "aria-live": "polite",
+                    span { class: "np-resolving__spinner", aria_hidden: "true" }
+                    span { class: "np-resolving__label", "Resolving YouTube…" }
+                    span { class: "np-resolving__query", title: "{query}", "{query}" }
+                }
+            }
             if let Some(track) = d.now_playing.as_ref() {
                 div { class: "now-playing",
                     if progress_pct.is_none() {
@@ -1170,6 +1186,9 @@ fn apply_event(d: &mut wire::MusicBotDetail, ev: &wire::BotEventWire) {
                 d.now_playing = None;
                 d.now_playing_elapsed_secs = None;
                 d.last_error = None;
+                // THE-927 — a disconnect mid-resolve abandons the wait;
+                // drop the pill so it doesn't stick around as a ghost.
+                d.resolving_query = None;
             }
         }
         wire::BotEventWire::Connected {
@@ -1183,6 +1202,7 @@ fn apply_event(d: &mut wire::MusicBotDetail, ev: &wire::BotEventWire) {
             d.now_playing = None;
             d.now_playing_elapsed_secs = None;
             d.last_error = None;
+            d.resolving_query = None;
         }
         wire::BotEventWire::JoinedChannel { channel_id } => {
             d.channel_id = Some(*channel_id);
@@ -1233,6 +1253,12 @@ fn apply_event(d: &mut wire::MusicBotDetail, ev: &wire::BotEventWire) {
         wire::BotEventWire::AudioFinished { reason } => {
             d.now_playing = None;
             d.now_playing_elapsed_secs = None;
+            // THE-927 — a `failed:` AudioFinished means the resolve
+            // collapsed without producing audio. Clear the pill so the
+            // operator sees the error chip, not a stuck "Resolving…".
+            // A clean EOF after audible playback already cleared the pill
+            // on `FirstFrameOnWire`, but redoing it is a no-op.
+            d.resolving_query = None;
             match reason.strip_prefix("failed: ") {
                 Some(cause) => {
                     d.last_error = Some(cause.to_string());
@@ -1242,6 +1268,17 @@ fn apply_event(d: &mut wire::MusicBotDetail, ev: &wire::BotEventWire) {
                 }
                 None => d.last_error = None,
             }
+        }
+        // THE-927 — light the transient "Resolving YouTube…" pill while
+        // the audio pipeline waits on yt-dlp + prebuffer. Replaces any
+        // previous in-flight query (`!play` then `!skip` then `!play yt:`
+        // again must show the newest wait).
+        wire::BotEventWire::Resolving { query } => {
+            d.resolving_query = Some(query.clone());
+        }
+        // THE-927 — the first audible frame just shipped; clear the pill.
+        wire::BotEventWire::FirstFrameOnWire => {
+            d.resolving_query = None;
         }
         wire::BotEventWire::Error { .. }
         | wire::BotEventWire::PlaylistChanged { .. }
@@ -1264,6 +1301,7 @@ mod tests {
             queue: Vec::new(),
             channel_id: None,
             last_error: None,
+            resolving_query: None,
         }
     }
 
@@ -1378,6 +1416,77 @@ mod tests {
         apply_event(&mut d, &wire::BotEventWire::QueueEmpty);
         assert!(d.now_playing.is_none());
         assert!(d.queue.is_empty());
+    }
+
+    /// THE-927 — `Resolving` lights the pill; the matching
+    /// `FirstFrameOnWire` clears it. The reducer is event-driven so the
+    /// FE doesn't need a client-side timer.
+    #[test]
+    fn resolving_lights_pill_first_frame_clears_it() {
+        let mut d = fixture(wire::BotState::InChannel);
+        apply_event(
+            &mut d,
+            &wire::BotEventWire::Resolving {
+                query: "red leather last call".into(),
+            },
+        );
+        assert_eq!(d.resolving_query.as_deref(), Some("red leather last call"));
+        apply_event(&mut d, &wire::BotEventWire::FirstFrameOnWire);
+        assert!(d.resolving_query.is_none());
+    }
+
+    /// THE-927 — a second `Resolving` replaces the in-flight query
+    /// (operator skipped and queued a new yt: search; the pill must show
+    /// the newest wait, not the abandoned one).
+    #[test]
+    fn second_resolving_supersedes_the_first() {
+        let mut d = fixture(wire::BotState::InChannel);
+        apply_event(
+            &mut d,
+            &wire::BotEventWire::Resolving {
+                query: "first".into(),
+            },
+        );
+        apply_event(
+            &mut d,
+            &wire::BotEventWire::Resolving {
+                query: "second".into(),
+            },
+        );
+        assert_eq!(d.resolving_query.as_deref(), Some("second"));
+    }
+
+    /// THE-927 — a failed pipeline (`AudioFinished` with a `failed:`
+    /// reason) clears the pill so the operator sees the error chip
+    /// rather than a stuck "Resolving…" while a real failure is shown.
+    #[test]
+    fn failed_audio_finished_clears_resolving_pill() {
+        let mut d = fixture(wire::BotState::Playing);
+        d.resolving_query = Some("query".into());
+        apply_event(
+            &mut d,
+            &wire::BotEventWire::AudioFinished {
+                reason: "failed: yt-dlp produced 0 frames".into(),
+            },
+        );
+        assert!(d.resolving_query.is_none());
+        assert_eq!(d.last_error.as_deref(), Some("yt-dlp produced 0 frames"));
+    }
+
+    /// THE-927 — disconnect mid-resolve abandons the wait; the pill
+    /// can't pretend resolution is still in flight when the bot left.
+    #[test]
+    fn disconnect_during_resolve_drops_the_pill() {
+        let mut d = fixture(wire::BotState::InChannel);
+        d.resolving_query = Some("query".into());
+        apply_event(
+            &mut d,
+            &wire::BotEventWire::StateChanged {
+                from: wire::BotState::InChannel,
+                to: wire::BotState::Disconnected,
+            },
+        );
+        assert!(d.resolving_query.is_none());
     }
 
     #[test]

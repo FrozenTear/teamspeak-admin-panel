@@ -282,6 +282,16 @@ async fn handle_radio(
                 current: Some(stored.clone()),
             });
             let _ = events.send(BotEvent::NowPlaying(stored));
+            // THE-927 — radio reaches yt-dlp through the same resolve path
+            // as !play, so a `yt:`/`youtube:` station hits the same ~17 s
+            // startup wait. Light the dashboard pill for the same reason.
+            if let Some(query) = parse_yt_search(&arg) {
+                if !query.is_empty() {
+                    let _ = events.send(BotEvent::Resolving {
+                        query: query.to_string(),
+                    });
+                }
+            }
             // The queue head is now the radio track — the actor must tear
             // down whatever was playing and start it.
             (format!("radio: {}", label), ChatAudioAction::RestartHead)
@@ -321,6 +331,22 @@ async fn handle_play(
             } else {
                 format!("queued: {} (#{})", label, queue.len())
             };
+            // THE-927 — `!play yt:<query>` waits ~17 s on the yt-dlp
+            // resolve + pipeline prebuffer (THE-901 lever (ii)). Fire a
+            // `Resolving` event so the dashboard can light a transient
+            // status pill; the pipeline clears it with
+            // `BotEvent::FirstFrameOnWire` when the first Opus frame
+            // lands. Only emit on the idle path — a queued track sits
+            // behind whatever is playing and doesn't drive the wait.
+            if was_empty {
+                if let Some(query) = parse_yt_search(&arg) {
+                    if !query.is_empty() {
+                        let _ = events.send(BotEvent::Resolving {
+                            query: query.to_string(),
+                        });
+                    }
+                }
+            }
             // PURA-340 — the core fix: ask the actor to start the queue
             // head if the bot is idle. `StartIfIdle` is a no-op when a
             // pipeline is already running (the new track stays queued),
@@ -788,6 +814,124 @@ mod dispatch_tests {
         let (reply, action) = run(&store, ParsedCommand::Play { arg: "yt:".into() }).await;
         assert!(reply.contains("search YouTube for"), "reply was {reply:?}");
         assert_eq!(action, ChatAudioAction::None);
+    }
+
+    /// THE-927 — capture every `BotEvent` emitted by a single
+    /// `handle_command` invocation. The store is kept alive across the
+    /// scope so the broadcast subscriber drains every send before the
+    /// `events` sender drops.
+    async fn run_capture_events(
+        store: &Arc<dyn MusicBotStore>,
+        cmd: ParsedCommand,
+    ) -> (String, ChatAudioAction, Vec<BotEvent>) {
+        let (events, mut rx) = broadcast::channel(64);
+        let (reply, action) = handle_command(BotId(1), store, &events, cmd).await;
+        // Drain anything still queued — the broadcast channel buffers
+        // sends even when no receiver awaits, so a `try_recv` loop is
+        // enough; the sender has no other producers.
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        (reply, action, out)
+    }
+
+    /// THE-927 lever (ii) — `!play yt:<query>` on an idle bot must fire
+    /// `BotEvent::Resolving { query }` so the dashboard can light the
+    /// "Resolving YouTube…" pill for the ~17 s yt-dlp + prebuffer wait.
+    #[tokio::test]
+    async fn play_yt_search_on_idle_emits_resolving() {
+        let store = store();
+        let (_reply, action, events) = run_capture_events(
+            &store,
+            ParsedCommand::Play {
+                arg: "yt: red leather last call".into(),
+            },
+        )
+        .await;
+        assert_eq!(action, ChatAudioAction::StartIfIdle);
+        let queries: Vec<&str> = events
+            .iter()
+            .filter_map(|ev| match ev {
+                BotEvent::Resolving { query } => Some(query.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(queries, vec!["red leather last call"], "events={events:?}");
+    }
+
+    /// THE-927 — a queued `!play yt:` does NOT light the pill; the
+    /// in-flight wait belongs to whatever is already playing, and the
+    /// new track only starts resolving after the current head finishes.
+    #[tokio::test]
+    async fn play_yt_search_when_queue_is_busy_does_not_emit_resolving() {
+        let store = store();
+        let _ = run(
+            &store,
+            ParsedCommand::Play {
+                arg: "https://example.com/a.mp3".into(),
+            },
+        )
+        .await;
+        let (_reply, _action, events) = run_capture_events(
+            &store,
+            ParsedCommand::Play {
+                arg: "yt: queued query".into(),
+            },
+        )
+        .await;
+        assert!(
+            !events
+                .iter()
+                .any(|ev| matches!(ev, BotEvent::Resolving { .. })),
+            "events={events:?}",
+        );
+    }
+
+    /// THE-927 — a bare URL `!play` is not the resolving-pill case (the
+    /// 17 s wait quoted in THE-901 is yt-dlp specific). The chat-side
+    /// emitter only fires for the `yt:` / `youtube:` prefix.
+    #[tokio::test]
+    async fn play_url_does_not_emit_resolving() {
+        let store = store();
+        let (_reply, _action, events) = run_capture_events(
+            &store,
+            ParsedCommand::Play {
+                arg: "https://example.com/a.mp3".into(),
+            },
+        )
+        .await;
+        assert!(
+            !events
+                .iter()
+                .any(|ev| matches!(ev, BotEvent::Resolving { .. })),
+            "events={events:?}",
+        );
+    }
+
+    /// THE-927 — `!radio yt:<query>` is the same yt-dlp resolve path as
+    /// `!play`, so the pill must fire for radio stations too. !radio
+    /// always restarts the head, so the "queue is busy" guard doesn't
+    /// apply (a !radio replaces whatever was playing).
+    #[tokio::test]
+    async fn radio_yt_search_emits_resolving() {
+        let store = store();
+        let (_reply, action, events) = run_capture_events(
+            &store,
+            ParsedCommand::Radio {
+                arg: "yt: lofi beats".into(),
+            },
+        )
+        .await;
+        assert_eq!(action, ChatAudioAction::RestartHead);
+        let queries: Vec<&str> = events
+            .iter()
+            .filter_map(|ev| match ev {
+                BotEvent::Resolving { query } => Some(query.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(queries, vec!["lofi beats"], "events={events:?}");
     }
 
     /// PURA-353 — `!pause` / `!resume` must hand the connected loop a

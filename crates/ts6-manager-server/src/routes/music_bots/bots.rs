@@ -97,6 +97,10 @@ async fn detail(
         queue: queue.iter().map(track_to_wire).collect(),
         channel_id: liveness.channel_id,
         last_error: liveness.last_error.clone(),
+        // THE-927 — the resolving pill is an SSE-only animation; the cold
+        // detail snapshot never claims one is in flight. Subscribers
+        // light it from a live `BotEventWire::Resolving`.
+        resolving_query: None,
     }))
 }
 
@@ -352,6 +356,12 @@ fn wire_event(ev: &DomainBotEvent) -> Option<wire::BotEventWire> {
             name: name.0.clone(),
         },
         DomainBotEvent::LibraryChanged => wire::BotEventWire::LibraryChanged,
+        // THE-927 — surface the in-flight YouTube resolve to the FE so the
+        // 17 s wait reads as in-progress instead of broken.
+        DomainBotEvent::Resolving { query } => wire::BotEventWire::Resolving {
+            query: query.clone(),
+        },
+        DomainBotEvent::FirstFrameOnWire => wire::BotEventWire::FirstFrameOnWire,
         DomainBotEvent::Error(err) => wire::BotEventWire::Error {
             message: err.to_string(),
         },

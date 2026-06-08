@@ -2317,6 +2317,48 @@ textarea.input {
   color: var(--text-muted);
 }
 
+/* THE-927 — "Resolving YouTube…" pill. Lives between
+   `BotEventWire::Resolving` and `FirstFrameOnWire`, communicating that
+   the ~17 s yt-dlp + prebuffer wait is in flight (THE-901 lever (ii)).
+   Sized small so the now-playing strip below stays the focal point. */
+.np-resolving {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-full);
+  background: var(--bg-surface-raised, var(--border-subtle));
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  max-width: 100%;
+}
+.np-resolving__spinner {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 2px solid var(--border-subtle);
+  border-top-color: var(--accent-fg);
+  animation: np-resolving-spin 800ms linear infinite;
+  flex: 0 0 auto;
+}
+.np-resolving__label {
+  color: var(--text-primary);
+  font-weight: var(--weight-semibold);
+}
+.np-resolving__query {
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+@keyframes np-resolving-spin {
+  to { transform: rotate(360deg); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .np-resolving__spinner { animation: none; }
+}
+
 /* 3-bar equalizer — a truthful playing/paused signal. `elapsedSecs`
    is not on the wire yet, so a real progress bar would have to lie;
    the equalizer animates only while Playing and is static otherwise. */

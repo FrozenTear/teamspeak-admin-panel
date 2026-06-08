@@ -82,6 +82,19 @@ pub enum BotEvent {
     /// PURA-121 WS-3 — the library was mutated. Coarse-grained because
     /// most consumers refetch the whole list on change.
     LibraryChanged,
+    /// THE-927 — a chat `!play yt:<query>` (or `!radio yt:<query>`) was
+    /// accepted and the bot is now waiting on the YouTube resolve +
+    /// pipeline startup (median 17 s per THE-901). The dashboard renders a
+    /// transient "Resolving YouTube…" pill from this event so the wait
+    /// reads as in-flight instead of broken. Cleared by
+    /// [`BotEvent::FirstFrameOnWire`] when audible playback starts, or by
+    /// [`BotEvent::AudioFinished`] / [`BotEvent::Error`] on failure.
+    Resolving { query: String },
+    /// THE-927 — first Opus frame for the current track was just sent on
+    /// the wire (the same milestone the `music_bot_latency`
+    /// `first_frame_on_wire` log records). Clears any in-flight
+    /// `Resolving` pill on subscribers.
+    FirstFrameOnWire,
     /// Recoverable error during dispatch — illegal command for current
     /// state, transient send failure, audio-not-implemented stub, etc.
     Error(BotError),

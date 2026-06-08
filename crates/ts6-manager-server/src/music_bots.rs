@@ -199,7 +199,13 @@ impl LivenessTracker {
                     .map(|cause| cause.to_string());
             }
             // The remaining variants don't contribute to the snapshot.
-            BotEvent::PlaylistChanged(_) | BotEvent::LibraryChanged | BotEvent::Error(_) => {}
+            // THE-927 — `Resolving` / `FirstFrameOnWire` are SSE-only
+            // animation hints, not part of the persistent liveness state.
+            BotEvent::PlaylistChanged(_)
+            | BotEvent::LibraryChanged
+            | BotEvent::Resolving { .. }
+            | BotEvent::FirstFrameOnWire
+            | BotEvent::Error(_) => {}
         }
     }
 }
