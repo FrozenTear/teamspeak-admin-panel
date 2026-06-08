@@ -30,7 +30,8 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -122,11 +123,23 @@ struct WireResponse {
     video_id: Option<String>,
 }
 
+/// State shared between [`ResolverHandle`] and its background supervisor.
+///
+/// The `dead` flag is set by the supervisor right before it gives up (after
+/// [`MAX_FAST_FAILS`] fast crashes). Once set, the handle's [`round_trip`]
+/// short-circuits to [`ResolverError::Unavailable`] without paying the
+/// [`CONNECT_TIMEOUT`] tax on every subsequent `!play`.
+#[derive(Debug, Default)]
+struct SupervisorState {
+    dead: AtomicBool,
+}
+
 /// Handle to the supervised resolver process. Cheap to clone the reference;
 /// a process-global instance is shared via [`shared`].
 #[derive(Debug)]
 pub struct ResolverHandle {
     socket_path: PathBuf,
+    state: Arc<SupervisorState>,
 }
 
 impl ResolverHandle {
@@ -141,15 +154,30 @@ impl ResolverHandle {
         let script_path = dir.join(format!("ts6-yt-resolver-{pid}.py"));
         let socket_path = dir.join(format!("ts6-yt-resolver-{pid}.sock"));
         std::fs::write(&script_path, RESOLVER_SCRIPT)?;
-        tokio::spawn(supervise(script_path, socket_path.clone()));
-        Ok(Self { socket_path })
+        let state = Arc::new(SupervisorState::default());
+        tokio::spawn(supervise(script_path, socket_path.clone(), state.clone()));
+        Ok(Self {
+            socket_path,
+            state,
+        })
     }
 
     /// Construct a handle bound to an externally-managed socket. Test-only:
     /// lets a unit test point the client at an in-process mock server.
     #[cfg(test)]
     fn for_socket(socket_path: PathBuf) -> Self {
-        Self { socket_path }
+        Self {
+            socket_path,
+            state: Arc::new(SupervisorState::default()),
+        }
+    }
+
+    /// Construct a handle with an explicit supervisor state. Test-only seam
+    /// for verifying that a `dead` flag short-circuits `resolve()` without
+    /// touching the socket.
+    #[cfg(test)]
+    fn for_socket_with_state(socket_path: PathBuf, state: Arc<SupervisorState>) -> Self {
+        Self { socket_path, state }
     }
 
     /// Resolve `url` to a direct `bestaudio` media URL via the warm process.
@@ -201,6 +229,14 @@ impl ResolverHandle {
     /// server reads a single newline-terminated JSON line then writes one
     /// reply and closes, so the protocol needs no length framing.
     async fn round_trip(&self, req: &serde_json::Value) -> Result<WireResponse, ResolverError> {
+        // Supervisor gave up — no server is bound, so connecting would just
+        // burn `CONNECT_TIMEOUT` per call. Fail fast straight to subprocess.
+        if self.state.dead.load(Ordering::Acquire) {
+            return Err(ResolverError::Unavailable(
+                "supervisor gave up; subprocess fallback".into(),
+            ));
+        }
+
         let mut line =
             serde_json::to_vec(req).map_err(|e| ResolverError::Protocol(e.to_string()))?;
         line.push(b'\n');
@@ -237,7 +273,7 @@ impl ResolverHandle {
 /// them it gives up so a structurally-broken resolver (no `python3`, no
 /// importable `yt_dlp`) cannot spin-loop — the subprocess fallback carries
 /// playback in that case.
-async fn supervise(script: PathBuf, socket: PathBuf) {
+async fn supervise(script: PathBuf, socket: PathBuf, state: Arc<SupervisorState>) {
     /// Crashes faster than this count against the resolver's fast-fail tally.
     const FAST_FAIL_WINDOW: Duration = Duration::from_secs(5);
     /// Consecutive fast crashes tolerated before the supervisor gives up.
@@ -270,6 +306,7 @@ async fn supervise(script: PathBuf, socket: PathBuf) {
                         "yt-resolver: python3 unspawnable {MAX_FAST_FAILS}x — giving up; \
                          yt-dlp subprocess fallback stays in effect",
                     );
+                    state.dead.store(true, Ordering::Release);
                     break;
                 }
                 tokio::time::sleep(FAST_FAIL_WINDOW).await;
@@ -304,6 +341,7 @@ async fn supervise(script: PathBuf, socket: PathBuf) {
                      yt-dlp subprocess fallback stays in effect",
                     FAST_FAIL_WINDOW.as_secs(),
                 );
+                state.dead.store(true, Ordering::Release);
                 break;
             }
         } else {
@@ -444,5 +482,31 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ResolverError::Unavailable(_)), "got: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn dead_supervisor_short_circuits_without_connecting() {
+        // After the supervisor gives up, the handle still exists in
+        // RESOLVER. The dead flag must short-circuit `resolve` synchronously
+        // instead of paying CONNECT_TIMEOUT on every !play.
+        let state = Arc::new(SupervisorState::default());
+        state.dead.store(true, Ordering::Release);
+        // Point at a path no listener will ever bind to — proves we never
+        // actually attempt a connect.
+        let handle = ResolverHandle::for_socket_with_state(sock("dead"), state);
+
+        let start = Instant::now();
+        let err = handle
+            .resolve("https://youtu.be/x", None)
+            .await
+            .unwrap_err();
+        let elapsed = start.elapsed();
+
+        assert!(matches!(err, ResolverError::Unavailable(_)), "got: {err:?}");
+        // CONNECT_TIMEOUT is 2 s; the short-circuit should fire instantly.
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "dead-flag short-circuit must not block on connect: took {elapsed:?}",
+        );
     }
 }
