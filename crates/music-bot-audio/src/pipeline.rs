@@ -357,6 +357,12 @@ async fn build_source(
             // Every failure path below degrades to the proven `yt-dlp`
             // subprocess — a broken resolver slows `!play` but never breaks
             // it.
+            // THE-932: when the warm resolver returns a video_id (always for
+            // searches after two-phase instrumentation), prefer that direct
+            // watch URL for the subprocess fallback. This avoids re-running
+            // the expensive ytsearch query from scratch when the warm resolver
+            // fails or when ffmpeg rejects the resolved URL.
+            let mut fallback_url = url.clone();
             if let Some(resolver) = crate::resolver::shared() {
                 let t0 = Instant::now();
                 // PURA-368 — a `ytsearch<N>:` URL is a `!play yt:` search
@@ -365,6 +371,17 @@ async fn build_source(
                 let is_search = url.starts_with("ytsearch");
                 match resolver.resolve(&url, cfg.yt_cookie_file.as_deref()).await {
                     Ok(track) => {
+                        // THE-932: emit per-phase timing alongside the total.
+                        for phase in &track.phases {
+                            tracing::info!(
+                                target: "music_bot_latency",
+                                stage = "resolver_phase",
+                                phase = %phase.name,
+                                phase_ms = phase.ms,
+                                search = is_search,
+                                "yt-dlp resolver phase",
+                            );
+                        }
                         tracing::info!(
                             target: "music_bot_latency",
                             stage = "resolver_resolved",
@@ -376,11 +393,18 @@ async fn build_source(
                         match FfmpegSource::from_input(&track.direct_url, cfg.channels, None).await
                         {
                             Ok(src) => return Ok(Box::new(src)),
-                            Err(e) => tracing::warn!(
-                                error = %e,
-                                "ffmpeg rejected resolver direct URL — \
-                                 falling back to yt-dlp subprocess",
-                            ),
+                            Err(e) => {
+                                // Preserve the video_id for the subprocess fallback even
+                                // when ffmpeg rejects the direct URL.
+                                if let Some(vid) = &track.video_id {
+                                    fallback_url = format!("https://www.youtube.com/watch?v={vid}");
+                                }
+                                tracing::warn!(
+                                    error = %e,
+                                    "ffmpeg rejected resolver direct URL — \
+                                     falling back to yt-dlp subprocess",
+                                );
+                            }
                         }
                     }
                     Err(e) => tracing::warn!(
@@ -390,7 +414,7 @@ async fn build_source(
                     ),
                 }
             }
-            let src = YtDlpSource::new(&url, cfg.channels, cfg.yt_cookie_file.as_deref())
+            let src = YtDlpSource::new(&fallback_url, cfg.channels, cfg.yt_cookie_file.as_deref())
                 .await
                 .map_err(|e| PipelineError::Source(format!("yt-dlp spawn: {e}")))?;
             Ok(Box::new(src))

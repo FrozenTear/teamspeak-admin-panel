@@ -47,10 +47,15 @@ const RESOLVER_SCRIPT: &str = include_str!("yt_resolver.py");
 /// short timeout keeps a dead resolver from stalling `!play`.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Overall budget for a resolve round-trip. yt-dlp resolution is ~5–7 s
-/// (PURA-355); this leaves generous headroom for the rare slow watch-page
-/// fetch before the caller gives up and falls back to the subprocess.
-const RESOLVE_TIMEOUT: Duration = Duration::from_secs(40);
+/// Overall budget for a resolve round-trip.
+///
+/// THE-932: lowered from 40 s to 15 s. Each TCP socket inside yt-dlp is
+/// already bounded by `socket_timeout=10` s, so a single network phase
+/// cannot exceed 10 s. The total budget of 15 s covers the nsig-solve phase
+/// (~1–2 s warm) plus the socket timeout with a small margin, while cutting
+/// the worst-case failure-path delay from 40 s to 15 s before the subprocess
+/// fallback fires.
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// A resolved track — the warm resolver's answer for one URL.
 #[derive(Debug, Clone)]
@@ -61,6 +66,14 @@ pub struct ResolvedTrack {
     pub title: Option<String>,
     /// Duration in seconds, when known.
     pub duration: Option<f64>,
+    /// Per-phase timing from the Python resolver (THE-932). May be empty for
+    /// older resolver versions or when timing is unavailable.
+    pub phases: Vec<ResolvePhase>,
+    /// YouTube video ID, when the resolver can identify it. Present for both
+    /// direct watch URLs and search results after THE-932. The subprocess
+    /// fallback uses this to resolve the direct URL rather than re-running the
+    /// original search query.
+    pub video_id: Option<String>,
 }
 
 /// Why a resolve attempt did not yield a [`ResolvedTrack`]. Every variant is
@@ -78,6 +91,13 @@ pub enum ResolverError {
     Protocol(String),
 }
 
+/// One timing phase emitted by the Python resolver (THE-932).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResolvePhase {
+    pub name: String,
+    pub ms: u64,
+}
+
 /// Wire response shape — see the protocol docs in `yt_resolver.py`.
 #[derive(Debug, Deserialize)]
 struct WireResponse {
@@ -92,6 +112,14 @@ struct WireResponse {
     duration: Option<f64>,
     #[serde(default)]
     yt_dlp_version: Option<String>,
+    /// Per-phase timing from the Python resolver (THE-932).
+    #[serde(default)]
+    phases: Vec<ResolvePhase>,
+    /// YouTube video ID — present when the resolver can identify it.
+    /// Passed back to the caller so a subprocess fallback can resolve the
+    /// direct watch URL instead of re-running a search query.
+    #[serde(default)]
+    video_id: Option<String>,
 }
 
 /// Handle to the supervised resolver process. Cheap to clone the reference;
@@ -151,6 +179,8 @@ impl ResolverHandle {
             direct_url,
             title: resp.title,
             duration: resp.duration,
+            phases: resp.phases,
+            video_id: resp.video_id,
         })
     }
 

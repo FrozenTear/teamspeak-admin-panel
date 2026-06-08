@@ -31,6 +31,7 @@ import json
 import os
 import socketserver
 import sys
+import time
 
 
 def _load_yt_dlp():
@@ -190,8 +191,31 @@ def resolve(url, cookie_file):
     (including YouTube's nsig/signature challenge) without the download.
     Handles both a direct watch URL and a search/playlist result — see
     [`_extract_track`].
+
+    THE-932 — per-phase timing instrumentation.
+
+    For a ``ytsearch<N>:`` search URL the resolution splits into two phases so
+    each can be measured and attributed separately:
+
+    1. **search_fetch** — ``extract_flat`` call: asks the YouTube search API
+       for the top result and returns a flat entry dict (id + title only).
+       No nsig challenge, no format selection. Typical cost: the YouTube
+       search-API round-trip (~1–3 s on a warm prod host).
+
+    2. **nsig_solve** — second ``extract_info`` call on the concrete watch URL
+       (``https://www.youtube.com/watch?v=<id>``). This is where yt-dlp runs
+       the deno JS challenge and picks the best audio format. Typical cost on a
+       warm preprocessed-player cache: ~1.1 s (PURA-360).
+
+    For a direct watch URL both phases collapse into a single **direct_resolve**
+    measurement.
+
+    The resolved ``video_id`` is included in the response so the Rust
+    supervisor can hand it to the ``yt-dlp`` subprocess fallback as a direct
+    URL instead of re-running the search query from scratch — cutting the
+    worst-case fallback from ~25 s down to the single-video resolve floor.
     """
-    opts = {
+    base_opts = {
         "format": "bestaudio",
         "quiet": True,
         "no_warnings": True,
@@ -201,18 +225,64 @@ def resolve(url, cookie_file):
         # watch page, player JS, …). Parity with the subprocess fallback's
         # `--socket-timeout 10` (`source/url.rs` SOCKET_TIMEOUT_SECS): without
         # it a stalled YouTube search-API socket held the warm resolver for up
-        # to RESOLVE_TIMEOUT (40 s) before failing. yt-dlp installs no socket
+        # to RESOLVE_TIMEOUT before failing. yt-dlp installs no socket
         # timeout by default, so a dead-slow read otherwise blocks until the OS
         # gives up.
         "socket_timeout": 10,
     }
     if cookie_file:
-        opts["cookiefile"] = cookie_file
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.sanitize_info(ydl.extract_info(url, download=False))
+        base_opts["cookiefile"] = cookie_file
+
+    is_search = url.startswith("ytsearch")
+
+    if is_search:
+        # --- Phase 1: search_fetch ---
+        # Use extract_flat to ask YouTube for the top search result without
+        # running the nsig/format-selection machinery. This isolates the
+        # search-API network cost from the JS-challenge cost.
+        flat_opts = dict(base_opts)
+        flat_opts["extract_flat"] = True
+        flat_opts["noplaylist"] = False  # allow the search-result "playlist"
+
+        t0 = time.monotonic()
+        with yt_dlp.YoutubeDL(flat_opts) as ydl:
+            flat_info = ydl.extract_info(url, download=False)
+        search_ms = int((time.monotonic() - t0) * 1000)
+
+        # Pull the first entry's video ID.
+        entries = (flat_info or {}).get("entries") or []
+        video_id = entries[0].get("id") if entries else None
+        if not video_id:
+            raise RuntimeError("ytsearch returned no entries")
+
+        # --- Phase 2: nsig_solve ---
+        watch_url = "https://www.youtube.com/watch?v=%s" % video_id
+        t1 = time.monotonic()
+        with yt_dlp.YoutubeDL(base_opts) as ydl:
+            info = ydl.sanitize_info(ydl.extract_info(watch_url, download=False))
+        nsig_ms = int((time.monotonic() - t1) * 1000)
+
+        phases = [
+            {"name": "search_fetch", "ms": search_ms},
+            {"name": "nsig_solve", "ms": nsig_ms},
+        ]
+    else:
+        video_id = None
+        t0 = time.monotonic()
+        with yt_dlp.YoutubeDL(base_opts) as ydl:
+            info = ydl.sanitize_info(ydl.extract_info(url, download=False))
+        direct_ms = int((time.monotonic() - t0) * 1000)
+        # Try to capture the video ID from the resolved info for cache/fallback use.
+        if info:
+            video_id = info.get("id")
+        phases = [{"name": "direct_resolve", "ms": direct_ms}]
+
     track = _extract_track(info)
     if track is None:
         raise RuntimeError("yt-dlp returned no direct media URL")
+    track["phases"] = phases
+    if video_id:
+        track["video_id"] = video_id
     return track
 
 
