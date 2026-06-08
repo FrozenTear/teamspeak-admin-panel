@@ -20,6 +20,7 @@ pub mod resolver;
 pub mod source;
 pub mod types;
 pub mod volume;
+pub mod yt_search;
 
 pub use pipeline::AudioPipeline;
 pub use types::{

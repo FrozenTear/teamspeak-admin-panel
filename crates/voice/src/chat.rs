@@ -35,6 +35,8 @@ use tracing::{debug, warn};
 use tsclientlib::prelude::*;
 use tsclientlib::{Connection, MessageTarget};
 
+use music_bot_audio::yt_search::search_youtube_api;
+
 use crate::command::AudioSource;
 use crate::config::BotId;
 use crate::event::BotEvent;
@@ -445,7 +447,9 @@ async fn handle_np(bot_id: BotId, store: &Arc<dyn MusicBotStore>) -> String {
 /// Turn an arg into a `NewTrack`. Resolution order:
 ///  1. A bare `http(s)://` link passes straight through to yt-dlp.
 ///  2. A `yt:`/`youtube:` prefix is a YouTube search — the rest of the arg
-///     is the query, resolved via yt-dlp's `ytsearch1:` (PURA-353).
+///     is the query. When `YOUTUBE_API_KEY` is set the search is resolved
+///     via the YouTube Data API v3 (~300 ms; THE-933). Without it, falls
+///     back to yt-dlp's `ytsearch1:` (PURA-353, 15–30 s from DC IPs).
 ///  3. Anything else is looked up against the bot's library by exact
 ///     title (case-insensitive).
 async fn resolve_source(
@@ -469,12 +473,26 @@ async fn resolve_source(
                 "what should I search YouTube for? e.g. !play yt: artist - song".to_string(),
             );
         }
-        // yt-dlp treats `ytsearch1:<query>` as a one-result YouTube search
-        // and streams the top hit, so it flows through the same URL path
-        // as a real link — no pipeline change needed.
+        // THE-933: prefer YouTube Data API v3 when `YOUTUBE_API_KEY` is set —
+        // resolves to a direct watch URL in ~300 ms instead of the 15–30 s
+        // organic ytsearch1: path that datacenter IPs incur.
+        let url = if let Ok(api_key) = std::env::var("YOUTUBE_API_KEY") {
+            match search_youtube_api(query, &api_key).await {
+                Ok(watch_url) => watch_url,
+                Err(err) => {
+                    // API failed — fall back to yt-dlp organic search so the
+                    // bot remains functional at the cost of higher latency.
+                    warn!(?err, "YouTube Data API search failed, falling back to ytsearch1:");
+                    format!("ytsearch1:{query}")
+                }
+            }
+        } else {
+            // No API key — unchanged behaviour (PURA-353).
+            format!("ytsearch1:{query}")
+        };
         Ok((
             NewTrack {
-                source: AudioSource::Url(format!("ytsearch1:{query}")),
+                source: AudioSource::Url(url),
                 title: query.to_string(),
                 duration_secs: None,
                 requested_by: None,
