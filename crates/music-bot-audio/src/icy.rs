@@ -106,15 +106,24 @@ impl IcyStreamSplitter {
     }
 }
 
+/// Decode an ICY metadata byte slice as text. Modern Icecast emits UTF-8;
+/// older Shoutcast/Icecast servers emit Latin-1 (ISO-8859-1). Try UTF-8
+/// strictly first; on failure, map each byte 1:1 onto its Unicode codepoint
+/// (ISO-8859-1's identity mapping onto U+0000..=U+00FF). This recovers
+/// accented characters that `from_utf8_lossy` would replace with U+FFFD.
+fn decode_icy_string(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => bytes.iter().map(|&b| b as char).collect(),
+    }
+}
+
 /// Extract the `StreamTitle='…';` value from an ICY metadata block. Returns
 /// `None` if no `StreamTitle` is present (some stations also send `StreamUrl`,
 /// which we ignore).
 pub fn parse_stream_title(bytes: &[u8]) -> Option<String> {
-    // Trailing zero-padding is conventional. Treat the body as best-effort
-    // UTF-8; ICY traditionally encodes Latin-1 but most modern Icecast
-    // servers send UTF-8. We accept either and replace invalid bytes.
     let trimmed: Vec<u8> = bytes.iter().copied().take_while(|&b| b != 0).collect();
-    let text = String::from_utf8_lossy(&trimmed);
+    let text = decode_icy_string(&trimmed);
     let needle = "StreamTitle='";
     let start = text.find(needle)? + needle.len();
     let rest = &text[start..];
@@ -135,6 +144,23 @@ mod tests {
     #[test]
     fn parse_title_missing() {
         assert_eq!(parse_stream_title(b"\0\0"), None);
+    }
+
+    #[test]
+    fn parse_title_latin1_accented() {
+        let raw = b"StreamTitle='Caf\xe9 del Mar';\0\0";
+        assert_eq!(
+            parse_stream_title(raw).as_deref(),
+            Some("Café del Mar"),
+        );
+    }
+
+    #[test]
+    fn parse_title_utf8_accented() {
+        let raw = b"StreamTitle='Caf\xc3\xa9 del Mar';\0\0";
+        let got = parse_stream_title(raw).unwrap();
+        assert_eq!(got, "Café del Mar");
+        assert_eq!(got.chars().count(), 12);
     }
 
     #[test]
