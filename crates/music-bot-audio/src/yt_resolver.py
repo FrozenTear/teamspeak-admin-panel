@@ -197,6 +197,14 @@ def resolve(url, cookie_file):
         "no_warnings": True,
         "noplaylist": True,
         "skip_download": True,
+        # THE-931 — bound every outbound socket read (search-API fetch,
+        # watch page, player JS, …). Parity with the subprocess fallback's
+        # `--socket-timeout 10` (`source/url.rs` SOCKET_TIMEOUT_SECS): without
+        # it a stalled YouTube search-API socket held the warm resolver for up
+        # to RESOLVE_TIMEOUT (40 s) before failing. yt-dlp installs no socket
+        # timeout by default, so a dead-slow read otherwise blocks until the OS
+        # gives up.
+        "socket_timeout": 10,
     }
     if cookie_file:
         opts["cookiefile"] = cookie_file
