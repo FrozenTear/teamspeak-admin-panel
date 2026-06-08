@@ -15,7 +15,8 @@ script and the binary that supervises it never drift.
 PURA-360 additionally turns on yt-dlp's per-player-revision preprocessed-player
 cache (``_enable_preprocessed_player_cache`` below) so the expensive YouTube
 ``base.js`` parse is paid once per player revision rather than once per
-``!play``.
+``!play``. THE-943 then pays that once-per-revision parse at *boot*
+(``_prewarm`` below) so the first real ``!play`` is already warm.
 
 Protocol — one JSON request per connection, one JSON response, newline
 terminated, connection then closed by the server:
@@ -35,6 +36,7 @@ import json
 import os
 import socketserver
 import sys
+import threading
 import time
 
 
@@ -315,6 +317,57 @@ def resolve(url, cookie_file, send_partial=None):
     return track
 
 
+# THE-943 — yt-dlp's canonical test video ("youtube-dl test video"), used in
+# yt-dlp's own test suite and stable for years. Any video warms the
+# *preprocessed-player cache* (PURA-360), which is keyed by player `base.js`
+# revision and therefore shared across every later resolve — the prewarm video
+# itself does not matter beyond existing. Override with YT_RESOLVER_PREWARM_URL.
+PREWARM_URL = "https://www.youtube.com/watch?v=BaW_jenozKc"
+
+
+def _prewarm():
+    """THE-943 — pay the cold preprocessed-player parse at boot, not on the
+    user's first ``!play``.
+
+    The first resolve after boot is cold: deno parses the ~2.7 MB ``base.js``
+    before the nsig/signature solve (PURA-360 measured ~2.4 s on a cold cache,
+    ~1.1 s warm). Resolving one throwaway video at startup populates the
+    per-player-revision preprocessed-player cache, so the first *real* ``!play``
+    already hits the warm path.
+
+    Runs on a background thread so the socket server is accepting connections
+    immediately — a ``!play`` that races the prewarm simply resolves cold, as
+    it would have anyway. ``YT_RESOLVER_PREWARM_DISABLE`` skips it (and the
+    boot network call), ``YT_RESOLVER_PREWARM_URL`` overrides the target.
+    """
+    if os.environ.get("YT_RESOLVER_PREWARM_DISABLE"):
+        print(
+            "yt-resolver: boot prewarm disabled (YT_RESOLVER_PREWARM_DISABLE)",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+    url = os.environ.get("YT_RESOLVER_PREWARM_URL", PREWARM_URL)
+    t0 = time.monotonic()
+    try:
+        resolve(url, None)
+        ms = int((time.monotonic() - t0) * 1000)
+        print(
+            "yt-resolver: boot prewarm resolved %s in %d ms — "
+            "preprocessed-player cache warm (THE-943)" % (url, ms),
+            file=sys.stderr,
+            flush=True,
+        )
+    except Exception as exc:  # noqa: BLE001 — prewarm is best-effort
+        ms = int((time.monotonic() - t0) * 1000)
+        print(
+            "yt-resolver: boot prewarm failed after %d ms (%s) — "
+            "first !play will be cold" % (ms, exc),
+            file=sys.stderr,
+            flush=True,
+        )
+
+
 def dispatch(payload, send_partial=None):
     op = payload.get("op", "resolve")
     if op == "ping":
@@ -376,6 +429,9 @@ def main():
         file=sys.stderr,
         flush=True,
     )
+    # THE-943 — warm the preprocessed-player cache off the critical path. The
+    # server is already bound, so this never delays accepting connections.
+    threading.Thread(target=_prewarm, name="prewarm", daemon=True).start()
     server.serve_forever()
 
 

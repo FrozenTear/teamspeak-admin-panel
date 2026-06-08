@@ -26,13 +26,23 @@
 //! restarts the whole manager, so the resolver re-imports the upgraded
 //! yt-dlp zipapp on the next boot for free.
 //!
+//! **URL cache (THE-943).** A repeat `!play` of the same video used to re-pay
+//! the full `search_fetch` + `nsig_solve` (~several seconds) every time. The
+//! handle now keeps a bounded, TTL'd [`UrlCache`] of resolved direct URLs keyed
+//! by `video_id`: a hit returns the cached track without any round-trip — even
+//! if the resolver supervisor has given up — and the TTL tracks the signed
+//! URL's own `expire`, so an expired URL is re-resolved rather than handed to
+//! `ffmpeg`. `YT_RESOLVER_URL_CACHE_DISABLE` pins playback back to a full
+//! resolve on every `!play`.
+//!
 //! [PURA-355]: https://teamspeak-heaven/PURA/issues/PURA-355
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -75,6 +85,27 @@ const RESOLVE_TIMEOUT: Duration = Duration::from_secs(15);
 /// `search_fetch (~1–3 s) + 6 s ≈ 9 s`, under the ~12 s cap THE-942 targets and
 /// well below the pre-fix `15 s + subprocess re-search` tail.
 const PHASE2_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// THE-943 — bound on the per-`video_id` resolved-URL cache. Each entry holds
+/// one [`ResolvedTrack`]; a handful of hundred is plenty for a single bot's
+/// working set and keeps the cache's memory trivially small.
+const URL_CACHE_CAPACITY: usize = 256;
+
+/// THE-943 — how early before a signed URL's own `expire` we stop serving it
+/// from cache. YouTube `googlevideo` URLs carry an `expire=<unix_ts>` that
+/// `ffmpeg` will reject once past; we re-resolve a minute early so a cache hit
+/// never hands `ffmpeg` a URL that dies as it opens the stream.
+const URL_CACHE_SAFETY_MARGIN: Duration = Duration::from_secs(60);
+
+/// THE-943 — fallback TTL when a resolved URL carries no parseable `expire`
+/// (non-YouTube CDN, or a future URL shape). Conservatively short so we never
+/// pin a stale URL for long when we cannot read its real lifetime.
+const URL_CACHE_DEFAULT_TTL: Duration = Duration::from_secs(300);
+
+/// THE-943 — hard ceiling on a cached entry's lifetime, regardless of how far
+/// in the future the signed URL claims to expire. Caps clock-skew / malformed
+/// `expire` blowups.
+const URL_CACHE_MAX_TTL: Duration = Duration::from_secs(6 * 3600);
 
 /// A resolved track — the warm resolver's answer for one URL.
 #[derive(Debug, Clone)]
@@ -155,6 +186,155 @@ struct WireResponse {
     video_id: Option<String>,
 }
 
+/// THE-943 — one entry in the resolved-URL cache: a fully-resolved track plus
+/// the instant past which its direct URL must not be served.
+#[derive(Debug, Clone)]
+struct CacheEntry {
+    track: ResolvedTrack,
+    expires_at: Instant,
+}
+
+/// THE-943 — bounded, TTL'd cache of resolved direct URLs keyed by YouTube
+/// `video_id`.
+///
+/// A repeat `!play` of the same video skips the warm resolver's
+/// `search_fetch` + `nsig_solve` entirely: the cached direct URL goes straight
+/// to `ffmpeg`. The cache survives even a dead resolver supervisor, so a
+/// cached track plays instantly while the subprocess fallback covers misses.
+///
+/// Entries are only kept while their signed URL is still valid
+/// ([`signed_url_ttl`]); an expired entry is dropped on read so `ffmpeg` is
+/// never handed a stale URL. The map is bounded at [`URL_CACHE_CAPACITY`];
+/// when full it evicts expired entries first, then the soonest-to-expire.
+#[derive(Debug, Default)]
+struct UrlCache {
+    entries: Mutex<HashMap<String, CacheEntry>>,
+}
+
+impl UrlCache {
+    /// Return the cached track for `key` if present and not past its TTL.
+    /// An expired entry is removed in passing so it cannot be served and does
+    /// not occupy a slot.
+    fn get_fresh(&self, key: &str) -> Option<ResolvedTrack> {
+        let mut map = self.entries.lock().unwrap();
+        match map.get(key) {
+            Some(entry) if entry.expires_at > Instant::now() => Some(entry.track.clone()),
+            Some(_) => {
+                map.remove(key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Insert `track` under `key` with a lifetime of `ttl`, evicting to stay
+    /// within [`URL_CACHE_CAPACITY`].
+    fn insert(&self, key: String, track: ResolvedTrack, ttl: Duration) {
+        let mut map = self.entries.lock().unwrap();
+        if !map.contains_key(&key) && map.len() >= URL_CACHE_CAPACITY {
+            let now = Instant::now();
+            let expired: Vec<String> = map
+                .iter()
+                .filter(|(_, e)| e.expires_at <= now)
+                .map(|(k, _)| k.clone())
+                .collect();
+            if expired.is_empty() {
+                // Nothing expired — evict the entry closest to expiring, the
+                // one least useful to keep.
+                if let Some(soonest) = map
+                    .iter()
+                    .min_by_key(|(_, e)| e.expires_at)
+                    .map(|(k, _)| k.clone())
+                {
+                    map.remove(&soonest);
+                }
+            } else {
+                for k in expired {
+                    map.remove(&k);
+                }
+            }
+        }
+        map.insert(
+            key,
+            CacheEntry {
+                track,
+                expires_at: Instant::now() + ttl,
+            },
+        );
+    }
+}
+
+/// THE-943 — extract a YouTube `video_id` from a request URL, when one is
+/// directly present. Covers the `!play <url>` shapes (`watch?v=`,
+/// `youtu.be/`, `/shorts/`, `/embed/`); a bare `ytsearch…:` query carries no
+/// id (the id is only known after resolution) and yields `None`. Lets a repeat
+/// direct `!play` look up the cache before paying any round-trip.
+fn input_video_id(url: &str) -> Option<String> {
+    let token_after = |hay: &str, marker: &str| -> Option<String> {
+        let start = hay.find(marker)? + marker.len();
+        let rest = &hay[start..];
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+            .unwrap_or(rest.len());
+        let id = &rest[..end];
+        // YouTube ids are 11 chars; require a plausible, non-empty token.
+        (!id.is_empty() && id.len() <= 16).then(|| id.to_string())
+    };
+    token_after(url, "watch?v=")
+        .or_else(|| token_after(url, "&v="))
+        .or_else(|| token_after(url, "youtu.be/"))
+        .or_else(|| token_after(url, "/shorts/"))
+        .or_else(|| token_after(url, "/embed/"))
+}
+
+/// THE-943 — parse the `expire=<unix_ts>` (query) or `/expire/<unix_ts>/`
+/// (path) marker out of a resolved `googlevideo` URL.
+fn parse_expire_ts(url: &str) -> Option<u64> {
+    for marker in ["expire=", "/expire/"] {
+        if let Some(start) = url.find(marker) {
+            let rest = &url[start + marker.len()..];
+            let end = rest
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(rest.len());
+            if end > 0
+                && let Ok(ts) = rest[..end].parse::<u64>()
+            {
+                return Some(ts);
+            }
+        }
+    }
+    None
+}
+
+/// THE-943 — how long a resolved direct URL may safely be cached.
+///
+/// Derived from the URL's own `expire` timestamp minus
+/// [`URL_CACHE_SAFETY_MARGIN`], clamped to [`URL_CACHE_MAX_TTL`]. Returns
+/// [`Duration::ZERO`] when the URL is already expired (or expires within the
+/// safety margin) — the caller treats zero as "do not cache". Falls back to
+/// [`URL_CACHE_DEFAULT_TTL`] when no `expire` is present.
+fn signed_url_ttl(direct_url: &str) -> Duration {
+    let Some(expire) = parse_expire_ts(direct_url) else {
+        return URL_CACHE_DEFAULT_TTL;
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if expire <= now {
+        return Duration::ZERO;
+    }
+    let usable = (expire - now).saturating_sub(URL_CACHE_SAFETY_MARGIN.as_secs());
+    Duration::from_secs(usable).min(URL_CACHE_MAX_TTL)
+}
+
+/// THE-943 — `YT_RESOLVER_URL_CACHE_DISABLE` pins playback back to a full
+/// resolve on every `!play`, matching the escape-hatch pattern of the other
+/// resolver knobs (`YT_RESOLVER_DISABLE`, `YT_NSIG_CACHE_DISABLE`).
+fn url_cache_enabled() -> bool {
+    std::env::var_os("YT_RESOLVER_URL_CACHE_DISABLE").is_none()
+}
+
 /// State shared between [`ResolverHandle`] and its background supervisor.
 ///
 /// The `dead` flag is set by the supervisor right before it gives up (after
@@ -178,6 +358,9 @@ pub struct ResolverHandle {
     /// Budget for the final reply once a phase-1 `video_id` partial has
     /// arrived. Defaults to [`PHASE2_TIMEOUT`] (THE-942).
     phase2_timeout: Duration,
+    /// THE-943 — per-`video_id` resolved-URL cache. A hit skips the warm
+    /// resolver's `search_fetch` + `nsig_solve` round-trip entirely.
+    cache: UrlCache,
 }
 
 impl ResolverHandle {
@@ -199,6 +382,7 @@ impl ResolverHandle {
             state,
             resolve_timeout: RESOLVE_TIMEOUT,
             phase2_timeout: PHASE2_TIMEOUT,
+            cache: UrlCache::default(),
         })
     }
 
@@ -211,6 +395,7 @@ impl ResolverHandle {
             state: Arc::new(SupervisorState::default()),
             resolve_timeout: RESOLVE_TIMEOUT,
             phase2_timeout: PHASE2_TIMEOUT,
+            cache: UrlCache::default(),
         }
     }
 
@@ -224,6 +409,7 @@ impl ResolverHandle {
             state,
             resolve_timeout: RESOLVE_TIMEOUT,
             phase2_timeout: PHASE2_TIMEOUT,
+            cache: UrlCache::default(),
         }
     }
 
@@ -241,6 +427,7 @@ impl ResolverHandle {
             state: Arc::new(SupervisorState::default()),
             resolve_timeout,
             phase2_timeout,
+            cache: UrlCache::default(),
         }
     }
 
@@ -253,6 +440,27 @@ impl ResolverHandle {
         url: &str,
         cookie_file: Option<&Path>,
     ) -> Result<ResolvedTrack, ResolverError> {
+        // THE-943 — serve a still-valid resolved URL straight from cache,
+        // skipping search_fetch + nsig_solve. The lookup key is the video_id
+        // carried in the request URL (a direct `!play <url>`); a bare
+        // `ytsearch…:` query has none until after resolution, so it always
+        // misses here and is cached under its resolved id below. The cache is
+        // checked before the dead-flag short-circuit so a cached track still
+        // plays even if the resolver supervisor has given up.
+        let caching = url_cache_enabled();
+        let input_id = if caching { input_video_id(url) } else { None };
+        if let Some(id) = &input_id
+            && let Some(track) = self.cache.get_fresh(id)
+        {
+            tracing::info!(
+                target: "music_bot_latency",
+                stage = "resolver_url_cache_hit",
+                video_id = %id,
+                "served resolved URL from cache — skipped search_fetch + nsig_solve",
+            );
+            return Ok(track);
+        }
+
         let req = serde_json::json!({
             "op": "resolve",
             "url": url,
@@ -267,13 +475,26 @@ impl ResolverHandle {
         let direct_url = resp
             .direct_url
             .ok_or_else(|| ResolverError::Protocol("ok response without direct_url".into()))?;
-        Ok(ResolvedTrack {
+        let track = ResolvedTrack {
             direct_url,
             title: resp.title,
             duration: resp.duration,
             phases: resp.phases,
             video_id: resp.video_id,
-        })
+        };
+
+        // THE-943 — cache the freshly-resolved URL. Prefer the id from the
+        // request (so a repeat direct `!play` hits); else the id the resolver
+        // identified (so a search that landed on this video is reusable). TTL
+        // tracks the signed URL's own `expire`, so we never serve a stale URL.
+        if caching && let Some(key) = input_id.or_else(|| track.video_id.clone()) {
+            let ttl = signed_url_ttl(&track.direct_url);
+            if !ttl.is_zero() {
+                self.cache.insert(key, track.clone(), ttl);
+            }
+        }
+
+        Ok(track)
     }
 
     /// Liveness probe — returns the resolver's `yt_dlp` version string.
@@ -779,5 +1000,114 @@ mod tests {
             PHASE2_TIMEOUT < RESOLVE_TIMEOUT,
             "phase-2 budget must be shorter than the overall budget",
         );
+    }
+
+    // ---- THE-943: video_id URL cache ----
+
+    #[test]
+    fn input_video_id_extracts_from_common_url_shapes() {
+        assert_eq!(
+            input_video_id("https://www.youtube.com/watch?v=dQw4w9WgXcQ").as_deref(),
+            Some("dQw4w9WgXcQ"),
+        );
+        assert_eq!(
+            input_video_id("https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=abc").as_deref(),
+            Some("dQw4w9WgXcQ"),
+        );
+        assert_eq!(
+            input_video_id("https://youtu.be/dQw4w9WgXcQ?t=10").as_deref(),
+            Some("dQw4w9WgXcQ"),
+        );
+        assert_eq!(
+            input_video_id("https://www.youtube.com/shorts/dQw4w9WgXcQ").as_deref(),
+            Some("dQw4w9WgXcQ"),
+        );
+        // A bare search query carries no id — must miss the cache, not key on junk.
+        assert_eq!(input_video_id("ytsearch1:never gonna give you up"), None);
+    }
+
+    #[test]
+    fn signed_url_ttl_tracks_expire_and_rejects_stale() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // Far-future expire → a positive, capped TTL.
+        let fresh = format!("https://r1.googlevideo.com/x.webm?expire={}", now + 3600);
+        let ttl = signed_url_ttl(&fresh);
+        assert!(
+            ttl > Duration::ZERO && ttl <= URL_CACHE_MAX_TTL,
+            "ttl={ttl:?}"
+        );
+        // Already-expired URL → zero (the caller treats zero as "do not cache").
+        let stale = format!("https://r1.googlevideo.com/x.webm?expire={}", now - 10);
+        assert_eq!(signed_url_ttl(&stale), Duration::ZERO);
+        // Expires inside the safety margin → also zero.
+        let soon = format!("https://r1.googlevideo.com/x.webm?expire={}", now + 5);
+        assert_eq!(signed_url_ttl(&soon), Duration::ZERO);
+        // No expire param → conservative default TTL.
+        assert_eq!(signed_url_ttl("https://cdn/x.webm"), URL_CACHE_DEFAULT_TTL);
+        // Path-style /expire/ form is parsed too.
+        let path_style = format!("https://r1.googlevideo.com/expire/{}/x.webm", now + 3600);
+        assert!(signed_url_ttl(&path_style) > Duration::ZERO);
+    }
+
+    #[test]
+    fn url_cache_evicts_expired_then_serves_only_fresh() {
+        let cache = UrlCache::default();
+        let track = |u: &str| ResolvedTrack {
+            direct_url: u.into(),
+            title: None,
+            duration: None,
+            phases: vec![],
+            video_id: None,
+        };
+        cache.insert("fresh".into(), track("a"), Duration::from_secs(60));
+        // A zero-TTL insert is expired the instant it lands.
+        cache.insert("stale".into(), track("b"), Duration::from_secs(0));
+        assert_eq!(
+            cache.get_fresh("fresh").map(|t| t.direct_url),
+            Some("a".into())
+        );
+        assert!(
+            cache.get_fresh("stale").is_none(),
+            "expired entry must not be served"
+        );
+        // The expired entry is dropped on read, not just hidden.
+        assert!(!cache.entries.lock().unwrap().contains_key("stale"));
+    }
+
+    #[tokio::test]
+    async fn repeat_resolve_hits_cache_without_a_second_round_trip() {
+        // The mock server accepts exactly ONE connection. If the second
+        // resolve reached the socket, it would hang/fail; instead it must be
+        // served from the THE-943 cache.
+        let path = sock("cache");
+        let _ = std::fs::remove_file(&path);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let reply = format!(
+            "{{\"ok\":true,\"direct_url\":\"https://r1.googlevideo.com/v.webm?expire={}\",\"title\":\"Song\",\"video_id\":\"dQw4w9WgXcQ\"}}\n",
+            now + 3600,
+        );
+        let reply: &'static str = Box::leak(reply.into_boxed_str());
+        mock_server(path.clone(), reply);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let handle = ResolverHandle::for_socket(path.clone());
+        let url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
+
+        let first = handle.resolve(url, None).await.unwrap();
+        assert_eq!(first.title.as_deref(), Some("Song"));
+
+        // Second resolve: no server is listening anymore (one-shot mock), so a
+        // round-trip would error — a success proves the cache served it.
+        let second = handle.resolve(url, None).await.unwrap();
+        assert_eq!(second.direct_url, first.direct_url);
+        assert_eq!(second.title.as_deref(), Some("Song"));
+
+        let _ = std::fs::remove_file(&path);
     }
 }
