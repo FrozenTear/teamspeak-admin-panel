@@ -5,6 +5,7 @@
 use std::time::Instant;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
@@ -83,7 +84,7 @@ impl AudioPipeline {
             // channel and a transient producer stall during start-up cannot
             // immediately underrun the wire.
             let mut pacer: Option<WallClockPacer> = None;
-            let mut prebuffer: Vec<Vec<u8>> = Vec::with_capacity(prebuffer_target);
+            let mut prebuffer: Vec<Bytes> = Vec::with_capacity(prebuffer_target);
             let samples_per_frame = encoder.samples_per_frame();
             // PCM accumulator — holds samples that crossed a `read_samples`
             // boundary. We always emit whole frames; partial leftovers are
@@ -242,7 +243,7 @@ impl Drop for AudioPipeline {
 /// frame consumer has gone away — the worker treats that as its cancel
 /// signal.
 async fn flush_prebuffer(
-    prebuffer: &mut Vec<Vec<u8>>,
+    prebuffer: &mut Vec<Bytes>,
     pacer: &mut WallClockPacer,
     frames_tx: &mpsc::Sender<OpusFrame>,
     channels: u8,

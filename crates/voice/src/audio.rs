@@ -23,6 +23,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::{JoinHandle, block_in_place};
 use tracing::{debug, info, warn};
@@ -49,7 +50,7 @@ pub(crate) enum AudioMsg {
     /// frame waited for the connected loop to poll the audio arm (the
     /// candidate-C "loop deferral" leg of the residual stall).
     Frame {
-        bytes: Vec<u8>,
+        bytes: Bytes,
         enqueued_at: Instant,
     },
     /// Out-of-band event from the pipeline (ICY `NowPlaying`, warnings,

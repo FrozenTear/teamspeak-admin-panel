@@ -52,6 +52,11 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
+# THE-922 — `bytes::Bytes` rides the `AudioMsg::Frame` mpsc from the audio
+# sibling to the wire task. The encoder hands us frames as `Bytes` carved
+# from a reused `BytesMut` (see music-bot-audio for the alloc story); the
+# wire boundary still derefs to `&[u8]` for `Connection::send_audio`.
+bytes = "1"
 # PURA-121 WS-3 — `MusicBotStore` is async (the WS-5 SurrealDB impl
 # needs `async fn` on the trait); `async-trait` keeps the dispatch
 # surface object-safe so the supervisor + bot actor share an
