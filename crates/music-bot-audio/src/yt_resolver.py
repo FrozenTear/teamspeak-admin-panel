@@ -317,12 +317,16 @@ def resolve(url, cookie_file, send_partial=None):
     return track
 
 
-# THE-943 — yt-dlp's canonical test video ("youtube-dl test video"), used in
-# yt-dlp's own test suite and stable for years. Any video warms the
+# THE-943 — default prewarm target. Any *available* video warms the
 # *preprocessed-player cache* (PURA-360), which is keyed by player `base.js`
 # revision and therefore shared across every later resolve — the prewarm video
-# itself does not matter beyond existing. Override with YT_RESOLVER_PREWARM_URL.
-PREWARM_URL = "https://www.youtube.com/watch?v=BaW_jenozKc"
+# itself does not matter beyond resolving successfully. The original pick,
+# yt-dlp's canonical test video `BaW_jenozKc`, turned out to be unavailable in
+# the live QA capture (2026-06-09), so the boot prewarm silently no-op'd in the
+# default config. Switched to `dQw4w9WgXcQ` (Rick Astley — one of the most
+# stable, globally-available videos on YouTube; confirmed resolving in that same
+# QA run). Override with YT_RESOLVER_PREWARM_URL.
+PREWARM_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 
 
 def _prewarm():
