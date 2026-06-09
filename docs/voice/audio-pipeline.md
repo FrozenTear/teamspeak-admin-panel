@@ -193,6 +193,48 @@ YouTube increasingly requires a logged-in session for age-gated content, region-
 
 Cookies expire (typical YouTube cookies: weeks to months). A future UI ticket adds an upload + replace surface inside the operator panel; for now, replace the file in place and restart the manager.
 
+### YouTube Data API key for fast `!play yt:` search (THE-933)
+
+`!play yt:<query>` runs in two phases: a *search* phase (query → video) and a
+*media-URL* phase (video → direct stream). From datacenter IPs YouTube
+rate-limits the organic `ytsearch1:` search path, so the search phase alone
+costs 15–30 s (see [THE-931](../../../THE/issues/THE-931)).
+
+Setting `YOUTUBE_API_KEY` switches the *search* phase to the YouTube Data API
+v3 (~300 ms, [`yt_search::search_youtube_api`](../../crates/music-bot-audio/src/yt_search.rs)).
+The resolved watch URL then flows through the unchanged warm yt-dlp resolver
+for the media phase. If the key is absent — or the API call errors — the bot
+falls back to `ytsearch1:` with no behaviour change, so this is a pure
+opt-in speedup.
+
+**Getting a key (Google Cloud Console, free tier):**
+
+1. Sign in at <https://console.cloud.google.com/> and create a project (or
+   pick an existing one) via the project dropdown → **New Project**.
+2. Enable the API: **APIs & Services → Library**, search **"YouTube Data API
+   v3"**, open it, click **Enable**. (Direct link:
+   <https://console.cloud.google.com/apis/library/youtube.googleapis.com>.)
+3. Create the credential: **APIs & Services → Credentials → Create
+   credentials → API key**. Copy the generated key.
+4. *(Recommended)* Click the new key → **API restrictions → Restrict key →
+   YouTube Data API v3**, and **Save**. This scopes the key so a leak can
+   only burn YouTube quota, nothing else. No "Application restrictions" are
+   needed since the manager calls the API server-side.
+
+The default free quota is **10,000 units/day**; a `search.list` call costs
+**100 units**, so ~100 `!play yt:` searches/day. Heavy servers can request a
+quota increase in the console, but 10k/day covers typical use.
+
+**Wiring it into the manager:**
+
+1. Set `YOUTUBE_API_KEY=<the key>` in the manager's environment (Quadlet env
+   file or kube `env:` entry — same surface as `YT_COOKIE_FILE` above).
+2. Restart the manager. No DB setting is involved; the env var is read at
+   resolve time.
+
+Treat the key like any other secret — keep it in the env file, not in the
+repo or chat.
+
 ## What this crate does not do
 
 - TS6 wire transmission — that's WS-1's job. The pipeline only produces `OpusFrame { bytes, scheduled_at, … }`.
