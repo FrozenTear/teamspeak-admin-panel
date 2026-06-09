@@ -443,7 +443,11 @@ mod tests {
 
         // A fresh spawn must land past every rehydrated id, not at 1.
         let fresh = sup
-            .spawn(idle_config("fresh"), Arc::clone(&cookie), Arc::clone(&api_key))
+            .spawn(
+                idle_config("fresh"),
+                Arc::clone(&cookie),
+                Arc::clone(&api_key),
+            )
             .await;
         assert_eq!(fresh, BotId(6), "fresh spawn must not collide with id 5");
 

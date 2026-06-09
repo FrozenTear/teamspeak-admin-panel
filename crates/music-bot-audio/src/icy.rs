@@ -149,10 +149,7 @@ mod tests {
     #[test]
     fn parse_title_latin1_accented() {
         let raw = b"StreamTitle='Caf\xe9 del Mar';\0\0";
-        assert_eq!(
-            parse_stream_title(raw).as_deref(),
-            Some("Café del Mar"),
-        );
+        assert_eq!(parse_stream_title(raw).as_deref(), Some("Café del Mar"),);
     }
 
     #[test]

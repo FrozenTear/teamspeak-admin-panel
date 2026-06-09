@@ -49,10 +49,7 @@ pub(crate) enum AudioMsg {
     /// PURA-389a — `enqueued_at` lets the send path measure how long the
     /// frame waited for the connected loop to poll the audio arm (the
     /// candidate-C "loop deferral" leg of the residual stall).
-    Frame {
-        bytes: Bytes,
-        enqueued_at: Instant,
-    },
+    Frame { bytes: Bytes, enqueued_at: Instant },
     /// Out-of-band event from the pipeline (ICY `NowPlaying`, warnings,
     /// end-of-stream). The connected loop forwards these onto the bot's
     /// `BotEvent` broadcast.

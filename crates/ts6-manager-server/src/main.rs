@@ -230,7 +230,12 @@ mod server_entry {
                     state
                         .music_bots
                         .supervisor
-                        .spawn_with_id(id, config, state.yt_cookie.clone(), state.yt_api_key.clone())
+                        .spawn_with_id(
+                            id,
+                            config,
+                            state.yt_cookie.clone(),
+                            state.yt_api_key.clone(),
+                        )
                         .await;
                     state.music_bots.watch(id).await;
                 }

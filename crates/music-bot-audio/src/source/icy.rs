@@ -180,15 +180,8 @@ pub(crate) async fn run_fetcher<W>(
             },
         };
 
-        let outcome = drain_body(
-            resp,
-            metaint,
-            &url,
-            &mut writer,
-            &event_tx,
-            &mut last_title,
-        )
-        .await;
+        let outcome =
+            drain_body(resp, metaint, &url, &mut writer, &event_tx, &mut last_title).await;
 
         match outcome {
             BodyOutcome::ConsumerGone => return,
@@ -468,7 +461,10 @@ mod tests {
                     Some(n) => format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\nicy-metaint: {n}\r\nConnection: close\r\n\r\n"
                     ),
-                    None => "HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\nConnection: close\r\n\r\n".to_string(),
+                    None => {
+                        "HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    }
                 };
                 sock.write_all(header.as_bytes()).await?;
                 sock.write_all(&body).await?;
@@ -643,10 +639,26 @@ mod tests {
         let written = wait_for_bytes(&buf, 4 * audio_n, Duration::from_secs(5)).await;
         fetcher.abort();
 
-        assert_eq!(&written[..audio_n], &vec![0xAB; audio_n][..], "attempt 1 first half");
-        assert_eq!(&written[audio_n..2 * audio_n], &vec![0xCD; audio_n][..], "attempt 1 second half");
-        assert_eq!(&written[2 * audio_n..3 * audio_n], &vec![0xEE; audio_n][..], "attempt 2 first half");
-        assert_eq!(&written[3 * audio_n..4 * audio_n], &vec![0xFF; audio_n][..], "attempt 2 second half");
+        assert_eq!(
+            &written[..audio_n],
+            &vec![0xAB; audio_n][..],
+            "attempt 1 first half"
+        );
+        assert_eq!(
+            &written[audio_n..2 * audio_n],
+            &vec![0xCD; audio_n][..],
+            "attempt 1 second half"
+        );
+        assert_eq!(
+            &written[2 * audio_n..3 * audio_n],
+            &vec![0xEE; audio_n][..],
+            "attempt 2 first half"
+        );
+        assert_eq!(
+            &written[3 * audio_n..4 * audio_n],
+            &vec![0xFF; audio_n][..],
+            "attempt 2 second half"
+        );
 
         let events = drain_events(&mut rx);
         let now_playing_count = events
@@ -698,8 +710,16 @@ mod tests {
         .await;
         fetcher.abort();
 
-        assert_eq!(&written[..audio_n], &vec![0xAA; audio_n][..], "attempt 1 audio");
-        assert_eq!(&written[audio_n..2 * audio_n], &vec![0xBB; audio_n][..], "attempt 3 audio (after 5xx retry)");
+        assert_eq!(
+            &written[..audio_n],
+            &vec![0xAA; audio_n][..],
+            "attempt 1 audio"
+        );
+        assert_eq!(
+            &written[audio_n..2 * audio_n],
+            &vec![0xBB; audio_n][..],
+            "attempt 3 audio (after 5xx retry)"
+        );
         assert!(saw_5xx, "expected 5xx retry warning, got: {collected:?}");
     }
 
@@ -744,7 +764,10 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(2), fetcher).await;
 
         let written = buf.lock().unwrap().clone();
-        assert!(saw_terminal, "expected terminal-410 warning, got: {collected:?}");
+        assert!(
+            saw_terminal,
+            "expected terminal-410 warning, got: {collected:?}"
+        );
         assert_eq!(
             written,
             vec![0xAB; audio_n],
@@ -776,7 +799,10 @@ mod tests {
         .await;
         let _ = tokio::time::timeout(Duration::from_secs(2), fetcher).await;
 
-        assert!(saw_terminal, "expected empty-body terminal warning, got: {collected:?}");
+        assert!(
+            saw_terminal,
+            "expected empty-body terminal warning, got: {collected:?}"
+        );
         assert!(buf.lock().unwrap().is_empty(), "no audio expected");
     }
 
@@ -792,5 +818,4 @@ mod tests {
         let body = reqwest::get(&url).await.unwrap().bytes().await.unwrap();
         assert_eq!(&body[..], &[0xAB; 16]);
     }
-
 }

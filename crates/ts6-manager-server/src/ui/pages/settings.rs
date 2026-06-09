@@ -254,11 +254,7 @@ fn YoutubeApiKeySection() -> Element {
             }
             let key = input.read().trim().to_string();
             if key.is_empty() {
-                toaster.push(
-                    ToastVariant::Danger,
-                    "Enter an API key first",
-                    None,
-                );
+                toaster.push(ToastVariant::Danger, "Enter an API key first", None);
                 return;
             }
             saving.set(true);

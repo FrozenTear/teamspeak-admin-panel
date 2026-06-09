@@ -489,7 +489,10 @@ async fn resolve_source(
                 Err(err) => {
                     // API failed — fall back to yt-dlp organic search so the
                     // bot remains functional at the cost of higher latency.
-                    warn!(?err, "YouTube Data API search failed, falling back to ytsearch1:");
+                    warn!(
+                        ?err,
+                        "YouTube Data API search failed, falling back to ytsearch1:"
+                    );
                     format!("ytsearch1:{query}")
                 }
             }

@@ -88,6 +88,7 @@ async fn setup() -> (FlowApiState, FlowEngine, i64) {
         ssrf_resolver: Arc::new(ts6_ssrf::MockResolver::new()),
         moq_public_url: None,
         yt_cookie: Arc::new(std::sync::RwLock::new(None)),
+        yt_api_key: Arc::new(std::sync::RwLock::new(None)),
         data_dir: std::path::PathBuf::from("./data"),
         trusted_proxy_hops: 0,
     };

@@ -125,7 +125,13 @@ async fn run() -> Result<()> {
     // which is correct for this fixture run (no YouTube resolution).
     let yt_cookie: Arc<RwLock<Option<std::path::PathBuf>>> = Arc::new(RwLock::new(None));
     let yt_api_key: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
-    let bot = spawn_bot(BotId(1), bot_config, Arc::clone(&store), yt_cookie, yt_api_key);
+    let bot = spawn_bot(
+        BotId(1),
+        bot_config,
+        Arc::clone(&store),
+        yt_cookie,
+        yt_api_key,
+    );
     let mut bot_events = bot.subscribe();
 
     // 2. Wait for the bot's `Connected` event so we know the default channel.
