@@ -88,6 +88,12 @@ pub struct Config {
     /// connection.
     pub moq_public_url: Option<String>,
     pub yt_cookie_file: Option<PathBuf>,
+    /// THE-948 — boot-time seed for the YouTube Data API key used by the
+    /// music bot's fast-search path (THE-933). Read from `YOUTUBE_API_KEY`
+    /// here; once an operator saves a key via `/settings`, the persisted
+    /// `app_setting:youtube_api_key` row takes precedence at boot. Held at
+    /// runtime in `AppState::yt_api_key` (live-updatable without restart).
+    pub youtube_api_key: Option<String>,
     /// PURA-223 — base directory for operator-uploaded files.
     /// Defaults to `./data`. Cookie file is written as `<data_dir>/yt-cookies.txt`.
     pub data_dir: PathBuf,
@@ -179,6 +185,7 @@ impl Config {
         let sidecar_binary_path = optional_env("SIDECAR_BINARY_PATH").map(PathBuf::from);
         let moq_public_url = optional_env("MOQ_PUBLIC_URL");
         let yt_cookie_file = optional_env("YT_COOKIE_FILE").map(PathBuf::from);
+        let youtube_api_key = optional_env("YOUTUBE_API_KEY");
         let data_dir = PathBuf::from(env_or("DATA_DIR", DEFAULT_DATA_DIR));
 
         let ts_allow_self_signed = parse_bool_flag("TS_ALLOW_SELF_SIGNED");
@@ -219,6 +226,7 @@ impl Config {
             sidecar_binary_path,
             moq_public_url,
             yt_cookie_file,
+            youtube_api_key,
             data_dir,
             ts_allow_self_signed,
             ssh_tofu,
@@ -252,6 +260,7 @@ impl Config {
             sidecar_binary_path_set = self.sidecar_binary_path.is_some(),
             moq_public_url_set = self.moq_public_url.is_some(),
             yt_cookie_file_set = self.yt_cookie_file.is_some(),
+            youtube_api_key_set = self.youtube_api_key.is_some(),
             "ts6-manager configuration loaded"
         );
 

@@ -25,7 +25,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::get;
 use chrono::Utc;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::app_state::AppState;
 use crate::auth::extractors::RequireAdmin;
@@ -36,14 +36,27 @@ const KEY_PATH: &str = "yt_cookie_path";
 /// `app_setting` key for when the file was uploaded (ISO 8601).
 const KEY_TS: &str = "yt_cookie_uploaded_at";
 
+/// THE-948 — `app_setting` key for the persisted YouTube Data API key.
+/// The value is the raw key; it is never echoed back by the GET endpoint.
+const KEY_API: &str = "youtube_api_key";
+
+/// THE-948 — sanity bound on the API-key string. Google API keys are ~39
+/// chars; allow generous headroom but reject obviously-bogus payloads.
+const MAX_API_KEY_BYTES: usize = 256;
+
 /// Maximum accepted cookie file size (64 KiB).
 const MAX_SIZE_BYTES: usize = 64 * 1024;
 
 pub fn router() -> Router<AppState> {
-    Router::new().route(
-        "/api/settings/youtube-cookies",
-        get(get_cookies).put(put_cookies).delete(delete_cookies),
-    )
+    Router::new()
+        .route(
+            "/api/settings/youtube-cookies",
+            get(get_cookies).put(put_cookies).delete(delete_cookies),
+        )
+        .route(
+            "/api/settings/youtube-api-key",
+            get(get_api_key).put(put_api_key).delete(delete_api_key),
+        )
 }
 
 /// Wire shape for `GET /api/settings/youtube-cookies`.
@@ -240,5 +253,92 @@ async fn delete_cookies(_admin: RequireAdmin, State(state): State<AppState>) -> 
     }
 
     tracing::info!("yt-dlp cookie file deleted");
+    StatusCode::NO_CONTENT.into_response()
+}
+
+// ---------------------------------------------------------------------------
+// THE-948 — YouTube Data API key management.
+//
+// Mirrors the cookie-file pattern above but for a short opaque string rather
+// than an uploaded file: the key is persisted to `app_setting:youtube_api_key`
+// and held live in `AppState::yt_api_key` so the music bot's fast-search path
+// (THE-933) picks up changes without a process restart. The GET endpoint never
+// returns the stored value — only whether one is configured.
+// ---------------------------------------------------------------------------
+
+/// Wire shape for `GET /api/settings/youtube-api-key`. Deliberately never
+/// includes the key itself — the secret must not leave the server.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiKeyStatus {
+    configured: bool,
+}
+
+/// Wire shape for `PUT /api/settings/youtube-api-key`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiKeyUpdate {
+    api_key: String,
+}
+
+async fn get_api_key(_admin: RequireAdmin, State(state): State<AppState>) -> Response {
+    // Report presence from the live runtime value (which is seeded from the
+    // persisted row / env at boot) so a key set via env-only still reads as
+    // configured even before anything is persisted to `app_setting`.
+    let configured = state
+        .yt_api_key
+        .read()
+        .unwrap()
+        .as_deref()
+        .is_some_and(|k| !k.is_empty());
+    Json(ApiKeyStatus { configured }).into_response()
+}
+
+async fn put_api_key(
+    _admin: RequireAdmin,
+    State(state): State<AppState>,
+    Json(body): Json<ApiKeyUpdate>,
+) -> Response {
+    let key = body.api_key.trim();
+    if key.is_empty() {
+        return (StatusCode::BAD_REQUEST, "apiKey must not be empty").into_response();
+    }
+    if key.len() > MAX_API_KEY_BYTES {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("apiKey too long (max {MAX_API_KEY_BYTES} chars)"),
+        )
+            .into_response();
+    }
+
+    if let Err(e) = app_settings::put(&state.db, KEY_API, key).await {
+        tracing::error!(error = %e, "failed to persist youtube_api_key app_setting");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    // Update the live runtime Arc so the next `!play yt:` resolve uses it.
+    {
+        let mut guard = state.yt_api_key.write().unwrap();
+        *guard = Some(key.to_string());
+    }
+
+    // Never log the value — presence only.
+    tracing::info!("youtube api key updated via /settings");
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn delete_api_key(_admin: RequireAdmin, State(state): State<AppState>) -> Response {
+    if let Err(e) = app_settings::delete(&state.db, KEY_API).await {
+        tracing::error!(error = %e, "failed to clear youtube_api_key app_setting");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    // Clear runtime Arc — reverts `!play yt:` to the `ytsearch1:` path.
+    {
+        let mut guard = state.yt_api_key.write().unwrap();
+        *guard = None;
+    }
+
+    tracing::info!("youtube api key cleared via /settings");
     StatusCode::NO_CONTENT.into_response()
 }

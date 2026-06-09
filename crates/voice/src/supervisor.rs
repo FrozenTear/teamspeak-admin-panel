@@ -50,6 +50,7 @@ pub fn spawn_bot(
     config: BotConfig,
     store: Arc<dyn MusicBotStore>,
     yt_cookie: Arc<RwLock<Option<PathBuf>>>,
+    yt_api_key: Arc<RwLock<Option<String>>>,
 ) -> BotHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_BUFFER);
     let (event_tx, _) = broadcast::channel(config.event_buffer.max(1));
@@ -64,6 +65,7 @@ pub fn spawn_bot(
             cmd_rx,
             event_tx_for_actor,
             yt_cookie,
+            yt_api_key,
         )
         .await;
     });
@@ -197,10 +199,15 @@ impl BotSupervisor {
     ///
     /// `yt_cookie` is the live-updated cookie-file path (PURA-223).
     /// The caller typically passes `AppState::yt_cookie.clone()`.
-    pub async fn spawn(&self, config: BotConfig, yt_cookie: Arc<RwLock<Option<PathBuf>>>) -> BotId {
+    pub async fn spawn(
+        &self,
+        config: BotConfig,
+        yt_cookie: Arc<RwLock<Option<PathBuf>>>,
+        yt_api_key: Arc<RwLock<Option<String>>>,
+    ) -> BotId {
         let id = BotId(self.next_id.fetch_add(1, Ordering::Relaxed));
         let name = config.name.clone();
-        let handle = spawn_bot(id, config, Arc::clone(&self.store), yt_cookie);
+        let handle = spawn_bot(id, config, Arc::clone(&self.store), yt_cookie, yt_api_key);
         self.bots.lock().await.insert(id, handle);
         info!(%id, %name, "spawned bot");
         id
@@ -219,9 +226,10 @@ impl BotSupervisor {
         id: BotId,
         config: BotConfig,
         yt_cookie: Arc<RwLock<Option<PathBuf>>>,
+        yt_api_key: Arc<RwLock<Option<String>>>,
     ) -> BotId {
         let name = config.name.clone();
-        let handle = spawn_bot(id, config, Arc::clone(&self.store), yt_cookie);
+        let handle = spawn_bot(id, config, Arc::clone(&self.store), yt_cookie, yt_api_key);
         self.bots.lock().await.insert(id, handle);
         // Keep the minted-id counter ahead of every rehydrated id.
         self.next_id.fetch_max(id.0 + 1, Ordering::Relaxed);
@@ -421,14 +429,22 @@ mod tests {
     async fn spawn_with_id_preserves_id_and_advances_the_counter() {
         let sup = BotSupervisor::new();
         let cookie = Arc::new(RwLock::new(None));
+        let api_key = Arc::new(RwLock::new(None));
 
         let rehydrated = sup
-            .spawn_with_id(BotId(5), idle_config("rehydrated"), Arc::clone(&cookie))
+            .spawn_with_id(
+                BotId(5),
+                idle_config("rehydrated"),
+                Arc::clone(&cookie),
+                Arc::clone(&api_key),
+            )
             .await;
         assert_eq!(rehydrated, BotId(5), "rehydration must keep the stored id");
 
         // A fresh spawn must land past every rehydrated id, not at 1.
-        let fresh = sup.spawn(idle_config("fresh"), Arc::clone(&cookie)).await;
+        let fresh = sup
+            .spawn(idle_config("fresh"), Arc::clone(&cookie), Arc::clone(&api_key))
+            .await;
         assert_eq!(fresh, BotId(6), "fresh spawn must not collide with id 5");
 
         let ids: Vec<u64> = {

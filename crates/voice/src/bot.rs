@@ -68,6 +68,7 @@ pub(crate) async fn run_bot(
     mut rx: mpsc::Receiver<BotCommand>,
     events: broadcast::Sender<BotEvent>,
     yt_cookie: Arc<RwLock<Option<PathBuf>>>,
+    yt_api_key: Arc<RwLock<Option<String>>>,
 ) {
     let span = tracing::info_span!("music_bot", bot_id = %bot_id, name = %config.name);
     let _enter = span.enter();
@@ -169,6 +170,7 @@ pub(crate) async fn run_bot(
                                     bot_id,
                                     &store,
                                     Arc::clone(&yt_cookie),
+                                    Arc::clone(&yt_api_key),
                                     bot_volume.clone(),
                                 )
                                 .await;
@@ -184,6 +186,7 @@ pub(crate) async fn run_bot(
                                     bot_id,
                                     &store,
                                     Arc::clone(&yt_cookie),
+                                    Arc::clone(&yt_api_key),
                                     bot_volume.clone(),
                                 )
                                 .await;
@@ -372,6 +375,7 @@ async fn run_connected_loop(
     bot_id: BotId,
     store: &Arc<dyn MusicBotStore>,
     yt_cookie: Arc<RwLock<Option<PathBuf>>>,
+    yt_api_key: Arc<RwLock<Option<String>>>,
     bot_volume: VolumeHandle,
 ) -> ConnectedExit {
     // PURA-154 — `current_audio` is `Some` while a pipeline is spawned.
@@ -446,6 +450,7 @@ async fn run_connected_loop(
                             store,
                             events,
                             &yt_cookie,
+                            &yt_api_key,
                             &bot_volume,
                             &msg,
                         )
@@ -897,6 +902,7 @@ async fn run_split_connected_loop(
     bot_id: BotId,
     store: &Arc<dyn MusicBotStore>,
     yt_cookie: Arc<RwLock<Option<PathBuf>>>,
+    yt_api_key: Arc<RwLock<Option<String>>>,
     bot_volume: VolumeHandle,
 ) -> ConnectedExit {
     let (wire_cmd_tx, wire_cmd_rx) = mpsc::unbounded_channel::<WireCmd>();
@@ -932,6 +938,7 @@ async fn run_split_connected_loop(
                             store,
                             events,
                             &yt_cookie,
+                            &yt_api_key,
                             &bot_volume,
                             &msg,
                         )
@@ -1835,6 +1842,7 @@ async fn dispatch_chat_line(
     store: &Arc<dyn MusicBotStore>,
     events: &broadcast::Sender<BotEvent>,
     yt_cookie: &Arc<RwLock<Option<PathBuf>>>,
+    yt_api_key: &Arc<RwLock<Option<String>>>,
     bot_volume: &VolumeHandle,
     msg: &ChatLine,
 ) {
@@ -1850,7 +1858,12 @@ async fn dispatch_chat_line(
             // PURA-396 — `chat::handle_command` is `Connection`-free; the
             // reply rides the `WireSink` (a direct `send_reply`, or a
             // `WireCmd::ChatReply` to the wire task in the split path).
-            let (reply, action) = chat::handle_command(bot_id, store, events, parsed).await;
+            // THE-948 — read the live API key from the `RwLock` at dispatch
+            // time so a key saved in `/settings` takes effect without a
+            // restart; `None`/empty falls back to the `ytsearch1:` path.
+            let api_key = yt_api_key.read().unwrap().clone();
+            let (reply, action) =
+                chat::handle_command(bot_id, store, events, parsed, api_key.as_deref()).await;
             wire.chat_reply(reply);
             apply_chat_audio_action(
                 wire,

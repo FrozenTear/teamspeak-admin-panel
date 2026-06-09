@@ -208,10 +208,11 @@ pub(crate) async fn handle_command(
     store: &Arc<dyn MusicBotStore>,
     events: &broadcast::Sender<BotEvent>,
     cmd: ParsedCommand,
+    api_key: Option<&str>,
 ) -> (String, ChatAudioAction) {
     match cmd {
-        ParsedCommand::Radio { arg } => handle_radio(bot_id, store, events, arg).await,
-        ParsedCommand::Play { arg } => handle_play(bot_id, store, events, arg).await,
+        ParsedCommand::Radio { arg } => handle_radio(bot_id, store, events, arg, api_key).await,
+        ParsedCommand::Play { arg } => handle_play(bot_id, store, events, arg, api_key).await,
         ParsedCommand::Stop => handle_stop(bot_id, store, events).await,
         // PURA-353 — `!pause` / `!resume` now drive the live pipeline
         // (`apply_chat_audio_action` flips its pause `watch`), the same
@@ -262,8 +263,9 @@ async fn handle_radio(
     store: &Arc<dyn MusicBotStore>,
     events: &broadcast::Sender<BotEvent>,
     arg: String,
+    api_key: Option<&str>,
 ) -> (String, ChatAudioAction) {
-    let (track, label) = match resolve_source(bot_id, store, &arg).await {
+    let (track, label) = match resolve_source(bot_id, store, &arg, api_key).await {
         Ok(pair) => pair,
         Err(reply) => return (reply, ChatAudioAction::None),
     };
@@ -310,8 +312,9 @@ async fn handle_play(
     store: &Arc<dyn MusicBotStore>,
     events: &broadcast::Sender<BotEvent>,
     arg: String,
+    api_key: Option<&str>,
 ) -> (String, ChatAudioAction) {
-    let (track, label) = match resolve_source(bot_id, store, &arg).await {
+    let (track, label) = match resolve_source(bot_id, store, &arg, api_key).await {
         Ok(pair) => pair,
         Err(reply) => return (reply, ChatAudioAction::None),
     };
@@ -456,6 +459,7 @@ async fn resolve_source(
     bot_id: BotId,
     store: &Arc<dyn MusicBotStore>,
     arg: &str,
+    api_key: Option<&str>,
 ) -> Result<(NewTrack, String), String> {
     if is_url(arg) {
         Ok((
@@ -473,11 +477,14 @@ async fn resolve_source(
                 "what should I search YouTube for? e.g. !play yt: artist - song".to_string(),
             );
         }
-        // THE-933: prefer YouTube Data API v3 when `YOUTUBE_API_KEY` is set —
+        // THE-933 / THE-948: prefer YouTube Data API v3 when a key is set —
         // resolves to a direct watch URL in ~300 ms instead of the 15–30 s
-        // organic ytsearch1: path that datacenter IPs incur.
-        let url = if let Ok(api_key) = std::env::var("YOUTUBE_API_KEY") {
-            match search_youtube_api(query, &api_key).await {
+        // organic ytsearch1: path that datacenter IPs incur. The key is
+        // supplied by the caller (read from `AppState::yt_api_key`, which is
+        // seeded from `YOUTUBE_API_KEY` at boot and live-updated from the
+        // `/settings` admin UI — THE-948) rather than read from the env here.
+        let url = if let Some(api_key) = api_key.filter(|k| !k.is_empty()) {
+            match search_youtube_api(query, api_key).await {
                 Ok(watch_url) => watch_url,
                 Err(err) => {
                     // API failed — fall back to yt-dlp organic search so the
@@ -707,7 +714,7 @@ mod dispatch_tests {
         // Buffer is generous; the receiver is kept alive so `events.send`
         // inside the handlers never short-circuits on "no subscribers".
         let (events, _rx) = broadcast::channel(64);
-        handle_command(BotId(1), store, &events, cmd).await
+        handle_command(BotId(1), store, &events, cmd, None).await
     }
 
     /// The regression: chat `!play` on an idle bot must ask the actor to
@@ -843,7 +850,7 @@ mod dispatch_tests {
         cmd: ParsedCommand,
     ) -> (String, ChatAudioAction, Vec<BotEvent>) {
         let (events, mut rx) = broadcast::channel(64);
-        let (reply, action) = handle_command(BotId(1), store, &events, cmd).await;
+        let (reply, action) = handle_command(BotId(1), store, &events, cmd, None).await;
         // Drain anything still queued — the broadcast channel buffers
         // sends even when no receiver awaits, so a `try_recv` loop is
         // enough; the sender has no other producers.

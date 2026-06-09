@@ -50,6 +50,7 @@ pub fn SettingsPage() -> Element {
 
         section { class: "stack-md",
             YoutubeCookieSection {}
+            YoutubeApiKeySection {}
         }
     }
 }
@@ -203,6 +204,171 @@ fn YoutubeCookieSection() -> Element {
                         }
                     };
                     rsx! { {body} }
+                }
+            } }
+        }
+    }
+}
+
+/// Status of the persisted YouTube Data API key (THE-948): not yet
+/// fetched, an error, or a `{ configured }` payload. The key value never
+/// reaches the UI — only whether one is set.
+#[derive(Clone, Debug, PartialEq)]
+enum ApiKeyView {
+    Loading,
+    Error(ApiError),
+    Loaded(cookie_api::ApiKeyStatus),
+}
+
+#[component]
+fn YoutubeApiKeySection() -> Element {
+    let gate = use_auth_gate();
+    let toaster = use_toaster();
+
+    let mut view: Signal<ApiKeyView> = use_signal(|| ApiKeyView::Loading);
+    let mut reload: Signal<u64> = use_signal(|| 0u64);
+    let mut input: Signal<String> = use_signal(String::new);
+    let mut saving: Signal<bool> = use_signal(|| false);
+    let mut clearing: Signal<bool> = use_signal(|| false);
+
+    let snapshot = use_resource({
+        let gate = gate.clone();
+        move || {
+            let gate = gate.clone();
+            let _ = *reload.read();
+            async move { cookie_api::get_youtube_api_key_status(gate).await }
+        }
+    });
+
+    use_effect(move || match &*snapshot.read_unchecked() {
+        Some(Ok(status)) => view.set(ApiKeyView::Loaded(status.clone())),
+        Some(Err(e)) => view.set(ApiKeyView::Error(e.clone())),
+        None => view.set(ApiKeyView::Loading),
+    });
+
+    let on_save = {
+        let gate = gate.clone();
+        move |_| {
+            if *saving.read() || *clearing.read() {
+                return;
+            }
+            let key = input.read().trim().to_string();
+            if key.is_empty() {
+                toaster.push(
+                    ToastVariant::Danger,
+                    "Enter an API key first",
+                    None,
+                );
+                return;
+            }
+            saving.set(true);
+            let gate = gate.clone();
+            spawn(async move {
+                match cookie_api::set_youtube_api_key(gate, key).await {
+                    Ok(()) => {
+                        input.set(String::new());
+                        toaster.push(ToastVariant::Success, "YouTube API key saved", None);
+                        reload.with_mut(|n| *n += 1);
+                    }
+                    Err(e) => {
+                        toaster.push(
+                            ToastVariant::Danger,
+                            "Could not save API key",
+                            Some(format_error(&e)),
+                        );
+                    }
+                }
+                saving.set(false);
+            });
+        }
+    };
+
+    let on_clear = {
+        let gate = gate.clone();
+        move |_| {
+            if *saving.read() || *clearing.read() {
+                return;
+            }
+            clearing.set(true);
+            let gate = gate.clone();
+            spawn(async move {
+                match cookie_api::delete_youtube_api_key(gate).await {
+                    Ok(()) => {
+                        toaster.push(ToastVariant::Success, "YouTube API key cleared", None);
+                        reload.with_mut(|n| *n += 1);
+                    }
+                    Err(e) => {
+                        toaster.push(
+                            ToastVariant::Danger,
+                            "Could not clear API key",
+                            Some(format_error(&e)),
+                        );
+                    }
+                }
+                clearing.set(false);
+            });
+        }
+    };
+
+    rsx! {
+        div { class: "card stack-md",
+            div { class: "page-title-block",
+                h2 { "YouTube API key" }
+                p { class: "muted",
+                    "Paste a YouTube Data API v3 key to make !play yt: searches resolve in ~300 ms via the API instead of the slower organic yt-dlp search. Applies process-wide; takes effect immediately, no restart. The stored key is never shown back."
+                }
+            }
+
+            { match view.read().clone() {
+                ApiKeyView::Loading => rsx! {
+                    p { class: "muted", aria_busy: "true", "Loading API key status…" }
+                },
+                ApiKeyView::Error(err) => rsx! {
+                    Banner { variant: BannerVariant::Danger,
+                        title: "Could not load API key status".to_string(),
+                        "{format_error(&err)}"
+                    }
+                },
+                ApiKeyView::Loaded(status) => {
+                    let busy = *saving.read() || *clearing.read();
+                    let status_line = if status.configured {
+                        rsx! { p { class: "settings-status", "Configured ✓" } }
+                    } else {
+                        rsx! { p { class: "muted", "Not set" } }
+                    };
+                    rsx! {
+                        {status_line}
+                        div { class: "form-row",
+                            input {
+                                id: "yt-api-key",
+                                r#type: "password",
+                                class: "input",
+                                placeholder: if status.configured { "Enter a new key to replace" } else { "Paste API key" },
+                                autocomplete: "off",
+                                disabled: busy,
+                                value: "{input}",
+                                oninput: move |evt| input.set(evt.value()),
+                            }
+                        }
+                        div { class: "actions",
+                            Button {
+                                variant: ButtonVariant::Primary,
+                                disabled: busy,
+                                loading: *saving.read(),
+                                onclick: on_save.clone(),
+                                "Save"
+                            }
+                            if status.configured {
+                                Button {
+                                    variant: ButtonVariant::Danger,
+                                    disabled: busy,
+                                    loading: *clearing.read(),
+                                    onclick: on_clear.clone(),
+                                    "Clear"
+                                }
+                            }
+                        }
+                    }
                 }
             } }
         }

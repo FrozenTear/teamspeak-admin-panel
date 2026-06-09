@@ -227,13 +227,25 @@ quota increase in the console, but 10k/day covers typical use.
 
 **Wiring it into the manager:**
 
-1. Set `YOUTUBE_API_KEY=<the key>` in the manager's environment (Quadlet env
-   file or kube `env:` entry — same surface as `YT_COOKIE_FILE` above).
-2. Restart the manager. No DB setting is involved; the env var is read at
-   resolve time.
+Either of two paths — both feed the same live `AppState::yt_api_key`
+slot, so the resolve path is identical:
 
-Treat the key like any other secret — keep it in the env file, not in the
-repo or chat.
+- **`/settings` admin UI (preferred, [THE-948](../../../THE/issues/THE-948)).**
+  Open **Settings → YouTube API key**, paste the key, **Save**. The key
+  persists to `app_setting:youtube_api_key` and takes effect immediately —
+  no restart. **Clear** reverts to the `ytsearch1:` path. This mirrors the
+  cookie-file pattern and is the recommended route for the Podman/Quadlet
+  deploys where editing the container env means a restart. The GET endpoint
+  reports presence only; the stored key is never shown back.
+- **`YOUTUBE_API_KEY` env var (boot seed).** Set
+  `YOUTUBE_API_KEY=<the key>` in the manager's environment (Quadlet env file
+  or kube `env:` entry — same surface as `YT_COOKIE_FILE` above) and restart.
+  This is read once at boot to seed the runtime slot. A key later saved via
+  `/settings` (persisted to `app_setting:youtube_api_key`) takes precedence
+  on the next boot.
+
+Treat the key like any other secret — keep it in the env file or the
+admin-only settings surface, not in the repo or chat.
 
 ## What this crate does not do
 

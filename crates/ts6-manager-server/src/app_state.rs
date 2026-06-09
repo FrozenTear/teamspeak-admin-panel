@@ -88,6 +88,13 @@ pub struct AppState {
     /// track-play time. `Arc<RwLock<…>>` so the route handler can update
     /// it without touching the actors directly.
     pub yt_cookie: Arc<RwLock<Option<PathBuf>>>,
+    /// THE-948 — live-updated YouTube Data API key for the music bot's
+    /// fast-search path (THE-933). Written by
+    /// `PUT /api/settings/youtube-api-key`; read by each bot actor at
+    /// `!play yt:` resolve time. `Arc<RwLock<…>>` so the route handler can
+    /// update it without restarting the bot actors. Seeded at boot from
+    /// `YOUTUBE_API_KEY` (or the persisted `app_setting:youtube_api_key`).
+    pub yt_api_key: Arc<RwLock<Option<String>>>,
     /// PURA-223 — on-disk directory for operator-uploaded files (e.g.
     /// `yt-cookies.txt`). Defaults to `./data`; override with `DATA_DIR`.
     pub data_dir: PathBuf,
@@ -146,6 +153,10 @@ impl AppState {
         // The settings route will replace this at runtime if an operator
         // uploads a cookie via the UI.
         let yt_cookie = Arc::new(RwLock::new(cfg.yt_cookie_file.clone()));
+        // THE-948 — boot-time API key seed: prefer YOUTUBE_API_KEY env var.
+        // The settings route (and the boot reload in main.rs) will replace
+        // this at runtime if an operator saves a key via the UI.
+        let yt_api_key = Arc::new(RwLock::new(cfg.youtube_api_key.clone()));
 
         Self {
             db,
@@ -162,6 +173,7 @@ impl AppState {
             ssrf_resolver,
             moq_public_url: cfg.moq_public_url.clone(),
             yt_cookie,
+            yt_api_key,
             data_dir: cfg.data_dir.clone(),
             trusted_proxy_hops: cfg.trusted_proxy_hops,
         }

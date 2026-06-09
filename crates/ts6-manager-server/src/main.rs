@@ -190,6 +190,15 @@ mod server_entry {
             }
         }
 
+        // THE-948 — if a previous run saved a YouTube API key via the UI,
+        // it was persisted to `app_setting:youtube_api_key`. Prefer that
+        // over the `YOUTUBE_API_KEY` env seed so UI changes survive restarts.
+        if let Ok(Some(row)) = crate::repos::app_settings::get(&database, "youtube_api_key").await {
+            if !row.value.is_empty() {
+                *state.yt_api_key.write().unwrap() = Some(row.value);
+            }
+        }
+
         // PURA-359 — start the persistent yt-dlp resolver service now, at
         // boot, so its one-time `import yt_dlp` cost (~2 s, PURA-355) is
         // paid well before the first `!play` instead of on the critical
@@ -221,7 +230,7 @@ mod server_entry {
                     state
                         .music_bots
                         .supervisor
-                        .spawn_with_id(id, config, state.yt_cookie.clone())
+                        .spawn_with_id(id, config, state.yt_cookie.clone(), state.yt_api_key.clone())
                         .await;
                     state.music_bots.watch(id).await;
                 }

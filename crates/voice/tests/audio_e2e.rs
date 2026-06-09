@@ -123,7 +123,8 @@ async fn run() -> Result<()> {
     // This test plays a `synthetic://` source, so YouTube resolution
     // (the only cookie consumer) is never reached.
     let yt_cookie: Arc<RwLock<Option<std::path::PathBuf>>> = Arc::new(RwLock::new(None));
-    let handle = spawn_bot(BotId(1), config, Arc::clone(&store), yt_cookie);
+    let yt_api_key: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
+    let handle = spawn_bot(BotId(1), config, Arc::clone(&store), yt_cookie, yt_api_key);
     let mut bot_events = handle.subscribe();
 
     let (_, _) = match wait_for_bot_event(&mut bot_events, |ev| match ev {

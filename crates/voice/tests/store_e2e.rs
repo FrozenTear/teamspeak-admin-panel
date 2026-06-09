@@ -71,6 +71,7 @@ async fn enqueue_three_advance_head_restart_restore() {
         config,
         store_a_dyn.clone(),
         std::sync::Arc::new(std::sync::RwLock::new(None)),
+        std::sync::Arc::new(std::sync::RwLock::new(None)),
     );
 
     // Enqueue 3 tracks via the dispatch surface.
@@ -143,6 +144,7 @@ async fn enqueue_emits_queue_changed_and_now_playing_on_first_track() {
         config,
         store.clone(),
         std::sync::Arc::new(std::sync::RwLock::new(None)),
+        std::sync::Arc::new(std::sync::RwLock::new(None)),
     );
     let mut events = handle.subscribe();
 
@@ -209,6 +211,7 @@ async fn advance_emits_now_playing_then_queue_empty_on_drain() {
         id,
         config,
         store.clone(),
+        std::sync::Arc::new(std::sync::RwLock::new(None)),
         std::sync::Arc::new(std::sync::RwLock::new(None)),
     );
     let mut events = handle.subscribe();

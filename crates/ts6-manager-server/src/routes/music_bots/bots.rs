@@ -143,7 +143,9 @@ async fn create(
     config = config.with_server_addr(req.server_addr.clone());
     config = config.with_auto_connect(auto_connect);
 
-    let id = supervisor.spawn(config, state.yt_cookie.clone()).await;
+    let id = supervisor
+        .spawn(config, state.yt_cookie.clone(), state.yt_api_key.clone())
+        .await;
     state.music_bots.watch(id).await;
 
     // PURA-357 — persist the bot's runtime config so it survives a

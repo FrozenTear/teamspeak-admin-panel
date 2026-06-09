@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::client::api::{self, ApiError};
 use crate::client::session::RefreshGate;
@@ -42,6 +42,45 @@ pub async fn get_youtube_cookie_status(gate: Arc<RefreshGate>) -> Result<CookieS
 
 pub async fn delete_youtube_cookie_file(gate: Arc<RefreshGate>) -> Result<(), ApiError> {
     api::authorized_delete(&gate, &api::api_base(), "/api/settings/youtube-cookies").await
+}
+
+/// THE-948 — wire shape returned by `GET /api/settings/youtube-api-key`.
+/// Mirrors `routes::settings::ApiKeyStatus`; never carries the key itself.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiKeyStatus {
+    pub configured: bool,
+}
+
+/// THE-948 — request body for `PUT /api/settings/youtube-api-key`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiKeyUpdate {
+    api_key: String,
+}
+
+pub async fn get_youtube_api_key_status(gate: Arc<RefreshGate>) -> Result<ApiKeyStatus, ApiError> {
+    api::authorized_get_json::<ApiKeyStatus>(
+        &gate,
+        &api::api_base(),
+        "/api/settings/youtube-api-key",
+    )
+    .await
+}
+
+pub async fn set_youtube_api_key(gate: Arc<RefreshGate>, api_key: String) -> Result<(), ApiError> {
+    let body = ApiKeyUpdate { api_key };
+    api::authorized_put_json::<ApiKeyUpdate, ()>(
+        &gate,
+        &api::api_base(),
+        "/api/settings/youtube-api-key",
+        &body,
+    )
+    .await
+}
+
+pub async fn delete_youtube_api_key(gate: Arc<RefreshGate>) -> Result<(), ApiError> {
+    api::authorized_delete(&gate, &api::api_base(), "/api/settings/youtube-api-key").await
 }
 
 /// Upload `file` as a multipart `PUT` to `/api/settings/youtube-cookies`.

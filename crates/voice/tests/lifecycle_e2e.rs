@@ -95,7 +95,8 @@ async fn run() -> Result<()> {
     let store: Arc<dyn MusicBotStore> = Arc::new(InMemoryMusicBotStore::new());
     // `yt_cookie` — PURA-223 live cookie path; `None` disables cookies.
     let yt_cookie: Arc<RwLock<Option<std::path::PathBuf>>> = Arc::new(RwLock::new(None));
-    let handle = spawn_bot(BotId(1), config, store, yt_cookie);
+    let yt_api_key: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
+    let handle = spawn_bot(BotId(1), config, store, yt_cookie, yt_api_key);
     let mut events = handle.subscribe();
 
     // 1. Connected event fires with the default channel.
