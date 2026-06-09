@@ -193,10 +193,10 @@ mod server_entry {
         // THE-948 — if a previous run saved a YouTube API key via the UI,
         // it was persisted to `app_setting:youtube_api_key`. Prefer that
         // over the `YOUTUBE_API_KEY` env seed so UI changes survive restarts.
-        if let Ok(Some(row)) = crate::repos::app_settings::get(&database, "youtube_api_key").await {
-            if !row.value.is_empty() {
-                *state.yt_api_key.write().unwrap() = Some(row.value);
-            }
+        if let Ok(Some(row)) = crate::repos::app_settings::get(&database, "youtube_api_key").await
+            && !row.value.is_empty()
+        {
+            *state.yt_api_key.write().unwrap() = Some(row.value);
         }
 
         // PURA-359 — start the persistent yt-dlp resolver service now, at
