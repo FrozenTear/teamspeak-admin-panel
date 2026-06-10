@@ -434,12 +434,19 @@ async fn sleep_backoff(
     if consecutive_failures > BACKOFF_LADDER_MS.len() {
         return false;
     }
+    *attempt += 1;
+    // THE-983 (AR-5) — a healthy reconnect (`EndedAfterAudio` reset the
+    // failure counter: audio flowed, the URL is proven good) reconnects
+    // immediately. Sleeping ladder[0] here burned 500 ms of the thin
+    // radio runway (ffmpeg's input buffer) on every routine stream drop.
+    if consecutive_failures == 0 {
+        return true;
+    }
     let idx = consecutive_failures
         .saturating_sub(1)
         .min(BACKOFF_LADDER_MS.len() - 1);
     let wait = BACKOFF_LADDER_MS[idx];
     tokio::time::sleep(Duration::from_millis(wait)).await;
-    *attempt += 1;
     true
 }
 
@@ -877,6 +884,44 @@ mod tests {
         assert_eq!(ffmpeg_format_hint("text/html"), None);
         assert_eq!(ffmpeg_format_hint("audio/x-scpls"), None);
         assert_eq!(ffmpeg_format_hint("video/mp4"), None);
+    }
+
+    /// THE-983 (AR-5) — a healthy reconnect (`consecutive_failures == 0`,
+    /// i.e. `EndedAfterAudio` proved the URL good) must not sleep at all;
+    /// a failure still pays the ladder. Paused tokio time makes the
+    /// distinction deterministic: any `sleep` advances the mock clock.
+    #[tokio::test(start_paused = true)]
+    async fn healthy_reconnect_skips_backoff_sleep() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut attempt = 0usize;
+
+        let t0 = tokio::time::Instant::now();
+        assert!(sleep_backoff(0, &tx, "http://radio", &mut attempt).await);
+        assert_eq!(
+            t0.elapsed(),
+            Duration::ZERO,
+            "healthy reconnect slept the ladder instead of reconnecting now",
+        );
+        assert_eq!(attempt, 1, "the immediate reconnect still counts");
+
+        let t1 = tokio::time::Instant::now();
+        assert!(sleep_backoff(1, &tx, "http://radio", &mut attempt).await);
+        assert_eq!(
+            t1.elapsed(),
+            Duration::from_millis(BACKOFF_LADDER_MS[0]),
+            "first failure pays ladder[0]",
+        );
+
+        // Budget exhaustion contract unchanged.
+        assert!(
+            !sleep_backoff(
+                BACKOFF_LADDER_MS.len() + 1,
+                &tx,
+                "http://radio",
+                &mut attempt
+            )
+            .await
+        );
     }
 
     // Smoke for the helper itself — keep simple so a test infrastructure
