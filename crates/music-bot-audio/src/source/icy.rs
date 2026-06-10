@@ -47,7 +47,25 @@ impl IcyRadioSource {
         let client = reqwest::Client::builder()
             .build()
             .map_err(|e| io::Error::other(format!("reqwest build: {e}")))?;
+        let t0 = std::time::Instant::now();
         let (resp, metaint) = open_icy(&client, url).await?;
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        // THE-972 — the connect leg of the `!radio` → first-audio breakdown:
+        // DNS + TCP/TLS + the ICY GET up to response headers. The remaining
+        // legs are `ffmpeg_first_pcm` and `pipeline_first_frame`.
+        tracing::info!(
+            target: "music_bot_latency",
+            stage = "icy_connect",
+            elapsed_ms = t0.elapsed().as_millis() as u64,
+            content_type = %content_type,
+            metaint = ?metaint,
+            "icy stream connected (response headers in)",
+        );
 
         let (inner, ffmpeg_stdin) = FfmpegSource::from_stdin(channels).await?;
         let (event_tx, event_rx) = mpsc::channel::<PipelineEvent>(32);

@@ -42,6 +42,10 @@ scripts/perf-smoke.sh sustained
 
 # Fold in ffmpeg subprocess cold-start (needs `ffmpeg` on PATH).
 scripts/perf-smoke.sh ffmpeg crates/music-bot-audio/tests/fixtures/sine_440_1s_mono_48k.wav
+
+# THE-972 — the real `!radio` (ICY/Icecast) path against a live station.
+# Needs network + ffmpeg. Pick a fixed known-good URL so runs compare.
+scripts/perf-smoke.sh icy "https://ice1.somafm.com/groovesalad-128-mp3"
 ```
 
 Reports land under [`qa-evidence/perf-smoke/`](../../qa-evidence/perf-smoke/)
@@ -64,6 +68,42 @@ cargo run -q --release -p music-bot-audio --bin perf-smoke -- \
 
 Exit code is `0` if every configured budget passed and `1` otherwise — so
 the script can be wired directly into a CI / release-gate step.
+
+## First-frame latency (THE-972)
+
+The `icy` mode measures **resolve → first Opus frame** — the user-visible
+`!radio` → first-audio wait — in two places:
+
+- **`--first-frame-probes N`** (the `icy` driver mode passes 5): before the
+  paced run, the harness spawns the pipeline N times against the same URL,
+  records spawn → first frame per attempt, and tears each probe down. The
+  report carries the raw list plus min / p50 / max under `first_frame`.
+  Probing fresh connections matters because Icecast burst-on-connect and
+  ffmpeg's input probe dominate this number, and both are per-connection.
+- **`first_frame.main_run_ms`** — the same measurement for the run that then
+  feeds the steady-state drift percentiles (every mode reports this).
+
+Stage attribution comes from the `music_bot_latency` tracing target the
+pipeline already carries: `icy_connect` (GET → response headers, with
+`content_type`), `ffmpeg_first_pcm` (subprocess spawn → first decoded PCM,
+i.e. probe + decode), `pipeline_first_frame` (worker spawn → first encoded
+Opus frame). Run with `RUST_LOG=music_bot_latency=info` to see the
+breakdown alongside the JSON report.
+
+`--budget-first-frame-ms` gates on the probe p50 (or the main run's value
+when no probes ran). It defaults to **0 = unchecked** — first-frame latency
+against a live station depends on the station and the path to it, so set
+the budget per fixed URL once a baseline exists rather than globally.
+
+Steady-state pacing jitter for the radio path is the same `drift_ms`
+summary the other modes report; the 12-frame warmup skip absorbs the
+connect/probe spike exactly as it does ffmpeg cold-start. The `icy` driver
+mode passes `--frame-buffer 250 --prebuffer-frames 150` — the music bot's
+own runtime buffering (`crates/voice/src/audio.rs::pipeline_config`) — so
+the drift percentiles measure what the wire would see in production rather
+than the station's TCP chunk cadence against the harness's legacy 16-frame
+leash. Probes always run with `prebuffer_frames = 0`: the watermark is a
+deliberate post-encode hold, not part of resolve → first frame.
 
 ## Synthetic by default, ffmpeg by opt-in
 

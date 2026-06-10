@@ -56,13 +56,29 @@ struct Cli {
 
     /// Source type. `synthetic` removes external-toolchain variance and is
     /// the default. `ffmpeg` shells out to `ffmpeg -i <input>` and is what
-    /// you want when budgets fold in subprocess cold-start.
+    /// you want when budgets fold in subprocess cold-start. `icy` (THE-972)
+    /// runs the real `!radio` path — reqwest ICY GET → splitter → ffmpeg —
+    /// against a live radio URL, folding stream connect + probe into the
+    /// first-frame numbers.
     #[arg(long, value_enum, default_value_t = SourceKind::Synthetic)]
     source: SourceKind,
 
     /// Required when `--source ffmpeg`. Anything ffmpeg `-i` accepts.
     #[arg(long)]
     ffmpeg_input: Option<String>,
+
+    /// Required when `--source icy`. A Shoutcast/Icecast stream URL —
+    /// pick a fixed known-good station so runs stay comparable.
+    #[arg(long)]
+    icy_url: Option<String>,
+
+    /// THE-972 — before the main paced run, spawn the pipeline this many
+    /// extra times and record spawn → first Opus frame per attempt (the
+    /// `!radio` resolve → first-audio path the `music_bot_latency` stage
+    /// logs break down). Each probe is torn down after its first frame.
+    /// 0 = skip.
+    #[arg(long, default_value_t = 0)]
+    first_frame_probes: u32,
 
     /// Opus encoder bitrate.
     #[arg(long, default_value_t = 64_000)]
@@ -71,6 +87,21 @@ struct Cli {
     /// Channels (1 = mono, TS6 default).
     #[arg(long, default_value_t = 1)]
     channels: u8,
+
+    /// Frame channel depth. 16 (legacy harness default) keeps the producer
+    /// on a short leash; the music bot itself runs 250 (5 s runway, see
+    /// `crates/voice/src/audio.rs::pipeline_config`). For network sources,
+    /// pass the bot's values so steady-state drift measures what the wire
+    /// would see rather than upstream chunk cadence.
+    #[arg(long, default_value_t = 16)]
+    frame_buffer: usize,
+
+    /// Pre-buffer watermark (frames held before the pacer anchors). 0 =
+    /// legacy harness behaviour; the music bot runs 150. Applies to the
+    /// main paced run only — first-frame probes always run with 0 so they
+    /// measure resolve → first Opus frame, not watermark fill.
+    #[arg(long, default_value_t = 0)]
+    prebuffer_frames: usize,
 
     /// Where to write the JSON report. Empty = stdout only.
     #[arg(long)]
@@ -109,12 +140,20 @@ struct Cli {
     /// FD growth budget over the run (count). Anything > 0 is suspicious.
     #[arg(long, default_value_t = 0)]
     budget_fd_growth: i64,
+
+    /// First-frame latency budget (ms), checked against the probe p50 when
+    /// `--first-frame-probes` ran, else against the main run's first frame.
+    /// 0 = unchecked — network sources vary too much for one universal
+    /// default; set it per station once a baseline exists.
+    #[arg(long, default_value_t = 0.0)]
+    budget_first_frame_ms: f64,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
 enum SourceKind {
     Synthetic,
     Ffmpeg,
+    Icy,
 }
 
 #[derive(Serialize)]
@@ -130,6 +169,7 @@ struct Report {
     bitrate_bps: i32,
     channels: u8,
     frames: FramesSummary,
+    first_frame: FirstFrameSummary,
     drift_ms: DriftSummary,
     resources: ResourceSummary,
     samples: Vec<ResourceSample>,
@@ -142,6 +182,21 @@ struct FramesSummary {
     expected: u64,
     received: u64,
     warmup_skipped: u64,
+}
+
+/// THE-972 — spawn → first Opus frame latency. For network sources (`icy`)
+/// this folds in connect + ffmpeg probe + first encode, i.e. the user-visible
+/// `!radio` → first-audio wait the `music_bot_latency` stage logs attribute.
+#[derive(Serialize)]
+struct FirstFrameSummary {
+    /// First frame of the main paced run.
+    main_run_ms: f64,
+    /// Per-probe spawn → first frame, in probe order. Empty when
+    /// `--first-frame-probes 0`.
+    probes_ms: Vec<f64>,
+    probe_min_ms: f64,
+    probe_p50_ms: f64,
+    probe_max_ms: f64,
 }
 
 #[derive(Serialize)]
@@ -183,6 +238,9 @@ struct BudgetTable {
     cpu_percent: BudgetCheck,
     rss_growth_percent: BudgetCheck,
     fd_growth: BudgetCheck,
+    /// THE-972 — absent when `--budget-first-frame-ms 0` (unchecked).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_frame_ms: Option<BudgetCheck>,
 }
 
 #[derive(Serialize)]
@@ -215,18 +273,58 @@ async fn main() -> Result<()> {
                 .context("--ffmpeg-input is required when --source ffmpeg")?;
             AudioSourceSpec::Ffmpeg { input }
         }
+        SourceKind::Icy => {
+            let url = cli
+                .icy_url
+                .clone()
+                .context("--icy-url is required when --source icy")?;
+            AudioSourceSpec::IcyRadio { url }
+        }
     };
 
     let cfg = PipelineConfig {
         channels: cli.channels,
         bitrate_bps: Some(cli.bitrate),
         application: OpusApplication::Audio,
-        frame_buffer: 16,
-        prebuffer_frames: 0,
+        frame_buffer: cli.frame_buffer,
+        prebuffer_frames: cli.prebuffer_frames.min(cli.frame_buffer),
         event_buffer: 16,
         yt_cookie_file: None,
     };
 
+    // THE-972 — first-frame probes: spawn → first Opus frame, torn down
+    // straight after. Run *before* the main paced run so a station's
+    // burst-on-connect behaviour is sampled fresh per attempt.
+    let mut probes_ms: Vec<f64> = Vec::with_capacity(cli.first_frame_probes as usize);
+    // Probes measure resolve → first Opus frame, so the pre-buffer watermark
+    // (a deliberate hold) is forced to 0 regardless of the main run's value.
+    let probe_cfg = PipelineConfig {
+        prebuffer_frames: 0,
+        ..cfg.clone()
+    };
+    for probe in 0..cli.first_frame_probes {
+        let t0 = Instant::now();
+        let mut p = AudioPipeline::spawn(
+            spec.clone(),
+            probe_cfg.clone(),
+            music_bot_audio::VolumeHandle::default(),
+        )
+        .await
+        .context("AudioPipeline::spawn (probe)")?;
+        let mut probe_frames = p.take_frames();
+        match probe_frames.recv().await {
+            Some(_) => {
+                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                info!(probe, first_frame_ms = ms, "first-frame probe");
+                probes_ms.push(ms);
+            }
+            None => warn!(probe, "first-frame probe yielded no frame"),
+        }
+        drop(probe_frames);
+        p.shutdown().await;
+    }
+
+    let spawn_t0 = Instant::now();
     let mut pipeline = AudioPipeline::spawn(spec, cfg, music_bot_audio::VolumeHandle::default())
         .await
         .context("AudioPipeline::spawn")?;
@@ -281,7 +379,13 @@ async fn main() -> Result<()> {
     let mut drift_ms: Vec<f64> =
         Vec::with_capacity((cli.duration_seconds * FRAMES_PER_SECOND) as usize);
     let mut received: u64 = 0;
+    let mut main_first_frame_ms = 0.0_f64;
     while let Some(frame) = frames.recv().await {
+        if received == 0 {
+            // Before the pacer sleep — spawn → first frame *available*.
+            main_first_frame_ms = spawn_t0.elapsed().as_secs_f64() * 1000.0;
+            info!(first_frame_ms = main_first_frame_ms, "main-run first frame");
+        }
         let now = Instant::now();
         if frame.scheduled_at > now {
             tokio::time::sleep_until(frame.scheduled_at.into()).await;
@@ -323,6 +427,25 @@ async fn main() -> Result<()> {
 
     let resource_summary = summarize_resources(&samples);
 
+    let first_frame = {
+        let mut sorted = probes_ms.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        FirstFrameSummary {
+            main_run_ms: main_first_frame_ms,
+            probe_min_ms: sorted.first().copied().unwrap_or(0.0),
+            probe_p50_ms: percentile(&sorted, 50.0),
+            probe_max_ms: sorted.last().copied().unwrap_or(0.0),
+            probes_ms,
+        }
+    };
+    // Budget anchor: probe p50 when probes ran (stable against one slow
+    // connect), else the main run's single sample.
+    let first_frame_actual = if first_frame.probes_ms.is_empty() {
+        first_frame.main_run_ms
+    } else {
+        first_frame.probe_p50_ms
+    };
+
     let budgets = BudgetTable {
         drift_p99_ms: BudgetCheck {
             budget: cli.budget_drift_p99_ms,
@@ -349,12 +472,18 @@ async fn main() -> Result<()> {
             actual: resource_summary.fd_growth as f64,
             pass: resource_summary.fd_growth <= cli.budget_fd_growth,
         },
+        first_frame_ms: (cli.budget_first_frame_ms > 0.0).then_some(BudgetCheck {
+            budget: cli.budget_first_frame_ms,
+            actual: first_frame_actual,
+            pass: first_frame_actual <= cli.budget_first_frame_ms,
+        }),
     };
     let pass = budgets.drift_p99_ms.pass
         && budgets.drift_max_ms.pass
         && budgets.cpu_percent.pass
         && budgets.rss_growth_percent.pass
-        && budgets.fd_growth.pass;
+        && budgets.fd_growth.pass
+        && budgets.first_frame_ms.as_ref().is_none_or(|b| b.pass);
 
     let report = Report {
         schema_version: 1,
@@ -370,6 +499,7 @@ async fn main() -> Result<()> {
                 "ffmpeg:{}",
                 cli.ffmpeg_input.as_deref().unwrap_or("<missing>")
             ),
+            SourceKind::Icy => format!("icy:{}", cli.icy_url.as_deref().unwrap_or("<missing>")),
         },
         bitrate_bps: cli.bitrate,
         channels: cli.channels,
@@ -378,6 +508,7 @@ async fn main() -> Result<()> {
             received,
             warmup_skipped,
         },
+        first_frame,
         drift_ms: drift_summary,
         resources: resource_summary,
         samples,

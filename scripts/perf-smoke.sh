@@ -6,6 +6,8 @@
 #   scripts/perf-smoke.sh quick       # 60 s synthetic-tone smoke (CI gate)
 #   scripts/perf-smoke.sh sustained   # 1800 s synthetic-tone sustained-load
 #   scripts/perf-smoke.sh ffmpeg <input>   # 60 s with real ffmpeg source
+#   scripts/perf-smoke.sh icy <url>   # THE-972: 60 s real ICY radio path +
+#                                     # 5 first-frame probes (needs network)
 #
 # Builds the release binary the first time, then runs it. Writes a JSON
 # report to qa-evidence/perf-smoke/<utc>.json and stamps PERF_SMOKE_GIT_SHA
@@ -61,6 +63,25 @@ case "$MODE" in
             --duration-seconds 60
             --source ffmpeg
             --ffmpeg-input "$INPUT"
+            --output "$OUT"
+        )
+        ;;
+    icy)
+        # THE-972 — the real `!radio` path against a live station. First-frame
+        # latency folds in network connect + ffmpeg probe, so it is measured
+        # over 5 fresh probe connections (p50 in the report) before the
+        # steady-state pacing run.
+        URL="${1:?need icy stream URL as second arg}"
+        ARGS=(
+            --duration-seconds 60
+            --source icy
+            --icy-url "$URL"
+            --first-frame-probes 5
+            # The bot's runtime buffering (crates/voice/src/audio.rs) — the
+            # steady-state drift then measures what the wire would see, not
+            # the station's chunk cadence. Probes ignore the prebuffer.
+            --frame-buffer 250
+            --prebuffer-frames 150
             --output "$OUT"
         )
         ;;
