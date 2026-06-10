@@ -814,14 +814,28 @@ fn spawn_sibling(
         // the attribution `frame_underrun` and `dequeue_gap` both miss.
         let mut pacer = PacerMonitor::new();
 
+        // THE-982 (AR-1) — total time spent parked on pause across the whole
+        // play. The pipeline pacer's `scheduled_at` anchor never moves (it is
+        // fixed once at prebuffer flush), so after a pause every backlogged
+        // frame's raw slot is already in the past and an un-shifted
+        // `sleep_until` would return instantly for ~pause-duration/20 ms
+        // frames — a multi-second catch-up burst the TS server's jitter
+        // buffer plays as stutter/crackle. Shifting every slot by the
+        // accumulated pause keeps the 20 ms cadence across resumes (and
+        // stops the `frames_sent`-based progress clock fast-forwarding by
+        // the pause duration).
+        let mut paused_total = Duration::ZERO;
+
         loop {
             // Park while paused. `changed()` wakes on every flip,
             // including pause→pause (we just re-loop and re-check).
             while *pause_rx.borrow() {
+                let parked_at = std::time::Instant::now();
                 if pause_rx.changed().await.is_err() {
                     // Bot dropped the sender — clean exit.
                     return;
                 }
+                paused_total += parked_at.elapsed();
             }
             tokio::select! {
                 biased;
@@ -836,8 +850,11 @@ fn spawn_sibling(
                         // instantly, well ahead of `scheduled_at`).
                         let buffered = frames_rx.len();
                         let recv_at = std::time::Instant::now();
-                        let lateness =
-                            recv_at.saturating_duration_since(f.scheduled_at);
+                        // THE-982 — every slot is paced against the
+                        // pause-shifted schedule; the raw `scheduled_at`
+                        // stops being meaningful once playback has parked.
+                        let slot = f.scheduled_at + paused_total;
+                        let lateness = recv_at.saturating_duration_since(slot);
                         monitor.observe(f.index, buffered, lateness);
                         // Wall-clock pacing. The pipeline encodes far faster
                         // than real-time and only the small bounded frame
@@ -846,22 +863,19 @@ fn spawn_sibling(
                         // onto the wire in bursts and the TS server's jitter
                         // buffer plays them choppy and laggy (PURA-314). The
                         // pacer's `scheduled_at` is the drift-free
-                        // `first-frame anchor + index * 20 ms`; `sleep_until`
-                        // returns immediately once that slot is in the past.
+                        // `first-frame anchor + index * 20 ms` (plus the
+                        // THE-982 pause shift); `sleep_until` returns
+                        // immediately once that slot is in the past.
                         tokio::time::sleep_until(tokio::time::Instant::from_std(
-                            f.scheduled_at,
+                            slot,
                         ))
                         .await;
                         // PURA-408b — the paced `sleep_until` is meant to
-                        // return exactly at `scheduled_at`; sample how far
+                        // return exactly at the shifted slot; sample how far
                         // past it the sibling task actually woke. `recv_at`
                         // tells the monitor whether this frame genuinely
                         // slept or its slot had already passed.
-                        pacer.observe(
-                            f.scheduled_at,
-                            recv_at,
-                            std::time::Instant::now(),
-                        );
+                        pacer.observe(slot, recv_at, std::time::Instant::now());
                         // PURA-389a — stamp the hand-off instant so the
                         // connected loop's send path can measure how long
                         // this frame waited for the audio arm to be polled.
@@ -1452,6 +1466,100 @@ mod tests {
             span >= Duration::from_millis(120),
             "frames arrived within {span:?} — expected real-time pacing (~180 ms for \
              {frame_count} frames), not an unpaced burst",
+        );
+    }
+
+    /// THE-982 (AR-1) regression — a pause must shift every later frame's
+    /// pacing slot by the measured pause duration. Before the fix the
+    /// sibling kept pacing against the pipeline pacer's original
+    /// first-frame anchor, so on resume every backlogged frame's
+    /// `scheduled_at` was already in the past and ~pause-duration/20 ms
+    /// frames were blasted onto the wire in a catch-up burst (the TS
+    /// jitter buffer rendered it as stutter/crackle, and the
+    /// `frames_sent`-based progress clock fast-forwarded by the pause).
+    /// Post-resume frames must keep the 20 ms cadence — none forwarded
+    /// ahead of its shifted slot.
+    #[tokio::test]
+    async fn sibling_shifts_pacing_across_pause() {
+        let mut pipeline = AudioPipeline::spawn(
+            AudioSourceSpec::SyntheticTone {
+                hz: 440.0,
+                amplitude: 0.5,
+                duration_ms: Some(300),
+            },
+            PipelineConfig::default(),
+            VolumeHandle::default(),
+        )
+        .await
+        .expect("spawn synthetic pipeline");
+        let frames_rx = pipeline.take_frames();
+        let events_rx = pipeline.events();
+        let (pause_tx, pause_rx) = watch::channel(false);
+        let (msg_tx, mut msg_rx) = mpsc::channel(256);
+
+        let sibling = spawn_sibling(pipeline, frames_rx, events_rx, pause_rx, msg_tx);
+
+        // Let a few frames flow, then pause ≥2 s mid-play. The 300 ms tone
+        // is ~15 frames, so plenty remain backlogged across the pause.
+        let mut pre_pause = 0usize;
+        while pre_pause < 3 {
+            match msg_rx.recv().await.expect("stream alive before pause") {
+                AudioMsg::Frame { .. } => pre_pause += 1,
+                AudioMsg::Finished => panic!("tone finished before the pause"),
+                AudioMsg::PipelineEvent(_) => {}
+            }
+        }
+        pause_tx.send(true).expect("sibling holds pause_rx");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        pause_tx.send(false).expect("sibling holds pause_rx");
+        let resumed_at = std::time::Instant::now();
+
+        // One in-flight frame may have been sleeping in its slot when the
+        // pause flipped — it lands during the pause window and is not a
+        // post-resume frame. Everything received after `resumed_at` must be
+        // paced; collect arrival instants.
+        let mut post = Vec::new();
+        while let Some(msg) = msg_rx.recv().await {
+            match msg {
+                AudioMsg::Frame { .. } => {
+                    let now = std::time::Instant::now();
+                    if now >= resumed_at {
+                        post.push(now);
+                    }
+                }
+                AudioMsg::Finished => break,
+                AudioMsg::PipelineEvent(_) => {}
+            }
+        }
+        sibling.await.expect("sibling task join");
+
+        assert!(
+            post.len() >= 8,
+            "most of the ~15-frame tone should still be backlogged at \
+             resume, got {} post-resume frames",
+            post.len(),
+        );
+        // No frame ahead of its shifted slot: the i-th post-resume frame's
+        // slot is ≥ i * 20 ms after the first one's, and `sleep_until`
+        // never wakes early — allow a small slack for the receive loop.
+        for (i, at) in post.iter().enumerate() {
+            let min_offset =
+                Duration::from_millis(20 * i as u64).saturating_sub(Duration::from_millis(10));
+            let offset = at.duration_since(post[0]);
+            assert!(
+                offset >= min_offset,
+                "post-resume frame {i} arrived {offset:?} after the first — \
+                 ahead of its shifted slot (≥{min_offset:?}); catch-up burst",
+            );
+        }
+        // And the whole post-resume tail must span real time, not a burst.
+        let span = post.last().unwrap().duration_since(post[0]);
+        let expected = Duration::from_millis(20) * (post.len() as u32 - 1);
+        assert!(
+            span >= expected.mul_f32(0.66),
+            "{} post-resume frames spanned {span:?} — expected ~{expected:?} \
+             of 20 ms pacing, not a catch-up burst",
+            post.len(),
         );
     }
 
