@@ -92,6 +92,37 @@ pub(crate) fn apply_gain(pcm: &mut [i16], gain: f32) {
     }
 }
 
+/// THE-983 (AR-3) — apply a gain *ramp* to one interleaved PCM frame in
+/// place, lerping from `from` to `to` across the frame's channel strides.
+/// A flat per-frame multiplier puts a step discontinuity on the waveform
+/// at every `!vol` / slider move — audible as a click. Spreading the change
+/// across the 20 ms frame keeps it inaudible. All `channels` samples of one
+/// stride get the same gain so the ramp never skews the stereo image; the
+/// last stride lands exactly on `to`, so the next frame's flat
+/// [`apply_gain`] continues seamlessly.
+pub(crate) fn apply_gain_ramp(pcm: &mut [i16], from: f32, to: f32, channels: u8) {
+    let stride = channels.max(1) as usize;
+    let strides = pcm.len() / stride;
+    if (from - to).abs() <= f32::EPSILON || strides < 2 {
+        return apply_gain(pcm, to);
+    }
+    let last = strides - 1;
+    let step = (to - from) / last as f32;
+    for (i, frame) in pcm.chunks_mut(stride).enumerate() {
+        // Pin the last stride to `to` exactly — `from + step * last` can
+        // round 1 ulp off in f32 and put a residual step on the frame seam.
+        let gain = if i == last {
+            to
+        } else {
+            from + step * i as f32
+        };
+        for sample in frame {
+            let scaled = *sample as f32 * gain;
+            *sample = scaled.clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,6 +183,47 @@ mod tests {
         let mut pcm = [i16::MIN, -1, 1, i16::MAX];
         apply_gain(&mut pcm, 0.0);
         assert_eq!(pcm, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn ramp_is_monotonic_and_lands_on_target() {
+        // Constant-amplitude mono frame: the output must trace the ramp.
+        let mut pcm = [10_000i16; 100];
+        apply_gain_ramp(&mut pcm, 1.0, 0.0, 1);
+        assert_eq!(pcm[0], 10_000, "first sample starts at `from`");
+        assert_eq!(pcm[99], 0, "last sample lands exactly on `to`");
+        for w in pcm.windows(2) {
+            assert!(w[1] <= w[0], "fade-down must be monotonic: {w:?}");
+        }
+        // No flat-multiplier step: adjacent samples differ by ~from-to/99.
+        let max_step = pcm.windows(2).map(|w| (w[0] - w[1]).abs()).max().unwrap();
+        assert!(max_step <= 102, "step discontinuity in ramp: {max_step}");
+    }
+
+    #[test]
+    fn ramp_applies_equal_gain_per_stereo_stride() {
+        // L = 8000, R = -4000 interleaved; the L/R ratio must be preserved
+        // at every stride — a per-sample (not per-stride) ramp would skew
+        // the stereo image.
+        let mut pcm = [8000i16, -4000].repeat(48);
+        apply_gain_ramp(&mut pcm, 1.0, 0.5, 2);
+        for pair in pcm.chunks(2) {
+            // f32→i16 truncation costs <1 LSB per channel, so the exact
+            // 2:1 ratio holds to within 2 LSB at every stride.
+            let skew = (pair[0] as i32 + 2 * pair[1] as i32).abs();
+            assert!(skew <= 2, "L/R ratio skewed by {skew}: {pair:?}");
+        }
+        assert_eq!(&pcm[..2], &[8000, -4000], "first stride at `from`");
+        assert_eq!(&pcm[94..], &[4000, -2000], "last stride at `to`");
+    }
+
+    #[test]
+    fn ramp_with_equal_endpoints_is_flat_apply() {
+        let mut ramped = [-1000i16, 2000, 4000];
+        let mut flat = ramped;
+        apply_gain_ramp(&mut ramped, 0.5, 0.5, 1);
+        apply_gain(&mut flat, 0.5);
+        assert_eq!(ramped, flat, "no-change frame degrades to flat gain");
     }
 
     #[test]

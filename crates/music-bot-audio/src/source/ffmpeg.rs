@@ -29,6 +29,12 @@ pub struct FfmpegSource {
     spawned_at: std::time::Instant,
     /// PURA-330 — set once the first non-empty PCM read has been logged.
     first_pcm_logged: bool,
+    /// THE-983 (AR-2) — bytes left over from the previous read that did not
+    /// fill a whole channel stride (2 bytes × channels). Holds 0..stride−1
+    /// bytes; prepended to the next read so a short write landing on an odd
+    /// byte boundary can never tear i16 alignment (full-scale static) or
+    /// shift the interleave by one sample (permanent L/R swap on stereo).
+    carry: Vec<u8>,
 }
 
 impl FfmpegSource {
@@ -107,6 +113,7 @@ impl FfmpegSource {
             events: Vec::new(),
             spawned_at: std::time::Instant::now(),
             first_pcm_logged: false,
+            carry: Vec::new(),
         })
     }
 
@@ -210,6 +217,7 @@ impl FfmpegSource {
                 events: Vec::new(),
                 spawned_at: std::time::Instant::now(),
                 first_pcm_logged: false,
+                carry: Vec::new(),
             },
             stdin,
         ))
@@ -238,33 +246,69 @@ impl Drop for FfmpegSource {
     }
 }
 
+/// THE-983 (AR-2) — read s16le bytes from `reader` into `buf`, returning
+/// only whole *channel strides* (2 bytes × `channels`, i.e. one interleaved
+/// sample per channel). Bytes past the last whole stride go into `carry`
+/// and are prepended on the next call, so a short read landing on an odd
+/// byte boundary (EINTR-style short pipe write) can never tear i16
+/// alignment mid-stream, and a stride-odd boundary can never shift the
+/// stereo interleave (permanent L/R swap). A sub-stride tail at EOF is
+/// discarded — it can never be completed (ffmpeg died mid-sample).
+///
+/// Cancel-safe: `carry` is only rewritten after the reads complete, so a
+/// future dropped mid-await leaves it holding the same bytes for a re-read.
+async fn read_whole_strides<R>(
+    reader: &mut R,
+    carry: &mut Vec<u8>,
+    channels: u8,
+    buf: &mut [i16],
+) -> io::Result<usize>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let stride = 2 * channels.max(1) as usize;
+    let bytes_wanted = buf.len() * 2;
+    // The pipeline always asks for whole frames (≥ 960 samples); a buffer
+    // smaller than one stride could only return `Ok(0)`, which the caller
+    // reads as EOF.
+    debug_assert!(bytes_wanted >= stride + carry.len(), "buf too small");
+    let mut byte_buf = vec![0u8; bytes_wanted];
+    byte_buf[..carry.len()].copy_from_slice(carry);
+    let mut filled = carry.len();
+    let mut eof = false;
+    while filled < bytes_wanted {
+        match reader.read(&mut byte_buf[filled..]).await? {
+            0 => {
+                eof = true;
+                break;
+            }
+            n => filled += n,
+        }
+        // Read at least one full stride before yielding back so callers
+        // see whole interleaved samples. If we already have ≥ 1 stride and
+        // the read hit a short window (typical for piped ffmpeg), fall
+        // through and let the caller decide whether to ask for more.
+        if filled >= stride {
+            break;
+        }
+    }
+    let whole_bytes = filled - filled % stride;
+    carry.clear();
+    if !eof {
+        carry.extend_from_slice(&byte_buf[whole_bytes..filled]);
+    }
+    let whole_samples = whole_bytes / 2;
+    for i in 0..whole_samples {
+        buf[i] = i16::from_le_bytes([byte_buf[i * 2], byte_buf[i * 2 + 1]]);
+    }
+    Ok(whole_samples)
+}
+
 #[async_trait]
 impl PcmSource for FfmpegSource {
     async fn read_samples(&mut self, buf: &mut [i16]) -> io::Result<usize> {
-        // Read whole `i16` little-endian samples. We may receive a partial
-        // sample at the very end of stdout — round down to the previous whole
-        // sample boundary and discard the trailing odd byte (ffmpeg shouldn't
-        // produce one, but treat it defensively).
-        let bytes_wanted = buf.len() * 2;
-        let mut byte_buf = vec![0u8; bytes_wanted];
-        let mut filled = 0usize;
-        while filled < bytes_wanted {
-            match self.stdout.read(&mut byte_buf[filled..]).await? {
-                0 => break, // EOF
-                n => filled += n,
-            }
-            // Read at least one full sample before yielding back so callers
-            // see whole frames. If we already have ≥ 1 sample and the read
-            // hit a short window (typical for piped ffmpeg), fall through
-            // and let the caller decide whether to ask for more.
-            if filled >= 2 {
-                break;
-            }
-        }
-        let whole_samples = filled / 2;
-        for i in 0..whole_samples {
-            buf[i] = i16::from_le_bytes([byte_buf[i * 2], byte_buf[i * 2 + 1]]);
-        }
+        let whole_samples =
+            read_whole_strides(&mut self.stdout, &mut self.carry, self.channels, buf).await?;
         // PURA-330 — log time-to-first-PCM once. This is the boundary
         // between "ffmpeg has the input + finished probing" and "decoded
         // audio is flowing"; attributing the `!play` latency needs it.
@@ -282,5 +326,108 @@ impl PcmSource for FfmpegSource {
 
     fn try_drain_events(&mut self) -> Vec<PipelineEvent> {
         std::mem::take(&mut self.events)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    /// An `AsyncRead` that hands out its script at most `chunk` bytes per
+    /// poll — a deterministic stand-in for a pipe delivering short writes
+    /// on odd byte boundaries (THE-983 AR-2 repro).
+    struct OddChunkReader {
+        data: Vec<u8>,
+        pos: usize,
+        chunk: usize,
+    }
+
+    impl tokio::io::AsyncRead for OddChunkReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let remaining = self.data.len() - self.pos;
+            let n = self.chunk.min(remaining).min(buf.remaining());
+            buf.put_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// s16le-encode a ramp of `count` i16 samples starting at `start`.
+    fn ramp_bytes(start: i16, count: usize) -> (Vec<i16>, Vec<u8>) {
+        let samples: Vec<i16> = (0..count as i16).map(|i| start + i).collect();
+        let bytes = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+        (samples, bytes)
+    }
+
+    /// Drain `reader` through `read_whole_strides` until EOF, asserting every
+    /// intermediate return is stride-aligned.
+    async fn drain(reader: &mut OddChunkReader, channels: u8) -> Vec<i16> {
+        let mut carry = Vec::new();
+        let mut out = Vec::new();
+        let mut buf = [0i16; 64];
+        loop {
+            let n = read_whole_strides(reader, &mut carry, channels, &mut buf)
+                .await
+                .expect("read");
+            if n == 0 {
+                break;
+            }
+            assert_eq!(
+                n % channels as usize,
+                0,
+                "read returned a torn channel stride",
+            );
+            out.extend_from_slice(&buf[..n]);
+        }
+        assert!(carry.is_empty(), "carry must be drained at EOF");
+        out
+    }
+
+    /// Mono, 3-byte chunks: every read crosses an i16 boundary. The legacy
+    /// `filled >= 2` early break dropped the odd trailing byte and statics
+    /// the rest of the stream; the carry must reassemble the ramp exactly.
+    #[tokio::test]
+    async fn odd_chunks_keep_i16_alignment_mono() {
+        let (samples, bytes) = ramp_bytes(-100, 40);
+        let mut reader = OddChunkReader {
+            data: bytes,
+            pos: 0,
+            chunk: 3,
+        };
+        assert_eq!(drain(&mut reader, 1).await, samples);
+    }
+
+    /// Stereo, 5-byte chunks: every read crosses a channel stride (4 bytes).
+    /// Without stride tracking the interleave shifts by one sample — a
+    /// permanent L/R swap. The carry must hold sub-stride tails back.
+    #[tokio::test]
+    async fn odd_chunks_keep_channel_stride_stereo() {
+        let (samples, bytes) = ramp_bytes(1000, 48);
+        let mut reader = OddChunkReader {
+            data: bytes,
+            pos: 0,
+            chunk: 5,
+        };
+        assert_eq!(drain(&mut reader, 2).await, samples);
+    }
+
+    /// A torn trailing byte at EOF (ffmpeg killed mid-sample) is discarded;
+    /// every whole sample before it survives.
+    #[tokio::test]
+    async fn torn_tail_at_eof_is_discarded() {
+        let (samples, mut bytes) = ramp_bytes(7, 10);
+        bytes.push(0xAB); // half an i16 that can never complete
+        let mut reader = OddChunkReader {
+            data: bytes,
+            pos: 0,
+            chunk: 7,
+        };
+        assert_eq!(drain(&mut reader, 1).await, samples);
     }
 }

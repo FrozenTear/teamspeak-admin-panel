@@ -15,7 +15,7 @@ use crate::source::{
     AudioSourceSpec, FfmpegSource, IcyRadioSource, PcmSource, SyntheticToneSource, YtDlpSource,
 };
 use crate::types::{OpusFrame, PipelineConfig, PipelineError, PipelineEvent};
-use crate::volume::{VolumeHandle, apply_gain};
+use crate::volume::{VolumeHandle, apply_gain, apply_gain_ramp};
 
 /// The handle WS-1 talks to. Drop = cancel.
 pub struct AudioPipeline {
@@ -91,6 +91,10 @@ impl AudioPipeline {
             // padded with silence at EOF.
             let mut pcm: Vec<i16> = Vec::with_capacity(samples_per_frame * 2);
             let channels = encoder.channels();
+            // THE-983 (AR-3) — the gain the previous frame ended on. A `!vol`
+            // / slider move is ramped from this to the new target across the
+            // change frame instead of stepping (a step is an audible click).
+            let mut prev_gain = volume.get();
             let mut eof = false;
             loop {
                 // Fill `pcm` until we have at least one frame or EOF.
@@ -139,7 +143,18 @@ impl AudioPipeline {
                 // PCM before the Opus encode. Read once per frame so a
                 // mid-track slider move is picked up on the next 20 ms
                 // boundary; unity gain is a no-op fast path.
-                apply_gain(&mut frame_pcm, volume.get());
+                //
+                // THE-983 (AR-3) — on the frame where the gain *changes*,
+                // lerp from the previous frame's gain to the target across
+                // the frame so the move is click-free; steady-state frames
+                // keep the flat (unity-fast-path) apply.
+                let target_gain = volume.get();
+                if (target_gain - prev_gain).abs() > f32::EPSILON {
+                    apply_gain_ramp(&mut frame_pcm, prev_gain, target_gain, channels);
+                } else {
+                    apply_gain(&mut frame_pcm, target_gain);
+                }
+                prev_gain = target_gain;
                 let opus = match encoder.encode_frame(&frame_pcm) {
                     Ok(b) => b,
                     Err(e) => {
