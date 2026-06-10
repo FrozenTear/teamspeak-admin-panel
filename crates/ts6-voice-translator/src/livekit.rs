@@ -347,17 +347,37 @@ fn spawn_audio_subscriber(
         let mut opus_out = vec![0u8; 4096];
         let mut frame_window: Vec<i16> = Vec::with_capacity(FRAME_SAMPLES * 2);
         let mut frames_published = 0u64;
+        // THE-981 (AR-11) — count format-mismatch drops and surface them at
+        // WARN. Each dropped frame is 100 % silent audio loss on the bridge;
+        // the old debug!-only line meant an SDK update or remote-track
+        // reconfiguration delivering 16 kHz / stereo would mute the bridge
+        // with no operator-visible evidence. WARN on the first drop and
+        // every 500 thereafter (~10 s of audio) so a sustained mismatch is
+        // loud in logs without flooding them.
+        let mut format_drops = 0u64;
 
         while let Some(frame) = stream.next().await {
             // The SDK sometimes delivers frames at sample rates other than
             // what we asked for (typical when libwebrtc resamples internally
             // before the sink). Skip such frames; we ask for 48 kHz mono.
             if frame.sample_rate != SAMPLE_RATE_HZ || frame.num_channels != 1 {
-                debug!(
-                    sample_rate = frame.sample_rate,
-                    num_channels = frame.num_channels,
-                    "dropping LiveKit frame with unexpected format"
-                );
+                format_drops += 1;
+                if format_drops == 1 || format_drops.is_multiple_of(500) {
+                    warn!(
+                        identity = %identity,
+                        sample_rate = frame.sample_rate,
+                        num_channels = frame.num_channels,
+                        format_drops,
+                        "dropping LiveKit frame with unexpected format — \
+                         bridge audio from this track is being lost"
+                    );
+                } else {
+                    debug!(
+                        sample_rate = frame.sample_rate,
+                        num_channels = frame.num_channels,
+                        "dropping LiveKit frame with unexpected format"
+                    );
+                }
                 continue;
             }
             frame_window.extend_from_slice(&frame.data);

@@ -33,6 +33,13 @@ const SAMPLE_RATE_HZ: u32 = 48_000;
 const FRAME_MS: u32 = 20;
 const FRAME_SAMPLES: usize = (SAMPLE_RATE_HZ / 1_000 * FRAME_MS) as usize; // 960
 const MAX_OPUS_FRAME: usize = 4_000;
+/// THE-981 (AR-10) — decode-buffer size for *inbound* packets. Opus legally
+/// carries up to 120 ms per packet and the codec filter admits stereo
+/// `OpusMusic`, so the receive side must size for the worst case
+/// (120 ms × 48 kHz × 2 ch = 11 520 samples), not our own 20 ms mono send
+/// frame — a real TS6 client sending 40/60/120 ms frames otherwise failed
+/// decode with buffer-too-small.
+const MAX_DECODE_SAMPLES: usize = (SAMPLE_RATE_HZ as usize / 1_000) * 120 * 2;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -326,15 +333,27 @@ fn handle_event(item: StreamItem, stem: &Path, sinks: &mut HashMap<u16, RecvSink
                     v.insert(RecvSink::new(from, stem)?)
                 }
             };
-            let mut pcm = vec![0i16; FRAME_SAMPLES];
-            let opus_pkt = Packet::try_from(opus)
-                .map_err(|e| anyhow!("audiopus Packet::try_from failed: {e}"))?;
+            // THE-981 (AR-10) — decode failures are logged and skipped, not
+            // propagated: a single malformed Opus packet from any peer used
+            // to `?`-abort the entire prototype run. Buffer sized for the
+            // largest legal packet (120 ms stereo), not our 20 ms send frame.
+            let mut pcm = vec![0i16; MAX_DECODE_SAMPLES];
+            let opus_pkt = match Packet::try_from(opus) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(from, %e, "skipping undecodable packet (Packet::try_from)");
+                    return Ok(());
+                }
+            };
             let signals = MutSignals::try_from(&mut pcm[..])
                 .map_err(|e| anyhow!("audiopus MutSignals::try_from failed: {e}"))?;
-            let n = sink
-                .decoder
-                .decode(Some(opus_pkt), signals, false)
-                .map_err(|e| anyhow!("opus decode failed: {e}"))?;
+            let n = match sink.decoder.decode(Some(opus_pkt), signals, false) {
+                Ok(n) => n,
+                Err(e) => {
+                    warn!(from, %e, "skipping packet that failed Opus decode");
+                    return Ok(());
+                }
+            };
             for sample in &pcm[..n] {
                 sink.writer.write_sample(*sample)?;
             }
