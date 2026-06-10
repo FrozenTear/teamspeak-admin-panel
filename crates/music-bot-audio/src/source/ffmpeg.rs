@@ -114,12 +114,45 @@ impl FfmpegSource {
     /// source plus the writable stdin end so the caller can pipe arbitrary
     /// bytes (e.g. yt-dlp output, ICY-stripped radio body) into ffmpeg.
     pub async fn from_stdin(channels: u8) -> io::Result<(Self, tokio::process::ChildStdin)> {
+        Self::from_stdin_with_hint(channels, None).await
+    }
+
+    /// THE-972 — [`from_stdin`](Self::from_stdin) with an optional input
+    /// *format hint*: an ffmpeg demuxer name (`"mp3"`, `"aac"`, `"ogg"`,
+    /// `"flac"`) passed as `-f <fmt>` before `-i pipe:0`.
+    ///
+    /// What the hint buys is a much smaller **start-up read**: before the
+    /// first PCM byte, ffmpeg consumes probe + stream-analysis input, and
+    /// under the PURA-330 caps (256 KB probe / 1 s analysis) that is
+    /// ~18 KB of a 128 kbps radio stream — measured against a live ICY
+    /// station, where bytes trickle in at TCP-slow-start pace, that read
+    /// alone holds first PCM back by one or two round trips. With the
+    /// demuxer named there is nothing to probe and a 200 ms analysis
+    /// window is plenty for codec parameters (the measured floor is ~3 KB
+    /// — a handful of frames — for mp3/aac elementary streams), so the
+    /// caps drop to 32 KB / 200 ms and first PCM rides the first burst.
+    /// Callers that cannot trust their container knowledge (the yt-dlp
+    /// path) pass `None` and keep the PURA-330 caps unchanged.
+    pub async fn from_stdin_with_hint(
+        channels: u8,
+        format_hint: Option<&str>,
+    ) -> io::Result<(Self, tokio::process::ChildStdin)> {
         let mut cmd = Command::new("ffmpeg");
         cmd.kill_on_drop(true)
             .arg("-hide_banner")
             .arg("-loglevel")
             .arg("error")
-            .arg("-nostdin")
+            .arg("-nostdin");
+        match format_hint {
+            // THE-972 — named demuxer: no probe, short analysis (see above).
+            Some(fmt) => {
+                cmd.arg("-probesize")
+                    .arg("32k")
+                    .arg("-analyzeduration")
+                    .arg("200000")
+                    .arg("-f")
+                    .arg(fmt);
+            }
             // PURA-330 — cap container probing on the piped yt-dlp stream.
             // ffmpeg's defaults (5 MB probesize / 5 s analyzeduration) make
             // it buffer and inspect several seconds of input before it
@@ -127,11 +160,14 @@ impl FfmpegSource {
             // (a single webm/opus or m4a/aac elementary stream) a fraction
             // of that is plenty to detect the format. This trims dead time
             // from `!play` → first-audio without affecting decode quality.
-            .arg("-probesize")
-            .arg("256k")
-            .arg("-analyzeduration")
-            .arg("1000000")
-            .arg("-i")
+            None => {
+                cmd.arg("-probesize")
+                    .arg("256k")
+                    .arg("-analyzeduration")
+                    .arg("1000000");
+            }
+        }
+        cmd.arg("-i")
             .arg("pipe:0")
             .arg("-vn")
             .arg("-f")

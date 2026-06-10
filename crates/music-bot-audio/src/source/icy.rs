@@ -55,19 +55,29 @@ impl IcyRadioSource {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        // THE-972 — the connect leg of the `!radio` → first-audio breakdown:
-        // DNS + TCP/TLS + the ICY GET up to response headers. The remaining
-        // legs are `ffmpeg_first_pcm` and `pipeline_first_frame`.
+        // THE-972 — the ICY response names the codec up front, so hand
+        // ffmpeg the matching demuxer instead of letting it probe the pipe.
+        // The named demuxer shrinks ffmpeg's start-up read from ~18 KB to
+        // ~3 KB (probe skipped, analysis window cut), which on a live
+        // stream still ramping through TCP slow start is worth one or two
+        // round trips of `!radio` → first-audio latency. Unknown / missing
+        // Content-Type falls back to the probing path.
+        let format_hint = ffmpeg_format_hint(&content_type);
+        // The connect leg of the `!radio` → first-audio breakdown: DNS +
+        // TCP/TLS + the ICY GET up to response headers. The remaining legs
+        // are `ffmpeg_first_pcm` and `pipeline_first_frame`.
         tracing::info!(
             target: "music_bot_latency",
             stage = "icy_connect",
             elapsed_ms = t0.elapsed().as_millis() as u64,
             content_type = %content_type,
+            format_hint = format_hint.unwrap_or("none"),
             metaint = ?metaint,
             "icy stream connected (response headers in)",
         );
 
-        let (inner, ffmpeg_stdin) = FfmpegSource::from_stdin(channels).await?;
+        let (inner, ffmpeg_stdin) =
+            FfmpegSource::from_stdin_with_hint(channels, format_hint).await?;
         let (event_tx, event_rx) = mpsc::channel::<PipelineEvent>(32);
         let url_owned = url.to_string();
 
@@ -141,6 +151,33 @@ pub(crate) async fn open_icy(
         .map_err(|e| io::Error::other(format!("icy http status: {e}")))?;
     let metaint = parse_metaint(&resp);
     Ok((resp, metaint))
+}
+
+/// THE-972 — map an ICY response `Content-Type` to the ffmpeg demuxer that
+/// reads it, for [`FfmpegSource::from_stdin_with_hint`].
+///
+/// Exact-match only, against the MIME types Icecast/Shoutcast actually
+/// serve — a hint that names the *wrong* demuxer is worse than no hint
+/// (ffmpeg would reject every frame instead of probing its way to the
+/// truth), so anything unrecognised returns `None` and keeps the probing
+/// path. The `mp3` demuxer covers all MPEG audio layers, matching the
+/// `audio/mpeg` registration; `audio/aacp` is the de-facto Shoutcast type
+/// for ADTS AAC; Ogg-contained codecs (vorbis, opus, flac-in-ogg) all ride
+/// the `ogg` demuxer.
+fn ffmpeg_format_hint(content_type: &str) -> Option<&'static str> {
+    let ct = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    match ct.as_str() {
+        "audio/mpeg" | "audio/mp3" | "audio/x-mpeg" => Some("mp3"),
+        "audio/aac" | "audio/aacp" | "audio/x-aac" => Some("aac"),
+        "application/ogg" | "audio/ogg" | "audio/x-ogg" | "audio/opus" => Some("ogg"),
+        "audio/flac" | "audio/x-flac" => Some("flac"),
+        _ => None,
+    }
 }
 
 fn parse_metaint(resp: &reqwest::Response) -> Option<usize> {
@@ -822,6 +859,24 @@ mod tests {
             "expected empty-body terminal warning, got: {collected:?}"
         );
         assert!(buf.lock().unwrap().is_empty(), "no audio expected");
+    }
+
+    /// THE-972 — Content-Type → demuxer hint mapping. Parameters and
+    /// unknown types must stay conservative: a wrong hint breaks decode
+    /// outright, so anything unrecognised maps to `None` (probe).
+    #[test]
+    fn content_type_maps_to_demuxer_hint() {
+        assert_eq!(ffmpeg_format_hint("audio/mpeg"), Some("mp3"));
+        assert_eq!(ffmpeg_format_hint("audio/mpeg; charset=UTF-8"), Some("mp3"));
+        assert_eq!(ffmpeg_format_hint("Audio/MPEG"), Some("mp3"));
+        assert_eq!(ffmpeg_format_hint("audio/aacp"), Some("aac"));
+        assert_eq!(ffmpeg_format_hint("application/ogg"), Some("ogg"));
+        assert_eq!(ffmpeg_format_hint("audio/flac"), Some("flac"));
+        // Unknown / absent / suspicious → probe, never guess.
+        assert_eq!(ffmpeg_format_hint(""), None);
+        assert_eq!(ffmpeg_format_hint("text/html"), None);
+        assert_eq!(ffmpeg_format_hint("audio/x-scpls"), None);
+        assert_eq!(ffmpeg_format_hint("video/mp4"), None);
     }
 
     // Smoke for the helper itself — keep simple so a test infrastructure
