@@ -21,23 +21,26 @@ URL / file / radio
 └──────────────────┘                 │    │
                                      ▼    │
                             ┌───────────────────┐
-                            │ OpusFrameEncoder  │   audiopus
-                            │ 20 ms / 48 kHz    │   (libopus 1.x)
-                            └───────────────────┘
-                                     │ Opus packet
-                                     ▼
-                            ┌───────────────────┐
                             │  WallClockPacer   │   scheduled_at = start
                             │   drift-free      │     + i × 20 ms
                             └───────────────────┘
                                      │
                   ┌──────────────────┴──────────────────┐
                   │                                     │
-                  ▼ frames (mpsc<OpusFrame>)            ▼ events (broadcast<…>)
+                  ▼ frames (mpsc<PcmFrame>)             ▼ events (broadcast<…>)
             WS-1 bot worker                       WS-1 / REST / FE-PAGES
-            sends OutAudio::C2S                   NowPlaying / EndOfStream
-            on tsclientlib                        / Warning
+            GainStage (!vol) →                    NowPlaying / EndOfStream
+            OpusFrameEncoder →                    / Warning
+            OutAudio::C2S on tsclientlib
 ```
+
+THE-986 — gain + Opus encode happen on the **consumer** side of the frame
+channel (the voice crate's audio sibling owns `GainStage` +
+`OpusFrameEncoder` and runs both at dequeue). The pipeline worker emits
+paced raw-PCM frames. Rationale: the channel buffers ≈ 5 s on fast sources;
+gain applied at produce time made a `!vol` move audible only after that
+backlog drained. Cost: the channel holds PCM (≈ 480 kB/playing bot mono at
+the 250-frame depth — see `PCM_FRAME_BYTES_MONO`) instead of ~75 kB of Opus.
 
 ## Format decision: `ffmpeg` over `symphonia`
 
@@ -61,18 +64,25 @@ let mut pipeline = AudioPipeline::spawn(
     PipelineConfig::default(),  // mono, 64 kbps, OpusApplication::Audio
 ).await?;
 
-let mut frames = pipeline.take_frames();          // mpsc<OpusFrame>
+let mut frames = pipeline.take_frames();          // mpsc<PcmFrame>
 let mut events = pipeline.events();               // broadcast<PipelineEvent>
 
-while let Some(frame) = frames.recv().await {
+// THE-986 — the consumer owns gain + encode (build both from the same
+// PipelineConfig as the pipeline so the frame layouts agree).
+let mut encoder = music_bot_audio::OpusFrameEncoder::new(&cfg)?;
+let mut gain = music_bot_audio::GainStage::new(volume_handle);
+
+while let Some(mut frame) = frames.recv().await {
+    gain.apply(&mut frame.samples, frame.channels);   // !vol, ≤ 1–2 frame latency
+    let opus = encoder.encode_frame(&frame.samples)?; // ~100 µs
     tokio::time::sleep_until(frame.scheduled_at.into()).await;
-    // wrap `frame.bytes` in an OutAudio::C2S { codec: OpusVoice, .. } and
+    // wrap `opus` in an OutAudio::C2S { codec: OpusVoice, .. } and
     // hand to `tsclientlib::Connection::send_audio(...)`.
 }
 pipeline.shutdown().await;
 ```
 
-`OpusFrame.scheduled_at` is the only thing WS-1 needs to honour for jitter-free wire transmission. The pacer is drift-free: `frame[i].scheduled_at == frame[0].scheduled_at + i × 20 ms`, exactly.
+`PcmFrame.scheduled_at` is the only thing WS-1 needs to honour for jitter-free wire transmission. The pacer is drift-free: `frame[i].scheduled_at == frame[0].scheduled_at + i × 20 ms`, exactly.
 
 ## Sources
 
@@ -249,7 +259,7 @@ admin-only settings surface, not in the repo or chat.
 
 ## What this crate does not do
 
-- TS6 wire transmission — that's WS-1's job. The pipeline only produces `OpusFrame { bytes, scheduled_at, … }`.
+- TS6 wire transmission — that's WS-1's job. The pipeline only produces `PcmFrame { samples, scheduled_at, … }`; the consumer applies gain and encodes (THE-986).
 - Queue / playlist / library — owned by [PURA-121](../../../PURA/issues/PURA-121) (WS-3). The pipeline plays one source at a time and exits at EOF; chaining sources is a higher-level concern.
 - `!play` / `!stop` chat commands — owned by WS-4.
 - REST endpoints — owned by WS-5.

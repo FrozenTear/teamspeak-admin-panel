@@ -2,13 +2,14 @@
 //!
 //! The music-bot dashboard's volume slider and the `!vol` chat command both
 //! lower into a single linear-gain multiplier applied to PCM samples just
-//! before the Opus encode. A [`VolumeHandle`] is an `Arc`-backed, lock-free
-//! cell: the bot actor owns the canonical handle, hands a clone to each
-//! [`AudioPipeline`](crate::AudioPipeline) it spawns, and `set`s it from the
-//! REST / chat surfaces. Because every pipeline the bot spawns shares the
-//! *same* handle, a volume change takes effect on the current track
-//! immediately, is inherited by every later track, and survives a
-//! reconnect — all without extra plumbing or a DB round-trip.
+//! before the Opus encode — on the *consumer* side of the frame channel
+//! (THE-986, via [`GainStage`]). A [`VolumeHandle`] is an `Arc`-backed,
+//! lock-free cell: the bot actor owns the canonical handle, hands a clone to
+//! each play's consumer-side gain stage, and `set`s it from the REST / chat
+//! surfaces. Because every play shares the *same* handle, a volume change
+//! takes effect on the current track within ≤ 1–2 frames, is inherited by
+//! every later track, and survives a reconnect — all without extra plumbing
+//! or a DB round-trip.
 //!
 //! ## Unit
 //!
@@ -64,6 +65,49 @@ impl Default for VolumeHandle {
     /// the source's native level.
     fn default() -> Self {
         Self::new(UNITY_GAIN)
+    }
+}
+
+/// THE-986 — per-play gain stage, applied by the *consumer* at frame
+/// dequeue. Tracks the gain the previous frame ended on and applies either
+/// the flat (unity-fast-path) gain or the THE-983 (AR-3) click-free ramp on
+/// the frame where the gain changes.
+///
+/// This used to live in the pipeline worker at encode time, which put every
+/// `!vol` / slider move behind the frame channel's in-flight backlog — ≈ 5 s
+/// on fast (yt-dlp / file) sources whose channel runs full, near-instant on
+/// radio. At the dequeue side the move is audible within ≤ 1–2 frames,
+/// uniform across source types. The THE-988 soft-knee limiter lands in this
+/// stage too.
+pub struct GainStage {
+    handle: VolumeHandle,
+    /// THE-983 (AR-3) — the gain the previous frame ended on; a change is
+    /// lerped from this to the new target across the change frame instead
+    /// of stepping (a step is an audible click).
+    prev_gain: f32,
+}
+
+impl GainStage {
+    /// Build a stage reading from `handle`. The first frame starts from the
+    /// handle's *current* gain, so a volume set before playback applies
+    /// flat rather than ramping from unity.
+    pub fn new(handle: VolumeHandle) -> Self {
+        let prev_gain = handle.get();
+        Self { handle, prev_gain }
+    }
+
+    /// Apply the operator's current gain to one interleaved PCM frame in
+    /// place. Read once per frame so a mid-track move is picked up on the
+    /// next 20 ms boundary; steady-state frames take the flat apply, the
+    /// change frame is ramped.
+    pub fn apply(&mut self, pcm: &mut [i16], channels: u8) {
+        let target = self.handle.get();
+        if (target - self.prev_gain).abs() > f32::EPSILON {
+            apply_gain_ramp(pcm, self.prev_gain, target, channels);
+        } else {
+            apply_gain(pcm, target);
+        }
+        self.prev_gain = target;
     }
 }
 
@@ -224,6 +268,49 @@ mod tests {
         apply_gain_ramp(&mut ramped, 0.5, 0.5, 1);
         apply_gain(&mut flat, 0.5);
         assert_eq!(ramped, flat, "no-change frame degrades to flat gain");
+    }
+
+    /// THE-986 — steady-state frames take the flat apply: two frames at an
+    /// unchanged gain come out identical to a plain [`apply_gain`].
+    #[test]
+    fn gain_stage_steady_state_is_flat() {
+        let handle = VolumeHandle::new(0.5);
+        let mut stage = GainStage::new(handle);
+        for _ in 0..2 {
+            let mut staged = [-1000i16, 2000, 4000];
+            let mut flat = staged;
+            stage.apply(&mut staged, 1);
+            apply_gain(&mut flat, 0.5);
+            assert_eq!(staged, flat, "steady-state frame is the flat apply");
+        }
+    }
+
+    /// THE-986 — the frame where the gain changes is ramped from the
+    /// previous frame's gain (THE-983 AR-3), and the following frame is
+    /// flat at the new target.
+    #[test]
+    fn gain_stage_ramps_on_change_then_settles() {
+        let handle = VolumeHandle::default();
+        let mut stage = GainStage::new(handle.clone());
+        // Unity frame — untouched.
+        let mut frame = [10_000i16; 100];
+        stage.apply(&mut frame, 1);
+        assert_eq!(frame, [10_000i16; 100], "unity steady state is bit-exact");
+        // Cut to silence: the change frame ramps 1.0 → 0.0 across its
+        // strides instead of stepping.
+        handle.set(0.0);
+        let mut change = [10_000i16; 100];
+        stage.apply(&mut change, 1);
+        assert_eq!(change[0], 10_000, "ramp starts at the previous gain");
+        assert_eq!(change[99], 0, "ramp lands exactly on the target");
+        assert!(
+            change.windows(2).all(|w| w[1] <= w[0]),
+            "fade-down must be monotonic",
+        );
+        // Next frame is flat at the new target.
+        let mut settled = [10_000i16; 100];
+        stage.apply(&mut settled, 1);
+        assert_eq!(settled, [0i16; 100], "post-change frame is flat at target");
     }
 
     #[test]

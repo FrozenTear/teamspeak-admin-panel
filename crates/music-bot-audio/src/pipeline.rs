@@ -1,25 +1,30 @@
-//! Pipeline glue — wires `PcmSource → OpusFrameEncoder → WallClockPacer →
-//! mpsc<OpusFrame>`. The worker task lives until the source EOFs or the
-//! frame consumer drops.
+//! Pipeline glue — wires `PcmSource → WallClockPacer → mpsc<PcmFrame>`.
+//! The worker task lives until the source EOFs or the frame consumer drops.
+//!
+//! THE-986 — the worker no longer applies gain or encodes: it emits paced
+//! *PCM* frames and the consumer (the voice crate's audio sibling) owns the
+//! [`OpusFrameEncoder`](crate::encoder::OpusFrameEncoder) + gain stage at
+//! dequeue. Gain used to be applied here at encode time, so a `!vol` move
+//! only became audible after the channel's in-flight encoded frames drained
+//! — ≈ 5 s on fast (yt-dlp / file) sources, near-instant on radio.
 
 use std::time::Instant;
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
-use crate::encoder::OpusFrameEncoder;
 use crate::pacer::WallClockPacer;
 use crate::source::{
     AudioSourceSpec, FfmpegSource, IcyRadioSource, PcmSource, SyntheticToneSource, YtDlpSource,
 };
-use crate::types::{OpusFrame, PipelineConfig, PipelineError, PipelineEvent};
-use crate::volume::{VolumeHandle, apply_gain, apply_gain_ramp};
+use crate::types::{
+    PcmFrame, PipelineConfig, PipelineError, PipelineEvent, SAMPLES_PER_FRAME_MONO,
+};
 
 /// The handle WS-1 talks to. Drop = cancel.
 pub struct AudioPipeline {
-    frames_rx: Option<mpsc::Receiver<OpusFrame>>,
+    frames_rx: Option<mpsc::Receiver<PcmFrame>>,
     events_tx: broadcast::Sender<PipelineEvent>,
     worker: Option<JoinHandle<()>>,
 }
@@ -27,16 +32,7 @@ pub struct AudioPipeline {
 impl AudioPipeline {
     /// Spawn the pipeline. The frame receiver is taken once via
     /// [`take_frames`]; events can be subscribed to repeatedly.
-    ///
-    /// `volume` is the shared output-gain handle (PURA-351) — the caller
-    /// keeps a clone and `set`s it from the REST / chat surfaces; the
-    /// worker reads it once per frame and scales the PCM before encode.
-    /// Pass [`VolumeHandle::default`] for unity-gain pass-through.
-    pub async fn spawn(
-        spec: AudioSourceSpec,
-        cfg: PipelineConfig,
-        volume: VolumeHandle,
-    ) -> Result<Self, PipelineError> {
+    pub async fn spawn(spec: AudioSourceSpec, cfg: PipelineConfig) -> Result<Self, PipelineError> {
         // PURA-358 — wrap the spec in a `LazySource` instead of resolving
         // it here. Source bring-up (yt-dlp resolution of a YouTube URL is
         // ~5 s) used to run on this `await`; the music bot's connected
@@ -47,27 +43,32 @@ impl AudioPipeline {
         // `read_samples`, which already runs off the connected loop, so
         // this call now returns in microseconds.
         let source: Box<dyn PcmSource> = Box::new(LazySource::new(spec, cfg.clone()));
-        Self::spawn_with_source(source, cfg, volume)
+        Self::spawn_with_source(source, cfg)
     }
 
     /// Construct a pipeline from a caller-built source. Useful for tests
     /// (synthetic source) and for sources WS-1 wants to inject directly.
-    /// See [`spawn`](Self::spawn) for the `volume` handle contract.
     pub fn spawn_with_source(
         mut source: Box<dyn PcmSource>,
         cfg: PipelineConfig,
-        volume: VolumeHandle,
     ) -> Result<Self, PipelineError> {
-        let mut encoder = OpusFrameEncoder::new(&cfg)?;
-        let (frames_tx, frames_rx) = mpsc::channel::<OpusFrame>(cfg.frame_buffer);
+        // THE-986 — the encoder moved to the consumer, but the channel
+        // layout is still pinned here: it sizes the frames and stamps each
+        // one so the consumer-side `OpusFrameEncoder` (built from the same
+        // config) always sees a full frame of the layout it expects.
+        if !matches!(cfg.channels, 1 | 2) {
+            return Err(PipelineError::InvalidChannels(cfg.channels));
+        }
+        let (frames_tx, frames_rx) = mpsc::channel::<PcmFrame>(cfg.frame_buffer);
         let (events_tx, _) = broadcast::channel::<PipelineEvent>(cfg.event_buffer);
         let events_pub = events_tx.clone();
 
         let prebuffer_target = cfg.prebuffer_frames;
+        let channels = cfg.channels;
         let worker = tokio::spawn(async move {
             // PURA-330 — anchor for the per-stage latency log: time from
-            // worker spawn to the first encoded Opus frame covers the whole
-            // source bring-up (yt-dlp + ffmpeg) plus the first encode.
+            // worker spawn to the first full PCM frame covers the whole
+            // source bring-up (yt-dlp + ffmpeg).
             let worker_t0 = Instant::now();
             let mut first_frame_logged = false;
             // The pacer is anchored on the *first forwarded frame*, not on
@@ -79,22 +80,17 @@ impl AudioPipeline {
             // track (PURA-314).
             //
             // PURA-329 — the worker also pre-buffers: it holds the first
-            // `prebuffer_target` encoded frames before anchoring the pacer, so
+            // `prebuffer_target` PCM frames before anchoring the pacer, so
             // the paced consumer starts draining against an already-filled
             // channel and a transient producer stall during start-up cannot
             // immediately underrun the wire.
             let mut pacer: Option<WallClockPacer> = None;
-            let mut prebuffer: Vec<Bytes> = Vec::with_capacity(prebuffer_target);
-            let samples_per_frame = encoder.samples_per_frame();
+            let mut prebuffer: Vec<Vec<i16>> = Vec::with_capacity(prebuffer_target);
+            let samples_per_frame = SAMPLES_PER_FRAME_MONO * channels as usize;
             // PCM accumulator — holds samples that crossed a `read_samples`
             // boundary. We always emit whole frames; partial leftovers are
             // padded with silence at EOF.
             let mut pcm: Vec<i16> = Vec::with_capacity(samples_per_frame * 2);
-            let channels = encoder.channels();
-            // THE-983 (AR-3) — the gain the previous frame ended on. A `!vol`
-            // / slider move is ramped from this to the new target across the
-            // change frame instead of stepping (a step is an audible click).
-            let mut prev_gain = volume.get();
             let mut eof = false;
             loop {
                 // Fill `pcm` until we have at least one frame or EOF.
@@ -138,45 +134,25 @@ impl AudioPipeline {
                 if pcm.len() < samples_per_frame {
                     pcm.resize(samples_per_frame, 0);
                 }
-                let mut frame_pcm: Vec<i16> = pcm.drain(..samples_per_frame).collect();
-                // PURA-351 — apply the operator's output gain to the raw
-                // PCM before the Opus encode. Read once per frame so a
-                // mid-track slider move is picked up on the next 20 ms
-                // boundary; unity gain is a no-op fast path.
-                //
-                // THE-983 (AR-3) — on the frame where the gain *changes*,
-                // lerp from the previous frame's gain to the target across
-                // the frame so the move is click-free; steady-state frames
-                // keep the flat (unity-fast-path) apply.
-                let target_gain = volume.get();
-                if (target_gain - prev_gain).abs() > f32::EPSILON {
-                    apply_gain_ramp(&mut frame_pcm, prev_gain, target_gain, channels);
-                } else {
-                    apply_gain(&mut frame_pcm, target_gain);
-                }
-                prev_gain = target_gain;
-                let opus = match encoder.encode_frame(&frame_pcm) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        let _ = events_pub.send(PipelineEvent::Warning(format!("encode: {e}")));
-                        continue;
-                    }
-                };
+                // THE-986 — no gain, no encode: the raw PCM frame ships to
+                // the consumer, which applies the operator's gain (incl.
+                // the THE-983 AR-3 click-free ramp) and encodes at dequeue.
+                let frame_pcm: Vec<i16> = pcm.drain(..samples_per_frame).collect();
                 if !first_frame_logged {
                     first_frame_logged = true;
                     tracing::info!(
                         target: "music_bot_latency",
                         stage = "pipeline_first_frame",
                         elapsed_ms = worker_t0.elapsed().as_millis() as u64,
-                        "pipeline encoded first Opus frame (pre-buffering begins)",
+                        "pipeline produced first PCM frame (pre-buffering begins)",
                     );
                 }
                 let drained = eof && pcm.is_empty();
                 match &mut pacer {
                     Some(pacer) => {
                         let (index, scheduled_at) = pacer.tick();
-                        let frame = OpusFrame {
-                            bytes: opus,
+                        let frame = PcmFrame {
+                            samples: frame_pcm,
                             index,
                             scheduled_at,
                             channels,
@@ -191,7 +167,7 @@ impl AudioPipeline {
                         // pacer and flush once the watermark is reached, or
                         // immediately if the source drained first (track
                         // shorter than the watermark).
-                        prebuffer.push(opus);
+                        prebuffer.push(frame_pcm);
                         if prebuffer.len() >= prebuffer_target || drained {
                             tracing::info!(
                                 target: "music_bot_latency",
@@ -230,7 +206,7 @@ impl AudioPipeline {
     }
 
     /// Take the frame receiver. Panics if called twice.
-    pub fn take_frames(&mut self) -> mpsc::Receiver<OpusFrame> {
+    pub fn take_frames(&mut self) -> mpsc::Receiver<PcmFrame> {
         self.frames_rx
             .take()
             .expect("AudioPipeline::take_frames called twice")
@@ -258,15 +234,15 @@ impl Drop for AudioPipeline {
 /// frame consumer has gone away — the worker treats that as its cancel
 /// signal.
 async fn flush_prebuffer(
-    prebuffer: &mut Vec<Bytes>,
+    prebuffer: &mut Vec<Vec<i16>>,
     pacer: &mut WallClockPacer,
-    frames_tx: &mpsc::Sender<OpusFrame>,
+    frames_tx: &mpsc::Sender<PcmFrame>,
     channels: u8,
 ) -> bool {
-    for bytes in prebuffer.drain(..) {
+    for samples in prebuffer.drain(..) {
         let (index, scheduled_at) = pacer.tick();
-        let frame = OpusFrame {
-            bytes,
+        let frame = PcmFrame {
+            samples,
             index,
             scheduled_at,
             channels,
@@ -493,8 +469,9 @@ mod tests {
         assert!(lazy.spec.is_none(), "spec cleared once resolved");
     }
 
-    /// Pipeline drains the synthetic source and emits valid Opus frames with
-    /// drift-free `scheduled_at` indices. Pure logic — no wall-clock waits.
+    /// THE-986 (ported pacer test) — pipeline drains the synthetic source
+    /// and emits full *PCM* frames with drift-free `scheduled_at` indices.
+    /// Pure logic — no wall-clock waits.
     #[tokio::test]
     async fn synthetic_emits_frames_with_paced_schedule() {
         let cfg = PipelineConfig::default();
@@ -505,14 +482,13 @@ mod tests {
                 duration_ms: Some(200),
             },
             cfg,
-            VolumeHandle::default(),
         )
         .await
         .expect("spawn");
         let mut frames = pipeline.take_frames();
         let mut events = pipeline.events();
 
-        let mut collected: Vec<OpusFrame> = Vec::new();
+        let mut collected: Vec<PcmFrame> = Vec::new();
         while let Some(f) = frames.recv().await {
             collected.push(f);
         }
@@ -520,11 +496,31 @@ mod tests {
         // 200 ms at 20 ms cadence = 10 frames.
         assert_eq!(collected.len(), 10, "10 frames for 200 ms");
 
-        // Indices monotonic from 0.
+        // Indices monotonic from 0; every frame is a full 20 ms of PCM.
         for (i, f) in collected.iter().enumerate() {
             assert_eq!(f.index as usize, i);
-            assert!(!f.bytes.is_empty(), "non-empty Opus packet");
+            assert_eq!(f.channels, 1, "default config is mono");
+            assert_eq!(
+                f.samples.len(),
+                SAMPLES_PER_FRAME_MONO,
+                "every emitted frame is exactly one full 20 ms frame",
+            );
         }
+        // THE-986 — the worker no longer applies gain: the PCM must be the
+        // source's *un-gained* output. A 0.5-amplitude tone peaks at
+        // ~0.5 × i16::MAX; any worker-side scaling would shift this.
+        let peak = collected
+            .iter()
+            .flat_map(|f| f.samples.iter())
+            .map(|s| (*s as i32).abs())
+            .max()
+            .unwrap();
+        let expected = (0.5 * i16::MAX as f32) as i32;
+        assert!(
+            (peak - expected).abs() <= expected / 50,
+            "pipeline PCM must be un-gained source output: peak {peak}, \
+             expected ≈{expected}",
+        );
         // scheduled_at offsets are exact (drift-free).
         let start = collected[0].scheduled_at;
         for (i, f) in collected.iter().enumerate() {
@@ -559,7 +555,6 @@ mod tests {
                 duration_ms: None, // infinite
             },
             cfg,
-            VolumeHandle::default(),
         )
         .await
         .expect("spawn");
@@ -628,9 +623,7 @@ mod tests {
             prebuffer_frames: PREBUFFER,
             ..PipelineConfig::default()
         };
-        let mut pipeline =
-            AudioPipeline::spawn_with_source(Box::new(source), cfg, VolumeHandle::default())
-                .expect("spawn");
+        let mut pipeline = AudioPipeline::spawn_with_source(Box::new(source), cfg).expect("spawn");
         let mut frames = pipeline.take_frames();
 
         // First frame marks playback start; the pre-buffer is full by now.

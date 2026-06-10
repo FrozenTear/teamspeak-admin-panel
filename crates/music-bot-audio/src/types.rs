@@ -3,8 +3,6 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
-
 /// Opus voice frames are pinned to 48 kHz per RFC 7587 / TS6 §19.10.
 pub const SAMPLE_RATE_HZ: u32 = 48_000;
 
@@ -12,19 +10,35 @@ pub const SAMPLE_RATE_HZ: u32 = 48_000;
 /// on for live TS6 transmission.
 pub const SAMPLES_PER_FRAME_MONO: usize = (SAMPLE_RATE_HZ as usize / 1000) * 20;
 
+/// THE-986 — heap bytes one mono [`PcmFrame`] holds (960 × `i16` ≈ 1.9 kB;
+/// double for stereo). The frame channel buffers *PCM* now, not encoded
+/// Opus: the music bot's 250-frame channel holds ≈ 480 kB of PCM per
+/// playing bot (mono; ≈ 960 kB stereo) versus ~75 kB encoded — the
+/// deliberate price for moving gain + encode to the consumer side of the
+/// buffer, which bounds `!vol` latency to ≤ 1–2 frames instead of the full
+/// channel backlog (≈ 5 s on fast sources).
+pub const PCM_FRAME_BYTES_MONO: usize = SAMPLES_PER_FRAME_MONO * std::mem::size_of::<i16>();
+
 /// Wall-clock duration of a single Opus frame.
 pub const fn frame_duration() -> Duration {
     Duration::from_millis(20)
 }
 
-/// One paced Opus frame ready for `tsclientlib`'s `OutAudio::new(AudioData::C2S {…})`.
+/// One paced 20 ms PCM frame, ready for the consumer-side gain + Opus
+/// encode.
+///
+/// THE-986 — the pipeline used to emit *encoded* `OpusFrame`s, with gain
+/// applied at encode time in the worker; a `!vol` move then sat behind the
+/// in-flight frames in the channel (≈ 5 s on fast sources) before becoming
+/// audible. Emitting PCM and letting the consumer apply gain + encode at
+/// dequeue makes volume latency uniform across source types.
 #[derive(Debug, Clone)]
-pub struct OpusFrame {
-    /// Raw Opus packet bytes (no TS6 voice header — WS-1 wraps it). Backed
-    /// by a `Bytes` slice carved from the encoder's reused `BytesMut`
-    /// scratch — see [`crate::encoder::OpusFrameEncoder::encode_frame`] for
-    /// the per-frame ownership contract.
-    pub bytes: Bytes,
+pub struct PcmFrame {
+    /// Interleaved 48 kHz s16le PCM — exactly one 20 ms frame
+    /// (`SAMPLES_PER_FRAME_MONO * channels` samples; an EOF-short tail is
+    /// silence-padded by the worker, so the consumer's encoder always sees
+    /// a full frame).
+    pub samples: Vec<i16>,
     /// Monotonic frame index, starting at 0.
     pub index: u64,
     /// `Instant` the frame was *intended* to play at, derived from the pipeline
@@ -32,8 +46,8 @@ pub struct OpusFrame {
     /// emit time. WS-1 sleeps the difference between this and the live clock
     /// before pushing the frame on the wire.
     pub scheduled_at: Instant,
-    /// PCM channel count the encoder was configured with (1 or 2). TS6 voice
-    /// is conventionally mono; stereo is supported for archival / WS-7 paths.
+    /// PCM channel count (1 or 2). TS6 voice is conventionally mono; stereo
+    /// is supported for archival / WS-7 paths.
     pub channels: u8,
 }
 
@@ -66,6 +80,9 @@ pub struct PipelineConfig {
     /// stall longer than `frame_buffer * 20 ms` empties the channel and gaps
     /// the wire — audible crackle (PURA-329). Size it for the worst expected
     /// network / ffmpeg hiccup: the music bot uses 100 frames (2 s).
+    /// THE-986 — each buffered frame is PCM ([`PCM_FRAME_BYTES_MONO`] per
+    /// channel), so depth now costs ~25× more memory than the encoded-Opus
+    /// era; see the constant for the per-bot figure.
     pub frame_buffer: usize,
     /// Pre-buffer watermark (PURA-329). The pipeline worker holds the first
     /// `prebuffer_frames` encoded frames before it anchors the pacer and

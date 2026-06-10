@@ -1,7 +1,10 @@
 //! Music-bot audio pipeline — PURA-117 WS-2 ([PURA-119]).
 //!
-//! Pulls a source URL, decodes to 48 kHz s16le PCM, encodes Opus 20 ms frames,
-//! paces them at wall-clock 20 ms cadence, and surfaces ICY metadata events.
+//! Pulls a source URL, decodes to 48 kHz s16le PCM, paces 20 ms PCM frames
+//! at wall-clock cadence, and surfaces ICY metadata events. The *consumer*
+//! applies gain and encodes Opus at dequeue (THE-986 — keeps `!vol` latency
+//! to ≤ 1–2 frames instead of the frame-channel backlog) via the exported
+//! [`GainStage`] + [`OpusFrameEncoder`].
 //!
 //! Lives in its own crate so [PURA-118] (WS-1, bot lifecycle in `crates/voice/`)
 //! can take a path dependency without pulling the audio toolchain into the
@@ -22,9 +25,10 @@ pub mod types;
 pub mod volume;
 pub mod yt_search;
 
+pub use encoder::OpusFrameEncoder;
 pub use pipeline::AudioPipeline;
 pub use types::{
-    OpusFrame, PipelineConfig, PipelineError, PipelineEvent, SAMPLE_RATE_HZ,
+    PCM_FRAME_BYTES_MONO, PcmFrame, PipelineConfig, PipelineError, PipelineEvent, SAMPLE_RATE_HZ,
     SAMPLES_PER_FRAME_MONO, frame_duration,
 };
-pub use volume::{MAX_GAIN, MIN_GAIN, UNITY_GAIN, VolumeHandle};
+pub use volume::{GainStage, MAX_GAIN, MIN_GAIN, UNITY_GAIN, VolumeHandle};

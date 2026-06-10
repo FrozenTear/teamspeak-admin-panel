@@ -74,8 +74,10 @@ impl OpusFrameEncoder {
     }
 
     /// Encode exactly one 20 ms frame. `pcm` MUST be `samples_per_frame()`
-    /// long; shorter frames are padded with silence by the caller (see
-    /// `Pipeline::pump_one`).
+    /// long — the pipeline worker silence-pads EOF-short frames before they
+    /// reach the channel, so a consumer encoding dequeued
+    /// [`PcmFrame`](crate::types::PcmFrame)s (THE-986) always has a full
+    /// frame.
     ///
     /// Returns the encoded Opus packet as a `Bytes` slice carved from the
     /// reused `scratch` buffer. The remainder of `scratch` is re-grown back

@@ -15,9 +15,14 @@
 //!    `tokio::select!` and calls `con.send_audio(pkt)` on every `Frame`.
 //! 3. Pause/Resume flip a `tokio::sync::watch` the sibling honours by
 //!    parking on `pause_rx.changed()` — that back-pressures the pipeline
-//!    naturally (the encoder's `read_samples` stalls on a full channel).
+//!    naturally (the worker's `read_samples` stalls on a full channel).
 //! 4. Dropping [`ActiveAudio`] aborts both the sibling and the pipeline
 //!    worker — clean teardown on `Stop` / `SkipNext` / `Play(replace)`.
+//!
+//! THE-986 — the pipeline emits *PCM*; the sibling applies the operator's
+//! gain and encodes Opus at dequeue, so a `!vol` move is audible within
+//! ≤ 1–2 frames instead of after the frame channel's in-flight backlog
+//! (≈ 5 s on fast sources) drains.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -31,7 +36,10 @@ use tsclientlib::Connection;
 use tsproto_packets::packets::{AudioData, CodecType, OutAudio};
 
 use music_bot_audio::source::AudioSourceSpec;
-use music_bot_audio::{AudioPipeline, PipelineConfig, PipelineError, PipelineEvent, VolumeHandle};
+use music_bot_audio::{
+    AudioPipeline, GainStage, OpusFrameEncoder, PcmFrame, PipelineConfig, PipelineError,
+    PipelineEvent, VolumeHandle,
+};
 
 use crate::command::AudioSource;
 
@@ -261,6 +269,12 @@ fn parse_synthetic_url(url: &str) -> SyntheticParams {
 /// PURA-342's `pipeline_prebuffer_full` log), and it is in the noise next
 /// to the ~11 s yt-dlp resolve (PURA-330). `frame_buffer >= prebuffer_frames`
 /// so `flush_prebuffer` never blocks the worker mid-prebuffer.
+///
+/// THE-986 — the channel now buffers *PCM*, not encoded Opus: 250 frames ×
+/// [`music_bot_audio::PCM_FRAME_BYTES_MONO`] ≈ 480 kB per playing bot
+/// (mono) versus ~75 kB encoded. Accepted: it buys gain + encode at the
+/// consumer side, which bounds `!vol` latency to ≤ 1–2 frames instead of
+/// this channel's full ≈ 5 s backlog.
 fn pipeline_config(yt_cookie_file: Option<PathBuf>) -> PipelineConfig {
     PipelineConfig {
         frame_buffer: 250,
@@ -273,8 +287,18 @@ fn pipeline_config(yt_cookie_file: Option<PathBuf>) -> PipelineConfig {
 /// Assemble an [`ActiveAudio`] around a freshly-spawned pipeline: take its
 /// frame + event channels, spawn the draining sibling, and wire up the
 /// per-bot audio state. Shared by [`start_pipeline`] and [`seek_to`].
+///
+/// THE-986 — `encoder` + `volume` feed the sibling's consumer-side gain +
+/// encode stage; the encoder must be built from the same [`PipelineConfig`]
+/// as `pipeline` so the frame layouts agree.
+// One over clippy's 8-arg threshold since THE-986 added the encoder +
+// volume pair. Internal assembly helper with exactly two callers; a
+// params struct would just restate the field list.
+#[allow(clippy::too_many_arguments)]
 fn build_active(
     mut pipeline: AudioPipeline,
+    encoder: OpusFrameEncoder,
+    volume: VolumeHandle,
     source_label: String,
     started_at: Instant,
     seek_base_secs: u64,
@@ -285,7 +309,9 @@ fn build_active(
     let events_rx = pipeline.events();
     let (msg_tx, msg_rx) = mpsc::channel(AUDIO_MSG_BUFFER);
     let (pause_tx, pause_rx) = watch::channel(false);
-    let sibling = spawn_sibling(pipeline, frames_rx, events_rx, pause_rx, msg_tx);
+    let sibling = spawn_sibling(
+        pipeline, encoder, volume, frames_rx, events_rx, pause_rx, msg_tx,
+    );
     ActiveAudio {
         source_label,
         audio_rx: Some(msg_rx),
@@ -306,9 +332,10 @@ fn build_active(
 /// previous worker + sibling). Returns the operator-facing source label
 /// so the caller can log it.
 /// `volume` is the bot actor's shared output-gain handle (PURA-351). The
-/// same handle is passed to every pipeline the bot spawns, so an operator's
-/// volume setting persists across track changes and reconnects and a
-/// mid-track change is picked up by the live pipeline without a respawn.
+/// same handle is passed to every play's consumer-side gain stage
+/// (THE-986), so an operator's volume setting persists across track
+/// changes and reconnects and a mid-track change is picked up by the live
+/// sibling without a respawn.
 pub(crate) async fn start_pipeline(
     current: &mut Option<ActiveAudio>,
     source: &AudioSource,
@@ -328,7 +355,10 @@ pub(crate) async fn start_pipeline(
     let (spec, label) = source_to_spec(source);
     let cfg = pipeline_config(yt_cookie_file.clone());
     debug!(label = %label, ?cfg, gain = volume.get(), "spawning audio pipeline");
-    let pipeline = AudioPipeline::spawn(spec, cfg, volume.clone()).await?;
+    // THE-986 — the sibling owns the encoder now; build it from the same
+    // config the pipeline sizes its PCM frames with.
+    let encoder = OpusFrameEncoder::new(&cfg)?;
+    let pipeline = AudioPipeline::spawn(spec, cfg).await?;
 
     // PURA-352 — set up seek retention for the new track. A library file
     // is seekable the moment it starts; a URL source needs a one-off
@@ -365,6 +395,8 @@ pub(crate) async fn start_pipeline(
 
     *current = Some(build_active(
         pipeline,
+        encoder,
+        volume.clone(),
         label.clone(),
         started_at,
         0,
@@ -417,10 +449,13 @@ pub(crate) async fn seek_to(
         gain = volume.get(),
         "PURA-352 seek: re-spawning decoder at offset"
     );
-    let pipeline = AudioPipeline::spawn(spec, cfg, volume.clone()).await?;
+    let encoder = OpusFrameEncoder::new(&cfg)?;
+    let pipeline = AudioPipeline::spawn(spec, cfg).await?;
 
     *current = Some(build_active(
         pipeline,
+        encoder,
+        volume.clone(),
         source_label,
         started_at,
         secs,
@@ -817,7 +852,9 @@ async fn park_while_paused(pause_rx: &mut watch::Receiver<bool>) -> Option<Durat
 
 fn spawn_sibling(
     pipeline: AudioPipeline,
-    mut frames_rx: mpsc::Receiver<music_bot_audio::OpusFrame>,
+    mut encoder: OpusFrameEncoder,
+    volume: VolumeHandle,
+    mut frames_rx: mpsc::Receiver<PcmFrame>,
     mut events_rx: broadcast::Receiver<PipelineEvent>,
     mut pause_rx: watch::Receiver<bool>,
     tx: mpsc::Sender<AudioMsg>,
@@ -826,6 +863,11 @@ fn spawn_sibling(
         // Keep `pipeline` alive for the lifetime of the sibling — its
         // `Drop` aborts the worker task. We don't otherwise touch it.
         let _pipeline_guard = pipeline;
+
+        // THE-986 — consumer-side gain: reads the operator's volume handle
+        // once per dequeued frame and applies flat gain or the THE-983
+        // (AR-3) click-free ramp.
+        let mut gain = GainStage::new(volume);
 
         // PURA-342 — frame-buffer underrun watchdog. Lives for the whole
         // play: it tags the opening `STARTUP_WATCH_FRAMES` as the `startup`
@@ -912,7 +954,7 @@ fn spawn_sibling(
                         let mut slot = f.scheduled_at + paused_total;
                         let lateness = recv_at.saturating_duration_since(slot);
                         monitor.observe(f.index, buffered, lateness);
-                        // Wall-clock pacing. The pipeline encodes far faster
+                        // Wall-clock pacing. The pipeline decodes far faster
                         // than real-time and only the small bounded frame
                         // channel throttles it; without waiting for each
                         // frame's `scheduled_at` slot the frames are pushed
@@ -957,14 +999,54 @@ fn spawn_sibling(
                         // return exactly at the shifted slot; sample how far
                         // past it the sibling task actually woke. `recv_at`
                         // tells the monitor whether this frame genuinely
-                        // slept or its slot had already passed.
+                        // slept or its slot had already passed. Sampled
+                        // before the encode below so oversleep measures the
+                        // timer, not the ~100 µs encode.
                         pacer.observe(slot, recv_at, std::time::Instant::now());
+                        // THE-986 — gain + encode happen *here*, on the
+                        // consumer side of the frame channel. The pipeline
+                        // worker used to apply gain at encode time, which
+                        // put every `!vol` move behind the channel's
+                        // in-flight frames (≈ 5 s on fast sources whose
+                        // channel runs full) — and radio reacted fast, so
+                        // behaviour was inconsistent across sources. Here
+                        // the move is audible within ≤ 1–2 frames, uniform.
+                        // Placed after the pacing sleep (not at dequeue) so
+                        // a frame the THE-985 AR-8 race held across a pause
+                        // goes out at *send-time* gain — a `!vol` during
+                        // the pause applies to the very first resumed
+                        // frame. The ~100 µs encode is well inside the
+                        // 20 ms budget and stays off the connected loop.
+                        // Encode errors: warn + skip the frame, the same
+                        // policy the worker applied pre-THE-986.
+                        let mut samples = f.samples;
+                        gain.apply(&mut samples, f.channels);
+                        let bytes = match encoder.encode_frame(&samples) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                warn!(
+                                    error = %e,
+                                    frame_index = f.index,
+                                    "consumer-side Opus encode failed — skipping frame",
+                                );
+                                if tx
+                                    .send(AudioMsg::PipelineEvent(PipelineEvent::Warning(
+                                        format!("encode: {e}"),
+                                    )))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                continue;
+                            }
+                        };
                         // PURA-389a — stamp the hand-off instant so the
                         // connected loop's send path can measure how long
                         // this frame waited for the audio arm to be polled.
                         if tx
                             .send(AudioMsg::Frame {
-                                bytes: f.bytes,
+                                bytes,
                                 enqueued_at: std::time::Instant::now(),
                             })
                             .await
@@ -1310,6 +1392,13 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// THE-986 — encoder for sibling tests, matching
+    /// [`PipelineConfig::default`] (the config the test pipelines spawn
+    /// with) so the frame layouts agree.
+    fn test_encoder() -> OpusFrameEncoder {
+        OpusFrameEncoder::new(&PipelineConfig::default()).expect("encoder")
+    }
+
     #[test]
     fn synthetic_url_default_when_no_query() {
         let SyntheticParams {
@@ -1464,7 +1553,6 @@ mod tests {
                 duration_ms: Some(50),
             },
             PipelineConfig::default(),
-            VolumeHandle::default(),
         )
         .await
         .expect("spawn synthetic pipeline");
@@ -1482,6 +1570,8 @@ mod tests {
 
         let active = build_active(
             pipeline,
+            test_encoder(),
+            VolumeHandle::default(),
             "synthetic://test".to_string(),
             Instant::now(),
             0,
@@ -1517,7 +1607,6 @@ mod tests {
                 duration_ms: Some(200),
             },
             PipelineConfig::default(),
-            VolumeHandle::default(),
         )
         .await
         .expect("spawn synthetic pipeline");
@@ -1527,7 +1616,15 @@ mod tests {
         let (msg_tx, mut msg_rx) = mpsc::channel(256);
 
         let started = std::time::Instant::now();
-        let sibling = spawn_sibling(pipeline, frames_rx, events_rx, pause_rx, msg_tx);
+        let sibling = spawn_sibling(
+            pipeline,
+            test_encoder(),
+            VolumeHandle::default(),
+            frames_rx,
+            events_rx,
+            pause_rx,
+            msg_tx,
+        );
 
         let mut frame_count = 0usize;
         let mut last_frame_at = started;
@@ -1578,7 +1675,6 @@ mod tests {
                 duration_ms: Some(600),
             },
             PipelineConfig::default(),
-            VolumeHandle::default(),
         )
         .await
         .expect("spawn synthetic pipeline");
@@ -1587,7 +1683,15 @@ mod tests {
         let (pause_tx, pause_rx) = watch::channel(false);
         let (msg_tx, mut msg_rx) = mpsc::channel(256);
 
-        let sibling = spawn_sibling(pipeline, frames_rx, events_rx, pause_rx, msg_tx);
+        let sibling = spawn_sibling(
+            pipeline,
+            test_encoder(),
+            VolumeHandle::default(),
+            frames_rx,
+            events_rx,
+            pause_rx,
+            msg_tx,
+        );
 
         // Let a few frames flow, then pause ≥2 s mid-play. The 600 ms tone
         // is ~30 frames, so plenty remain backlogged across the pause.
@@ -1717,7 +1821,6 @@ mod tests {
                 duration_ms: Some(50),
             },
             PipelineConfig::default(),
-            VolumeHandle::default(),
         )
         .await
         .expect("spawn synthetic pipeline");
@@ -1729,10 +1832,11 @@ mod tests {
 
         // Every slot is already due, so the sibling's pacing sleep returns
         // immediately and the frame arm is continuously ready — the C-2
-        // starvation regime.
+        // starvation regime. THE-986 — hand-fed frames are PCM silence now;
+        // the sibling gain+encodes them at dequeue.
         let anchor = std::time::Instant::now();
-        let frame = move |i: u64| music_bot_audio::OpusFrame {
-            bytes: Bytes::from_static(&[0; 4]),
+        let frame = move |i: u64| PcmFrame {
+            samples: vec![0i16; music_bot_audio::SAMPLES_PER_FRAME_MONO],
             index: i,
             scheduled_at: anchor,
             channels: 1,
@@ -1758,7 +1862,15 @@ mod tests {
             }
         });
 
-        let sibling = spawn_sibling(pipeline, frames_rx, events_rx, pause_rx, msg_tx);
+        let sibling = spawn_sibling(
+            pipeline,
+            test_encoder(),
+            VolumeHandle::default(),
+            frames_rx,
+            events_rx,
+            pause_rx,
+            msg_tx,
+        );
 
         let mut frames_seen = 0usize;
         let mut events_seen = 0usize;
@@ -1787,6 +1899,133 @@ mod tests {
             "last event delivered only after {frames_before_last_event} of 40 \
              frames — events starved behind the saturated frame channel \
              instead of interleaving (THE-985 C-2)",
+        );
+    }
+
+    /// THE-986 (C-1) regression — a `!vol` move must become effective within
+    /// ≤ 2 frames, asserted via decoded output amplitude on the synthetic
+    /// source. Gain used to be applied in the pipeline worker at encode
+    /// time, so a volume change sat behind the frame channel's in-flight
+    /// encoded frames (≈ 5 s on fast sources whose 250-frame channel runs
+    /// full) before reaching the wire. With gain + encode at the sibling's
+    /// dequeue, at most one already-dequeued frame can still carry the old
+    /// gain; the next frame ramps (THE-983 AR-3) and the one after is fully
+    /// at the new gain.
+    #[tokio::test]
+    async fn vol_change_audible_within_two_frames() {
+        let mut pipeline = AudioPipeline::spawn(
+            AudioSourceSpec::SyntheticTone {
+                hz: 440.0,
+                amplitude: 0.5,
+                duration_ms: Some(2_000),
+            },
+            PipelineConfig::default(),
+        )
+        .await
+        .expect("spawn synthetic pipeline");
+        let frames_rx = pipeline.take_frames();
+        let events_rx = pipeline.events();
+        let (_pause_tx, pause_rx) = watch::channel(false);
+        let (msg_tx, mut msg_rx) = mpsc::channel(256);
+        let volume = VolumeHandle::default();
+        let _sibling = spawn_sibling(
+            pipeline,
+            test_encoder(),
+            volume.clone(),
+            frames_rx,
+            events_rx,
+            pause_rx,
+            msg_tx,
+        );
+
+        // Decode each Opus frame back to PCM — decoded amplitude is what a
+        // TS client hears, the observable this regression is specified
+        // against. RMS (not peak) so the THE-983 ramp frame, whose early
+        // samples are still near the old gain, registers as "change in
+        // progress".
+        let mut decoder =
+            audiopus::coder::Decoder::new(audiopus::SampleRate::Hz48000, audiopus::Channels::Mono)
+                .expect("decoder");
+        let mut decode_rms = move |frame: &Bytes| -> f64 {
+            let mut pcm = vec![0i16; music_bot_audio::SAMPLES_PER_FRAME_MONO];
+            let packet = audiopus::packet::Packet::try_from(&frame[..]).expect("packet");
+            let signals = audiopus::MutSignals::try_from(&mut pcm[..]).expect("signals");
+            let n = decoder
+                .decode(Some(packet), signals, false)
+                .expect("decode");
+            let sum_sq: f64 = pcm[..n].iter().map(|s| (*s as f64) * (*s as f64)).sum();
+            (sum_sq / n.max(1) as f64).sqrt()
+        };
+
+        // Drain to steady loudness, then cut the volume to silence.
+        let mut loud_rms = 0.0f64;
+        let mut received = 0usize;
+        while received < 5 {
+            match msg_rx.recv().await.expect("stream alive before change") {
+                AudioMsg::Frame { bytes, .. } => {
+                    received += 1;
+                    loud_rms = decode_rms(&bytes);
+                }
+                AudioMsg::Finished => panic!("tone finished before the volume change"),
+                AudioMsg::PipelineEvent(_) => {}
+            }
+        }
+        // 0.5-amplitude sine peaks at ~16384; its RMS is ~11.5k.
+        assert!(
+            loud_rms > 6_000.0,
+            "tone should decode loud before the change, rms {loud_rms:.0}",
+        );
+
+        volume.set(0.0);
+
+        // Within ≤ 2 frames the output must be measurably *affected*. At
+        // most one already-dequeued frame may still carry the old gain; the
+        // next is the THE-983 ramp frame. Opus' ~6.5 ms lookahead smears
+        // the PCM-domain ramp across two decoded frames (measured: steady
+        // ~11.5k → ramp ~9.3k (−19 %) → ~1.2k → ~0), so the decoded change
+        // frame shows a clear-but-partial drop: ≤ 90 % of steady state
+        // counts as affected, with full silence (−20 dB) required within 2
+        // further frames. The pre-fix architecture (gain applied at the
+        // worker's encode) fails this by the whole frame_buffer depth —
+        // ≥ 8 frames here, ~250 (≈ 5 s) with the production config.
+        let affected_ceiling = loud_rms * 0.9;
+        let silence_floor = loud_rms / 10.0;
+        let mut frames_after = 0usize;
+        let mut affected_at: Option<usize> = None;
+        loop {
+            match msg_rx.recv().await.expect("stream alive after change") {
+                AudioMsg::Frame { bytes, .. } => {
+                    frames_after += 1;
+                    let rms = decode_rms(&bytes);
+                    if rms <= silence_floor && affected_at.is_some() {
+                        break; // settled at the new gain
+                    }
+                    if rms <= affected_ceiling {
+                        affected_at.get_or_insert(frames_after);
+                        continue;
+                    }
+                    assert!(
+                        frames_after <= 2,
+                        "`!vol 0` still ineffective {frames_after} frames after the \
+                         change (rms {rms:.0} vs steady {loud_rms:.0}) — gain is \
+                         being applied behind the frame buffer again (C-1)",
+                    );
+                }
+                AudioMsg::Finished => panic!("tone finished before silence was observed"),
+                AudioMsg::PipelineEvent(_) => {}
+            }
+        }
+        let affected_at = affected_at.expect("loop only breaks once affected");
+        assert!(
+            affected_at <= 2,
+            "volume change only took effect {affected_at} frames after `!vol` — \
+             budget is ≤ 2 frames (THE-986)",
+        );
+        assert!(
+            frames_after <= affected_at + 2,
+            "output not silent until {frames_after} frames after `!vol` (change \
+             frame {affected_at}) — expected the ramp + ≤ 2 frames of Opus \
+             lookahead smear",
         );
     }
 

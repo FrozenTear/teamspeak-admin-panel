@@ -304,13 +304,9 @@ async fn main() -> Result<()> {
     };
     for probe in 0..cli.first_frame_probes {
         let t0 = Instant::now();
-        let mut p = AudioPipeline::spawn(
-            spec.clone(),
-            probe_cfg.clone(),
-            music_bot_audio::VolumeHandle::default(),
-        )
-        .await
-        .context("AudioPipeline::spawn (probe)")?;
+        let mut p = AudioPipeline::spawn(spec.clone(), probe_cfg.clone())
+            .await
+            .context("AudioPipeline::spawn (probe)")?;
         let mut probe_frames = p.take_frames();
         match probe_frames.recv().await {
             Some(_) => {
@@ -324,8 +320,15 @@ async fn main() -> Result<()> {
         p.shutdown().await;
     }
 
+    // THE-986 — the pipeline emits PCM; the production consumer (the voice
+    // sibling) applies gain + encodes at dequeue. Mirror that here so the
+    // harness measures the same per-frame work the shipped bot does.
+    let mut encoder =
+        music_bot_audio::OpusFrameEncoder::new(&cfg).context("OpusFrameEncoder::new")?;
+    let mut gain = music_bot_audio::GainStage::new(music_bot_audio::VolumeHandle::default());
+
     let spawn_t0 = Instant::now();
-    let mut pipeline = AudioPipeline::spawn(spec, cfg, music_bot_audio::VolumeHandle::default())
+    let mut pipeline = AudioPipeline::spawn(spec, cfg)
         .await
         .context("AudioPipeline::spawn")?;
     let mut frames = pipeline.take_frames();
@@ -380,11 +383,18 @@ async fn main() -> Result<()> {
         Vec::with_capacity((cli.duration_seconds * FRAMES_PER_SECOND) as usize);
     let mut received: u64 = 0;
     let mut main_first_frame_ms = 0.0_f64;
-    while let Some(frame) = frames.recv().await {
+    while let Some(mut frame) = frames.recv().await {
         if received == 0 {
             // Before the pacer sleep — spawn → first frame *available*.
             main_first_frame_ms = spawn_t0.elapsed().as_secs_f64() * 1000.0;
             info!(first_frame_ms = main_first_frame_ms, "main-run first frame");
+        }
+        // THE-986 — consumer-side gain + encode, as the production sibling
+        // does at dequeue (before the pacing sleep).
+        gain.apply(&mut frame.samples, frame.channels);
+        if let Err(e) = encoder.encode_frame(&frame.samples) {
+            warn!(%e, index = frame.index, "consumer-side encode failed — skipping frame");
+            continue;
         }
         let now = Instant::now();
         if frame.scheduled_at > now {

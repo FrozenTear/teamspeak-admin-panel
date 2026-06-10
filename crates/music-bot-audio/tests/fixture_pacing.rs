@@ -61,7 +61,6 @@ async fn ffmpeg_fixture_paces_within_tolerance() {
             input: FIXTURE_PATH.to_string(),
         },
         cfg,
-        music_bot_audio::VolumeHandle::default(),
     )
     .await
     .expect("AudioPipeline::spawn");
@@ -169,7 +168,6 @@ async fn ffmpeg_subprocess_cleanup_on_cancel() {
             input: FIXTURE_PATH.to_string(),
         },
         cfg,
-        music_bot_audio::VolumeHandle::default(),
     )
     .await
     .expect("spawn");
@@ -212,7 +210,6 @@ async fn ffmpeg_at_seeks_input_to_offset() {
                 start_secs,
             },
             PipelineConfig::default(),
-            music_bot_audio::VolumeHandle::default(),
         )
         .await
         .expect("spawn FfmpegAt");

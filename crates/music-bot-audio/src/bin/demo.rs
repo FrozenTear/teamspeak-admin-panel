@@ -120,7 +120,13 @@ async fn main() -> Result<()> {
         pace = cli.pace,
         "starting pipeline"
     );
-    let mut pipeline = AudioPipeline::spawn(spec, cfg, music_bot_audio::VolumeHandle::default())
+    // THE-986 — the pipeline emits PCM; gain + encode live with the
+    // consumer now. Mirror the production sibling: unity gain, encode at
+    // dequeue, so the byte stats below still describe Opus on the wire.
+    let mut encoder =
+        music_bot_audio::OpusFrameEncoder::new(&cfg).context("OpusFrameEncoder::new")?;
+    let mut gain = music_bot_audio::GainStage::new(music_bot_audio::VolumeHandle::default());
+    let mut pipeline = AudioPipeline::spawn(spec, cfg)
         .await
         .context("AudioPipeline::spawn")?;
     let mut frames = pipeline.take_frames();
@@ -147,9 +153,16 @@ async fn main() -> Result<()> {
     let mut received = 0u64;
     let mut total_bytes = 0u64;
     let mut max_jitter_ms = 0i64;
-    while let Some(frame) = frames.recv().await {
+    while let Some(mut frame) = frames.recv().await {
         received += 1;
-        total_bytes += frame.bytes.len() as u64;
+        gain.apply(&mut frame.samples, frame.channels);
+        match encoder.encode_frame(&frame.samples) {
+            Ok(opus) => total_bytes += opus.len() as u64,
+            Err(e) => {
+                warn!(%e, index = frame.index, "consumer-side encode failed — skipping frame");
+                continue;
+            }
+        }
         if cli.pace {
             // Wait until the pacer says it's time, then measure.
             let now = Instant::now();

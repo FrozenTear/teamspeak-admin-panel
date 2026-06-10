@@ -78,3 +78,7 @@ libc = "0.2"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync", "test-util"] }
 tracing-subscriber = { workspace = true }
 serde_json = { workspace = true }
+# THE-986 — the `!vol`-latency regression decodes the sibling's
+# consumer-encoded Opus frames back to PCM and asserts on output amplitude.
+# Same pin as music-bot-audio's encoder, so this pulls no new libopus.
+audiopus = "0.3.0-rc.0"
