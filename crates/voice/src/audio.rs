@@ -826,6 +826,16 @@ fn spawn_sibling(
         // the pause duration).
         let mut paused_total = Duration::ZERO;
 
+        // THE-981 (AR-7) — whether the pipeline-event broadcast still has a
+        // live sender. Today `_pipeline_guard` keeps `events_tx` alive for
+        // the sibling's whole lifetime, so `Closed` cannot fire before the
+        // frame channel ends — but that invariant is implicit and one
+        // refactor away from breaking, and a `Closed => continue` arm in a
+        // select loop is immediately-ready on every iteration: the loop
+        // would busy-spin at 100 % CPU. Gate the event arm off instead once
+        // the broadcast closes.
+        let mut events_open = true;
+
         loop {
             // Park while paused. `changed()` wakes on every flip,
             // including pause→pause (we just re-loop and re-check).
@@ -892,14 +902,17 @@ fn spawn_sibling(
                     }
                     None => break,
                 },
-                ev = events_rx.recv() => match ev {
+                ev = events_rx.recv(), if events_open => match ev {
                     Ok(e) => {
                         if tx.send(AudioMsg::PipelineEvent(e)).await.is_err() {
                             return;
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => continue,
+                    // THE-981 (AR-7) — stop polling a closed broadcast: a
+                    // bare `continue` would make this arm immediately-ready
+                    // forever and hot-spin the select loop.
+                    Err(broadcast::error::RecvError::Closed) => events_open = false,
                 },
                 _ = pause_rx.changed() => {
                     // Loop back; the outer `while *pause_rx.borrow()`
