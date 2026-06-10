@@ -15,6 +15,13 @@
 //! promise. We wrap the body drain in an outer reconnect loop with a bounded
 //! backoff ladder. `last_title` is preserved across reconnects so the
 //! `NowPlaying` event only fires on real track changes.
+//!
+//! THE-984 reconnect splice: a reconnect splices the new HTTP body into the
+//! *same* long-lived ffmpeg stdin — the old body truncates mid-frame and the
+//! new one starts at an arbitrary byte offset. For self-sync codecs (mp3 /
+//! ADTS AAC) we scan past the torn bytes to a verified frame boundary before
+//! writing; for non-self-synchronizing containers (Ogg, FLAC) we write
+//! through and surface a Warning — see [`ResyncMode`] for the rationale.
 
 use std::io;
 use std::time::Duration;
@@ -63,6 +70,9 @@ impl IcyRadioSource {
         // round trips of `!radio` → first-audio latency. Unknown / missing
         // Content-Type falls back to the probing path.
         let format_hint = ffmpeg_format_hint(&content_type);
+        // THE-984 — the same Content-Type also picks the post-reconnect
+        // resync strategy (frame-sync scan vs warn vs passthrough).
+        let resync = resync_mode(&content_type);
         // The connect leg of the `!radio` → first-audio breakdown: DNS +
         // TCP/TLS + the ICY GET up to response headers. The remaining legs
         // are `ffmpeg_first_pcm` and `pipeline_first_frame`.
@@ -92,6 +102,7 @@ impl IcyRadioSource {
             client,
             url_owned,
             FirstAttempt { resp, metaint },
+            resync,
             ffmpeg_stdin,
             event_tx,
         ));
@@ -180,6 +191,268 @@ fn ffmpeg_format_hint(content_type: &str) -> Option<&'static str> {
     }
 }
 
+/// THE-984 (AR-4) — how the fetcher handles the byte-stream splice a
+/// THE-898 reconnect creates: the old HTTP body truncates mid-frame and the
+/// new one starts at an arbitrary offset, but both feed the *same*
+/// long-lived ffmpeg stdin, so the demuxer sees torn bytes at the seam.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum ResyncMode {
+    /// Unknown Content-Type (ffmpeg probing path): write through unchanged.
+    /// We can't scan for a frame boundary without knowing the codec; the
+    /// dominant ICY codecs (mp3/aac) self-resync at the cost of one pop.
+    Passthrough,
+    /// Self-sync codec with a recognisable frame header (mp3 / ADTS AAC):
+    /// after a reconnect, discard bytes until a verified frame boundary so
+    /// ffmpeg never sees the torn seam — removes the per-reconnect pop.
+    FrameSync(SyncKind),
+    /// Non-self-synchronizing container (Ogg, FLAC) — THE-984 option (a):
+    /// we deliberately do NOT attempt mid-stream repair. Ogg pages carry
+    /// stream state (serials, granule positions, packet continuations) that
+    /// a byte scanner can't rebuild, and a wrong guess turns "garbled audio"
+    /// into "demuxer error kills the station". Write through and surface a
+    /// Warning so the operator knows why audio degraded. The full fix is
+    /// option (c) — respawn ffmpeg per connection — tracked only if Ogg
+    /// stations show up in practice. Raw FLAC frames do carry sync codes,
+    /// but mid-stream recovery by ffmpeg's `flac` demuxer isn't guaranteed,
+    /// so FLAC rides the conservative bucket too.
+    WarnNotSelfSync,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum SyncKind {
+    Mp3,
+    Adts,
+}
+
+/// THE-984 — map the negotiated Content-Type to a post-reconnect resync
+/// strategy. Mirrors the [`ffmpeg_format_hint`] table: same normalisation,
+/// same conservative default (unknown → passthrough, never guess a codec).
+fn resync_mode(content_type: &str) -> ResyncMode {
+    let ct = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    match ct.as_str() {
+        "audio/mpeg" | "audio/mp3" | "audio/x-mpeg" => ResyncMode::FrameSync(SyncKind::Mp3),
+        "audio/aac" | "audio/aacp" | "audio/x-aac" => ResyncMode::FrameSync(SyncKind::Adts),
+        "application/ogg" | "audio/ogg" | "audio/x-ogg" | "audio/opus" | "audio/flac"
+        | "audio/x-flac" => ResyncMode::WarnNotSelfSync,
+        _ => ResyncMode::Passthrough,
+    }
+}
+
+/// Cap on bytes examined per reconnect before the scanner gives up and falls
+/// back to write-through. The torn prefix is at most one partial frame
+/// (mp3 ≤ ~2.9 KB, ADTS ≤ 8 KB), so 32 KB without a verified sync means the
+/// stream isn't the codec the Content-Type claimed — stop withholding audio.
+const RESYNC_SCAN_MAX: usize = 32 * 1024;
+
+/// Bytes of the *candidate* frame header needed to compute its length.
+fn sync_header_len(kind: SyncKind) -> usize {
+    match kind {
+        SyncKind::Mp3 => 4,
+        SyncKind::Adts => 6,
+    }
+}
+
+/// Bytes of the *next* frame header needed to confirm the candidate.
+const CONFIRM_LEN: usize = 3;
+
+/// THE-984 — drops post-reconnect bytes until a verified frame boundary.
+///
+/// "Verified" means: a header that parses (sync bits + valid version /
+/// layer / bitrate / samplerate fields) AND whose computed frame length
+/// lands on a second header that agrees with it. A bare 11-bit sync check
+/// false-positives every few KB of compressed audio; the two-header confirm
+/// makes a false sync vanishingly unlikely. Both failure modes are benign:
+/// a false positive merely degrades to the pre-THE-984 behaviour (decoder
+/// self-resync pop), a missed sync costs one extra frame of discard.
+struct ResyncScanner {
+    kind: SyncKind,
+    buf: Vec<u8>,
+    /// Bytes already ruled out and dropped (excludes what's still in `buf`).
+    discarded: usize,
+}
+
+enum ScanStep {
+    /// Still hunting — nothing reaches the writer yet.
+    Hold,
+    /// Verified frame boundary: write `aligned`, pass through from here on.
+    Synced { aligned: Vec<u8>, discarded: usize },
+    /// Scan budget exhausted without a sync — flush what's buffered and
+    /// fall back to write-through (the Content-Type probably lied).
+    GaveUp { flush: Vec<u8>, scanned: usize },
+}
+
+impl ResyncScanner {
+    fn new(kind: SyncKind) -> Self {
+        Self {
+            kind,
+            buf: Vec::new(),
+            discarded: 0,
+        }
+    }
+
+    fn feed(&mut self, bytes: &[u8]) -> ScanStep {
+        self.buf.extend_from_slice(bytes);
+        let mut i = 0;
+        loop {
+            // Jump to the next possible sync byte.
+            match self.buf[i..].iter().position(|&b| b == 0xFF) {
+                Some(off) => i += off,
+                None => {
+                    i = self.buf.len();
+                    break;
+                }
+            }
+            // Candidate header split across chunks — wait for more bytes.
+            if self.buf.len() - i < sync_header_len(self.kind) {
+                break;
+            }
+            let Some(frame_len) = parse_frame_len(self.kind, &self.buf[i..]) else {
+                i += 1;
+                continue;
+            };
+            // Need the start of the next frame's header to confirm.
+            if self.buf.len() - i < frame_len + CONFIRM_LEN {
+                break;
+            }
+            if headers_agree(self.kind, &self.buf[i..], &self.buf[i + frame_len..]) {
+                let aligned = self.buf.split_off(i);
+                return ScanStep::Synced {
+                    aligned,
+                    discarded: self.discarded + i,
+                };
+            }
+            i += 1;
+        }
+        // Everything before `i` is ruled out; `buf[i..]` is a pending
+        // candidate (or empty) that needs more bytes to judge.
+        self.discarded += i;
+        self.buf.drain(..i);
+        if self.discarded + self.buf.len() > RESYNC_SCAN_MAX {
+            return ScanStep::GaveUp {
+                flush: std::mem::take(&mut self.buf),
+                scanned: self.discarded,
+            };
+        }
+        ScanStep::Hold
+    }
+}
+
+fn parse_frame_len(kind: SyncKind, h: &[u8]) -> Option<usize> {
+    match kind {
+        SyncKind::Mp3 => mp3_frame_len(h),
+        SyncKind::Adts => adts_frame_len(h),
+    }
+}
+
+/// MPEG audio bitrate tables (kbps), indexed by the 4-bit bitrate field.
+/// Index 0 ("free format" — frame length unknowable) and 15 (invalid) are 0
+/// and rejected by the parser.
+const MP3_KBPS_V1_L1: [u32; 16] = [
+    0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448, 0,
+];
+const MP3_KBPS_V1_L2: [u32; 16] = [
+    0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 0,
+];
+const MP3_KBPS_V1_L3: [u32; 16] = [
+    0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0,
+];
+const MP3_KBPS_V2_L1: [u32; 16] = [
+    0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256, 0,
+];
+const MP3_KBPS_V2_L23: [u32; 16] = [
+    0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0,
+];
+
+/// Parse an MPEG-audio frame header at the start of `h` (caller guarantees
+/// 4 bytes); returns the whole-frame length in bytes, `None` if any field
+/// is invalid.
+fn mp3_frame_len(h: &[u8]) -> Option<usize> {
+    if h[0] != 0xFF || (h[1] & 0xE0) != 0xE0 {
+        return None;
+    }
+    let version = (h[1] >> 3) & 0x3; // 0=MPEG2.5  1=reserved  2=MPEG2  3=MPEG1
+    let layer = (h[1] >> 1) & 0x3; // 0=reserved  1=III  2=II  3=I
+    if version == 1 || layer == 0 {
+        return None;
+    }
+    let bitrate_idx = (h[2] >> 4) as usize;
+    let sr_idx = ((h[2] >> 2) & 0x3) as usize;
+    if bitrate_idx == 0 || bitrate_idx == 15 || sr_idx == 3 {
+        return None;
+    }
+    let v1 = version == 3;
+    let kbps = match (v1, layer) {
+        (true, 3) => MP3_KBPS_V1_L1[bitrate_idx],
+        (true, 2) => MP3_KBPS_V1_L2[bitrate_idx],
+        (true, _) => MP3_KBPS_V1_L3[bitrate_idx],
+        (false, 3) => MP3_KBPS_V2_L1[bitrate_idx],
+        (false, _) => MP3_KBPS_V2_L23[bitrate_idx],
+    };
+    let sr: u32 = match version {
+        3 => [44_100, 48_000, 32_000][sr_idx],
+        2 => [22_050, 24_000, 16_000][sr_idx],
+        _ => [11_025, 12_000, 8_000][sr_idx],
+    };
+    let padding = ((h[2] >> 1) & 0x1) as u32;
+    let bps = kbps * 1_000;
+    // Samples per frame: Layer I = 384 (4-byte slots), Layer II = 1152,
+    // Layer III = 1152 (MPEG1) / 576 (MPEG2/2.5).
+    let len = match layer {
+        3 => (12 * bps / sr + padding) * 4,
+        2 => 144 * bps / sr + padding,
+        _ if v1 => 144 * bps / sr + padding,
+        _ => 72 * bps / sr + padding,
+    };
+    (len >= 24).then_some(len as usize)
+}
+
+/// Parse an ADTS frame header at the start of `h` (caller guarantees
+/// 6 bytes); returns the whole-frame length (`aac_frame_length` includes
+/// the header), `None` if any field is invalid.
+fn adts_frame_len(h: &[u8]) -> Option<usize> {
+    if h[0] != 0xFF || (h[1] & 0xF0) != 0xF0 {
+        return None;
+    }
+    if (h[1] & 0x06) != 0 {
+        return None; // layer bits must be 00 in ADTS
+    }
+    let sf_idx = (h[2] >> 2) & 0xF;
+    if sf_idx > 12 {
+        return None; // 13/14 reserved, 15 escape — never on a real stream
+    }
+    let len = (((h[3] & 0x03) as usize) << 11) | ((h[4] as usize) << 3) | ((h[5] as usize) >> 5);
+    // Shorter than its own header → corrupt.
+    (len >= 7).then_some(len)
+}
+
+/// Confirm that the bytes at `b` (caller guarantees [`CONFIRM_LEN`]) open
+/// the next frame of the stream whose previous header is `a`: sync bits
+/// present, fields constant within one stream agree (version / layer /
+/// samplerate), and fields that legitimately vary (bitrate — VBR) are
+/// merely valid.
+fn headers_agree(kind: SyncKind, a: &[u8], b: &[u8]) -> bool {
+    match kind {
+        SyncKind::Mp3 => {
+            b[0] == 0xFF
+                && (b[1] & 0xE0) == 0xE0
+                && (a[1] & 0x1E) == (b[1] & 0x1E) // version + layer
+                && (a[2] & 0x0C) == (b[2] & 0x0C) // samplerate index
+                && (b[2] >> 4) != 0xF
+                && (b[2] >> 4) != 0 // bitrate valid (may differ — VBR)
+        }
+        SyncKind::Adts => {
+            b[0] == 0xFF
+                && (b[1] & 0xF6) == 0xF0 // sync + layer 00
+                && (a[2] & 0x3C) == (b[2] & 0x3C) // sampling-frequency index
+        }
+    }
+}
+
 fn parse_metaint(resp: &reqwest::Response) -> Option<usize> {
     resp.headers()
         .get("icy-metaint")
@@ -206,6 +479,7 @@ pub(crate) async fn run_fetcher<W>(
     client: reqwest::Client,
     url: String,
     first: FirstAttempt,
+    resync: ResyncMode,
     mut writer: W,
     event_tx: mpsc::Sender<PipelineEvent>,
 ) where
@@ -217,12 +491,12 @@ pub(crate) async fn run_fetcher<W>(
     let mut current: Option<FirstAttempt> = Some(first);
 
     loop {
-        let (resp, metaint) = match current.take() {
-            Some(c) => (c.resp, c.metaint),
+        let (resp, metaint, spliced) = match current.take() {
+            Some(c) => (c.resp, c.metaint, false),
             None => match reconnect_get(&client, &url, &event_tx).await {
                 ReconnectOutcome::Got(resp) => {
                     let metaint = parse_metaint(&resp);
-                    (resp, metaint)
+                    (resp, metaint, true)
                 }
                 ReconnectOutcome::Retry => {
                     consecutive_failures += 1;
@@ -235,8 +509,35 @@ pub(crate) async fn run_fetcher<W>(
             },
         };
 
-        let outcome =
-            drain_body(resp, metaint, &url, &mut writer, &event_tx, &mut last_title).await;
+        // THE-984 — this is the splice point: the previous body truncated
+        // mid-frame and this one starts at an arbitrary offset, but both
+        // feed the same long-lived ffmpeg stdin. Self-sync codecs get a
+        // frame-boundary scan, non-self-sync containers (Ogg/FLAC) get a
+        // Warning — see `ResyncMode`.
+        let scanner = match (resync, spliced) {
+            (ResyncMode::FrameSync(kind), true) => Some(ResyncScanner::new(kind)),
+            (ResyncMode::WarnNotSelfSync, true) => {
+                let _ = event_tx
+                    .send(PipelineEvent::Warning(format!(
+                        "icy stream {url}: reconnected mid-stream on a non-self-synchronizing \
+                         container — audio may be garbled until the station is restarted"
+                    )))
+                    .await;
+                None
+            }
+            _ => None,
+        };
+
+        let outcome = drain_body(
+            resp,
+            metaint,
+            &url,
+            &mut writer,
+            &event_tx,
+            &mut last_title,
+            scanner,
+        )
+        .await;
 
         match outcome {
             BodyOutcome::ConsumerGone => return,
@@ -311,6 +612,7 @@ async fn drain_body<W>(
     writer: &mut W,
     event_tx: &mpsc::Sender<PipelineEvent>,
     last_title: &mut String,
+    mut scanner: Option<ResyncScanner>,
 ) -> BodyOutcome
 where
     W: AsyncWrite + Unpin,
@@ -327,9 +629,40 @@ where
                 while let Some(piece) = splitter.next_piece() {
                     match piece {
                         icy::IcyPiece::Audio(bs) => {
+                            // "Audio arrived" — the URL is proven healthy
+                            // (this drives the reconnect-budget reset) even
+                            // while the THE-984 scanner is withholding the
+                            // torn bytes from the writer.
                             ever_pushed_audio = true;
-                            if writer.write_all(&bs).await.is_err() {
-                                return BodyOutcome::ConsumerGone;
+                            match scanner.as_mut().map(|s| s.feed(&bs)) {
+                                None => {
+                                    if writer.write_all(&bs).await.is_err() {
+                                        return BodyOutcome::ConsumerGone;
+                                    }
+                                }
+                                Some(ScanStep::Hold) => {}
+                                Some(ScanStep::Synced { aligned, discarded }) => {
+                                    tracing::debug!(
+                                        url,
+                                        discarded,
+                                        "icy reconnect resync: frame boundary found, torn bytes dropped",
+                                    );
+                                    scanner = None;
+                                    if writer.write_all(&aligned).await.is_err() {
+                                        return BodyOutcome::ConsumerGone;
+                                    }
+                                }
+                                Some(ScanStep::GaveUp { flush, scanned }) => {
+                                    tracing::warn!(
+                                        url,
+                                        scanned,
+                                        "icy reconnect resync: no frame sync within budget, writing through",
+                                    );
+                                    scanner = None;
+                                    if writer.write_all(&flush).await.is_err() {
+                                        return BodyOutcome::ConsumerGone;
+                                    }
+                                }
                             }
                         }
                         icy::IcyPiece::Metadata(bs) => {
@@ -692,6 +1025,9 @@ mod tests {
             client,
             url.clone(),
             FirstAttempt { resp, metaint },
+            // Reconnect mechanics under test use fill bytes, not valid
+            // frames — keep the THE-984 scanner out of the way.
+            ResyncMode::Passthrough,
             writer,
             tx,
         ));
@@ -760,6 +1096,9 @@ mod tests {
             client,
             url.clone(),
             FirstAttempt { resp, metaint },
+            // Reconnect mechanics under test use fill bytes, not valid
+            // frames — keep the THE-984 scanner out of the way.
+            ResyncMode::Passthrough,
             writer,
             tx,
         ));
@@ -812,6 +1151,9 @@ mod tests {
             client,
             url.clone(),
             FirstAttempt { resp, metaint },
+            // Reconnect mechanics under test use fill bytes, not valid
+            // frames — keep the THE-984 scanner out of the way.
+            ResyncMode::Passthrough,
             writer,
             tx,
         ));
@@ -850,6 +1192,9 @@ mod tests {
             client,
             url.clone(),
             FirstAttempt { resp, metaint },
+            // Reconnect mechanics under test use fill bytes, not valid
+            // frames — keep the THE-984 scanner out of the way.
+            ResyncMode::Passthrough,
             writer,
             tx,
         ));
@@ -866,6 +1211,259 @@ mod tests {
             "expected empty-body terminal warning, got: {collected:?}"
         );
         assert!(buf.lock().unwrap().is_empty(), "no audio expected");
+    }
+
+    /// Build one valid MPEG1 Layer III frame (128 kbps, 44.1 kHz, no
+    /// padding — 417 bytes) filled with `fill`. `fill` must not be 0xFF so
+    /// the only sync patterns in a test body are real headers.
+    fn mp3_frame(fill: u8) -> Vec<u8> {
+        assert_ne!(fill, 0xFF);
+        let mut f = vec![fill; 417];
+        f[0] = 0xFF;
+        f[1] = 0xFB; // sync + MPEG1 + Layer III + no CRC
+        f[2] = 0x90; // bitrate idx 9 (128 kbps), 44.1 kHz, no padding
+        f[3] = 0x00;
+        f
+    }
+
+    /// Build one valid ADTS AAC-LC frame (44.1 kHz) of `len` total bytes
+    /// filled with `fill` (must not be 0xFF).
+    fn adts_frame(fill: u8, len: usize) -> Vec<u8> {
+        assert_ne!(fill, 0xFF);
+        let mut f = vec![fill; len];
+        f[0] = 0xFF;
+        f[1] = 0xF1; // sync + MPEG-4 + layer 00 + no CRC
+        f[2] = 0x50; // AAC LC, sampling-frequency index 4 (44.1 kHz)
+        f[3] = ((len >> 11) & 0x3) as u8;
+        f[4] = ((len >> 3) & 0xFF) as u8;
+        f[5] = ((len & 0x7) << 5) as u8;
+        f[6] = 0x00;
+        f
+    }
+
+    #[test]
+    fn frame_len_parsers_accept_canonical_reject_invalid() {
+        assert_eq!(mp3_frame_len(&mp3_frame(0x11)), Some(417));
+        assert_eq!(mp3_frame_len(&[0xFF, 0xFB, 0xF0, 0x00]), None); // bitrate idx 15
+        assert_eq!(mp3_frame_len(&[0xFF, 0xFB, 0x0C, 0x00]), None); // free bitrate + sr idx 3
+        assert_eq!(mp3_frame_len(&[0xFF, 0xEB, 0x90, 0x00]), None); // reserved version
+        assert_eq!(mp3_frame_len(&[0xFF, 0xF9, 0x90, 0x00]), None); // reserved layer
+        assert_eq!(mp3_frame_len(&[0x00, 0xFB, 0x90, 0x00]), None); // no sync
+
+        assert_eq!(adts_frame_len(&adts_frame(0x11, 256)), Some(256));
+        assert_eq!(adts_frame_len(&[0xFF, 0xF7, 0x50, 0x00, 0x20, 0x00]), None); // layer != 0
+        assert_eq!(adts_frame_len(&[0xFF, 0xF1, 0x50, 0x00, 0x00, 0x20]), None); // len < 7
+        assert_eq!(adts_frame_len(&[0xFF, 0xF1, 0xFC, 0x00, 0x20, 0x00]), None); // sf idx 15
+    }
+
+    /// THE-984 — scanner finds the first verified frame boundary even when
+    /// the bytes arrive in awkward chunk sizes that split headers.
+    #[test]
+    fn resync_scanner_skips_torn_prefix_mp3() {
+        let torn = vec![0x22u8; 137]; // mid-frame tail, no 0xFF
+        let mut stream = torn.clone();
+        stream.extend(mp3_frame(0x33));
+        stream.extend(mp3_frame(0x44));
+
+        let mut s = ResyncScanner::new(SyncKind::Mp3);
+        let mut fed = 0;
+        let mut synced = None;
+        for chunk in stream.chunks(7) {
+            fed += chunk.len();
+            match s.feed(chunk) {
+                ScanStep::Hold => {}
+                ScanStep::Synced { aligned, discarded } => {
+                    synced = Some((aligned, discarded));
+                    break;
+                }
+                ScanStep::GaveUp { .. } => panic!("scanner gave up"),
+            }
+        }
+        let (aligned, discarded) = synced.expect("never synced");
+        assert_eq!(discarded, torn.len(), "exactly the torn prefix is dropped");
+        assert_eq!(
+            &aligned[..],
+            &stream[torn.len()..fed],
+            "aligned output starts at the verified frame header"
+        );
+    }
+
+    /// THE-984 — a sync pattern whose computed frame length does NOT land
+    /// on a second agreeing header is a false positive and must be skipped.
+    #[test]
+    fn resync_scanner_rejects_false_sync_without_second_header() {
+        let mut prefix = vec![0u8; 300];
+        let fake = adts_frame(0x00, 256);
+        // Valid-looking ADTS header at offset 1, but offset 1+256 is junk.
+        prefix[1..8].copy_from_slice(&fake[..7]);
+        let mut stream = prefix.clone();
+        stream.extend(adts_frame(0x55, 256));
+        stream.extend(adts_frame(0x66, 256));
+
+        let mut s = ResyncScanner::new(SyncKind::Adts);
+        let mut synced = None;
+        for chunk in stream.chunks(64) {
+            if let ScanStep::Synced { aligned, discarded } = s.feed(chunk) {
+                synced = Some((aligned, discarded));
+                break;
+            }
+        }
+        let (aligned, discarded) = synced.expect("never synced");
+        assert_eq!(discarded, prefix.len(), "false sync at offset 1 skipped");
+        assert_eq!(&aligned[..7], &adts_frame(0x55, 256)[..7]);
+    }
+
+    /// THE-984 — past the scan budget the scanner flushes and steps aside
+    /// (write-through is the pre-THE-984 status quo, never worse).
+    #[test]
+    fn resync_scanner_gives_up_past_budget() {
+        let mut s = ResyncScanner::new(SyncKind::Mp3);
+        let junk = vec![0x20u8; RESYNC_SCAN_MAX + 1024];
+        let mut gave_up = false;
+        for chunk in junk.chunks(4096) {
+            if let ScanStep::GaveUp { flush, scanned } = s.feed(chunk) {
+                assert!(scanned + flush.len() > RESYNC_SCAN_MAX);
+                gave_up = true;
+                break;
+            }
+        }
+        assert!(gave_up, "scanner must not withhold audio forever");
+    }
+
+    /// THE-984 — Content-Type → resync strategy. Same conservatism as the
+    /// THE-972 hint table: unknown types pass through, never guess.
+    #[test]
+    fn content_type_maps_to_resync_mode() {
+        assert_eq!(
+            resync_mode("audio/mpeg"),
+            ResyncMode::FrameSync(SyncKind::Mp3)
+        );
+        assert_eq!(
+            resync_mode("audio/mpeg; charset=UTF-8"),
+            ResyncMode::FrameSync(SyncKind::Mp3)
+        );
+        assert_eq!(
+            resync_mode("audio/aacp"),
+            ResyncMode::FrameSync(SyncKind::Adts)
+        );
+        assert_eq!(resync_mode("audio/ogg"), ResyncMode::WarnNotSelfSync);
+        assert_eq!(resync_mode("application/ogg"), ResyncMode::WarnNotSelfSync);
+        assert_eq!(resync_mode("audio/opus"), ResyncMode::WarnNotSelfSync);
+        assert_eq!(resync_mode("audio/flac"), ResyncMode::WarnNotSelfSync);
+        assert_eq!(resync_mode("text/html"), ResyncMode::Passthrough);
+        assert_eq!(resync_mode(""), ResyncMode::Passthrough);
+    }
+
+    /// THE-984 acceptance — across a reconnect on a frame-sync codec, no
+    /// torn bytes reach the writer: attempt 2's leading partial frame is
+    /// discarded and writing resumes exactly at the first verified frame
+    /// header.
+    #[tokio::test]
+    async fn reconnect_discards_torn_bytes_until_frame_sync() {
+        // Attempt 1: two whole frames (a clean cut keeps the expected-output
+        // arithmetic simple; the torn part is attempt 2's lead-in).
+        let mut body_a = mp3_frame(0x21);
+        body_a.extend(mp3_frame(0x22));
+        // Attempt 2: rejoins mid-frame — 137 bytes of frame tail (torn),
+        // then two whole frames.
+        let torn = vec![0x23u8; 137];
+        let f3 = mp3_frame(0x24);
+        let f4 = mp3_frame(0x25);
+        let mut body_b = torn.clone();
+        body_b.extend_from_slice(&f3);
+        body_b.extend_from_slice(&f4);
+
+        let (url, _server) = spawn_server(vec![
+            MockResponse::Ok {
+                metaint: None,
+                body: body_a.clone(),
+            },
+            MockResponse::Ok {
+                metaint: None,
+                body: body_b,
+            },
+        ])
+        .await;
+
+        let client = reqwest::Client::new();
+        let (resp, metaint) = open_icy(&client, &url).await.unwrap();
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = CaptureWriter { buf: buf.clone() };
+        let (tx, _rx) = mpsc::channel(128);
+        let fetcher = tokio::spawn(run_fetcher(
+            client,
+            url.clone(),
+            FirstAttempt { resp, metaint },
+            ResyncMode::FrameSync(SyncKind::Mp3),
+            writer,
+            tx,
+        ));
+
+        let mut expected = body_a;
+        expected.extend_from_slice(&f3);
+        expected.extend_from_slice(&f4);
+        let written = wait_for_bytes(&buf, expected.len(), Duration::from_secs(5)).await;
+        fetcher.abort();
+
+        assert_eq!(
+            written, expected,
+            "writer must see attempt 1 verbatim, then attempt 2 from the \
+             verified frame header — no torn bytes"
+        );
+    }
+
+    /// THE-984 option (a) — Ogg/FLAC reconnects pass bytes through but
+    /// surface a Warning that the splice may garble audio.
+    #[tokio::test]
+    async fn reconnect_on_non_self_sync_warns_and_passes_through() {
+        let audio_n = 100;
+        let (url, _server) = spawn_server(vec![
+            MockResponse::Ok {
+                metaint: None,
+                body: vec![0xAA; audio_n],
+            },
+            MockResponse::Ok {
+                metaint: None,
+                body: vec![0xBB; audio_n],
+            },
+        ])
+        .await;
+
+        let client = reqwest::Client::new();
+        let (resp, metaint) = open_icy(&client, &url).await.unwrap();
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = CaptureWriter { buf: buf.clone() };
+        let (tx, mut rx) = mpsc::channel(128);
+        let fetcher = tokio::spawn(run_fetcher(
+            client,
+            url.clone(),
+            FirstAttempt { resp, metaint },
+            ResyncMode::WarnNotSelfSync,
+            writer,
+            tx,
+        ));
+
+        let written = wait_for_bytes(&buf, 2 * audio_n, Duration::from_secs(5)).await;
+        let mut collected = Vec::new();
+        let saw_warn = wait_for_event(
+            &mut rx,
+            &mut collected,
+            Duration::from_secs(2),
+            |e| matches!(e, PipelineEvent::Warning(s) if s.contains("non-self-synchronizing")),
+        )
+        .await;
+        fetcher.abort();
+
+        assert_eq!(&written[..audio_n], &vec![0xAA; audio_n][..]);
+        assert_eq!(
+            &written[audio_n..],
+            &vec![0xBB; audio_n][..],
+            "passthrough must not drop bytes"
+        );
+        assert!(
+            saw_warn,
+            "expected non-self-sync warning, got: {collected:?}"
+        );
     }
 
     /// THE-972 — Content-Type → demuxer hint mapping. Parameters and
