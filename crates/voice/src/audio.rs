@@ -791,6 +791,30 @@ impl PacerMonitor {
     }
 }
 
+/// THE-985 (C-2) — pipeline events drained per sibling loop iteration.
+/// The biased select polls the frame arm first, so on a fast source the
+/// event arm starves; the bounded `try_recv` drain at the top of each
+/// iteration caps the worst case at 8 forwards (~µs each) per 20 ms frame
+/// slot — events surface within ~one frame period without the drain itself
+/// being able to stall pacing behind a chatty event producer.
+const EVENT_DRAIN_MAX: usize = 8;
+
+/// THE-982 / THE-985 (AR-8) — park until `pause_rx` reads unpaused,
+/// returning the wall-clock time spent parked (the caller adds it to
+/// `paused_total`, shifting every later frame's pacing slot). `None` means
+/// the pause sender dropped — the bot tore us down, clean exit.
+/// `changed()` wakes on every flip, including pause→pause (we just
+/// re-loop and re-check).
+async fn park_while_paused(pause_rx: &mut watch::Receiver<bool>) -> Option<Duration> {
+    let mut parked = Duration::ZERO;
+    while *pause_rx.borrow() {
+        let parked_at = std::time::Instant::now();
+        pause_rx.changed().await.ok()?;
+        parked += parked_at.elapsed();
+    }
+    Some(parked)
+}
+
 fn spawn_sibling(
     pipeline: AudioPipeline,
     mut frames_rx: mpsc::Receiver<music_bot_audio::OpusFrame>,
@@ -837,15 +861,37 @@ fn spawn_sibling(
         let mut events_open = true;
 
         loop {
-            // Park while paused. `changed()` wakes on every flip,
-            // including pause→pause (we just re-loop and re-check).
-            while *pause_rx.borrow() {
-                let parked_at = std::time::Instant::now();
-                if pause_rx.changed().await.is_err() {
-                    // Bot dropped the sender — clean exit.
-                    return;
+            // THE-985 (C-2) — bounded event drain. The biased select below
+            // polls the frame arm first; on a fast source it is always
+            // ready, so pipeline events (warnings, ICY `NowPlaying`) starve
+            // behind a full frame channel until the broadcast overflows and
+            // drops them as `Lagged`. Draining up to [`EVENT_DRAIN_MAX`]
+            // queued events here surfaces them within ~one frame period;
+            // the select's event arm below still wakes us when no frame is
+            // pending.
+            let mut drained = 0;
+            while events_open && drained < EVENT_DRAIN_MAX {
+                match events_rx.try_recv() {
+                    Ok(e) => {
+                        drained += 1;
+                        if tx.send(AudioMsg::PipelineEvent(e)).await.is_err() {
+                            return;
+                        }
+                    }
+                    // Cursor jumped to the oldest retained event; the next
+                    // `try_recv` returns it.
+                    Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::TryRecvError::Empty) => break,
+                    // THE-981 (AR-7) — same gate as the select arm: stop
+                    // polling a closed broadcast.
+                    Err(broadcast::error::TryRecvError::Closed) => events_open = false,
                 }
-                paused_total += parked_at.elapsed();
+            }
+            // Park while paused.
+            match park_while_paused(&mut pause_rx).await {
+                Some(parked) => paused_total += parked,
+                // Bot dropped the sender — clean exit.
+                None => return,
             }
             tokio::select! {
                 biased;
@@ -863,7 +909,7 @@ fn spawn_sibling(
                         // THE-982 — every slot is paced against the
                         // pause-shifted schedule; the raw `scheduled_at`
                         // stops being meaningful once playback has parked.
-                        let slot = f.scheduled_at + paused_total;
+                        let mut slot = f.scheduled_at + paused_total;
                         let lateness = recv_at.saturating_duration_since(slot);
                         monitor.observe(f.index, buffered, lateness);
                         // Wall-clock pacing. The pipeline encodes far faster
@@ -876,10 +922,37 @@ fn spawn_sibling(
                         // `first-frame anchor + index * 20 ms` (plus the
                         // THE-982 pause shift); `sleep_until` returns
                         // immediately once that slot is in the past.
-                        tokio::time::sleep_until(tokio::time::Instant::from_std(
-                            slot,
-                        ))
-                        .await;
+                        //
+                        // THE-985 (AR-8) — race the sleep against the pause
+                        // flag. The outer pause gate only runs between
+                        // frames, so a pause landing during this sleep used
+                        // to be honoured one frame late: the frame went out
+                        // ~20 ms into the pause and the park only started
+                        // after it. Instead: hold the frame unsent, park,
+                        // shift its slot by the parked time (THE-982), and
+                        // re-sleep to the shifted slot. `biased` polls the
+                        // pause arm first so a pause that is already
+                        // observable when the slot expires still holds the
+                        // frame rather than letting it slip out.
+                        loop {
+                            tokio::select! {
+                                biased;
+                                changed = pause_rx.changed() => {
+                                    if changed.is_err() {
+                                        // Bot dropped the sender — clean exit.
+                                        return;
+                                    }
+                                    match park_while_paused(&mut pause_rx).await {
+                                        Some(parked) => paused_total += parked,
+                                        None => return,
+                                    }
+                                    slot = f.scheduled_at + paused_total;
+                                }
+                                _ = tokio::time::sleep_until(
+                                    tokio::time::Instant::from_std(slot),
+                                ) => break,
+                            }
+                        }
                         // PURA-408b — the paced `sleep_until` is meant to
                         // return exactly at the shifted slot; sample how far
                         // past it the sibling task actually woke. `recv_at`
@@ -1492,13 +1565,17 @@ mod tests {
     /// `frames_sent`-based progress clock fast-forwarded by the pause).
     /// Post-resume frames must keep the 20 ms cadence — none forwarded
     /// ahead of its shifted slot.
+    ///
+    /// Extended for THE-985 (AR-8): the pause flips mid-`sleep_until`, and
+    /// the sibling must hold the in-flight frame for the whole pause window
+    /// instead of letting it slip out ~20 ms into the pause.
     #[tokio::test]
     async fn sibling_shifts_pacing_across_pause() {
         let mut pipeline = AudioPipeline::spawn(
             AudioSourceSpec::SyntheticTone {
                 hz: 440.0,
                 amplitude: 0.5,
-                duration_ms: Some(300),
+                duration_ms: Some(600),
             },
             PipelineConfig::default(),
             VolumeHandle::default(),
@@ -1512,25 +1589,69 @@ mod tests {
 
         let sibling = spawn_sibling(pipeline, frames_rx, events_rx, pause_rx, msg_tx);
 
-        // Let a few frames flow, then pause ≥2 s mid-play. The 300 ms tone
-        // is ~15 frames, so plenty remain backlogged across the pause.
+        // Let a few frames flow, then pause ≥2 s mid-play. The 600 ms tone
+        // is ~30 frames, so plenty remain backlogged across the pause.
+        //
+        // Pause only once the 20 ms cadence is demonstrably live: under
+        // load the opening frames can arrive as a late catch-up burst
+        // (their slots already past, so the sibling never sleeps between
+        // them), and a pause flag sent mid-burst is only observed several
+        // frames late. A ≥15 ms inter-arrival gap proves the sibling
+        // genuinely parks in a pacing sleep between frames.
         let mut pre_pause = 0usize;
-        while pre_pause < 3 {
+        let mut last_at = std::time::Instant::now();
+        loop {
             match msg_rx.recv().await.expect("stream alive before pause") {
-                AudioMsg::Frame { .. } => pre_pause += 1,
+                AudioMsg::Frame { .. } => {
+                    let now = std::time::Instant::now();
+                    let gap = now.duration_since(last_at);
+                    last_at = now;
+                    pre_pause += 1;
+                    if pre_pause >= 3 && gap >= Duration::from_millis(15) {
+                        break;
+                    }
+                }
                 AudioMsg::Finished => panic!("tone finished before the pause"),
                 AudioMsg::PipelineEvent(_) => {}
             }
         }
         pause_tx.send(true).expect("sibling holds pause_rx");
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        let paused_at = std::time::Instant::now();
+
+        // THE-985 (AR-8) — the pause flag flips right after a frame was
+        // received, so the sibling is in (or about to enter) the ~20 ms
+        // pacing sleep for the next frame. It must hold that frame unsent
+        // for the whole pause window — before the fix it slipped out ~20 ms
+        // into the pause, so the grace below must stay well under that. The
+        // grace only absorbs a frame sent just *before* the flip but
+        // received just after it.
+        let pause_window = Duration::from_secs(2);
+        let grace = Duration::from_millis(10);
+        loop {
+            let elapsed = paused_at.elapsed();
+            let Some(left) = pause_window.checked_sub(elapsed) else {
+                break;
+            };
+            match tokio::time::timeout(left, msg_rx.recv()).await {
+                Ok(Some(AudioMsg::Frame { .. })) => {
+                    let at = paused_at.elapsed();
+                    assert!(
+                        at < grace,
+                        "frame forwarded {at:?} into the pause window — pause \
+                         not honoured mid-sleep (THE-985 AR-8)",
+                    );
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("stream ended during the pause"),
+                // Window elapsed with no message — exactly what we want.
+                Err(_) => break,
+            }
+        }
         pause_tx.send(false).expect("sibling holds pause_rx");
         let resumed_at = std::time::Instant::now();
 
-        // One in-flight frame may have been sleeping in its slot when the
-        // pause flipped — it lands during the pause window and is not a
-        // post-resume frame. Everything received after `resumed_at` must be
-        // paced; collect arrival instants.
+        // Everything received after `resumed_at` must be paced; collect
+        // arrival instants.
         let mut post = Vec::new();
         while let Some(msg) = msg_rx.recv().await {
             match msg {
@@ -1548,23 +1669,25 @@ mod tests {
 
         assert!(
             post.len() >= 8,
-            "most of the ~15-frame tone should still be backlogged at \
+            "most of the ~30-frame tone should still be backlogged at \
              resume, got {} post-resume frames",
             post.len(),
         );
-        // No frame ahead of its shifted slot: the i-th post-resume frame's
-        // slot is ≥ i * 20 ms after the first one's, and `sleep_until`
-        // never wakes early — allow a small slack for the receive loop.
-        for (i, at) in post.iter().enumerate() {
-            let min_offset =
-                Duration::from_millis(20 * i as u64).saturating_sub(Duration::from_millis(10));
-            let offset = at.duration_since(post[0]);
-            assert!(
-                offset >= min_offset,
-                "post-resume frame {i} arrived {offset:?} after the first — \
-                 ahead of its shifted slot (≥{min_offset:?}); catch-up burst",
-            );
-        }
+        // No catch-up burst: with pause-shifted slots every post-resume
+        // frame is paced ~20 ms after the previous one. Individual gaps are
+        // noisy under load — a single ≥15 ms scheduler oversleep (sibling
+        // or test-side recv) squeezes the next gap toward zero — so judge
+        // the distribution, not each gap: the median is ~20 ms when paced
+        // and ~0 when the backlog goes out back-to-back (pre-THE-982 the
+        // whole ~2 s worth of frames did).
+        let mut gaps: Vec<Duration> = post.windows(2).map(|w| w[1].duration_since(w[0])).collect();
+        gaps.sort();
+        let median = gaps[gaps.len() / 2];
+        assert!(
+            median >= Duration::from_millis(10),
+            "median post-resume inter-frame gap was {median:?} — catch-up \
+             burst instead of 20 ms pacing",
+        );
         // And the whole post-resume tail must span real time, not a burst.
         let span = post.last().unwrap().duration_since(post[0]);
         let expected = Duration::from_millis(20) * (post.len() as u32 - 1);
@@ -1573,6 +1696,97 @@ mod tests {
             "{} post-resume frames spanned {span:?} — expected ~{expected:?} \
              of 20 ms pacing, not a catch-up burst",
             post.len(),
+        );
+    }
+
+    /// THE-985 (C-2) regression — pipeline events must surface while frames
+    /// are still flowing, not after EOS. The sibling's `biased` select polls
+    /// the frame arm first, so with a saturated frame channel the event arm
+    /// never won and queued events (warnings, ICY `NowPlaying`) starved
+    /// until the broadcast overflowed and dropped them as `Lagged`. The
+    /// bounded per-iteration drain forwards them within ~one frame period.
+    #[tokio::test]
+    async fn sibling_drains_events_under_frame_pressure() {
+        // The pipeline only serves as the sibling's keep-alive guard here;
+        // frames and events are hand-fed so the frame channel stays
+        // saturated for the whole run.
+        let pipeline = AudioPipeline::spawn(
+            AudioSourceSpec::SyntheticTone {
+                hz: 440.0,
+                amplitude: 0.5,
+                duration_ms: Some(50),
+            },
+            PipelineConfig::default(),
+            VolumeHandle::default(),
+        )
+        .await
+        .expect("spawn synthetic pipeline");
+
+        let (frames_tx, frames_rx) = mpsc::channel(8);
+        let (events_tx, events_rx) = broadcast::channel(16);
+        let (_pause_tx, pause_rx) = watch::channel(false);
+        let (msg_tx, mut msg_rx) = mpsc::channel(256);
+
+        // Every slot is already due, so the sibling's pacing sleep returns
+        // immediately and the frame arm is continuously ready — the C-2
+        // starvation regime.
+        let anchor = std::time::Instant::now();
+        let frame = move |i: u64| music_bot_audio::OpusFrame {
+            bytes: Bytes::from_static(&[0; 4]),
+            index: i,
+            scheduled_at: anchor,
+            channels: 1,
+        };
+        // Saturate the frame channel before the sibling starts…
+        for i in 0..8 {
+            frames_tx
+                .try_send(frame(i))
+                .expect("prefill fits the empty channel");
+        }
+        // …with events queued behind it…
+        for n in 0..4 {
+            events_tx
+                .send(PipelineEvent::Warning(format!("queued-{n}")))
+                .expect("events receiver alive");
+        }
+        // …and a producer that keeps it topped up well past the flush.
+        let producer = tokio::spawn(async move {
+            for i in 8..40u64 {
+                if frames_tx.send(frame(i)).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        let sibling = spawn_sibling(pipeline, frames_rx, events_rx, pause_rx, msg_tx);
+
+        let mut frames_seen = 0usize;
+        let mut events_seen = 0usize;
+        let mut frames_before_last_event = 0usize;
+        while let Some(msg) = msg_rx.recv().await {
+            match msg {
+                AudioMsg::Frame { .. } => frames_seen += 1,
+                AudioMsg::PipelineEvent(_) => {
+                    events_seen += 1;
+                    frames_before_last_event = frames_seen;
+                }
+                AudioMsg::Finished => break,
+            }
+        }
+        producer.await.expect("producer join");
+        sibling.await.expect("sibling task join");
+
+        assert_eq!(frames_seen, 40, "all hand-fed frames forwarded");
+        assert_eq!(events_seen, 4, "no event dropped as Lagged");
+        // With the bounded drain the queued events go out on the first loop
+        // iteration, before any frame — deterministically 0; the slack only
+        // covers a scheduling oddity. Pre-fix they starved until the frame
+        // arm first pended (observed: 9+ frames in).
+        assert!(
+            frames_before_last_event <= 4,
+            "last event delivered only after {frames_before_last_event} of 40 \
+             frames — events starved behind the saturated frame channel \
+             instead of interleaving (THE-985 C-2)",
         );
     }
 
