@@ -207,7 +207,7 @@ async fn put_cookies(
 
     // Update the live runtime Arc so the next yt-dlp invocation picks it up.
     {
-        let mut guard = state.yt_cookie.write().unwrap();
+        let mut guard = state.yt_cookie.write().unwrap_or_else(|e| e.into_inner());
         *guard = Some(cookie_path);
     }
 
@@ -248,7 +248,7 @@ async fn delete_cookies(_admin: RequireAdmin, State(state): State<AppState>) -> 
 
     // Clear runtime Arc.
     {
-        let mut guard = state.yt_cookie.write().unwrap();
+        let mut guard = state.yt_cookie.write().unwrap_or_else(|e| e.into_inner());
         *guard = None;
     }
 
@@ -288,7 +288,7 @@ async fn get_api_key(_admin: RequireAdmin, State(state): State<AppState>) -> Res
     let configured = state
         .yt_api_key
         .read()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .as_deref()
         .is_some_and(|k| !k.is_empty());
     Json(ApiKeyStatus { configured }).into_response()
@@ -318,7 +318,7 @@ async fn put_api_key(
 
     // Update the live runtime Arc so the next `!play yt:` resolve uses it.
     {
-        let mut guard = state.yt_api_key.write().unwrap();
+        let mut guard = state.yt_api_key.write().unwrap_or_else(|e| e.into_inner());
         *guard = Some(key.to_string());
     }
 
@@ -335,7 +335,7 @@ async fn delete_api_key(_admin: RequireAdmin, State(state): State<AppState>) -> 
 
     // Clear runtime Arc — reverts `!play yt:` to the `ytsearch1:` path.
     {
-        let mut guard = state.yt_api_key.write().unwrap();
+        let mut guard = state.yt_api_key.write().unwrap_or_else(|e| e.into_inner());
         *guard = None;
     }
 

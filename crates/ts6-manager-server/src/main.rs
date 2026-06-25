@@ -186,7 +186,7 @@ mod server_entry {
         if let Ok(Some(row)) = crate::repos::app_settings::get(&database, "yt_cookie_path").await {
             let db_path = std::path::PathBuf::from(&row.value);
             if db_path.exists() {
-                *state.yt_cookie.write().unwrap() = Some(db_path);
+                *state.yt_cookie.write().unwrap_or_else(|e| e.into_inner()) = Some(db_path);
             }
         }
 
@@ -196,7 +196,7 @@ mod server_entry {
         if let Ok(Some(row)) = crate::repos::app_settings::get(&database, "youtube_api_key").await
             && !row.value.is_empty()
         {
-            *state.yt_api_key.write().unwrap() = Some(row.value);
+            *state.yt_api_key.write().unwrap_or_else(|e| e.into_inner()) = Some(row.value);
         }
 
         // PURA-359 — start the persistent yt-dlp resolver service now, at
