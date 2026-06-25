@@ -9,9 +9,16 @@
 #
 # Usage:
 #   scripts/ws-gate/run-all.sh BASE_URL
+#   WS_GATE_DRY_RUN=1 scripts/ws-gate/run-all.sh [BASE_URL]
 #
 # ADMIN_TOKEN (and any per-probe env) must be exported by the caller; it is
 # passed through to each probe unchanged.
+#
+# Dry-run mode (WS_GATE_DRY_RUN=1): BASE_URL becomes optional (a placeholder
+# is substituted). Each dry-run-aware probe validates its own request
+# payloads / tooling and exits green WITHOUT a server boot or any network —
+# the path used to prove the suite is turnkey from the headless heartbeat env
+# (no reachable TS server, no release-image runner — THE-1009/THE-1013).
 #
 # Exit codes:
 #   0   every probe passed (a cleanup-only warning, exit 71, still counts pass)
@@ -21,10 +28,17 @@
 
 set -uo pipefail
 
+case "${WS_GATE_DRY_RUN:-0}" in 1|true|yes) DRY=1 ;; *) DRY=0 ;; esac
+export WS_GATE_DRY_RUN
+
 BASE_URL="${1:-}"
 if [[ -z "$BASE_URL" ]]; then
-    echo "usage: $0 BASE_URL" >&2
-    exit 64
+    if [[ "$DRY" -eq 1 ]]; then
+        BASE_URL="http://dry-run.invalid"
+    else
+        echo "usage: $0 BASE_URL   (or WS_GATE_DRY_RUN=1 $0 for a dry run)" >&2
+        exit 64
+    fi
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

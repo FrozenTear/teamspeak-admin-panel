@@ -93,6 +93,15 @@ for tool in curl jq; do
     command -v "$tool" >/dev/null 2>&1 || { fail "missing required tool: $tool"; exit "$EXIT_USAGE"; }
 done
 
+# Dry-run short-circuit (THE-1014): the headless umbrella run validates only
+# that tooling is present, then exits green without building/booting a server.
+case "${WS_GATE_DRY_RUN:-0}" in
+    1|true|yes)
+        log "PASS (dry-run) — admin-management probe present; live run self-boots a server."
+        exit 0
+        ;;
+esac
+
 BASE_URL="${1:-}"
 BOOTSTRAP_USER="${BOOTSTRAP_USER:-bootstrap}"
 BOOTSTRAP_PASS="${BOOTSTRAP_PASS:-Bootstrap1!pw}"

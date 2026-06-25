@@ -83,6 +83,18 @@ log()  { printf '[%s] %s\n' "$PROBE_NAME" "$*"; }
 fail() { printf '[%s] FAIL: %s\n' "$PROBE_NAME" "$*" >&2; }
 warn() { printf '[%s] WARN: %s\n' "$PROBE_NAME" "$*" >&2; }
 
+# Dry-run short-circuit (THE-1014): the headless umbrella run validates only
+# that tooling is present, then exits green without firing anything.
+case "${WS_GATE_DRY_RUN:-0}" in
+    1|true|yes)
+        for t in curl jq; do
+            command -v "$t" >/dev/null 2>&1 || { fail "missing required tool: $t"; exit 64; }
+        done
+        log "PASS (dry-run) — V6 graph-trigger probe present; live run needs a manager + ADMIN_TOKEN."
+        exit 0
+        ;;
+esac
+
 usage() {
     cat >&2 <<EOF
 usage: $0 BASE_URL
