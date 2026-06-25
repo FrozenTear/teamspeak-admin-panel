@@ -102,7 +102,12 @@ enum TrackKind {
 impl SourceInput {
     fn args_for(&self, kind: TrackKind) -> Vec<String> {
         match self {
-            SourceInput::Url(url) => vec!["-i".into(), url.clone()],
+            SourceInput::Url(url) => {
+                let mut args = tls_args_for(url);
+                args.push("-i".into());
+                args.push(url.clone());
+                args
+            }
             SourceInput::Lavfi { video, audio } => {
                 let spec = match kind {
                     TrackKind::Video => video,
@@ -119,6 +124,47 @@ impl SourceInput {
             SourceInput::Lavfi { video, audio } => format!("lavfi[{video} | {audio}]"),
         }
     }
+}
+
+/// R6 (THE-1010) — force FFmpeg to verify TLS certificates on `https://`
+/// inputs.
+///
+/// Plaintext-HTTP sources never reach FFmpeg directly: the control plane
+/// rewrites them to the loopback IP-pin proxy (`http://127.0.0.1:<port>/…`,
+/// see [`crate::http_pin`]), so the DNS-rebinding window is already closed
+/// for those. `https://` sources, however, are handed to FFmpeg *verbatim*
+/// because the IP-pin trick breaks TLS SNI / `Host:` on virtual-hosted CDNs
+/// (PURA-149). The control plane's safety argument for that pass-through is
+/// "TLS hostname validation already binds the connection to the cert SAN" —
+/// **but that is only true if the TLS peer certificate is actually
+/// verified**, and FFmpeg's `tls` protocol defaults `tls_verify` to `0`
+/// (no verification). Left unset, an attacker who controls DNS for an
+/// `https` source host can rebind it to an internal / cloud-metadata IP at
+/// FFmpeg's fetch time; FFmpeg completes the TLS handshake without checking
+/// the cert and streams back internal content — a full SSRF read past the
+/// `ts6-ssrf` validator.
+///
+/// Setting `-tls_verify 1` makes FFmpeg reject any peer whose certificate
+/// does not chain to a trusted CA *and* match the requested hostname, which
+/// restores the cert-SAN binding the pass-through relies on. A rebind to
+/// `169.254.169.254` (or any internal host that cannot present a valid cert
+/// for the attacker's domain) now fails the handshake — failure-closed.
+///
+/// `TS6_TLS_CA_FILE`, when set, pins the trust anchor to an explicit bundle
+/// (useful in minimal containers that don't ship a system trust store);
+/// otherwise FFmpeg's TLS backend uses its default store.
+fn tls_args_for(url: &str) -> Vec<String> {
+    if !url.starts_with("https://") {
+        return Vec::new();
+    }
+    let mut args = vec!["-tls_verify".into(), "1".into()];
+    if let Ok(ca_file) = std::env::var("TS6_TLS_CA_FILE")
+        && !ca_file.is_empty()
+    {
+        args.push("-ca_file".into());
+        args.push(ca_file);
+    }
+    args
 }
 
 impl PipelineConfig {
@@ -1083,5 +1129,94 @@ mod tests {
         assert!(p1.iter().all(|&b| b == b'Y'));
 
         assert!(parser.next_packet().unwrap().is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // R6 (THE-1010) — FFmpeg must verify TLS certs on https inputs so a
+    // DNS rebind to an internal/metadata IP fails the handshake instead of
+    // streaming back internal content. See `tls_args_for`.
+    // -----------------------------------------------------------------
+
+    /// Return the value that immediately follows `flag` in `args`, if any.
+    fn value_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        args.iter()
+            .position(|a| a == flag)
+            .and_then(|i| args.get(i + 1))
+            .map(String::as_str)
+    }
+
+    #[test]
+    fn https_input_forces_tls_verify() {
+        let cfg = PipelineConfig::new(
+            "src",
+            SourceInput::Url("https://download.samplelib.com/mp4/sample-5s.mp4".into()),
+        );
+        let args = ffmpeg_video_args(&cfg);
+        assert_eq!(
+            value_after(&args, "-tls_verify"),
+            Some("1"),
+            "https input MUST set -tls_verify 1 (R6); argv = {args:?}"
+        );
+    }
+
+    #[test]
+    fn tls_verify_precedes_the_input_url() {
+        // FFmpeg only honours protocol AVOptions that appear *before* the
+        // `-i` they apply to. A `-tls_verify` placed after `-i` is silently
+        // ignored — which would re-open the rebinding hole.
+        let cfg = PipelineConfig::new(
+            "src",
+            SourceInput::Url("https://cdn.example/v.mp4".into()),
+        );
+        let args = ffmpeg_audio_args(&cfg);
+        let verify_idx = args.iter().position(|a| a == "-tls_verify");
+        let input_idx = args.iter().position(|a| a == "-i");
+        match (verify_idx, input_idx) {
+            (Some(v), Some(i)) => assert!(v < i, "-tls_verify must come before -i; argv = {args:?}"),
+            other => panic!("expected both -tls_verify and -i in argv, got {other:?}: {args:?}"),
+        }
+    }
+
+    #[test]
+    fn plaintext_http_loopback_proxy_input_is_not_given_tls_verify() {
+        // Plaintext HTTP sources reach FFmpeg only via the loopback IP-pin
+        // proxy (rebinding already closed); TLS options would be nonsense
+        // on an http:// URL.
+        let cfg = PipelineConfig::new(
+            "src",
+            SourceInput::Url("http://127.0.0.1:54321/3f2a-token".into()),
+        );
+        let args = ffmpeg_video_args(&cfg);
+        assert!(
+            !args.iter().any(|a| a == "-tls_verify"),
+            "http loopback input must not carry -tls_verify; argv = {args:?}"
+        );
+    }
+
+    #[test]
+    fn lavfi_input_is_not_given_tls_verify() {
+        let cfg = PipelineConfig::new(
+            "src",
+            SourceInput::Lavfi {
+                video: "testsrc2=size=320x240:rate=30".into(),
+                audio: "sine=frequency=440".into(),
+            },
+        );
+        let args = ffmpeg_video_args(&cfg);
+        assert!(
+            !args.iter().any(|a| a == "-tls_verify"),
+            "synthetic lavfi input must not carry -tls_verify; argv = {args:?}"
+        );
+    }
+
+    #[test]
+    fn tls_args_helper_gates_on_scheme() {
+        // (Assert the leading pair rather than full equality — a
+        // `TS6_TLS_CA_FILE` in the ambient env legitimately appends more.)
+        let https = tls_args_for("https://h/x");
+        assert_eq!(&https[..2], ["-tls_verify", "1"]);
+        assert!(tls_args_for("http://h/x").is_empty());
+        assert!(tls_args_for("rtsp://h/x").is_empty());
+        assert!(tls_args_for("file:///etc/passwd").is_empty());
     }
 }
