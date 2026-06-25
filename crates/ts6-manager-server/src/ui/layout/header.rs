@@ -85,7 +85,7 @@ pub fn Header() -> Element {
                 class: "btn btn-ghost btn-sm hamburger",
                 r#type: "button",
                 "aria-label": "Open navigation",
-                "aria-disabled": "true",
+                disabled: true,
                 title: "Mobile drawer arrives in Phase 2",
                 "☰"
             }

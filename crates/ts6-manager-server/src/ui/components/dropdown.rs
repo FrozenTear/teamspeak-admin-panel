@@ -268,15 +268,18 @@ pub fn Dropdown(
 
     // Outside-click closer. `use_hook` runs once on mount; the callback reads
     // the live `open` signal each invocation so the same listener handles
-    // every open/close cycle for this Dropdown instance.
+    // every open/close cycle for this Dropdown instance. The Rc<Closure>
+    // satisfies use_hook's Clone bound; use_drop removes the listener when
+    // the Dropdown unmounts so it does not leak across mount/unmount cycles.
     #[cfg(target_arch = "wasm32")]
     {
+        use std::rc::Rc;
         use wasm_bindgen::closure::Closure;
 
         let menu_id_outside = menu_id.clone();
         let trigger_id_outside = trigger_id.clone();
         let mut open_outside = open;
-        use_hook(move || {
+        let (cb_rc, func) = use_hook(move || {
             let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |evt: web_sys::Event| {
                 if !*open_outside.peek() {
                     return;
@@ -296,15 +299,17 @@ pub fn Dropdown(
                     open_outside.set(false);
                 }
             });
+            let func = cb.as_ref().unchecked_ref::<js_sys::Function>().clone();
             if let Some(document) = web_sys::window().and_then(|w| w.document()) {
-                let _ = document
-                    .add_event_listener_with_callback("mousedown", cb.as_ref().unchecked_ref());
+                let _ = document.add_event_listener_with_callback("mousedown", &func);
             }
-            // Phase 1 simplification: the listener is leaked for the lifetime
-            // of the page. The Dropdown lives as long as the authenticated
-            // shell, so this is bounded; replace with a Drop-aware handle
-            // when more dropdowns mount and unmount frequently.
-            cb.forget();
+            (Rc::new(cb), func)
+        });
+        use_drop(move || {
+            if let Some(document) = web_sys::window().and_then(|w| w.document()) {
+                let _ = document.remove_event_listener_with_callback("mousedown", &func);
+            }
+            drop(cb_rc);
         });
     }
 
