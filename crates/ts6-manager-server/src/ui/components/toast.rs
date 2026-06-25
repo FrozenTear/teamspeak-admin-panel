@@ -13,6 +13,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use dioxus::prelude::*;
 
 const DEFAULT_TIMEOUT_MS: u32 = 5_000;
+/// Maximum toasts shown simultaneously. Oldest is evicted when exceeded.
+const MAX_VISIBLE: usize = 5;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ToastVariant {
@@ -73,7 +75,12 @@ impl Toaster {
             title: title.into(),
             detail,
         };
-        self.items.clone().write().push(entry);
+        let mut items = self.items.clone().write();
+        items.push(entry);
+        if items.len() > MAX_VISIBLE {
+            items.drain(0..items.len() - MAX_VISIBLE);
+        }
+        drop(items);
         schedule_dismiss(self.items, id);
     }
 
