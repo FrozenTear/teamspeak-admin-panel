@@ -128,13 +128,26 @@ pub async fn list_for_family(db: &Database, family: &str) -> Result<Vec<RefreshT
 }
 
 /// Set `replacedBy` for the row that owns `old_token`. Spec §6.5.3 step 4.
+///
+/// R5 (THE-1010): this is a **compare-and-swap** — the `replacedBy IS NONE`
+/// guard means only the *first* rotation of a given token can stamp a
+/// successor. A second concurrent rotation that already passed the
+/// application-level `replacedBy.is_some()` check (because it read the row
+/// before the first writer committed) finds 0 matching rows here and gets
+/// `Ok(None)`. The caller MUST treat `None` as "lost the rotation race" and
+/// refuse to insert a successor — otherwise two live tokens fork out of one,
+/// and the loser's successor is a valid refresh token that never trips
+/// reuse-detection. A single SurrealDB `UPDATE … WHERE` runs as one atomic
+/// statement, so the guard is the authoritative gate even when the prior
+/// read was stale.
 pub async fn set_replaced_by(
     db: &Database,
     old_token: &str,
     new_token: &str,
 ) -> Result<Option<RefreshToken>> {
     let sql = format!(
-        "UPDATE refresh_token MERGE {{ replacedBy: $new }} WHERE token = $old
+        "UPDATE refresh_token MERGE {{ replacedBy: $new }}
+            WHERE token = $old AND replacedBy IS NONE
             RETURN {PROJECTION};"
     );
     let mut resp = db

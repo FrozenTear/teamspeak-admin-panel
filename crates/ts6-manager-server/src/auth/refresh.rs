@@ -172,7 +172,20 @@ pub async fn rotate(db: &Database, supplied: &str, lifetime: Duration) -> Result
     // skipped — see module-level docs.
     let new_token = generate_refresh_token();
     let new_expires = Utc::now() + lifetime;
-    refresh_tokens::set_replaced_by(db, supplied, &new_token).await?;
+
+    // R5 (THE-1010) — compare-and-swap the `replacedBy` stamp. The read above
+    // and this write are separate statements, so two concurrent rotations of
+    // the same token can both pass the `replacedBy.is_some()` check. The
+    // CAS-guarded UPDATE (`… AND replacedBy IS NONE`) lets only one of them
+    // win; the loser gets `None` here and MUST bail before inserting, or the
+    // family forks into two live tokens (the orphan never trips
+    // reuse-detection). Failure-closed: the loser is treated as invalid.
+    if refresh_tokens::set_replaced_by(db, supplied, &new_token)
+        .await?
+        .is_none()
+    {
+        return Err(Error::InvalidOrExpired);
+    }
     refresh_tokens::insert(
         db,
         refresh_tokens::NewRefreshToken {
@@ -708,5 +721,62 @@ mod tests {
                 .unwrap()
                 .block_on(run_sequence(seq));
         }
+    }
+
+    // ---------------------------------------------------------------
+    // R5 (THE-1010) — concurrent-rotation anti-fork.
+    //
+    // The proptest harness above is single-threaded: it drives rotations
+    // sequentially and so can never exercise the TOCTOU between `rotate`'s
+    // read of `replacedBy` and its later write. That window is the real
+    // R5 residual the re-audit was asked to probe ("concurrent rotation").
+    //
+    // Fire many rotations of the *same* token at once. Before the
+    // compare-and-swap in `refresh_tokens::set_replaced_by`
+    // (`… AND replacedBy IS NONE`), two racers could both pass the
+    // `replacedBy.is_some()` check and each insert their own live
+    // successor — a silent family fork whose orphan token is a fully valid
+    // refresh credential that never trips reuse-detection. The invariant:
+    // a family may end with at most ONE live token (replacedBy NONE) and at
+    // most one rotation may succeed.
+    // ---------------------------------------------------------------
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_rotation_of_one_token_never_forks_the_family() {
+        let db = setup().await;
+        let uid = make_user(&db, "alice").await;
+        let issued = issue_for_login(&db, uid, ONE_DAY).await.unwrap();
+        let family = issued.family.clone();
+
+        const N: usize = 12;
+        let mut handles = Vec::with_capacity(N);
+        for _ in 0..N {
+            let db = db.clone();
+            let tok = issued.token.clone();
+            handles.push(tokio::spawn(
+                async move { rotate(&db, &tok, ONE_DAY).await.is_ok() },
+            ));
+        }
+        let mut oks = 0usize;
+        for h in handles {
+            if h.await.unwrap() {
+                oks += 1;
+            }
+        }
+
+        // At most one rotation may win the CAS.
+        assert!(
+            oks <= 1,
+            "{oks} concurrent rotations succeeded — token forked into multiple live chains"
+        );
+
+        // The family must hold at most one live token: exactly one on a
+        // clean win, or zero if a late reader hit the predecessor-replay
+        // reuse branch and revoked the set. Two would mean a fork.
+        let rows = refresh_tokens::list_for_family(&db, &family).await.unwrap();
+        let live = rows.iter().filter(|r| r.replacedBy.is_none()).count();
+        assert!(
+            live <= 1,
+            "family has {live} live tokens after concurrent rotation — fork detected"
+        );
     }
 }
