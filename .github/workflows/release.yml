@@ -238,6 +238,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       - name: Resolve release tag
         id: tag
@@ -277,6 +279,46 @@ jobs:
             echo "## ${TAG}"
             echo
             echo "Signed multi-arch OCI images and pre-built sidecar binaries."
+            echo
+            echo "## What's changed"
+            echo
+            PREV=""
+            if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+              PREV="$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)"
+            fi
+            if [[ -z "$PREV" ]]; then
+              PREV="$(git tag --list 'v*' --sort=-version:refname | awk -v t="$TAG" '$0 != t { print; exit }')"
+            fi
+            RANGE=""
+            if [[ -n "$PREV" ]] && git rev-parse -q --verify "refs/tags/${PREV}" >/dev/null; then
+              if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+                RANGE="${PREV}..${TAG}"
+              else
+                RANGE="${PREV}..HEAD"
+              fi
+            fi
+            if [[ -n "$RANGE" ]]; then
+              echo "Commits since \`${PREV}\`:"
+              echo
+              LOG="$(git log --pretty=format:'- %s (%h)' --no-merges "$RANGE" || true)"
+              if [[ -n "$LOG" ]]; then
+                echo "$LOG"
+              else
+                echo "_No non-merge commits in \`${RANGE}\`._"
+              fi
+            else
+              echo "No previous \`v*\` tag found to diff against (first cut, or tags were not fetched)."
+            fi
+            echo
+            echo "## Contabo / kube upgrade"
+            echo
+            echo "On the existing host checkout (never \`podman kube down --force\`):"
+            echo
+            echo '```'
+            echo "./scripts/update.sh ${TAG}"
+            echo '```'
+            echo
+            echo "Pulls both GHCR images, keeps fullstack + sidecar on \`${TAG}\`, plays without wiping \`ts6-data\` / \`ts6-db\` / \`ts6-music\`. See \`deploy/kube/README.md\` and \`docs/runbook.md\` § 3.4."
             echo
             echo "### Images (manifest lists, linux/amd64 + linux/arm64)"
             echo

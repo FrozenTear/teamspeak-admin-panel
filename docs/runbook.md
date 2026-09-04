@@ -149,7 +149,7 @@ For all three shapes the external smoke is the same: `curl -fsS http://127.0.0.1
 | Shape | Start | Stop | Restart |
 | --- | --- | --- | --- |
 | Quadlet | `systemctl --user start ts6-manager-pod.service` | `systemctl --user stop ts6-manager-pod.service` | `systemctl --user restart ts6-manager-pod.service` |
-| Kube | `cat deploy/kube/secrets.yaml deploy/kube/ts6-manager.yaml > /tmp/ts6-manager.kube.yaml && podman kube play /tmp/ts6-manager.kube.yaml` | `podman kube down deploy/kube/ts6-manager.yaml` | `podman kube down …` then `podman kube play …` (re-concat the kube file too if you re-edited a source manifest) |
+| Kube | `cat deploy/kube/secrets.yaml deploy/kube/ts6-manager.yaml > /tmp/ts6-manager.kube.yaml && podman kube play /tmp/ts6-manager.kube.yaml` (skip the concat if `podman secret exists ts6-manager-secrets`) | `podman kube down deploy/kube/ts6-manager.yaml` (never `--force`) | `./scripts/update.sh vX.Y.Z` |
 | Compose | `podman-compose up -d fullstack` | `podman-compose down` | `podman-compose restart fullstack` |
 
 Kube `kube down` removes the pod and containers but leaves the named
@@ -223,17 +223,29 @@ log path off the manager itself.
 > If bots/flows/rules vanish after an upgrade, the `ts6-db` volume was
 > lost — restore it from a § 3.2 backup.
 
-The Quadlet and Kube manifests pin `ghcr.io/frozentear/ts6-manager-fullstack:v0.1.0-rc1`
-(release candidate; floats to `:v1.0.0` on the next signed cut). Two
-documented upgrade paths:
+The kube manifest pins fullstack **and** sidecar to the same release tag
+(currently `:v1.6.2`). Both GHCR images share that tag from
+`.github/workflows/release.yml`. `imagePullPolicy: IfNotPresent` means
+you must `podman pull` the target tags before play or old layers stick.
 
-**Pin-by-tag (recommended):**
+**Contabo / kube — `scripts/update.sh` (recommended):**
 
-1. Verify the new image's signature with cosign — see § 5 below and
-   [`docs/ops/images.md` § 3](ops/images.md#3-signing) for the canonical
-   recipe.
-2. Edit the unit / manifest to pin the new tag.
-3. `daemon-reload && restart` (Quadlet) or `kube down && kube play` (kube).
+```sh
+./scripts/update.sh v1.6.2
+```
+
+From any cwd against a repo checkout. The script pulls both images,
+rewrites a temp manifest so sidecar cannot lag, `podman kube down`s
+**without** `--force`, plays (pod-only if `ts6-manager-secrets` already
+exists; otherwise concatenates `deploy/kube/secrets.yaml`), and curls
+`http://127.0.0.1:3001/health`. Verify the new image's signature first
+if you want — see § 5 and [`docs/ops/images.md` § 3](ops/images.md#3-signing).
+
+**Quadlet:**
+
+1. Verify the new image's signature with cosign — see § 5 below.
+2. Edit the unit to pin the new tag.
+3. `daemon-reload && restart`.
 
 **Auto-update (Quadlet only, opt-in):** the unit ships with
 `AutoUpdate=registry`. Then:
@@ -246,6 +258,24 @@ podman auto-update              # apply
 Only enable auto-update against immutable `vX.Y.Z` tags — pointing it at a
 floating `latest` tag will roll silently on every push and breaks the
 "every running instance has a known signature" property.
+
+#### Appendix: manual kube upgrade
+
+Prefer `./scripts/update.sh vX.Y.Z`. Same sequence by hand:
+
+```sh
+TAG=v1.6.2
+podman pull "ghcr.io/frozentear/ts6-manager-fullstack:${TAG}"
+podman pull "ghcr.io/frozentear/ts6-manager-sidecar:${TAG}"
+sed -E \
+  -e "s#(image:[[:space:]]+ghcr\\.io/frozentear/ts6-manager-fullstack:)[^[:space:]]+#\\1${TAG}#" \
+  -e "s#(image:[[:space:]]+ghcr\\.io/frozentear/ts6-manager-sidecar:)[^[:space:]]+#\\1${TAG}#" \
+  deploy/kube/ts6-manager.yaml > /tmp/ts6-manager.kube.yaml
+podman kube down deploy/kube/ts6-manager.yaml    # never --force
+# If the host secret is missing: cat deploy/kube/secrets.yaml in front.
+podman kube play /tmp/ts6-manager.kube.yaml
+curl -fsS http://127.0.0.1:3001/health
+```
 
 ### 3.5 Re-issuing secrets
 
