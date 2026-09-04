@@ -408,17 +408,40 @@ pub async fn advance_queue(gate: Arc<RefreshGate>, bot: wire::BotId) -> Result<(
 
 // ---- SSE event stream ---------------------------------------------------
 
+/// `{api_base}/api/music-bots/{id}/events?token={urlencoded JWT}`.
+///
+/// Query name is `token`, matching `GET /api/ws?token=…` / the WS hub's
+/// `build_ws_url`. Browsers cannot set `Authorization` on `EventSource`,
+/// so the access JWT has to travel in the query string. An empty token
+/// produces a URL the caller must not open (anonymous session).
+pub(crate) fn build_bot_events_url(api_base: &str, bot: wire::BotId, access_token: &str) -> String {
+    format!(
+        "{}/api/music-bots/{}/events?token={}",
+        api_base,
+        bot.0,
+        urlencoding::encode(access_token)
+    )
+}
+
 /// Subscribe to `/api/music-bots/{id}/events` and call `on_event` for
 /// every parsed [`wire::BotEventWire`] payload. The returned struct is
 /// dropped automatically when the calling component unmounts; that closes
 /// the underlying `EventSource` and detaches the JS callback.
+///
+/// `access_token` is the live access JWT. It is appended as `?token=`
+/// (urlencoded) because the browser `EventSource` constructor cannot set
+/// headers. An empty token is treated as anonymous: no socket is opened.
 ///
 /// The browser's native `EventSource` already handles reconnect (with a
 /// 3 s default backoff) and `Last-Event-ID` resume — the FE only deals
 /// with the parsed event stream. The native build (SSR / native unit
 /// tests) returns a no-op handle that never fires `on_event`.
 #[cfg(target_arch = "wasm32")]
-pub fn open_bot_event_source<F>(bot: wire::BotId, mut on_event: F) -> BotEventStream
+pub fn open_bot_event_source<F>(
+    bot: wire::BotId,
+    access_token: &str,
+    mut on_event: F,
+) -> BotEventStream
 where
     F: FnMut(wire::BotEventWire) + 'static,
 {
@@ -426,7 +449,11 @@ where
     use wasm_bindgen::closure::Closure;
     use web_sys::{EventSource, MessageEvent};
 
-    let url = format!("{}/api/music-bots/{}/events", api::api_base(), bot.0);
+    if access_token.is_empty() {
+        return BotEventStream::default();
+    }
+
+    let url = build_bot_events_url(&api::api_base(), bot, access_token);
     let source = match EventSource::new(&url) {
         Ok(es) => es,
         Err(_) => return BotEventStream::default(),
@@ -448,7 +475,11 @@ where
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub fn open_bot_event_source<F>(_bot: wire::BotId, _on_event: F) -> BotEventStream
+pub fn open_bot_event_source<F>(
+    _bot: wire::BotId,
+    _access_token: &str,
+    _on_event: F,
+) -> BotEventStream
 where
     F: FnMut(wire::BotEventWire) + 'static,
 {
@@ -485,3 +516,31 @@ impl Drop for BotEventStream {
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Default)]
 pub struct BotEventStream;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bot_events_url_uses_token_query_and_encodes_jwt() {
+        // `+` / `=` are the characters a compact JWT can carry that must
+        // be percent-encoded; `.` is unreserved and stays literal — same
+        // `urlencoding::encode` path as the WS hub's `?token=`.
+        let url = build_bot_events_url(
+            "https://panel.example",
+            wire::BotId(42),
+            "hdr.pay+load.sig=",
+        );
+        assert_eq!(
+            url,
+            "https://panel.example/api/music-bots/42/events?token=hdr.pay%2Bload.sig%3D"
+        );
+    }
+
+    #[test]
+    fn bot_events_url_query_name_is_token_not_access_token() {
+        let url = build_bot_events_url("https://x", wire::BotId(1), "abc");
+        assert!(url.contains("?token="), "got: {url}");
+        assert!(!url.contains("access_token"), "got: {url}");
+    }
+}
