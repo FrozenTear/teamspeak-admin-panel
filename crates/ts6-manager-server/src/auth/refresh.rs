@@ -752,9 +752,9 @@ mod tests {
         for _ in 0..N {
             let db = db.clone();
             let tok = issued.token.clone();
-            handles.push(tokio::spawn(
-                async move { rotate(&db, &tok, ONE_DAY).await.is_ok() },
-            ));
+            handles.push(tokio::spawn(async move {
+                rotate(&db, &tok, ONE_DAY).await.is_ok()
+            }));
         }
         let mut oks = 0usize;
         for h in handles {

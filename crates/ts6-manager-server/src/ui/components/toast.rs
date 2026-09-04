@@ -75,17 +75,22 @@ impl Toaster {
             title: title.into(),
             detail,
         };
-        let mut items = self.items.clone().write();
-        items.push(entry);
-        if items.len() > MAX_VISIBLE {
-            items.drain(0..items.len() - MAX_VISIBLE);
+        // Bind the Copy Signal first so `write()` is not on a temporary (E0716/E0502).
+        let mut items = self.items;
+        {
+            let mut items = items.write();
+            items.push(entry);
+            if items.len() > MAX_VISIBLE {
+                let overflow = items.len() - MAX_VISIBLE;
+                items.drain(0..overflow);
+            }
         }
-        drop(items);
         schedule_dismiss(self.items, id);
     }
 
     pub fn dismiss(&self, id: u64) {
-        self.items.clone().write().retain(|e| e.id != id);
+        let mut items = self.items;
+        items.write().retain(|e| e.id != id);
     }
 }
 
