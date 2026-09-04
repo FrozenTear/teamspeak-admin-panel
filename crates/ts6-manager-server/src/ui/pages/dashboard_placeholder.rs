@@ -136,7 +136,9 @@ enum DashboardSelection {
     WaitingOnList,
     NoServers,
     NoSelection,
-    Selected(ServerSummary),
+    /// Boxed so the enum stays small — `ServerSummary` is ~208 bytes
+    /// (`large_enum_variant` on rustc 1.95 / clippy `-D warnings`).
+    Selected(Box<ServerSummary>),
 }
 
 fn selection_from_context(list: &ServersData, selected_id: Option<i64>) -> DashboardSelection {
@@ -148,7 +150,7 @@ fn selection_from_context(list: &ServersData, selected_id: Option<i64>) -> Dashb
         ServersData::Error(_) => DashboardSelection::WaitingOnList,
         ServersData::Loaded(rows) if rows.is_empty() => DashboardSelection::NoServers,
         ServersData::Loaded(_) => match active_server::resolve_selected(list, selected_id) {
-            Some(server) => DashboardSelection::Selected(server),
+            Some(server) => DashboardSelection::Selected(Box::new(server)),
             None => DashboardSelection::NoSelection,
         },
     }
@@ -179,7 +181,7 @@ async fn fetch_dashboard(
             let data: DashboardData =
                 api::authorized_get_json(&gate, &api::api_base(), &path).await?;
             Ok(DashboardLoaded::Ready(Box::new(DashboardReadyPayload {
-                server,
+                server: *server,
                 data,
             })))
         }
