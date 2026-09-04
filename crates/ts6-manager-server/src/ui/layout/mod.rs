@@ -86,11 +86,11 @@ pub fn AppShell() -> Element {
         }
     });
 
-    // Single shared `/api/servers` resource for both selector variants and
-    // (eventually) any chrome surface that wants the same list. Mounted
-    // before the anon-session early return so the hook order is stable
-    // across renders — for anon sessions the fetch errors out harmlessly
-    // before the chrome bounces to /login.
+    // Single shared `/api/servers` list + selected-id signal for both
+    // selector variants and any page (dashboard KPIs included) that
+    // wants the same pick. Mounted before the anon-session early return
+    // so the hook order is stable across renders — for anon sessions
+    // the fetch errors out harmlessly before the chrome bounces to /login.
     let _servers = mount_servers_context();
 
     if !is_authed {

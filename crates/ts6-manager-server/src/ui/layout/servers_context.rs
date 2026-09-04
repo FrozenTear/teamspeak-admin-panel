@@ -8,10 +8,11 @@
 //! request and a single cache, avoiding the desktop/mobile selector pair
 //! firing two `/api/servers` calls on every authed route mount.
 //!
-//! The dashboard still does its own per-mount fetch today (see
-//! `ui::pages::dashboard_placeholder`); PURA-31 can collapse that onto this
-//! context in a follow-up — the contract here is "shared list, refetched
-//! on demand", which is the only thing the selector needs.
+//! The operator's current pick lives on the same context as a
+//! [`Signal<Option<i64>>`] hydrated from [`crate::client::ui_prefs`]. The
+//! header / mobile [`crate::ui::components::ServerSelector`] pair write
+//! that signal (and persist it); the dashboard reads it so a header pick
+//! refetches KPIs for that `configId` without a second `GET /api/servers`.
 //!
 //! Internally we hold a [`Signal<ServersData>`] state machine rather than a
 //! raw `Resource<…>`. That makes the selector logic identical between
@@ -26,6 +27,7 @@ use ts6_manager_shared::servers::ServerSummary;
 use crate::client::api::{self, ApiError};
 use crate::client::dioxus::{use_auth_gate, use_session};
 use crate::client::session::RefreshGate;
+use crate::client::ui_prefs::load_selected_server_id;
 
 /// Three-state load model for the `/api/servers` list.
 #[derive(Clone, Debug, PartialEq)]
@@ -47,10 +49,16 @@ impl ServersData {
 }
 
 /// Shape stashed in Dioxus context. Cloning shares the same underlying
-/// Signal, so two consumers see the same updates.
+/// Signals, so two consumers see the same updates.
 #[derive(Clone, Copy)]
 pub struct ServersContext {
     pub data: Signal<ServersData>,
+    /// Operator's current pick — the same id the header selector persists
+    /// through [`crate::client::ui_prefs`]. `None` means no selection
+    /// (never picked, or a stale id was cleared). Sharing the signal lets
+    /// the dashboard refetch when the pick changes without polling
+    /// `localStorage` or issuing a second `/api/servers` call.
+    pub selected: Signal<Option<i64>>,
 }
 
 /// Compound hook: build the [`ServersContext`], spawn the background fetch,
@@ -72,6 +80,10 @@ pub fn mount_servers_context() -> ServersContext {
     let gate = use_auth_gate();
     let session = use_session();
     let mut data: Signal<ServersData> = use_signal(|| ServersData::Loading);
+    let selected: Signal<Option<i64>> = use_signal({
+        let storage = session.storage.clone();
+        move || load_selected_server_id(&*storage)
+    });
 
     // PURA-232 — memoise the authed bit so token rotations
     // (`session.update_pair` from the refresh gate) don't cancel and
@@ -108,7 +120,7 @@ pub fn mount_servers_context() -> ServersContext {
             data.set(next);
         }
     });
-    let ctx = ServersContext { data };
+    let ctx = ServersContext { data, selected };
     use_context_provider(|| ctx);
     ctx
 }

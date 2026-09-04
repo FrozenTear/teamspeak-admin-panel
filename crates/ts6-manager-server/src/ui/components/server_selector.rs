@@ -7,11 +7,14 @@
 //! `GET /api/servers` resource backs both the desktop header pill and the
 //! mobile-bar variant, so no extra fetches fire when both render.
 //!
-//! Selected-server persistence rides through [`crate::client::ui_prefs`]:
-//! the operator's last pick is restored from `localStorage` on mount, and
-//! every `onselect` writes back. A persisted id that no longer matches any
-//! row in the live list is treated as "no selection" and silently cleared
-//! so the chrome doesn't keep pointing at a deleted server.
+//! Selected-server persistence rides through [`crate::client::ui_prefs`]
+//! **and** the shared [`ServersContext::selected`] signal: the operator's
+//! last pick is restored from `localStorage` when the context mounts, and
+//! every `onselect` writes both the signal and storage. A persisted id
+//! that no longer matches any row in the live list is treated as "no
+//! selection" and silently cleared so the chrome doesn't keep pointing at
+//! a deleted server. Sharing the signal means the desktop/mobile selector
+//! pair and the dashboard see the same pick without a second fetch.
 //!
 //! Two visual variants exist because the chrome surfaces the selector in
 //! two slots (header pill on desktop, full-width bar above the page on
@@ -25,11 +28,8 @@ use ts6_manager_shared::servers::ServerSummary;
 
 use crate::client::api::ApiError;
 use crate::client::dioxus::use_session;
-use crate::client::storage::Storage;
 use crate::client::store::AuthState;
-use crate::client::ui_prefs::{
-    clear_selected_server_id, load_selected_server_id, save_selected_server_id,
-};
+use crate::client::ui_prefs::{clear_selected_server_id, save_selected_server_id};
 use crate::ui::components::dropdown::{
     Dropdown, Menu, MenuDivider, MenuEmpty, MenuFilter, MenuFooter, MenuItem, MenuItemKind,
     MenuSection,
@@ -92,12 +92,9 @@ pub fn ServerSelector(
     let session = use_session();
     let storage = session.storage.clone();
 
-    // Hydrate from localStorage on mount. The signal stays `Option<i64>` so
-    // a missing pref / never-picked state cleanly maps to "no selection".
-    let mut selected: Signal<Option<i64>> = use_signal({
-        let storage = storage.clone();
-        move || load_selected_server_id(&*storage)
-    });
+    // Shared with the dashboard (and the other selector variant). Hydrated
+    // from localStorage in `mount_servers_context`; we only write it here.
+    let mut selected = ctx.selected;
     let mut open = use_signal(|| false);
     let mut active_id: Signal<Option<String>> = use_signal(|| None::<String>);
     let mut filter = use_signal(String::new);
@@ -533,6 +530,7 @@ mod tests {
         // renders without firing a real fetch.
         use_context_provider(|| ServersContext {
             data: Signal::new(ServersData::Loaded(vec![fixture(1, "Primary")])),
+            selected: Signal::new(None),
         });
         rsx! { ServerSelector { variant: ServerSelectorVariant::Desktop } }
     }
@@ -611,6 +609,7 @@ mod tests {
         use_context_provider(|| provide_auth_gate(session));
         use_context_provider(|| ServersContext {
             data: Signal::new(ServersData::Loaded(vec![fixture(1, "Primary")])),
+            selected: Signal::new(Some(1)),
         });
         rsx! { ServerSelector { variant: ServerSelectorVariant::Desktop } }
     }

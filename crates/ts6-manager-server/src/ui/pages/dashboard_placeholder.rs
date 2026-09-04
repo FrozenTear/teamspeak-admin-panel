@@ -7,24 +7,28 @@
 //! single-flight refresh gate handles `401 Invalid or expired token`
 //! transparently — the dashboard never sees a stale-token race.
 //!
-//! Phase-1 selection rules (PURA-31):
-//! - The "selected server" is the first row from `GET /api/servers`. The
-//!   header server-selector is being wired to a live source in a sibling
-//!   ticket; until that selection state is exposed via context, defaulting
-//!   to the first granted row keeps the dashboard testable end-to-end.
-//! - The virtual-server id defaults to `1` per spec §4.2.5. A future
-//!   `serverlist`-backed picker (Phase 2) replaces the constant.
+//! Selection (PURA-31 follow-up): KPIs track the header selector's pick
+//! via [`crate::ui::layout::ServersContext`]. The list itself is the
+//! chrome's already-fetched `GET /api/servers` cache — this page does
+//! **not** re-fetch it. Changing the pick restarts the KPI resource for
+//! that `configId`. Virtual-server id stays pinned to
+//! [`super::active_server::DEFAULT_VIRTUAL_SERVER_ID`] (`1`) until a live
+//! vs-picker exists (spec §4.2.5). Access control stays on the API;
+//! this surface does not implement `RequireServerAccess`.
 //!
 //! Render states (per the issue's "empty / loading / error / 502-from-TS"
 //! contract):
 //! - **Loading**: skeleton blocks sized to the KPI grid so the chrome
-//!   doesn't reflow when data arrives.
+//!   doesn't reflow when data arrives (list still loading, or KPI fetch
+//!   in flight after a pick).
 //! - **No servers**: empty-state nudging the operator to `/servers`.
+//! - **No selection**: servers exist but the header pick is empty / stale.
 //! - **Loaded**: KPI grid with formatted online users, channels, uptime,
 //!   bandwidth, ping, and packet loss.
 //! - **Error**: surface-scoped `Banner` carrying the spec §7.0.2
 //!   `{ error, code, details }` envelope verbatim when the upstream is the
-//!   TS WebQuery (`502`); a generic copy otherwise.
+//!   TS WebQuery (`502`); a generic copy otherwise. The same Banner
+//!   pattern covers a failed chrome `/api/servers` load.
 //!
 //! Auth gating + logout still live in `AppShell` / `Header`; this component
 //! is rendered only when a session exists.
@@ -40,10 +44,8 @@ use crate::client::dioxus::{use_auth_gate, use_session};
 use crate::client::session::RefreshGate;
 use crate::client::store::AuthState;
 use crate::ui::components::{Banner, BannerVariant};
-
-/// Spec §4.2.5 — `virtualServerId` defaults to `1`. Surface-level constant
-/// so the day a vs-picker exists, the only change is replacing the value.
-const DEFAULT_VIRTUAL_SERVER_ID: i64 = 1;
+use crate::ui::layout::{ServersData, use_servers_context};
+use crate::ui::pages::active_server;
 
 /// Outcome of a dashboard load. Loading is `None` on the resource itself —
 /// only `Ok` payload variants live here. The `Ready` payload is boxed so
@@ -51,7 +53,11 @@ const DEFAULT_VIRTUAL_SERVER_ID: i64 = 1;
 /// together carry a chunk of strings + chrono timestamps).
 #[derive(Clone, Debug)]
 enum DashboardLoaded {
+    /// Chrome list is still in flight — render the same skeleton as a
+    /// KPI fetch so the grid does not pop in later.
+    WaitingOnList,
     NoServers,
+    NoSelection,
     Ready(Box<DashboardReadyPayload>),
 }
 
@@ -72,15 +78,18 @@ pub fn DashboardPlaceholder() -> Element {
     };
 
     let gate = use_auth_gate();
+    let servers_ctx = use_servers_context();
 
-    // Dioxus 0.7 quirk: `use_resource` re-runs whenever a tracked signal it
-    // depends on changes. We don't track any signals inside the future, so
-    // this fires exactly once per mount — which is the contract Phase 1
-    // wants (no polling). A `refresh` button + interval refresh land in the
-    // separate Phase-2 ticket per the issue's "Out of scope" list.
+    // Dioxus 0.7: `use_resource` re-runs whenever a tracked signal it
+    // depends on changes. Reading the chrome list + selected id inside
+    // the closure means a header pick (or list arrival) cancels any
+    // in-flight KPI fetch and starts a new one for that `configId`.
+    // A refresh button + interval refresh stay Phase-2.
     let dashboard = use_resource(move || {
         let gate = gate.clone();
-        async move { fetch_dashboard(gate).await }
+        let list = servers_ctx.data.read().clone();
+        let selected_id = *servers_ctx.selected.read();
+        async move { fetch_dashboard(gate, list, selected_id).await }
     });
 
     rsx! {
@@ -89,9 +98,13 @@ pub fn DashboardPlaceholder() -> Element {
 
         section { class: "stack-md",
             { match &*dashboard.read_unchecked() {
-                // Initial render + WASM in-flight: skeleton stand-in.
-                None => rsx! { DashboardSkeleton {} },
+                // Initial render + WASM in-flight, or chrome list still
+                // arriving: skeleton stand-in.
+                None | Some(Ok(DashboardLoaded::WaitingOnList)) => {
+                    rsx! { DashboardSkeleton {} }
+                }
                 Some(Ok(DashboardLoaded::NoServers)) => rsx! { DashboardEmpty {} },
+                Some(Ok(DashboardLoaded::NoSelection)) => rsx! { DashboardNoSelection {} },
                 Some(Ok(DashboardLoaded::Ready(payload))) => rsx! {
                     DashboardReady {
                         config_name: payload.server.name.clone(),
@@ -115,24 +128,64 @@ pub fn DashboardPlaceholder() -> Element {
     }
 }
 
-async fn fetch_dashboard(gate: Arc<RefreshGate>) -> Result<DashboardLoaded, ApiError> {
-    let base = api::api_base();
-    let servers: Vec<ServerSummary> =
-        api::authorized_get_json(&gate, &base, "/api/servers").await?;
+/// Pure chrome → KPI decision. Unit-tested without a Dioxus runtime so we
+/// can pin "use the selected id, never the first granted row, never a
+/// second `/api/servers` fetch".
+#[derive(Clone, Debug, PartialEq)]
+enum DashboardSelection {
+    WaitingOnList,
+    NoServers,
+    NoSelection,
+    /// Boxed so the enum stays small — `ServerSummary` is ~208 bytes
+    /// (`large_enum_variant` on rustc 1.95 / clippy `-D warnings`).
+    Selected(Box<ServerSummary>),
+}
 
-    let Some(server) = servers.into_iter().next() else {
-        return Ok(DashboardLoaded::NoServers);
-    };
+fn selection_from_context(list: &ServersData, selected_id: Option<i64>) -> DashboardSelection {
+    match list {
+        ServersData::Loading => DashboardSelection::WaitingOnList,
+        // List errors are turned into a Banner by `fetch_dashboard` before
+        // this helper is asked to pick a row. Treat them as "not ready"
+        // so a failed chrome load can never resolve to a Selected row.
+        ServersData::Error(_) => DashboardSelection::WaitingOnList,
+        ServersData::Loaded(rows) if rows.is_empty() => DashboardSelection::NoServers,
+        ServersData::Loaded(_) => match active_server::resolve_selected(list, selected_id) {
+            Some(server) => DashboardSelection::Selected(Box::new(server)),
+            None => DashboardSelection::NoSelection,
+        },
+    }
+}
 
-    let path = format!(
-        "/api/servers/{}/vs/{}/dashboard",
-        server.id, DEFAULT_VIRTUAL_SERVER_ID
-    );
-    let data: DashboardData = api::authorized_get_json(&gate, &base, &path).await?;
-    Ok(DashboardLoaded::Ready(Box::new(DashboardReadyPayload {
-        server,
-        data,
-    })))
+async fn fetch_dashboard(
+    gate: Arc<RefreshGate>,
+    list: ServersData,
+    selected_id: Option<i64>,
+) -> Result<DashboardLoaded, ApiError> {
+    if let ServersData::Error(err) = &list {
+        return Err(err.clone());
+    }
+
+    match selection_from_context(&list, selected_id) {
+        DashboardSelection::WaitingOnList => Ok(DashboardLoaded::WaitingOnList),
+        DashboardSelection::NoServers => Ok(DashboardLoaded::NoServers),
+        DashboardSelection::NoSelection => Ok(DashboardLoaded::NoSelection),
+        DashboardSelection::Selected(server) => {
+            // Phase-1 pin: no live virtual-server picker yet. Spec §4.2.5
+            // defaults `virtualServerId` to 1; swap
+            // [`active_server::DEFAULT_VIRTUAL_SERVER_ID`] when a picker lands.
+            let path = format!(
+                "/api/servers/{}/vs/{}/dashboard",
+                server.id,
+                active_server::DEFAULT_VIRTUAL_SERVER_ID
+            );
+            let data: DashboardData =
+                api::authorized_get_json(&gate, &api::api_base(), &path).await?;
+            Ok(DashboardLoaded::Ready(Box::new(DashboardReadyPayload {
+                server: *server,
+                data,
+            })))
+        }
+    }
 }
 
 #[component]
@@ -176,6 +229,20 @@ fn DashboardEmpty() -> Element {
             }
             div { class: "actions",
                 a { class: "btn btn-primary", href: "/servers", "Add a server" }
+            }
+        }
+    }
+}
+
+#[component]
+fn DashboardNoSelection() -> Element {
+    rsx! {
+        div { class: "empty",
+            div { class: "icon", "⬢" }
+            h3 { "No server selected" }
+            p {
+                "Pick a TeamSpeak instance from the header selector to load "
+                "live counts, bandwidth, and uptime."
             }
         }
     }
@@ -492,5 +559,72 @@ mod tests {
         let err = ApiError::Transport("net::ERR".into());
         let (title, _) = error_copy(&err);
         assert_eq!(title, "Dashboard temporarily unavailable");
+    }
+
+    fn fixture(id: i64, name: &str) -> ServerSummary {
+        let now = chrono::Utc::now();
+        ServerSummary {
+            id,
+            name: name.into(),
+            host: "ts.example.com".into(),
+            webquery_port: 10080,
+            use_https: true,
+            ssh_port: 10022,
+            ssh_username: None,
+            has_ssh_credentials: false,
+            query_bot_channel: None,
+            query_bot_nickname: None,
+            ssh_bot_nickname: None,
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+            last_seen_at: None,
+        }
+    }
+
+    #[test]
+    fn selection_waits_while_chrome_list_is_loading() {
+        assert_eq!(
+            selection_from_context(&ServersData::Loading, Some(1)),
+            DashboardSelection::WaitingOnList
+        );
+    }
+
+    #[test]
+    fn selection_is_no_servers_when_list_is_empty() {
+        assert_eq!(
+            selection_from_context(&ServersData::Loaded(Vec::new()), None),
+            DashboardSelection::NoServers
+        );
+    }
+
+    #[test]
+    fn selection_is_no_selection_when_pick_is_missing_or_stale() {
+        let list = ServersData::Loaded(vec![fixture(7, "Primary"), fixture(9, "Backup")]);
+        assert_eq!(
+            selection_from_context(&list, None),
+            DashboardSelection::NoSelection
+        );
+        assert_eq!(
+            selection_from_context(&list, Some(99)),
+            DashboardSelection::NoSelection
+        );
+    }
+
+    #[test]
+    fn selection_uses_the_picked_row_not_the_first_granted() {
+        let list = ServersData::Loaded(vec![fixture(7, "Primary"), fixture(9, "Backup")]);
+        match selection_from_context(&list, Some(9)) {
+            DashboardSelection::Selected(server) => {
+                assert_eq!(server.id, 9);
+                assert_eq!(server.name, "Backup");
+            }
+            other => panic!("expected Selected(Backup), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kpi_path_pins_phase1_virtual_server_id() {
+        assert_eq!(active_server::DEFAULT_VIRTUAL_SERVER_ID, 1);
     }
 }
