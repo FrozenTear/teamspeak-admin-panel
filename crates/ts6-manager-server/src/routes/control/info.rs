@@ -7,13 +7,13 @@ use axum::response::Response;
 use ts6_manager_shared::control::ServerInfoResponse;
 
 use crate::app_state::AppState;
-use crate::auth::extractors::RequireAuth;
+use crate::auth::extractors::RequireServerAccess;
 
 use super::{access, translate_control_error};
 
 pub async fn server_info(
     State(state): State<AppState>,
-    RequireAuth(user): RequireAuth,
+    RequireServerAccess { user, .. }: RequireServerAccess,
     Path((config_id, sid)): Path<(i64, i64)>,
 ) -> Result<Json<ServerInfoResponse>, Response> {
     let connection = access::check_read(&state, &user, config_id).await?;

@@ -2,9 +2,11 @@
 //! endpoints (PURA-71).
 //!
 //! Each endpoint:
-//! - Authenticates via the [`crate::auth::extractors::RequireAuth`] extractor
-//!   chain (JWT + DB user lookup, spec §6.4.1). Inside the handler we run an
-//!   additional per-server access check via [`access::check_read`] / [`access::check_write`].
+//! - Authenticates and gates per-server access via
+//!   [`crate::auth::extractors::RequireServerAccess`] (JWT + live user row +
+//!   admin-or-`server_user_grant`, spec §6.6 / `Y+access`). Write handlers
+//!   then apply [`access::check_write`] / [`access::check_admin`] for the
+//!   extra role gate.
 //! - Resolves the `server_connection` row by `configId` and pulls an
 //!   `Arc<dyn ControlBackend>` from [`crate::app_state::AppState::control`]
 //!   (PURA-99). The pool branches on `controlPath` so kicks/moves/banadds

@@ -27,7 +27,7 @@ use ts6_manager_shared::control::{
 };
 
 use crate::app_state::AppState;
-use crate::auth::extractors::RequireAuth;
+use crate::auth::extractors::RequireServerAccess;
 use crate::webquery::PermSelector;
 
 use super::{access, bad_request, translate_webquery_error, webquery_client};
@@ -35,7 +35,7 @@ use super::{access, bad_request, translate_webquery_error, webquery_client};
 /// `GET ` — `permissionlist`. The full read-only catalog.
 pub async fn list(
     State(state): State<AppState>,
-    RequireAuth(user): RequireAuth,
+    RequireServerAccess { user, .. }: RequireServerAccess,
     Path((config_id, sid)): Path<(i64, i64)>,
 ) -> Result<Json<Vec<PermissionCatalogItem>>, Response> {
     let connection = access::check_read(&state, &user, config_id).await?;
@@ -59,7 +59,7 @@ pub async fn list(
 /// supplied; `permid` wins if both are present.
 pub async fn find(
     State(state): State<AppState>,
-    RequireAuth(user): RequireAuth,
+    RequireServerAccess { user, .. }: RequireServerAccess,
     Path((config_id, sid)): Path<(i64, i64)>,
     Query(q): Query<PermFindQuery>,
 ) -> Result<Json<Vec<PermFindItem>>, Response> {
@@ -94,7 +94,7 @@ pub async fn find(
 /// default to `0` (whole-catalog overview for the client).
 pub async fn overview(
     State(state): State<AppState>,
-    RequireAuth(user): RequireAuth,
+    RequireServerAccess { user, .. }: RequireServerAccess,
     Path((config_id, sid, cldbid)): Path<(i64, i64, i64)>,
     Query(q): Query<PermOverviewQuery>,
 ) -> Result<Json<Vec<PermOverviewItem>>, Response> {

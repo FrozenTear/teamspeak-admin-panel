@@ -26,7 +26,7 @@ use ts6_manager_shared::control::{
 };
 
 use crate::app_state::AppState;
-use crate::auth::extractors::RequireAuth;
+use crate::auth::extractors::RequireServerAccess;
 
 use super::{
     access, audit_ok, bad_request, emit_webquery_failure, publish_moderation,
@@ -36,7 +36,7 @@ use super::{
 /// `GET ` — `channelgrouplist`.
 pub async fn list(
     State(state): State<AppState>,
-    RequireAuth(user): RequireAuth,
+    RequireServerAccess { user, .. }: RequireServerAccess,
     Path((config_id, sid)): Path<(i64, i64)>,
 ) -> Result<Json<Vec<ChannelGroupItem>>, Response> {
     let connection = access::check_read(&state, &user, config_id).await?;
@@ -66,7 +66,7 @@ pub async fn list(
 /// `POST ` — `channelgroupadd`.
 pub async fn create(
     State(state): State<AppState>,
-    RequireAuth(user): RequireAuth,
+    RequireServerAccess { user, .. }: RequireServerAccess,
     Path((config_id, sid)): Path<(i64, i64)>,
     Json(req): Json<GroupCreateRequest>,
 ) -> Result<(StatusCode, Json<ChannelGroupCreated>), Response> {
@@ -114,7 +114,7 @@ pub async fn create(
 /// `PUT :cgid` — `channelgrouprename`.
 pub async fn rename(
     State(state): State<AppState>,
-    RequireAuth(user): RequireAuth,
+    RequireServerAccess { user, .. }: RequireServerAccess,
     Path((config_id, sid, cgid)): Path<(i64, i64, i64)>,
     Json(req): Json<GroupRenameRequest>,
 ) -> Result<StatusCode, Response> {
@@ -162,7 +162,7 @@ pub async fn rename(
 /// `DELETE :cgid` — `channelgroupdel` (`force=1`).
 pub async fn delete(
     State(state): State<AppState>,
-    RequireAuth(user): RequireAuth,
+    RequireServerAccess { user, .. }: RequireServerAccess,
     Path((config_id, sid, cgid)): Path<(i64, i64, i64)>,
 ) -> Result<StatusCode, Response> {
     let connection = access::check_admin(&state, &user, config_id).await?;
@@ -206,7 +206,7 @@ pub async fn delete(
 /// `GET :cgid/clients` — `channelgroupclientlist`.
 pub async fn clients(
     State(state): State<AppState>,
-    RequireAuth(user): RequireAuth,
+    RequireServerAccess { user, .. }: RequireServerAccess,
     Path((config_id, sid, cgid)): Path<(i64, i64, i64)>,
 ) -> Result<Json<Vec<ChannelGroupClientItem>>, Response> {
     let connection = access::check_read(&state, &user, config_id).await?;
@@ -229,7 +229,7 @@ pub async fn clients(
 /// `POST :cgid/assign` — `setclientchannelgroup`.
 pub async fn assign(
     State(state): State<AppState>,
-    RequireAuth(user): RequireAuth,
+    RequireServerAccess { user, .. }: RequireServerAccess,
     Path((config_id, sid, cgid)): Path<(i64, i64, i64)>,
     Json(req): Json<ChannelGroupAssignRequest>,
 ) -> Result<StatusCode, Response> {
@@ -277,7 +277,7 @@ pub async fn assign(
 /// `GET :cgid/permissions` — `channelgrouppermlist -permsid`.
 pub async fn permissions(
     State(state): State<AppState>,
-    RequireAuth(user): RequireAuth,
+    RequireServerAccess { user, .. }: RequireServerAccess,
     Path((config_id, sid, cgid)): Path<(i64, i64, i64)>,
 ) -> Result<Json<Vec<GroupPermItem>>, Response> {
     let connection = access::check_read(&state, &user, config_id).await?;
@@ -303,7 +303,7 @@ pub async fn permissions(
 /// forwarded; channel-group permissions have no negate / skip flags.
 pub async fn set_permission(
     State(state): State<AppState>,
-    RequireAuth(user): RequireAuth,
+    RequireServerAccess { user, .. }: RequireServerAccess,
     Path((config_id, sid, cgid)): Path<(i64, i64, i64)>,
     Json(req): Json<GroupPermSetRequest>,
 ) -> Result<StatusCode, Response> {
@@ -357,7 +357,7 @@ pub async fn set_permission(
 /// `DELETE :cgid/permissions?permsid=` — `channelgroupdelperm`.
 pub async fn delete_permission(
     State(state): State<AppState>,
-    RequireAuth(user): RequireAuth,
+    RequireServerAccess { user, .. }: RequireServerAccess,
     Path((config_id, sid, cgid)): Path<(i64, i64, i64)>,
     Query(q): Query<GroupPermDeleteQuery>,
 ) -> Result<StatusCode, Response> {

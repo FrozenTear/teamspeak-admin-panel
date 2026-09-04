@@ -344,10 +344,10 @@ mod server_entry {
         // extractors so we don't need a separate middleware layer here.
         let setup_router = routes::setup::router(setup_rate_limit_state).with_state(state.clone());
         let servers_router = routes::servers::router().with_state(state.clone());
-        // PURA-23 — Phase 1 dashboard route. Lives at an absolute path under
-        // `/api/servers/:configId/vs/:sid/dashboard` (spec §7.19); the rest of
-        // the `/api/servers/...` surface is owned by SecurityEngineer's
-        // PURA-22 routes.
+        // PURA-23 — dashboard route. Lives at an absolute path under
+        // `/api/servers/:configId/vs/:sid/dashboard` (spec §7.19). The
+        // handler gates via `RequireServerAccess` (same `Y+access` ACL as
+        // the rest of the `/api/servers/:configId/...` control surface).
         let dashboard_router = webquery::dashboard::router().with_state(state.clone());
         // PURA-71 — Phase 2 control surface (clients/channels/bans/info/logs).
         // Mounts every `/api/servers/:configId/vs/:sid/...` action route; auth
@@ -432,8 +432,8 @@ mod server_entry {
             // Per-message fan-out (TS events, bot logs, voice/video status —
             // spec §8.4) is owned by the future REST/Realtime engineer.
             .merge(ws_router)
-            // PURA-23 dashboard route (spec §7.19). The handler enforces JWT
-            // auth itself via the `RequireAuth` extractor.
+            // PURA-23 dashboard route (spec §7.19). The handler enforces
+            // JWT + per-server access via `RequireServerAccess`.
             .merge(dashboard_router)
             // PURA-71 — Phase 2 control surface.
             .merge(control_router)

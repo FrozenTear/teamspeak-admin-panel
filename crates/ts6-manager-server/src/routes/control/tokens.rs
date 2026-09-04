@@ -23,7 +23,7 @@ use serde_json::json;
 use ts6_manager_shared::control::{TokenCreateRequest, TokenCreated, TokenItem};
 
 use crate::app_state::AppState;
-use crate::auth::extractors::RequireAuth;
+use crate::auth::extractors::RequireServerAccess;
 use crate::webquery::PrivilegeKeyAddParams;
 
 use super::{
@@ -34,7 +34,7 @@ use super::{
 /// `GET ` — `privilegekeylist`.
 pub async fn list(
     State(state): State<AppState>,
-    RequireAuth(user): RequireAuth,
+    RequireServerAccess { user, .. }: RequireServerAccess,
     Path((config_id, sid)): Path<(i64, i64)>,
 ) -> Result<Json<Vec<TokenItem>>, Response> {
     let connection = access::check_read(&state, &user, config_id).await?;
@@ -61,7 +61,7 @@ pub async fn list(
 /// `POST ` — `privilegekeyadd`.
 pub async fn create(
     State(state): State<AppState>,
-    RequireAuth(user): RequireAuth,
+    RequireServerAccess { user, .. }: RequireServerAccess,
     Path((config_id, sid)): Path<(i64, i64)>,
     Json(req): Json<TokenCreateRequest>,
 ) -> Result<(StatusCode, Json<TokenCreated>), Response> {
@@ -110,7 +110,7 @@ pub async fn create(
 /// `DELETE :token` — `privilegekeydelete`.
 pub async fn delete(
     State(state): State<AppState>,
-    RequireAuth(user): RequireAuth,
+    RequireServerAccess { user, .. }: RequireServerAccess,
     Path((config_id, sid, token)): Path<(i64, i64, String)>,
 ) -> Result<StatusCode, Response> {
     let connection = access::check_admin(&state, &user, config_id).await?;
