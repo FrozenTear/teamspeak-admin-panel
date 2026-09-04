@@ -55,8 +55,10 @@ pub struct PcmFrame {
 /// `BotEvent` variants (`NowPlaying`, `Error`, `EndOfStream`).
 #[derive(Debug, Clone)]
 pub enum PipelineEvent {
-    /// ICY `StreamTitle` change observed on a radio source. WS-1 forwards this
-    /// to chat / REST / FE-PAGES as `BotEvent::NowPlaying`.
+    /// ICY `StreamTitle` change, or a non-empty title from yt-dlp resolve
+    /// (warm resolver / subprocess). WS-1 forwards this to chat / REST /
+    /// FE-PAGES as `BotEvent::NowPlaying` and writes it back onto the
+    /// queue head when one exists.
     NowPlaying { title: String, source: String },
     /// The source closed cleanly (track ended, stream EOF). The frame channel
     /// will close shortly after.

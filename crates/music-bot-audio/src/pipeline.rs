@@ -355,6 +355,9 @@ async fn build_source(
             // the expensive ytsearch query from scratch when the warm resolver
             // fails or when ffmpeg rejects the resolved URL.
             let mut fallback_url = url.clone();
+            // Title from a successful warm resolve, carried onto the
+            // subprocess fallback when ffmpeg rejects the direct URL.
+            let mut resolved_title: Option<String> = None;
             if let Some(resolver) = crate::resolver::shared() {
                 let t0 = Instant::now();
                 // PURA-368 — a `ytsearch<N>:` URL is a `!play yt:` search
@@ -384,13 +387,29 @@ async fn build_source(
                         );
                         match FfmpegSource::from_input(&track.direct_url, cfg.channels, None).await
                         {
-                            Ok(src) => return Ok(Box::new(src)),
+                            Ok(mut src) => {
+                                // Title is already in `ResolvedTrack` — push it
+                                // as `NowPlaying` so the bot actor can fill the
+                                // queue-head / SSE chrome. Previously this was
+                                // log-only (`resolver_resolved`) and Panel
+                                // kept showing the pasted watch URL.
+                                if let Some(ev) =
+                                    now_playing_from_resolved(&url, track.title.as_deref())
+                                {
+                                    src.push_event(ev);
+                                }
+                                return Ok(Box::new(src));
+                            }
                             Err(e) => {
                                 // Preserve the video_id for the subprocess fallback even
                                 // when ffmpeg rejects the direct URL.
                                 if let Some(vid) = &track.video_id {
                                     fallback_url = format!("https://www.youtube.com/watch?v={vid}");
                                 }
+                                // Keep the resolved title for the subprocess
+                                // source so a ffmpeg-reject fallback still
+                                // fills Now Playing.
+                                resolved_title = track.title.clone();
                                 tracing::warn!(
                                     error = %e,
                                     "ffmpeg rejected resolver direct URL — \
@@ -421,9 +440,13 @@ async fn build_source(
                     }
                 }
             }
-            let src = YtDlpSource::new(&fallback_url, cfg.channels, cfg.yt_cookie_file.as_deref())
-                .await
-                .map_err(|e| PipelineError::Source(format!("yt-dlp spawn: {e}")))?;
+            let mut src =
+                YtDlpSource::new(&fallback_url, cfg.channels, cfg.yt_cookie_file.as_deref())
+                    .await
+                    .map_err(|e| PipelineError::Source(format!("yt-dlp spawn: {e}")))?;
+            if let Some(ev) = now_playing_from_resolved(&url, resolved_title.as_deref()) {
+                src.push_event(ev);
+            }
             Ok(Box::new(src))
         }
         AudioSourceSpec::IcyRadio { url } => {
@@ -433,6 +456,17 @@ async fn build_source(
             Ok(Box::new(src))
         }
     }
+}
+
+/// Build a `NowPlaying` event from a resolved title. Empty / whitespace
+/// titles are dropped so we never overwrite a URL placeholder with
+/// nothing — the bot actor only fills the store on a non-empty title.
+fn now_playing_from_resolved(page_url: &str, title: Option<&str>) -> Option<PipelineEvent> {
+    let title = title.map(str::trim).filter(|t| !t.is_empty())?;
+    Some(PipelineEvent::NowPlaying {
+        title: title.to_string(),
+        source: page_url.to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -656,5 +690,28 @@ mod tests {
         );
 
         pipeline.shutdown().await;
+    }
+
+    #[test]
+    fn now_playing_from_resolved_skips_empty_titles() {
+        assert!(now_playing_from_resolved("https://yt.example/watch?v=1", None).is_none());
+        assert!(now_playing_from_resolved("https://yt.example/watch?v=1", Some("")).is_none());
+        assert!(now_playing_from_resolved("https://yt.example/watch?v=1", Some("   ")).is_none());
+    }
+
+    #[test]
+    fn now_playing_from_resolved_emits_trimmed_title() {
+        let ev = now_playing_from_resolved(
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            Some("  Rick Astley - Never Gonna Give You Up  "),
+        )
+        .expect("non-empty title");
+        match ev {
+            PipelineEvent::NowPlaying { title, source } => {
+                assert_eq!(title, "Rick Astley - Never Gonna Give You Up");
+                assert_eq!(source, "https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+            }
+            other => panic!("expected NowPlaying, got {other:?}"),
+        }
     }
 }

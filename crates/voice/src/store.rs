@@ -190,6 +190,12 @@ pub trait MusicBotStore: Send + Sync {
     /// `queue_peek(...)?.first().cloned()`.
     async fn queue_current(&self, bot: BotId) -> StoreResult<Option<Track>>;
 
+    /// Overwrite the head track's display title. Returns the updated
+    /// head, or `Ok(None)` if the queue is empty. Used when yt-dlp /
+    /// ICY metadata fills in a real title after enqueue stamped the
+    /// source URL as a placeholder.
+    async fn queue_set_head_title(&self, bot: BotId, title: String) -> StoreResult<Option<Track>>;
+
     // ---- Playlists ----------------------------------------------------
 
     async fn playlist_create(&self, bot: BotId, name: PlaylistName) -> StoreResult<()>;
@@ -441,6 +447,15 @@ impl MusicBotStore for InMemoryMusicBotStore {
     async fn queue_current(&self, bot: BotId) -> StoreResult<Option<Track>> {
         let inner = self.inner.read().await;
         Ok(inner.bots.get(&bot).and_then(|s| s.queue.first().cloned()))
+    }
+
+    async fn queue_set_head_title(&self, bot: BotId, title: String) -> StoreResult<Option<Track>> {
+        let mut inner = self.inner.write().await;
+        let Some(head) = inner.bots.entry(bot).or_default().queue.first_mut() else {
+            return Ok(None);
+        };
+        head.title = title;
+        Ok(Some(head.clone()))
     }
 
     // ---- Playlists ----------------------------------------------------
@@ -902,5 +917,36 @@ mod tests {
         assert_eq!(q1.len(), 1);
         assert_eq!(q2.len(), 1);
         assert_ne!(q1[0].title, q2[0].title);
+    }
+
+    #[tokio::test]
+    async fn queue_set_head_title_updates_head_only() {
+        let store = InMemoryMusicBotStore::new();
+        store.queue_enqueue(bot(), new_track("a")).await.unwrap();
+        store.queue_enqueue(bot(), new_track("b")).await.unwrap();
+
+        let updated = store
+            .queue_set_head_title(bot(), "resolved title".into())
+            .await
+            .unwrap()
+            .expect("head exists");
+        assert_eq!(updated.title, "resolved title");
+
+        let peeked = store.queue_peek(bot()).await.unwrap();
+        assert_eq!(peeked[0].title, "resolved title");
+        assert_eq!(peeked[1].title, "b", "non-head titles must stay put");
+        assert_eq!(peeked[0].id, updated.id, "id is stable across title fill");
+    }
+
+    #[tokio::test]
+    async fn queue_set_head_title_empty_queue_is_none() {
+        let store = InMemoryMusicBotStore::new();
+        assert!(
+            store
+                .queue_set_head_title(bot(), "nope".into())
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }
