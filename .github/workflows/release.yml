@@ -282,7 +282,13 @@ jobs:
             echo
             echo "## What's changed"
             echo
-            PREV="$(git tag --list 'v*' --sort=-version:refname | awk -v t="$TAG" '$0 != t { print; exit }')"
+            PREV=""
+            if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+              PREV="$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)"
+            fi
+            if [[ -z "$PREV" ]]; then
+              PREV="$(git tag --list 'v*' --sort=-version:refname | awk -v t="$TAG" '$0 != t { print; exit }')"
+            fi
             RANGE=""
             if [[ -n "$PREV" ]] && git rev-parse -q --verify "refs/tags/${PREV}" >/dev/null; then
               if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then

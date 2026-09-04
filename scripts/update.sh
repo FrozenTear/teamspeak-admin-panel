@@ -34,16 +34,31 @@ SECRETS="${REPO_ROOT}/deploy/kube/secrets.yaml"
 FULLSTACK="ghcr.io/frozentear/ts6-manager-fullstack:${TAG}"
 SIDECAR="ghcr.io/frozentear/ts6-manager-sidecar:${TAG}"
 
-if [[ ! -f "$MANIFEST" ]]; then
-    echo "error: missing kube manifest: ${MANIFEST}" >&2
+die() {
+    echo "error: $*" >&2
+    echo "FAIL: upgrade to ${TAG} did not finish. Named volumes should still be intact — never kube down --force." >&2
     exit 1
+}
+
+if [[ ! -f "$MANIFEST" ]]; then
+    die "missing kube manifest: ${MANIFEST}"
 fi
 if ! command -v podman >/dev/null; then
-    echo "error: podman not found on PATH" >&2
-    exit 1
+    die "podman not found on PATH"
 fi
 if ! command -v curl >/dev/null; then
-    echo "error: curl not found on PATH (needed for /health)" >&2
+    die "curl not found on PATH (needed for /health)"
+fi
+
+HAVE_SECRET=0
+if podman secret exists ts6-manager-secrets; then
+    HAVE_SECRET=1
+fi
+if [[ "$HAVE_SECRET" -ne 1 && ! -f "$SECRETS" ]]; then
+    echo "error: podman secret ts6-manager-secrets is missing and ${SECRETS} is not present." >&2
+    echo "  copy deploy/kube/secrets.example.yaml → deploy/kube/secrets.yaml and fill JWT_SECRET," >&2
+    echo "  or create the secret on the host first." >&2
+    echo "FAIL: upgrade to ${TAG} did not finish. Named volumes should still be intact — never kube down --force." >&2
     exit 1
 fi
 
@@ -63,8 +78,7 @@ sed -E \
 
 if ! grep -q "image: ${FULLSTACK}" "$PLAY_POD" \
     || ! grep -q "image: ${SIDECAR}" "$PLAY_POD"; then
-    echo "error: failed to rewrite both image tags to ${TAG} in the temp manifest" >&2
-    exit 1
+    die "failed to rewrite both image tags to ${TAG} in the temp manifest"
 fi
 
 echo "==> pulling ${FULLSTACK}"
@@ -81,15 +95,9 @@ else
 fi
 
 PLAY_FILE="$PLAY_POD"
-if podman secret exists ts6-manager-secrets; then
+if [[ "$HAVE_SECRET" -eq 1 ]]; then
     echo "==> podman secret ts6-manager-secrets exists; playing pod+PVCs only"
 else
-    if [[ ! -f "$SECRETS" ]]; then
-        echo "error: podman secret ts6-manager-secrets is missing and ${SECRETS} is not present." >&2
-        echo "  copy deploy/kube/secrets.example.yaml → deploy/kube/secrets.yaml and fill JWT_SECRET," >&2
-        echo "  or create the secret on the host first." >&2
-        exit 1
-    fi
     echo "==> concatenating ${SECRETS} + temp manifest"
     PLAY_FILE="${TMPDIR}/ts6-manager.with-secrets.yaml"
     cat "$SECRETS" "$PLAY_POD" > "$PLAY_FILE"
@@ -109,8 +117,7 @@ for _ in $(seq 1 45); do
     sleep 2
 done
 if [[ "$HEALTH_OK" -ne 1 ]]; then
-    echo "error: /health did not succeed after kube play" >&2
-    exit 1
+    die "/health did not succeed after kube play"
 fi
 echo "    $(cat "$HEALTH_OUT")"
 
