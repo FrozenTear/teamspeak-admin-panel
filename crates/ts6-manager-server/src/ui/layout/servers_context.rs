@@ -102,7 +102,7 @@ pub fn mount_servers_context() -> ServersContext {
     // Read `ready` + the authed memo *inside* the resource so Dioxus 0.7
     // cancels and re-spawns after rehydrate (same class as #19's AppShell
     // gate). `use_future` cannot do this — it is fire-and-forget.
-    let _ = use_resource(move || {
+    let _resource = use_resource(move || {
         let gate = gate.clone();
         let ready = *session.ready.read();
         let authed = is_authed();
