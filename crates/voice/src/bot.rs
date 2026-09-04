@@ -1174,19 +1174,7 @@ async fn handle_audio_msg(
             "frame"
         }
         AudioMsg::PipelineEvent(PipelineEvent::NowPlaying { title, source }) => {
-            // Synthesize an ephemeral `Track` so the wire surface (which
-            // already accepts `BotEvent::NowPlaying(Track)` from the
-            // queue path) carries the ICY metadata too. id=0 marks this
-            // as "not a queue entry" — subscribers that care can match
-            // on it. WS-7 may swap this for a richer event later.
-            let track = Track {
-                id: TrackId(0),
-                source: AudioSource::Url(source),
-                title,
-                duration_secs: None,
-                requested_by: None,
-            };
-            let _ = events.send(BotEvent::NowPlaying(track));
+            apply_pipeline_now_playing(bot_id, store, events, title, source).await;
             "now_playing"
         }
         AudioMsg::PipelineEvent(PipelineEvent::Warning(message)) => {
@@ -1745,6 +1733,62 @@ async fn emit_head_change(
     }
 }
 
+/// Apply a pipeline `NowPlaying` title (ICY `StreamTitle`, or a
+/// non-empty title from warm / subprocess resolve).
+///
+/// When a queue head exists, write the title back onto that track and
+/// re-emit `QueueChanged` + `NowPlaying` so SSE / REST / `!np` all see
+/// the resolved name instead of the pasted URL. Play-without-queue
+/// (REST `/play`) still synthesizes an ephemeral `Track` with id=0 —
+/// the same shape ICY used before there was a store to fill.
+async fn apply_pipeline_now_playing(
+    bot_id: BotId,
+    store: &Arc<dyn MusicBotStore>,
+    events: &broadcast::Sender<BotEvent>,
+    title: String,
+    source: String,
+) {
+    let title = title.trim();
+    if title.is_empty() {
+        return;
+    }
+    // Only rewrite the store when the pipeline event is for the current
+    // head. Direct Play bypasses the queue; a leftover queued track must
+    // not pick up that Play's resolved title.
+    let head_matches = match store.queue_current(bot_id).await {
+        Ok(Some(head)) => matches!(&head.source, AudioSource::Url(u) if u == &source),
+        Ok(None) => false,
+        Err(err) => {
+            emit_store_error(events, "queue_current", err);
+            false
+        }
+    };
+    if head_matches {
+        match store.queue_set_head_title(bot_id, title.to_string()).await {
+            Ok(Some(track)) => {
+                emit_queue_changed(store, bot_id, events).await;
+                let _ = events.send(BotEvent::NowPlaying(track));
+                return;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                emit_store_error(events, "queue_set_head_title", err);
+                return;
+            }
+        }
+    }
+    // No matching queue head — ephemeral `Track` (direct Play, or ICY
+    // before anything is queued). id=0 marks "not a queue entry".
+    let track = Track {
+        id: TrackId(0),
+        source: AudioSource::Url(source),
+        title: title.to_string(),
+        duration_secs: None,
+        requested_by: None,
+    };
+    let _ = events.send(BotEvent::NowPlaying(track));
+}
+
 fn emit_store_error(events: &broadcast::Sender<BotEvent>, op: &str, err: StoreError) {
     warn!(op, ?err, "store op failed");
     let _ = events.send(BotEvent::Error(BotError::Store {
@@ -2134,6 +2178,158 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(WireCmd::ChatReply(line)) if line == "hello"),);
         assert!(matches!(rx.try_recv(), Ok(WireCmd::ChannelMove(7))));
         assert!(rx.try_recv().is_err(), "exactly four commands issued");
+    }
+
+    /// After enqueue stamps the source URL as the title, a pipeline
+    /// resolve `NowPlaying` must overwrite the queue-head title and
+    /// re-emit `NowPlaying` / `QueueChanged` so SSE and REST see the
+    /// resolved name (Contabo v1.6.2: watch URL stayed as the title).
+    #[tokio::test]
+    async fn resolve_title_updates_queue_head_and_reemits_now_playing() {
+        let store: Arc<dyn MusicBotStore> = Arc::new(InMemoryMusicBotStore::new());
+        let bot_id = BotId(1);
+        let watch = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
+        let enqueued = store
+            .queue_enqueue(bot_id, NewTrack::url(watch, watch))
+            .await
+            .expect("enqueue watch URL");
+        assert_eq!(enqueued.title, watch);
+
+        let (events, mut rx) = broadcast::channel(16);
+        apply_pipeline_now_playing(
+            bot_id,
+            &store,
+            &events,
+            "Rick Astley - Never Gonna Give You Up (Official Video) (4K Remaster)".into(),
+            watch.into(),
+        )
+        .await;
+
+        let current = store
+            .queue_current(bot_id)
+            .await
+            .unwrap()
+            .expect("head still present");
+        assert_eq!(
+            current.title,
+            "Rick Astley - Never Gonna Give You Up (Official Video) (4K Remaster)"
+        );
+        assert_eq!(current.id, enqueued.id, "track id is unchanged");
+        assert_eq!(
+            current.source,
+            AudioSource::Url(watch.into()),
+            "source URL is unchanged"
+        );
+
+        let mut saw_now_playing = None;
+        let mut saw_queue_changed = None;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                BotEvent::NowPlaying(t) => saw_now_playing = Some(t),
+                BotEvent::QueueChanged { current, len } => {
+                    saw_queue_changed = Some((current, len));
+                }
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+        let np = saw_now_playing.expect("must re-emit NowPlaying");
+        assert_eq!(np.title, current.title);
+        assert_eq!(np.id, enqueued.id);
+        let (qc_current, qc_len) = saw_queue_changed.expect("must emit QueueChanged");
+        assert_eq!(qc_len, 1);
+        assert_eq!(qc_current.unwrap().title, current.title);
+    }
+
+    /// Direct Play has no queue head — keep the ephemeral id=0 Track so
+    /// LivenessTracker / SSE still pick up the resolved title.
+    #[tokio::test]
+    async fn resolve_title_without_queue_emits_ephemeral_now_playing() {
+        let store: Arc<dyn MusicBotStore> = Arc::new(InMemoryMusicBotStore::new());
+        let (events, mut rx) = broadcast::channel(8);
+        apply_pipeline_now_playing(
+            BotId(1),
+            &store,
+            &events,
+            "Resolved Title".into(),
+            "https://www.youtube.com/watch?v=abc".into(),
+        )
+        .await;
+
+        assert!(
+            store.queue_current(BotId(1)).await.unwrap().is_none(),
+            "empty queue stays empty"
+        );
+        let ev = rx.try_recv().expect("NowPlaying");
+        match ev {
+            BotEvent::NowPlaying(t) => {
+                assert_eq!(t.id, TrackId(0));
+                assert_eq!(t.title, "Resolved Title");
+            }
+            other => panic!("expected NowPlaying, got {other:?}"),
+        }
+    }
+
+    /// Empty / whitespace titles must not clobber a URL placeholder.
+    #[tokio::test]
+    async fn empty_resolve_title_is_ignored() {
+        let store: Arc<dyn MusicBotStore> = Arc::new(InMemoryMusicBotStore::new());
+        let bot_id = BotId(1);
+        store
+            .queue_enqueue(
+                bot_id,
+                NewTrack::url("https://example.com/a", "https://example.com/a"),
+            )
+            .await
+            .unwrap();
+        let (events, mut rx) = broadcast::channel(8);
+        apply_pipeline_now_playing(
+            bot_id,
+            &store,
+            &events,
+            "   ".into(),
+            "https://example.com/a".into(),
+        )
+        .await;
+        assert_eq!(
+            store.queue_current(bot_id).await.unwrap().unwrap().title,
+            "https://example.com/a"
+        );
+        assert!(rx.try_recv().is_err(), "no event on empty title");
+    }
+
+    /// A resolve title for a Play that is *not* the queued head must not
+    /// overwrite the staged track — Play bypasses the queue.
+    #[tokio::test]
+    async fn resolve_title_does_not_clobber_unrelated_queue_head() {
+        let store: Arc<dyn MusicBotStore> = Arc::new(InMemoryMusicBotStore::new());
+        let bot_id = BotId(1);
+        store
+            .queue_enqueue(
+                bot_id,
+                NewTrack::url("queued", "https://example.com/queued.mp3"),
+            )
+            .await
+            .unwrap();
+        let (events, mut rx) = broadcast::channel(8);
+        apply_pipeline_now_playing(
+            bot_id,
+            &store,
+            &events,
+            "Play title".into(),
+            "https://www.youtube.com/watch?v=other".into(),
+        )
+        .await;
+        assert_eq!(
+            store.queue_current(bot_id).await.unwrap().unwrap().title,
+            "queued"
+        );
+        match rx.try_recv().expect("ephemeral NowPlaying") {
+            BotEvent::NowPlaying(t) => {
+                assert_eq!(t.id, TrackId(0));
+                assert_eq!(t.title, "Play title");
+            }
+            other => panic!("expected NowPlaying, got {other:?}"),
+        }
     }
 
     /// PURA-396 — `install_pending_audio` hands a freshly-spawned

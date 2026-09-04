@@ -160,6 +160,12 @@ impl YtDlpSource {
         })
     }
 
+    /// Queue an out-of-band event (e.g. a resolve-time title) for the next
+    /// `try_drain_events` drain. Mirrors [`FfmpegSource::push_event`].
+    pub fn push_event(&mut self, ev: PipelineEvent) {
+        self.diagnostics.push(ev);
+    }
+
     /// Drain the yt-dlp stderr task once the pipeline has hit EOF. Called
     /// from `read_samples` the first time the inner ffmpeg source reports
     /// EOF — at that point yt-dlp has already exited (its exit is what
