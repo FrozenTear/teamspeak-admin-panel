@@ -3,8 +3,9 @@
 `podman kube play` reads this manifest and brings up the TS6 Manager
 stack rootless on any Podman ≥ 4.4 host. The same YAML is portable to
 a real Kubernetes cluster — but the supported runtime here is Podman.
-For semantically-equivalent systemd-managed deploys, see
-`deploy/quadlet/` (sibling workstream).
+Contabo production is this shape: a git checkout plus
+`scripts/update.sh` — not Quadlet. For semantically-equivalent
+systemd-managed deploys, see `deploy/quadlet/` (sibling workstream).
 
 ## Files
 
@@ -12,6 +13,30 @@ For semantically-equivalent systemd-managed deploys, see
 |------|---------|
 | `ts6-manager.yaml` | Pod + PVCs. Pod references a Secret named `ts6-manager-secrets`. |
 | `secrets.example.yaml` | Template Secret. Copy → `secrets.yaml`, fill in real values, never commit. |
+
+## Upgrade (existing host)
+
+On a host that already has the pod and volumes (Contabo: a checkout
+under a path like `/root/github/teamspeak-admin-panel`):
+
+```bash
+./scripts/update.sh v1.6.2
+```
+
+The script is cwd-agnostic. It `podman pull`s both GHCR images for
+that tag (required — the manifest uses `imagePullPolicy: IfNotPresent`),
+writes a temp manifest so fullstack **and** sidecar share the tag,
+`podman kube down`s the committed YAML **without** `--force`, plays
+the temp file (pod-only if `podman secret exists ts6-manager-secrets`,
+otherwise concatenates `deploy/kube/secrets.yaml`), and curls
+`http://127.0.0.1:3001/health`.
+
+Never `podman kube down --force` — that wipes `ts6-data` / `ts6-db` /
+`ts6-music`. Confirm volumes survived with
+`podman volume ls --filter name=^ts6-`.
+
+Manual `sed` / concat / play steps are in [Appendix: manual kube
+path](#appendix-manual-kube-path).
 
 ## Bring up
 
@@ -65,9 +90,45 @@ podman volume rm ts6-data ts6-db ts6-music
 
 ## Image source
 
-The committed manifest pins
-`ghcr.io/frozentear/ts6-manager-fullstack:latest`. That image is
-published by the `WS-OPS-Images` workstream — see `Containerfile.fullstack`.
+The committed manifest pins both images to the same release tag
+(`ghcr.io/frozentear/ts6-manager-fullstack:v1.6.2` and
+`ghcr.io/frozentear/ts6-manager-sidecar:v1.6.2`). Bump both on a
+release cut, or let `scripts/update.sh TAG` override them. Images are
+published by `.github/workflows/release.yml` — see
+`docs/ops/images.md`.
+
+A blind `podman kube play` of the committed file without a prior
+`podman pull` of those tags will keep stale layers (`IfNotPresent`)
+or, if the host still has an older `:v1.0` pin in an old checkout,
+downgrade. Always pull first — `update.sh` does this.
+
+## Appendix: manual kube path
+
+Prefer `./scripts/update.sh vX.Y.Z`. The steps below are the same
+sequence without the helper (tag override, pull, down without
+`--force`, play, health).
+
+```bash
+TAG=v1.6.2
+podman pull "ghcr.io/frozentear/ts6-manager-fullstack:${TAG}"
+podman pull "ghcr.io/frozentear/ts6-manager-sidecar:${TAG}"
+
+sed -E \
+  -e "s#(image:[[:space:]]+ghcr\\.io/frozentear/ts6-manager-fullstack:)[^[:space:]]+#\\1${TAG}#" \
+  -e "s#(image:[[:space:]]+ghcr\\.io/frozentear/ts6-manager-sidecar:)[^[:space:]]+#\\1${TAG}#" \
+  deploy/kube/ts6-manager.yaml > /tmp/ts6-manager.kube.override.yaml
+
+# If the host already has podman secret ts6-manager-secrets:
+podman kube down deploy/kube/ts6-manager.yaml   # never --force
+podman kube play /tmp/ts6-manager.kube.override.yaml
+
+# Otherwise concat secrets.yaml (copy from secrets.example.yaml first):
+# cat deploy/kube/secrets.yaml /tmp/ts6-manager.kube.override.yaml \
+#   > /tmp/ts6-manager.kube.yaml
+# podman kube play /tmp/ts6-manager.kube.yaml
+
+curl -fsS http://127.0.0.1:3001/health
+```
 
 ### Override to a local build (pre-publish smoke)
 
@@ -144,22 +205,20 @@ respects probe semantics from v4.4 onward.
 
 ```
 Pod ts6-manager
-└── container fullstack  (port 3001, uid 10001, non-root)
-     ├── PVC ts6-data  → /var/lib/ts6-manager       (state root / uploads)
-     ├── PVC ts6-db    → /var/lib/ts6-manager/db    (SurrealKV)
-     └── PVC ts6-music → /var/lib/ts6-manager/music
+├── container fullstack  (port 3001, uid 10001, non-root)
+│    ├── PVC ts6-data  → /var/lib/ts6-manager       (state root / uploads)
+│    ├── PVC ts6-db    → /var/lib/ts6-manager/db    (SurrealKV)
+│    └── PVC ts6-music → /var/lib/ts6-manager/music
+└── container sidecar    (7080/tcp, 4443/udp, uid 10002)
 ```
 
 This matches the Quadlet `ts6-manager.pod` topology in
 `deploy/quadlet/` (sibling workstream) and the default services in
-`podman-compose.yml` (dev). Future workstreams may add a `sidecar`
-container (MoQ media sidecar, port 9800) once `Containerfile.sidecar`
-publishes — at that point, append a second container entry alongside
-`fullstack` and a corresponding service-network glue if needed.
+`podman-compose.yml` (dev).
 
 ## Definition of done check
 
-- `cat deploy/kube/secrets.yaml deploy/kube/ts6-manager.yaml > /tmp/ts6-manager.kube.yaml && podman kube play /tmp/ts6-manager.kube.yaml` succeeds on a clean rootless Podman ≥ 4.4 host with only the published image (`ghcr.io/frozentear/ts6-manager-fullstack:latest`) available.
+- `./scripts/update.sh v1.6.2` (or a first-install concat + `kube play`) succeeds on a Podman ≥ 4.4 host with the published `v1.6.2` fullstack + sidecar images available.
 - `curl http://localhost:3001/health` returns 200.
 - `podman kube down deploy/kube/ts6-manager.yaml` cleans up the pod.
 - Data on PVCs `ts6-data`, `ts6-db` and `ts6-music` survives `kube down` and is reachable on the next `kube play` — including a yt-dlp cookie uploaded via Settings.

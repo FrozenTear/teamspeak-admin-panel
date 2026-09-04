@@ -3,6 +3,8 @@
 This directory holds the [Quadlet](https://docs.podman.io/en/latest/markdown/podman-systemd.unit.5.html)
 unit files that bring the manager up as a rootless `systemd --user`
 service. Quadlet is the recommended single-host shape per impl-plan §9.
+Contabo production is `podman kube play` plus `scripts/update.sh`, not
+Quadlet — see [`deploy/kube/README.md`](../kube/README.md).
 
 For multi-host / Kubernetes-bound deploys, use the
 `podman kube play` YAML emitted under `deploy/kube/` (sibling
