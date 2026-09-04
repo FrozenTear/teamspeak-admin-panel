@@ -960,6 +960,7 @@ mod tests {
             .unwrap_or(ServersData::Loading);
         use_context_provider(|| ServersContext {
             data: Signal::new(data),
+            selected: Signal::new(None),
         });
         rsx! { ServersIndexPage {} }
     }

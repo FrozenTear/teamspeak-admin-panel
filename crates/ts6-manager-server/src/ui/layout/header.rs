@@ -250,6 +250,7 @@ mod tests {
         use_context_provider(|| provide_auth_gate(session));
         use_context_provider(|| ServersContext {
             data: Signal::new(ServersData::Loaded(Vec::new())),
+            selected: Signal::new(None),
         });
         rsx! { Header {} }
     }

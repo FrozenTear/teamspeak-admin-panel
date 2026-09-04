@@ -78,10 +78,11 @@ pub fn ActivityFeedSubscription() -> Element {
     let storage = session.storage.clone();
 
     // Track which server is currently subscribed so we can re-subscribe
-    // when the operator picks a different one. The selection lives in
-    // localStorage today (`ui_prefs::SELECTED_SERVER_STORAGE_KEY`); the
-    // `active_server::resolve` helper applies the same precedence rule
-    // the dashboard does (persisted-id-if-present, else first row).
+    // when the operator picks a different one. The pick is persisted in
+    // `ui_prefs::SELECTED_SERVER_STORAGE_KEY`; `active_server::resolve`
+    // still falls back to the first live row for this feed. The dashboard
+    // reads `ServersContext::selected` directly so a missing pick is an
+    // empty state rather than a silent first-row KPI fetch.
     let mut active_server_id: Signal<Option<i64>> = use_signal(|| None::<i64>);
 
     {
