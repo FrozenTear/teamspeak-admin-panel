@@ -238,6 +238,7 @@ mod tests {
                 },
             }),
             storage: Arc::new(MemoryStore::new()),
+            ready: SyncSignal::new_maybe_sync(true),
         });
         use_context_provider(|| ThemeContext {
             theme: Signal::new(crate::ui::theme::Theme::Dark),

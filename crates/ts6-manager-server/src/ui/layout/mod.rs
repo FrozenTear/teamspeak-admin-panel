@@ -21,7 +21,7 @@ pub use sidebar::{NAV_LANDMARK_ID, Sidebar};
 
 use dioxus::prelude::*;
 
-use crate::client::dioxus::use_session;
+use crate::client::dioxus::{should_redirect_anonymous_to_login, use_session};
 use crate::client::store::AuthState;
 use crate::ui::components::{
     ActivityFeedSubscription, ServerSelector, ServerSelectorVariant, ToasterRegion,
@@ -78,13 +78,22 @@ pub fn AppShell() -> Element {
     let route: Route = use_route();
 
     let is_authed = matches!(*session.state.read(), AuthState::Authenticated { .. });
-    use_effect(move || {
-        if !is_authed {
-            nav.replace(Route::LoginPage {
-                next: Some(current_path()),
-            });
-        }
-    });
+    // Do not close over `is_authed`. First paint is always Anonymous
+    // (PURA-129); a captured bool queues `/login` before rehydrate and
+    // never re-runs. Read `ready` + `state` inside the effect so Dioxus
+    // re-subscribes, and wait for `ready` (same class as PURA-232).
+    {
+        let session = session.clone();
+        use_effect(move || {
+            let ready = *session.ready.read();
+            let authenticated = session.state.read().is_authenticated();
+            if should_redirect_anonymous_to_login(ready, authenticated) {
+                nav.replace(Route::LoginPage {
+                    next: Some(current_path()),
+                });
+            }
+        });
+    }
 
     // Single shared `/api/servers` list + selected-id signal for both
     // selector variants and any page (dashboard KPIs included) that
@@ -167,6 +176,7 @@ mod tests {
                 },
             }),
             storage: Arc::new(MemoryStore::new()),
+            ready: SyncSignal::new_maybe_sync(true),
         });
         use_context_provider(|| ThemeContext {
             theme: Signal::new(Theme::Dark),

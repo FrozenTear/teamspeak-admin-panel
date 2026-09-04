@@ -54,9 +54,12 @@ pub fn App() -> Element {
     // first paint completes. `provide_session` keeps the signal `Anonymous`
     // on first render so SSR and the browser hydrate identical trees;
     // `use_effect` is client-only, so this fires exactly once on mount and
-    // upgrades the auth state in place. Downstream effects
-    // (`AppShell`'s redirect, `use_ws_lifecycle`, route guards) react via
-    // their existing signal subscriptions.
+    // upgrades the auth state in place. `rehydrate_from_storage` also
+    // flips `session.ready`. Effects that *read* `session.ready` /
+    // `session.state` inside their closure (`AppShell`, `LoginPage`,
+    // `use_ws_lifecycle`) re-subscribe and see the upgrade. A bool
+    // captured on first paint does not — that was the hard-refresh
+    // bounce to `/login` with a valid blob still in localStorage.
     {
         let session_for_rehydrate = session.clone();
         use_effect(move || {

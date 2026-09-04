@@ -33,34 +33,40 @@ pub fn LoginPage(next: Option<String>) -> Element {
     let nav = use_navigator();
 
     // If the user is already authenticated when they hit /login, send
-    // them straight to the post-login target. This makes the route a
-    // no-op for already-logged-in users instead of letting them log in a
-    // second time over their own session.
-    let already = matches!(*session.state.read(), AuthState::Authenticated { .. });
+    // them straight to the post-login target. Read `session.state` *inside*
+    // the effect so a hard-refresh that lands here while still Anonymous
+    // (PURA-129 first paint, or an AppShell bounce that raced rehydrate)
+    // re-runs after the blob is copied in and leaves `/login`.
     let redirect_target_for_already = next.clone();
-    use_effect(move || {
-        if already {
-            let target = post_login_target(redirect_target_for_already.as_deref());
-            nav.replace(target);
-        }
-    });
+    {
+        let session = session.clone();
+        use_effect(move || {
+            if session.state.read().is_authenticated() {
+                let target = post_login_target(redirect_target_for_already.as_deref());
+                nav.replace(target);
+            }
+        });
+    }
 
     // First-run gate (PURA-34): if no admin exists yet, the login form is
     // moot — bounce the operator to `/setup` so they can create one. We
-    // skip the gate for already-authed users (the previous effect handled
-    // them) and on status-fetch errors (the operator sees the login form
-    // as a fallback; they'll get a friendly auth error if there's truly no
-    // admin to log in as).
+    // skip the gate until rehydrate has finished and skip it for
+    // already-authed users (the previous effect handled them). Status-
+    // fetch errors fall through to the login form as a fallback.
     {
-        use_future(move || async move {
-            if already {
-                return;
-            }
-            let base = api_base();
-            if let Ok(status) = setup_client::status(&base).await
-                && status.needs_setup
-            {
-                nav.replace(Route::SetupPage {});
+        let session = session.clone();
+        use_future(move || {
+            let skip = !*session.ready.read() || session.state.read().is_authenticated();
+            async move {
+                if skip {
+                    return;
+                }
+                let base = api_base();
+                if let Ok(status) = setup_client::status(&base).await
+                    && status.needs_setup
+                {
+                    nav.replace(Route::SetupPage {});
+                }
             }
         });
     }
