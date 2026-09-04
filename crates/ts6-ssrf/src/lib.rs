@@ -132,9 +132,14 @@ pub async fn is_url_allowed(raw: &str, resolver: &dyn Resolver) -> Result<Pinned
         }
         url::Host::Domain(name) => {
             let lc = name.to_ascii_lowercase();
+            // Trailing FQDN dot (`localhost.`, `metadata.google.internal.`)
+            // is the same host. Spec §6.7.1 lists the names without the
+            // dot; a literal equality check would miss the dotted form
+            // and fall through to DNS (§9.3 allow-on-NXDOMAIN).
+            let lc_bare = lc.trim_end_matches('.');
 
             // 4. Metadata-hostname literal check.
-            if METADATA_HOSTNAMES.contains(&lc.as_str()) {
+            if METADATA_HOSTNAMES.contains(&lc_bare) {
                 return Err(SsrfError::HostnameNotAllowed(name.to_string()));
             }
 
@@ -142,7 +147,7 @@ pub async fn is_url_allowed(raw: &str, resolver: &dyn Resolver) -> Result<Pinned
             // The `url` crate treats `0177.0.0.1` as a domain; we recognise
             // these forms via the BSD-style canonicaliser and run the IPv4
             // range check on the canonical address.
-            if let Some(v4) = ipnorm::canonicalise_ipv4(&lc) {
+            if let Some(v4) = ipnorm::canonicalise_ipv4(lc_bare) {
                 let ip = IpAddr::V4(v4);
                 if ranges::is_blocked_ip(ip) {
                     return Err(SsrfError::IpNotAllowed(ip));

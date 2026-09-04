@@ -48,6 +48,16 @@ async fn rejects_loopback_v6() {
 }
 
 #[tokio::test]
+async fn rejects_unspecified_v6() {
+    // `::` is unspecified; on Linux connect(::) is rewritten to ::1.
+    // Must not slip past the IPv4 0.0.0.0/8 equivalent.
+    assert_rejected("http://[::]", &empty_resolver()).await;
+    assert_rejected("http://[::]/", &empty_resolver()).await;
+    assert_rejected("http://[::]:80/", &empty_resolver()).await;
+    assert_rejected("http://[0:0:0:0:0:0:0:0]/", &empty_resolver()).await;
+}
+
+#[tokio::test]
 async fn rejects_private_ipv4_ranges() {
     assert_rejected("http://10.1.2.3/", &empty_resolver()).await;
     assert_rejected("http://192.168.1.1", &empty_resolver()).await;
@@ -232,6 +242,18 @@ async fn case_insensitive_metadata_hostnames() {
     let err = assert_rejected("http://LocalHost/", &empty_resolver()).await;
     matches!(err, SsrfError::HostnameNotAllowed(_));
     let err = assert_rejected("http://Metadata.Google.Internal/", &empty_resolver()).await;
+    matches!(err, SsrfError::HostnameNotAllowed(_));
+}
+
+#[tokio::test]
+async fn rejects_metadata_hostnames_with_trailing_fqdn_dot() {
+    // Absolute-form FQDN (`localhost.`) must not bypass the literal list
+    // and fall through to §9.3 allow-on-NXDOMAIN.
+    let err = assert_rejected("http://localhost./", &empty_resolver()).await;
+    matches!(err, SsrfError::HostnameNotAllowed(_));
+    let err = assert_rejected("http://metadata.google.internal./", &empty_resolver()).await;
+    matches!(err, SsrfError::HostnameNotAllowed(_));
+    let err = assert_rejected("http://Metadata.Internal./", &empty_resolver()).await;
     matches!(err, SsrfError::HostnameNotAllowed(_));
 }
 
