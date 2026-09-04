@@ -23,8 +23,9 @@ use crate::client::store::AuthState;
 use crate::ui::components::toast::{ToastVariant, use_toaster};
 use crate::ui::components::{Banner, BannerVariant, Button, ButtonSize, ButtonType, ButtonVariant};
 use crate::ui::pages::music_bots::shared::{
-    audio_source_host, format_duration, format_error, parse_audio_source, source_glyph,
-    state_badge_class, state_label,
+    audio_source_host, bot_in_channel, effective_playback_state, format_duration, format_error,
+    parse_audio_source, source_glyph, state_badge_class, state_label, track_display_title,
+    track_title_is_placeholder,
 };
 use crate::ui::routes::Route;
 
@@ -205,6 +206,15 @@ pub fn BotDetailPage(bot_id: u64) -> Element {
         .as_ref()
         .map(|d| d.name.clone())
         .unwrap_or_else(|| format!("Bot {}", bot.0));
+    // Handshake auto-join leaves the FSM on `Connected` while `channel_id`
+    // is set. Collapse that onto `InChannel` so the badge, channel copy,
+    // and transport cannot disagree.
+    let shown_state = snap
+        .as_ref()
+        .map(|d| effective_playback_state(d.state, d.channel_id));
+    let in_a_channel = snap
+        .as_ref()
+        .is_some_and(|d| bot_in_channel(d.state, d.channel_id));
     rsx! {
         div { class: "crumb",
             Link { to: Route::BotsIndexPage {}, "Music bots" }
@@ -227,12 +237,14 @@ pub fn BotDetailPage(bot_id: u64) -> Element {
                 div { class: "page-title-block",
                     h1 { "{d.name}" }
                     p { class: "page-lede",
-                        span { class: state_badge_class(d.state),
-                            "{state_label(d.state)}"
+                        span { class: state_badge_class(shown_state.unwrap_or(d.state)),
+                            "{state_label(shown_state.unwrap_or(d.state))}"
                         }
                         " · {d.server_addr}"
-                        if let Some(cid) = d.channel_id {
-                            " · channel {cid}"
+                        if in_a_channel {
+                            if let Some(cid) = d.channel_id {
+                                " · channel {cid}"
+                            }
                         }
                     }
                 }
@@ -296,6 +308,7 @@ pub fn BotDetailPage(bot_id: u64) -> Element {
                         Button {
                             variant: ButtonVariant::Ghost,
                             size: ButtonSize::Small,
+                            disabled: !in_a_channel,
                             onclick: on_leave,
                             "Leave"
                         }
@@ -409,9 +422,9 @@ fn PlayerCard(
                     div { class: "np-body",
                         div {
                             class: "np-title",
-                            title: "{track.title}",
+                            title: "{track_display_title(track)}",
                             "aria-live": "polite",
-                            "{track.title}"
+                            "{track_display_title(track)}"
                         }
                         div { class: "np-meta",
                             span { class: "np-glyph", aria_hidden: "true",
@@ -522,13 +535,15 @@ fn PlayerControls(
     let Some(d) = detail.read().clone() else {
         return rsx! {};
     };
-    // Audio commands are meaningless when the bot isn't on a server — the
-    // backend would 404 the dispatch. Disable the row wholesale so the
-    // chrome reflects what the operator can actually do.
-    let in_channel = matches!(d.state, wire::BotState::InChannel | wire::BotState::Playing);
+    // Audio commands are meaningless when the bot isn't in a channel —
+    // the backend would 404 the dispatch. Collapse `Connected` +
+    // `channel_id` onto `InChannel` so the default-channel auto-join
+    // cannot disable Pause/Stop while the header shows a channel.
+    let shown = effective_playback_state(d.state, d.channel_id);
+    let in_channel = bot_in_channel(d.state, d.channel_id);
     let has_track = d.now_playing.is_some();
     let busy = pending.read().is_some();
-    let transport = transport_action(d.state, has_track, d.queue.len());
+    let transport = transport_action(shown, has_track, d.queue.len());
 
     let dispatch = move |action: AudioAction| {
         if pending.read().is_some() {
@@ -1178,7 +1193,7 @@ fn QueueRow(
         li { class: "queue-row",
             span { class: "queue-row__pos", "{position}." }
             div { class: "queue-row__body",
-                span { class: "queue-row__title", title: "{track.title}", "{track.title}" }
+                span { class: "queue-row__title", title: "{track_display_title(&track)}", "{track_display_title(&track)}" }
                 span { class: "queue-row__sub",
                     "{audio_source_host(&track.source)}"
                     if let Some(by) = track.requested_by.as_deref() {
@@ -1192,7 +1207,7 @@ fn QueueRow(
                     r#type: "button",
                     class: "icon-btn",
                     disabled: locked || is_first,
-                    "aria-label": "Move {track.title} up",
+                    "aria-label": "Move {track_display_title(&track)} up",
                     onclick: move |e| on_up.call(e),
                     "↑"
                 }
@@ -1200,7 +1215,7 @@ fn QueueRow(
                     r#type: "button",
                     class: "icon-btn",
                     disabled: locked || is_last,
-                    "aria-label": "Move {track.title} down",
+                    "aria-label": "Move {track_display_title(&track)} down",
                     onclick: move |e| on_down.call(e),
                     "↓"
                 }
@@ -1208,13 +1223,32 @@ fn QueueRow(
                     r#type: "button",
                     class: "icon-btn icon-btn--danger",
                     disabled: locked,
-                    "aria-label": "Remove {track.title} from queue",
+                    "aria-label": "Remove {track_display_title(&track)} from queue",
                     onclick: move |e| on_remove.call(e),
                     "✕"
                 }
             }
         }
     }
+}
+
+/// Keep a resolved title when a later event for the same source only
+/// carries the Play-stamped URL placeholder (warm resolve title may
+/// arrive first via ICY/`NowPlaying`, then a REST-shaped snapshot or
+/// `QueueChanged` restates the URL).
+fn prefer_resolved_title(existing: Option<&wire::Track>, incoming: &wire::Track) -> wire::Track {
+    let Some(prev) = existing else {
+        return incoming.clone();
+    };
+    if prev.source != incoming.source {
+        return incoming.clone();
+    }
+    if track_title_is_placeholder(incoming) && !track_title_is_placeholder(prev) {
+        let mut merged = incoming.clone();
+        merged.title = prev.title.clone();
+        return merged;
+    }
+    incoming.clone()
 }
 
 /// Reduce a single SSE event into the locally-held [`wire::MusicBotDetail`]
@@ -1235,6 +1269,11 @@ fn apply_event(d: &mut wire::MusicBotDetail, ev: &wire::BotEventWire) {
                 // THE-927 — a disconnect mid-resolve abandons the wait;
                 // drop the pill so it doesn't stick around as a ghost.
                 d.resolving_query = None;
+            } else if *to == wire::BotState::Connected && d.channel_id.is_some() {
+                // Handshake emits StateChanged(Connected) around the
+                // default-channel JoinedChannel. Don't let the FSM step
+                // hide an already-recorded channel from the chrome.
+                d.state = wire::BotState::InChannel;
             }
         }
         wire::BotEventWire::Connected {
@@ -1242,6 +1281,9 @@ fn apply_event(d: &mut wire::MusicBotDetail, ev: &wire::BotEventWire) {
         } => {
             d.channel_id = Some(*default_channel);
             d.last_error = None;
+            if d.state == wire::BotState::Connected {
+                d.state = wire::BotState::InChannel;
+            }
         }
         wire::BotEventWire::Disconnected { .. } => {
             d.channel_id = None;
@@ -1252,12 +1294,18 @@ fn apply_event(d: &mut wire::MusicBotDetail, ev: &wire::BotEventWire) {
         }
         wire::BotEventWire::JoinedChannel { channel_id } => {
             d.channel_id = Some(*channel_id);
+            if d.state == wire::BotState::Connected {
+                d.state = wire::BotState::InChannel;
+            }
         }
         wire::BotEventWire::LeftChannel => {
             d.channel_id = None;
+            if matches!(d.state, wire::BotState::InChannel | wire::BotState::Playing) {
+                d.state = wire::BotState::Connected;
+            }
         }
         wire::BotEventWire::NowPlaying { track } => {
-            d.now_playing = Some(track.clone());
+            d.now_playing = Some(prefer_resolved_title(d.now_playing.as_ref(), track));
             // Keep the head of the queue in sync — callers also send a
             // `QueueChanged` right after `NowPlaying`, but applying it
             // optimistically here lets the row light up instantly.
@@ -1283,12 +1331,15 @@ fn apply_event(d: &mut wire::MusicBotDetail, ev: &wire::BotEventWire) {
             // The lifecycle FSM doesn't carry "Playing" — collapse back
             // to a connected/in_channel state via the next StateChanged.
         }
-        wire::BotEventWire::QueueChanged { current, .. } => {
-            d.now_playing = current.clone();
-            if current.is_none() {
+        wire::BotEventWire::QueueChanged { current, .. } => match current {
+            Some(track) => {
+                d.now_playing = Some(prefer_resolved_title(d.now_playing.as_ref(), track));
+            }
+            None => {
+                d.now_playing = None;
                 d.now_playing_elapsed_secs = None;
             }
-        }
+        },
         // PURA-261 — audio pipeline drained. Clear `now_playing` so the
         // live view stops showing `Playing`; an auto-advance `NowPlaying`
         // for the next track arrives after this event and re-sets it.
@@ -1394,6 +1445,94 @@ mod tests {
             &wire::BotEventWire::JoinedChannel { channel_id: 21 },
         );
         assert_eq!(d.channel_id, Some(21));
+        assert_eq!(
+            d.state,
+            wire::BotState::InChannel,
+            "JoinedChannel must promote Connected so transport matches the badge"
+        );
+    }
+
+    #[test]
+    fn connected_event_records_default_channel_as_in_channel() {
+        let mut d = fixture(wire::BotState::Connected);
+        apply_event(
+            &mut d,
+            &wire::BotEventWire::Connected {
+                client_id: 1,
+                default_channel: 2,
+            },
+        );
+        assert_eq!(d.channel_id, Some(2));
+        assert_eq!(d.state, wire::BotState::InChannel);
+        assert!(bot_in_channel(d.state, d.channel_id));
+        assert_eq!(
+            state_label(effective_playback_state(d.state, d.channel_id)),
+            "In channel"
+        );
+        assert!(
+            !transport_action(effective_playback_state(d.state, d.channel_id), true, 0).disabled,
+            "Pause/Resume must be enabled once a channel_id is present"
+        );
+    }
+
+    #[test]
+    fn state_changed_to_connected_does_not_hide_existing_channel() {
+        let mut d = fixture(wire::BotState::Connecting);
+        d.channel_id = Some(2);
+        apply_event(
+            &mut d,
+            &wire::BotEventWire::StateChanged {
+                from: wire::BotState::Connecting,
+                to: wire::BotState::Connected,
+            },
+        );
+        assert_eq!(d.channel_id, Some(2));
+        assert_eq!(d.state, wire::BotState::InChannel);
+    }
+
+    #[test]
+    fn left_channel_clears_channel_and_drops_to_connected() {
+        let mut d = fixture(wire::BotState::InChannel);
+        d.channel_id = Some(5);
+        apply_event(&mut d, &wire::BotEventWire::LeftChannel);
+        assert!(d.channel_id.is_none());
+        assert_eq!(d.state, wire::BotState::Connected);
+        assert!(!bot_in_channel(d.state, d.channel_id));
+    }
+
+    #[test]
+    fn now_playing_keeps_resolved_title_over_url_placeholder() {
+        let mut d = fixture(wire::BotState::InChannel);
+        let mut named = track(0, "Never Gonna Give You Up");
+        named.source = wire::AudioSource::Url {
+            url: "https://www.youtube.com/watch?v=abc".into(),
+        };
+        apply_event(
+            &mut d,
+            &wire::BotEventWire::NowPlaying {
+                track: named.clone(),
+            },
+        );
+        let placeholder = wire::Track {
+            id: wire::TrackId(0),
+            source: named.source.clone(),
+            title: "https://www.youtube.com/watch?v=abc".into(),
+            duration_secs: Some(212),
+            requested_by: None,
+        };
+        apply_event(
+            &mut d,
+            &wire::BotEventWire::NowPlaying { track: placeholder },
+        );
+        assert_eq!(
+            d.now_playing.as_ref().map(|t| t.title.as_str()),
+            Some("Never Gonna Give You Up")
+        );
+        assert_eq!(
+            d.now_playing.as_ref().and_then(|t| t.duration_secs),
+            Some(212),
+            "later event still supplies duration / other fields"
+        );
     }
 
     #[test]

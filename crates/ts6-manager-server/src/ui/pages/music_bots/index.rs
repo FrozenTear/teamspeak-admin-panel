@@ -14,7 +14,9 @@ use crate::client::music_bots as mb;
 use crate::client::store::AuthState;
 use crate::ui::components::toast::{ToastVariant, use_toaster};
 use crate::ui::components::{Banner, BannerVariant, Button, ButtonSize, ButtonType, ButtonVariant};
-use crate::ui::pages::music_bots::shared::{format_error, state_badge_class, state_label};
+use crate::ui::pages::music_bots::shared::{
+    format_error, state_badge_class, state_label, track_display_title,
+};
 use crate::ui::routes::Route;
 
 #[component]
@@ -242,7 +244,7 @@ fn BotsTable(props: BotsTableProps) -> Element {
                         let now_playing = b
                             .now_playing
                             .as_ref()
-                            .map(|t| t.title.clone())
+                            .map(track_display_title)
                             .unwrap_or_else(|| "—".into());
                         rsx! {
                             tr { key: "{id.0}",

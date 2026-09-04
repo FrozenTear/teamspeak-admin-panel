@@ -32,12 +32,75 @@ pub fn state_label(state: wire::BotState) -> &'static str {
     }
 }
 
+/// Collapse the handshake snapshot onto the enum the chrome actually
+/// branches on.
+///
+/// After connect the music bot auto-joins its default channel and the
+/// snapshot carries `channel_id`, but the lifecycle FSM stays
+/// `Connected` until an explicit Join. Status used to read
+/// `Connected · channel 2` while transport required `InChannel`. Treat
+/// "Connected + has a channel" as `InChannel` so badge, channel copy,
+/// Leave, and Pause/Stop share one wire state.
+pub fn effective_playback_state(state: wire::BotState, channel_id: Option<u64>) -> wire::BotState {
+    match state {
+        wire::BotState::Connected if channel_id.is_some() => wire::BotState::InChannel,
+        other => other,
+    }
+}
+
+/// True when transport / Leave are meaningful — bot is sitting in a
+/// channel (including the default-channel auto-join that the FSM still
+/// reports as `Connected`).
+pub fn bot_in_channel(state: wire::BotState, channel_id: Option<u64>) -> bool {
+    matches!(
+        effective_playback_state(state, channel_id),
+        wire::BotState::InChannel | wire::BotState::Playing
+    )
+}
+
 /// One-line summary of an [`wire::AudioSource`] for tables.
 pub fn audio_source_summary(source: &wire::AudioSource) -> String {
     match source {
         wire::AudioSource::Url { url } => url.clone(),
         wire::AudioSource::LibraryPath { path } => format!("library:{path}"),
     }
+}
+
+/// Title shown on the Now Playing card and queue rows.
+///
+/// Prefers `track.title` when it is a real name. Direct Play
+/// (`POST /play`) stamps the source URL as the title until the
+/// pipeline (ICY / a later `NowPlaying`) supplies a resolved one — the
+/// warm resolver already returns a title, but that path does not yet
+/// reach this wire field. Treat an empty title or a title that *is*
+/// the source URL as missing and fall back to the compact host / path.
+pub fn track_display_title(track: &wire::Track) -> String {
+    let title = track.title.trim();
+    if !title.is_empty() && !title_duplicates_source(title, &track.source) {
+        return title.to_string();
+    }
+    audio_source_host(&track.source)
+}
+
+/// True when `track.title` is empty or just restates the source URL /
+/// library path — i.e. Play stamped a placeholder, not a resolved name.
+pub fn track_title_is_placeholder(track: &wire::Track) -> bool {
+    let title = track.title.trim();
+    title.is_empty() || title_duplicates_source(title, &track.source)
+}
+
+fn title_duplicates_source(title: &str, source: &wire::AudioSource) -> bool {
+    match source {
+        wire::AudioSource::Url { url } => title == url || looks_like_http_url(title),
+        wire::AudioSource::LibraryPath { path } => {
+            title == path || title == format!("library:{path}")
+        }
+    }
+}
+
+fn looks_like_http_url(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
 }
 
 /// Compact source label for the now-playing widget and queue rows: the
@@ -209,5 +272,102 @@ mod tests {
             state_badge_class(wire::BotState::Disconnected),
             state_badge_class(wire::BotState::Connecting)
         );
+    }
+
+    #[test]
+    fn connected_with_channel_collapses_to_in_channel() {
+        // Handshake auto-join: FSM stays Connected, snapshot has a
+        // channel. Chrome must not say "Connected" while transport
+        // thinks the bot is not in a channel.
+        assert_eq!(
+            effective_playback_state(wire::BotState::Connected, Some(2)),
+            wire::BotState::InChannel
+        );
+        assert!(bot_in_channel(wire::BotState::Connected, Some(2)));
+        assert_eq!(
+            state_label(effective_playback_state(wire::BotState::Connected, Some(2))),
+            "In channel"
+        );
+    }
+
+    #[test]
+    fn connected_without_channel_stays_connected() {
+        assert_eq!(
+            effective_playback_state(wire::BotState::Connected, None),
+            wire::BotState::Connected
+        );
+        assert!(!bot_in_channel(wire::BotState::Connected, None));
+        assert_eq!(
+            state_label(effective_playback_state(wire::BotState::Connected, None)),
+            "Connected"
+        );
+    }
+
+    #[test]
+    fn in_channel_and_playing_are_already_in_channel() {
+        assert!(bot_in_channel(wire::BotState::InChannel, Some(5)));
+        assert!(bot_in_channel(wire::BotState::InChannel, None));
+        assert!(bot_in_channel(wire::BotState::Playing, Some(5)));
+        assert!(!bot_in_channel(wire::BotState::Disconnected, Some(5)));
+        assert!(!bot_in_channel(wire::BotState::Connecting, Some(5)));
+    }
+
+    #[test]
+    fn track_display_title_prefers_resolved_name() {
+        let track = wire::Track {
+            id: wire::TrackId(1),
+            source: wire::AudioSource::Url {
+                url: "https://www.youtube.com/watch?v=abc".into(),
+            },
+            title: "Never Gonna Give You Up".into(),
+            duration_secs: None,
+            requested_by: None,
+        };
+        assert_eq!(track_display_title(&track), "Never Gonna Give You Up");
+    }
+
+    #[test]
+    fn track_display_title_falls_back_when_title_is_the_url() {
+        let track = wire::Track {
+            id: wire::TrackId(0),
+            source: wire::AudioSource::Url {
+                url: "https://www.youtube.com/watch?v=abc".into(),
+            },
+            title: "https://www.youtube.com/watch?v=abc".into(),
+            duration_secs: None,
+            requested_by: None,
+        };
+        assert_eq!(track_display_title(&track), "youtube.com");
+    }
+
+    #[test]
+    fn track_display_title_falls_back_for_empty_or_http_title() {
+        let mut track = wire::Track {
+            id: wire::TrackId(0),
+            source: wire::AudioSource::Url {
+                url: "https://soundcloud.com/x/track".into(),
+            },
+            title: "   ".into(),
+            duration_secs: None,
+            requested_by: None,
+        };
+        assert_eq!(track_display_title(&track), "soundcloud.com");
+        track.title = "https://other.example/watch?v=1".into();
+        assert_eq!(track_display_title(&track), "soundcloud.com");
+        assert!(track_title_is_placeholder(&track));
+    }
+
+    #[test]
+    fn track_display_title_library_path_falls_back_to_library_label() {
+        let track = wire::Track {
+            id: wire::TrackId(3),
+            source: wire::AudioSource::LibraryPath {
+                path: "lo-fi/x.mp3".into(),
+            },
+            title: "library:lo-fi/x.mp3".into(),
+            duration_secs: None,
+            requested_by: None,
+        };
+        assert_eq!(track_display_title(&track), "library:lo-fi/x.mp3");
     }
 }
