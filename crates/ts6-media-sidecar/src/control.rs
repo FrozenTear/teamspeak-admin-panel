@@ -504,6 +504,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ssrf_blocks_ipv6_unspecified() {
+        let resolver = MockResolver::new();
+        let err = is_url_allowed("http://[::]/", &resolver)
+            .await
+            .expect_err("IPv6 unspecified must be rejected");
+        let api_err = ApiError::SsrfBlocked(err);
+        assert_eq!(api_err.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(api_err.error_code(), "ssrf_blocked");
+    }
+
+    #[tokio::test]
     async fn ssrf_blocks_dns_rebinder() {
         let resolver = MockResolver::new().with("rebind.test", vec![ip("10.0.0.1")]);
         let err = is_url_allowed("http://rebind.test/", &resolver)

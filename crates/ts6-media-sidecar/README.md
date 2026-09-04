@@ -171,17 +171,28 @@ sidecar's resolver uses `tokio::net::lookup_host` (system getaddrinfo);
 the manager-server uses `hickory-resolver`. Both implement the same
 `Resolver` trait so the validator is identical bytes either side.
 
+Boot-time `--source` / `--source-lavfi-*` do **not** go through this
+validator. Those flags are a local-operator primitive (file paths,
+lavfi test patterns). `POST /source` is the untrusted-URL surface.
+
 DNS-rebinding defence in v1 splits by scheme:
 
-* **HTTPS**: TLS hostname validation binds the connection to the
-  certificate, which is a stronger guarantee than IP-pinning — a DNS
-  rebinder substituting a private-range answer fails on the SAN check.
-* **HTTP**: a small TOCTTOU window remains between the SSRF resolve
-  and FFmpeg's own DNS lookup. `ts6-ssrf` has already rejected the
-  metadata-host list and any answer in a private range, so a successful
-  rebinder needs a public→private answer flip inside that window. A
-  follow-up will route plaintext HTTP through a Rust-side proxy that
-  pins the IP while preserving the `Host:` header.
+* **HTTPS**: the original URL is handed to FFmpeg with `-tls_verify 1`
+  so the TLS peer cert must chain to a trusted CA *and* match the
+  hostname (FFmpeg defaults `tls_verify` to `0`). A DNS rebinder that
+  swaps in a private/metadata IP fails the handshake unless that host
+  can present a valid cert for the requested name. FFmpeg still
+  follows `3xx` itself — per-hop re-validation is PURA-150 / v2.
+* **HTTP**: `POST /source` registers the SSRF-pinned IP in a
+  loopback-only Host-preserving proxy (PURA-172, `http_pin.rs`) and
+  rewrites FFmpeg's `-i` to `http://127.0.0.1:<port>/<uuid>`. The
+  proxy pins the outbound socket with `reqwest::resolve_to_addrs`,
+  refuses `3xx` (502), and burns the token on `POST /source/stop`.
+  The initial GET's rebinding window is closed. Residual: HTTP
+  sources whose DNS failed at validate time (`resolved_ip` is `None`,
+  spec §9.3) skip the proxy; FFmpeg-initiated secondary fetches
+  (HLS/DASH absolute segment URLs) also bypass it. Those are
+  PURA-150 follow-ups, not v1 pin-proxy scope.
 
 The earlier "rewrite the FFmpeg-input URL to the resolved IP literal"
 approach (PURA-149) was reverted because it broke TLS SNI / `Host:`

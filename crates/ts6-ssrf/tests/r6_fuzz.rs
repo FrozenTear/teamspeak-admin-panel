@@ -10,9 +10,10 @@
 //! 1-part integer, octal, hex, IPv4-mapped IPv6) MUST be rejected by
 //! `is_url_allowed`.
 //!
-//! Property: for every IPv6 address in the link-local (`fe80::/10`),
-//! ULA (`fc00::/7`), loopback (`::1`), or IPv4-mapped-with-blocked-v4
-//! ranges, the bracketed literal MUST be rejected.
+//! Property: for every IPv6 address in the unspecified (`::`),
+//! link-local (`fe80::/10`), ULA (`fc00::/7`), loopback (`::1`), or
+//! IPv4-mapped-with-blocked-v4 ranges, the bracketed literal MUST be
+//! rejected.
 //!
 //! Symmetric properties cover the *allow* side: public IPv4 literals and
 //! their encoded forms MUST be allowed (modulo NXDOMAIN allow-through for
@@ -64,7 +65,7 @@ fn expect_blocked_v4(v4: Ipv4Addr) -> bool {
 }
 
 fn expect_blocked_v6(v6: Ipv6Addr) -> bool {
-    if v6.is_loopback() {
+    if v6.is_unspecified() || v6.is_loopback() {
         return true;
     }
     let segs = v6.segments();

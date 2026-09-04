@@ -138,6 +138,20 @@ async fn control_plane_start_lookup_stats_stop() {
     let err: Value = resp.json().await.unwrap();
     assert_eq!(err["error"], "ssrf_blocked");
 
+    // --- POST /source — IPv6 unspecified (`::`) is a loopback alias. ---------
+    let ssrf_unspec = serde_json::json!({
+        "url": "http://[::]/local",
+    });
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/source"))
+        .json(&ssrf_unspec)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "IPv6 unspecified must be blocked");
+    let err: Value = resp.json().await.unwrap();
+    assert_eq!(err["error"], "ssrf_blocked");
+
     // --- POST /source/stop — happy path → 204 + registry empty. --------------
     let stop_body = serde_json::json!({"source_id": source_id});
     let resp = reqwest::Client::new()

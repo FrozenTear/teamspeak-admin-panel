@@ -3,8 +3,10 @@
 //! IPv4: `0.0.0.0/8`, `10.0.0.0/8`, `127.0.0.0/8`, `169.254.0.0/16`,
 //! `172.16.0.0/12` (only 16..=31), `192.168.0.0/16`.
 //!
-//! IPv6: `::1/128`, `fe80::/10` (link-local), `fc00::/7` (ULA — covers `fc..` and `fd..`),
-//! IPv4-mapped `::ffff:0:0/96` (delegate the embedded v4 to IPv4 rules).
+//! IPv6: `::/128` (unspecified — Linux `connect(::)` lands on `::1`, same
+//! class as IPv4 `0.0.0.0/8`), `::1/128`, `fe80::/10` (link-local),
+//! `fc00::/7` (ULA — covers `fc..` and `fd..`), IPv4-mapped `::ffff:0:0/96`
+//! (delegate the embedded v4 to IPv4 rules).
 //!
 //! Spec also names two metadata-IP literals (`169.254.169.254`, `fd00:ec2::254`).
 //! Those are checked via the explicit metadata constants in `mod.rs`; this
@@ -14,7 +16,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// Returns `true` if the given IP falls in one of the spec's disallowed ranges
 /// (private, loopback, link-local, ULA, IPv4-mapped-with-blocked-embedded-v4,
-/// `0.0.0.0/8`).
+/// `0.0.0.0/8`, IPv6 unspecified `::`).
 pub fn is_blocked_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_blocked_ipv4(v4),
@@ -52,6 +54,12 @@ pub fn is_blocked_ipv4(v4: Ipv4Addr) -> bool {
 }
 
 pub fn is_blocked_ipv6(v6: Ipv6Addr) -> bool {
+    // ::/128 (unspecified). On Linux a connect() to `::` is rewritten to
+    // `::1` — the IPv6 counterpart of the IPv4 `0.0.0.0` → `127.0.0.1`
+    // alias that §6.7.1 already blocks via `0.0.0.0/8`.
+    if v6.is_unspecified() {
+        return true;
+    }
     // ::1/128 (loopback)
     if v6.is_loopback() {
         return true;
@@ -131,6 +139,14 @@ mod tests {
         assert!(!is_blocked_ipv4(v4("8.8.8.8")));
         assert!(!is_blocked_ipv4(v4("1.1.1.1")));
         assert!(!is_blocked_ipv4(v4("93.184.216.34"))); // example.com (historic)
+    }
+
+    #[test]
+    fn ipv6_unspecified_blocked() {
+        // Linux connect(::) lands on ::1 — same class as IPv4 0.0.0.0.
+        assert!(is_blocked_ipv6(v6("::")));
+        assert!(is_blocked_ipv6(Ipv6Addr::UNSPECIFIED));
+        assert!(!is_blocked_ipv6(v6("2001:db8::1"))); // doc range, not in our blocklist
     }
 
     #[test]
