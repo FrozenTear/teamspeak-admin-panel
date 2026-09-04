@@ -3,7 +3,10 @@
 //! Renders a single bot's connection state, channel, now-playing card,
 //! and queue snapshot. Subscribes to the SSE event stream so reductions
 //! land without polling — the underlying [`web_sys::EventSource`] also
-//! handles reconnect + last-event-id for free.
+//! handles reconnect + last-event-id for free. The stream is opened with
+//! `?token=` (browsers cannot set `Authorization` on `EventSource`);
+//! Play / transport success also bump the REST snapshot reload so Now
+//! Playing does not depend on SSE alone.
 //!
 //! Playback control buttons (resume / pause / skip / stop) dispatch to
 //! the audio-control REST surface (PURA-126). Buttons disable
@@ -63,27 +66,51 @@ pub fn BotDetailPage(bot_id: u64) -> Element {
     });
 
     // SSE subscription — push events into the detail signal so the page
-    // reflects state changes without polling. Stored inside an `Rc<RefCell>`
-    // owned by `use_hook` so the underlying `EventSource` closes on
-    // unmount (the `BotEventStream`'s `Drop` impl does the work; the Rc
-    // wrapper just gives `use_hook` a `Clone` handle to stash). Lag is
-    // handled by the browser's native reconnect; library / playlist
-    // events trigger a refetch because the snapshot doesn't carry that
-    // data inline.
-    use_hook(|| {
-        let stream = mb::open_bot_event_source(bot, move |ev| {
-            detail.with_mut(|d| {
-                let Some(snap) = d.as_mut() else { return };
-                apply_event(snap, &ev);
-            });
-            if matches!(
-                ev,
-                wire::BotEventWire::LibraryChanged | wire::BotEventWire::PlaylistChanged { .. }
-            ) {
-                reload.with_mut(|n| *n += 1);
+    // reflects state changes without polling. Held in an `Rc<RefCell>` so
+    // the underlying `EventSource` closes on unmount (`BotEventStream`'s
+    // `Drop`). Opened only after the first REST snapshot lands, and only
+    // when the session has an access JWT: events that arrive before
+    // `detail` is `Some` used to be dropped, and browsers cannot set
+    // `Authorization` on `EventSource` so the URL carries `?token=`
+    // (same query name as `/api/ws`). Library / playlist events still
+    // trigger a refetch because the snapshot doesn't carry that data.
+    let sse_hold: std::rc::Rc<std::cell::RefCell<Option<mb::BotEventStream>>> =
+        use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(None)));
+
+    use_effect({
+        let sse_hold = sse_hold.clone();
+        let session = session.clone();
+        move || {
+            if sse_hold.borrow().is_some() {
+                return;
             }
-        });
-        std::rc::Rc::new(std::cell::RefCell::new(Some(stream)))
+            let access = match &*session.state.read() {
+                AuthState::Authenticated { access, .. } if !access.is_empty() => access.clone(),
+                _ => return,
+            };
+            // Wait for the first snapshot so early events aren't applied
+            // against `None` (and dropped). `peek` after the first Some
+            // is unnecessary — the armed hold short-circuits above.
+            if detail.peek().is_none() {
+                let _ = detail.read();
+                return;
+            }
+            let mut reload = reload;
+            let mut detail = detail;
+            let stream = mb::open_bot_event_source(bot, &access, move |ev| {
+                detail.with_mut(|d| {
+                    let Some(snap) = d.as_mut() else { return };
+                    apply_event(snap, &ev);
+                });
+                if matches!(
+                    ev,
+                    wire::BotEventWire::LibraryChanged | wire::BotEventWire::PlaylistChanged { .. }
+                ) {
+                    reload.with_mut(|n| *n += 1);
+                }
+            });
+            *sse_hold.borrow_mut() = Some(stream);
+        }
     });
 
     let bump = move || reload.with_mut(|n| *n += 1);
@@ -275,9 +302,9 @@ pub fn BotDetailPage(bot_id: u64) -> Element {
                     }
                 }
 
-                PlayNowComposer { bot_id, state: d.state }
+                PlayNowComposer { bot_id, state: d.state, reload }
 
-                PlayerCard { bot_id, detail }
+                PlayerCard { bot_id, detail, reload }
 
                 QueueCard { bot_id, detail }
             }
@@ -290,7 +317,11 @@ pub fn BotDetailPage(bot_id: u64) -> Element {
 /// acts on the track shown directly above it). Reads the live `detail`
 /// signal so SSE reductions land without a prop round-trip.
 #[component]
-fn PlayerCard(bot_id: u64, detail: Signal<Option<wire::MusicBotDetail>>) -> Element {
+fn PlayerCard(
+    bot_id: u64,
+    detail: Signal<Option<wire::MusicBotDetail>>,
+    reload: Signal<u64>,
+) -> Element {
     let Some(d) = detail.read().clone() else {
         return rsx! {};
     };
@@ -451,7 +482,7 @@ fn PlayerCard(bot_id: u64, detail: Signal<Option<wire::MusicBotDetail>>) -> Elem
                     "{d.last_error.as_deref().unwrap_or_default()}"
                 }
             }
-            PlayerControls { bot_id, detail }
+            PlayerControls { bot_id, detail, reload }
         }
     }
 }
@@ -474,7 +505,11 @@ fn track_progress(d: &wire::MusicBotDetail) -> Option<f64> {
 /// optimistic state flip on click, whole-bar disable while a command is
 /// in flight, spinner only past ~400ms, revert on error.
 #[component]
-fn PlayerControls(bot_id: u64, detail: Signal<Option<wire::MusicBotDetail>>) -> Element {
+fn PlayerControls(
+    bot_id: u64,
+    detail: Signal<Option<wire::MusicBotDetail>>,
+    mut reload: Signal<u64>,
+) -> Element {
     let bot = wire::BotId(bot_id);
     let gate = use_auth_gate();
     let toaster = use_toaster();
@@ -527,7 +562,12 @@ fn PlayerControls(bot_id: u64, detail: Signal<Option<wire::MusicBotDetail>>) -> 
             pending.set(None);
             slow.set(false);
             match res {
-                Ok(()) => toaster.push(ToastVariant::Success, action.success_label(), None),
+                Ok(()) => {
+                    toaster.push(ToastVariant::Success, action.success_label(), None);
+                    // Same reload bump as connect/disconnect — hydrate
+                    // now_playing / queue from REST if SSE is still catching up.
+                    reload.with_mut(|n| *n += 1);
+                }
                 Err(e) => {
                     // Revert the optimistic flip to the last server-
                     // confirmed snapshot. The SSE stream remains the
@@ -678,7 +718,7 @@ fn apply_optimistic(d: &mut wire::MusicBotDetail, action: AudioAction) {
 }
 
 #[component]
-fn PlayNowComposer(bot_id: u64, state: wire::BotState) -> Element {
+fn PlayNowComposer(bot_id: u64, state: wire::BotState, mut reload: Signal<u64>) -> Element {
     let bot = wire::BotId(bot_id);
     let gate = use_auth_gate();
     let toaster = use_toaster();
@@ -720,6 +760,12 @@ fn PlayNowComposer(bot_id: u64, state: wire::BotState) -> Element {
                     Ok(()) => {
                         toaster.push(ToastVariant::Success, "Playing", None);
                         url_input.set(String::new());
+                        // Belt-and-suspenders: Play used to rely only on
+                        // SSE to flip Now Playing. Bump the same reload
+                        // signal connect/disconnect use so `get_bot`
+                        // hydrates `now_playing` even if the event stream
+                        // is still catching up.
+                        reload.with_mut(|n| *n += 1);
                     }
                     Err(e) => {
                         let msg = format_error(&e);
