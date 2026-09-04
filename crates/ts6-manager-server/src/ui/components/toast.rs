@@ -81,7 +81,8 @@ impl Toaster {
             let mut items = items.write();
             items.push(entry);
             if items.len() > MAX_VISIBLE {
-                items.drain(0..items.len() - MAX_VISIBLE);
+                let overflow = items.len() - MAX_VISIBLE;
+                items.drain(0..overflow);
             }
         }
         schedule_dismiss(self.items, id);
