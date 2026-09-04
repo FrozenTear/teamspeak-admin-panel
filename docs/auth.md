@@ -52,7 +52,10 @@ Numeric-only values are seconds (`60` → 60s). Suffix parser lives in
 5. The WebSocket at `/api/ws?token=<jwt>` authenticates on connect
    only — it does NOT re-auth on the same socket after access expiry.
    A reconnect picks up the current access token from the session
-   signal.
+   signal. The music-bot SSE at
+   `/api/music-bots/{id}/events?token=<jwt>` uses the same
+   `authenticate_token` path (Bearer remains accepted for non-EventSource
+   clients). Other `/api/*` routes stay `Authorization: Bearer` only.
 
 ## Refresh failure contract (PURA-214)
 

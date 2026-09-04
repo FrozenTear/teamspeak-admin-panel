@@ -17,6 +17,7 @@ use axum::http::{HeaderValue, Method, Request, StatusCode};
 use http_body_util::BodyExt;
 use tokio::sync::Mutex;
 use tower::ServiceExt;
+use ts6_manager_shared::auth::{ErrorResponse, auth_error_strings as msg};
 use ts6_manager_shared::music_bots as wire;
 
 use crate::app_state::AppState;
@@ -132,6 +133,163 @@ async fn list_requires_auth() {
             Request::builder()
                 .method(Method::GET)
                 .uri("/api/music-bots")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+async fn create_test_bot(app: &Router, token: &str) -> wire::MusicBotSummary {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/music-bots")
+                .header("authorization", auth_header(token))
+                .header("content-type", "application/json")
+                .body(json_body(&create_bot_body()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    read_json(resp).await
+}
+
+fn events_uri(bot_id: u64, token: Option<&str>) -> String {
+    match token {
+        Some(t) => format!(
+            "/api/music-bots/{bot_id}/events?token={}",
+            urlencoding::encode(t)
+        ),
+        None => format!("/api/music-bots/{bot_id}/events"),
+    }
+}
+
+/// SSE success responses are an infinite keep-alive stream — assert
+/// status + content-type only; do not collect the body.
+fn assert_sse_ok(resp: &axum::http::Response<Body>) {
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ct = resp
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        ct.starts_with("text/event-stream"),
+        "expected event-stream, got {ct:?}"
+    );
+}
+
+#[tokio::test]
+async fn events_sse_rejects_missing_auth() {
+    let (app, token, _state) = make_test_app().await;
+    let bot = create_test_bot(&app, &token).await;
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(events_uri(bot.id.0, None))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let body: ErrorResponse = read_json(resp).await;
+    assert_eq!(body.error, msg::NO_TOKEN);
+}
+
+#[tokio::test]
+async fn events_sse_rejects_invalid_query_token() {
+    let (app, token, _state) = make_test_app().await;
+    let bot = create_test_bot(&app, &token).await;
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(events_uri(bot.id.0, Some("not-a-jwt")))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let body: ErrorResponse = read_json(resp).await;
+    assert_eq!(body.error, msg::INVALID_TOKEN);
+}
+
+#[tokio::test]
+async fn events_sse_rejects_invalid_bearer() {
+    let (app, token, _state) = make_test_app().await;
+    let bot = create_test_bot(&app, &token).await;
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(events_uri(bot.id.0, None))
+                .header("authorization", auth_header("not-a-jwt"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let body: ErrorResponse = read_json(resp).await;
+    assert_eq!(body.error, msg::INVALID_TOKEN);
+}
+
+#[tokio::test]
+async fn events_sse_accepts_bearer() {
+    let (app, token, _state) = make_test_app().await;
+    let bot = create_test_bot(&app, &token).await;
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(events_uri(bot.id.0, None))
+                .header("authorization", auth_header(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_sse_ok(&resp);
+}
+
+#[tokio::test]
+async fn events_sse_accepts_query_token() {
+    let (app, token, _state) = make_test_app().await;
+    let bot = create_test_bot(&app, &token).await;
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(events_uri(bot.id.0, Some(&token)))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_sse_ok(&resp);
+}
+
+#[tokio::test]
+async fn list_does_not_accept_query_token() {
+    // Query-token auth is SSE-only. Other music-bot REST routes stay
+    // Bearer-gated so access JWTs are not leaked onto arbitrary query strings.
+    let (app, token, _state) = make_test_app().await;
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/api/music-bots?token={}",
+                    urlencoding::encode(&token)
+                ))
                 .body(Body::empty())
                 .unwrap(),
         )

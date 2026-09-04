@@ -6,6 +6,12 @@
 //! lookup, not the JWT claim** (spec §6.4.1) — revoking a user's role takes
 //! effect immediately.
 //!
+//! Browser `EventSource` cannot set `Authorization` headers. Routes that
+//! must stay EventSource-compatible (today: music-bot SSE) use
+//! [`RequireAuthOrQueryToken`] instead: Bearer still works, and
+//! `?token=<access_jwt>` authenticates via the same
+//! [`crate::auth::ws_handshake::authenticate_token`] path as `/api/ws`.
+//!
 //! [`RequireRole`] composes on top of `RequireAuth` to gate routes by role
 //! membership. [`crate::auth::extractors`] does NOT yet ship the per-server
 //! `RequireServerAccess` extractor — that lands when the first per-server
@@ -16,7 +22,7 @@ use std::marker::PhantomData;
 use std::net::SocketAddr;
 
 use axum::Json;
-use axum::extract::{ConnectInfo, FromRef, FromRequestParts};
+use axum::extract::{ConnectInfo, FromRef, FromRequestParts, Query};
 use axum::http::StatusCode;
 use axum::http::header::{AUTHORIZATION, USER_AGENT};
 use axum::http::request::Parts;
@@ -26,6 +32,7 @@ use ts6_manager_shared::auth::{ErrorResponse, auth_error_strings as msg};
 use crate::app_state::AppState;
 use crate::auth::jwt;
 use crate::auth::permissions::{self, ModPermission};
+use crate::auth::ws_handshake::{WsAuthError, WsTokenQuery, authenticate_token};
 use crate::repos::{user_permissions, users};
 use crate::web::proxy;
 
@@ -137,6 +144,82 @@ where
             role: user.role,
             enabled: user.enabled,
         }))
+    }
+}
+
+/// EventSource-compatible auth: `Authorization: Bearer` **or**
+/// `?token=<access_jwt>`.
+///
+/// Bearer is tried first so existing REST clients keep working unchanged.
+/// When no Bearer is present, the `token` query param is resolved with
+/// [`authenticate_token`] — the same access-JWT + live DB-role path the
+/// operator WebSocket handshake uses. Other `/api/*` routes stay on
+/// [`RequireAuth`] (Bearer only) so access JWTs are not accepted on
+/// arbitrary query strings.
+#[derive(Debug, Clone)]
+pub struct RequireAuthOrQueryToken(pub AuthUser);
+
+impl<S> FromRequestParts<S> for RequireAuthOrQueryToken
+where
+    AppState: FromRef<S>,
+    S: Send + Sync,
+{
+    type Rejection = AuthError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let has_bearer = parts
+            .headers
+            .get(AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|s| s.starts_with("Bearer "));
+
+        if has_bearer {
+            let RequireAuth(user) = RequireAuth::from_request_parts(parts, state).await?;
+            return Ok(Self(user));
+        }
+
+        let query_token = Query::<WsTokenQuery>::from_request_parts(parts, state)
+            .await
+            .ok()
+            .and_then(|Query(q)| q.token)
+            .filter(|t| !t.is_empty());
+
+        let Some(token) = query_token else {
+            let path = parts.uri.path().to_owned();
+            tracing::debug!(path = %path, sub_code = "no_token", "auth 401");
+            return Err(AuthError::NoToken);
+        };
+
+        let app: AppState = AppState::from_ref(state);
+        match authenticate_token(&app, &token).await {
+            Ok(user) => Ok(Self(user)),
+            Err(WsAuthError::InvalidOrExpired) => {
+                tracing::debug!(
+                    path = %parts.uri.path(),
+                    sub_code = "invalid_token",
+                    "auth 401"
+                );
+                Err(AuthError::Invalid)
+            }
+            Err(WsAuthError::Disabled) => {
+                tracing::debug!(
+                    path = %parts.uri.path(),
+                    sub_code = "user_disabled",
+                    reason = "query_token_disabled_or_missing",
+                    "auth 401"
+                );
+                Err(AuthError::Disabled)
+            }
+            Err(WsAuthError::Backend) => {
+                tracing::debug!(
+                    path = %parts.uri.path(),
+                    sub_code = "invalid_token",
+                    reason = "db_lookup_error",
+                    "auth 401"
+                );
+                Err(AuthError::Invalid)
+            }
+        }
     }
 }
 

@@ -15,8 +15,12 @@
 //! - `requests`        — `/music-requests` log.
 //!
 //! Auth: a fresh `RequireAuth` lookup runs on every handler (per spec
-//! §6.4.1). RBAC granularity is "any authenticated user" — multi-tenant
-//! / per-bot ACLs are flagged for follow-up on the parent epic.
+//! §6.4.1). The `/events` SSE is the exception: browser `EventSource`
+//! cannot set `Authorization`, so that route also accepts
+//! `?token=<access_jwt>` via [`crate::auth::extractors::RequireAuthOrQueryToken`]
+//! (same access-JWT check as `/api/ws`). RBAC granularity is "any
+//! authenticated user" — multi-tenant / per-bot ACLs are flagged for
+//! follow-up on the parent epic.
 
 mod audio_control;
 mod bots;

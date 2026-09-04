@@ -6,7 +6,7 @@ The wire types are defined once in [`ts6_manager_shared::music_bots`](../../crat
 
 ## Conventions
 
-- **Auth**: `RequireAuth` extractor on every endpoint (one fresh DB lookup per call, per spec §6.4.1). Multi-tenant / per-bot ACLs are flagged for follow-up on the parent epic — every authenticated user can drive every bot today.
+- **Auth**: `RequireAuth` extractor on every endpoint (one fresh DB lookup per call, per spec §6.4.1). Multi-tenant / per-bot ACLs are flagged for follow-up on the parent epic — every authenticated user can drive every bot today. The `/events` SSE is the exception (see below): it also accepts `?token=<access_jwt>` because browser `EventSource` cannot set `Authorization` headers.
 - **JSON keys**: camelCase on the wire, snake_case in Rust.
 - **Error envelope** (every non-2xx): `{ "error": "<message>", "code": "<class>", "details": "<optional>" }`. `code` is one of `validation`, `not_found`, `conflict`, `queue_full`. Unknown codes render as a generic error in the FE.
 - **Timestamps**: ISO 8601 / RFC 3339, UTC (`chrono::DateTime<Utc>`).
@@ -40,7 +40,7 @@ Snake-case strings: `"disconnected" | "connecting" | "connected" | "in_channel" 
 | `POST` | `/api/music-bots/{id}/disconnect` | — | `202` | Dispatches `BotCommand::Disconnect`. |
 | `POST` | `/api/music-bots/{id}/join` | `JoinChannelRequest` | `202` | Dispatches `BotCommand::JoinChannel`. |
 | `POST` | `/api/music-bots/{id}/leave` | — | `202` | Dispatches `BotCommand::LeaveChannel`. |
-| `GET` | `/api/music-bots/{id}/events` | — | `text/event-stream` | SSE stream of `BotEventWire` events. Tagged `type` discriminator. 15 s keep-alive. |
+| `GET` | `/api/music-bots/{id}/events` | — | `text/event-stream` | SSE stream of `BotEventWire` events. Tagged `type` discriminator. 15 s keep-alive. Auth: `Authorization: Bearer` **or** `?token=<access_jwt>` (same access-JWT path as `/api/ws`). |
 
 ### Audio control (PURA-126 WS-6 follow-up)
 
@@ -162,7 +162,15 @@ Untagged 5xx responses still match the same envelope shape so the FE can render 
 
 ## SSE event stream
 
-`GET /api/music-bots/{id}/events` opens an `event-stream` response. Each event is a JSON object; the discriminator is `"type"`:
+`GET /api/music-bots/{id}/events` opens an `event-stream` response. Auth matches the operator WebSocket handshake: pass the access JWT as `Authorization: Bearer <jwt>` **or** as `?token=<jwt>`. Browser `EventSource` cannot set headers, so the Panel should open:
+
+```
+GET /api/music-bots/{id}/events?token=<access_jwt>
+```
+
+(`encodeURIComponent` the JWT). Other music-bot REST routes stay Bearer-only.
+
+Each event is a JSON object; the discriminator is `"type"`:
 
 ```json
 { "type": "stateChanged", "from": "connecting", "to": "connected" }

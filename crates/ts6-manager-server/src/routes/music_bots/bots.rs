@@ -21,7 +21,7 @@ use tracing::{info, warn};
 use ts6_manager_shared::music_bots as wire;
 
 use crate::app_state::AppState;
-use crate::auth::extractors::RequireAuth;
+use crate::auth::extractors::{RequireAuth, RequireAuthOrQueryToken};
 use crate::routes::music_bots::convert::{bot_id_to_wire, bot_state_to_wire, track_to_wire};
 use crate::routes::music_bots::{not_found, translate_send_error, validation};
 
@@ -280,7 +280,9 @@ async fn leave(
 
 async fn events_sse(
     State(state): State<AppState>,
-    RequireAuth(_user): RequireAuth,
+    // EventSource cannot set Authorization headers. Accept Bearer *or*
+    // `?token=<access_jwt>` via the same path as `/api/ws?token=…`.
+    RequireAuthOrQueryToken(_user): RequireAuthOrQueryToken,
     Path(id): Path<u64>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, Response> {
     let bot = music_bot::BotId(id);
