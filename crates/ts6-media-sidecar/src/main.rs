@@ -65,17 +65,37 @@ struct Args {
     /// Path to the ffmpeg binary. Defaults to `ffmpeg` on PATH.
     #[arg(long = "ffmpeg-path", default_value = "ffmpeg")]
     ffmpeg_path: PathBuf,
+
+    /// Probe the control-plane `/health` and exit (0 = healthy).
+    ///
+    /// Used as the Quadlet `HealthCmd` / OCI `HEALTHCHECK` so the
+    /// sidecar runtime image does not need `curl` or `wget`. When the
+    /// flag is present without a value, defaults to
+    /// `http://127.0.0.1:7080/health` (the `--http-listen` default).
+    #[arg(
+        long = "healthcheck-url",
+        value_name = "URL",
+        num_args = 0..=1,
+        default_missing_value = ts6_media_sidecar::healthcheck::DEFAULT_URL
+    )]
+    healthcheck_url: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args = Args::parse();
+
+    // Healthcheck is a one-shot GET — skip tracing so Quadlet / OCI
+    // probe output stays silent on success (curl -fsS equivalent).
+    if let Some(url) = args.healthcheck_url {
+        return ts6_media_sidecar::healthcheck::probe(&url).await;
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
             EnvFilter::new("info,ts6_media_sidecar=debug,moq_native=info,moq_lite=info")
         }))
         .init();
-
-    let args = Args::parse();
 
     let config = SidecarConfig {
         transport: TransportConfig {

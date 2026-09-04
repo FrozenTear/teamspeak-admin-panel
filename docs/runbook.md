@@ -127,12 +127,20 @@ reference [`troubleshooting.md`](troubleshooting.md).
 
 ### 2.4 In-container health probe
 
-The Quadlet unit ships with `HealthCmd=` commented out. The fullstack
+The Quadlet fullstack unit ships with `HealthCmd=` commented out. The fullstack
 runtime image does not include a `curl`-style probe binary, so an
 in-container probe wedges the container under `HealthOnFailure=kill`.
 systemd still recovers from soft hangs via `Restart=on-failure`. Re-enable
 the probe lines once a probe binary lands in the runtime image — see
 [`deploy/quadlet/README.md` § In-container health probe](../deploy/quadlet/README.md#in-container-health-probe-disabled).
+Fullstack HealthCmd is unchanged by the sidecar binary probe.
+
+The sidecar Quadlet unit probes with
+`ts6-media-sidecar --healthcheck-url http://127.0.0.1:7080/health`
+because `Containerfile.sidecar` does not install curl/wget. A curl
+HealthCmd fails at exec and restart-loops the sidecar (~105s). Control
+plane port is **7080** (binary `--http-listen` default); historical
+spec `9800` is not used.
 
 The `kube` manifest defines readiness (5 s delay, 10 s period) and liveness
 (30 s delay, 30 s period) probes against `GET /health`. Podman ≥ 4.4

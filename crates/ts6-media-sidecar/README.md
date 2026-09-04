@@ -83,6 +83,23 @@ curl -sf http://127.0.0.1:7080/stats    | jq .
 curl -sf http://127.0.0.1:7080/certificate.sha256
 ```
 
+The sidecar runtime image (`Containerfile.sidecar`) does **not** ship
+`curl` or `wget`. In-container / Quadlet / OCI probes must use the
+binary itself:
+
+```sh
+ts6-media-sidecar --healthcheck-url http://127.0.0.1:7080/health
+# flag with no value defaults to the same URL
+ts6-media-sidecar --healthcheck-url
+```
+
+Exit 0 on HTTP 2xx, non-zero otherwise. `Containerfile.sidecar`
+`HEALTHCHECK` and `deploy/quadlet/ts6-manager-sidecar.container.example`
+`HealthCmd` use this invocation. `deploy/kube` probes the same path
+via kube `httpGet` (Podman/kubelet issues the GET; no in-container
+binary needed). Control-plane default is **7080**; historical spec
+`9800` is not used.
+
 ### `POST /source`
 
 ```sh
@@ -255,10 +272,15 @@ Production cert management is a WS-7 / operator-experience concern.
 
 ## Smoke tests
 
+`tests/healthcheck_cli.rs` spawns the binary with `--healthcheck-url`
+against a tiny axum listener and asserts process exit codes (0 on
+HTTP 200, non-zero on connection-refused / HTTP 503). Always-on.
+
 `tests/smoke.rs` (WS-1) boots the sidecar lib on ephemeral ports,
 asserts the JSON shape of every control-plane endpoint, registers a
-broadcast through `SidecarOrigin::register_broadcast`, and re-checks
-`/stats`. Always-on (no ffmpeg required):
+broadcast through `SidecarOrigin::register_broadcast`, re-checks
+`/stats`, and runs the same binary health probe the Quadlet/OCI
+HEALTHCHECK uses. Always-on (no ffmpeg required):
 
 ```sh
 cd crates/ts6-media-sidecar

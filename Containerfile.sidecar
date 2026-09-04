@@ -95,6 +95,14 @@ WORKDIR /var/lib/ts6-manager-sidecar
 EXPOSE 4443/udp
 EXPOSE 7080/tcp
 
+# OCI HEALTHCHECK uses the sidecar binary itself — this runtime image
+# does not ship curl/wget (unlike fullstack). Quadlet HealthCmd must
+# match this invocation. Default --http-listen is 127.0.0.1:7080;
+# operators who change the control port override HEALTHCHECK / HealthCmd
+# to match. Exec form: no shell, no extra packages.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD ["/usr/local/bin/ts6-media-sidecar", "--healthcheck-url", "http://127.0.0.1:7080/health"]
+
 ENTRYPOINT ["/usr/local/bin/ts6-media-sidecar"]
 # No CMD — operator-provided flags select cert source (`--cert`/`--key` for
 # production, `--tls-generate <hostname>` for dev/smoke).

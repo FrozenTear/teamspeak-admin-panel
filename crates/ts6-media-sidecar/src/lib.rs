@@ -10,6 +10,7 @@
 //! is WS-5. The pinning rationale lives in ADR-0007.
 
 pub mod control;
+pub mod healthcheck;
 pub mod http;
 pub mod http_pin;
 pub mod origin;
