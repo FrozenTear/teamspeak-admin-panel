@@ -65,6 +65,13 @@ async fn smoke_health_stats_certificate_endpoints() {
     assert_eq!(health["sessions"], 0);
     assert_eq!(health["broadcasts"], 0);
 
+    // Same path Quadlet / OCI HEALTHCHECK take — the binary probe,
+    // not curl. Exercises the lib entry the CLI `--healthcheck-url`
+    // flag calls.
+    ts6_media_sidecar::healthcheck::probe(&format!("http://{http_addr}/health"))
+        .await
+        .expect("binary health probe must succeed against a live /health");
+
     // /stats
     let stats: Value = get_json(http_addr, "/stats").await;
     assert_eq!(stats["active_sessions"], 0);

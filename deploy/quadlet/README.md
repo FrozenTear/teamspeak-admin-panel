@@ -160,8 +160,18 @@ publishes the sidecar image and update:
 - `Image=` — point at the published sidecar image
 - `ts6-manager.pod` — add `PublishPort=443:443/udp` (or whatever
   public UDP port lands the WebTransport listener)
-- `ts6-manager.env` — set `SIDECAR_URL=http://127.0.0.1:9800` so the
-  manager talks to it across the pod's shared loopback
+- `ts6-manager.env` — set `SIDECAR_URL=http://127.0.0.1:7080` so the
+  manager talks to it across the pod's shared loopback. 7080 is the
+  sidecar `--http-listen` default (`Containerfile.sidecar` / kube);
+  the historical spec default `9800` is not used.
+
+The sidecar unit's `HealthCmd` invokes
+`ts6-media-sidecar --healthcheck-url http://127.0.0.1:7080/health`
+instead of `curl`. The sidecar runtime image has neither curl nor wget
+(unlike fullstack); a curl HealthCmd fails at exec and Quadlet
+restarts the container on a ~105s cycle. The binary probe GETs the
+control-plane `/health` and exits 0 / non-zero. This does **not**
+unpark the `.example` unit for production.
 
 ## In-container health probe (disabled)
 

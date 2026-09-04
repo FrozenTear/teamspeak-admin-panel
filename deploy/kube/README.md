@@ -198,7 +198,11 @@ unaffected — that path was never on passt.
 ## Health checks
 
 The manifest defines readiness (5s delay, 10s period) and liveness
-(30s delay, 30s period) probes against `GET /health`. Podman
+(30s delay, 30s period) probes against `GET /health` on both
+fullstack (`:3001`) and sidecar (`:7080`). These are kube `httpGet`
+probes — Podman/kubelet issues the HTTP request itself, so the sidecar
+image does not need curl/wget (Quadlet uses
+`ts6-media-sidecar --healthcheck-url` for the same reason). Podman
 respects probe semantics from v4.4 onward.
 
 ## Topology

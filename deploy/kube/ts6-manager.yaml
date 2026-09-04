@@ -175,6 +175,10 @@ spec:
         - name: webtransport
           containerPort: 4443
           protocol: UDP
+      # httpGet is issued by Podman/kubelet, not by an in-container
+      # curl. The sidecar image has neither curl nor wget — do not
+      # switch these to exec + curl. Quadlet uses the binary probe
+      # (`--healthcheck-url`) for the same reason.
       readinessProbe:
         httpGet:
           path: /health

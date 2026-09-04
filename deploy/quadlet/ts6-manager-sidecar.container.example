@@ -18,8 +18,9 @@
 #      (or whatever public port the deployment lands the moq-lite
 #      listener on; coordinate via PURA-146 / MOQ_PUBLIC_URL).
 #   3. Set SIDECAR_URL in `ts6-manager.env` to
-#      `http://127.0.0.1:<sidecar-control-port>` so the manager can
-#      reach it across the shared pod loopback.
+#      `http://127.0.0.1:7080` so the manager can reach the control
+#      plane across the shared pod loopback. 7080 is the binary's
+#      `--http-listen` default (historical spec 9800 is not used).
 
 [Unit]
 Description=TS6 Manager MoQ video sidecar
@@ -36,8 +37,11 @@ AutoUpdate=registry
 EnvironmentFile=%h/.config/containers/systemd/ts6-manager.env
 
 # Sidecar liveness — `/health` is the documented sidecar health probe
-# (impl-plan §3.10 deliverables).
-HealthCmd=curl -fsS http://127.0.0.1:9800/health
+# (impl-plan §3.10 deliverables). Invokes the sidecar binary itself
+# because Containerfile.sidecar has neither curl nor wget (a curl
+# HealthCmd fails at exec and Quadlet restart-loops ~every 105s).
+# Port 7080 matches --http-listen / Containerfile EXPOSE / kube.
+HealthCmd=/usr/local/bin/ts6-media-sidecar --healthcheck-url http://127.0.0.1:7080/health
 HealthInterval=30s
 HealthTimeout=5s
 HealthRetries=3
