@@ -1164,15 +1164,14 @@ mod tests {
         // FFmpeg only honours protocol AVOptions that appear *before* the
         // `-i` they apply to. A `-tls_verify` placed after `-i` is silently
         // ignored — which would re-open the rebinding hole.
-        let cfg = PipelineConfig::new(
-            "src",
-            SourceInput::Url("https://cdn.example/v.mp4".into()),
-        );
+        let cfg = PipelineConfig::new("src", SourceInput::Url("https://cdn.example/v.mp4".into()));
         let args = ffmpeg_audio_args(&cfg);
         let verify_idx = args.iter().position(|a| a == "-tls_verify");
         let input_idx = args.iter().position(|a| a == "-i");
         match (verify_idx, input_idx) {
-            (Some(v), Some(i)) => assert!(v < i, "-tls_verify must come before -i; argv = {args:?}"),
+            (Some(v), Some(i)) => {
+                assert!(v < i, "-tls_verify must come before -i; argv = {args:?}")
+            }
             other => panic!("expected both -tls_verify and -i in argv, got {other:?}: {args:?}"),
         }
     }
