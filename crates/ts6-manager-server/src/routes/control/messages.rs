@@ -24,7 +24,7 @@ use serde_json::json;
 use ts6_manager_shared::control::{MessageCreateRequest, MessageDetailResponse, MessageListItem};
 
 use crate::app_state::AppState;
-use crate::auth::extractors::RequireAuth;
+use crate::auth::extractors::RequireServerAccess;
 
 use super::{
     access, audit_ok, bad_request, emit_webquery_failure, publish_moderation,
@@ -34,7 +34,7 @@ use super::{
 /// `GET ` — `messagelist`. Empty inbox → `[]` (1281 normalised upstream).
 pub async fn list(
     State(state): State<AppState>,
-    RequireAuth(user): RequireAuth,
+    RequireServerAccess { user, .. }: RequireServerAccess,
     Path((config_id, sid)): Path<(i64, i64)>,
 ) -> Result<Json<Vec<MessageListItem>>, Response> {
     let connection = access::check_read(&state, &user, config_id).await?;
@@ -59,7 +59,7 @@ pub async fn list(
 /// `GET :msgid` — `messageget` (includes the message body).
 pub async fn detail(
     State(state): State<AppState>,
-    RequireAuth(user): RequireAuth,
+    RequireServerAccess { user, .. }: RequireServerAccess,
     Path((config_id, sid, msgid)): Path<(i64, i64, i64)>,
 ) -> Result<Json<MessageDetailResponse>, Response> {
     let connection = access::check_read(&state, &user, config_id).await?;
@@ -80,7 +80,7 @@ pub async fn detail(
 /// `POST ` — `messageadd`.
 pub async fn create(
     State(state): State<AppState>,
-    RequireAuth(user): RequireAuth,
+    RequireServerAccess { user, .. }: RequireServerAccess,
     Path((config_id, sid)): Path<(i64, i64)>,
     Json(req): Json<MessageCreateRequest>,
 ) -> Result<StatusCode, Response> {
@@ -125,7 +125,7 @@ pub async fn create(
 /// `DELETE :msgid` — `messagedel`.
 pub async fn delete(
     State(state): State<AppState>,
-    RequireAuth(user): RequireAuth,
+    RequireServerAccess { user, .. }: RequireServerAccess,
     Path((config_id, sid, msgid)): Path<(i64, i64, i64)>,
 ) -> Result<StatusCode, Response> {
     let connection = access::check_admin(&state, &user, config_id).await?;

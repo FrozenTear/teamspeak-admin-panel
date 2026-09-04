@@ -28,7 +28,7 @@ use ts6_manager_shared::control::{
 };
 
 use crate::app_state::AppState;
-use crate::auth::extractors::RequireAuth;
+use crate::auth::extractors::RequireServerAccess;
 use crate::control::{ControlBackend, ControlBackendError};
 use crate::repos::server_connections::ServerConnection;
 use crate::ws::topic::{Topic, TopicKind};
@@ -41,7 +41,7 @@ const BASE_CLIENT_FLAGS: &[&str] = &["uid", "away", "voice", "times", "groups", 
 
 pub async fn list(
     State(state): State<AppState>,
-    RequireAuth(user): RequireAuth,
+    RequireServerAccess { user, .. }: RequireServerAccess,
     Path((config_id, sid)): Path<(i64, i64)>,
 ) -> Result<Json<Vec<ClientListItem>>, Response> {
     let connection = access::check_read(&state, &user, config_id).await?;
@@ -68,7 +68,7 @@ pub async fn list(
 
 pub async fn detail(
     State(state): State<AppState>,
-    RequireAuth(user): RequireAuth,
+    RequireServerAccess { user, .. }: RequireServerAccess,
     Path((config_id, sid, cldbid)): Path<(i64, i64, i64)>,
 ) -> Result<Json<ClientDetail>, Response> {
     let connection = access::check_read(&state, &user, config_id).await?;
@@ -123,7 +123,7 @@ pub async fn detail(
 
 pub async fn kick(
     State(state): State<AppState>,
-    RequireAuth(user): RequireAuth,
+    RequireServerAccess { user, .. }: RequireServerAccess,
     Path((config_id, sid, clid)): Path<(i64, i64, i64)>,
     Json(req): Json<KickRequest>,
 ) -> Result<StatusCode, Response> {
@@ -187,7 +187,7 @@ pub async fn kick(
 /// with older callers but ignores its contents.
 pub async fn mute(
     State(state): State<AppState>,
-    RequireAuth(user): RequireAuth,
+    RequireServerAccess { user, .. }: RequireServerAccess,
     Path((config_id, sid, clid)): Path<(i64, i64, i64)>,
     _body: Option<Json<MuteRequest>>,
 ) -> Result<StatusCode, Response> {
@@ -239,7 +239,7 @@ pub async fn mute(
 /// already speak, so we treat `1538` as success.
 pub async fn unmute(
     State(state): State<AppState>,
-    RequireAuth(user): RequireAuth,
+    RequireServerAccess { user, .. }: RequireServerAccess,
     Path((config_id, sid, clid)): Path<(i64, i64, i64)>,
 ) -> Result<StatusCode, Response> {
     let connection = access::check_write(&state, &user, config_id).await?;
@@ -299,7 +299,7 @@ pub async fn unmute(
 
 pub async fn move_to(
     State(state): State<AppState>,
-    RequireAuth(user): RequireAuth,
+    RequireServerAccess { user, .. }: RequireServerAccess,
     Path((config_id, sid, clid)): Path<(i64, i64, i64)>,
     Json(req): Json<MoveRequest>,
 ) -> Result<StatusCode, Response> {

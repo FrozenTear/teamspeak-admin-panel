@@ -2,8 +2,10 @@
 //!
 //! Two gates:
 //!
-//! - [`check_read`] — the caller (already authenticated by [`crate::auth::extractors::RequireAuth`])
+//! - [`check_read`] — the caller (already authenticated by
+//!   [`crate::auth::extractors::RequireServerAccess`] / [`crate::auth::extractors::RequireAuth`])
 //!   must be admin OR have a `server_user_grant` row for `configId`.
+//!   The grant ACL is shared with [`crate::auth::extractors::resolve_server_read_access`].
 //! - [`check_write`] — admin OR (moderator AND `server_user_grant`). Viewer
 //!   role can never mutate, even on servers they have a grant on.
 //!
@@ -14,34 +16,23 @@ use axum::http::StatusCode;
 use axum::response::Response;
 
 use crate::app_state::AppState;
-use crate::auth::extractors::AuthUser;
-use crate::repos::{server_connections::ServerConnection, server_user_grants};
+use crate::auth::extractors::{self, AuthUser};
+use crate::repos::server_connections::ServerConnection;
 
 use super::{err, internal, not_found};
 
 /// Read access. Returns the resolved [`ServerConnection`].
+///
+/// Delegates to [`extractors::resolve_server_read_access`] so the grant
+/// ACL stays in one place with [`extractors::RequireServerAccess`].
 pub async fn check_read(
     state: &AppState,
     user: &AuthUser,
     config_id: i64,
 ) -> Result<ServerConnection, Response> {
-    let connection = resolve_connection(state, config_id).await?;
-    if user.is_admin() {
-        return Ok(connection);
-    }
-    let granted = server_user_grants::exists(&state.db, user.id, config_id)
+    extractors::resolve_server_read_access(&state.db, user, config_id)
         .await
-        .map_err(|e| {
-            tracing::error!(err = %e, user_id = user.id, config_id, "control: grant lookup failed");
-            internal()
-        })?;
-    if !granted {
-        // Spec §6.4.2 — missing-grant ⇒ 403, not 404. (Pure absence of
-        // the row would also be 404 if we leaked existence; we don't —
-        // the connection lookup ran ahead of the grant check.)
-        return Err(err(StatusCode::FORBIDDEN, "Insufficient permissions"));
-    }
-    Ok(connection)
+        .map_err(axum::response::IntoResponse::into_response)
 }
 
 /// Write access. Returns the resolved [`ServerConnection`].
@@ -102,7 +93,7 @@ mod tests {
     use crate::auth::password;
     use crate::crypto;
     use crate::db::{connect_in_memory, migrations};
-    use crate::repos::{server_connections::NewServerConnection, users};
+    use crate::repos::{server_connections::NewServerConnection, server_user_grants, users};
     use crate::webquery::WebQueryPool;
     use crate::ws::Hub;
     use std::sync::Arc;

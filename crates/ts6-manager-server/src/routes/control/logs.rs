@@ -16,7 +16,7 @@ use axum::response::Response;
 use ts6_manager_shared::control::{LogLine, LogTailQuery, LogTailResponse};
 
 use crate::app_state::AppState;
-use crate::auth::extractors::RequireAuth;
+use crate::auth::extractors::RequireServerAccess;
 
 use super::{access, translate_control_error};
 
@@ -25,7 +25,7 @@ const MAX_LOG_LINES: u32 = 500;
 
 pub async fn tail(
     State(state): State<AppState>,
-    RequireAuth(user): RequireAuth,
+    RequireServerAccess { user, .. }: RequireServerAccess,
     Path((config_id, sid)): Path<(i64, i64)>,
     Query(query): Query<LogTailQuery>,
 ) -> Result<Json<LogTailResponse>, Response> {

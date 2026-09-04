@@ -18,7 +18,7 @@ use serde_json::json;
 use ts6_manager_shared::control::{BanCreateRequest, BanCreated, BanListItem};
 
 use crate::app_state::AppState;
-use crate::auth::extractors::RequireAuth;
+use crate::auth::extractors::RequireServerAccess;
 use crate::control::ControlBackendError;
 use crate::repos::server_connections::ServerConnection;
 use crate::webquery::BanAddParams;
@@ -28,7 +28,7 @@ use super::{access, audit, bad_request, translate_control_error};
 
 pub async fn list(
     State(state): State<AppState>,
-    RequireAuth(user): RequireAuth,
+    RequireServerAccess { user, .. }: RequireServerAccess,
     Path((config_id, sid)): Path<(i64, i64)>,
 ) -> Result<Json<Vec<BanListItem>>, Response> {
     let connection = access::check_read(&state, &user, config_id).await?;
@@ -61,7 +61,7 @@ pub async fn list(
 
 pub async fn create(
     State(state): State<AppState>,
-    RequireAuth(user): RequireAuth,
+    RequireServerAccess { user, .. }: RequireServerAccess,
     Path((config_id, sid)): Path<(i64, i64)>,
     Json(req): Json<BanCreateRequest>,
 ) -> Result<(StatusCode, Json<BanCreated>), Response> {
@@ -136,7 +136,7 @@ pub async fn create(
 
 pub async fn delete(
     State(state): State<AppState>,
-    RequireAuth(user): RequireAuth,
+    RequireServerAccess { user, .. }: RequireServerAccess,
     Path((config_id, sid, banid)): Path<(i64, i64, i64)>,
 ) -> Result<StatusCode, Response> {
     let connection = access::check_write(&state, &user, config_id).await?;

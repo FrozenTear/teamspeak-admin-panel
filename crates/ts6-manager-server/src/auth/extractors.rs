@@ -13,27 +13,31 @@
 //! [`crate::auth::ws_handshake::authenticate_token`] path as `/api/ws`.
 //!
 //! [`RequireRole`] composes on top of `RequireAuth` to gate routes by role
-//! membership. [`crate::auth::extractors`] does NOT yet ship the per-server
-//! `RequireServerAccess` extractor — that lands when the first per-server
-//! REST route does (none exist yet in the Phase 1 surface).
+//! membership. [`RequireServerAccess`] is the spec §6.6 / `Y+access` gate
+//! for `/api/servers/{configId}/...`: admin bypasses grants; every other
+//! role needs a `server_user_grant` row. Missing `server_connection` is
+//! `404`, matching [`crate::routes::control::access::check_read`].
 
 use std::convert::Infallible;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 
 use axum::Json;
-use axum::extract::{ConnectInfo, FromRef, FromRequestParts, Query};
+use axum::extract::{ConnectInfo, FromRef, FromRequestParts, Path, Query};
 use axum::http::StatusCode;
 use axum::http::header::{AUTHORIZATION, USER_AGENT};
 use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
+use serde::Deserialize;
 use ts6_manager_shared::auth::{ErrorResponse, auth_error_strings as msg};
 
 use crate::app_state::AppState;
 use crate::auth::jwt;
 use crate::auth::permissions::{self, ModPermission};
 use crate::auth::ws_handshake::{WsAuthError, WsTokenQuery, authenticate_token};
-use crate::repos::{user_permissions, users};
+use crate::db::Database;
+use crate::repos::server_connections::ServerConnection;
+use crate::repos::{server_connections, server_user_grants, user_permissions, users};
 use crate::web::proxy;
 
 /// User context attached to a request after [`RequireAuth`] succeeds.
@@ -346,6 +350,90 @@ where
     }
 }
 
+/// Path parameter used by every `/api/servers/{configId}/...` control route.
+/// A missing or non-integer segment is `400` per spec §6.6.
+#[derive(Debug, Deserialize)]
+struct ConfigIdParam {
+    #[serde(rename = "configId")]
+    config_id: i64,
+}
+
+/// Authenticated caller who may access the `:configId` in the path.
+///
+/// Spec §6.6 / `Y+access`, same ACL as
+/// [`crate::routes::control::access::check_read`]:
+/// - `admin` bypasses `server_user_grant`.
+/// - every other role needs a grant row for `configId`.
+/// - missing `server_connection` → `404` (do not leak existence via 403).
+#[derive(Debug, Clone)]
+pub struct RequireServerAccess {
+    pub user: AuthUser,
+    pub connection: ServerConnection,
+}
+
+/// Resolve a `server_connection` the caller is allowed to read.
+///
+/// Shared by [`RequireServerAccess`] and
+/// [`crate::routes::control::access::check_read`] so the grant ACL lives in
+/// one place.
+pub async fn resolve_server_read_access(
+    db: &Database,
+    user: &AuthUser,
+    config_id: i64,
+) -> Result<ServerConnection, AuthError> {
+    let connection = server_connections::find_by_id(db, config_id)
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                err = %e,
+                config_id,
+                "server access: server_connection lookup failed"
+            );
+            AuthError::Internal
+        })?
+        .ok_or(AuthError::NotFound)?;
+    if user.is_admin() {
+        return Ok(connection);
+    }
+    let granted = server_user_grants::exists(db, user.id, config_id)
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                err = %e,
+                user_id = user.id,
+                config_id,
+                "server access: grant lookup failed"
+            );
+            AuthError::Internal
+        })?;
+    if !granted {
+        // Spec §6.4.2 / existing control surface — missing-grant ⇒ 403,
+        // not 404. The connection lookup already ran, so we do not leak
+        // existence.
+        return Err(AuthError::Forbidden);
+    }
+    Ok(connection)
+}
+
+impl<S> FromRequestParts<S> for RequireServerAccess
+where
+    AppState: FromRef<S>,
+    S: Send + Sync,
+{
+    type Rejection = AuthError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let RequireAuth(user) = RequireAuth::from_request_parts(parts, state).await?;
+        let Path(ConfigIdParam { config_id }) =
+            Path::<ConfigIdParam>::from_request_parts(parts, state)
+                .await
+                .map_err(|_| AuthError::InvalidServerId)?;
+        let app: AppState = AppState::from_ref(state);
+        let connection = resolve_server_read_access(&app.db, &user, config_id).await?;
+        Ok(RequireServerAccess { user, connection })
+    }
+}
+
 /// Rejection responses for the extractors above. Bodies match spec §6.4
 /// verbatim via `auth_error_strings::*`.
 #[derive(Debug, Clone, Copy)]
@@ -354,6 +442,8 @@ pub enum AuthError {
     Invalid,
     Disabled,
     Forbidden,
+    InvalidServerId,
+    NotFound,
     Internal,
 }
 
@@ -364,8 +454,254 @@ impl IntoResponse for AuthError {
             AuthError::Invalid => (StatusCode::UNAUTHORIZED, msg::INVALID_TOKEN),
             AuthError::Disabled => (StatusCode::UNAUTHORIZED, msg::USER_DISABLED),
             AuthError::Forbidden => (StatusCode::FORBIDDEN, msg::INSUFFICIENT_PERMS),
+            AuthError::InvalidServerId => (StatusCode::BAD_REQUEST, msg::INVALID_SERVER_ID),
+            AuthError::NotFound => (StatusCode::NOT_FOUND, "Not found"),
             AuthError::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "internal server error"),
         };
         (status, Json(ErrorResponse::new(msg))).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::{jwt, password};
+    use crate::crypto;
+    use crate::db::{connect_in_memory, migrations};
+    use crate::repos::server_connections::NewServerConnection;
+    use crate::repos::{server_user_grants, users};
+    use crate::webquery::WebQueryPool;
+    use crate::ws::Hub;
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::{HeaderValue, Method, Request, StatusCode};
+    use axum::routing::get;
+    use http_body_util::BodyExt;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tower::ServiceExt;
+    use ts6_manager_shared::auth::ErrorResponse;
+
+    async fn fresh_state() -> AppState {
+        let db = connect_in_memory().await.unwrap();
+        migrations::run(&db).await.unwrap();
+        crypto::init("test-seed-require-server-access");
+        let control = crate::control::ControlBackendPool::new(false, db.clone());
+        AppState {
+            db,
+            jwt_secret: Arc::new(b"test-secret-bytes-please-32-or-more".to_vec()),
+            jwt_access_expiry: Duration::from_secs(900),
+            jwt_refresh_expiry: Duration::from_secs(7 * 24 * 3600),
+            setup_lock: Arc::new(tokio::sync::Mutex::new(())),
+            webquery: WebQueryPool::new(false),
+            control,
+            ws_hub: Hub::new(),
+            widget_cache: crate::widgets::WidgetCache::new(),
+            music_bots: crate::music_bots::MusicBotService::default_for_tests(),
+            sidecar: None,
+            ssrf_resolver: Arc::new(ts6_ssrf::MockResolver::new()),
+            moq_public_url: None,
+            yt_cookie: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            yt_api_key: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            data_dir: std::path::PathBuf::from("./data"),
+            trusted_proxy_hops: 0,
+        }
+    }
+
+    async fn seed_user_with_token(state: &AppState, name: &str, role: &str) -> (AuthUser, String) {
+        let pw = "Hunter2!ok".to_string();
+        let hash = tokio::task::spawn_blocking(move || password::hash_new(&pw))
+            .await
+            .unwrap()
+            .unwrap();
+        let row = users::insert(
+            &state.db,
+            users::NewUser {
+                username: name.into(),
+                passwordHash: hash,
+                displayName: name.into(),
+                role: role.into(),
+                enabled: true,
+            },
+        )
+        .await
+        .unwrap();
+        let token = jwt::mint_access(
+            row.id,
+            &row.username,
+            &row.role,
+            state.jwt_access_expiry,
+            &state.jwt_secret,
+        )
+        .unwrap();
+        (
+            AuthUser {
+                id: row.id,
+                username: row.username,
+                display_name: row.displayName,
+                role: row.role,
+                enabled: row.enabled,
+            },
+            token,
+        )
+    }
+
+    async fn seed_server(state: &AppState, name: &str) -> i64 {
+        crate::repos::server_connections::insert(
+            &state.db,
+            NewServerConnection {
+                name: name.into(),
+                host: "ts.example.com".into(),
+                webqueryPort: 10080,
+                apiKey: crypto::seal("k").unwrap(),
+                useHttps: false,
+                sshPort: 10022,
+                sshUsername: None,
+                sshPassword: None,
+                queryBotChannel: None,
+                queryBotNickname: None,
+                sshBotNickname: None,
+                enabled: true,
+                controlPath: None,
+                sshAuthMethod: None,
+                sshPrivateKey: None,
+                sshKeyAgentSocket: None,
+                sshHostKeyFingerprint: None,
+            },
+        )
+        .await
+        .unwrap()
+        .id
+    }
+
+    async fn probe(
+        RequireServerAccess { user, connection }: RequireServerAccess,
+    ) -> (StatusCode, String) {
+        (
+            StatusCode::NO_CONTENT,
+            format!("{}:{}", user.username, connection.id),
+        )
+    }
+
+    fn app(state: AppState) -> Router {
+        Router::new()
+            .route("/api/servers/{configId}/probe", get(probe))
+            .with_state(state)
+    }
+
+    fn auth_header(token: &str) -> HeaderValue {
+        HeaderValue::from_str(&format!("Bearer {token}")).unwrap()
+    }
+
+    async fn call(
+        state: AppState,
+        token: Option<&str>,
+        config_id: i64,
+    ) -> axum::http::Response<Body> {
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/api/servers/{config_id}/probe"));
+        if let Some(token) = token {
+            req = req.header("authorization", auth_header(token));
+        }
+        app(state)
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    async fn read_error(resp: axum::http::Response<Body>) -> ErrorResponse {
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+            panic!(
+                "expected JSON error, got {:?}: {e}",
+                String::from_utf8_lossy(&bytes)
+            )
+        })
+    }
+
+    #[tokio::test]
+    async fn admin_is_allowed_without_a_grant() {
+        let state = fresh_state().await;
+        let (_admin, token) = seed_user_with_token(&state, "alice", "admin").await;
+        let sid = seed_server(&state, "S").await;
+        let resp = call(state, Some(&token), sid).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn viewer_with_grant_is_allowed() {
+        let state = fresh_state().await;
+        let (viewer, token) = seed_user_with_token(&state, "viewer", "viewer").await;
+        let sid = seed_server(&state, "S").await;
+        server_user_grants::insert(&state.db, viewer.id, sid)
+            .await
+            .unwrap();
+        let resp = call(state, Some(&token), sid).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn moderator_with_grant_is_allowed() {
+        let state = fresh_state().await;
+        let (modr, token) = seed_user_with_token(&state, "mod", "moderator").await;
+        let sid = seed_server(&state, "S").await;
+        server_user_grants::insert(&state.db, modr.id, sid)
+            .await
+            .unwrap();
+        let resp = call(state, Some(&token), sid).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn viewer_without_grant_is_forbidden() {
+        let state = fresh_state().await;
+        let (_viewer, token) = seed_user_with_token(&state, "viewer", "viewer").await;
+        let sid = seed_server(&state, "S").await;
+        let resp = call(state, Some(&token), sid).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = read_error(resp).await;
+        assert_eq!(body.error, msg::INSUFFICIENT_PERMS);
+    }
+
+    #[tokio::test]
+    async fn moderator_without_grant_is_forbidden() {
+        let state = fresh_state().await;
+        let (_modr, token) = seed_user_with_token(&state, "mod", "moderator").await;
+        let sid = seed_server(&state, "S").await;
+        let resp = call(state, Some(&token), sid).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = read_error(resp).await;
+        assert_eq!(body.error, msg::INSUFFICIENT_PERMS);
+    }
+
+    #[tokio::test]
+    async fn missing_server_is_404_for_admin() {
+        let state = fresh_state().await;
+        let (_admin, token) = seed_user_with_token(&state, "alice", "admin").await;
+        let resp = call(state, Some(&token), 9999).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = read_error(resp).await;
+        assert_eq!(body.error, "Not found");
+    }
+
+    #[tokio::test]
+    async fn missing_server_is_404_for_viewer() {
+        let state = fresh_state().await;
+        let (_viewer, token) = seed_user_with_token(&state, "viewer", "viewer").await;
+        let resp = call(state, Some(&token), 9999).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = read_error(resp).await;
+        assert_eq!(body.error, "Not found");
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_is_401() {
+        let state = fresh_state().await;
+        let sid = seed_server(&state, "S").await;
+        let resp = call(state, None, sid).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body = read_error(resp).await;
+        assert_eq!(body.error, msg::NO_TOKEN);
     }
 }

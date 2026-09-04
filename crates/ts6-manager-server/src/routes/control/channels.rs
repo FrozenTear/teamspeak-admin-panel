@@ -12,7 +12,7 @@ use axum::response::Response;
 use ts6_manager_shared::control::ChannelTreeNode;
 
 use crate::app_state::AppState;
-use crate::auth::extractors::RequireAuth;
+use crate::auth::extractors::RequireServerAccess;
 
 use super::{access, translate_control_error};
 
@@ -22,7 +22,7 @@ const CHANNEL_FLAGS: &[&str] = &["topic", "flags", "voice", "limits", "icon", "s
 
 pub async fn list(
     State(state): State<AppState>,
-    RequireAuth(user): RequireAuth,
+    RequireServerAccess { user, .. }: RequireServerAccess,
     Path((config_id, sid)): Path<(i64, i64)>,
 ) -> Result<Json<Vec<ChannelTreeNode>>, Response> {
     let connection = access::check_read(&state, &user, config_id).await?;

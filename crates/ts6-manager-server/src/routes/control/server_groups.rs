@@ -23,7 +23,7 @@ use ts6_manager_shared::control::{
 };
 
 use crate::app_state::AppState;
-use crate::auth::extractors::RequireAuth;
+use crate::auth::extractors::RequireServerAccess;
 use crate::webquery::GroupPermWrite;
 
 use super::{
@@ -34,7 +34,7 @@ use super::{
 /// `GET ` — `servergrouplist`.
 pub async fn list(
     State(state): State<AppState>,
-    RequireAuth(user): RequireAuth,
+    RequireServerAccess { user, .. }: RequireServerAccess,
     Path((config_id, sid)): Path<(i64, i64)>,
 ) -> Result<Json<Vec<ServerGroupItem>>, Response> {
     let connection = access::check_read(&state, &user, config_id).await?;
@@ -64,7 +64,7 @@ pub async fn list(
 /// `POST ` — `servergroupadd`.
 pub async fn create(
     State(state): State<AppState>,
-    RequireAuth(user): RequireAuth,
+    RequireServerAccess { user, .. }: RequireServerAccess,
     Path((config_id, sid)): Path<(i64, i64)>,
     Json(req): Json<GroupCreateRequest>,
 ) -> Result<(StatusCode, Json<ServerGroupCreated>), Response> {
@@ -112,7 +112,7 @@ pub async fn create(
 /// `PUT :sgid` — `servergrouprename`.
 pub async fn rename(
     State(state): State<AppState>,
-    RequireAuth(user): RequireAuth,
+    RequireServerAccess { user, .. }: RequireServerAccess,
     Path((config_id, sid, sgid)): Path<(i64, i64, i64)>,
     Json(req): Json<GroupRenameRequest>,
 ) -> Result<StatusCode, Response> {
@@ -160,7 +160,7 @@ pub async fn rename(
 /// `DELETE :sgid` — `servergroupdel` (`force=1`).
 pub async fn delete(
     State(state): State<AppState>,
-    RequireAuth(user): RequireAuth,
+    RequireServerAccess { user, .. }: RequireServerAccess,
     Path((config_id, sid, sgid)): Path<(i64, i64, i64)>,
 ) -> Result<StatusCode, Response> {
     let connection = access::check_admin(&state, &user, config_id).await?;
@@ -204,7 +204,7 @@ pub async fn delete(
 /// `POST :sgid/copy` — `servergroupcopy` into a new group (`tsgid=0`).
 pub async fn copy(
     State(state): State<AppState>,
-    RequireAuth(user): RequireAuth,
+    RequireServerAccess { user, .. }: RequireServerAccess,
     Path((config_id, sid, sgid)): Path<(i64, i64, i64)>,
     Json(req): Json<ServerGroupCopyRequest>,
 ) -> Result<(StatusCode, Json<ServerGroupCreated>), Response> {
@@ -260,7 +260,7 @@ pub async fn copy(
 /// `GET :sgid/members` — `servergroupclientlist -names`.
 pub async fn members(
     State(state): State<AppState>,
-    RequireAuth(user): RequireAuth,
+    RequireServerAccess { user, .. }: RequireServerAccess,
     Path((config_id, sid, sgid)): Path<(i64, i64, i64)>,
 ) -> Result<Json<Vec<ServerGroupMember>>, Response> {
     let connection = access::check_read(&state, &user, config_id).await?;
@@ -283,7 +283,7 @@ pub async fn members(
 /// `POST :sgid/members` — `servergroupaddclient`.
 pub async fn add_member(
     State(state): State<AppState>,
-    RequireAuth(user): RequireAuth,
+    RequireServerAccess { user, .. }: RequireServerAccess,
     Path((config_id, sid, sgid)): Path<(i64, i64, i64)>,
     Json(req): Json<GroupMemberAddRequest>,
 ) -> Result<StatusCode, Response> {
@@ -328,7 +328,7 @@ pub async fn add_member(
 /// `DELETE :sgid/members/:cldbid` — `servergroupdelclient`.
 pub async fn remove_member(
     State(state): State<AppState>,
-    RequireAuth(user): RequireAuth,
+    RequireServerAccess { user, .. }: RequireServerAccess,
     Path((config_id, sid, sgid, cldbid)): Path<(i64, i64, i64, i64)>,
 ) -> Result<StatusCode, Response> {
     let connection = access::check_admin(&state, &user, config_id).await?;
@@ -372,7 +372,7 @@ pub async fn remove_member(
 /// `GET :sgid/permissions` — `servergrouppermlist -permsid`.
 pub async fn permissions(
     State(state): State<AppState>,
-    RequireAuth(user): RequireAuth,
+    RequireServerAccess { user, .. }: RequireServerAccess,
     Path((config_id, sid, sgid)): Path<(i64, i64, i64)>,
 ) -> Result<Json<Vec<GroupPermItem>>, Response> {
     let connection = access::check_read(&state, &user, config_id).await?;
@@ -397,7 +397,7 @@ pub async fn permissions(
 /// `PUT :sgid/permissions` — `servergroupaddperm` (upsert one permission).
 pub async fn set_permission(
     State(state): State<AppState>,
-    RequireAuth(user): RequireAuth,
+    RequireServerAccess { user, .. }: RequireServerAccess,
     Path((config_id, sid, sgid)): Path<(i64, i64, i64)>,
     Json(req): Json<GroupPermSetRequest>,
 ) -> Result<StatusCode, Response> {
@@ -454,7 +454,7 @@ pub async fn set_permission(
 /// `DELETE :sgid/permissions?permsid=` — `servergroupdelperm`.
 pub async fn delete_permission(
     State(state): State<AppState>,
-    RequireAuth(user): RequireAuth,
+    RequireServerAccess { user, .. }: RequireServerAccess,
     Path((config_id, sid, sgid)): Path<(i64, i64, i64)>,
     Query(q): Query<GroupPermDeleteQuery>,
 ) -> Result<StatusCode, Response> {

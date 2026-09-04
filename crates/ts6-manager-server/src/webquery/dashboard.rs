@@ -1,10 +1,9 @@
 //! `GET /api/servers/:configId/vs/:sid/dashboard` (spec §7.19) — PURA-23,
 //! re-pointed onto [`crate::control::ControlBackend`] in PURA-78.
 //!
-//! Auth-gated by [`RequireAuth`] (the Phase 1 surface only requires `Y`
-//! authentication; per-server access gating lands when the per-server
-//! `RequireServerAccess` extractor does in Phase 2 alongside the rest of
-//! `/api/servers/:configId/...`).
+//! Auth-gated by [`RequireServerAccess`] (spec §7.19 `Y+access`): admin
+//! bypasses grants; every other role needs a `server_user_grant` row.
+//! Missing `server_connection` → `404`.
 //!
 //! The handler:
 //! 1. Looks up `server_connections.id == configId`. Missing → `404`.
@@ -36,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use ts6_manager_shared::dashboard::{BandwidthSnapshot, DashboardData};
 
 use crate::app_state::AppState;
-use crate::auth::extractors::RequireAuth;
+use crate::auth::extractors::RequireServerAccess;
 use crate::control::{ControlBackend, ControlBackendError, ControlResult};
 use crate::repos::server_connections;
 
@@ -105,34 +104,10 @@ pub struct DashboardPath {
 
 async fn handler(
     State(state): State<AppState>,
-    _auth: RequireAuth,
+    RequireServerAccess { connection, .. }: RequireServerAccess,
     Path(params): Path<DashboardPath>,
 ) -> Result<Json<DashboardData>, Response> {
     let DashboardPath { config_id, sid } = params;
-
-    // Resolve the connection row. Spec §7.5 — `404` when missing.
-    let connection = server_connections::find_by_id(&state.db, config_id)
-        .await
-        .map_err(|_| {
-            err_body(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ErrorBody {
-                    error: "Internal server error".into(),
-                    code: None,
-                    details: None,
-                },
-            )
-        })?
-        .ok_or_else(|| {
-            err_body(
-                StatusCode::NOT_FOUND,
-                ErrorBody {
-                    error: "Not found".into(),
-                    code: None,
-                    details: None,
-                },
-            )
-        })?;
 
     let client = state
         .control
@@ -204,6 +179,186 @@ fn aggregate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::{jwt, password};
+    use crate::crypto;
+    use crate::db::{connect_in_memory, migrations};
+    use crate::repos::server_connections::NewServerConnection;
+    use crate::repos::{server_user_grants, users};
+    use crate::webquery::WebQueryPool;
+    use crate::ws::Hub;
+    use axum::body::Body;
+    use axum::http::{HeaderValue, Method, Request};
+    use http_body_util::BodyExt;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tower::ServiceExt;
+    use ts6_manager_shared::auth::ErrorResponse;
+
+    async fn fresh_state() -> AppState {
+        let db = connect_in_memory().await.unwrap();
+        migrations::run(&db).await.unwrap();
+        crypto::init("test-seed-dashboard-server-access");
+        let control = crate::control::ControlBackendPool::new(false, db.clone());
+        AppState {
+            db,
+            jwt_secret: Arc::new(b"test-secret-bytes-please-32-or-more".to_vec()),
+            jwt_access_expiry: Duration::from_secs(900),
+            jwt_refresh_expiry: Duration::from_secs(7 * 24 * 3600),
+            setup_lock: Arc::new(tokio::sync::Mutex::new(())),
+            webquery: WebQueryPool::new(false),
+            control,
+            ws_hub: Hub::new(),
+            widget_cache: crate::widgets::WidgetCache::new(),
+            music_bots: crate::music_bots::MusicBotService::default_for_tests(),
+            sidecar: None,
+            ssrf_resolver: Arc::new(ts6_ssrf::MockResolver::new()),
+            moq_public_url: None,
+            yt_cookie: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            yt_api_key: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            data_dir: std::path::PathBuf::from("./data"),
+            trusted_proxy_hops: 0,
+        }
+    }
+
+    async fn seed_user_token(state: &AppState, name: &str, role: &str) -> (i64, String) {
+        let pw = "Hunter2!ok".to_string();
+        let hash = tokio::task::spawn_blocking(move || password::hash_new(&pw))
+            .await
+            .unwrap()
+            .unwrap();
+        let row = users::insert(
+            &state.db,
+            users::NewUser {
+                username: name.into(),
+                passwordHash: hash,
+                displayName: name.into(),
+                role: role.into(),
+                enabled: true,
+            },
+        )
+        .await
+        .unwrap();
+        let token = jwt::mint_access(
+            row.id,
+            &row.username,
+            &row.role,
+            state.jwt_access_expiry,
+            &state.jwt_secret,
+        )
+        .unwrap();
+        (row.id, token)
+    }
+
+    async fn seed_server(state: &AppState) -> i64 {
+        crate::repos::server_connections::insert(
+            &state.db,
+            NewServerConnection {
+                name: "S".into(),
+                host: "ts.example.com".into(),
+                webqueryPort: 10080,
+                apiKey: crypto::seal("k").unwrap(),
+                useHttps: false,
+                sshPort: 10022,
+                sshUsername: None,
+                sshPassword: None,
+                queryBotChannel: None,
+                queryBotNickname: None,
+                sshBotNickname: None,
+                enabled: true,
+                controlPath: None,
+                sshAuthMethod: None,
+                sshPrivateKey: None,
+                sshKeyAgentSocket: None,
+                sshHostKeyFingerprint: None,
+            },
+        )
+        .await
+        .unwrap()
+        .id
+    }
+
+    fn app(state: AppState) -> Router {
+        super::router().with_state(state)
+    }
+
+    async fn get_dashboard(
+        state: AppState,
+        token: Option<&str>,
+        config_id: i64,
+    ) -> axum::http::Response<Body> {
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/api/servers/{config_id}/vs/1/dashboard"));
+        if let Some(token) = token {
+            req = req.header(
+                "authorization",
+                HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+            );
+        }
+        app(state)
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    async fn read_error(resp: axum::http::Response<Body>) -> ErrorResponse {
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn dashboard_viewer_without_grant_is_403() {
+        let state = fresh_state().await;
+        let (_id, token) = seed_user_token(&state, "viewer", "viewer").await;
+        let sid = seed_server(&state).await;
+        let resp = get_dashboard(state, Some(&token), sid).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            read_error(resp).await.error,
+            ts6_manager_shared::auth::auth_error_strings::INSUFFICIENT_PERMS
+        );
+    }
+
+    #[tokio::test]
+    async fn dashboard_viewer_with_grant_passes_the_access_gate() {
+        // Grant check happens before the WebQuery fan-out. A granted
+        // viewer must not 403; the subsequent 502 is the mock-less
+        // upstream (no live TS) and proves the extractor let them through.
+        let state = fresh_state().await;
+        let (uid, token) = seed_user_token(&state, "viewer", "viewer").await;
+        let sid = seed_server(&state).await;
+        server_user_grants::insert(&state.db, uid, sid)
+            .await
+            .unwrap();
+        let resp = get_dashboard(state, Some(&token), sid).await;
+        assert_ne!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "granted viewer must pass RequireServerAccess"
+        );
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn dashboard_admin_passes_the_access_gate_without_a_grant() {
+        let state = fresh_state().await;
+        let (_id, token) = seed_user_token(&state, "alice", "admin").await;
+        let sid = seed_server(&state).await;
+        let resp = get_dashboard(state, Some(&token), sid).await;
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN);
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn dashboard_missing_server_is_404() {
+        let state = fresh_state().await;
+        let (_id, token) = seed_user_token(&state, "alice", "admin").await;
+        let resp = get_dashboard(state, Some(&token), 9999).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(read_error(resp).await.error, "Not found");
+    }
 
     #[test]
     fn aggregate_excludes_serverquery_slots_from_online_users() {
