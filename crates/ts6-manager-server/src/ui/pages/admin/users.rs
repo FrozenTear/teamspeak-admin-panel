@@ -1870,6 +1870,7 @@ mod tests {
                 },
             }),
             storage: Arc::new(MemoryStore::new()),
+            ready: SyncSignal::new_maybe_sync(true),
         });
         use_context_provider(|| provide_auth_gate(session));
         let _ = provide_toaster();
@@ -1890,6 +1891,7 @@ mod tests {
                 },
             }),
             storage: Arc::new(MemoryStore::new()),
+            ready: SyncSignal::new_maybe_sync(true),
         });
         use_context_provider(|| provide_auth_gate(session));
         let _ = provide_toaster();

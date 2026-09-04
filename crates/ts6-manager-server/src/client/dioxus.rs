@@ -28,10 +28,17 @@ pub type SessionStorage = Arc<dyn Storage + Send + Sync>;
 /// [`SessionHandle`]). UI components read the same signal via context to
 /// re-render on every mutation, regardless of whether the mutation came
 /// from the login button or from the refresh interceptor.
+///
+/// `ready` stays `false` until [`rehydrate_from_storage`] (or a login
+/// [`DioxusSession::replace`]) has resolved the first-paint `Anonymous`
+/// placeholder. Auth-gate redirects must wait for this bit — a bool
+/// captured on first paint is always anonymous (PURA-129) and will not
+/// re-run after the blob lands.
 #[derive(Clone)]
 pub struct DioxusSession {
     pub state: SyncSignal<AuthState>,
     pub storage: SessionStorage,
+    pub ready: SyncSignal<bool>,
 }
 
 impl DioxusSession {
@@ -52,6 +59,21 @@ impl DioxusSession {
         Self {
             state: SyncSignal::new_maybe_sync(AuthState::Anonymous),
             storage,
+            ready: SyncSignal::new_maybe_sync(false),
+        }
+    }
+
+    /// Session that is already past the post-mount rehydrate gate.
+    ///
+    /// SSR chrome tests and page harnesses inject a known [`AuthState`]
+    /// instead of running [`rehydrate_from_storage`]; they must start
+    /// `ready` so an AppShell-style gate does not treat them as the
+    /// first-paint placeholder.
+    pub fn new_ready(state: AuthState, storage: SessionStorage) -> Self {
+        Self {
+            state: SyncSignal::new_maybe_sync(state),
+            storage,
+            ready: SyncSignal::new_maybe_sync(true),
         }
     }
 
@@ -66,6 +88,7 @@ impl DioxusSession {
             auth_debug::fields(&[("from", prev_authed.into()), ("to", next_authed.into())]),
         );
         *self.state.write_unchecked() = state.clone();
+        *self.ready.write_unchecked() = true;
         save_state(&*self.storage, &state);
     }
 }
@@ -154,10 +177,15 @@ pub fn provide_session() -> DioxusSession {
 /// is client-only (it does not run during SSR), so the first render on
 /// both server and browser observes the same `Anonymous` state, hydration
 /// walks identical trees, and the real auth state is applied immediately
-/// after mount. Any UI gated on `session.state` (the auth-redirect inside
-/// `AppShell`, `use_ws_lifecycle`, the auth-aware page guards) sees the
-/// transition `Anonymous → Authenticated` and reacts via its existing
-/// signal subscriptions.
+/// after mount.
+///
+/// Always flips [`DioxusSession::ready`] — including the empty-storage
+/// path — so auth-gate effects that *subscribe* to `ready` + `state`
+/// (instead of closing over a first-paint bool) can decide whether to
+/// bounce to `/login`. `use_ws_lifecycle` already reads `session.state`
+/// inside its effect and self-heals; `AppShell` / `LoginPage` did not,
+/// which is what stranded a valid `localStorage` blob on the login form
+/// after a hard refresh.
 pub fn rehydrate_from_storage(session: &DioxusSession) {
     let loaded = load_state(&*session.storage);
     let hydrated = matches!(loaded, AuthState::Authenticated { .. });
@@ -180,6 +208,17 @@ pub fn rehydrate_from_storage(session: &DioxusSession) {
         let state = session.state;
         *state.write_unchecked() = loaded;
     }
+    *session.ready.write_unchecked() = true;
+}
+
+/// AppShell `/login` bounce predicate.
+///
+/// First paint is always [`AuthState::Anonymous`] (PURA-129). Bouncing
+/// before [`rehydrate_from_storage`] flips `ready` races a valid
+/// `localStorage` blob onto the login form; waiting for `ready` is the
+/// same class of gate as PURA-232's `SessionAnonymous` short-circuit.
+pub fn should_redirect_anonymous_to_login(ready: bool, authenticated: bool) -> bool {
+    ready && !authenticated
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -195,4 +234,114 @@ fn pick_default_storage() -> SessionStorage {
 fn pick_default_storage() -> SessionStorage {
     use crate::client::storage::MemoryStore;
     Arc::new(MemoryStore::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::storage::MemoryStore;
+    use crate::client::store::save_state;
+    use ts6_manager_shared::auth::UserInfo;
+
+    fn authed() -> AuthState {
+        AuthState::Authenticated {
+            access: "access-token".into(),
+            refresh: "refresh-token".into(),
+            user: UserInfo {
+                id: 1,
+                username: "op".into(),
+                display_name: "Operator".into(),
+                role: "admin".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn anonymous_bounce_waits_for_ready() {
+        assert!(
+            !should_redirect_anonymous_to_login(false, false),
+            "first paint is Anonymous and not ready — do not bounce"
+        );
+        assert!(
+            !should_redirect_anonymous_to_login(false, true),
+            "a ready-false authed session is the SSR harness path, not a bounce"
+        );
+        assert!(
+            should_redirect_anonymous_to_login(true, false),
+            "rehydrate finished with no blob — bounce to login"
+        );
+        assert!(
+            !should_redirect_anonymous_to_login(true, true),
+            "rehydrate finished with a blob — stay on the panel"
+        );
+    }
+
+    #[test]
+    fn rehydrate_empty_storage_stays_anonymous_and_marks_ready() {
+        let mut dom = VirtualDom::new(EmptyRehydrateHarness);
+        dom.rebuild_in_place();
+    }
+
+    #[test]
+    fn rehydrate_copies_blob_and_marks_ready() {
+        let mut dom = VirtualDom::new(BlobRehydrateHarness);
+        dom.rebuild_in_place();
+    }
+
+    #[component]
+    fn EmptyRehydrateHarness() -> Element {
+        let session = use_hook(|| DioxusSession::new_anonymous(Arc::new(MemoryStore::new())));
+        assert!(
+            !*session.ready.peek(),
+            "new_anonymous must start not-ready so AppShell waits"
+        );
+        assert!(!session.state.read().is_authenticated());
+        rehydrate_from_storage(&session);
+        assert!(
+            *session.ready.peek(),
+            "empty-storage rehydrate must still flip ready"
+        );
+        assert!(
+            !session.state.read().is_authenticated(),
+            "no blob means the signal stays Anonymous"
+        );
+        rsx! { "" }
+    }
+
+    #[component]
+    fn BlobRehydrateHarness() -> Element {
+        let session = use_hook(|| {
+            let storage: SessionStorage = Arc::new(MemoryStore::new());
+            save_state(&*storage, &authed());
+            DioxusSession::new_anonymous(storage)
+        });
+        assert!(!*session.ready.peek());
+        assert!(
+            !session.state.read().is_authenticated(),
+            "first paint stays Anonymous even when storage holds a blob"
+        );
+        rehydrate_from_storage(&session);
+        assert!(*session.ready.peek());
+        assert!(
+            session.state.read().is_authenticated(),
+            "rehydrate must copy the persisted blob into the signal"
+        );
+        rsx! { "" }
+    }
+
+    #[test]
+    fn new_ready_starts_past_the_rehydrate_gate() {
+        let mut dom = VirtualDom::new(ReadyHarness);
+        dom.rebuild_in_place();
+    }
+
+    #[component]
+    fn ReadyHarness() -> Element {
+        let session = use_hook(|| DioxusSession::new_ready(authed(), Arc::new(MemoryStore::new())));
+        assert!(
+            *session.ready.peek() && session.state.read().is_authenticated(),
+            "harness sessions skip the first-paint Anonymous placeholder"
+        );
+        rsx! { "" }
+    }
 }

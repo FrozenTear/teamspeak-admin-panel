@@ -524,6 +524,7 @@ mod tests {
                 },
             }),
             storage: Arc::new(MemoryStore::new()),
+            ready: SyncSignal::new_maybe_sync(true),
         });
         use_context_provider(|| provide_auth_gate(session));
         // Synthetic context: a single fixture row so the loaded path
@@ -605,6 +606,7 @@ mod tests {
                 },
             }),
             storage,
+            ready: SyncSignal::new_maybe_sync(true),
         });
         use_context_provider(|| provide_auth_gate(session));
         use_context_provider(|| ServersContext {
