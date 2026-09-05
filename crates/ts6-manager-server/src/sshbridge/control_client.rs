@@ -36,12 +36,12 @@ use serde_json::{Map, Value};
 use tokio::sync::Mutex;
 
 use crate::control::{ControlBackend, ControlBackendError, ControlResult};
-use crate::webquery::BanAddParams;
 use crate::webquery::escape::escape;
 use crate::webquery::models::{
     BanEntry, ChannelEntry, ClientDbEntry, ClientEntry, ClientInfo, ComplaintEntry, ConnectionInfo,
     LogEntry, ServerInfo, VersionInfo, VirtualServerEntry,
 };
+use crate::webquery::{BanAddParams, ChannelWriteParams};
 
 use super::transport::{CommandOutcome, TransportHandle};
 use super::wire::parse_records;
@@ -410,6 +410,60 @@ impl ControlBackend for SshControlClient {
         Ok(())
     }
 
+    async fn channelcreate(&self, sid: i64, params: &ChannelWriteParams<'_>) -> ControlResult<i64> {
+        let line = append_channel_props("channelcreate", params);
+        let outcome = self.run_scoped(sid, &line).await?;
+        let mut records = Self::collect_records(&outcome.body_lines);
+        if records.is_empty() {
+            return Err(ControlBackendError::InvalidResponse(
+                "channelcreate returned no body record".into(),
+            ));
+        }
+        let r = records.remove(0);
+        let raw = r.get("cid").ok_or_else(|| {
+            ControlBackendError::InvalidResponse("channelcreate response missing cid field".into())
+        })?;
+        raw.parse::<i64>().map_err(|e| {
+            ControlBackendError::InvalidResponse(format!(
+                "channelcreate returned non-integer cid={raw:?}: {e}"
+            ))
+        })
+    }
+
+    async fn channeledit(
+        &self,
+        sid: i64,
+        cid: i64,
+        params: &ChannelWriteParams<'_>,
+    ) -> ControlResult<()> {
+        let mut line = format!("channeledit cid={cid}");
+        append_channel_props_into(&mut line, params);
+        self.run_scoped(sid, &line).await?;
+        Ok(())
+    }
+
+    async fn channeldelete(&self, sid: i64, cid: i64, force: bool) -> ControlResult<()> {
+        let force_i = if force { 1 } else { 0 };
+        let line = format!("channeldelete cid={cid} force={force_i}");
+        self.run_scoped(sid, &line).await?;
+        Ok(())
+    }
+
+    async fn channelmove(
+        &self,
+        sid: i64,
+        cid: i64,
+        cpid: i64,
+        order: Option<i64>,
+    ) -> ControlResult<()> {
+        let mut line = format!("channelmove cid={cid} cpid={cpid}");
+        if let Some(order) = order {
+            line.push_str(&format!(" order={order}"));
+        }
+        self.run_scoped(sid, &line).await?;
+        Ok(())
+    }
+
     fn ssh_transport(&self) -> Option<TransportHandle> {
         Some(self.transport.clone())
     }
@@ -423,6 +477,23 @@ impl ControlBackend for SshControlClient {
 /// protocol expects flags as space-separated tokens, each prefixed with
 /// a single `-`. Stripping a leading `-` from caller-supplied flag names
 /// keeps both call sites uniform.
+/// Render `channelcreate` / `channeledit` property assignments onto a
+/// ServerQuery command line. String values go through [`escape`].
+fn append_channel_props(cmd: &str, params: &ChannelWriteParams<'_>) -> String {
+    let mut line = cmd.to_string();
+    append_channel_props_into(&mut line, params);
+    line
+}
+
+fn append_channel_props_into(line: &mut String, params: &ChannelWriteParams<'_>) {
+    for (key, value) in params.query_pairs() {
+        line.push(' ');
+        line.push_str(&key);
+        line.push('=');
+        line.push_str(&escape(&value));
+    }
+}
+
 fn append_flags(flags: &[&str]) -> String {
     if flags.is_empty() {
         return String::new();
@@ -726,6 +797,31 @@ mod tests {
         );
         // Caller-supplied leading `-` is normalised so both styles work.
         assert_eq!(append_flags(&["-uid", "away"]), " -uid -away");
+    }
+
+    #[test]
+    fn append_channel_props_escapes_name_and_skips_unset() {
+        let params = ChannelWriteParams {
+            channel_name: Some("My Channel"),
+            cpid: Some(1),
+            channel_flag_permanent: Some(1),
+            ..Default::default()
+        };
+        let line = append_channel_props("channelcreate", &params);
+        assert_eq!(
+            line,
+            "channelcreate channel_name=My\\sChannel cpid=1 channel_flag_permanent=1"
+        );
+    }
+
+    #[test]
+    fn channelcreate_parses_cid_from_response() {
+        let body = vec!["cid=9".to_string()];
+        let mut records = SshControlClient::collect_records(&body);
+        assert_eq!(records.len(), 1);
+        let r = records.remove(0);
+        let raw = r.get("cid").unwrap();
+        assert_eq!(raw.parse::<i64>().unwrap(), 9);
     }
 
     /// PURA-99 — `banadd` parses `banid` out of the upstream's record.

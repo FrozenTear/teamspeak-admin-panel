@@ -9,7 +9,8 @@
 //!   `serverinfo`/`hostinfo`/`logview`,
 //!   `channelclientpermlist`.
 //! - **Write** — `clientkick`/`clientpoke`/`clientmove`/`clientedit` (used by
-//!   the talker-flag helper), `banadd`/`bandel`/`bandelall`.
+//!   the talker-flag helper), `banadd`/`bandel`/`bandelall`,
+//!   `channelcreate`/`channeledit`/`channeldelete`/`channelmove`.
 //!
 //! Cross-cutting:
 //!
@@ -60,9 +61,9 @@ use crate::repos::server_connections::ServerConnection;
 
 pub use models::{
     BanAddResponse, BanEntry, ChannelClientPerm, ChannelEntry, ChannelGroupClient,
-    ChannelGroupEntry, ChannelGroupIdResponse, ChannelInfo, ClientDbEntry, ClientEntry, ClientInfo,
-    ComplaintEntry, ConnectionInfo, GroupPermEntry, HostInfo, LogEntry, MessageDetail,
-    MessageEntry, PermFindEntry, PermIdEntry, PermOverviewEntry, PermissionEntry,
+    ChannelGroupEntry, ChannelGroupIdResponse, ChannelIdResponse, ChannelInfo, ClientDbEntry,
+    ClientEntry, ClientInfo, ComplaintEntry, ConnectionInfo, GroupPermEntry, HostInfo, LogEntry,
+    MessageDetail, MessageEntry, PermFindEntry, PermIdEntry, PermOverviewEntry, PermissionEntry,
     PrivilegeKeyAddResponse, PrivilegeKeyEntry, ServerGroupClient, ServerGroupEntry,
     ServerGroupIdResponse, ServerInfo, VersionInfo, VirtualServerEntry,
 };
@@ -558,6 +559,71 @@ impl WebQueryClient {
             &[("cid", cid_s.as_str())],
         )
         .await
+    }
+
+    /// `channelcreate` (sid scope) — returns the new channel id.
+    pub async fn channelcreate(
+        &self,
+        sid: i64,
+        params: &ChannelWriteParams<'_>,
+    ) -> WebQueryResult<i64> {
+        let owned = params.query_pairs();
+        let q: Vec<(&str, &str)> = owned
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let resp: ChannelIdResponse = self.get_one(&format!("/{sid}/channelcreate"), &q).await?;
+        Ok(resp.cid)
+    }
+
+    /// `channeledit` (sid scope) — apply the set properties to `cid`.
+    pub async fn channeledit(
+        &self,
+        sid: i64,
+        cid: i64,
+        params: &ChannelWriteParams<'_>,
+    ) -> WebQueryResult<()> {
+        let cid_s = cid.to_string();
+        let owned = params.query_pairs();
+        let mut q: Vec<(&str, &str)> = Vec::with_capacity(owned.len() + 1);
+        q.push(("cid", cid_s.as_str()));
+        q.extend(owned.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        self.get::<UnitBody>(&format!("/{sid}/channeledit"), &q)
+            .await?;
+        Ok(())
+    }
+
+    /// `channeldelete` (sid scope). `force=1` kicks occupants first
+    /// (spec §7.7 default); `force=0` fails if the channel is occupied.
+    pub async fn channeldelete(&self, sid: i64, cid: i64, force: bool) -> WebQueryResult<()> {
+        let cid_s = cid.to_string();
+        self.get::<UnitBody>(
+            &format!("/{sid}/channeldelete"),
+            &[("cid", cid_s.as_str()), ("force", bool_to_int(force))],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// `channelmove` (sid scope) — reparent / reorder. `order` is the
+    /// sort-after channel id (upstream `order` field).
+    pub async fn channelmove(
+        &self,
+        sid: i64,
+        cid: i64,
+        cpid: i64,
+        order: Option<i64>,
+    ) -> WebQueryResult<()> {
+        let cid_s = cid.to_string();
+        let cpid_s = cpid.to_string();
+        let order_s = order.map(|v| v.to_string());
+        let mut q: Vec<(&str, &str)> = vec![("cid", cid_s.as_str()), ("cpid", cpid_s.as_str())];
+        if let Some(ref v) = order_s {
+            q.push(("order", v.as_str()));
+        }
+        self.get::<UnitBody>(&format!("/{sid}/channelmove"), &q)
+            .await?;
+        Ok(())
     }
 
     /// `hostinfo` (instance scope).
@@ -1379,6 +1445,80 @@ pub struct BanAddParams<'a> {
     /// Ban duration in seconds. `Some(0)` is permanent per §7.12; `None`
     /// omits the field entirely (upstream defaults apply).
     pub time: Option<i64>,
+}
+
+/// Parameters for [`WebQueryClient::channelcreate`] /
+/// [`WebQueryClient::channeledit`]. Only `Some` fields are forwarded so
+/// callers can send the editor-shape subset (name / topic / flags /
+/// limits / password / order / parent).
+#[derive(Debug, Default, Clone)]
+pub struct ChannelWriteParams<'a> {
+    pub channel_name: Option<&'a str>,
+    pub cpid: Option<i64>,
+    pub channel_topic: Option<&'a str>,
+    pub channel_password: Option<&'a str>,
+    pub channel_description: Option<&'a str>,
+    pub channel_maxclients: Option<i64>,
+    pub channel_maxfamilyclients: Option<i64>,
+    pub channel_order: Option<i64>,
+    pub channel_flag_permanent: Option<i64>,
+    pub channel_flag_semi_permanent: Option<i64>,
+    pub channel_flag_temporary: Option<i64>,
+    pub channel_flag_default: Option<i64>,
+    pub channel_needed_talk_power: Option<i64>,
+    pub channel_icon_id: Option<i64>,
+}
+
+impl ChannelWriteParams<'_> {
+    /// TS WebQuery / ServerQuery `key=value` pairs for the set fields.
+    /// Integers are decimal; strings are the raw operator values (WebQuery
+    /// URL-encodes; the SSH path applies §10.4 `escape`).
+    pub fn query_pairs(&self) -> Vec<(String, String)> {
+        let mut q = Vec::new();
+        if let Some(v) = self.channel_name {
+            q.push(("channel_name".into(), v.into()));
+        }
+        if let Some(v) = self.cpid {
+            q.push(("cpid".into(), v.to_string()));
+        }
+        if let Some(v) = self.channel_topic {
+            q.push(("channel_topic".into(), v.into()));
+        }
+        if let Some(v) = self.channel_password {
+            q.push(("channel_password".into(), v.into()));
+        }
+        if let Some(v) = self.channel_description {
+            q.push(("channel_description".into(), v.into()));
+        }
+        if let Some(v) = self.channel_maxclients {
+            q.push(("channel_maxclients".into(), v.to_string()));
+        }
+        if let Some(v) = self.channel_maxfamilyclients {
+            q.push(("channel_maxfamilyclients".into(), v.to_string()));
+        }
+        if let Some(v) = self.channel_order {
+            q.push(("channel_order".into(), v.to_string()));
+        }
+        if let Some(v) = self.channel_flag_permanent {
+            q.push(("channel_flag_permanent".into(), v.to_string()));
+        }
+        if let Some(v) = self.channel_flag_semi_permanent {
+            q.push(("channel_flag_semi_permanent".into(), v.to_string()));
+        }
+        if let Some(v) = self.channel_flag_temporary {
+            q.push(("channel_flag_temporary".into(), v.to_string()));
+        }
+        if let Some(v) = self.channel_flag_default {
+            q.push(("channel_flag_default".into(), v.to_string()));
+        }
+        if let Some(v) = self.channel_needed_talk_power {
+            q.push(("channel_needed_talk_power".into(), v.to_string()));
+        }
+        if let Some(v) = self.channel_icon_id {
+            q.push(("channel_icon_id".into(), v.to_string()));
+        }
+        q
+    }
 }
 
 /// Parameters for a server-group permission upsert

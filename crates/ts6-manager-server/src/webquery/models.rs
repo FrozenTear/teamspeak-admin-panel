@@ -364,6 +364,13 @@ pub struct BanAddResponse {
     pub banid: i64,
 }
 
+/// `channelcreate` response — TS returns the new channel id.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelIdResponse {
+    #[serde(deserialize_with = "stringy::deserialize")]
+    pub cid: i64,
+}
+
 /// `complainlist` row — one TS6 complaint. A complaint is a
 /// `(tcldbid, fcldbid)` pair: the `t*` fields name the **target** (the
 /// subject complained about), the `f*` fields name the **from** client
@@ -737,6 +744,13 @@ mod stringy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn channel_id_response_parses_stringy_cid() {
+        let raw = serde_json::json!({"cid": "9"});
+        let parsed: ChannelIdResponse = serde_json::from_value(raw).unwrap();
+        assert_eq!(parsed.cid, 9);
+    }
 
     #[test]
     fn channel_entry_parses_stringy_id() {

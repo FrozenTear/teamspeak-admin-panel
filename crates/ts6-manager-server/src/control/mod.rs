@@ -63,7 +63,7 @@ use crate::sshbridge::{
     transport::{TransportConfig, TransportHandle, spawn_with_db as spawn_transport_with_db},
 };
 use crate::webquery::{
-    BanAddParams, ClassifiedTransport, WebQueryClient, WebQueryError,
+    BanAddParams, ChannelWriteParams, ClassifiedTransport, WebQueryClient, WebQueryError,
     models::{
         BanEntry, ChannelEntry, ClientDbEntry, ClientEntry, ClientInfo, ComplaintEntry,
         ConnectionInfo, LogEntry, ServerInfo, VersionInfo, VirtualServerEntry,
@@ -379,6 +379,30 @@ pub trait ControlBackend: Send + Sync + std::fmt::Debug {
     /// target. Per-target (`tcldbid` required), idempotent (`9.0-spike`).
     async fn complaindelall(&self, sid: i64, tcldbid: i64) -> ControlResult<()>;
 
+    /// `channelcreate` (sid scope) — returns the new channel id.
+    async fn channelcreate(&self, sid: i64, params: &ChannelWriteParams<'_>) -> ControlResult<i64>;
+
+    /// `channeledit` (sid scope) — apply the set properties to `cid`.
+    async fn channeledit(
+        &self,
+        sid: i64,
+        cid: i64,
+        params: &ChannelWriteParams<'_>,
+    ) -> ControlResult<()>;
+
+    /// `channeldelete` (sid scope). `force=true` kicks occupants first.
+    async fn channeldelete(&self, sid: i64, cid: i64, force: bool) -> ControlResult<()>;
+
+    /// `channelmove` (sid scope) — reparent / reorder. `order` is the
+    /// sort-after channel id (upstream `order` field).
+    async fn channelmove(
+        &self,
+        sid: i64,
+        cid: i64,
+        cpid: i64,
+        order: Option<i64>,
+    ) -> ControlResult<()>;
+
     /// Underlying SSH transport handle, if this backend is SSH-driven.
     /// `None` for WebQuery — that path has no `notify*` event surface.
     /// PURA-80 uses this to share the existing SSH session with the
@@ -538,6 +562,37 @@ impl ControlBackend for WebQueryClient {
 
     async fn complaindelall(&self, sid: i64, tcldbid: i64) -> ControlResult<()> {
         self.complaindelall(sid, tcldbid).await.map_err(Into::into)
+    }
+
+    async fn channelcreate(&self, sid: i64, params: &ChannelWriteParams<'_>) -> ControlResult<i64> {
+        self.channelcreate(sid, params).await.map_err(Into::into)
+    }
+
+    async fn channeledit(
+        &self,
+        sid: i64,
+        cid: i64,
+        params: &ChannelWriteParams<'_>,
+    ) -> ControlResult<()> {
+        self.channeledit(sid, cid, params).await.map_err(Into::into)
+    }
+
+    async fn channeldelete(&self, sid: i64, cid: i64, force: bool) -> ControlResult<()> {
+        self.channeldelete(sid, cid, force)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn channelmove(
+        &self,
+        sid: i64,
+        cid: i64,
+        cpid: i64,
+        order: Option<i64>,
+    ) -> ControlResult<()> {
+        self.channelmove(sid, cid, cpid, order)
+            .await
+            .map_err(Into::into)
     }
 }
 

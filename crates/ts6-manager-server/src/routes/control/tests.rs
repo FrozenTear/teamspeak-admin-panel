@@ -26,9 +26,11 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 use ts6_manager_shared::control::{
-    BanCreateRequest, BanCreated, BanListItem, ChannelTreeNode, ClientDetail, ClientListItem,
-    GroupCreateRequest, GroupPermSetRequest, KickKind, KickRequest, MessageListItem, MoveRequest,
-    MuteRequest, PermissionCatalogItem, ServerGroupCreated, ServerGroupItem, ServerInfoResponse,
+    BanCreateRequest, BanCreated, BanListItem, ChannelCreateRequest, ChannelCreated,
+    ChannelEditRequest, ChannelMoveRequest, ChannelProperties, ChannelTreeNode, ClientDetail,
+    ClientListItem, GroupCreateRequest, GroupPermSetRequest, KickKind, KickRequest,
+    MessageListItem, MoveRequest, MuteRequest, PermissionCatalogItem, ServerGroupCreated,
+    ServerGroupItem, ServerInfoResponse,
 };
 
 use crate::app_state::AppState;
@@ -192,6 +194,7 @@ async fn handler_dispatch(
             }
         ]),
         "banadd" => json!({ "banid": "42" }),
+        "channelcreate" => json!({ "cid": "9" }),
         // PURA-373 — moderation surface reads.
         "servergrouplist" => json!([
             { "sgid": "6", "name": "Server Admin", "type": "1", "iconid": "300",
@@ -243,6 +246,9 @@ async fn handler_dispatch(
         "clientkick"
         | "clientmove"
         | "clientedit"
+        | "channeledit"
+        | "channeldelete"
+        | "channelmove"
         | "bandel"
         | "bandelall"
         | "servergrouprename"
@@ -543,6 +549,356 @@ async fn channel_list_returns_flat_tree() {
     assert_eq!(nodes.len(), 2);
     assert_eq!(nodes[0].channel_name, "Lobby");
     assert_eq!(nodes[1].pid, 1);
+}
+
+// ---------------------------------------------------------------------
+// Channel mutations — create / edit / delete / move (spec §7.7)
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn channel_create_returns_cid_and_publishes_ws() {
+    let (port, mock) = boot_mock_webquery("API-KEY").await;
+    let state = fresh_state().await;
+    let server = seed_server(&state, port, "API-KEY").await;
+    let (_admin, atoken) = seed_user_with_token(&state, "alice", "admin").await;
+
+    let admin_principal = crate::ws::auth::Principal::User(crate::ws::auth::UserPrincipal {
+        user_id: 1,
+        username: "alice".into(),
+        role: "admin".into(),
+        is_admin: true,
+        is_at_least_moderator: true,
+    });
+    let topic = crate::ws::topic::Topic::new(server.id, crate::ws::topic::TopicKind::Channels);
+    let mut sub = state
+        .ws_hub
+        .subscribe(&state.db, &admin_principal, topic, None)
+        .await
+        .unwrap();
+
+    let body = ChannelCreateRequest {
+        channel_name: "Music".into(),
+        cpid: Some(1),
+        properties: ChannelProperties {
+            channel_topic: Some("bots".into()),
+            channel_flag_permanent: Some(1),
+            channel_maxclients: Some(8),
+            ..Default::default()
+        },
+    };
+    let resp = app(state)
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/servers/{}/vs/1/channels", server.id))
+                .header("authorization", auth_header(&atoken))
+                .header("content-type", "application/json")
+                .body(json_body(&body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let created: ChannelCreated = read_json(resp).await;
+    assert_eq!(created.cid, 9);
+
+    let paths = mock.captured_paths.lock().unwrap().clone();
+    assert!(
+        paths.iter().any(|p| p.ends_with("/channelcreate")),
+        "expected channelcreate upstream path, got {paths:?}"
+    );
+    let queries = mock.captured_queries.lock().unwrap().clone();
+    let last = queries.last().expect("captured query");
+    assert_eq!(last.get("channel_name").map(String::as_str), Some("Music"));
+    assert_eq!(last.get("cpid").map(String::as_str), Some("1"));
+    assert_eq!(last.get("channel_topic").map(String::as_str), Some("bots"));
+    assert_eq!(
+        last.get("channel_flag_permanent").map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(
+        last.get("channel_maxclients").map(String::as_str),
+        Some("8")
+    );
+
+    let envelope = sub.receiver.recv().await.unwrap();
+    assert_eq!(envelope.kind, "ts:channel:created");
+    assert_eq!(envelope.data["cid"], 9);
+    assert_eq!(envelope.data["channelName"], "Music");
+}
+
+#[tokio::test]
+async fn channel_create_rejects_empty_name() {
+    let (port, _mock) = boot_mock_webquery("API-KEY").await;
+    let state = fresh_state().await;
+    let server = seed_server(&state, port, "API-KEY").await;
+    let (_admin, atoken) = seed_user_with_token(&state, "alice", "admin").await;
+
+    let resp = app(state)
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/servers/{}/vs/1/channels", server.id))
+                .header("authorization", auth_header(&atoken))
+                .header("content-type", "application/json")
+                .body(json_body(&ChannelCreateRequest {
+                    channel_name: "   ".into(),
+                    ..Default::default()
+                }))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn channel_create_rejects_moderator() {
+    let (port, _mock) = boot_mock_webquery("API-KEY").await;
+    let state = fresh_state().await;
+    let server = seed_server(&state, port, "API-KEY").await;
+    let (modr, mtoken) = seed_user_with_token(&state, "mod", "moderator").await;
+    server_user_grants::insert(&state.db, modr.id, server.id)
+        .await
+        .unwrap();
+
+    let resp = app(state)
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/servers/{}/vs/1/channels", server.id))
+                .header("authorization", auth_header(&mtoken))
+                .header("content-type", "application/json")
+                .body(json_body(&ChannelCreateRequest {
+                    channel_name: "Music".into(),
+                    ..Default::default()
+                }))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn channel_edit_forwards_properties() {
+    let (port, mock) = boot_mock_webquery("API-KEY").await;
+    let state = fresh_state().await;
+    let server = seed_server(&state, port, "API-KEY").await;
+    let (_admin, atoken) = seed_user_with_token(&state, "alice", "admin").await;
+
+    let body = ChannelEditRequest {
+        channel_name: Some("Lobby 2".into()),
+        properties: ChannelProperties {
+            channel_topic: Some("welcome".into()),
+            channel_password: Some("s3cret".into()),
+            channel_flag_default: Some(1),
+            ..Default::default()
+        },
+    };
+    let resp = app(state)
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri(format!("/api/servers/{}/vs/1/channels/2", server.id))
+                .header("authorization", auth_header(&atoken))
+                .header("content-type", "application/json")
+                .body(json_body(&body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let last = mock
+        .captured_queries
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .expect("captured query");
+    assert_eq!(last.get("cid").map(String::as_str), Some("2"));
+    assert_eq!(
+        last.get("channel_name").map(String::as_str),
+        Some("Lobby 2")
+    );
+    assert_eq!(
+        last.get("channel_topic").map(String::as_str),
+        Some("welcome")
+    );
+    assert_eq!(
+        last.get("channel_password").map(String::as_str),
+        Some("s3cret")
+    );
+    assert_eq!(
+        last.get("channel_flag_default").map(String::as_str),
+        Some("1")
+    );
+}
+
+#[tokio::test]
+async fn channel_edit_rejects_empty_body() {
+    let (port, _mock) = boot_mock_webquery("API-KEY").await;
+    let state = fresh_state().await;
+    let server = seed_server(&state, port, "API-KEY").await;
+    let (_admin, atoken) = seed_user_with_token(&state, "alice", "admin").await;
+
+    let resp = app(state)
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri(format!("/api/servers/{}/vs/1/channels/2", server.id))
+                .header("authorization", auth_header(&atoken))
+                .header("content-type", "application/json")
+                .body(json_body(&ChannelEditRequest::default()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn channel_delete_defaults_force_1() {
+    let (port, mock) = boot_mock_webquery("API-KEY").await;
+    let state = fresh_state().await;
+    let server = seed_server(&state, port, "API-KEY").await;
+    let (_admin, atoken) = seed_user_with_token(&state, "alice", "admin").await;
+
+    let resp = app(state)
+        .oneshot(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri(format!("/api/servers/{}/vs/1/channels/3", server.id))
+                .header("authorization", auth_header(&atoken))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let last = mock
+        .captured_queries
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .expect("captured query");
+    assert_eq!(last.get("cid").map(String::as_str), Some("3"));
+    assert_eq!(last.get("force").map(String::as_str), Some("1"));
+}
+
+#[tokio::test]
+async fn channel_delete_passes_force_0() {
+    let (port, mock) = boot_mock_webquery("API-KEY").await;
+    let state = fresh_state().await;
+    let server = seed_server(&state, port, "API-KEY").await;
+    let (_admin, atoken) = seed_user_with_token(&state, "alice", "admin").await;
+
+    let resp = app(state)
+        .oneshot(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri(format!(
+                    "/api/servers/{}/vs/1/channels/3?force=0",
+                    server.id
+                ))
+                .header("authorization", auth_header(&atoken))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let last = mock
+        .captured_queries
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .expect("captured query");
+    assert_eq!(last.get("force").map(String::as_str), Some("0"));
+}
+
+#[tokio::test]
+async fn channel_delete_rejects_invalid_force() {
+    let (port, _mock) = boot_mock_webquery("API-KEY").await;
+    let state = fresh_state().await;
+    let server = seed_server(&state, port, "API-KEY").await;
+    let (_admin, atoken) = seed_user_with_token(&state, "alice", "admin").await;
+
+    let resp = app(state)
+        .oneshot(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri(format!(
+                    "/api/servers/{}/vs/1/channels/3?force=2",
+                    server.id
+                ))
+                .header("authorization", auth_header(&atoken))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn channel_move_forwards_cpid_and_order() {
+    let (port, mock) = boot_mock_webquery("API-KEY").await;
+    let state = fresh_state().await;
+    let server = seed_server(&state, port, "API-KEY").await;
+    let (_admin, atoken) = seed_user_with_token(&state, "alice", "admin").await;
+
+    let resp = app(state)
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/servers/{}/vs/1/channels/4/move", server.id))
+                .header("authorization", auth_header(&atoken))
+                .header("content-type", "application/json")
+                .body(json_body(&ChannelMoveRequest {
+                    cpid: 1,
+                    order: Some(2),
+                }))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let last = mock
+        .captured_queries
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .expect("captured query");
+    assert_eq!(last.get("cid").map(String::as_str), Some("4"));
+    assert_eq!(last.get("cpid").map(String::as_str), Some("1"));
+    assert_eq!(last.get("order").map(String::as_str), Some("2"));
+}
+
+#[tokio::test]
+async fn channel_create_unauthenticated_is_401() {
+    let (port, _mock) = boot_mock_webquery("API-KEY").await;
+    let state = fresh_state().await;
+    let server = seed_server(&state, port, "API-KEY").await;
+    let resp = app(state)
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/servers/{}/vs/1/channels", server.id))
+                .header("content-type", "application/json")
+                .body(json_body(&ChannelCreateRequest {
+                    channel_name: "Music".into(),
+                    ..Default::default()
+                }))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
