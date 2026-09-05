@@ -903,44 +903,58 @@ mod tests {
     /// failure mode: phase 1 streamed the video_id, phase 2 (`nsig_solve`)
     /// wedged and never produced a final reply.
     fn mock_streaming(path: PathBuf, lines: Vec<&'static str>, hang_after: Option<Duration>) {
-        mock_connections(path, vec![(lines, hang_after)]);
+        let _ready = mock_connections(path, vec![(lines, hang_after)]);
     }
 
     /// Accept `replies.len()` connections in order. Each entry is the
     /// streamed lines for that connection plus an optional hang before
     /// close. Used to exercise the warm-retry path (first blip, second
     /// success) without a real yt-dlp.
-    fn mock_connections(path: PathBuf, replies: Vec<(Vec<&'static str>, Option<Duration>)>) {
+    ///
+    /// Returns a oneshot that fires once the listener is bound. Each
+    /// accepted connection is handled on its own task: a hang on the
+    /// first (timeout-then-retry) must not block `accept` of the second,
+    /// or the retry would sit in the listen backlog, burn its own
+    /// `resolve_timeout`, and fail with `TimedOut` — the CI failure on
+    /// `warm_timeout_retries_once_and_succeeds`.
+    fn mock_connections(
+        path: PathBuf,
+        replies: Vec<(Vec<&'static str>, Option<Duration>)>,
+    ) -> tokio::sync::oneshot::Receiver<()> {
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let listener = UnixListener::bind(&path).unwrap();
+            let _ = ready_tx.send(());
             for (lines, hang_after) in replies {
                 let (mut stream, _) = listener.accept().await.unwrap();
-                // Drain the request line (the client half-closes its write side).
-                let mut byte = [0u8; 1];
-                loop {
-                    match stream.read(&mut byte).await {
-                        Ok(0) => break,
-                        Ok(_) => {
-                            if byte[0] == b'\n' {
-                                break;
+                tokio::spawn(async move {
+                    let mut byte = [0u8; 1];
+                    loop {
+                        match stream.read(&mut byte).await {
+                            Ok(0) => break,
+                            Ok(_) => {
+                                if byte[0] == b'\n' {
+                                    break;
+                                }
                             }
+                            Err(_) => break,
                         }
-                        Err(_) => break,
                     }
-                }
-                for line in lines {
-                    if stream.write_all(line.as_bytes()).await.is_err() {
-                        return;
+                    for line in lines {
+                        if stream.write_all(line.as_bytes()).await.is_err() {
+                            return;
+                        }
+                        let _ = stream.flush().await;
+                        tokio::time::sleep(Duration::from_millis(10)).await;
                     }
-                    let _ = stream.flush().await;
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-                if let Some(d) = hang_after {
-                    tokio::time::sleep(d).await;
-                }
-                let _ = stream.shutdown().await;
+                    if let Some(d) = hang_after {
+                        tokio::time::sleep(d).await;
+                    }
+                    let _ = stream.shutdown().await;
+                });
             }
         });
+        ready_rx
     }
 
     fn sock(name: &str) -> PathBuf {
@@ -1313,14 +1327,22 @@ mod tests {
     /// First attempt times out with no partial (the Contabo cliff); the
     /// helper sock is still accepting. The second warm request succeeds
     /// — subprocess must not run.
+    ///
+    /// The first connection parks (never replies) on its own task so the
+    /// mock can `accept` the retry immediately. A sequential hang-then-
+    /// accept let the retry connect (listen backlog) but never read a
+    /// reply, so both attempts returned `TimedOut`.
     #[tokio::test]
     async fn warm_timeout_retries_once_and_succeeds() {
         let path = sock("retry-ok");
         let _ = std::fs::remove_file(&path);
-        mock_connections(
+        let ready = mock_connections(
             path.clone(),
             vec![
-                (vec![], Some(Duration::from_secs(3))),
+                // Park: hang longer than resolve_timeout so attempt 1
+                // TimedOut, but do it on a sibling task (see
+                // `mock_connections`) so accept of attempt 2 is not blocked.
+                (vec![], Some(Duration::from_secs(30))),
                 (
                     vec![
                         "{\"ok\":true,\"direct_url\":\"https://cdn/x.webm\",\"title\":\"Song\"}\n",
@@ -1329,7 +1351,7 @@ mod tests {
                 ),
             ],
         );
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        ready.await.expect("mock listener bound");
 
         let handle = ResolverHandle::for_socket_with_timeouts(
             path.clone(),
@@ -1352,14 +1374,14 @@ mod tests {
     async fn empty_partial_retries_once_before_giving_up() {
         let path = sock("retry-empty");
         let _ = std::fs::remove_file(&path);
-        mock_connections(
+        let ready = mock_connections(
             path.clone(),
             vec![
                 (vec![], None), // EOF before a final reply
                 (vec![], None),
             ],
         );
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        ready.await.expect("mock listener bound");
 
         let handle = ResolverHandle::for_socket(path.clone());
         let mut retried = false;
