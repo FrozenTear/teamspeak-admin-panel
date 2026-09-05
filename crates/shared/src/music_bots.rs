@@ -177,11 +177,18 @@ pub struct MusicBotDetail {
     /// THE-927 — the YouTube query string the bot is currently resolving.
     /// `Some` between `BotEventWire::Resolving` and the matching
     /// `FirstFrameOnWire` / failure event; the FE renders a transient
-    /// "Resolving YouTube…" pill while it is set. `None` outside that
+    /// resolving pill while it is set. `None` outside that
     /// window, and elided from the wire by `skip_serializing_if` so the
     /// steady-state snapshot stays unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolving_query: Option<String>,
+    /// Set when the in-flight [`BotEventWire::Resolving`] is the
+    /// automatic warm-resolver retry (timeout / empty-partial blip).
+    /// Elided when `false` so the steady-state snapshot stays unchanged.
+    /// Panel binds this (or the live SSE `retrying` field) to show
+    /// "resolving / retrying…".
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resolving_retrying: bool,
 }
 
 /// `POST /music-library` body. Tags default to empty.
@@ -451,10 +458,18 @@ pub enum BotEventWire {
     /// THE-927 — a chat `!play yt:<query>` (or `!radio yt:<query>`)
     /// landed on an idle bot and the audio pipeline is now resolving the
     /// YouTube source + filling the prebuffer (~17 s median). The FE
-    /// renders a transient "Resolving YouTube…" pill against `query`
-    /// until `FirstFrameOnWire` arrives.
+    /// renders a transient resolving pill against `query` until
+    /// `FirstFrameOnWire` arrives.
+    ///
+    /// `retrying` is `true` when this is the pipeline's automatic second
+    /// warm-resolver attempt after a timeout / empty-partial blip.
+    /// Additive (`serde default`, elided when false) so existing Panel
+    /// clients keep showing the THE-927 pill; bind `retrying` to show
+    /// "resolving / retrying…".
     Resolving {
         query: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        retrying: bool,
     },
     /// THE-927 — the first Opus frame for the current track was just sent
     /// on the wire (the audible milestone). Subscribers clear any in-
@@ -641,6 +656,7 @@ mod tests {
     fn resolving_and_first_frame_round_trip() {
         let ev = BotEventWire::Resolving {
             query: "red leather last call".into(),
+            retrying: false,
         };
         let json = serde_json::to_string(&ev).unwrap();
         assert!(json.contains(r#""type":"resolving""#), "got: {json}");
@@ -648,10 +664,28 @@ mod tests {
             json.contains(r#""query":"red leather last call""#),
             "got: {json}",
         );
-        let back: BotEventWire = serde_json::from_str(&json).unwrap();
         assert!(
-            matches!(back, BotEventWire::Resolving { query } if query == "red leather last call")
+            !json.contains("retrying"),
+            "retrying=false must be elided: {json}"
         );
+        let back: BotEventWire = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            back,
+            BotEventWire::Resolving { query, retrying }
+                if query == "red leather last call" && !retrying
+        ));
+
+        let ev = BotEventWire::Resolving {
+            query: "red leather last call".into(),
+            retrying: true,
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains(r#""retrying":true"#), "got: {json}");
+        let back: BotEventWire = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            back,
+            BotEventWire::Resolving { retrying: true, .. }
+        ));
 
         let ev = BotEventWire::FirstFrameOnWire;
         let json = serde_json::to_string(&ev).unwrap();
@@ -676,9 +710,11 @@ mod tests {
             channel_id: None,
             last_error: None,
             resolving_query: None,
+            resolving_retrying: false,
         };
         let json = serde_json::to_string(&detail).unwrap();
         assert!(!json.contains("resolvingQuery"), "got: {json}");
+        assert!(!json.contains("resolvingRetrying"), "got: {json}");
 
         let detail = MusicBotDetail {
             resolving_query: Some("the killers - mr brightside".into()),
@@ -691,6 +727,15 @@ mod tests {
         );
         let back: MusicBotDetail = serde_json::from_str(&json).unwrap();
         assert_eq!(back, detail);
+
+        let detail = MusicBotDetail {
+            resolving_retrying: true,
+            ..detail
+        };
+        let json = serde_json::to_string(&detail).unwrap();
+        assert!(json.contains(r#""resolvingRetrying":true"#), "got: {json}");
+        let back: MusicBotDetail = serde_json::from_str(&json).unwrap();
+        assert!(back.resolving_retrying);
     }
 
     #[test]
@@ -707,6 +752,7 @@ mod tests {
             channel_id: None,
             last_error: None,
             resolving_query: None,
+            resolving_retrying: false,
         };
         let json = serde_json::to_string(&detail).unwrap();
         assert!(!json.contains("nowPlayingElapsedSecs"), "got: {json}");

@@ -543,4 +543,27 @@ mod tests {
         assert!(url.contains("?token="), "got: {url}");
         assert!(!url.contains("access_token"), "got: {url}");
     }
+
+    /// EventSource `onmessage` parses `BotEventWire` and must not drop
+    /// THE-927 `resolving` events — including the additive `retrying`
+    /// flag from Music Bot PR #21 (elided when false).
+    #[test]
+    fn resolving_sse_payload_accepts_additive_retrying() {
+        let first: wire::BotEventWire =
+            serde_json::from_str(r#"{"type":"resolving","query":"never gonna"}"#).unwrap();
+        assert!(matches!(
+            first,
+            wire::BotEventWire::Resolving {
+                retrying: false,
+                ..
+            }
+        ));
+        let retry: wire::BotEventWire =
+            serde_json::from_str(r#"{"type":"resolving","query":"never gonna","retrying":true}"#)
+                .unwrap();
+        assert!(matches!(
+            retry,
+            wire::BotEventWire::Resolving { retrying: true, .. }
+        ));
+    }
 }
