@@ -28,6 +28,7 @@
 
 pub mod api;
 pub mod auth;
+pub mod channels;
 pub mod debug;
 pub mod dioxus;
 pub mod flows;
