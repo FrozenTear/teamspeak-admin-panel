@@ -120,19 +120,22 @@ fn ChannelGroupsPageBody(props: ChannelGroupsPageBodyProps) -> Element {
 
     rsx! {
         div { class: "crumb", "Moderation · Channel groups · {server_name}" }
-        div { class: "mod-panel-head",
-            h1 { "Channel groups" }
-            if is_admin {
-                Button {
-                    variant: ButtonVariant::Primary,
-                    size: ButtonSize::Small,
-                    onclick: move |_| modal_open.set(true),
-                    "+ New group"
+        section { class: "page-header",
+            div { class: "page-title-block",
+                h1 { "Channel groups" }
+                p { class: "page-lede",
+                    "Permission groups that apply inside a channel. Unlike a server group, a client's channel group is scoped to one channel — they can hold a different channel group in every channel they enter."
                 }
             }
-        }
-        p { class: "info-hint",
-            "Permission groups that apply inside a channel. Unlike a server group, a client's channel group is scoped to one channel — they can hold a different channel group in every channel they enter."
+            if is_admin {
+                div { class: "page-actions",
+                    Button {
+                        variant: ButtonVariant::Primary,
+                        onclick: move |_| modal_open.set(true),
+                        "+ New group"
+                    }
+                }
+            }
         }
 
         if !is_admin {
@@ -145,23 +148,8 @@ fn ChannelGroupsPageBody(props: ChannelGroupsPageBodyProps) -> Element {
 
         match groups_snapshot {
             None => rsx! {
-                table { class: "data-table",
-                    thead {
-                        tr {
-                            th { scope: "col", "Name" }
-                            th { scope: "col", "Type" }
-                            th { scope: "col", "Members" }
-                            th { scope: "col", "Permissions" }
-                            th { scope: "col", class: "actions-col", "" }
-                        }
-                    }
-                    tbody {
-                        for i in 0..4 {
-                            tr { key: "{i}",
-                                td { colspan: "5", div { class: "skeleton sg-skeleton-row" } }
-                            }
-                        }
-                    }
+                div { class: "card", aria_busy: "true",
+                    p { class: "muted", "Loading channel groups…" }
                 }
             },
             Some(Err(e)) => rsx! {
@@ -185,11 +173,12 @@ fn ChannelGroupsPageBody(props: ChannelGroupsPageBodyProps) -> Element {
                     h3 { "No channel groups" }
                     p { "This server has no channel permission groups. TeamSpeak normally ships default channel groups — create one to get started." }
                     if is_admin {
-                        Button {
-                            variant: ButtonVariant::Primary,
-                            size: ButtonSize::Small,
-                            onclick: move |_| modal_open.set(true),
-                            "+ New group"
+                        div { class: "actions",
+                            Button {
+                                variant: ButtonVariant::Primary,
+                                onclick: move |_| modal_open.set(true),
+                                "+ New group"
+                            }
                         }
                     }
                 }
@@ -203,7 +192,7 @@ fn ChannelGroupsPageBody(props: ChannelGroupsPageBodyProps) -> Element {
                             th { scope: "col", "Type" }
                             th { scope: "col", class: "num-col", "Members" }
                             th { scope: "col", class: "num-col", "Permissions" }
-                            th { scope: "col", class: "actions-col", "" }
+                            th { scope: "col", class: "actions-col", "Actions" }
                         }
                     }
                     tbody {
@@ -263,7 +252,6 @@ struct GroupRowProps {
 /// data and a slow count never blocks the table.
 #[component]
 fn GroupRow(props: GroupRowProps) -> Element {
-    let nav = use_navigator();
     let gate = use_auth_gate();
     let g = props.group.clone();
     let cgid = g.cgid;
@@ -288,26 +276,18 @@ fn GroupRow(props: GroupRowProps) -> Element {
         _ => (None, None),
     };
 
-    let go_detail = move |_| {
-        nav.push(Route::ChannelGroupDetailPage { cgid });
-    };
     let on_delete = props.on_delete;
     let group_for_delete = g.clone();
 
     rsx! {
         tr { key: "{cgid}", class: "sg-row",
-            td {
-                class: "sg-name-cell",
-                role: "link",
-                tabindex: "0",
-                onclick: go_detail,
-                onkeydown: move |e: KeyboardEvent| {
-                    if matches!(e.key(), Key::Enter | Key::Character(_)) && e.key() == Key::Enter {
-                        nav.push(Route::ChannelGroupDetailPage { cgid });
-                    }
-                },
-                span { class: "sg-name", "{g.name}" }
-                span { class: "sg-id mono", "cgid {cgid}" }
+            td { class: "client-cell",
+                Link {
+                    to: Route::ChannelGroupDetailPage { cgid },
+                    class: "client-name",
+                    "{g.name}"
+                }
+                span { class: "client-uid", "cgid {cgid}" }
             }
             td {
                 span { class: "tag tag-neutral", "{group_type_label(g.group_type)}" }
@@ -315,10 +295,9 @@ fn GroupRow(props: GroupRowProps) -> Element {
             td { class: "num-col mono", {count_cell(members)} }
             td { class: "num-col mono", {count_cell(perms)} }
             td { class: "actions-col",
-                Button {
-                    variant: ButtonVariant::Ghost,
-                    size: ButtonSize::Small,
-                    onclick: go_detail,
+                Link {
+                    to: Route::ChannelGroupDetailPage { cgid },
+                    class: "btn btn-ghost btn-sm",
                     "Open"
                 }
                 if props.is_admin {
