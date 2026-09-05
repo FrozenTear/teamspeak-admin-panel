@@ -7,10 +7,15 @@
 //! - Tree assembly: the REST layer returns a flat list ordered by upstream
 //!   `channel_order`. We group by `pid`, recursing from the synthetic root
 //!   (channels with `pid == 0`).
-//! - Spacers (`channel_name` matching `[*r/l/c]nnnnn[…]` or all-glyph
-//!   names) render as horizontal rules — same heuristic the public widget
-//!   renderer (PURA-86) will use, kept module-local for now to avoid a
-//!   premature shared crate.
+//! - Spacers (`[l/c/r/*]spacer<n>]…`, `[*l/r/c]…`, or all-glyph names)
+//!   render as labelled rules — same heuristic the public widget renderer
+//!   (PURA-86) uses, kept module-local for now to avoid a premature
+//!   shared crate.
+//!
+//! Channel create / edit / delete / reorder are **not** wired. The control
+//! router only mounts `GET …/channels` (see `routes/control/channels.rs`);
+//! header and row actions render as disabled “coming soon” affordances so
+//! the chrome matches Music bots without inventing write routes.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -23,9 +28,16 @@ use crate::client::dioxus::{use_auth_gate, use_session};
 use crate::client::session::RefreshGate;
 use crate::client::store::AuthState;
 use crate::client::ws::use_ws_hub;
-use crate::ui::components::{Banner, BannerVariant};
+use crate::ui::components::{Banner, BannerVariant, Button, ButtonSize, ButtonVariant};
 use crate::ui::layout::use_servers_context;
 use crate::ui::pages::active_server;
+
+/// Tooltip on every write-shaped control. The control API has no
+/// channel POST/PUT/DELETE/reorder routes yet — do not invent them.
+const CHANNEL_WRITES_HINT: &str =
+    "Coming soon — channel create, edit, delete, and reorder are not on the control API yet.";
+
+const PAGE_LEDE: &str = "Live channel tree for the selected server. Occupied channels list clients underneath. Create, edit, delete, and reorder wait on write routes that are not shipped yet.";
 
 #[component]
 pub fn ChannelsPage() -> Element {
@@ -41,10 +53,9 @@ pub fn ChannelsPage() -> Element {
     let server = active_server::resolve(&servers_ctx.data.read(), &*storage);
     let Some(server) = server else {
         return rsx! {
-            div { class: "crumb", "Channels" }
-            h1 { "Channels" }
+            ChannelsChrome { server_name: None }
             div { class: "empty",
-                div { class: "icon", "#" }
+                div { class: "icon", aria_hidden: "true", "#" }
                 h3 { "No server selected" }
                 p { "Add a server to view its channel tree." }
             }
@@ -140,9 +151,18 @@ pub fn ChannelsPage() -> Element {
         });
     }
 
+    let channels_loading = channels_resource.read_unchecked().is_none();
+    let on_refresh = EventHandler::new({
+        let mut channels_resource = channels_resource;
+        let mut clients_resource = clients_resource;
+        move |_: ()| {
+            channels_resource.restart();
+            clients_resource.restart();
+        }
+    });
+
     rsx! {
-        div { class: "crumb", "Channels · {server_name}" }
-        h1 { "Channels" }
+        ChannelsChrome { server_name: Some(server_name) }
 
         if let Some(err) = error.read().as_ref() {
             Banner { variant: BannerVariant::Danger, title: "Could not load channels".to_string(),
@@ -157,6 +177,33 @@ pub fn ChannelsPage() -> Element {
             ChannelsTree {
                 channels: channels.read().clone(),
                 clients: clients.read().clone(),
+                loading: channels_loading,
+                on_refresh: on_refresh,
+            }
+        }
+    }
+}
+
+#[component]
+fn ChannelsChrome(server_name: Option<String>) -> Element {
+    let crumb = match server_name.as_deref() {
+        Some(name) => format!("Channels · {name}"),
+        None => "Channels".into(),
+    };
+    rsx! {
+        div { class: "crumb", "{crumb}" }
+        section { class: "page-header",
+            div { class: "page-title-block",
+                h1 { "Channels" }
+                p { class: "page-lede", "{PAGE_LEDE}" }
+            }
+            div { class: "page-actions",
+                Button {
+                    variant: ButtonVariant::Primary,
+                    disabled: true,
+                    title: Some(CHANNEL_WRITES_HINT.to_string()),
+                    "+ New channel"
+                }
             }
         }
     }
@@ -166,26 +213,62 @@ pub fn ChannelsPage() -> Element {
 struct ChannelsTreeProps {
     channels: Vec<ChannelTreeNode>,
     clients: Vec<ClientListItem>,
+    loading: bool,
+    on_refresh: EventHandler<()>,
 }
 
 #[component]
 fn ChannelsTree(props: ChannelsTreeProps) -> Element {
+    if props.loading && props.channels.is_empty() {
+        return rsx! {
+            div { class: "card", aria_busy: "true",
+                p { class: "muted", "Loading channels…" }
+            }
+        };
+    }
     if props.channels.is_empty() {
         return rsx! {
             div { class: "empty",
-                div { class: "icon", "#" }
+                div { class: "icon", aria_hidden: "true", "#" }
                 h3 { "No channels yet" }
-                p { "Configured channels will appear here." }
+                p { "Configured channels will appear here once the selected server reports a tree." }
+                div { class: "actions",
+                    Button {
+                        variant: ButtonVariant::Primary,
+                        disabled: true,
+                        title: Some(CHANNEL_WRITES_HINT.to_string()),
+                        "+ New channel"
+                    }
+                }
             }
         };
     }
     let groups = group_by_parent(&props.channels);
     let clients_by_cid = group_clients(&props.clients);
+    let visible_clients = clients_by_cid.values().map(|v| v.len()).sum::<usize>();
+    let channel_count = props.channels.len();
+    let on_refresh = props.on_refresh;
 
     rsx! {
-        ul { class: "channel-tree",
-            "aria-label": "Channel tree",
-            ChannelChildren { pid: 0, depth: 0, groups: groups.clone(), clients: clients_by_cid.clone() }
+        div { class: "channel-tree-panel",
+            div { class: "channel-tree-toolbar",
+                div { class: "channel-tree-toolbar-meta",
+                    span { class: "channel-tree-count",
+                        "{channel_count} channels · {visible_clients} clients"
+                    }
+                    span { class: "channel-tree-hint", "Read-only · live" }
+                }
+                Button {
+                    variant: ButtonVariant::Secondary,
+                    size: ButtonSize::Small,
+                    onclick: move |_| on_refresh.call(()),
+                    "Refresh"
+                }
+            }
+            ul { class: "channel-tree",
+                "aria-label": "Channel tree",
+                ChannelChildren { pid: 0, depth: 0, groups: groups.clone(), clients: clients_by_cid.clone() }
+            }
         }
     }
 }
@@ -209,31 +292,46 @@ fn ChannelChildren(props: ChannelChildrenProps) -> Element {
             {
                 let c = c.clone();
                 let cid = c.cid;
-                let is_spacer = is_spacer(&c.channel_name);
+                let kind = spacer_kind(&c.channel_name);
                 let groups = props.groups.clone();
                 let clients = props.clients.clone();
                 let depth = props.depth;
                 let row_clients = clients.get(&cid).cloned().unwrap_or_default();
+                let has_children = groups.get(&cid).is_some_and(|k| !k.is_empty());
+                let row_class = if is_spacer(&c.channel_name) {
+                    "channel-row channel-spacer"
+                } else {
+                    "channel-row"
+                };
                 rsx! {
                     li { key: "{cid}",
-                        class: if is_spacer { "channel-row channel-spacer" } else { "channel-row" },
+                        class: "{row_class}",
                         style: "--channel-depth: {depth}",
-                        ChannelHeader { node: c.clone(), is_spacer: is_spacer, client_count: row_clients.len() }
+                        ChannelHeader {
+                            node: c.clone(),
+                            spacer: kind,
+                            client_count: row_clients.len(),
+                        }
                         if !row_clients.is_empty() {
                             ul { class: "channel-clients",
+                                "aria-label": "Clients in {c.channel_name}",
                                 for r in row_clients.iter() {
-                                    li { key: "client-{r.clid}",
-                                        class: "channel-client",
-                                        span { class: "client-name", "{r.client_nickname}" }
+                                    {
+                                        let r = r.clone();
+                                        rsx! { ChannelClientBadge { client: r } }
                                     }
                                 }
                             }
                         }
-                        ChannelChildren {
-                            pid: cid,
-                            depth: depth + 1,
-                            groups: groups,
-                            clients: clients,
+                        if has_children {
+                            ul { class: "channel-tree-children",
+                                ChannelChildren {
+                                    pid: cid,
+                                    depth: depth + 1,
+                                    groups: groups,
+                                    clients: clients,
+                                }
+                            }
                         }
                     }
                 }
@@ -245,35 +343,173 @@ fn ChannelChildren(props: ChannelChildrenProps) -> Element {
 #[derive(Props, Clone, PartialEq)]
 struct ChannelHeaderProps {
     node: ChannelTreeNode,
-    is_spacer: bool,
+    spacer: Option<SpacerKind>,
     client_count: usize,
 }
 
 #[component]
 fn ChannelHeader(props: ChannelHeaderProps) -> Element {
     let n = props.node;
-    if props.is_spacer {
+    if let Some(kind) = props.spacer {
         return rsx! {
-            div { class: "spacer",
-                "aria-hidden": "true",
-                span { "{n.channel_name}" }
+            div { class: "channel-row-body",
+                ChannelSpacer { name: n.channel_name.clone(), kind: kind }
             }
         };
     }
+    let topic = n.channel_topic.trim();
     rsx! {
-        div { class: "channel-header",
-            span { class: "channel-name", "{n.channel_name}" }
-            span { class: "channel-meta",
-                if n.channel_flag_password != 0 { span { "title": "Password protected", "🔒" } }
-                if n.channel_flag_default != 0 { span { class: "tag", "default" } }
-                if n.channel_flag_permanent != 0 { span { class: "tag", "permanent" } }
-                else if n.channel_flag_semi_permanent != 0 { span { class: "tag", "semi-permanent" } }
-                span { class: "client-count",
-                    "{props.client_count}"
-                    if n.channel_maxclients > 0 {
-                        " / {n.channel_maxclients}"
+        div { class: "channel-row-body",
+            div { class: "channel-header",
+                div { class: "channel-identity",
+                    div { class: "channel-identity-row",
+                        span { class: "channel-glyph", aria_hidden: "true", "#" }
+                        span { class: "channel-name", "{n.channel_name}" }
+                    }
+                    if !topic.is_empty() {
+                        span { class: "channel-topic", "{topic}" }
                     }
                 }
+                div { class: "channel-meta",
+                    if n.channel_flag_password != 0 {
+                        span { class: "tag tag-warning", title: "Password protected",
+                            span { class: "tag-icn", aria_hidden: "true", "🔒" }
+                            "Password"
+                        }
+                    }
+                    if n.channel_flag_default != 0 {
+                        span { class: "tag tag-info", "Default" }
+                    }
+                    if n.channel_flag_permanent != 0 {
+                        span { class: "tag tag-neutral", "Permanent" }
+                    } else if n.channel_flag_semi_permanent != 0 {
+                        span { class: "tag tag-neutral", "Semi-permanent" }
+                    }
+                    span {
+                        class: "tag tag-neutral channel-count",
+                        title: "Clients in this channel",
+                        "{props.client_count}"
+                        if n.channel_maxclients > 0 {
+                            " / {n.channel_maxclients}"
+                        }
+                    }
+                }
+            }
+            ComingSoonActions {}
+        }
+    }
+}
+
+#[component]
+fn ComingSoonActions() -> Element {
+    rsx! {
+        div { class: "row-actions channel-row-actions",
+            Button {
+                variant: ButtonVariant::Ghost,
+                size: ButtonSize::Small,
+                disabled: true,
+                title: Some(CHANNEL_WRITES_HINT.to_string()),
+                "Edit"
+            }
+            Button {
+                variant: ButtonVariant::Ghost,
+                size: ButtonSize::Small,
+                disabled: true,
+                title: Some(CHANNEL_WRITES_HINT.to_string()),
+                aria_label: Some("Move up — coming soon".into()),
+                "↑"
+            }
+            Button {
+                variant: ButtonVariant::Ghost,
+                size: ButtonSize::Small,
+                disabled: true,
+                title: Some(CHANNEL_WRITES_HINT.to_string()),
+                aria_label: Some("Move down — coming soon".into()),
+                "↓"
+            }
+            Button {
+                variant: ButtonVariant::Danger,
+                size: ButtonSize::Small,
+                disabled: true,
+                title: Some(CHANNEL_WRITES_HINT.to_string()),
+                "Delete"
+            }
+        }
+    }
+}
+
+#[derive(Props, Clone, PartialEq)]
+struct ChannelSpacerProps {
+    name: String,
+    kind: SpacerKind,
+}
+
+#[component]
+fn ChannelSpacer(props: ChannelSpacerProps) -> Element {
+    let label = spacer_text(&props.name);
+    match props.kind {
+        SpacerKind::Line => rsx! {
+            div { class: "channel-spacer-line", "aria-hidden": "true" }
+        },
+        SpacerKind::Dashline => rsx! {
+            div { class: "channel-spacer-line dashed", "aria-hidden": "true" }
+        },
+        SpacerKind::Dotline => rsx! {
+            div { class: "channel-spacer-line dotted", "aria-hidden": "true" }
+        },
+        SpacerKind::Left | SpacerKind::Center | SpacerKind::Right => {
+            let align = match props.kind {
+                SpacerKind::Center => "center",
+                SpacerKind::Right => "right",
+                _ => "left",
+            };
+            let shown = if label.is_empty() {
+                props.name.clone()
+            } else {
+                label
+            };
+            rsx! {
+                div {
+                    class: "channel-spacer-label {align}",
+                    "aria-hidden": "true",
+                    "{shown}"
+                }
+            }
+        }
+    }
+}
+
+#[derive(Props, Clone, PartialEq)]
+struct ChannelClientBadgeProps {
+    client: ClientListItem,
+}
+
+#[component]
+fn ChannelClientBadge(props: ChannelClientBadgeProps) -> Element {
+    let r = props.client;
+    let away = r.client_away != 0;
+    let muted = r.client_input_muted != 0 || r.client_output_muted != 0 || r.client_is_talker == 0;
+    let talking = r.client_flag_talking != 0 && !muted;
+    let mut class = String::from("channel-client");
+    if away {
+        class.push_str(" is-away");
+    }
+    if muted {
+        class.push_str(" is-muted");
+    }
+    if talking {
+        class.push_str(" is-talking");
+    }
+    rsx! {
+        li { key: "client-{r.clid}",
+            class: "{class}",
+            span { class: "client-dot", aria_hidden: "true" }
+            span { class: "client-name", "{r.client_nickname}" }
+            if away {
+                span { class: "client-flag", title: "{r.client_away_message}", "away" }
+            }
+            if muted {
+                span { class: "client-flag", "muted" }
             }
         }
     }
@@ -304,25 +540,105 @@ fn group_clients(rows: &[ClientListItem]) -> Arc<HashMap<i64, Vec<ClientListItem
     Arc::new(map)
 }
 
-/// Recognise TS spacer channels — names of the form `[*spacer]…`,
-/// `[*l/r/c]…`, or made entirely of repeated separator glyphs. The TS
-/// desktop client treats these as visual dividers, not joinable channels.
+/// Visual treatment for a TeamSpeak spacer channel.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SpacerKind {
+    Line,
+    Dashline,
+    Dotline,
+    Left,
+    Center,
+    Right,
+}
+
+/// Recognise TS spacer channels — spec §27.2 `[<prefix>spacer<n>]<text>`,
+/// the `[*l/r/c]…` shorthand, or names made entirely of separator glyphs.
 fn is_spacer(name: &str) -> bool {
-    if name.starts_with("[*spacer") {
-        return true;
+    spacer_kind(name).is_some()
+}
+
+fn spacer_kind(name: &str) -> Option<SpacerKind> {
+    if let Some(kind) = spacer_from_bracket(name) {
+        return Some(kind);
     }
-    if name.starts_with("[*l") || name.starts_with("[*r") || name.starts_with("[*c") {
-        return true;
+    if let Some(kind) = spacer_from_shorthand(name) {
+        return Some(kind);
     }
-    // All-glyph spacers: fewer than 3 chars or all of "─=*-—_.·".
-    if !name.is_empty()
+    if is_glyph_spacer(name) {
+        return Some(SpacerKind::Line);
+    }
+    None
+}
+
+/// Spec §27.2: `^\[([lcr]?\*?)spacer\d*\](.*)$/i`.
+fn spacer_from_bracket(name: &str) -> Option<SpacerKind> {
+    let bytes = name.as_bytes();
+    if bytes.first().copied() != Some(b'[') {
+        return None;
+    }
+    let close = name.find(']')?;
+    let inside = &name[1..close];
+    let lower = inside.to_ascii_lowercase();
+    let spacer_pos = lower.find("spacer")?;
+    let prefix = &lower[..spacer_pos];
+    if !matches!(prefix, "" | "l" | "c" | "r" | "*" | "l*" | "c*" | "r*") {
+        return None;
+    }
+    let trailing = &lower[spacer_pos + "spacer".len()..];
+    if !trailing.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let text = &name[close + 1..];
+    Some(classify_spacer_text(prefix, text))
+}
+
+/// `[*l]`, `[*r]`, `[*c]` — kept so the original tree heuristic still
+/// treats those names as dividers even when they omit the `spacer` token.
+fn spacer_from_shorthand(name: &str) -> Option<SpacerKind> {
+    if name.starts_with("[*l") {
+        return Some(SpacerKind::Left);
+    }
+    if name.starts_with("[*r") {
+        return Some(SpacerKind::Right);
+    }
+    if name.starts_with("[*c") {
+        return Some(SpacerKind::Center);
+    }
+    None
+}
+
+fn classify_spacer_text(prefix: &str, text: &str) -> SpacerKind {
+    if text == "---" {
+        return SpacerKind::Dashline;
+    }
+    if text == "..." {
+        return SpacerKind::Dotline;
+    }
+    if !text.is_empty()
+        && text
+            .chars()
+            .all(|c| matches!(c, '=' | '-' | '_' | '.' | '─' | '—'))
+    {
+        return SpacerKind::Line;
+    }
+    match prefix {
+        "c" | "c*" => SpacerKind::Center,
+        "r" | "r*" => SpacerKind::Right,
+        _ => SpacerKind::Left,
+    }
+}
+
+fn spacer_text(name: &str) -> String {
+    name.find(']')
+        .map(|close| name[close + 1..].to_string())
+        .unwrap_or_default()
+}
+
+fn is_glyph_spacer(name: &str) -> bool {
+    !name.is_empty()
         && name
             .chars()
             .all(|c| matches!(c, '─' | '=' | '*' | '-' | '—' | '_' | '.' | '·'))
-    {
-        return true;
-    }
-    false
 }
 
 async fn fetch_channels(
@@ -414,8 +730,24 @@ mod tests {
         assert!(is_spacer("[*l]"));
         assert!(is_spacer("─────"));
         assert!(is_spacer("****"));
+        assert!(is_spacer("[cspacer]Hello"));
+        assert!(is_spacer("[lspacer]Left"));
+        assert!(is_spacer("[rspacer3]Right"));
         assert!(!is_spacer("Lobby"));
         assert!(!is_spacer("Channel 12"));
+        assert!(!is_spacer("[chat] room"));
+    }
+
+    #[test]
+    fn spacer_kind_classifies_alignment_and_rules() {
+        assert_eq!(spacer_kind("[cspacer]Hello"), Some(SpacerKind::Center));
+        assert_eq!(spacer_kind("[lspacer]Left"), Some(SpacerKind::Left));
+        assert_eq!(spacer_kind("[rspacer3]Right"), Some(SpacerKind::Right));
+        assert_eq!(spacer_kind("[spacer]---"), Some(SpacerKind::Dashline));
+        assert_eq!(spacer_kind("[spacer]..."), Some(SpacerKind::Dotline));
+        assert_eq!(spacer_kind("[*spacer1]====="), Some(SpacerKind::Line));
+        assert_eq!(spacer_kind("─────"), Some(SpacerKind::Line));
+        assert_eq!(spacer_text("[cspacer]Hello"), "Hello");
     }
 
     #[test]
