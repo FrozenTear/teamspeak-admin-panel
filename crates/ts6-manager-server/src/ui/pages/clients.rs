@@ -34,6 +34,8 @@ use crate::ui::components::{Banner, BannerVariant, Button, ButtonSize, ButtonVar
 use crate::ui::layout::use_servers_context;
 use crate::ui::pages::active_server;
 
+const PAGE_LEDE: &str = "Live clients on the selected server. Filter by nickname, unique ID, or channel. Kick, mute, or move without leaving the list.";
+
 #[component]
 pub fn ClientsPage() -> Element {
     let session = use_session();
@@ -49,8 +51,7 @@ pub fn ClientsPage() -> Element {
     let server = active_server::resolve(&servers_ctx.data.read(), &*storage);
     let Some(server) = server else {
         return rsx! {
-            div { class: "crumb", "Clients" }
-            h1 { "Clients" }
+            ClientsChrome { server_name: None, filter: None, match_count: None }
             div { class: "empty",
                 div { class: "icon", "◆" }
                 h3 { "No server selected" }
@@ -77,6 +78,8 @@ pub fn ClientsPage() -> Element {
     // signal so action handlers can mutate it optimistically.
     let mut rows: Signal<Vec<ClientListItem>> = use_signal(Vec::<ClientListItem>::new);
     let mut last_error: Signal<Option<ApiError>> = use_signal(|| None::<ApiError>);
+    let mut loading: Signal<bool> = use_signal(|| true);
+    let mut filter: Signal<String> = use_signal(String::new);
     let mut server_changed_marker: Signal<i64> = use_signal(|| 0i64);
 
     // When the snapshot resolves, write it into the working copy. The
@@ -85,11 +88,17 @@ pub fn ClientsPage() -> Element {
     // re-run of side-effecting code.
     {
         use_effect(move || {
-            if let Some(Ok(list)) = &*snapshot.read_unchecked() {
-                rows.set(list.clone());
-                last_error.set(None);
-            } else if let Some(Err(e)) = &*snapshot.read_unchecked() {
-                last_error.set(Some(e.clone()));
+            match &*snapshot.read_unchecked() {
+                Some(Ok(list)) => {
+                    rows.set(list.clone());
+                    last_error.set(None);
+                    loading.set(false);
+                }
+                Some(Err(e)) => {
+                    last_error.set(Some(e.clone()));
+                    loading.set(false);
+                }
+                None => loading.set(true),
             }
             server_changed_marker.set(server_id);
         });
@@ -213,9 +222,21 @@ pub fn ClientsPage() -> Element {
         }
     };
 
+    let all_rows = rows.read().clone();
+    let query = filter.read().clone();
+    let visible = filter_clients(&all_rows, &query);
+    let match_count = if query.trim().is_empty() {
+        None
+    } else {
+        Some((visible.len(), all_rows.len()))
+    };
+
     rsx! {
-        div { class: "crumb", "Clients · {server_name}" }
-        h1 { "Clients" }
+        ClientsChrome {
+            server_name: Some(server_name),
+            filter: Some(filter),
+            match_count,
+        }
 
         if let Some(err) = last_error.read().as_ref() {
             Banner { variant: BannerVariant::Danger, title: "Could not load clients".to_string(),
@@ -227,28 +248,78 @@ pub fn ClientsPage() -> Element {
         }
 
         section { class: "stack-md",
-            ClientsTable {
-                rows: rows.read().clone(),
-                on_kick_server: {
-                    let k = make_kick.clone();
-                    EventHandler::new(move |clid: i64| k(clid, KickKind::Server))
-                },
-                on_kick_channel: {
-                    let k = make_kick.clone();
-                    EventHandler::new(move |clid: i64| k(clid, KickKind::Channel))
-                },
-                on_mute: {
-                    let m = make_mute.clone();
-                    EventHandler::new(move |clid: i64| m(clid, true))
-                },
-                on_unmute: {
-                    let m = make_mute.clone();
-                    EventHandler::new(move |clid: i64| m(clid, false))
-                },
-                on_move: {
-                    let mv = make_move.clone();
-                    EventHandler::new(move |args: (i64, i64)| mv(args.0, args.1))
-                },
+            if *loading.read() && all_rows.is_empty() {
+                div { class: "card", aria_busy: "true",
+                    p { class: "muted", "Loading clients…" }
+                }
+            } else {
+                ClientsTable {
+                    rows: visible,
+                    has_any_clients: !all_rows.is_empty(),
+                    filter_active: !query.trim().is_empty(),
+                    on_kick_server: {
+                        let k = make_kick.clone();
+                        EventHandler::new(move |clid: i64| k(clid, KickKind::Server))
+                    },
+                    on_kick_channel: {
+                        let k = make_kick.clone();
+                        EventHandler::new(move |clid: i64| k(clid, KickKind::Channel))
+                    },
+                    on_mute: {
+                        let m = make_mute.clone();
+                        EventHandler::new(move |clid: i64| m(clid, true))
+                    },
+                    on_unmute: {
+                        let m = make_mute.clone();
+                        EventHandler::new(move |clid: i64| m(clid, false))
+                    },
+                    on_move: {
+                        let mv = make_move.clone();
+                        EventHandler::new(move |args: (i64, i64)| mv(args.0, args.1))
+                    },
+                }
+            }
+        }
+    }
+}
+
+#[derive(Props, Clone, PartialEq)]
+struct ClientsChromeProps {
+    server_name: Option<String>,
+    filter: Option<Signal<String>>,
+    match_count: Option<(usize, usize)>,
+}
+
+#[component]
+fn ClientsChrome(props: ClientsChromeProps) -> Element {
+    let crumb = match props.server_name.as_deref() {
+        Some(name) => format!("Clients · {name}"),
+        None => "Clients".into(),
+    };
+    rsx! {
+        div { class: "crumb", "{crumb}" }
+        section { class: "page-header",
+            div { class: "page-title-block",
+                h1 { "Clients" }
+                p { class: "page-lede", "{PAGE_LEDE}" }
+            }
+            if let Some(mut filter) = props.filter {
+                div { class: "page-actions",
+                    label { class: "sr-only", r#for: "clients-filter", "Filter clients" }
+                    input {
+                        id: "clients-filter",
+                        class: "input list-filter",
+                        r#type: "search",
+                        placeholder: "Filter by nickname, unique ID, or channel",
+                        value: "{filter.read()}",
+                        oninput: move |e| filter.set(e.value()),
+                    }
+                    if let Some((shown, total)) = props.match_count {
+                        span { class: "list-filter-meta", role: "status", "aria-live": "polite",
+                            "{shown} of {total}"
+                        }
+                    }
+                }
             }
         }
     }
@@ -257,6 +328,8 @@ pub fn ClientsPage() -> Element {
 #[derive(Props, Clone, PartialEq)]
 struct ClientsTableProps {
     rows: Vec<ClientListItem>,
+    has_any_clients: bool,
+    filter_active: bool,
     on_kick_server: EventHandler<i64>,
     on_kick_channel: EventHandler<i64>,
     on_mute: EventHandler<i64>,
@@ -267,11 +340,21 @@ struct ClientsTableProps {
 #[component]
 fn ClientsTable(props: ClientsTableProps) -> Element {
     if props.rows.is_empty() {
-        return rsx! {
-            div { class: "empty",
-                div { class: "icon", "◆" }
-                h3 { "No clients online" }
-                p { "When a client connects, they'll appear here." }
+        return if props.filter_active && props.has_any_clients {
+            rsx! {
+                div { class: "empty",
+                    div { class: "icon", "○" }
+                    h3 { "No matches" }
+                    p { "Try a different search term, or clear the filter." }
+                }
+            }
+        } else {
+            rsx! {
+                div { class: "empty",
+                    div { class: "icon", "◆" }
+                    h3 { "No clients online" }
+                    p { "When a client connects, they'll appear here." }
+                }
             }
         };
     }
@@ -304,7 +387,7 @@ fn ClientsTable(props: ClientsTableProps) -> Element {
                             tr { key: "{clid}",
                                 td { class: "client-cell",
                                     span { class: "client-name", "{r.client_nickname}" }
-                                    span { class: "client-uid", "{r.client_unique_identifier}" }
+                                    UniqueIdAffordance { uid: r.client_unique_identifier.clone() }
                                 }
                                 td { "{cid}" }
                                 td {
@@ -464,6 +547,65 @@ fn default_reason(kind: KickKind) -> String {
     }
 }
 
+/// Client-side list filter — nickname, unique ID, session id, channel
+/// id, or database id. Empty / whitespace query matches every row.
+fn filter_clients(rows: &[ClientListItem], query: &str) -> Vec<ClientListItem> {
+    let needle = query.trim();
+    if needle.is_empty() {
+        return rows.to_vec();
+    }
+    rows.iter()
+        .filter(|row| client_matches(row, needle))
+        .cloned()
+        .collect()
+}
+
+fn client_matches(row: &ClientListItem, needle: &str) -> bool {
+    let needle_lc = needle.to_ascii_lowercase();
+    row.client_nickname
+        .to_ascii_lowercase()
+        .contains(&needle_lc)
+        || row
+            .client_unique_identifier
+            .to_ascii_lowercase()
+            .contains(&needle_lc)
+        || row.clid.to_string().contains(needle)
+        || row.cid.to_string().contains(needle)
+        || row.client_database_id.to_string().contains(needle)
+}
+
+/// Unique ID under the nickname: CSS-truncated, full value on hover,
+/// click copies the complete identifier.
+#[component]
+fn UniqueIdAffordance(uid: String) -> Element {
+    let copy_uid = uid.clone();
+    rsx! {
+        button {
+            r#type: "button",
+            class: "client-uid client-uid-copy",
+            title: "{uid} — click to copy",
+            "aria-label": "Copy unique ID {uid}",
+            onclick: move |_| copy_to_clipboard(&copy_uid),
+            "{uid}"
+        }
+    }
+}
+
+/// Best-effort copy of `text` to the system clipboard. No-op off the
+/// browser (SSR / unit tests). Mirrors `ui::pages::widgets::copy_to_clipboard`.
+fn copy_to_clipboard(text: &str) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(window) = web_sys::window() {
+            let _ = window.navigator().clipboard().write_text(text);
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = text;
+    }
+}
+
 fn format_error(err: &ApiError) -> String {
     match err {
         ApiError::BadGateway {
@@ -503,6 +645,7 @@ mod tests {
             client_database_id: clid + 100,
             client_type: 0,
             client_nickname: format!("user-{clid}"),
+            client_unique_identifier: format!("uid-hash-{clid}/ABCDEFGHIJKLMNOPQRSTUV=="),
             ..Default::default()
         }
     }
@@ -569,5 +712,48 @@ mod tests {
         let mut rows = vec![row(5)];
         apply_event(&mut rows, &evt("ts:server:edited", json!({})));
         assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn filter_empty_query_keeps_every_row() {
+        let rows = vec![row(1), row(2)];
+        assert_eq!(filter_clients(&rows, "").len(), 2);
+        assert_eq!(filter_clients(&rows, "   ").len(), 2);
+    }
+
+    #[test]
+    fn filter_matches_nickname_case_insensitively() {
+        let rows = vec![row(1), row(2)];
+        let hits = filter_clients(&rows, "USER-2");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].clid, 2);
+    }
+
+    #[test]
+    fn filter_matches_unique_id_substring() {
+        let rows = vec![row(1), row(2)];
+        let hits = filter_clients(&rows, "uid-hash-1");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].clid, 1);
+    }
+
+    #[test]
+    fn filter_matches_channel_and_session_ids() {
+        let mut other = row(9);
+        other.cid = 42;
+        let rows = vec![row(1), other];
+        assert_eq!(filter_clients(&rows, "42")[0].clid, 9);
+        assert_eq!(filter_clients(&rows, "109")[0].clid, 9);
+    }
+
+    #[test]
+    fn filter_no_match_returns_empty() {
+        let rows = vec![row(1)];
+        assert!(filter_clients(&rows, "zzzz-no-such-client").is_empty());
+    }
+
+    #[test]
+    fn copy_to_clipboard_is_a_noop_on_native() {
+        copy_to_clipboard("anything");
     }
 }

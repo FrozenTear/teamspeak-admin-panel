@@ -310,19 +310,23 @@ fn TokensPageBody(props: TokensPageBodyProps) -> Element {
     let load_error = error.read().clone();
 
     rsx! {
-        div { class: "crumb", "Moderation · {server_name}" }
-        div { class: "page-header",
-            h1 { "Privilege keys" }
-            if is_admin {
-                Button {
-                    variant: ButtonVariant::Primary,
-                    onclick: open_create.clone(),
-                    "+ Create key"
+        div { class: "crumb", "Moderation · Privilege keys · {server_name}" }
+        section { class: "page-header",
+            div { class: "page-title-block",
+                h1 { "Privilege keys" }
+                p { class: "page-lede",
+                    "One-time codes a client redeems to join a server or channel group."
                 }
             }
-        }
-        p { class: "muted",
-            "One-time codes a client redeems to join a server or channel group."
+            if is_admin {
+                div { class: "page-actions",
+                    Button {
+                        variant: ButtonVariant::Primary,
+                        onclick: open_create.clone(),
+                        "+ Create key"
+                    }
+                }
+            }
         }
 
         // ── the four list states ──────────────────────────────────────

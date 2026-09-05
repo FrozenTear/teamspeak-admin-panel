@@ -231,7 +231,7 @@ pub fn Sidebar(props: SidebarProps) -> Element {
                         active: perm_catalog_active,
                     }
                     NavItem { icon: "⊘", label: "Bans", to: Route::BansPage {}, active: bans_active }
-                    NavItem { icon: "∘", label: "Tokens", to: Route::TokensPage {}, active: tokens_active }
+                    NavItem { icon: "∘", label: "Privilege keys", to: Route::TokensPage {}, active: tokens_active }
                     // PURA-287 — moderation case + complaint queue.
                     NavItem { icon: "⚖", label: "Cases", to: Route::ModerationQueuePage {}, active: moderation_active }
                     // PURA-303 — per-rule automod metrics.
@@ -440,7 +440,7 @@ mod tests {
         // PURA-287 has converted "Complaints" into the real "Cases" nav
         // item (the /moderation queue). PURA-380 has converted the five
         // Moderation placeholders (Server groups, Channel groups,
-        // Permissions, Tokens, Messages) into real nav items. Remaining
+        // Permissions, Privilege keys, Messages) into real nav items. Remaining
         // placeholders: 1 × Server (Files), 1 × Automation (Bots), 1 ×
         // Admin (Instance) = 3. The count is the authoritative signal here
         // — adding/removing a real route should bump it.
@@ -533,6 +533,21 @@ mod tests {
         let mut dom = VirtualDom::new(root).with_root_context(history);
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
+    }
+
+    /// Privilege keys (not “Tokens”) is the operator-facing label on the
+    /// sidebar, matching the tokens page heading and crumb.
+    #[test]
+    fn privilege_keys_nav_label_matches_page() {
+        let html = render_sidebar_harness();
+        assert!(
+            html.contains("Privilege keys"),
+            "sidebar must label the tokens route Privilege keys: {html}"
+        );
+        assert!(
+            html.contains(r#"href="/moderation/tokens""#),
+            "Privilege keys nav must still link to /moderation/tokens: {html}"
+        );
     }
 
     /// PURA-392 acceptance: at `/moderation/permissions`, the Permissions nav

@@ -175,19 +175,18 @@ fn ChannelGroupDetailBody(props: ChannelGroupDetailBodyProps) -> Element {
             Link { to: Route::ChannelGroupsPage {}, "Moderation · Channel groups" }
             " · {group_name}"
         }
-        div { class: "mod-panel-head",
-            div {
+        section { class: "page-header",
+            div { class: "page-title-block",
                 h1 { "{group_name}" }
-                p { class: "info-hint",
+                p { class: "page-lede",
                     span { class: "tag tag-neutral", "{group_type_label(group.group_type)}" }
                     " · cgid {cgid}"
                 }
             }
             if is_admin {
-                div { class: "sg-detail-actions",
+                div { class: "page-actions",
                     Button {
                         variant: ButtonVariant::Danger,
-                        size: ButtonSize::Small,
                         disabled: protected,
                         title: if protected { "Server-managed group — cannot be deleted" } else { "Delete this channel group" },
                         onclick: move |_| {

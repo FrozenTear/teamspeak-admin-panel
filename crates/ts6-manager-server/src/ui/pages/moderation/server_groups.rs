@@ -131,19 +131,22 @@ fn ServerGroupsPageBody(props: ServerGroupsPageBodyProps) -> Element {
 
     rsx! {
         div { class: "crumb", "Moderation · Server groups · {server_name}" }
-        div { class: "mod-panel-head",
-            h1 { "Server groups" }
-            if is_admin {
-                Button {
-                    variant: ButtonVariant::Primary,
-                    size: ButtonSize::Small,
-                    onclick: move |_| modal_open.set(true),
-                    "+ New group"
+        section { class: "page-header",
+            div { class: "page-title-block",
+                h1 { "Server groups" }
+                p { class: "page-lede",
+                    "Permission groups assigned to clients on this server. A client holds the union of every group they are in."
                 }
             }
-        }
-        p { class: "info-hint",
-            "Permission groups assigned to clients on this server. A client holds the union of every group they are in."
+            if is_admin {
+                div { class: "page-actions",
+                    Button {
+                        variant: ButtonVariant::Primary,
+                        onclick: move |_| modal_open.set(true),
+                        "+ New group"
+                    }
+                }
+            }
         }
 
         if !is_admin {
@@ -156,23 +159,8 @@ fn ServerGroupsPageBody(props: ServerGroupsPageBodyProps) -> Element {
 
         match groups_snapshot {
             None => rsx! {
-                table { class: "data-table",
-                    thead {
-                        tr {
-                            th { scope: "col", "Name" }
-                            th { scope: "col", "Type" }
-                            th { scope: "col", "Members" }
-                            th { scope: "col", "Permissions" }
-                            th { scope: "col", class: "actions-col", "" }
-                        }
-                    }
-                    tbody {
-                        for i in 0..4 {
-                            tr { key: "{i}",
-                                td { colspan: "5", div { class: "skeleton sg-skeleton-row" } }
-                            }
-                        }
-                    }
+                div { class: "card", aria_busy: "true",
+                    p { class: "muted", "Loading server groups…" }
                 }
             },
             Some(Err(e)) => rsx! {
@@ -196,11 +184,12 @@ fn ServerGroupsPageBody(props: ServerGroupsPageBodyProps) -> Element {
                     h3 { "No server groups" }
                     p { "This server has no permission groups. TeamSpeak normally ships default groups — create one to get started." }
                     if is_admin {
-                        Button {
-                            variant: ButtonVariant::Primary,
-                            size: ButtonSize::Small,
-                            onclick: move |_| modal_open.set(true),
-                            "+ New group"
+                        div { class: "actions",
+                            Button {
+                                variant: ButtonVariant::Primary,
+                                onclick: move |_| modal_open.set(true),
+                                "+ New group"
+                            }
                         }
                     }
                 }
@@ -214,7 +203,7 @@ fn ServerGroupsPageBody(props: ServerGroupsPageBodyProps) -> Element {
                             th { scope: "col", "Type" }
                             th { scope: "col", class: "num-col", "Members" }
                             th { scope: "col", class: "num-col", "Permissions" }
-                            th { scope: "col", class: "actions-col", "" }
+                            th { scope: "col", class: "actions-col", "Actions" }
                         }
                     }
                     tbody {
@@ -275,7 +264,6 @@ struct GroupRowProps {
 /// data and a slow count never blocks the table.
 #[component]
 fn GroupRow(props: GroupRowProps) -> Element {
-    let nav = use_navigator();
     let gate = use_auth_gate();
     let g = props.group.clone();
     let sgid = g.sgid;
@@ -300,26 +288,18 @@ fn GroupRow(props: GroupRowProps) -> Element {
         _ => (None, None),
     };
 
-    let go_detail = move |_| {
-        nav.push(Route::ServerGroupDetailPage { sgid });
-    };
     let on_delete = props.on_delete;
     let group_for_delete = g.clone();
 
     rsx! {
         tr { key: "{sgid}", class: "sg-row",
-            td {
-                class: "sg-name-cell",
-                role: "link",
-                tabindex: "0",
-                onclick: go_detail,
-                onkeydown: move |e: KeyboardEvent| {
-                    if matches!(e.key(), Key::Enter | Key::Character(_)) && e.key() == Key::Enter {
-                        nav.push(Route::ServerGroupDetailPage { sgid });
-                    }
-                },
-                span { class: "sg-name", "{g.name}" }
-                span { class: "sg-id mono", "sgid {sgid}" }
+            td { class: "client-cell",
+                Link {
+                    to: Route::ServerGroupDetailPage { sgid },
+                    class: "client-name",
+                    "{g.name}"
+                }
+                span { class: "client-uid", "sgid {sgid}" }
             }
             td {
                 span { class: "tag tag-neutral", "{group_type_label(g.group_type)}" }
@@ -327,10 +307,9 @@ fn GroupRow(props: GroupRowProps) -> Element {
             td { class: "num-col mono", {count_cell(members)} }
             td { class: "num-col mono", {count_cell(perms)} }
             td { class: "actions-col",
-                Button {
-                    variant: ButtonVariant::Ghost,
-                    size: ButtonSize::Small,
-                    onclick: go_detail,
+                Link {
+                    to: Route::ServerGroupDetailPage { sgid },
+                    class: "btn btn-ghost btn-sm",
                     "Open"
                 }
                 if props.is_admin {
