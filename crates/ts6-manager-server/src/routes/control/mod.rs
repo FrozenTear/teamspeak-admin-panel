@@ -72,7 +72,15 @@ pub fn router() -> Router<AppState> {
         )
         .route(
             "/api/servers/{configId}/vs/{sid}/channels",
-            get(channels::list),
+            get(channels::list).post(channels::create),
+        )
+        .route(
+            "/api/servers/{configId}/vs/{sid}/channels/{cid}",
+            put(channels::edit).delete(channels::delete),
+        )
+        .route(
+            "/api/servers/{configId}/vs/{sid}/channels/{cid}/move",
+            post(channels::move_channel),
         )
         .route(
             "/api/servers/{configId}/vs/{sid}/info",

@@ -126,6 +126,117 @@ pub struct ChannelTreeNode {
     pub channel_needed_subscribe_power: i64,
 }
 
+/// Shared optional properties forwarded to `channelcreate` / `channeledit`.
+/// Parent/order tree placement uses [`ChannelMoveRequest`] (and `cpid` /
+/// `channelOrder` on create) — `channeledit` does not change parent.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelProperties {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_topic: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_password: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_maxclients: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_maxfamilyclients: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_order: Option<i64>,
+    /// `1` / `0` TS flag. Permanent, semi-permanent, and temporary are
+    /// mutually exclusive upstream — the route does not enforce that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_flag_permanent: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_flag_semi_permanent: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_flag_temporary: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_flag_default: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_needed_talk_power: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_icon_id: Option<i64>,
+}
+
+impl ChannelProperties {
+    /// `true` when no optional property is set. Used to reject an empty
+    /// `channeledit` body that would otherwise be a no-op upstream.
+    pub fn is_empty(&self) -> bool {
+        self.channel_topic.is_none()
+            && self.channel_password.is_none()
+            && self.channel_description.is_none()
+            && self.channel_maxclients.is_none()
+            && self.channel_maxfamilyclients.is_none()
+            && self.channel_order.is_none()
+            && self.channel_flag_permanent.is_none()
+            && self.channel_flag_semi_permanent.is_none()
+            && self.channel_flag_temporary.is_none()
+            && self.channel_flag_default.is_none()
+            && self.channel_needed_talk_power.is_none()
+            && self.channel_icon_id.is_none()
+    }
+}
+
+/// `POST /api/servers/{configId}/vs/{sid}/channels` body — `channelcreate`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelCreateRequest {
+    pub channel_name: String,
+    /// Parent channel id. `0` / omitted = top-level.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpid: Option<i64>,
+    #[serde(flatten)]
+    pub properties: ChannelProperties,
+}
+
+/// `POST /api/servers/{configId}/vs/{sid}/channels` 201 response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelCreated {
+    pub cid: i64,
+}
+
+/// `PUT /api/servers/{configId}/vs/{sid}/channels/{cid}` body — `channeledit`.
+/// At least `channelName` or one flattened property MUST be set.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelEditRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_name: Option<String>,
+    #[serde(flatten)]
+    pub properties: ChannelProperties,
+}
+
+impl ChannelEditRequest {
+    pub fn is_empty(&self) -> bool {
+        self.channel_name.is_none() && self.properties.is_empty()
+    }
+}
+
+/// `DELETE /api/servers/{configId}/vs/{sid}/channels/{cid}` query.
+/// Spec §7.7: `?force=0|1`, default `1` (kick occupants and delete).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelDeleteQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub force: Option<i64>,
+}
+
+/// `POST /api/servers/{configId}/vs/{sid}/channels/{cid}/move` body —
+/// `channelmove`. Spec §7.7 passthrough (`cpid`, `order?`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelMoveRequest {
+    /// New parent channel id. `0` = move to top-level.
+    pub cpid: i64,
+    /// Sort-after channel id (upstream `order`). Omitted lets the
+    /// virtual server pick the default sibling position.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<i64>,
+}
+
 /// `POST /api/servers/{configId}/vs/{sid}/clients/{clid}/kick` body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -542,4 +653,40 @@ pub struct MessageCreateRequest {
     pub cluid: String,
     pub subject: String,
     pub message: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn channel_create_request_round_trips_camel_case() {
+        let raw = serde_json::json!({
+            "channelName": "Music",
+            "cpid": 1,
+            "channelTopic": "bots",
+            "channelFlagPermanent": 1,
+            "channelMaxclients": 8
+        });
+        let parsed: ChannelCreateRequest = serde_json::from_value(raw).unwrap();
+        assert_eq!(parsed.channel_name, "Music");
+        assert_eq!(parsed.cpid, Some(1));
+        assert_eq!(parsed.properties.channel_topic.as_deref(), Some("bots"));
+        assert_eq!(parsed.properties.channel_flag_permanent, Some(1));
+        assert_eq!(parsed.properties.channel_maxclients, Some(8));
+
+        let encoded = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(encoded["channelName"], "Music");
+        assert_eq!(encoded["channelTopic"], "bots");
+        assert!(encoded.get("channelPassword").is_none());
+    }
+
+    #[test]
+    fn channel_edit_request_empty_when_no_fields() {
+        let parsed: ChannelEditRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(parsed.is_empty());
+        let parsed: ChannelEditRequest =
+            serde_json::from_value(serde_json::json!({"channelName": "X"})).unwrap();
+        assert!(!parsed.is_empty());
+    }
 }

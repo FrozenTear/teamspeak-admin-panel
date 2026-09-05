@@ -494,6 +494,33 @@ mod tests {
         async fn complaindelall(&self, _sid: i64, _tcldbid: i64) -> ControlResult<()> {
             unimplemented!("not used by dashboard fetch")
         }
+        async fn channelcreate(
+            &self,
+            _sid: i64,
+            _params: &crate::webquery::ChannelWriteParams<'_>,
+        ) -> ControlResult<i64> {
+            unimplemented!("not used by dashboard fetch")
+        }
+        async fn channeledit(
+            &self,
+            _sid: i64,
+            _cid: i64,
+            _params: &crate::webquery::ChannelWriteParams<'_>,
+        ) -> ControlResult<()> {
+            unimplemented!("not used by dashboard fetch")
+        }
+        async fn channeldelete(&self, _sid: i64, _cid: i64, _force: bool) -> ControlResult<()> {
+            unimplemented!("not used by dashboard fetch")
+        }
+        async fn channelmove(
+            &self,
+            _sid: i64,
+            _cid: i64,
+            _cpid: i64,
+            _order: Option<i64>,
+        ) -> ControlResult<()> {
+            unimplemented!("not used by dashboard fetch")
+        }
     }
 
     async fn seed_connection(db: &Database, name: &str, enabled: bool) -> ServerConnection {

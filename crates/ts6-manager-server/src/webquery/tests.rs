@@ -207,6 +207,10 @@ impl MockServer {
             .route("/{sid}/clientinfo", get(handler_clientinfo))
             .route("/{sid}/clientdblist", get(handler_clientdblist))
             .route("/{sid}/channelinfo", get(handler_channelinfo))
+            .route("/{sid}/channelcreate", get(handler_channelcreate))
+            .route("/{sid}/channeledit", get(handler_channeledit))
+            .route("/{sid}/channeldelete", get(handler_channeldelete))
+            .route("/{sid}/channelmove", get(handler_channelmove))
             .route("/{sid}/channelclientlist", get(handler_channelclientlist))
             .route("/{sid}/logview", get(handler_logview))
             .route("/{sid}/banlist", get(handler_banlist))
@@ -668,6 +672,90 @@ async fn handler_channelinfo(
     .into_response()
 }
 
+async fn handler_channelcreate(
+    State(state): State<MockState>,
+    headers: HeaderMap,
+    Path(_sid): Path<i64>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if !key_matches(&headers, &state.expected_api_key) {
+        return upstream_error(1283, "client_query_login_failed");
+    }
+    *state.captured_query.lock().unwrap() = Some((
+        params.get("channel_name").cloned().unwrap_or_default(),
+        params.get("cpid").cloned().unwrap_or_default(),
+    ));
+    Json(json!({
+        "body": [{"cid": "9"}],
+        "status": {"code": 0, "message": "ok"},
+    }))
+    .into_response()
+}
+
+async fn handler_channeledit(
+    State(state): State<MockState>,
+    headers: HeaderMap,
+    Path(_sid): Path<i64>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if !key_matches(&headers, &state.expected_api_key) {
+        return upstream_error(1283, "client_query_login_failed");
+    }
+    *state.captured_query.lock().unwrap() = Some((
+        params.get("cid").cloned().unwrap_or_default(),
+        params.get("channel_name").cloned().unwrap_or_default(),
+    ));
+    Json(json!({
+        "body": null,
+        "status": {"code": 0, "message": "ok"},
+    }))
+    .into_response()
+}
+
+async fn handler_channeldelete(
+    State(state): State<MockState>,
+    headers: HeaderMap,
+    Path(_sid): Path<i64>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if !key_matches(&headers, &state.expected_api_key) {
+        return upstream_error(1283, "client_query_login_failed");
+    }
+    *state.captured_query.lock().unwrap() = Some((
+        params.get("cid").cloned().unwrap_or_default(),
+        params.get("force").cloned().unwrap_or_default(),
+    ));
+    Json(json!({
+        "body": null,
+        "status": {"code": 0, "message": "ok"},
+    }))
+    .into_response()
+}
+
+async fn handler_channelmove(
+    State(state): State<MockState>,
+    headers: HeaderMap,
+    Path(_sid): Path<i64>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if !key_matches(&headers, &state.expected_api_key) {
+        return upstream_error(1283, "client_query_login_failed");
+    }
+    *state.captured_query.lock().unwrap() = Some((
+        params.get("cid").cloned().unwrap_or_default(),
+        format!(
+            "{}/{}",
+            params.get("cpid").cloned().unwrap_or_default(),
+            params.get("order").cloned().unwrap_or_default()
+        ),
+    ));
+    Json(json!({
+        "body": null,
+        "status": {"code": 0, "message": "ok"},
+    }))
+    .into_response()
+}
+
 async fn handler_channelclientlist(
     State(state): State<MockState>,
     headers: HeaderMap,
@@ -1007,6 +1095,69 @@ async fn channelinfo_round_trips_full_payload() {
     assert_eq!(info.channel_codec, 4);
     assert_eq!(info.channel_flag_permanent, 1);
     assert_eq!(info.channel_maxclients, -1);
+}
+
+#[tokio::test]
+async fn channelcreate_returns_new_cid_and_passes_params() {
+    let server = MockServer::start("k").await;
+    let client = build_client(&server, "k");
+
+    let cid = client
+        .channelcreate(
+            1,
+            &ChannelWriteParams {
+                channel_name: Some("Music"),
+                cpid: Some(1),
+                channel_topic: Some("bots"),
+                channel_flag_permanent: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(cid, 9);
+    let captured = server.state.captured_query.lock().unwrap().clone().unwrap();
+    assert_eq!(captured, ("Music".to_string(), "1".to_string()));
+}
+
+#[tokio::test]
+async fn channeledit_passes_cid_and_name() {
+    let server = MockServer::start("k").await;
+    let client = build_client(&server, "k");
+
+    client
+        .channeledit(
+            1,
+            5,
+            &ChannelWriteParams {
+                channel_name: Some("Lobby 2"),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let captured = server.state.captured_query.lock().unwrap().clone().unwrap();
+    assert_eq!(captured, ("5".to_string(), "Lobby 2".to_string()));
+}
+
+#[tokio::test]
+async fn channeldelete_passes_cid_and_force() {
+    let server = MockServer::start("k").await;
+    let client = build_client(&server, "k");
+
+    client.channeldelete(1, 7, false).await.unwrap();
+    let captured = server.state.captured_query.lock().unwrap().clone().unwrap();
+    assert_eq!(captured, ("7".to_string(), "0".to_string()));
+}
+
+#[tokio::test]
+async fn channelmove_passes_cid_cpid_and_order() {
+    let server = MockServer::start("k").await;
+    let client = build_client(&server, "k");
+
+    client.channelmove(1, 4, 1, Some(2)).await.unwrap();
+    let captured = server.state.captured_query.lock().unwrap().clone().unwrap();
+    assert_eq!(captured, ("4".to_string(), "1/2".to_string()));
 }
 
 #[tokio::test]
