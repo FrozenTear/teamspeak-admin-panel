@@ -1177,6 +1177,14 @@ async fn handle_audio_msg(
             apply_pipeline_now_playing(bot_id, store, events, title, source).await;
             "now_playing"
         }
+        AudioMsg::PipelineEvent(PipelineEvent::Resolving { query, retrying }) => {
+            // Reuse THE-927 `Resolving` so a warm retry keeps the
+            // dashboard pill lit (and can show "retrying…" when the
+            // flag is set). Chat already fires this on `!play yt:`;
+            // this is the in-pipeline refresh.
+            let _ = events.send(BotEvent::Resolving { query, retrying });
+            "resolving"
+        }
         AudioMsg::PipelineEvent(PipelineEvent::Warning(message)) => {
             warn!(%message, "audio pipeline warning");
             // PURA-314 — stash the cause so a 0-frame `Finished` can build a

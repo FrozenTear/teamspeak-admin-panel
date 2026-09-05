@@ -294,6 +294,7 @@ async fn handle_radio(
             {
                 let _ = events.send(BotEvent::Resolving {
                     query: query.to_string(),
+                    retrying: false,
                 });
             }
             // The queue head is now the radio track — the actor must tear
@@ -349,6 +350,7 @@ async fn handle_play(
             {
                 let _ = events.send(BotEvent::Resolving {
                     query: query.to_string(),
+                    retrying: false,
                 });
             }
             // PURA-340 — the core fix: ask the actor to start the queue
@@ -880,7 +882,7 @@ mod dispatch_tests {
         let queries: Vec<&str> = events
             .iter()
             .filter_map(|ev| match ev {
-                BotEvent::Resolving { query } => Some(query.as_str()),
+                BotEvent::Resolving { query, .. } => Some(query.as_str()),
                 _ => None,
             })
             .collect();
@@ -954,7 +956,7 @@ mod dispatch_tests {
         let queries: Vec<&str> = events
             .iter()
             .filter_map(|ev| match ev {
-                BotEvent::Resolving { query } => Some(query.as_str()),
+                BotEvent::Resolving { query, .. } => Some(query.as_str()),
                 _ => None,
             })
             .collect();

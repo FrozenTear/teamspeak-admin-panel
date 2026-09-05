@@ -89,7 +89,16 @@ pub enum BotEvent {
     /// reads as in-flight instead of broken. Cleared by
     /// [`BotEvent::FirstFrameOnWire`] when audible playback starts, or by
     /// [`BotEvent::AudioFinished`] / [`BotEvent::Error`] on failure.
-    Resolving { query: String },
+    ///
+    /// `retrying` is set when the audio pipeline is making its automatic
+    /// second warm-resolver attempt after a timeout/empty-partial blip.
+    /// Panel binds the same SSE `type: "resolving"` event and can show
+    /// "resolving / retrying…" when the wire field is true.
+    Resolving {
+        query: String,
+        #[serde(default)]
+        retrying: bool,
+    },
     /// THE-927 — first Opus frame for the current track was just sent on
     /// the wire (the same milestone the `music_bot_latency`
     /// `first_frame_on_wire` log records). Clears any in-flight
