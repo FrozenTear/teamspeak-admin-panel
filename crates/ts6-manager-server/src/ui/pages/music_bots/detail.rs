@@ -396,19 +396,26 @@ fn PlayerCard(
     rsx! {
         div { class: "card player-card",
             div { class: "np-eyebrow", "Now playing" }
-            // THE-927 — transient "Resolving YouTube…" pill. Lives between
-            // `BotEventWire::Resolving { query }` (chat `!play yt:<query>`
-            // accepted, ~17 s yt-dlp + prebuffer wait per THE-901) and
-            // `FirstFrameOnWire` (audible frame on the wire). Sits above
-            // the now-playing row so it's visible regardless of whether a
-            // previous track still occupies the title strip.
+            // THE-927 + warm-retry — transient resolving pill. Lives
+            // between `BotEventWire::Resolving` (chat `!play yt:<query>`
+            // or an in-pipeline warm retry) and `FirstFrameOnWire` /
+            // NowPlaying / error / idle. Sits above the now-playing row
+            // so it's visible regardless of whether a previous track
+            // still occupies the title strip. First attempt is quiet
+            // ("resolving…"); the automatic second warm attempt stamps
+            // `retrying` / `resolvingRetrying` and the copy becomes
+            // "resolving / retrying…".
             if let Some(query) = d.resolving_query.as_deref() {
                 div {
-                    class: "np-resolving",
+                    class: if d.resolving_retrying {
+                        "np-resolving np-resolving--retrying"
+                    } else {
+                        "np-resolving"
+                    },
                     role: "status",
                     "aria-live": "polite",
                     span { class: "np-resolving__spinner", aria_hidden: "true" }
-                    span { class: "np-resolving__label", "Resolving YouTube…" }
+                    span { class: "np-resolving__label", "{resolving_status_label(d.resolving_retrying)}" }
                     span { class: "np-resolving__query", title: "{query}", "{query}" }
                 }
             }
@@ -1251,6 +1258,22 @@ fn prefer_resolved_title(existing: Option<&wire::Track>, incoming: &wire::Track)
     incoming.clone()
 }
 
+/// Copy for the Now Playing resolving pill. First warm attempt is quiet;
+/// the automatic second attempt (Music Bot PR #21 `retrying: true`) is
+/// the louder "resolving / retrying…" line.
+fn resolving_status_label(retrying: bool) -> &'static str {
+    if retrying {
+        "resolving / retrying…"
+    } else {
+        "resolving…"
+    }
+}
+
+fn clear_resolving(d: &mut wire::MusicBotDetail) {
+    d.resolving_query = None;
+    d.resolving_retrying = false;
+}
+
 /// Reduce a single SSE event into the locally-held [`wire::MusicBotDetail`]
 /// snapshot. Every variant only mutates fields the route layer projects
 /// onto the wire.
@@ -1268,7 +1291,11 @@ fn apply_event(d: &mut wire::MusicBotDetail, ev: &wire::BotEventWire) {
                 d.last_error = None;
                 // THE-927 — a disconnect mid-resolve abandons the wait;
                 // drop the pill so it doesn't stick around as a ghost.
-                d.resolving_query = None;
+                clear_resolving(d);
+            } else if *to == wire::BotState::Playing {
+                // Synthesised Playing means a track is on the wire;
+                // the resolving chrome has done its job.
+                clear_resolving(d);
             } else if *to == wire::BotState::Connected && d.channel_id.is_some() {
                 // Handshake emits StateChanged(Connected) around the
                 // default-channel JoinedChannel. Don't let the FSM step
@@ -1290,7 +1317,7 @@ fn apply_event(d: &mut wire::MusicBotDetail, ev: &wire::BotEventWire) {
             d.now_playing = None;
             d.now_playing_elapsed_secs = None;
             d.last_error = None;
-            d.resolving_query = None;
+            clear_resolving(d);
         }
         wire::BotEventWire::JoinedChannel { channel_id } => {
             d.channel_id = Some(*channel_id);
@@ -1313,8 +1340,10 @@ fn apply_event(d: &mut wire::MusicBotDetail, ev: &wire::BotEventWire) {
             // PURA-347 — a fresh track restarts the play clock at 0;
             // `Progress` ticks bump it once per second.
             d.now_playing_elapsed_secs = Some(0);
-            // A fresh track supersedes any prior failure (PURA-261).
+            // A fresh track supersedes any prior failure (PURA-261)
+            // and any in-flight resolving chrome.
             d.last_error = None;
+            clear_resolving(d);
         }
         // PURA-347 — playback-progress tick. Advance the elapsed clock
         // only while a track is playing so a stray tick can't resurrect
@@ -1328,6 +1357,8 @@ fn apply_event(d: &mut wire::MusicBotDetail, ev: &wire::BotEventWire) {
             d.now_playing = None;
             d.now_playing_elapsed_secs = None;
             d.queue.clear();
+            // Idle — nothing left to resolve or play.
+            clear_resolving(d);
             // The lifecycle FSM doesn't carry "Playing" — collapse back
             // to a connected/in_channel state via the next StateChanged.
         }
@@ -1338,6 +1369,7 @@ fn apply_event(d: &mut wire::MusicBotDetail, ev: &wire::BotEventWire) {
             None => {
                 d.now_playing = None;
                 d.now_playing_elapsed_secs = None;
+                clear_resolving(d);
             }
         },
         // PURA-261 — audio pipeline drained. Clear `now_playing` so the
@@ -1352,10 +1384,10 @@ fn apply_event(d: &mut wire::MusicBotDetail, ev: &wire::BotEventWire) {
             d.now_playing_elapsed_secs = None;
             // THE-927 — a `failed:` AudioFinished means the resolve
             // collapsed without producing audio. Clear the pill so the
-            // operator sees the error chip, not a stuck "Resolving…".
+            // operator sees the error chip, not a stuck "resolving…".
             // A clean EOF after audible playback already cleared the pill
             // on `FirstFrameOnWire`, but redoing it is a no-op.
-            d.resolving_query = None;
+            clear_resolving(d);
             match reason.strip_prefix("failed: ") {
                 Some(cause) => {
                     d.last_error = Some(cause.to_string());
@@ -1366,20 +1398,25 @@ fn apply_event(d: &mut wire::MusicBotDetail, ev: &wire::BotEventWire) {
                 None => d.last_error = None,
             }
         }
-        // THE-927 — light the transient "Resolving YouTube…" pill while
-        // the audio pipeline waits on yt-dlp + prebuffer. Replaces any
-        // previous in-flight query (`!play` then `!skip` then `!play yt:`
-        // again must show the newest wait).
-        wire::BotEventWire::Resolving { query } => {
+        // THE-927 — light the transient resolving pill while the audio
+        // pipeline waits on yt-dlp + prebuffer. Replaces any previous
+        // in-flight query (`!play` then `!skip` then `!play yt:` again
+        // must show the newest wait). `retrying` is the automatic second
+        // warm attempt from Music Bot PR #21; older events omit it.
+        wire::BotEventWire::Resolving { query, retrying } => {
             d.resolving_query = Some(query.clone());
+            d.resolving_retrying = *retrying;
         }
         // THE-927 — the first audible frame just shipped; clear the pill.
         wire::BotEventWire::FirstFrameOnWire => {
-            d.resolving_query = None;
+            clear_resolving(d);
         }
-        wire::BotEventWire::Error { .. }
-        | wire::BotEventWire::PlaylistChanged { .. }
-        | wire::BotEventWire::LibraryChanged => {}
+        wire::BotEventWire::Error { .. } => {
+            // A bot-level error ends the wait; don't leave "resolving…"
+            // up while the rest of the page is already in a failed state.
+            clear_resolving(d);
+        }
+        wire::BotEventWire::PlaylistChanged { .. } | wire::BotEventWire::LibraryChanged => {}
     }
 }
 
@@ -1399,6 +1436,7 @@ mod tests {
             channel_id: None,
             last_error: None,
             resolving_query: None,
+            resolving_retrying: false,
         }
     }
 
@@ -1613,11 +1651,77 @@ mod tests {
             &mut d,
             &wire::BotEventWire::Resolving {
                 query: "red leather last call".into(),
+                retrying: false,
             },
         );
         assert_eq!(d.resolving_query.as_deref(), Some("red leather last call"));
+        assert!(!d.resolving_retrying);
         apply_event(&mut d, &wire::BotEventWire::FirstFrameOnWire);
         assert!(d.resolving_query.is_none());
+        assert!(!d.resolving_retrying);
+    }
+
+    /// Warm-retry SSE: the same `resolving` event with `retrying: true`
+    /// keeps the pill and stamps `resolvingRetrying` so Now Playing can
+    /// show "resolving / retrying…".
+    #[test]
+    fn resolving_retrying_stamps_detail_flag() {
+        let mut d = fixture(wire::BotState::InChannel);
+        apply_event(
+            &mut d,
+            &wire::BotEventWire::Resolving {
+                query: "never gonna".into(),
+                retrying: true,
+            },
+        );
+        assert_eq!(d.resolving_query.as_deref(), Some("never gonna"));
+        assert!(d.resolving_retrying);
+        apply_event(&mut d, &wire::BotEventWire::FirstFrameOnWire);
+        assert!(d.resolving_query.is_none());
+        assert!(!d.resolving_retrying);
+    }
+
+    #[test]
+    fn resolving_status_label_is_quiet_then_retrying() {
+        assert_eq!(resolving_status_label(false), "resolving…");
+        assert_eq!(resolving_status_label(true), "resolving / retrying…");
+    }
+
+    #[test]
+    fn now_playing_clears_resolving_chrome() {
+        let mut d = fixture(wire::BotState::InChannel);
+        d.resolving_query = Some("never gonna".into());
+        d.resolving_retrying = true;
+        apply_event(
+            &mut d,
+            &wire::BotEventWire::NowPlaying {
+                track: track(7, "Song"),
+            },
+        );
+        assert!(d.resolving_query.is_none());
+        assert!(!d.resolving_retrying);
+        assert_eq!(d.state, wire::BotState::Playing);
+    }
+
+    #[test]
+    fn error_and_idle_events_clear_resolving_chrome() {
+        let mut d = fixture(wire::BotState::InChannel);
+        d.resolving_query = Some("query".into());
+        d.resolving_retrying = true;
+        apply_event(
+            &mut d,
+            &wire::BotEventWire::Error {
+                message: "extractor failed".into(),
+            },
+        );
+        assert!(d.resolving_query.is_none());
+        assert!(!d.resolving_retrying);
+
+        d.resolving_query = Some("query".into());
+        d.resolving_retrying = true;
+        apply_event(&mut d, &wire::BotEventWire::QueueEmpty);
+        assert!(d.resolving_query.is_none());
+        assert!(!d.resolving_retrying);
     }
 
     /// THE-927 — a second `Resolving` replaces the in-flight query
@@ -1630,15 +1734,18 @@ mod tests {
             &mut d,
             &wire::BotEventWire::Resolving {
                 query: "first".into(),
+                retrying: false,
             },
         );
         apply_event(
             &mut d,
             &wire::BotEventWire::Resolving {
                 query: "second".into(),
+                retrying: false,
             },
         );
         assert_eq!(d.resolving_query.as_deref(), Some("second"));
+        assert!(!d.resolving_retrying);
     }
 
     /// THE-927 — a failed pipeline (`AudioFinished` with a `failed:`
@@ -1648,6 +1755,7 @@ mod tests {
     fn failed_audio_finished_clears_resolving_pill() {
         let mut d = fixture(wire::BotState::Playing);
         d.resolving_query = Some("query".into());
+        d.resolving_retrying = true;
         apply_event(
             &mut d,
             &wire::BotEventWire::AudioFinished {
@@ -1655,6 +1763,7 @@ mod tests {
             },
         );
         assert!(d.resolving_query.is_none());
+        assert!(!d.resolving_retrying);
         assert_eq!(d.last_error.as_deref(), Some("yt-dlp produced 0 frames"));
     }
 
@@ -1664,6 +1773,7 @@ mod tests {
     fn disconnect_during_resolve_drops_the_pill() {
         let mut d = fixture(wire::BotState::InChannel);
         d.resolving_query = Some("query".into());
+        d.resolving_retrying = true;
         apply_event(
             &mut d,
             &wire::BotEventWire::StateChanged {
@@ -1672,6 +1782,7 @@ mod tests {
             },
         );
         assert!(d.resolving_query.is_none());
+        assert!(!d.resolving_retrying);
     }
 
     #[test]

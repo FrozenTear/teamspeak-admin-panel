@@ -101,6 +101,7 @@ async fn detail(
         // detail snapshot never claims one is in flight. Subscribers
         // light it from a live `BotEventWire::Resolving`.
         resolving_query: None,
+        resolving_retrying: false,
     }))
 }
 
@@ -364,6 +365,10 @@ fn wire_event(ev: &DomainBotEvent) -> Option<wire::BotEventWire> {
         // 17 s wait reads as in-progress instead of broken.
         DomainBotEvent::Resolving { query } => wire::BotEventWire::Resolving {
             query: query.clone(),
+            // Warm-retry (`retrying: true`) lands with Music Bot PR #21.
+            // Until that maps through `BotEvent::Resolving`, first-attempt
+            // chat `!play yt:` stays `false` (elided on the wire).
+            retrying: false,
         },
         DomainBotEvent::FirstFrameOnWire => wire::BotEventWire::FirstFrameOnWire,
         DomainBotEvent::Error(err) => wire::BotEventWire::Error {

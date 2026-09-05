@@ -2317,9 +2317,10 @@ textarea.input {
   color: var(--text-muted);
 }
 
-/* THE-927 — "Resolving YouTube…" pill. Lives between
-   `BotEventWire::Resolving` and `FirstFrameOnWire`, communicating that
-   the ~17 s yt-dlp + prebuffer wait is in flight (THE-901 lever (ii)).
+/* THE-927 — resolving pill. Lives between `BotEventWire::Resolving`
+   and `FirstFrameOnWire` / NowPlaying / error / idle. First attempt
+   is quiet ("resolving…"); the automatic warm retry adds
+   `.np-resolving--retrying` ("resolving / retrying…").
    Sized small so the now-playing strip below stays the focal point. */
 .np-resolving {
   display: inline-flex;
@@ -2332,6 +2333,10 @@ textarea.input {
   font-size: var(--text-sm);
   max-width: 100%;
 }
+.np-resolving--retrying {
+  color: var(--text-primary);
+  background: var(--bg-surface-raised, var(--border-subtle));
+}
 .np-resolving__spinner {
   width: 10px;
   height: 10px;
@@ -2342,6 +2347,10 @@ textarea.input {
   flex: 0 0 auto;
 }
 .np-resolving__label {
+  color: var(--text-muted);
+  font-weight: var(--weight-medium);
+}
+.np-resolving--retrying .np-resolving__label {
   color: var(--text-primary);
   font-weight: var(--weight-semibold);
 }
