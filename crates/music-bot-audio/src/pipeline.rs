@@ -42,25 +42,41 @@ impl AudioPipeline {
         // `LazySource` defers bring-up to the worker task's first
         // `read_samples`, which already runs off the connected loop, so
         // this call now returns in microseconds.
-        let source: Box<dyn PcmSource> = Box::new(LazySource::new(spec, cfg.clone()));
-        Self::spawn_with_source(source, cfg)
+        if !matches!(cfg.channels, 1 | 2) {
+            return Err(PipelineError::InvalidChannels(cfg.channels));
+        }
+        let (events_tx, _) = broadcast::channel::<PipelineEvent>(cfg.event_buffer);
+        let source: Box<dyn PcmSource> = Box::new(LazySource::with_events(
+            spec,
+            cfg.clone(),
+            events_tx.clone(),
+        ));
+        Self::spawn_with_source_and_events(source, cfg, events_tx)
     }
 
     /// Construct a pipeline from a caller-built source. Useful for tests
     /// (synthetic source) and for sources WS-1 wants to inject directly.
     pub fn spawn_with_source(
+        source: Box<dyn PcmSource>,
+        cfg: PipelineConfig,
+    ) -> Result<Self, PipelineError> {
+        if !matches!(cfg.channels, 1 | 2) {
+            return Err(PipelineError::InvalidChannels(cfg.channels));
+        }
+        let (events_tx, _) = broadcast::channel::<PipelineEvent>(cfg.event_buffer);
+        Self::spawn_with_source_and_events(source, cfg, events_tx)
+    }
+
+    fn spawn_with_source_and_events(
         mut source: Box<dyn PcmSource>,
         cfg: PipelineConfig,
+        events_tx: broadcast::Sender<PipelineEvent>,
     ) -> Result<Self, PipelineError> {
         // THE-986 — the encoder moved to the consumer, but the channel
         // layout is still pinned here: it sizes the frames and stamps each
         // one so the consumer-side `OpusFrameEncoder` (built from the same
         // config) always sees a full frame of the layout it expects.
-        if !matches!(cfg.channels, 1 | 2) {
-            return Err(PipelineError::InvalidChannels(cfg.channels));
-        }
         let (frames_tx, frames_rx) = mpsc::channel::<PcmFrame>(cfg.frame_buffer);
-        let (events_tx, _) = broadcast::channel::<PipelineEvent>(cfg.event_buffer);
         let events_pub = events_tx.clone();
 
         let prebuffer_target = cfg.prebuffer_frames;
@@ -274,14 +290,33 @@ struct LazySource {
     spec: Option<AudioSourceSpec>,
     cfg: PipelineConfig,
     inner: Option<Box<dyn PcmSource>>,
+    /// Live event fan-out so a warm-retry can emit `Resolving` *during*
+    /// bring-up. `try_drain_events` only runs after `read_samples`
+    /// returns, which is too late for the dashboard pill.
+    events: Option<broadcast::Sender<PipelineEvent>>,
 }
 
 impl LazySource {
+    #[cfg(test)]
     fn new(spec: AudioSourceSpec, cfg: PipelineConfig) -> Self {
         Self {
             spec: Some(spec),
             cfg,
             inner: None,
+            events: None,
+        }
+    }
+
+    fn with_events(
+        spec: AudioSourceSpec,
+        cfg: PipelineConfig,
+        events: broadcast::Sender<PipelineEvent>,
+    ) -> Self {
+        Self {
+            spec: Some(spec),
+            cfg,
+            inner: None,
+            events: Some(events),
         }
     }
 }
@@ -295,7 +330,7 @@ impl PcmSource for LazySource {
                     "LazySource: source bring-up already failed",
                 ));
             };
-            let src = build_source(spec, &self.cfg)
+            let src = build_source(spec, &self.cfg, self.events.as_ref())
                 .await
                 .map_err(std::io::Error::other)?;
             self.spec = None;
@@ -315,6 +350,7 @@ impl PcmSource for LazySource {
 async fn build_source(
     spec: AudioSourceSpec,
     cfg: &PipelineConfig,
+    events: Option<&broadcast::Sender<PipelineEvent>>,
 ) -> Result<Box<dyn PcmSource>, PipelineError> {
     match spec {
         AudioSourceSpec::SyntheticTone {
@@ -364,7 +400,22 @@ async fn build_source(
                 // query (PURA-353); a watch URL is a direct `!play`. Tag the
                 // latency log so the two resolve paths can be measured apart.
                 let is_search = url.starts_with("ytsearch");
-                match resolver.resolve(&url, cfg.yt_cookie_file.as_deref()).await {
+                let query = resolving_query(&url);
+                // Contabo v1.6.5 — one automatic warm retry on timeout /
+                // empty-partial while the helper sock is healthy, so a
+                // mid-life extract blip does not immediately cliff to the
+                // 20–60 s cold yt-dlp subprocess.
+                match resolver
+                    .resolve_with_warm_retry(&url, cfg.yt_cookie_file.as_deref(), || {
+                        if let Some(tx) = events {
+                            let _ = tx.send(PipelineEvent::Resolving {
+                                query,
+                                retrying: true,
+                            });
+                        }
+                    })
+                    .await
+                {
                     Ok(track) => {
                         // THE-932: emit per-phase timing alongside the total.
                         for phase in &track.phases {
@@ -432,6 +483,8 @@ async fn build_source(
                             fallback_url = format!("https://www.youtube.com/watch?v={vid}");
                         }
                         tracing::warn!(
+                            target: "music_bot_latency",
+                            stage = "resolver_subprocess_fallback",
                             error = %e,
                             search = is_search,
                             fallback_url = %fallback_url,
@@ -456,6 +509,16 @@ async fn build_source(
             Ok(Box::new(src))
         }
     }
+}
+
+/// Query string the dashboard pill should show for this resolve URL.
+/// `ytsearch1:never gonna` → `never gonna`; a watch URL is used as-is.
+fn resolving_query(url: &str) -> String {
+    url.strip_prefix("ytsearch")
+        .and_then(|rest| rest.split_once(':').map(|(_, q)| q.trim()))
+        .filter(|q| !q.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| url.to_string())
 }
 
 /// Build a `NowPlaying` event from a resolved title. Empty / whitespace
@@ -697,6 +760,19 @@ mod tests {
         assert!(now_playing_from_resolved("https://yt.example/watch?v=1", None).is_none());
         assert!(now_playing_from_resolved("https://yt.example/watch?v=1", Some("")).is_none());
         assert!(now_playing_from_resolved("https://yt.example/watch?v=1", Some("   ")).is_none());
+    }
+
+    #[test]
+    fn resolving_query_strips_ytsearch_prefix() {
+        assert_eq!(
+            resolving_query("ytsearch1:never gonna give you up"),
+            "never gonna give you up",
+        );
+        assert_eq!(resolving_query("ytsearch5:the killers"), "the killers",);
+        assert_eq!(
+            resolving_query("https://www.youtube.com/watch?v=dQw4w9WgXcQ"),
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        );
     }
 
     #[test]

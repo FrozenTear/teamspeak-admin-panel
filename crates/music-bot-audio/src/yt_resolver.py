@@ -27,6 +27,10 @@ terminated, connection then closed by the server:
                (THE-942 — a search streams this the moment phase 1 resolves the
                 video_id, before phase 2 runs; zero or more partials precede the
                 final reply. A non-streaming client ignores it.)
+               {"ok":true,"partial":true,"phase":"prewarm","warming":true}
+               (boot ``_prewarm`` is still in flight — the Rust client holds
+                its 15 s resolve budget until ``prewarm_done``)
+               {"ok":true,"partial":true,"phase":"prewarm_done","warming":false}
     response : {"ok":true,"direct_url":"...","title":"...","duration":N}
                {"ok":true,"pong":true,"yt_dlp_version":"..."}
                {"ok":false,"error":"..."}
@@ -328,6 +332,16 @@ def resolve(url, cookie_file, send_partial=None):
 # QA run). Override with YT_RESOLVER_PREWARM_URL.
 PREWARM_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 
+# Set when boot ``_prewarm`` finishes (success, failure, or disabled). A
+# ``!play`` that arrives while this is unset is gated: the handler streams
+# a ``phase=prewarm`` partial, waits here, then starts the real extract so
+# the Rust 15 s resolve budget does not race a busy extractor.
+_prewarm_done = threading.Event()
+
+# Ceiling on how long a Play will wait for boot prewarm. Observed boot
+# prewarm on Contabo v1.6.5 was ~63 s; this is a backstop, not a target.
+_PREWARM_WAIT_SECS = 90
+
 
 def _prewarm():
     """THE-943 — pay the cold preprocessed-player parse at boot, not on the
@@ -340,42 +354,52 @@ def _prewarm():
     already hits the warm path.
 
     Runs on a background thread so the socket server is accepting connections
-    immediately — a ``!play`` that races the prewarm simply resolves cold, as
-    it would have anyway. ``YT_RESOLVER_PREWARM_DISABLE`` skips it (and the
-    boot network call), ``YT_RESOLVER_PREWARM_URL`` overrides the target.
+    immediately. A ``!play`` that races the prewarm is *gated* (see
+    ``Handler``): the helper streams ``phase=prewarm`` and waits for this
+    thread to finish so the Rust client does not start its 15 s timeout
+    against a busy extractor. ``YT_RESOLVER_PREWARM_DISABLE`` skips it (and
+    the boot network call), ``YT_RESOLVER_PREWARM_URL`` overrides the target.
     """
-    if os.environ.get("YT_RESOLVER_PREWARM_DISABLE"):
-        print(
-            "yt-resolver: boot prewarm disabled (YT_RESOLVER_PREWARM_DISABLE)",
-            file=sys.stderr,
-            flush=True,
-        )
-        return
-    url = os.environ.get("YT_RESOLVER_PREWARM_URL", PREWARM_URL)
-    t0 = time.monotonic()
     try:
-        resolve(url, None)
-        ms = int((time.monotonic() - t0) * 1000)
-        print(
-            "yt-resolver: boot prewarm resolved %s in %d ms — "
-            "preprocessed-player cache warm (THE-943)" % (url, ms),
-            file=sys.stderr,
-            flush=True,
-        )
-    except Exception as exc:  # noqa: BLE001 — prewarm is best-effort
-        ms = int((time.monotonic() - t0) * 1000)
-        print(
-            "yt-resolver: boot prewarm failed after %d ms (%s) — "
-            "first !play will be cold" % (ms, exc),
-            file=sys.stderr,
-            flush=True,
-        )
+        if os.environ.get("YT_RESOLVER_PREWARM_DISABLE"):
+            print(
+                "yt-resolver: boot prewarm disabled (YT_RESOLVER_PREWARM_DISABLE)",
+                file=sys.stderr,
+                flush=True,
+            )
+            return
+        url = os.environ.get("YT_RESOLVER_PREWARM_URL", PREWARM_URL)
+        t0 = time.monotonic()
+        try:
+            resolve(url, None)
+            ms = int((time.monotonic() - t0) * 1000)
+            print(
+                "yt-resolver: boot prewarm resolved %s in %d ms — "
+                "preprocessed-player cache warm (THE-943)" % (url, ms),
+                file=sys.stderr,
+                flush=True,
+            )
+        except Exception as exc:  # noqa: BLE001 — prewarm is best-effort
+            ms = int((time.monotonic() - t0) * 1000)
+            print(
+                "yt-resolver: boot prewarm failed after %d ms (%s) — "
+                "first !play will be cold" % (ms, exc),
+                file=sys.stderr,
+                flush=True,
+            )
+    finally:
+        _prewarm_done.set()
 
 
 def dispatch(payload, send_partial=None):
     op = payload.get("op", "resolve")
     if op == "ping":
-        return {"ok": True, "pong": True, "yt_dlp_version": _yt_dlp_version()}
+        return {
+            "ok": True,
+            "pong": True,
+            "yt_dlp_version": _yt_dlp_version(),
+            "warming": not _prewarm_done.is_set(),
+        }
     if op == "resolve":
         url = payload.get("url")
         if not url:
@@ -387,6 +411,35 @@ def dispatch(payload, send_partial=None):
     return {"ok": False, "error": "unknown op %r" % (op,)}
 
 
+def _gate_for_prewarm(send_partial):
+    """If boot ``_prewarm`` is still running, tell the client and wait.
+
+    Streams ``phase=prewarm`` immediately so the Rust side holds its
+    resolve budget, waits up to ``_PREWARM_WAIT_SECS``, then streams
+    ``phase=prewarm_done`` so the 15 s timeout starts against a free
+    (or at least no-longer-prewarming) helper.
+    """
+    if _prewarm_done.is_set():
+        return
+    send_partial(
+        {
+            "ok": True,
+            "partial": True,
+            "phase": "prewarm",
+            "warming": True,
+        }
+    )
+    _prewarm_done.wait(timeout=_PREWARM_WAIT_SECS)
+    send_partial(
+        {
+            "ok": True,
+            "partial": True,
+            "phase": "prewarm_done",
+            "warming": False,
+        }
+    )
+
+
 class Handler(socketserver.StreamRequestHandler):
     def handle(self):
         line = self.rfile.readline()
@@ -396,7 +449,8 @@ class Handler(socketserver.StreamRequestHandler):
         def send_partial(obj):
             # THE-942 — write one newline-terminated partial line and flush it
             # immediately so the Rust caller can read the streamed video_id
-            # while phase 2 (nsig_solve) is still running.
+            # while phase 2 (nsig_solve) is still running. Also used for the
+            # prewarm gate so Play does not start its 15 s timeout mid-boot.
             self.wfile.write((json.dumps(obj) + "\n").encode())
             self.wfile.flush()
 
@@ -405,6 +459,8 @@ class Handler(socketserver.StreamRequestHandler):
         except json.JSONDecodeError as exc:
             resp = {"ok": False, "error": "bad json: %s" % (exc,)}
         else:
+            if payload.get("op", "resolve") == "resolve":
+                _gate_for_prewarm(send_partial)
             resp = dispatch(payload, send_partial)
         self.wfile.write((json.dumps(resp) + "\n").encode())
 

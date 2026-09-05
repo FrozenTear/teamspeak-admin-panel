@@ -65,6 +65,12 @@ pub enum PipelineEvent {
     EndOfStream,
     /// Non-fatal subsystem error. Pipeline keeps running where possible.
     Warning(String),
+    /// Warm YouTube resolve is in flight. Reuses the THE-927 dashboard
+    /// "Resolving YouTube…" pill (`BotEvent::Resolving` / SSE
+    /// `type: "resolving"`). `retrying` is `true` on the automatic second
+    /// warm attempt after a timeout/empty-partial blip — Panel can show
+    /// "resolving / retrying…".
+    Resolving { query: String, retrying: bool },
 }
 
 #[derive(Debug, Clone)]

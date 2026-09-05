@@ -19,6 +19,14 @@
 //! `!play` down but can never break it. The escape hatch `YT_RESOLVER_DISABLE`
 //! pins playback to the subprocess path outright.
 //!
+//! **Warm retry.** A mid-life YouTube extract blip (Contabo v1.6.5: warm
+//! `RESOLVE_TIMEOUT` with `video_id: None`, then an immediate 20–60 s cold
+//! yt-dlp cliff) is absorbed by [`ResolverHandle::resolve_with_warm_retry`]:
+//! one fresh warm request while the helper sock/process is still healthy,
+//! and only then the subprocess fallback. Permanent failures (private
+//! video, supervisor dead, connect unavailable) still skip straight to
+//! subprocess.
+//!
 //! **Supervision.** [`ResolverHandle::spawn`] launches a background task
 //! that (re)spawns the Python process and restarts it on exit with a short
 //! backoff. After repeated fast crashes it gives up and leaves the
@@ -67,6 +75,22 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// the worst-case failure-path delay from 40 s to 15 s before the subprocess
 /// fallback fires.
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long after supervisor spawn the first-minutes grace budget applies.
+/// Contabo v1.6.5 saw a warm timeout ~3 min after a 63 s boot prewarm;
+/// five minutes covers that window without stretching steady-state Play.
+const BOOT_GRACE: Duration = Duration::from_secs(5 * 60);
+
+/// Slightly longer overall budget while [`BOOT_GRACE`] is still open.
+/// Only used when the handle is on the production [`RESOLVE_TIMEOUT`];
+/// tests that inject a short timeout are left alone.
+const BOOT_RESOLVE_TIMEOUT: Duration = Duration::from_secs(28);
+
+/// Budget held while the helper streams a `phase=prewarm` partial. Boot
+/// prewarm has been measured around a minute; this is a ceiling, not a
+/// target — a `prewarm_done` partial resets the deadline to the normal
+/// resolve budget the moment the cache is warm.
+const PREWARM_WAIT: Duration = Duration::from_secs(90);
 
 /// THE-942 — budget for phase 2 (`nsig_solve`) *after* a search has streamed
 /// its phase-1 `video_id` partial.
@@ -184,6 +208,14 @@ struct WireResponse {
     /// direct watch URL instead of re-running a search query.
     #[serde(default)]
     video_id: Option<String>,
+    /// Streamed phase name. `search_fetch` is THE-942; `prewarm` /
+    /// `prewarm_done` gate Play so the 15 s resolve budget does not race
+    /// boot `_prewarm`.
+    #[serde(default)]
+    phase: Option<String>,
+    /// `true` on a `phase=prewarm` line while boot `_prewarm` is in flight.
+    #[serde(default)]
+    warming: bool,
 }
 
 /// THE-943 — one entry in the resolved-URL cache: a fully-resolved track plus
@@ -361,6 +393,10 @@ pub struct ResolverHandle {
     /// THE-943 — per-`video_id` resolved-URL cache. A hit skips the warm
     /// resolver's `search_fetch` + `nsig_solve` round-trip entirely.
     cache: UrlCache,
+    /// Instant the handle was constructed. Used for the first-minutes
+    /// [`BOOT_RESOLVE_TIMEOUT`] grace; ignored when `resolve_timeout` is
+    /// not the production default (so tests stay deterministic).
+    started_at: Instant,
 }
 
 impl ResolverHandle {
@@ -383,6 +419,7 @@ impl ResolverHandle {
             resolve_timeout: RESOLVE_TIMEOUT,
             phase2_timeout: PHASE2_TIMEOUT,
             cache: UrlCache::default(),
+            started_at: Instant::now(),
         })
     }
 
@@ -396,6 +433,7 @@ impl ResolverHandle {
             resolve_timeout: RESOLVE_TIMEOUT,
             phase2_timeout: PHASE2_TIMEOUT,
             cache: UrlCache::default(),
+            started_at: Instant::now(),
         }
     }
 
@@ -410,6 +448,7 @@ impl ResolverHandle {
             resolve_timeout: RESOLVE_TIMEOUT,
             phase2_timeout: PHASE2_TIMEOUT,
             cache: UrlCache::default(),
+            started_at: Instant::now(),
         }
     }
 
@@ -428,6 +467,7 @@ impl ResolverHandle {
             resolve_timeout,
             phase2_timeout,
             cache: UrlCache::default(),
+            started_at: Instant::now(),
         }
     }
 
@@ -497,6 +537,59 @@ impl ResolverHandle {
         Ok(track)
     }
 
+    /// `true` when the supervised helper is still the one we should talk
+    /// to: supervisor has not given up and the unix socket path is still
+    /// on disk. A missing sock or a dead supervisor is the subprocess
+    /// path — retrying warm would just pay another connect timeout.
+    pub fn is_healthy(&self) -> bool {
+        !self.state.dead.load(Ordering::Acquire) && self.socket_path.exists()
+    }
+
+    /// One automatic warm retry before the caller cliffs to the cold
+    /// yt-dlp subprocess.
+    ///
+    /// Retries when the first attempt times out or comes back empty (no
+    /// useful partial) *and* [`is_healthy`](Self::is_healthy) is still
+    /// true. `on_retry` fires after the blip is logged and before the
+    /// second request so the pipeline can emit a `Resolving { retrying }`
+    /// event for the dashboard pill. Permanent failures and an unhealthy
+    /// helper skip the retry.
+    pub async fn resolve_with_warm_retry<F>(
+        &self,
+        url: &str,
+        cookie_file: Option<&Path>,
+        on_retry: F,
+    ) -> Result<ResolvedTrack, ResolverError>
+    where
+        F: FnOnce(),
+    {
+        match self.resolve(url, cookie_file).await {
+            Ok(track) => Ok(track),
+            Err(err) if self.is_healthy() && is_warm_retryable(&err) => {
+                tracing::info!(
+                    target: "music_bot_latency",
+                    stage = "resolver_warm_retry",
+                    error = %err,
+                    "warm resolve blipped with healthy helper — retrying once before subprocess fallback",
+                );
+                on_retry();
+                self.resolve(url, cookie_file).await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Production [`RESOLVE_TIMEOUT`], stretched to [`BOOT_RESOLVE_TIMEOUT`]
+    /// for the first [`BOOT_GRACE`] after spawn. Injected test budgets are
+    /// returned unchanged so THE-942 stall tests stay fast.
+    fn current_resolve_timeout(&self) -> Duration {
+        if self.resolve_timeout == RESOLVE_TIMEOUT && self.started_at.elapsed() < BOOT_GRACE {
+            BOOT_RESOLVE_TIMEOUT
+        } else {
+            self.resolve_timeout
+        }
+    }
+
     /// Liveness probe — returns the resolver's `yt_dlp` version string.
     pub async fn ping(&self) -> Result<String, ResolverError> {
         let resp = self
@@ -516,9 +609,16 @@ impl ResolverHandle {
     /// `partial` lines (THE-942 — a search emits one carrying the phase-1
     /// `video_id`) followed by exactly one final reply, then closes.
     ///
-    /// Timeout discipline (THE-942):
+    /// Timeout discipline (THE-942 + prewarm gate):
     /// * Until a partial arrives, the whole exchange is bounded by
-    ///   [`resolve_timeout`](Self::resolve_timeout) ([`RESOLVE_TIMEOUT`]).
+    ///   [`current_resolve_timeout`](Self::current_resolve_timeout)
+    ///   ([`RESOLVE_TIMEOUT`], or [`BOOT_RESOLVE_TIMEOUT`] in the first
+    ///   minutes after spawn).
+    /// * A `phase=prewarm` / `warming` partial means boot `_prewarm` is
+    ///   still occupying the helper. The deadline is held at
+    ///   [`PREWARM_WAIT`] so Play does not start its 15 s race against a
+    ///   busy extractor. `phase=prewarm_done` resets the deadline to the
+    ///   normal resolve budget.
     /// * Once a `video_id` partial arrives, the wait for the final reply is
     ///   re-bounded to [`phase2_timeout`](Self::phase2_timeout)
     ///   ([`PHASE2_TIMEOUT`]) — a stalled `nsig_solve` no longer holds the
@@ -560,9 +660,10 @@ impl ResolverHandle {
 
         let mut lines = BufReader::new(stream).lines();
         let mut partial_video_id: Option<String> = None;
-        // Deadline for the *next* line. Starts at the overall budget; tightens
-        // to `phase2_timeout` once a partial hands us the video_id.
-        let mut deadline = Instant::now() + self.resolve_timeout;
+        // Deadline for the *next* line. Starts at the overall budget; holds
+        // at `PREWARM_WAIT` while boot prewarm is in flight; tightens to
+        // `phase2_timeout` once a partial hands us the video_id.
+        let mut deadline = Instant::now() + self.current_resolve_timeout();
 
         loop {
             let now = Instant::now();
@@ -584,6 +685,22 @@ impl ResolverHandle {
             let resp: WireResponse = serde_json::from_str(&text)
                 .map_err(|e| ResolverError::Protocol(format!("undecodable reply: {e}")))?;
             if resp.partial {
+                let phase = resp.phase.as_deref();
+                if resp.warming || phase == Some("prewarm") {
+                    // Boot prewarm still running — do not start the 15 s
+                    // resolve race against a busy extractor.
+                    tracing::info!(
+                        target: "music_bot_latency",
+                        stage = "resolver_prewarm_wait",
+                        "warm resolver still prewarming — holding resolve budget",
+                    );
+                    deadline = Instant::now() + PREWARM_WAIT;
+                    continue;
+                }
+                if phase == Some("prewarm_done") {
+                    deadline = Instant::now() + self.current_resolve_timeout();
+                    continue;
+                }
                 // Streamed progress line: capture the video_id and tighten the
                 // deadline for the (possibly stalling) final reply.
                 if let Some(vid) = resp.video_id {
@@ -594,6 +711,25 @@ impl ResolverHandle {
             }
             return Ok(resp);
         }
+    }
+}
+
+/// A first-attempt warm failure that is worth one retry while the helper
+/// is still healthy. Timeouts (with or without a phase-1 `video_id`) and
+/// empty/no-useful-partial replies match the Contabo cliff; permanent
+/// extractor errors (private, age-gated) and `Unavailable` do not.
+pub fn is_warm_retryable(err: &ResolverError) -> bool {
+    match err {
+        ResolverError::TimedOut { .. } => true,
+        ResolverError::Protocol(msg) => msg.contains("connection closed before a final reply"),
+        ResolverError::Resolution(msg) => {
+            let m = msg.to_ascii_lowercase();
+            m.is_empty()
+                || m.contains("no entries")
+                || m.contains("no direct media url")
+                || m.contains("no video")
+        }
+        ResolverError::Unavailable(_) => false,
     }
 }
 
@@ -767,33 +903,43 @@ mod tests {
     /// failure mode: phase 1 streamed the video_id, phase 2 (`nsig_solve`)
     /// wedged and never produced a final reply.
     fn mock_streaming(path: PathBuf, lines: Vec<&'static str>, hang_after: Option<Duration>) {
+        mock_connections(path, vec![(lines, hang_after)]);
+    }
+
+    /// Accept `replies.len()` connections in order. Each entry is the
+    /// streamed lines for that connection plus an optional hang before
+    /// close. Used to exercise the warm-retry path (first blip, second
+    /// success) without a real yt-dlp.
+    fn mock_connections(path: PathBuf, replies: Vec<(Vec<&'static str>, Option<Duration>)>) {
         tokio::spawn(async move {
             let listener = UnixListener::bind(&path).unwrap();
-            let (mut stream, _) = listener.accept().await.unwrap();
-            // Drain the request line (the client half-closes its write side).
-            let mut byte = [0u8; 1];
-            loop {
-                match stream.read(&mut byte).await {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        if byte[0] == b'\n' {
-                            break;
+            for (lines, hang_after) in replies {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                // Drain the request line (the client half-closes its write side).
+                let mut byte = [0u8; 1];
+                loop {
+                    match stream.read(&mut byte).await {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            if byte[0] == b'\n' {
+                                break;
+                            }
                         }
+                        Err(_) => break,
                     }
-                    Err(_) => break,
                 }
-            }
-            for line in lines {
-                if stream.write_all(line.as_bytes()).await.is_err() {
-                    return;
+                for line in lines {
+                    if stream.write_all(line.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    let _ = stream.flush().await;
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                let _ = stream.flush().await;
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                if let Some(d) = hang_after {
+                    tokio::time::sleep(d).await;
+                }
+                let _ = stream.shutdown().await;
             }
-            if let Some(d) = hang_after {
-                tokio::time::sleep(d).await;
-            }
-            let _ = stream.shutdown().await;
         });
     }
 
@@ -1108,6 +1254,240 @@ mod tests {
         assert_eq!(second.direct_url, first.direct_url);
         assert_eq!(second.title.as_deref(), Some("Song"));
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- Warm retry / prewarm gate / boot-grace budget ----
+
+    #[test]
+    fn warm_retryable_covers_timeout_and_empty_partial_only() {
+        assert!(is_warm_retryable(&ResolverError::TimedOut {
+            partial_video_id: None
+        }));
+        assert!(is_warm_retryable(&ResolverError::TimedOut {
+            partial_video_id: Some("VID".into())
+        }));
+        assert!(is_warm_retryable(&ResolverError::Protocol(
+            "connection closed before a final reply".into()
+        )));
+        assert!(is_warm_retryable(&ResolverError::Resolution(
+            "ytsearch returned no entries".into()
+        )));
+        assert!(is_warm_retryable(&ResolverError::Resolution(
+            "yt-dlp returned no direct media URL".into()
+        )));
+        assert!(!is_warm_retryable(&ResolverError::Resolution(
+            "Private video".into()
+        )));
+        assert!(!is_warm_retryable(&ResolverError::Unavailable(
+            "connect timed out".into()
+        )));
+    }
+
+    #[test]
+    fn boot_grace_only_stretches_the_production_budget() {
+        // Mirrors `current_resolve_timeout`: injected test budgets stay put.
+        let stretch = |configured: Duration, age: Duration| {
+            if configured == RESOLVE_TIMEOUT && age < BOOT_GRACE {
+                BOOT_RESOLVE_TIMEOUT
+            } else {
+                configured
+            }
+        };
+        assert_eq!(
+            stretch(RESOLVE_TIMEOUT, Duration::from_secs(60)),
+            BOOT_RESOLVE_TIMEOUT,
+        );
+        assert_eq!(
+            stretch(RESOLVE_TIMEOUT, BOOT_GRACE + Duration::from_secs(1)),
+            RESOLVE_TIMEOUT,
+        );
+        assert_eq!(
+            stretch(Duration::from_millis(300), Duration::from_secs(1)),
+            Duration::from_millis(300),
+        );
+        assert!(BOOT_RESOLVE_TIMEOUT > RESOLVE_TIMEOUT);
+        assert!(BOOT_RESOLVE_TIMEOUT <= Duration::from_secs(30));
+    }
+
+    /// First attempt times out with no partial (the Contabo cliff); the
+    /// helper sock is still accepting. The second warm request succeeds
+    /// — subprocess must not run.
+    #[tokio::test]
+    async fn warm_timeout_retries_once_and_succeeds() {
+        let path = sock("retry-ok");
+        let _ = std::fs::remove_file(&path);
+        mock_connections(
+            path.clone(),
+            vec![
+                (vec![], Some(Duration::from_secs(3))),
+                (
+                    vec![
+                        "{\"ok\":true,\"direct_url\":\"https://cdn/x.webm\",\"title\":\"Song\"}\n",
+                    ],
+                    None,
+                ),
+            ],
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let handle = ResolverHandle::for_socket_with_timeouts(
+            path.clone(),
+            Duration::from_millis(200),
+            Duration::from_millis(200),
+        );
+        let mut retried = false;
+        let track = handle
+            .resolve_with_warm_retry("ytsearch1:song", None, || retried = true)
+            .await
+            .expect("second warm attempt must succeed");
+        assert!(retried, "on_retry must fire after the first timeout");
+        assert_eq!(track.direct_url, "https://cdn/x.webm");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// First attempt closes with no final reply (empty partial). Same
+    /// retry path as a timeout: one more warm request, then give up.
+    #[tokio::test]
+    async fn empty_partial_retries_once_before_giving_up() {
+        let path = sock("retry-empty");
+        let _ = std::fs::remove_file(&path);
+        mock_connections(
+            path.clone(),
+            vec![
+                (vec![], None), // EOF before a final reply
+                (vec![], None),
+            ],
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let handle = ResolverHandle::for_socket(path.clone());
+        let mut retried = false;
+        let err = handle
+            .resolve_with_warm_retry("ytsearch1:song", None, || retried = true)
+            .await
+            .unwrap_err();
+        assert!(retried, "empty first reply must retry once");
+        assert!(
+            matches!(err, ResolverError::Protocol(ref m) if m.contains("connection closed")),
+            "got: {err:?}",
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Unavailable (no sock) is not a healthy-helper blip — do not retry.
+    #[tokio::test]
+    async fn unavailable_does_not_retry() {
+        let handle = ResolverHandle::for_socket(sock("retry-absent"));
+        let mut retried = false;
+        let err = handle
+            .resolve_with_warm_retry("https://youtu.be/x", None, || retried = true)
+            .await
+            .unwrap_err();
+        assert!(
+            !retried,
+            "missing sock must cliff to subprocess immediately"
+        );
+        assert!(matches!(err, ResolverError::Unavailable(_)), "got: {err:?}");
+    }
+
+    /// Dead supervisor is the same "not healthy" path as a missing sock.
+    #[tokio::test]
+    async fn dead_supervisor_does_not_retry() {
+        let state = Arc::new(SupervisorState::default());
+        state.dead.store(true, Ordering::Release);
+        let handle = ResolverHandle::for_socket_with_state(sock("retry-dead"), state);
+        let mut retried = false;
+        let err = handle
+            .resolve_with_warm_retry("https://youtu.be/x", None, || retried = true)
+            .await
+            .unwrap_err();
+        assert!(!retried);
+        assert!(matches!(err, ResolverError::Unavailable(_)), "got: {err:?}");
+    }
+
+    /// A `phase=prewarm` partial must not consume the short resolve
+    /// budget. The mock holds 250 ms (longer than resolve_timeout) then
+    /// sends `prewarm_done` + the final reply; without the gate this
+    /// would TimedOut.
+    #[tokio::test]
+    async fn prewarm_partial_holds_budget_until_done() {
+        let path = sock("prewarm-gate");
+        let _ = std::fs::remove_file(&path);
+        mock_streaming(
+            path.clone(),
+            vec![
+                "{\"ok\":true,\"partial\":true,\"phase\":\"prewarm\",\"warming\":true}\n",
+                "{\"ok\":true,\"partial\":true,\"phase\":\"prewarm_done\",\"warming\":false}\n",
+                "{\"ok\":true,\"direct_url\":\"https://cdn/warm.webm\",\"title\":\"Warmed\"}\n",
+            ],
+            None,
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // resolve_timeout is tight; the prewarm lines + 10 ms sleeps would
+        // still fit, so stall between the prewarm line and prewarm_done
+        // via a custom hang on a two-step mock.
+        let handle = ResolverHandle::for_socket_with_timeouts(
+            path.clone(),
+            Duration::from_millis(80),
+            Duration::from_millis(80),
+        );
+        let track = handle
+            .resolve("https://youtu.be/x", None)
+            .await
+            .expect("prewarm gate must not fire the short resolve timeout");
+        assert_eq!(track.direct_url, "https://cdn/warm.webm");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Same as above, but the mock actually waits longer than
+    /// `resolve_timeout` after the prewarm partial so a budget leak
+    /// would fail the test.
+    #[tokio::test]
+    async fn prewarm_partial_survives_a_resolve_timeout_sized_wait() {
+        let path = sock("prewarm-stall");
+        let _ = std::fs::remove_file(&path);
+        tokio::spawn({
+            let path = path.clone();
+            async move {
+                let listener = UnixListener::bind(&path).unwrap();
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut byte = [0u8; 1];
+                loop {
+                    match stream.read(&mut byte).await {
+                        Ok(0) => break,
+                        Ok(_) if byte[0] == b'\n' => break,
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+                let prewarm =
+                    "{\"ok\":true,\"partial\":true,\"phase\":\"prewarm\",\"warming\":true}\n";
+                stream.write_all(prewarm.as_bytes()).await.unwrap();
+                stream.flush().await.unwrap();
+                // Longer than resolve_timeout (80 ms); shorter than PREWARM_WAIT.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let done =
+                    "{\"ok\":true,\"partial\":true,\"phase\":\"prewarm_done\",\"warming\":false}\n";
+                stream.write_all(done.as_bytes()).await.unwrap();
+                let fin = "{\"ok\":true,\"direct_url\":\"https://cdn/after-prewarm.webm\",\"title\":\"Ok\"}\n";
+                stream.write_all(fin.as_bytes()).await.unwrap();
+                let _ = stream.shutdown().await;
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let handle = ResolverHandle::for_socket_with_timeouts(
+            path.clone(),
+            Duration::from_millis(80),
+            Duration::from_millis(80),
+        );
+        let track = handle
+            .resolve("https://youtu.be/x", None)
+            .await
+            .expect("Play must wait for prewarm instead of timing out");
+        assert_eq!(track.direct_url, "https://cdn/after-prewarm.webm");
         let _ = std::fs::remove_file(&path);
     }
 }

@@ -143,6 +143,9 @@ async fn main() -> Result<()> {
                     break;
                 }
                 Ok(PipelineEvent::Warning(msg)) => warn!(%msg, "pipeline warning"),
+                Ok(PipelineEvent::Resolving { query, retrying }) => {
+                    info!(%query, retrying, "Resolving");
+                }
                 Err(RecvError::Lagged(n)) => warn!(missed = n, "event subscriber lagged"),
                 Err(RecvError::Closed) => break,
             }

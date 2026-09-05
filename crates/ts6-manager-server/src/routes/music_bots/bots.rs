@@ -363,12 +363,9 @@ fn wire_event(ev: &DomainBotEvent) -> Option<wire::BotEventWire> {
         DomainBotEvent::LibraryChanged => wire::BotEventWire::LibraryChanged,
         // THE-927 — surface the in-flight YouTube resolve to the FE so the
         // 17 s wait reads as in-progress instead of broken.
-        DomainBotEvent::Resolving { query } => wire::BotEventWire::Resolving {
+        DomainBotEvent::Resolving { query, retrying } => wire::BotEventWire::Resolving {
             query: query.clone(),
-            // Warm-retry (`retrying: true`) lands with Music Bot PR #21.
-            // Until that maps through `BotEvent::Resolving`, first-attempt
-            // chat `!play yt:` stays `false` (elided on the wire).
-            retrying: false,
+            retrying: *retrying,
         },
         DomainBotEvent::FirstFrameOnWire => wire::BotEventWire::FirstFrameOnWire,
         DomainBotEvent::Error(err) => wire::BotEventWire::Error {

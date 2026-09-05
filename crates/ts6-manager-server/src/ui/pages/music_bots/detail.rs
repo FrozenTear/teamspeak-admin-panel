@@ -1402,7 +1402,7 @@ fn apply_event(d: &mut wire::MusicBotDetail, ev: &wire::BotEventWire) {
         // pipeline waits on yt-dlp + prebuffer. Replaces any previous
         // in-flight query (`!play` then `!skip` then `!play yt:` again
         // must show the newest wait). `retrying` is the automatic second
-        // warm attempt from Music Bot PR #21; older events omit it.
+        // warm attempt from this PR; older events omit it.
         wire::BotEventWire::Resolving { query, retrying } => {
             d.resolving_query = Some(query.clone());
             d.resolving_retrying = *retrying;
