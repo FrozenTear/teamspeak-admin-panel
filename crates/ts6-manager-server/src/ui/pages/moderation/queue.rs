@@ -31,10 +31,12 @@ use crate::ui::components::{Banner, BannerVariant, Button, ButtonSize, ButtonTyp
 use crate::ui::layout::use_servers_context;
 use crate::ui::pages::active_server;
 use crate::ui::routes::Route;
+use ts6_manager_shared::servers::ServerSummary;
 
 use super::perm;
 use super::{
     AccessDenied, case_status_class, fmt_datetime, format_error, origin_label, relative_from_unix,
+    resolve_moderation_server,
 };
 
 /// Case rows fetched per query. The queue is a working surface, not an
@@ -91,23 +93,49 @@ pub fn ModerationQueuePage() -> Element {
     let can_view_complaints = perm::role_holds(&role, "moderation.complaint.view");
     let can_resolve_complaints = perm::role_holds(&role, "moderation.complaint.resolve");
 
+    let servers_ctx = use_servers_context();
+    let server = match resolve_moderation_server(
+        servers_ctx,
+        "Moderation",
+        "Moderation",
+        "Pick a server from the selector to see its moderation queue.",
+    ) {
+        Ok(server) => server,
+        Err(placeholder) => return placeholder,
+    };
+
+    rsx! {
+        ModerationQueueBody {
+            server,
+            can_manage_cases,
+            can_view_complaints,
+            can_resolve_complaints,
+        }
+    }
+}
+
+#[derive(Props, Clone, PartialEq)]
+struct ModerationQueueBodyProps {
+    server: ServerSummary,
+    can_manage_cases: bool,
+    can_view_complaints: bool,
+    can_resolve_complaints: bool,
+}
+
+/// Server-scoped queue body. Mounts only after the chrome list resolves
+/// a pick, so its `use_resource` hooks are never registered on the
+/// Loading / empty path (same family as #20).
+#[component]
+fn ModerationQueueBody(props: ModerationQueueBodyProps) -> Element {
+    let ModerationQueueBodyProps {
+        server,
+        can_manage_cases,
+        can_view_complaints,
+        can_resolve_complaints,
+    } = props;
+
     let gate = use_auth_gate();
     let toaster = use_toaster();
-    let servers_ctx = use_servers_context();
-    let storage = session.storage.clone();
-
-    let server = active_server::resolve(&servers_ctx.data.read(), &*storage);
-    let Some(server) = server else {
-        return rsx! {
-            div { class: "crumb", "Moderation" }
-            h1 { "Moderation" }
-            div { class: "empty",
-                div { class: "icon", "⊙" }
-                h3 { "No server selected" }
-                p { "Pick a server from the selector to see its moderation queue." }
-            }
-        };
-    };
     let server_id = server.id;
     let server_name = server.name.clone();
     let sid = active_server::DEFAULT_VIRTUAL_SERVER_ID;

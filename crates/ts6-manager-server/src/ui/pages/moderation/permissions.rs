@@ -47,9 +47,11 @@ use crate::ui::components::{
 };
 use crate::ui::layout::use_servers_context;
 use crate::ui::pages::active_server;
+use ts6_manager_shared::servers::ServerSummary;
 
 use super::format_error;
 use super::permeditor::{PERM_SCOPES, PermKind, is_companion, perm_kind, perm_scope};
+use super::resolve_moderation_server;
 
 /// Catalog view caps the rendered row count — an unscoped catalog is ~510
 /// rows (~255 with companions hidden). The rail + search keep the working
@@ -97,24 +99,33 @@ pub fn PermissionsCatalogPage(permsid: Option<String>) -> Element {
         return rsx! { "" };
     }
 
-    let storage = session.storage.clone();
     let servers_ctx = use_servers_context();
 
-    let server = active_server::resolve(&servers_ctx.data.read(), &*storage);
-    let Some(server) = server else {
-        return rsx! {
-            div { class: "crumb", "Moderation · Permissions" }
-            h1 { "Permissions" }
-            div { class: "empty",
-                div { class: "icon", "🔑" }
-                h3 { "No server selected" }
-                p { "Select a server to browse its permission catalog." }
-            }
-        };
+    let server = match resolve_moderation_server(
+        servers_ctx,
+        "Moderation · Permissions",
+        "Permissions",
+        "Select a server to browse its permission catalog.",
+    ) {
+        Ok(server) => server,
+        Err(placeholder) => return placeholder,
     };
-    let server_id = server.id;
-    let server_name = server.name.clone();
+
+    rsx! { PermissionsCatalogBody { server, permsid } }
+}
+
+#[derive(Props, Clone, PartialEq)]
+struct PermissionsCatalogBodyProps {
+    server: ServerSummary,
+    permsid: Option<String>,
+}
+
+#[component]
+fn PermissionsCatalogBody(props: PermissionsCatalogBodyProps) -> Element {
+    let server_id = props.server.id;
+    let server_name = props.server.name.clone();
     let sid = active_server::DEFAULT_VIRTUAL_SERVER_ID;
+    let permsid = props.permsid.clone();
 
     // A deep link lands on the Catalog tab; otherwise Catalog is the default.
     let mut active_tab = use_signal(|| String::from("catalog"));

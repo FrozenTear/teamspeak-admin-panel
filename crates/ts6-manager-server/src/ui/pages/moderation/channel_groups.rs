@@ -33,8 +33,10 @@ use crate::ui::components::{Banner, BannerVariant, Button, ButtonSize, ButtonTyp
 use crate::ui::layout::use_servers_context;
 use crate::ui::pages::active_server;
 use crate::ui::routes::Route;
+use ts6_manager_shared::servers::ServerSummary;
 
 use super::format_error;
+use super::resolve_moderation_server;
 use super::server_groups::{group_type_label, group_type_protected};
 
 #[component]
@@ -43,9 +45,6 @@ pub fn ChannelGroupsPage() -> Element {
     if matches!(*session.state.read(), AuthState::Anonymous) {
         return rsx! { "" };
     }
-    let storage = session.storage.clone();
-    let gate = use_auth_gate();
-    let hub = use_ws_hub();
     let servers_ctx = use_servers_context();
 
     let is_admin = session
@@ -55,18 +54,30 @@ pub fn ChannelGroupsPage() -> Element {
         .map(|u| u.role.eq_ignore_ascii_case("admin"))
         .unwrap_or(false);
 
-    let server = active_server::resolve(&servers_ctx.data.read(), &*storage);
-    let Some(server) = server else {
-        return rsx! {
-            div { class: "crumb", "Moderation · Channel groups" }
-            h1 { "Channel groups" }
-            div { class: "empty",
-                div { class: "icon", "⚑" }
-                h3 { "No server selected" }
-                p { "Select a server to manage its channel permission groups." }
-            }
-        };
+    let server = match resolve_moderation_server(
+        servers_ctx,
+        "Moderation · Channel groups",
+        "Channel groups",
+        "Select a server to manage its channel permission groups.",
+    ) {
+        Ok(server) => server,
+        Err(placeholder) => return placeholder,
     };
+
+    rsx! { ChannelGroupsPageBody { server, is_admin } }
+}
+
+#[derive(Props, Clone, PartialEq)]
+struct ChannelGroupsPageBodyProps {
+    server: ServerSummary,
+    is_admin: bool,
+}
+
+#[component]
+fn ChannelGroupsPageBody(props: ChannelGroupsPageBodyProps) -> Element {
+    let ChannelGroupsPageBodyProps { server, is_admin } = props;
+    let gate = use_auth_gate();
+    let hub = use_ws_hub();
     let server_id = server.id;
     let server_name = server.name.clone();
     let sid = active_server::DEFAULT_VIRTUAL_SERVER_ID;

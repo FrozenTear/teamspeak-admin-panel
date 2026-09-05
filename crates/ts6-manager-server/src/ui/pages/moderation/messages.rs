@@ -44,8 +44,9 @@ use crate::ui::components::{
 };
 use crate::ui::layout::use_servers_context;
 use crate::ui::pages::active_server;
+use ts6_manager_shared::servers::ServerSummary;
 
-use super::format_error;
+use super::{format_error, resolve_moderation_server};
 
 #[component]
 pub fn MessagesPage() -> Element {
@@ -67,24 +68,32 @@ pub fn MessagesPage() -> Element {
         .unwrap_or_default();
     let is_admin = role.eq_ignore_ascii_case("admin");
 
-    let storage = session.storage.clone();
+    let servers_ctx = use_servers_context();
+    let server = match resolve_moderation_server(
+        servers_ctx,
+        "Moderation · Messages",
+        "Messages",
+        "Add a server to read its offline-message inbox.",
+    ) {
+        Ok(server) => server,
+        Err(placeholder) => return placeholder,
+    };
+
+    rsx! { MessagesPageBody { server, is_admin } }
+}
+
+#[derive(Props, Clone, PartialEq)]
+struct MessagesPageBodyProps {
+    server: ServerSummary,
+    is_admin: bool,
+}
+
+#[component]
+fn MessagesPageBody(props: MessagesPageBodyProps) -> Element {
+    let MessagesPageBodyProps { server, is_admin } = props;
     let gate = use_auth_gate();
     let toaster = use_toaster();
     let hub = use_ws_hub();
-    let servers_ctx = use_servers_context();
-
-    let server = active_server::resolve(&servers_ctx.data.read(), &*storage);
-    let Some(server) = server else {
-        return rsx! {
-            div { class: "crumb", "Moderation · Messages" }
-            h1 { "Messages" }
-            div { class: "empty",
-                div { class: "icon", "✉" }
-                h3 { "No server selected" }
-                p { "Add a server to read its offline-message inbox." }
-            }
-        };
-    };
     let server_id = server.id;
     let server_name = server.name.clone();
     let sid = active_server::DEFAULT_VIRTUAL_SERVER_ID;

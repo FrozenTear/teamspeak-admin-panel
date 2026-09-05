@@ -13,28 +13,77 @@
 //!   yet recorded to a queryable store, so the column currently reads `0`.
 //!
 //! Page-gated to `admin` + `moderator`, like the rest of `/moderation/*`.
+//!
+//! Hydration: the metrics `use_resource` is registered on every render
+//! and gated on `session.ready` + authenticated + the header pick. A
+//! one-shot bail on Anonymous / empty chrome list left this page stuck
+//! on **No server selected** after hard-refresh (same family as #20).
+
+use std::sync::Arc;
 
 use dioxus::prelude::*;
 use ts6_manager_shared::moderation::AutomodRuleMetrics;
+use ts6_manager_shared::servers::ServerSummary;
 
-use crate::client::api;
+use crate::client::api::{self, ApiError};
 use crate::client::dioxus::{use_auth_gate, use_session};
+use crate::client::session::RefreshGate;
 use crate::client::store::AuthState;
 use crate::ui::components::{Banner, BannerVariant};
-use crate::ui::layout::use_servers_context;
-use crate::ui::pages::active_server;
+use crate::ui::layout::{ServersData, use_servers_context};
+use crate::ui::pages::active_server::{self, ActiveServerSelection};
 use crate::ui::routes::Route;
 
 use super::perm;
-use super::{AccessDenied, format_error};
+use super::{AccessDenied, WaitingOnServer, format_error, no_server_selected};
 
 /// False-positive rate at or above which the cell is tinted — a rule
 /// misfiring this often should not be promoted to `enforce`.
 const HIGH_FP_RATE: f64 = 20.0;
 
+/// Outcome of an automod-metrics load. Loading is `None` on the resource
+/// itself — only resolved variants live here.
+#[derive(Clone, Debug)]
+enum AutomodLoaded {
+    WaitingOnSession,
+    WaitingOnList,
+    NoServers,
+    NoSelection,
+    Ready(Box<AutomodReadyPayload>),
+}
+
+#[derive(Clone, Debug)]
+struct AutomodReadyPayload {
+    server: ServerSummary,
+    rows: Vec<AutomodRuleMetrics>,
+}
+
 #[component]
 pub fn AutomodMetricsPage() -> Element {
     let session = use_session();
+    let gate = use_auth_gate();
+    let servers_ctx = use_servers_context();
+
+    // Memo the authed bit so a refresh-gate `update_pair` (token rotation)
+    // does not cancel an in-flight metrics fetch. Same as #20's chrome
+    // `/api/servers` resource.
+    let is_authed = use_memo(move || session.state.read().is_authenticated());
+
+    // Dioxus 0.7: `use_resource` re-runs whenever a tracked signal it
+    // depends on changes. Reading ready / authed / chrome list / selected
+    // id *inside* the closure means a header pick (or list arrival after
+    // rehydrate) cancels any in-flight fetch and starts a new one. A
+    // one-shot `use_future`, or an early return before this hook is
+    // registered, cannot do that.
+    let metrics = use_resource(move || {
+        let gate = gate.clone();
+        let ready = *session.ready.read();
+        let authed = is_authed();
+        let list = servers_ctx.data.read().clone();
+        let selected_id = *servers_ctx.selected.read();
+        async move { fetch_automod_metrics(gate, ready, authed, list, selected_id).await }
+    });
+
     if matches!(*session.state.read(), AuthState::Anonymous) {
         return rsx! { "" };
     }
@@ -55,49 +104,66 @@ pub fn AutomodMetricsPage() -> Element {
         };
     }
 
-    let gate = use_auth_gate();
-    let servers_ctx = use_servers_context();
-    let storage = session.storage.clone();
-
-    let server = active_server::resolve(&servers_ctx.data.read(), &*storage);
-    let Some(server) = server else {
-        return rsx! {
-            div { class: "crumb",
-                Link { to: Route::ModerationQueuePage {}, "Moderation" }
-                " · Automod"
-            }
-            h1 { "Automod metrics" }
-            div { class: "empty",
-                div { class: "icon", "⊙" }
-                h3 { "No server selected" }
-                p { "Pick a server from the selector to see its automod metrics." }
-            }
-        };
-    };
-    let server_id = server.id;
-    let server_name = server.name.clone();
-    let sid = active_server::DEFAULT_VIRTUAL_SERVER_ID;
-
-    let metrics = use_resource({
-        let gate = gate.clone();
-        move || {
-            let gate = gate.clone();
-            async move {
-                let path = format!(
-                    "/api/moderation/automod/metrics?serverConfigId={server_id}&virtualServerId={sid}"
-                );
-                api::authorized_get_json::<Vec<AutomodRuleMetrics>>(&gate, &api::api_base(), &path)
-                    .await
-            }
-        }
-    });
-
     let snapshot = metrics.read().clone();
 
     rsx! {
+        { match snapshot {
+            None | Some(Ok(AutomodLoaded::WaitingOnSession | AutomodLoaded::WaitingOnList)) => {
+                rsx! {
+                    WaitingOnServer {
+                        crumb: "Moderation · Automod".to_string(),
+                        heading: "Automod metrics".to_string(),
+                    }
+                }
+            }
+            Some(Ok(AutomodLoaded::NoServers)) => {
+                no_server_selected(
+                    "Moderation · Automod",
+                    "Automod metrics",
+                    "Add a TeamSpeak instance from Servers before automod metrics can load.",
+                )
+            }
+            Some(Ok(AutomodLoaded::NoSelection)) => {
+                no_server_selected(
+                    "Moderation · Automod",
+                    "Automod metrics",
+                    "Pick a server from the selector to see its automod metrics.",
+                )
+            }
+            Some(Ok(AutomodLoaded::Ready(payload))) => rsx! {
+                AutomodReady {
+                    server_name: payload.server.name.clone(),
+                    rows: payload.rows.clone(),
+                }
+            },
+            Some(Err(e)) => rsx! {
+                div { class: "crumb",
+                    Link { to: Route::ModerationQueuePage {}, "Moderation" }
+                    " · Automod"
+                }
+                h1 { "Automod metrics" }
+                Banner {
+                    variant: BannerVariant::Danger,
+                    title: "Could not load automod metrics".to_string(),
+                    "{format_error(&e)}"
+                }
+            },
+        } }
+    }
+}
+
+#[derive(Props, Clone, PartialEq)]
+struct AutomodReadyProps {
+    server_name: String,
+    rows: Vec<AutomodRuleMetrics>,
+}
+
+#[component]
+fn AutomodReady(props: AutomodReadyProps) -> Element {
+    rsx! {
         div { class: "crumb",
             Link { to: Route::ModerationQueuePage {}, "Moderation" }
-            " · Automod · {server_name}"
+            " · Automod · {props.server_name}"
         }
         h1 { "Automod metrics" }
         p { class: "info-hint",
@@ -107,21 +173,40 @@ pub fn AutomodMetricsPage() -> Element {
         }
 
         section { class: "stack-md mod-panel",
-            match snapshot {
-                None => rsx! {
-                    p { class: "info-hint", "Loading metrics…" }
-                },
-                Some(Err(e)) => rsx! {
-                    Banner {
-                        variant: BannerVariant::Danger,
-                        title: "Could not load automod metrics".to_string(),
-                        "{format_error(&e)}"
-                    }
-                },
-                Some(Ok(rows)) => rsx! {
-                    MetricsTable { rows }
-                },
-            }
+            MetricsTable { rows: props.rows.clone() }
+        }
+    }
+}
+
+async fn fetch_automod_metrics(
+    gate: Arc<RefreshGate>,
+    ready: bool,
+    authenticated: bool,
+    list: ServersData,
+    selected_id: Option<i64>,
+) -> Result<AutomodLoaded, ApiError> {
+    if !active_server::should_load_server_scoped(ready, authenticated) {
+        return Ok(AutomodLoaded::WaitingOnSession);
+    }
+
+    match active_server::selection_from_context(&list, selected_id) {
+        ActiveServerSelection::WaitingOnList => Ok(AutomodLoaded::WaitingOnList),
+        ActiveServerSelection::ListError(err) => Err(err),
+        ActiveServerSelection::NoServers => Ok(AutomodLoaded::NoServers),
+        ActiveServerSelection::NoSelection => Ok(AutomodLoaded::NoSelection),
+        ActiveServerSelection::Selected(server) => {
+            let path = format!(
+                "/api/moderation/automod/metrics?serverConfigId={}&virtualServerId={}",
+                server.id,
+                active_server::DEFAULT_VIRTUAL_SERVER_ID
+            );
+            let rows =
+                api::authorized_get_json::<Vec<AutomodRuleMetrics>>(&gate, &api::api_base(), &path)
+                    .await?;
+            Ok(AutomodLoaded::Ready(Box::new(AutomodReadyPayload {
+                server: *server,
+                rows,
+            })))
         }
     }
 }
@@ -185,5 +270,26 @@ fn MetricsTable(props: MetricsTableProps) -> Element {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hydrate_waits_when_session_is_not_ready() {
+        assert!(
+            !active_server::should_load_server_scoped(false, false),
+            "Anonymous first paint must not fire GET /automod/metrics"
+        );
+    }
+
+    #[test]
+    fn loading_chrome_list_is_not_no_server_selected() {
+        assert_eq!(
+            active_server::selection_from_context(&ServersData::Loading, Some(42)),
+            ActiveServerSelection::WaitingOnList
+        );
     }
 }

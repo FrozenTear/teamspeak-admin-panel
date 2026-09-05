@@ -63,8 +63,12 @@ pub use tokens::TokensPage;
 
 use chrono::{DateTime, Utc};
 use dioxus::prelude::*;
+use ts6_manager_shared::servers::ServerSummary;
 
 use crate::client::api::ApiError;
+use crate::ui::components::{Banner, BannerVariant};
+use crate::ui::layout::ServersContext;
+use crate::ui::pages::active_server::{self, ActiveServerSelection};
 
 // ── shared error formatting ─────────────────────────────────────────────
 
@@ -217,6 +221,82 @@ pub(crate) struct AccessDeniedProps {
     heading: String,
     /// One-line explanation of which role is required.
     detail: String,
+}
+
+/// Resolve the header pick for a `/moderation/*` page. `Err` is a
+/// finished placeholder Element (loading / empty / chrome-list error)
+/// so the caller can `return` it without registering a server-scoped
+/// `use_resource` on a path that has no server yet — the child body
+/// mounts only once a row is selected, with a fresh hook list.
+///
+/// Reading `data` + `selected` here keeps the parent subscribed, so a
+/// list arrival after hard-refresh unsticks **No server selected**.
+pub(crate) fn resolve_moderation_server(
+    ctx: ServersContext,
+    crumb: &str,
+    heading: &str,
+    pick_detail: &str,
+) -> Result<ServerSummary, Element> {
+    match active_server::selection_from_context(&ctx.data.read(), *ctx.selected.read()) {
+        ActiveServerSelection::WaitingOnList => Err(rsx! {
+            WaitingOnServer {
+                crumb: crumb.to_string(),
+                heading: heading.to_string(),
+            }
+        }),
+        ActiveServerSelection::ListError(err) => Err(rsx! {
+            div { class: "crumb", "{crumb}" }
+            h1 { "{heading}" }
+            Banner {
+                variant: BannerVariant::Danger,
+                title: "Could not load servers".to_string(),
+                "{format_error(&err)}"
+            }
+        }),
+        ActiveServerSelection::NoServers => Err(no_server_selected(
+            crumb,
+            heading,
+            "Add a TeamSpeak instance from Servers before this page can load.",
+        )),
+        ActiveServerSelection::NoSelection => Err(no_server_selected(crumb, heading, pick_detail)),
+        ActiveServerSelection::Selected(server) => Ok(*server),
+    }
+}
+
+/// Shared **No server selected** empty state. Used by Automod and the
+/// sibling moderation pages so the copy stays one place.
+pub(crate) fn no_server_selected(crumb: &str, heading: &str, detail: &str) -> Element {
+    rsx! {
+        div { class: "crumb", "{crumb}" }
+        h1 { "{heading}" }
+        div { class: "empty",
+            div { class: "icon", "⊙" }
+            h3 { "No server selected" }
+            p { "{detail}" }
+        }
+    }
+}
+
+#[derive(Props, Clone, PartialEq)]
+pub(crate) struct WaitingOnServerProps {
+    crumb: String,
+    heading: String,
+}
+
+/// Loading chrome while `ServersContext` is still `Loading` after
+/// rehydrate. Distinct from [`no_server_selected`] so a hard-refresh
+/// does not flash (or stick on) the empty pick.
+#[component]
+pub(crate) fn WaitingOnServer(props: WaitingOnServerProps) -> Element {
+    rsx! {
+        div { class: "crumb", "{props.crumb}" }
+        h1 { "{props.heading}" }
+        p { class: "info-hint",
+            role: "status",
+            "aria-live": "polite",
+            "Loading servers…"
+        }
+    }
 }
 
 /// The in-page 403 surface a non-qualifying session lands on when it
