@@ -25,9 +25,11 @@ use crate::ui::components::{
 use crate::ui::layout::use_servers_context;
 use crate::ui::pages::active_server;
 use crate::ui::routes::Route;
+use ts6_manager_shared::servers::ServerSummary;
 
 use super::format_error;
 use super::permeditor::PermissionEditor;
+use super::resolve_moderation_server;
 use super::server_groups::{DeleteGroupModal, group_type_label, group_type_protected};
 
 #[component]
@@ -36,8 +38,6 @@ pub fn ServerGroupDetailPage(sgid: i64) -> Element {
     if matches!(*session.state.read(), AuthState::Anonymous) {
         return rsx! { "" };
     }
-    let storage = session.storage.clone();
-    let gate = use_auth_gate();
     let servers_ctx = use_servers_context();
 
     let is_admin = session
@@ -47,18 +47,34 @@ pub fn ServerGroupDetailPage(sgid: i64) -> Element {
         .map(|u| u.role.eq_ignore_ascii_case("admin"))
         .unwrap_or(false);
 
-    let server = active_server::resolve(&servers_ctx.data.read(), &*storage);
-    let Some(server) = server else {
-        return rsx! {
-            div { class: "crumb", "Moderation · Server groups" }
-            h1 { "Server group" }
-            div { class: "empty",
-                div { class: "icon", "⚐" }
-                h3 { "No server selected" }
-                p { "Select a server to manage its permission groups." }
-            }
-        };
+    let server = match resolve_moderation_server(
+        servers_ctx,
+        "Moderation · Server groups",
+        "Server group",
+        "Select a server to manage its permission groups.",
+    ) {
+        Ok(server) => server,
+        Err(placeholder) => return placeholder,
     };
+
+    rsx! { ServerGroupDetailBody { server, sgid, is_admin } }
+}
+
+#[derive(Props, Clone, PartialEq)]
+struct ServerGroupDetailBodyProps {
+    server: ServerSummary,
+    sgid: i64,
+    is_admin: bool,
+}
+
+#[component]
+fn ServerGroupDetailBody(props: ServerGroupDetailBodyProps) -> Element {
+    let ServerGroupDetailBodyProps {
+        server,
+        sgid,
+        is_admin,
+    } = props;
+    let gate = use_auth_gate();
     let server_id = server.id;
     let sid = active_server::DEFAULT_VIRTUAL_SERVER_ID;
 

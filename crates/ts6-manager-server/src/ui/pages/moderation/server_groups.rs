@@ -28,8 +28,9 @@ use crate::ui::components::{Banner, BannerVariant, Button, ButtonSize, ButtonTyp
 use crate::ui::layout::use_servers_context;
 use crate::ui::pages::active_server;
 use crate::ui::routes::Route;
+use ts6_manager_shared::servers::ServerSummary;
 
-use super::format_error;
+use super::{format_error, resolve_moderation_server};
 
 /// TS6 `PermissionGroupDBTypes` — server-group `type` field. `1` (Regular)
 /// is the only operator-creatable kind; `0` (Template) and `2` (Query) are
@@ -55,9 +56,6 @@ pub fn ServerGroupsPage() -> Element {
     if matches!(*session.state.read(), AuthState::Anonymous) {
         return rsx! { "" };
     }
-    let storage = session.storage.clone();
-    let gate = use_auth_gate();
-    let hub = use_ws_hub();
     let servers_ctx = use_servers_context();
 
     let is_admin = session
@@ -67,18 +65,30 @@ pub fn ServerGroupsPage() -> Element {
         .map(|u| u.role.eq_ignore_ascii_case("admin"))
         .unwrap_or(false);
 
-    let server = active_server::resolve(&servers_ctx.data.read(), &*storage);
-    let Some(server) = server else {
-        return rsx! {
-            div { class: "crumb", "Moderation · Server groups" }
-            h1 { "Server groups" }
-            div { class: "empty",
-                div { class: "icon", "⚐" }
-                h3 { "No server selected" }
-                p { "Select a server to manage its permission groups." }
-            }
-        };
+    let server = match resolve_moderation_server(
+        servers_ctx,
+        "Moderation · Server groups",
+        "Server groups",
+        "Select a server to manage its permission groups.",
+    ) {
+        Ok(server) => server,
+        Err(placeholder) => return placeholder,
     };
+
+    rsx! { ServerGroupsPageBody { server, is_admin } }
+}
+
+#[derive(Props, Clone, PartialEq)]
+struct ServerGroupsPageBodyProps {
+    server: ServerSummary,
+    is_admin: bool,
+}
+
+#[component]
+fn ServerGroupsPageBody(props: ServerGroupsPageBodyProps) -> Element {
+    let ServerGroupsPageBodyProps { server, is_admin } = props;
+    let gate = use_auth_gate();
+    let hub = use_ws_hub();
     let server_id = server.id;
     let server_name = server.name.clone();
     let sid = active_server::DEFAULT_VIRTUAL_SERVER_ID;

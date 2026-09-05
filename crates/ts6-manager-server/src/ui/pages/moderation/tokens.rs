@@ -34,8 +34,9 @@ use crate::ui::components::toast::{ToastVariant, use_toaster};
 use crate::ui::components::{Banner, BannerVariant, Button, ButtonSize, ButtonType, ButtonVariant};
 use crate::ui::layout::use_servers_context;
 use crate::ui::pages::active_server;
+use ts6_manager_shared::servers::ServerSummary;
 
-use super::{format_error, relative_from_unix};
+use super::{format_error, relative_from_unix, resolve_moderation_server};
 
 /// Server-group / channel-group / channel names, used to decode the
 /// GRANTS cell and to populate the create-flow pickers. Best-effort — a
@@ -64,24 +65,32 @@ pub fn TokensPage() -> Element {
     // operator still sees the list. The API enforces this regardless.
     let is_admin = role.eq_ignore_ascii_case("admin");
 
+    let servers_ctx = use_servers_context();
+    let server = match resolve_moderation_server(
+        servers_ctx,
+        "Moderation · Privilege keys",
+        "Privilege keys",
+        "Choose a server to manage its privilege keys.",
+    ) {
+        Ok(server) => server,
+        Err(placeholder) => return placeholder,
+    };
+
+    rsx! { TokensPageBody { server, is_admin } }
+}
+
+#[derive(Props, Clone, PartialEq)]
+struct TokensPageBodyProps {
+    server: ServerSummary,
+    is_admin: bool,
+}
+
+#[component]
+fn TokensPageBody(props: TokensPageBodyProps) -> Element {
+    let TokensPageBodyProps { server, is_admin } = props;
     let gate = use_auth_gate();
     let toaster = use_toaster();
     let hub = use_ws_hub();
-    let servers_ctx = use_servers_context();
-    let storage = session.storage.clone();
-
-    let server = active_server::resolve(&servers_ctx.data.read(), &*storage);
-    let Some(server) = server else {
-        return rsx! {
-            div { class: "crumb", "Moderation · Privilege keys" }
-            h1 { "Privilege keys" }
-            div { class: "empty",
-                div { class: "icon", "🔑" }
-                h3 { "No server selected" }
-                p { "Choose a server to manage its privilege keys." }
-            }
-        };
-    };
     let server_id = server.id;
     let server_name = server.name.clone();
     let sid = active_server::DEFAULT_VIRTUAL_SERVER_ID;
