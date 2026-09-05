@@ -869,7 +869,7 @@ pub fn warm_up() {
 mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
-    use tokio::net::UnixListener;
+    use tokio::net::{UnixListener, UnixStream};
 
     /// Spawn a one-shot mock resolver: bind `path`, accept one connection,
     /// read the request line, reply with `reply`, close.
@@ -955,6 +955,21 @@ mod tests {
             }
         });
         ready_rx
+    }
+
+    /// Drain the client's request line (it half-closes the write side)
+    /// and return the stream ready for a reply.
+    async fn drain_unix_request(mut stream: UnixStream) -> UnixStream {
+        let mut byte = [0u8; 1];
+        loop {
+            match stream.read(&mut byte).await {
+                Ok(0) => break,
+                Ok(_) if byte[0] == b'\n' => break,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        stream
     }
 
     fn sock(name: &str) -> PathBuf {
@@ -1328,35 +1343,48 @@ mod tests {
     /// helper sock is still accepting. The second warm request succeeds
     /// — subprocess must not run.
     ///
-    /// The first connection parks (never replies) on its own task so the
-    /// mock can `accept` the retry immediately. A sequential hang-then-
-    /// accept let the retry connect (listen backlog) but never read a
-    /// reply, so both attempts returned `TimedOut`.
+    /// Sequencing is explicit: accept #1 parks (never replies) on a
+    /// sibling task, then the listener is free to accept #2 and write
+    /// the success line immediately. The previous shared mock handled
+    /// connections inline, so a hang on #1 blocked `accept` of #2 —
+    /// the retry connected (listen backlog) but got no reply and
+    /// returned `TimedOut { partial_video_id: None }`.
     #[tokio::test]
     async fn warm_timeout_retries_once_and_succeeds() {
         let path = sock("retry-ok");
         let _ = std::fs::remove_file(&path);
-        let ready = mock_connections(
-            path.clone(),
-            vec![
-                // Park: hang longer than resolve_timeout so attempt 1
-                // TimedOut, but do it on a sibling task (see
-                // `mock_connections`) so accept of attempt 2 is not blocked.
-                (vec![], Some(Duration::from_secs(30))),
-                (
-                    vec![
-                        "{\"ok\":true,\"direct_url\":\"https://cdn/x.webm\",\"title\":\"Song\"}\n",
-                    ],
-                    None,
-                ),
-            ],
-        );
-        ready.await.expect("mock listener bound");
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn({
+            let path = path.clone();
+            async move {
+                let listener = UnixListener::bind(&path).unwrap();
+                let _ = ready_tx.send(());
+
+                // Attempt 1: drain the request and park. Do not reply.
+                let (stream1, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let _stream1 = drain_unix_request(stream1).await;
+                    std::future::pending::<()>().await;
+                });
+
+                // Attempt 2: the warm retry. Reply as soon as the request lands.
+                let stream2 = drain_unix_request(listener.accept().await.unwrap().0).await;
+                let mut stream2 = stream2;
+                stream2
+                    .write_all(
+                        b"{\"ok\":true,\"direct_url\":\"https://cdn/x.webm\",\"title\":\"Song\"}\n",
+                    )
+                    .await
+                    .unwrap();
+                let _ = stream2.shutdown().await;
+            }
+        });
+        ready_rx.await.expect("mock listener bound");
 
         let handle = ResolverHandle::for_socket_with_timeouts(
             path.clone(),
-            Duration::from_millis(200),
-            Duration::from_millis(200),
+            Duration::from_millis(250),
+            Duration::from_millis(250),
         );
         let mut retried = false;
         let track = handle
