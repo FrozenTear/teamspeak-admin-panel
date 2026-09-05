@@ -199,11 +199,15 @@ unaffected — that path was never on passt.
 
 The manifest defines readiness (5s delay, 10s period) and liveness
 (30s delay, 30s period) probes against `GET /health` on both
-fullstack (`:3001`) and sidecar (`:7080`). These are kube `httpGet`
-probes — Podman/kubelet issues the HTTP request itself, so the sidecar
-image does not need curl/wget (Quadlet uses
-`ts6-media-sidecar --healthcheck-url` for the same reason). Podman
-respects probe semantics from v4.4 onward.
+fullstack (`:3001`) and sidecar (`:7080`). Fullstack uses kube
+`httpGet` — `podman kube play` turns that into an in-container
+`curl` HealthCmd (and *overrides* any image HEALTHCHECK), which is
+why `Containerfile.fullstack` installs curl. Sidecar uses an `exec`
+probe that runs `ts6-media-sidecar --healthcheck-url` because the
+sidecar image has neither curl nor wget; an `httpGet` probe fails at
+exec (`curl: not found`) and restart-loops ~every 105s. Quadlet
+sidecar `HealthCmd` uses the same binary invocation. Podman applies
+the liveness probe as `HealthConfig` from v4.4 onward.
 
 ## Topology
 
