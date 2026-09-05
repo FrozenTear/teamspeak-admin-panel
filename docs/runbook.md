@@ -143,8 +143,13 @@ plane port is **7080** (binary `--http-listen` default); historical
 spec `9800` is not used.
 
 The `kube` manifest defines readiness (5 s delay, 10 s period) and liveness
-(30 s delay, 30 s period) probes against `GET /health`. Podman ≥ 4.4
-respects probe semantics from the manifest directly.
+(30 s delay, 30 s period) probes against `GET /health`. Fullstack uses
+`httpGet` (`podman kube play` synthesizes in-container curl; the fullstack
+image installs curl). Sidecar uses an `exec` probe of
+`ts6-media-sidecar --healthcheck-url` because the sidecar image has
+neither curl nor wget — `httpGet` becomes
+`curl -f http://localhost:7080/health || exit 1`, overrides the image
+HEALTHCHECK, and restart-loops ~every 105s.
 
 For all three shapes the external smoke is the same: `curl -fsS http://127.0.0.1:3001/health`.
 

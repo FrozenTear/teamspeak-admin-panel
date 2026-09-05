@@ -95,9 +95,10 @@ ts6-media-sidecar --healthcheck-url
 
 Exit 0 on HTTP 2xx, non-zero otherwise. `Containerfile.sidecar`
 `HEALTHCHECK` and `deploy/quadlet/ts6-manager-sidecar.container.example`
-`HealthCmd` use this invocation. `deploy/kube` probes the same path
-via kube `httpGet` (Podman/kubelet issues the GET; no in-container
-binary needed). Control-plane default is **7080**; historical spec
+`HealthCmd` use this invocation. `deploy/kube` uses the same command
+as an `exec` probe: `podman kube play` materializes kube `httpGet` as
+in-container curl (which this image does not ship) and overrides the
+image HEALTHCHECK. Control-plane default is **7080**; historical spec
 `9800` is not used.
 
 ### `POST /source`

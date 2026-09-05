@@ -175,21 +175,30 @@ spec:
         - name: webtransport
           containerPort: 4443
           protocol: UDP
-      # httpGet is issued by Podman/kubelet, not by an in-container
-      # curl. The sidecar image has neither curl nor wget — do not
-      # switch these to exec + curl. Quadlet uses the binary probe
-      # (`--healthcheck-url`) for the same reason.
+      # `podman kube play` (verified Podman 5.6.0) materializes kube
+      # `httpGet` as an in-container CMD-SHELL HealthCmd
+      # `curl -f http://localhost:<port>/health || exit 1` and
+      # *overrides* the image HEALTHCHECK. The sidecar runtime has
+      # neither curl nor wget, so httpGet fails at exec (`curl: not
+      # found`) and `restartPolicy: Always` restart-loops the
+      # container (~105s: 30s start-period + 3 × 30s). Use an exec
+      # probe that invokes the binary, matching the OCI HEALTHCHECK
+      # and Quadlet HealthCmd. Do not switch these to exec + curl.
       readinessProbe:
-        httpGet:
-          path: /health
-          port: control
+        exec:
+          command:
+            - /usr/local/bin/ts6-media-sidecar
+            - --healthcheck-url
+            - http://127.0.0.1:7080/health
         initialDelaySeconds: 5
         periodSeconds: 10
         timeoutSeconds: 3
       livenessProbe:
-        httpGet:
-          path: /health
-          port: control
+        exec:
+          command:
+            - /usr/local/bin/ts6-media-sidecar
+            - --healthcheck-url
+            - http://127.0.0.1:7080/health
         initialDelaySeconds: 30
         periodSeconds: 30
         timeoutSeconds: 5
