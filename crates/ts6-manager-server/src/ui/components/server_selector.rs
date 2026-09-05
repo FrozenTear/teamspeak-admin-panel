@@ -121,16 +121,16 @@ pub fn ServerSelector(
 
     // Whenever the live list arrives, reconcile the persisted id: if it
     // doesn't match any row, treat the operator as un-picked AND clear the
-    // stale localStorage entry. Done in an effect so we react to
-    // out-of-tab edits and post-fetch arrival uniformly.
+    // stale localStorage entry. Read `ctx.data` inside the effect so we
+    // react to post-fetch arrival. Do **not** treat Loading's empty
+    // `rows()` as "stale" — that wiped a valid pick on every refresh
+    // before `GET /api/servers` completed, so the dashboard (#16) then
+    // rendered "No server selected" against a list the operator owns.
     {
-        let rows_for_effect = rows.clone();
         let storage_for_effect = storage.clone();
         use_effect(move || {
-            let cur = *selected.read();
-            if let Some(id) = cur
-                && !rows_for_effect.iter().any(|s| s.id == id)
-            {
+            let snap = ctx.data.read().clone();
+            if stale_selected_server_id(&snap, *selected.read()).is_some() {
                 selected.set(None);
                 clear_selected_server_id(&*storage_for_effect);
             }
@@ -324,6 +324,17 @@ fn current_authed_path() -> String {
     }
 }
 
+/// Id to drop once the live list has arrived and no longer contains it.
+/// `None` during Loading/Error so a refresh cannot erase a persisted pick
+/// before `GET /api/servers` completes — `ServersData::rows` is empty in
+/// those states, which is not the same as "this id is gone".
+pub fn stale_selected_server_id(data: &ServersData, selected: Option<i64>) -> Option<i64> {
+    let ServersData::Loaded(rows) = data else {
+        return None;
+    };
+    selected.filter(|id| !rows.iter().any(|s| s.id == *id))
+}
+
 /// Best-effort label for the trigger pill. `None` means the caller should
 /// fall back to a state-aware placeholder (loading / error / "Select a
 /// server"); `Some` is always a server name pulled from the live list.
@@ -453,6 +464,44 @@ mod tests {
             ServerSelectorVariant::Desktop.id_prefix(),
             ServerSelectorVariant::Mobile.id_prefix(),
             "two ServerSelectors mount in the same document; their DOM ids must not collide"
+        );
+    }
+
+    #[test]
+    fn stale_selected_id_is_ignored_while_list_is_loading_or_errored() {
+        // Loading exposes an empty rows() slice; treating that as "id is
+        // gone" would clear ts6-manager.ui.selected-server on every
+        // hard-refresh before GET /api/servers returns.
+        assert_eq!(
+            stale_selected_server_id(&ServersData::Loading, Some(7)),
+            None
+        );
+        assert_eq!(
+            stale_selected_server_id(
+                &ServersData::Error(ApiError::Transport("boom".into())),
+                Some(7)
+            ),
+            None
+        );
+        assert_eq!(stale_selected_server_id(&ServersData::Loading, None), None);
+    }
+
+    #[test]
+    fn stale_selected_id_clears_only_after_loaded_list_omits_it() {
+        let rows = vec![fixture(7, "Primary")];
+        assert_eq!(
+            stale_selected_server_id(&ServersData::Loaded(rows.clone()), Some(7)),
+            None,
+            "matching pick must survive"
+        );
+        assert_eq!(
+            stale_selected_server_id(&ServersData::Loaded(rows), Some(99)),
+            Some(99)
+        );
+        assert_eq!(
+            stale_selected_server_id(&ServersData::Loaded(Vec::new()), Some(7)),
+            Some(7),
+            "empty Loaded list means the operator deleted every row"
         );
     }
 

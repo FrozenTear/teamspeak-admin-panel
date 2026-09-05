@@ -45,10 +45,11 @@ pub enum ApiError {
     /// This is fired in the brief window between an `AppShell` mount
     /// and `rehydrate_from_storage` completing, or right after a logout
     /// before the route guard takes over. The pattern in
-    /// `mount_servers_context` is to subscribe to `is_authenticated()`
-    /// via `use_memo` and refetch when the session transitions
-    /// Anonymous → Authenticated — that turns this error into a
-    /// self-healing transient.
+    /// `mount_servers_context` is to subscribe to `session.ready` and
+    /// `is_authenticated()` via `use_resource` and refetch when the
+    /// session transitions Anonymous → Authenticated — that turns this
+    /// error into a self-healing transient. Dioxus 0.7 `use_future` is
+    /// not reactive and cannot do this.
     SessionAnonymous,
 
     /// Spec §7.0.2 502 envelope — TeamSpeak upstream failed.

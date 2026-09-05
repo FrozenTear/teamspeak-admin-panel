@@ -16,7 +16,7 @@
 //!
 //! Internally we hold a [`Signal<ServersData>`] state machine rather than a
 //! raw `Resource<…>`. That makes the selector logic identical between
-//! production (where a background `use_future` updates the signal) and
+//! production (where a reactive `use_resource` updates the signal) and
 //! tests (where the harness sets the signal to a canned value with no fetch).
 
 use std::sync::Arc;
@@ -64,18 +64,25 @@ pub struct ServersContext {
 /// Compound hook: build the [`ServersContext`], spawn the background fetch,
 /// and provide the context for descendants. Designed to be called **directly**
 /// from a component body (not inside another hook's closure) so the inner
-/// `use_signal` / `use_future` / `use_context_provider` calls all run as
+/// `use_signal` / `use_resource` / `use_context_provider` calls all run as
 /// top-level hooks in the parent's hook list.
 ///
-/// The fetch is gated on `is_authenticated()` via a `use_memo` subscription
-/// so it self-heals across the Anonymous → Authenticated transition. The
+/// The fetch is gated on `session.ready` **and** `is_authenticated()` so
+/// it self-heals across the Anonymous → Authenticated transition. The
 /// first poll on a hard-refresh of `/servers` can land before
 /// `App`'s post-mount `rehydrate_from_storage` `use_effect` upgrades the
 /// session signal; without the gate, the gate's anonymous short-circuit
 /// would cache a synthetic `Unauthorized` and the page would render
 /// "Session expired" the moment the chrome appeared
-/// ([PURA-232](/PURA/issues/PURA-232)). A refresh button + interval
-/// refresh land in Phase 2 with the rest of the live-telemetry story.
+/// ([PURA-232](/PURA/issues/PURA-232)).
+///
+/// Dioxus 0.7 `use_future` is **not** reactive — it spawns once on first
+/// render. Reading a memo inside that one-shot closure does not restart
+/// the task after rehydrate, so ServerSelector stayed on "Loading
+/// servers…" forever while pages saw an empty list ("No server selected").
+/// `use_resource` is the same hook the dashboard already uses for a
+/// signal-driven refetch. A refresh button + interval refresh land in
+/// Phase 2 with the rest of the live-telemetry story.
 pub fn mount_servers_context() -> ServersContext {
     let gate = use_auth_gate();
     let session = use_session();
@@ -89,21 +96,22 @@ pub fn mount_servers_context() -> ServersContext {
     // (`session.update_pair` from the refresh gate) don't cancel and
     // restart the in-flight fetch. The memo's value only flips on
     // Anonymous ↔ Authenticated transitions, which is exactly the
-    // signal we want the future to react to.
+    // signal we want the resource to react to.
     let is_authed = use_memo(move || session.state.read().is_authenticated());
 
-    let _ = use_future(move || {
+    // Read `ready` + the authed memo *inside* the resource so Dioxus 0.7
+    // cancels and re-spawns after rehydrate (same class as #19's AppShell
+    // gate). `use_future` cannot do this — it is fire-and-forget.
+    let _resource = use_resource(move || {
         let gate = gate.clone();
-        // Read the memo INSIDE the closure body so the future subscribes
-        // to memo-value changes; once subscribed, the runtime cancels
-        // any in-flight prior future and re-spawns when authed flips.
+        let ready = *session.ready.read();
         let authed = is_authed();
         async move {
-            if !authed {
+            if !should_fetch_servers(ready, authed) {
                 // Stay in Loading. The route guard (`AppShell`) bounces
                 // to /login if the session never materialises; if it
-                // does (rehydrate / post-login), this closure re-runs
-                // with `authed=true` and fires the real fetch.
+                // does (rehydrate / post-login), this resource re-runs
+                // with both bits set and fires the real fetch.
                 data.set(ServersData::Loading);
                 return;
             }
@@ -113,7 +121,9 @@ pub fn mount_servers_context() -> ServersContext {
                 // `SessionAnonymous` instead of a server-401 envelope on
                 // its own short-circuit; even if a future refactor
                 // tweaks the upstream surface, the page must not render
-                // this as a fatal error.
+                // this as a fatal error. The resource re-runs once
+                // `ready`/`is_authed` flip, so this is no longer a
+                // terminal state after hard-refresh.
                 Err(ApiError::SessionAnonymous) => ServersData::Loading,
                 Err(e) => ServersData::Error(e),
             };
@@ -123,6 +133,16 @@ pub fn mount_servers_context() -> ServersContext {
     let ctx = ServersContext { data, selected };
     use_context_provider(|| ctx);
     ctx
+}
+
+/// Chrome `/api/servers` fetch predicate.
+///
+/// First paint is Anonymous and not-ready (PURA-129). Fetching then
+/// short-circuits as `SessionAnonymous`. Combined with a non-reactive
+/// `use_future`, that left ServerSelector on "Loading servers…" after a
+/// hard refresh even though the operator still had a valid session blob.
+pub fn should_fetch_servers(ready: bool, authenticated: bool) -> bool {
+    ready && authenticated
 }
 
 /// Pull the shared [`ServersContext`] from context. Panics if no provider
@@ -175,5 +195,25 @@ mod tests {
         assert!(ServersData::Loading.rows().is_empty());
         let err = ServersData::Error(ApiError::Transport("boom".into()));
         assert!(err.rows().is_empty());
+    }
+
+    #[test]
+    fn fetch_waits_for_rehydrate_and_an_authenticated_session() {
+        assert!(
+            !should_fetch_servers(false, false),
+            "first paint is Anonymous and not-ready — do not hit /api/servers"
+        );
+        assert!(
+            !should_fetch_servers(false, true),
+            "ready-false authed is the SSR harness path, not a live fetch"
+        );
+        assert!(
+            !should_fetch_servers(true, false),
+            "rehydrate finished with no blob — stay Loading; AppShell bounces"
+        );
+        assert!(
+            should_fetch_servers(true, true),
+            "rehydrate finished with a blob — fire GET /api/servers"
+        );
     }
 }
