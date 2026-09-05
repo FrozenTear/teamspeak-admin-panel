@@ -79,7 +79,7 @@ pub fn ClientsPage() -> Element {
     let mut rows: Signal<Vec<ClientListItem>> = use_signal(Vec::<ClientListItem>::new);
     let mut last_error: Signal<Option<ApiError>> = use_signal(|| None::<ApiError>);
     let mut loading: Signal<bool> = use_signal(|| true);
-    let mut filter: Signal<String> = use_signal(String::new);
+    let filter: Signal<String> = use_signal(String::new);
     let mut server_changed_marker: Signal<i64> = use_signal(|| 0i64);
 
     // When the snapshot resolves, write it into the working copy. The
