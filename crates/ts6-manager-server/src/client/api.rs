@@ -445,6 +445,11 @@ fn record_api_error_for_bug_report(method: &str, path: &str, status: u16, err: &
     ) {
         return;
     }
+    // Optional Music Bot snapshot (PR #31). 404 until that route lands —
+    // do not attach the miss to the next Report bug payload.
+    if path == "/api/music-bots/bug-report-context" {
+        return;
+    }
     crate::client::diagnostics::record_client_error(format!("{method} {path} → {status}: {err}"));
 }
 
