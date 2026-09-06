@@ -554,6 +554,8 @@ mod tests {
         assert_eq!(ctx.get("fresh").and_then(Value::as_str), Some("ok"));
     }
 
+    // std Mutex is intentional test exclusivity across the await.
+    #[allow(clippy::await_holding_lock)]
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn attach_optional_seat_context_ignores_native_unsupported() {
