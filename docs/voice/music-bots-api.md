@@ -41,6 +41,7 @@ Snake-case strings: `"disconnected" | "connecting" | "connected" | "in_channel" 
 | `POST` | `/api/music-bots/{id}/join` | `JoinChannelRequest` | `202` | Dispatches `BotCommand::JoinChannel`. |
 | `POST` | `/api/music-bots/{id}/leave` | — | `202` | Dispatches `BotCommand::LeaveChannel`. |
 | `GET` | `/api/music-bots/{id}/events` | — | `text/event-stream` | SSE stream of `BotEventWire` events. Tagged `type` discriminator. 15 s keep-alive. Auth: `Authorization: Bearer` **or** `?token=<access_jwt>` (same access-JWT path as `/api/ws`). |
+| `GET` | `/api/music-bots/bug-report-context` | — | `200 MusicBotBugReportContext` | In-process snapshot for operator bug reports. See [Bug-report context](#bug-report-context). |
 
 ### Audio control (PURA-126 WS-6 follow-up)
 
@@ -184,6 +185,29 @@ Each event is a JSON object; the discriminator is `"type"`:
 ```
 
 Lagged subscribers (slow client + bursty events) are silently dropped; the FE refetches `/music-bots/{id}` on lag.
+
+## Bug-report context
+
+Music Bot contributes two suggested `POST /api/bug-reports` `context` keys (API PR #28 — locked wire; this seat is additive):
+
+| Key | Source | Shape |
+| --- | --- | --- |
+| `musicBotLatency` | recent `music_bot_latency` stages (`resolver_warm_retry`, `resolver_resolved`, `first_frame_on_wire`, …) | one line per stage: `stage elapsed_ms=<n\|-> retry=0\|1` |
+| `logTail` | short in-process tail of those structured lines (plus related `yt_dlp` WARN+) | one line per event, secrets redacted |
+
+There is no process-wide tracing ring in #28. Music Bot keeps its own bounded in-process ring (`music_bot_audio::bug_report`), fed by a `tracing` layer installed in `logging::init`. Values stay well under the shared 4k-per-value / 32 KiB caps.
+
+**How Panel / API get the bag**
+
+1. **Server-side enrichment (preferred).** A request middleware on the finished router watches `POST /api/bug-reports`. If `context.musicBotLatency` / `context.logTail` are absent, it merges the current snapshot, then #28's existing validator caps the result. Panel-supplied keys are not overwritten.
+2. **Explicit snapshot.** `GET /api/music-bots/bug-report-context` (`RequireAuth`) returns `{ "musicBotLatency": "…", "logTail": "…" }` so the upcoming Panel Report-bug PR can preview or attach the same strings.
+
+```json
+{
+  "musicBotLatency": "resolver_warm_retry elapsed_ms=- retry=1\nresolver_resolved elapsed_ms=1840 retry=0\nfirst_frame_on_wire elapsed_ms=2105 retry=0",
+  "logTail": "music_bot_latency stage=resolver_resolved elapsed_ms=1840 warm yt-dlp resolver returned direct media URL"
+}
+```
 
 ## Out of scope (flagged for follow-up)
 

@@ -223,6 +223,7 @@ pub(crate) async fn run_bot(
                                 connection = None;
                             }
                             ConnectedExit::Dropped(reason) => {
+                                crate::bug_report::record_handshake_drop(&reason);
                                 warn!(%reason, "connection dropped — auto-reconnect");
                                 drop(con_after);
                                 let _ = events.send(BotEvent::Disconnected {
@@ -248,6 +249,7 @@ pub(crate) async fn run_bot(
                         }
                     }
                     Err(err) => {
+                        crate::bug_report::record_handshake_drop(format!("{err:#}"));
                         error!(?err, "handshake failed");
                         let _ =
                             events.send(BotEvent::Error(BotError::Connection(format!("{err:#}"))));
@@ -321,12 +323,15 @@ const LOOP_STALL_WARN: Duration = Duration::from_millis(10);
 fn log_loop_stall(arm: &'static str, arm_start: Instant, detail: impl FnOnce() -> String) {
     let elapsed = arm_start.elapsed();
     if elapsed >= LOOP_STALL_WARN {
+        let elapsed_ms = elapsed.as_millis() as u64;
+        let detail = detail();
+        crate::bug_report::record_connected_loop_stall(arm, elapsed_ms, &detail);
         warn!(
             target: "music_bot_latency",
             stage = "connected_loop_stall",
             arm,
-            detail = %detail(),
-            elapsed_ms = elapsed.as_millis() as u64,
+            detail = %detail,
+            elapsed_ms,
             "connected-loop arm body outran the 20 ms audio-frame cadence — the \
              audio-drain arm was starved this long; correlate with a mid-song \
              frame_underrun (buffered_frames full) to confirm it reached the wire",
@@ -733,10 +738,12 @@ async fn run_wire_task(
                         // PURA-330 — first audible frame; closes the
                         // `!play` → first-audio latency breakdown.
                         if p.frames_sent == 1 {
+                            let elapsed_ms = p.started_at.elapsed().as_millis() as u64;
+                            crate::bug_report::record_first_frame_on_wire(elapsed_ms);
                             info!(
                                 target: "music_bot_latency",
                                 stage = "first_frame_on_wire",
-                                elapsed_ms = p.started_at.elapsed().as_millis() as u64,
+                                elapsed_ms,
                                 "first Opus frame sent on the wire — playback audible",
                             );
                             // THE-927 — clear any dashboard "Resolving
@@ -761,6 +768,7 @@ async fn run_wire_task(
                             &mut p.send_monitor,
                             false,
                         ) {
+                            crate::bug_report::record_send_audio_error(&err);
                             error!(?err, "send_audio failed on the wire task");
                             let epoch = p.epoch;
                             play = None;
@@ -999,6 +1007,7 @@ async fn run_split_connected_loop(
                 }
                 Some(WireEvent::SendFailed { error, epoch }) => {
                     if epoch == audio_epoch {
+                        crate::bug_report::record_send_audio_error(&error);
                         error!(error, "send_audio failed — tearing down pipeline");
                         audio::tear_down(&mut current_audio);
                         // PURA-261 — `failed: ` prefix so `LivenessTracker`
@@ -1130,10 +1139,12 @@ async fn handle_audio_msg(
                 // INFO line per play closes out the `!play` → first-audio
                 // breakdown started by the `music_bot_latency` stage logs.
                 if active.frames_sent == 1 {
+                    let elapsed_ms = active.started_at.elapsed().as_millis() as u64;
+                    crate::bug_report::record_first_frame_on_wire(elapsed_ms);
                     info!(
                         target: "music_bot_latency",
                         stage = "first_frame_on_wire",
-                        elapsed_ms = active.started_at.elapsed().as_millis() as u64,
+                        elapsed_ms,
                         "first Opus frame sent on the wire — playback audible",
                     );
                     // THE-927 — clear any dashboard "Resolving
@@ -1161,6 +1172,7 @@ async fn handle_audio_msg(
                 Ok(())
             };
             if let Err(err) = send_result {
+                crate::bug_report::record_send_audio_error(&err);
                 error!(?err, "send_audio failed — tearing down pipeline");
                 audio::tear_down(current_audio);
                 wire.clear_audio();

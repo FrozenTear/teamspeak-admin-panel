@@ -7,7 +7,8 @@
 //! `router()` constructor in this module is the single mount point.
 //!
 //! Resources:
-//! - `bots`            — `/music-bots[/{id}/{...}]`, plus the `/events` SSE.
+//! - `bots`            — `/music-bots[/{id}/{...}]`, plus the `/events` SSE
+//!   and `GET /music-bots/bug-report-context`.
 //! - `library`         — `/music-library`.
 //! - `playlists`       — `/playlists[/{name}/...]`, query-scoped by `bot`.
 //! - `radio_stations`  — `/radio-stations`, library entries marked with
@@ -24,12 +25,15 @@
 
 mod audio_control;
 mod bots;
+mod bug_report_context;
 mod convert;
 mod library;
 mod playlists;
 mod queue;
 mod radio_stations;
 mod requests;
+
+pub use bug_report_context::enrich_bug_report_request;
 
 #[cfg(test)]
 mod tests;
@@ -48,6 +52,7 @@ use crate::app_state::AppState;
 pub fn router() -> Router<AppState> {
     Router::new()
         .merge(bots::router())
+        .merge(bug_report_context::router())
         .merge(audio_control::router())
         .merge(queue::router())
         .merge(library::router())
