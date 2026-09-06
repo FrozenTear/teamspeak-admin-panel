@@ -297,8 +297,10 @@ mod tests {
 
     #[tokio::test]
     async fn voice_context_is_merged_into_the_issue_without_clobbering_music_bot() {
-        let _voice = music_bot::acquire_test_lock();
-        music_bot::seed_for_tests();
+        {
+            let _voice = music_bot::acquire_test_lock();
+            music_bot::seed_for_tests();
+        }
         let mut state = fresh_state().await;
         let recorder = RecordingSink::new(
             "https://github.com/FrozenTear/teamspeak-admin-panel/issues/101",
@@ -310,7 +312,10 @@ mod tests {
         let uid = seed_user(&state, "viewer5", "viewer").await;
         let token = mint_token(&state, uid, "viewer5", "viewer");
         let resp = post_report(app(state), Some(&token), &sample_body()).await;
-        music_bot::reset_for_tests();
+        {
+            let _voice = music_bot::acquire_test_lock();
+            music_bot::reset_for_tests();
+        }
         assert_eq!(resp.status(), StatusCode::CREATED);
 
         let drafts = recorded.lock().unwrap();
