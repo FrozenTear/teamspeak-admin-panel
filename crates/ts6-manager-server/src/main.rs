@@ -460,6 +460,13 @@ mod server_entry {
             .merge(public_moderation_router)
             .serve_dioxus_application(serve_cfg, ui::App)
             .layer(web::cors_layer(&cfg.frontend_url));
+        // Music Bot bug-report seat: merge `musicBotLatency` / `logTail`
+        // into `POST /api/bug-reports` when those keys are absent. Layered
+        // on the finished router so it still wraps API PR #28's route
+        // after that draft lands. Does not change #28's wire shape.
+        let router = router.layer(axum::middleware::from_fn(
+            routes::music_bots::enrich_bug_report_request,
+        ));
         let router = web::security_headers_stack(cfg.node_env).apply(router);
         // PURA-48 — per-request nonce-based CSP. Layered LAST so it sits
         // outermost: on the response path it runs after every inner layer,

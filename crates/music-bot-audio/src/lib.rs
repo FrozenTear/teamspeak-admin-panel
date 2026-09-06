@@ -14,6 +14,7 @@
 //! [PURA-118]: https://teamspeak-heaven/PURA/issues/PURA-118
 //! [PURA-119]: https://teamspeak-heaven/PURA/issues/PURA-119
 
+pub mod bug_report;
 pub mod encoder;
 pub mod icy;
 pub mod pacer;

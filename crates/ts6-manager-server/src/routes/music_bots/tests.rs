@@ -1518,3 +1518,106 @@ async fn queue_reorder_returns_snapshot() {
     let ids: Vec<wire::TrackId> = snapshot.iter().map(|t| t.id).collect();
     assert_eq!(ids, reversed, "reorder should return the new order");
 }
+
+#[tokio::test]
+async fn bug_report_context_requires_auth() {
+    let (app, _token, _state) = make_test_app().await;
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/music-bots/bug-report-context")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn bug_report_context_returns_camel_case_snapshot() {
+    let _guard = music_bot::bug_report::test_global_lock();
+    music_bot::bug_report::global_ring().clear();
+    music_bot::bug_report::global_ring().record_stage(
+        music_bot::bug_report::LatencyStage {
+            stage: "first_frame_on_wire".into(),
+            elapsed_ms: Some(105),
+            retry: false,
+        },
+        "music_bot_latency stage=first_frame_on_wire elapsed_ms=105",
+    );
+
+    let (app, token, _state) = make_test_app().await;
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/music-bots/bug-report-context")
+                .header("authorization", auth_header(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let snap: wire::MusicBotBugReportContext = read_json(resp).await;
+    assert!(
+        snap.music_bot_latency
+            .contains("first_frame_on_wire elapsed_ms=105 retry=0"),
+        "{}",
+        snap.music_bot_latency
+    );
+    assert!(
+        snap.log_tail.contains("stage=first_frame_on_wire"),
+        "{}",
+        snap.log_tail
+    );
+}
+
+#[tokio::test]
+async fn bug_report_post_middleware_merges_absent_context_keys() {
+    use crate::routes::music_bots::enrich_bug_report_request;
+    use axum::Json;
+    use axum::routing::post;
+    use serde_json::Value;
+
+    let _guard = music_bot::bug_report::test_global_lock();
+    music_bot::bug_report::global_ring().clear();
+    music_bot::bug_report::global_ring().record_stage(
+        music_bot::bug_report::LatencyStage {
+            stage: "resolver_warm_retry".into(),
+            elapsed_ms: None,
+            retry: true,
+        },
+        "music_bot_latency stage=resolver_warm_retry retry=1",
+    );
+
+    async fn echo(Json(body): Json<Value>) -> Json<Value> {
+        Json(body)
+    }
+
+    let app = Router::new()
+        .route("/api/bug-reports", post(echo))
+        .layer(axum::middleware::from_fn(enrich_bug_report_request));
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/bug-reports")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"pagePath":"/music-bots/42"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = read_json(resp).await;
+    assert_eq!(body["pagePath"], "/music-bots/42");
+    let latency = body["context"]["musicBotLatency"].as_str().unwrap();
+    assert!(
+        latency.contains("resolver_warm_retry elapsed_ms=- retry=1"),
+        "{latency}"
+    );
+}
