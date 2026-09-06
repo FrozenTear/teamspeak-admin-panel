@@ -12,6 +12,7 @@
 
 pub mod admin;
 pub mod auth;
+pub mod bug_reports;
 pub mod control;
 pub mod dashboard;
 pub mod flows;

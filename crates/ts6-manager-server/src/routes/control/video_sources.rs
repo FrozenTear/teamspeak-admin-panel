@@ -535,6 +535,7 @@ mod tests {
             yt_api_key: std::sync::Arc::new(std::sync::RwLock::new(None)),
             data_dir: std::path::PathBuf::from("./data"),
             trusted_proxy_hops: 0,
+            bug_reports: crate::bug_reports::unconfigured_sink(),
         };
         (state, mock)
     }
@@ -907,6 +908,7 @@ mod tests {
             yt_api_key: std::sync::Arc::new(std::sync::RwLock::new(None)),
             data_dir: std::path::PathBuf::from("./data"),
             trusted_proxy_hops: 0,
+            bug_reports: crate::bug_reports::unconfigured_sink(),
         };
         let token = seed_admin_token(&state).await;
         let server = seed_server(&state).await;
