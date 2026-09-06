@@ -454,7 +454,8 @@ mod tests {
                 log_tail: "music_bot_latency stage=resolver_resolved".into(),
             },
         );
-        let ctx = req.context.expect("context");
+        let json = serde_json::to_value(&req).unwrap();
+        let ctx = req.context.as_ref().expect("context");
         assert_eq!(
             ctx.get(CONTEXT_KEY_MUSIC_BOT_LATENCY)
                 .and_then(Value::as_str),
@@ -464,8 +465,6 @@ mod tests {
             ctx.get(CONTEXT_KEY_LOG_TAIL).and_then(Value::as_str),
             Some("music_bot_latency stage=resolver_resolved")
         );
-
-        let json = serde_json::to_value(&req).unwrap();
         assert_eq!(
             json["context"]["musicBotLatency"],
             "resolver_resolved elapsed_ms=20 retry=0"
