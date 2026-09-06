@@ -176,6 +176,10 @@ mod tests {
             toasts: Some(vec!["Failed to fetch".into()]),
             ws_errors: Some(vec!["SSE closed".into()]),
             release: Some("v1.6.9".into()),
+            context: Some(serde_json::Map::from_iter([(
+                "musicBotLatency".into(),
+                serde_json::json!("resolve=20s retry=1"),
+            )])),
         }
     }
 
@@ -279,5 +283,7 @@ mod tests {
         assert!(drafts[0].body.contains("Failed to fetch"));
         assert!(drafts[0].body.contains("SSE closed"));
         assert!(drafts[0].body.contains("v1.6.9"));
+        assert!(drafts[0].body.contains("musicBotLatency"));
+        assert!(drafts[0].body.contains("resolve=20s retry=1"));
     }
 }

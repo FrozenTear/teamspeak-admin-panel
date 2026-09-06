@@ -143,9 +143,18 @@ pub struct Config {
     pub moderation_trusted_proxy_cidrs: Vec<ipnet::IpNet>,
     /// Operator bug-report sink (private GitHub Issues). Unset token/repo
     /// does **not** fail boot — `POST /api/bug-reports` returns 503 until
-    /// Contabo sets `BUG_REPORTS_GITHUB_TOKEN` + `BUG_REPORTS_GITHUB_REPO`.
+    /// Contabo sets `BUG_REPORTS_GITHUB_TOKEN`. Repo defaults to
+    /// [`DEFAULT_BUG_REPORTS_GITHUB_REPO`]; every issue is labelled
+    /// [`DEFAULT_BUG_REPORTS_GITHUB_LABEL`].
     pub bug_reports: BugReportsGithubConfig,
 }
+
+/// Default private Issues target (same app repo). Override with
+/// `BUG_REPORTS_GITHUB_REPO`.
+pub const DEFAULT_BUG_REPORTS_GITHUB_REPO: &str = "FrozenTear/teamspeak-admin-panel";
+/// Applied on every created issue. Extra labels from
+/// `BUG_REPORTS_GITHUB_LABELS` are appended (this one is always present).
+pub const DEFAULT_BUG_REPORTS_GITHUB_LABEL: &str = "from-panel";
 
 /// Env-backed GitHub Issues target for [`crate::bug_reports`].
 #[derive(Debug, Clone, Default)]
@@ -160,8 +169,11 @@ impl BugReportsGithubConfig {
     fn from_env() -> Self {
         Self {
             token: optional_env("BUG_REPORTS_GITHUB_TOKEN"),
-            repo: optional_env("BUG_REPORTS_GITHUB_REPO"),
-            labels: parse_env_csv("BUG_REPORTS_GITHUB_LABELS"),
+            repo: Some(
+                optional_env("BUG_REPORTS_GITHUB_REPO")
+                    .unwrap_or_else(|| DEFAULT_BUG_REPORTS_GITHUB_REPO.to_string()),
+            ),
+            labels: merge_from_panel_label(parse_env_csv("BUG_REPORTS_GITHUB_LABELS")),
         }
     }
 
@@ -169,6 +181,13 @@ impl BugReportsGithubConfig {
         self.token.as_deref().is_some_and(|s| !s.trim().is_empty())
             && self.repo.as_deref().is_some_and(|s| !s.trim().is_empty())
     }
+}
+
+fn merge_from_panel_label(mut labels: Vec<String>) -> Vec<String> {
+    if !labels.iter().any(|l| l == DEFAULT_BUG_REPORTS_GITHUB_LABEL) {
+        labels.insert(0, DEFAULT_BUG_REPORTS_GITHUB_LABEL.to_string());
+    }
+    labels
 }
 
 impl Config {
@@ -489,6 +508,22 @@ mod tests {
                 labels: vec!["bug-report".into()],
             }
             .is_configured()
+        );
+    }
+
+    #[test]
+    fn from_panel_label_is_always_present() {
+        assert_eq!(
+            merge_from_panel_label(Vec::new()),
+            [DEFAULT_BUG_REPORTS_GITHUB_LABEL]
+        );
+        assert_eq!(
+            merge_from_panel_label(vec!["triage".into()]),
+            [DEFAULT_BUG_REPORTS_GITHUB_LABEL, "triage"]
+        );
+        assert_eq!(
+            merge_from_panel_label(vec!["from-panel".into(), "triage".into()]),
+            ["from-panel", "triage"]
         );
     }
 }

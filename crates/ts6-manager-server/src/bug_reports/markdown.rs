@@ -105,6 +105,17 @@ fn build_body(
     out.push_str("\n### WS / SSE errors\n\n");
     append_list(&mut out, &report.ws_errors);
 
+    out.push_str("\n### Context\n\n");
+    if report.context.is_empty() {
+        out.push_str("_none_\n");
+    } else {
+        for (key, value) in &report.context {
+            out.push_str(&format!("**{}**\n\n", escape_cell(key)));
+            out.push_str(&fenced(sanitize_text(value)));
+            out.push_str("\n\n");
+        }
+    }
+
     out
 }
 
@@ -211,6 +222,7 @@ mod tests {
             toasts: vec!["Failed to fetch".into()],
             ws_errors: vec!["SSE closed".into()],
             release: Some("v1.6.9".into()),
+            context: vec![("musicBotLatency".into(), "resolve=20s retry=1".into())],
         }
     }
 
@@ -247,6 +259,8 @@ mod tests {
         assert!(draft.body.contains("Failed to fetch"));
         assert!(draft.body.contains("SSE closed"));
         assert!(draft.body.contains("2026-09-06T18:00:00+00:00"));
+        assert!(draft.body.contains("**musicBotLatency**"));
+        assert!(draft.body.contains("resolve=20s retry=1"));
     }
 
     #[test]

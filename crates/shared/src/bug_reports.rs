@@ -21,6 +21,14 @@ pub const MAX_LIST_ITEMS: usize = 20;
 pub const MAX_LIST_ITEM_LEN: usize = 500;
 /// Maximum `release` length. Longer values are truncated.
 pub const MAX_RELEASE_LEN: usize = 128;
+/// Maximum keys accepted in `context`. Extra keys are dropped (insertion order).
+pub const MAX_CONTEXT_KEYS: usize = 32;
+/// Maximum `context` key length. Longer keys are truncated.
+pub const MAX_CONTEXT_KEY_LEN: usize = 64;
+/// Maximum rendered length of one `context` value. Longer values are truncated.
+pub const MAX_CONTEXT_VALUE_LEN: usize = 4096;
+/// Maximum total UTF-8 bytes across rendered `context` values. Extra keys dropped.
+pub const MAX_CONTEXT_BYTES: usize = 32 * 1024;
 
 /// Stable error strings for the bug-report surface.
 ///
@@ -29,7 +37,8 @@ pub const MAX_RELEASE_LEN: usize = 128;
 pub mod error_strings {
     pub const PAGE_PATH_REQUIRED: &str = "pagePath is required";
     pub const PAGE_PATH_TOO_LONG: &str = "pagePath is too long";
-    pub const SINK_UNCONFIGURED: &str = "Bug reports are not configured (BUG_REPORTS_GITHUB_TOKEN / BUG_REPORTS_GITHUB_REPO unset).";
+    pub const SINK_UNCONFIGURED: &str =
+        "Bug reports are not configured (BUG_REPORTS_GITHUB_TOKEN unset).";
     pub const SINK_FAILED: &str = "Failed to create GitHub issue";
 }
 
@@ -53,6 +62,10 @@ pub struct CreateBugReportRequest {
     pub ws_errors: Option<Vec<String>>,
     #[serde(default)]
     pub release: Option<String>,
+    /// Optional seat-context bag for Music Bot / Voice / Sidecar (tags + log tails).
+    /// Values may be strings or nested JSON; the server stringifies and caps them.
+    #[serde(default)]
+    pub context: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// `POST /api/bug-reports` 201 response body.
@@ -72,6 +85,8 @@ pub struct ValidatedBugReport {
     pub toasts: Vec<String>,
     pub ws_errors: Vec<String>,
     pub release: Option<String>,
+    /// Sanitised `context` entries as `(key, rendered_value)` in request order.
+    pub context: Vec<(String, String)>,
 }
 
 impl CreateBugReportRequest {
@@ -96,6 +111,7 @@ impl CreateBugReportRequest {
             toasts: cap_list(self.toasts.as_deref()),
             ws_errors: cap_list(self.ws_errors.as_deref()),
             release: truncate_opt(self.release.as_deref(), MAX_RELEASE_LEN),
+            context: cap_context(self.context.as_ref()),
         })
     }
 }
@@ -118,6 +134,39 @@ fn cap_list(raw: Option<&[String]>) -> Vec<String> {
         })
         .take(MAX_LIST_ITEMS)
         .collect()
+}
+
+fn cap_context(raw: Option<&serde_json::Map<String, serde_json::Value>>) -> Vec<(String, String)> {
+    let Some(map) = raw else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut used = 0usize;
+    for (key, value) in map {
+        if out.len() >= MAX_CONTEXT_KEYS {
+            break;
+        }
+        let key = truncate_chars(key.trim(), MAX_CONTEXT_KEY_LEN);
+        if key.is_empty() {
+            continue;
+        }
+        let rendered = render_context_value(value);
+        let rendered = truncate_chars(&rendered, MAX_CONTEXT_VALUE_LEN);
+        if used.saturating_add(rendered.len()) > MAX_CONTEXT_BYTES {
+            break;
+        }
+        used += rendered.len();
+        out.push((key, rendered));
+    }
+    out
+}
+
+fn render_context_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    }
 }
 
 fn truncate_chars(s: &str, max: usize) -> String {
@@ -165,6 +214,7 @@ mod tests {
             toasts: Some(vec!["t".into()]),
             ws_errors: Some(vec!["w".into()]),
             release: Some("v1.6.9".into()),
+            context: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         for key in [
@@ -247,6 +297,13 @@ mod tests {
                 "x".repeat(MAX_LIST_ITEM_LEN + 3),
             ]),
             release: Some(format!("  {}  ", "r".repeat(MAX_RELEASE_LEN + 2))),
+            context: Some(serde_json::Map::from_iter([
+                (
+                    "musicBotLatency".into(),
+                    serde_json::json!("resolve=20s retry=1"),
+                ),
+                ("nested".into(), serde_json::json!({"retry": 1})),
+            ])),
         };
         let v = req.validate().unwrap();
         assert_eq!(v.page_path, "/logs");
@@ -257,5 +314,31 @@ mod tests {
         assert_eq!(v.ws_errors[0], "ok");
         assert_eq!(v.ws_errors[1].chars().count(), MAX_LIST_ITEM_LEN);
         assert_eq!(v.release.as_ref().unwrap().chars().count(), MAX_RELEASE_LEN);
+        assert_eq!(
+            v.context,
+            vec![
+                ("musicBotLatency".into(), "resolve=20s retry=1".into()),
+                ("nested".into(), r#"{"retry":1}"#.into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn request_deserialises_context_object() {
+        let json = r#"{
+            "pagePath": "/music-bots/42",
+            "context": {
+                "musicBotLatency": "resolve=20s retry=1",
+                "logTail": "last line"
+            }
+        }"#;
+        let req: CreateBugReportRequest = serde_json::from_str(json).unwrap();
+        let ctx = req.context.as_ref().expect("context");
+        assert_eq!(
+            ctx.get("musicBotLatency").and_then(|v| v.as_str()),
+            Some("resolve=20s retry=1")
+        );
+        let v = req.validate().unwrap();
+        assert_eq!(v.context.len(), 2);
     }
 }

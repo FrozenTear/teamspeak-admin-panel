@@ -2,9 +2,10 @@
 //! rustls `reqwest` client.
 //!
 //! Product choice (this draft): no Sentry crate, no browser SDK. Contabo
-//! enables the sink later by setting `BUG_REPORTS_GITHUB_TOKEN` +
-//! `BUG_REPORTS_GITHUB_REPO` without a boot crash — missing config is a
-//! 503 from the route, not a `Config::load` failure.
+//! enables the sink later by setting `BUG_REPORTS_GITHUB_TOKEN` without a
+//! boot crash — missing token is a 503 from the route, not a `Config::load`
+//! failure. Repo defaults to `FrozenTear/teamspeak-admin-panel`; every
+//! issue is labelled `from-panel`.
 //!
 //! [`BugReportSink`] is a trait so route tests inject a recording mock
 //! instead of talking to api.github.com.
@@ -42,7 +43,7 @@ pub trait BugReportSink: Send + Sync {
     async fn create_issue(&self, draft: IssueDraft) -> Result<CreatedIssue, SinkError>;
 }
 
-/// Build the production sink from boot config. Token/repo unset or a
+/// Build the production sink from boot config. Token unset or a
 /// malformed `owner/name` repo → [`UnconfiguredSink`] (503 at request time).
 pub fn sink_from_config(cfg: &BugReportsGithubConfig) -> BugReportSinkHandle {
     if !cfg.is_configured() {
