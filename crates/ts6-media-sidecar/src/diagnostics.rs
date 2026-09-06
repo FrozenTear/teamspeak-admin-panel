@@ -335,9 +335,7 @@ fn strip_url_userinfo(s: &str) -> String {
             out.push_str(&s[i..i + rel + 3]);
             i += rel + 3;
             let rest = &s[i..];
-            let end = rest
-                .find(|c: char| c == '/' || c == ' ' || c == '"' || c == '\'')
-                .unwrap_or(rest.len());
+            let end = rest.find(['/', ' ', '"', '\'']).unwrap_or(rest.len());
             let authority = &rest[..end];
             if let Some(at) = authority.rfind('@') {
                 out.push_str("[redacted]@");
@@ -360,19 +358,19 @@ fn redact_ip_literals(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
     let mut i = 0;
     while i < chars.len() {
-        if chars[i].is_ascii_digit() {
-            if let Some((end, _)) = match_ipv4(&chars, i) {
-                out.push_str("[ip]");
-                i = end;
-                continue;
-            }
+        if chars[i].is_ascii_digit()
+            && let Some((end, _)) = match_ipv4(&chars, i)
+        {
+            out.push_str("[ip]");
+            i = end;
+            continue;
         }
-        if chars[i] == '[' {
-            if let Some(end) = match_bracketed_ipv6(&chars, i) {
-                out.push_str("[ip]");
-                i = end;
-                continue;
-            }
+        if chars[i] == '['
+            && let Some(end) = match_bracketed_ipv6(&chars, i)
+        {
+            out.push_str("[ip]");
+            i = end;
+            continue;
         }
         out.push(chars[i]);
         i += 1;
