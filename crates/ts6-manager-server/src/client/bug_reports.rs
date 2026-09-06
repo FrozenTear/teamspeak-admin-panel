@@ -437,8 +437,14 @@ mod tests {
         let json = serde_json::to_string(&snap).unwrap();
         assert!(json.contains("\"musicBotLatency\""));
         assert!(json.contains("\"logTail\""));
-        assert!(!json.contains("music_bot_latency"));
-        assert!(!json.contains("log_tail"));
+        assert!(
+            !json.contains("\"music_bot_latency\""),
+            "leaked snake_case key: {json}"
+        );
+        assert!(
+            !json.contains("\"log_tail\""),
+            "leaked snake_case key: {json}"
+        );
     }
 
     #[test]
