@@ -101,6 +101,24 @@ pub fn snapshot_client_errors() -> Vec<ClientErrorSnapshot> {
     lock_ring(&CLIENT_ERRORS).iter().cloned().collect()
 }
 
+/// Plain toast messages for the locked `toasts: string[]` wire field.
+pub fn toast_messages() -> Vec<String> {
+    snapshot_toasts()
+        .into_iter()
+        .map(|t| t.message)
+        .filter(|m| !m.trim().is_empty())
+        .collect()
+}
+
+/// Plain error messages for the locked `wsErrors: string[]` wire field.
+pub fn ws_error_messages() -> Vec<String> {
+    snapshot_client_errors()
+        .into_iter()
+        .map(|e| e.message)
+        .filter(|m| !m.trim().is_empty())
+        .collect()
+}
+
 /// Wipe both rings. Test-only — production never resets mid-session.
 #[cfg(test)]
 pub fn reset_for_tests() {
@@ -149,5 +167,14 @@ mod tests {
         reset_for_tests();
         assert!(snapshot_toasts().is_empty());
         assert!(snapshot_client_errors().is_empty());
+    }
+
+    #[test]
+    fn wire_helpers_emit_plain_strings() {
+        reset_for_tests();
+        record_toast("error", "Kick failed");
+        record_client_error("SSE closed");
+        assert_eq!(toast_messages(), vec!["Kick failed".to_string()]);
+        assert_eq!(ws_error_messages(), vec!["SSE closed".to_string()]);
     }
 }

@@ -1,47 +1,60 @@
 //! Typed client for `POST /api/bug-reports`.
 //!
-//! The API route is landing in a sibling PR. This module owns the
-//! provisional camelCase request / response shapes so the panel can ship
-//! the Report bug control without waiting on a shared DTO. 404 and 501
-//! are treated as "route not available yet" so a panel build that predates
-//! the API still fails cleanly instead of looking like a crash.
+//! Wire shape is locked by API PR #28 (`ts6_manager_shared::bug_reports`).
+//! Types live in this module so the Panel compiles before that PR merges;
+//! field names and optionality match the shared DTO byte-for-byte.
 //!
-//! No backend route is registered here — client call only.
+//! ```text
+//! POST /api/bug-reports   RequireAuth
+//! { pagePath, serverId?, note?, toasts[]?, wsErrors[]?, release?, context? }
+//! → 201 { issueUrl, issueNumber }
+//! ```
+//!
+//! `toasts` / `wsErrors` are plain strings. `context` is an optional
+//! string→JSON map reserved for Music / Voice / Sidecar — Panel omits it.
+//! 404 / 501 stay tolerated until the route lands; 503 is the configured-
+//! but-token-unset sink.
 
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 use crate::client::api::{self, ApiError};
-use crate::client::diagnostics::{ClientErrorSnapshot, ToastSnapshot};
 use crate::client::session::RefreshGate;
 
+/// Caps from the shared DTO so we truncate before POST.
+const MAX_NOTE_LEN: usize = 4096;
+const MAX_LIST_ITEMS: usize = 20;
+const MAX_LIST_ITEM_LEN: usize = 500;
+const MAX_RELEASE_LEN: usize = 128;
+
 /// `POST /api/bug-reports` body. Field names are camelCase on the wire.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BugReportRequest {
-    pub note: String,
     pub page_path: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_id: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub server_name: Option<String>,
-    pub toasts: Vec<ToastSnapshot>,
-    pub ws_errors: Vec<ClientErrorSnapshot>,
-    pub user_agent: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub app_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toasts: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ws_errors: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release: Option<String>,
+    /// Seat-context bag. Panel leaves this unset; other seats fill it later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<Map<String, Value>>,
 }
 
-/// Success body. Either field (or both, or neither on 204) is accepted so
-/// the UI stays tolerant of the API PR's final shape.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// `POST /api/bug-reports` 201 body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BugReportResponse {
-    #[serde(default, alias = "issue_url")]
-    pub issue_url: Option<String>,
-    #[serde(default, alias = "issue_number")]
-    pub issue_number: Option<i64>,
+    pub issue_url: String,
+    pub issue_number: i64,
 }
 
 /// `true` when the panel build does not yet expose the route (API PR
@@ -53,76 +66,59 @@ pub fn is_route_unavailable(err: &ApiError) -> bool {
     )
 }
 
+/// `true` when the route is up but `BUG_REPORTS_GITHUB_TOKEN` is unset (503).
+pub fn is_sink_unconfigured(err: &ApiError) -> bool {
+    matches!(err, ApiError::Server { status: 503, .. })
+}
+
 /// Operator-facing copy for a 404 / 501 until the API PR merges.
 pub fn unavailable_message() -> &'static str {
     "Bug reports are not available on this panel yet (the API route has not landed)."
 }
 
-/// Auth-gated `POST /api/bug-reports`. A 204 / empty 2xx body is success
-/// with an empty [`BugReportResponse`].
+/// Operator-facing copy for a 503 unconfigured sink.
+pub fn sink_unconfigured_message() -> &'static str {
+    "Bug reports are not configured (BUG_REPORTS_GITHUB_TOKEN unset)."
+}
+
+/// Auth-gated `POST /api/bug-reports`. Success is 201 `{ issueUrl, issueNumber }`.
 pub async fn submit(
     gate: Arc<RefreshGate>,
     body: &BugReportRequest,
 ) -> Result<BugReportResponse, ApiError> {
-    let parsed: Option<BugReportResponse> = api::authorized_post_json(
+    api::authorized_post_json(
         gate.as_ref(),
         &api::api_base(),
         "/api/bug-reports",
         Some(body),
     )
-    .await?;
-    Ok(parsed.unwrap_or_default())
+    .await
 }
 
-/// Build the request from values the dialog already collected. Kept as a
-/// free function so unit tests can assert the wire shape without mounting
-/// Dioxus.
+/// Build the locked request from values the dialog already collected.
 pub fn build_request(
     note: impl Into<String>,
     page_path: impl Into<String>,
     server_id: Option<i64>,
-    server_name: Option<String>,
-    user_agent: impl Into<String>,
-    app_version: Option<String>,
 ) -> BugReportRequest {
     BugReportRequest {
-        note: note.into(),
         page_path: page_path.into(),
         server_id,
-        server_name,
-        toasts: crate::client::diagnostics::snapshot_toasts(),
-        ws_errors: crate::client::diagnostics::snapshot_client_errors(),
-        user_agent: user_agent.into(),
-        app_version,
+        note: nonempty_truncated(note.into(), MAX_NOTE_LEN),
+        toasts: nonempty_list(crate::client::diagnostics::toast_messages()),
+        ws_errors: nonempty_list(crate::client::diagnostics::ws_error_messages()),
+        release: release(),
+        context: None,
     }
 }
 
-/// Panel version stamped into the payload when the UI knows one.
-pub fn app_version() -> Option<String> {
-    let v = env!("CARGO_PKG_VERSION");
-    if v.is_empty() {
-        None
-    } else {
-        Some(v.to_string())
-    }
-}
-
-/// Browser UA on WASM; empty string on native / SSR.
-pub fn user_agent() -> String {
-    #[cfg(target_arch = "wasm32")]
-    {
-        web_sys::window()
-            .and_then(|w| w.navigator().user_agent().ok())
-            .unwrap_or_default()
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        String::new()
-    }
+/// Panel version stamped as `release` when the crate version is set.
+pub fn release() -> Option<String> {
+    nonempty_truncated(env!("CARGO_PKG_VERSION"), MAX_RELEASE_LEN)
 }
 
 /// SPA path used as `pagePath`. Prefers the live location (so query
-/// strings survive); falls back to the Routable display path.
+/// strings survive); falls back to the supplied path.
 pub fn page_path_from_location(fallback: &str) -> String {
     #[cfg(target_arch = "wasm32")]
     {
@@ -147,87 +143,104 @@ pub fn page_path_from_location(fallback: &str) -> String {
     }
 }
 
+fn nonempty_truncated(raw: impl AsRef<str>, max: usize) -> Option<String> {
+    let trimmed = raw.as_ref().trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(truncate_chars(trimmed, max))
+}
+
+fn nonempty_list(items: Vec<String>) -> Option<Vec<String>> {
+    let capped: Vec<String> = items
+        .into_iter()
+        .filter_map(|item| nonempty_truncated(item, MAX_LIST_ITEM_LEN))
+        .take(MAX_LIST_ITEMS)
+        .collect();
+    if capped.is_empty() {
+        None
+    } else {
+        Some(capped)
+    }
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    s.chars().take(max).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::diagnostics::{self, ClientErrorSnapshot, ToastSnapshot};
+    use crate::client::diagnostics;
 
     #[test]
-    fn request_serialises_camel_case() {
-        diagnostics::reset_for_tests();
+    fn request_serialises_locked_camel_case() {
         let req = BugReportRequest {
-            note: "clients table stuck".into(),
             page_path: "/clients".into(),
             server_id: Some(1),
-            server_name: Some("Scuffed World".into()),
-            toasts: vec![ToastSnapshot {
-                variant: "error".into(),
-                message: "Kick failed".into(),
-                at: "2026-09-06T18:00:00.000Z".into(),
-            }],
-            ws_errors: vec![ClientErrorSnapshot {
-                message: "websocket disconnected".into(),
-                at: "2026-09-06T18:00:01.000Z".into(),
-            }],
-            user_agent: "Mozilla/5.0".into(),
-            app_version: Some("0.0.1".into()),
+            note: Some("clients table stuck".into()),
+            toasts: Some(vec!["Kick failed".into()]),
+            ws_errors: Some(vec!["websocket disconnected".into()]),
+            release: Some("0.0.1".into()),
+            context: None,
         };
         let json = serde_json::to_value(&req).expect("serialize");
-        assert_eq!(json["note"], "clients table stuck");
         assert_eq!(json["pagePath"], "/clients");
         assert_eq!(json["serverId"], 1);
-        assert_eq!(json["serverName"], "Scuffed World");
-        assert_eq!(json["toasts"][0]["variant"], "error");
-        assert_eq!(json["toasts"][0]["message"], "Kick failed");
-        assert_eq!(json["toasts"][0]["at"], "2026-09-06T18:00:00.000Z");
-        assert_eq!(json["wsErrors"][0]["message"], "websocket disconnected");
-        assert_eq!(json["userAgent"], "Mozilla/5.0");
-        assert_eq!(json["appVersion"], "0.0.1");
-        assert!(json.get("server_id").is_none());
+        assert_eq!(json["note"], "clients table stuck");
+        assert_eq!(json["toasts"], serde_json::json!(["Kick failed"]));
+        assert_eq!(
+            json["wsErrors"],
+            serde_json::json!(["websocket disconnected"])
+        );
+        assert_eq!(json["release"], "0.0.1");
+        assert!(json.get("context").is_none());
+        assert!(json.get("serverName").is_none());
+        assert!(json.get("userAgent").is_none());
+        assert!(json.get("appVersion").is_none());
         assert!(json.get("page_path").is_none());
+        assert!(json.get("ws_errors").is_none());
+        assert!(json["toasts"][0].is_string());
+        assert!(json["wsErrors"][0].is_string());
     }
 
     #[test]
-    fn request_omits_optional_server_and_version_when_none() {
+    fn request_omits_optional_fields_when_empty() {
         let req = BugReportRequest {
-            note: String::new(),
             page_path: "/dashboard".into(),
-            server_id: None,
-            server_name: None,
-            toasts: Vec::new(),
-            ws_errors: Vec::new(),
-            user_agent: String::new(),
-            app_version: None,
+            ..Default::default()
         };
         let json = serde_json::to_value(&req).expect("serialize");
-        assert!(json.get("serverId").is_none());
-        assert!(json.get("serverName").is_none());
-        assert!(json.get("appVersion").is_none());
-        assert_eq!(json["note"], "");
-        assert_eq!(json["toasts"], serde_json::json!([]));
-        assert_eq!(json["wsErrors"], serde_json::json!([]));
+        assert_eq!(json["pagePath"], "/dashboard");
+        for key in [
+            "serverId", "note", "toasts", "wsErrors", "release", "context",
+        ] {
+            assert!(
+                json.get(key).is_none(),
+                "expected {key} omitted, got {json}"
+            );
+        }
     }
 
     #[test]
-    fn response_accepts_camel_case_and_snake_aliases() {
-        let camel: BugReportResponse = serde_json::from_str(
-            r#"{"issueUrl":"https://github.com/org/repo/issues/12","issueNumber":12}"#,
+    fn response_requires_issue_url_and_number() {
+        let resp: BugReportResponse = serde_json::from_str(
+            r#"{"issueUrl":"https://github.com/FrozenTear/teamspeak-admin-panel/issues/12","issueNumber":12}"#,
         )
         .unwrap();
         assert_eq!(
-            camel.issue_url.as_deref(),
-            Some("https://github.com/org/repo/issues/12")
+            resp.issue_url,
+            "https://github.com/FrozenTear/teamspeak-admin-panel/issues/12"
         );
-        assert_eq!(camel.issue_number, Some(12));
+        assert_eq!(resp.issue_number, 12);
 
-        let snake: BugReportResponse =
-            serde_json::from_str(r#"{"issue_url":"https://example.test/42","issue_number":42}"#)
-                .unwrap();
-        assert_eq!(snake.issue_url.as_deref(), Some("https://example.test/42"));
-        assert_eq!(snake.issue_number, Some(42));
-
-        let empty: BugReportResponse = serde_json::from_str("{}").unwrap();
-        assert_eq!(empty, BugReportResponse::default());
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains(r#""issueUrl":"#));
+        assert!(json.contains(r#""issueNumber":12"#));
+        assert!(!json.contains("issue_url"));
     }
 
     #[test]
@@ -241,39 +254,57 @@ mod tests {
             message: "Not implemented".into(),
         }));
         assert!(!is_route_unavailable(&ApiError::Server {
-            status: 500,
-            message: "boom".into(),
+            status: 503,
+            message: "unset".into(),
         }));
-        assert!(!is_route_unavailable(&ApiError::Transport("net".into())));
     }
 
     #[test]
-    fn build_request_pulls_current_rings() {
+    fn sink_unconfigured_is_503() {
+        assert!(is_sink_unconfigured(&ApiError::Server {
+            status: 503,
+            message: "Bug reports are not configured (BUG_REPORTS_GITHUB_TOKEN unset).".into(),
+        }));
+        assert!(!is_sink_unconfigured(&ApiError::Server {
+            status: 502,
+            message: "Failed to create GitHub issue".into(),
+        }));
+    }
+
+    #[test]
+    fn build_request_matches_locked_shape() {
         diagnostics::reset_for_tests();
         diagnostics::record_toast("warning", "saved");
         diagnostics::record_client_error("websocket disconnected");
-        let req = build_request(
-            "note",
-            "/clients",
-            Some(7),
-            Some("Primary".into()),
-            "ua",
-            Some("0.0.1".into()),
-        );
-        assert_eq!(req.note, "note");
+        let req = build_request("note", "/clients", Some(7));
         assert_eq!(req.page_path, "/clients");
         assert_eq!(req.server_id, Some(7));
-        assert_eq!(req.server_name.as_deref(), Some("Primary"));
-        assert_eq!(req.toasts.len(), 1);
-        assert_eq!(req.toasts[0].message, "saved");
-        assert_eq!(req.ws_errors.len(), 1);
-        assert_eq!(req.ws_errors[0].message, "websocket disconnected");
-        assert_eq!(req.app_version.as_deref(), Some("0.0.1"));
+        assert_eq!(req.note.as_deref(), Some("note"));
+        assert_eq!(
+            req.toasts.as_deref(),
+            Some([String::from("saved")].as_slice())
+        );
+        assert_eq!(
+            req.ws_errors.as_deref(),
+            Some([String::from("websocket disconnected")].as_slice())
+        );
+        assert_eq!(req.release.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+        assert!(req.context.is_none());
     }
 
     #[test]
-    fn app_version_is_crate_semver() {
-        let v = app_version().expect("CARGO_PKG_VERSION is set");
+    fn build_request_omits_blank_note() {
+        diagnostics::reset_for_tests();
+        let req = build_request("   ", "/logs", None);
+        assert!(req.note.is_none());
+        assert!(req.server_id.is_none());
+        assert!(req.toasts.is_none());
+        assert!(req.ws_errors.is_none());
+    }
+
+    #[test]
+    fn release_is_crate_semver() {
+        let v = release().expect("CARGO_PKG_VERSION is set");
         assert!(!v.is_empty());
         assert!(v.chars().next().unwrap().is_ascii_digit());
     }

@@ -10,7 +10,6 @@ use dioxus::prelude::*;
 
 use crate::client::api::ApiError;
 use crate::client::bug_reports::{self, BugReportResponse};
-use crate::client::diagnostics::{ClientErrorSnapshot, ToastSnapshot};
 use crate::client::dioxus::use_auth_gate;
 use crate::ui::components::toast::{ToastVariant, use_toaster};
 use crate::ui::components::{Button, ButtonType, ButtonVariant, Field};
@@ -49,10 +48,9 @@ pub fn ReportBugDialog(
             .find(|s| s.id == id)
             .map(|s| s.name.clone())
     });
-    let toasts = crate::client::diagnostics::snapshot_toasts();
-    let ws_errors = crate::client::diagnostics::snapshot_client_errors();
-    let user_agent = bug_reports::user_agent();
-    let version = bug_reports::app_version();
+    let toasts = crate::client::diagnostics::toast_messages();
+    let ws_errors = crate::client::diagnostics::ws_error_messages();
+    let release = bug_reports::release();
     let busy = *submitting.read();
 
     let on_cancel = move |_| {
@@ -65,21 +63,14 @@ pub fn ReportBugDialog(
     let on_submit = {
         let gate = gate.clone();
         let page_path = page_path.clone();
-        let selected_name = selected_name.clone();
         move |_| {
             if *submitting.read() {
                 return;
             }
             submitting.set(true);
             let gate = gate.clone();
-            let body = bug_reports::build_request(
-                note.read().trim(),
-                page_path.clone(),
-                selected_id,
-                selected_name.clone(),
-                bug_reports::user_agent(),
-                bug_reports::app_version(),
-            );
+            let body =
+                bug_reports::build_request(note.read().trim(), page_path.clone(), selected_id);
             spawn(async move {
                 match bug_reports::submit(gate, &body).await {
                     Ok(resp) => {
@@ -99,6 +90,12 @@ pub fn ReportBugDialog(
                                 ToastVariant::Warning,
                                 "Could not send bug report",
                                 Some(bug_reports::unavailable_message().to_string()),
+                            );
+                        } else if bug_reports::is_sink_unconfigured(&e) {
+                            toaster.push(
+                                ToastVariant::Warning,
+                                "Could not send bug report",
+                                Some(bug_reports::sink_unconfigured_message().to_string()),
                             );
                         } else {
                             toaster.push(
@@ -142,7 +139,7 @@ pub fn ReportBugDialog(
                 }
                 div { class: "modal-body stack-md",
                     p { id: "report-bug-lede", class: "info-hint",
-                        "Optional note — a page path, the selected server, recent toasts, and recent connection errors are always attached. Nothing is sent to a third-party crash service."
+                        "Optional note — page path, selected server id, recent toasts, and recent connection errors are always attached. Nothing is sent to a third-party crash service."
                     }
                     Field {
                         label: "What happened?".to_string(),
@@ -165,8 +162,7 @@ pub fn ReportBugDialog(
                         server_name: selected_name,
                         toasts: toasts,
                         ws_errors: ws_errors,
-                        user_agent: user_agent,
-                        app_version: version,
+                        release: release,
                     }
                 }
                 div { class: "modal-footer",
@@ -195,22 +191,16 @@ fn ContextPreview(
     page_path: String,
     server_id: Option<i64>,
     server_name: Option<String>,
-    toasts: Vec<ToastSnapshot>,
-    ws_errors: Vec<ClientErrorSnapshot>,
-    user_agent: String,
-    app_version: Option<String>,
+    toasts: Vec<String>,
+    ws_errors: Vec<String>,
+    release: Option<String>,
 ) -> Element {
     let server_line = match (server_name.as_deref(), server_id) {
         (Some(name), Some(id)) => format!("{name} (id {id})"),
         (None, Some(id)) => format!("id {id}"),
         _ => "None selected".to_string(),
     };
-    let ua_line = if user_agent.trim().is_empty() {
-        "Unavailable in this view".to_string()
-    } else {
-        user_agent
-    };
-    let version_line = app_version.unwrap_or_else(|| "Unknown".into());
+    let release_line = release.unwrap_or_else(|| "Unknown".into());
 
     rsx! {
         div { class: "bug-report-context",
@@ -220,22 +210,20 @@ fn ContextPreview(
                 dd { "{page_path}" }
                 dt { "Server" }
                 dd { "{server_line}" }
-                dt { "App version" }
-                dd { "{version_line}" }
-                dt { "Browser" }
-                dd { "{ua_line}" }
+                dt { "Release" }
+                dd { "{release_line}" }
                 dt { "Recent toasts" }
                 dd {
                     SnapshotList {
                         empty: "None yet".to_string(),
-                        items: toasts.iter().map(|t| format!("[{}] {}", t.variant, t.message)).collect(),
+                        items: toasts,
                     }
                 }
                 dt { "Recent connection errors" }
                 dd {
                     SnapshotList {
                         empty: "None yet".to_string(),
-                        items: ws_errors.iter().map(|e| e.message.clone()).collect(),
+                        items: ws_errors,
                     }
                 }
             }
@@ -258,22 +246,14 @@ fn SnapshotList(empty: String, items: Vec<String>) -> Element {
 }
 
 fn push_success_toast(toaster: crate::ui::components::Toaster, resp: &BugReportResponse) {
-    let title = match resp.issue_number {
-        Some(n) => format!("Bug reported — #{n}"),
-        None => "Bug reported".to_string(),
-    };
-    let href = resp
-        .issue_url
-        .as_ref()
-        .map(|u| u.trim())
-        .filter(|u| !u.is_empty())
-        .map(|u| u.to_string());
-    let detail = if href.is_none() && resp.issue_number.is_none() {
-        Some("Thanks — the report was sent.".to_string())
-    } else {
+    let title = format!("Bug reported — #{}", resp.issue_number);
+    let href = resp.issue_url.trim();
+    let href = if href.is_empty() {
         None
+    } else {
+        Some(href.to_string())
     };
-    toaster.push_with_link(ToastVariant::Success, title, detail, href);
+    toaster.push_with_link(ToastVariant::Success, title, None, href);
 }
 
 fn format_submit_error(err: &ApiError) -> String {
@@ -320,18 +300,14 @@ mod tests {
     #[test]
     fn success_title_includes_issue_number() {
         let resp = BugReportResponse {
-            issue_url: Some("https://github.com/FrozenTear/teamspeak-admin-panel/issues/99".into()),
-            issue_number: Some(99),
+            issue_url: "https://github.com/FrozenTear/teamspeak-admin-panel/issues/99".into(),
+            issue_number: 99,
         };
-        // Pure helper contract — the toast title is what the operator reads.
-        let title = match resp.issue_number {
-            Some(n) => format!("Bug reported — #{n}"),
-            None => "Bug reported".to_string(),
-        };
+        let title = format!("Bug reported — #{}", resp.issue_number);
         assert_eq!(title, "Bug reported — #99");
         assert_eq!(
-            resp.issue_url.as_deref(),
-            Some("https://github.com/FrozenTear/teamspeak-admin-panel/issues/99")
+            resp.issue_url,
+            "https://github.com/FrozenTear/teamspeak-admin-panel/issues/99"
         );
     }
 
