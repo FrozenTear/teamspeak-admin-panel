@@ -133,9 +133,8 @@ pub async fn fetch_music_bot_context(
 /// Merge Music Bot snapshot keys into `body.context` when missing. No-op
 /// on fetch failure or an empty snapshot.
 pub async fn attach_optional_seat_context(gate: &RefreshGate, body: &mut BugReportRequest) {
-    match fetch_music_bot_context(gate).await {
-        Ok(snap) => merge_music_bot_context(body, &snap),
-        Err(_) => {}
+    if let Ok(snap) = fetch_music_bot_context(gate).await {
+        merge_music_bot_context(body, &snap);
     }
 }
 
