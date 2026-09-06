@@ -132,6 +132,7 @@ impl BotHandle {
         // was off and we never went online).
         drop(self.commands);
         self.join.await.map_err(|err| {
+            crate::bug_report::record_actor_panic(format!("{err:?}"));
             warn!(?err, "bot actor panicked on shutdown");
             SendError::ActorGone
         })

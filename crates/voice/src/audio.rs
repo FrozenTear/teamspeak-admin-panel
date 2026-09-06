@@ -539,12 +539,15 @@ impl PlaybackMonitor {
             if !self.prev_late {
                 // Rising edge — the start of a fresh underrun event.
                 self.underrun_events += 1;
+                let regime = if in_startup { "startup" } else { "midsong" };
+                let lateness_ms = lateness.as_millis() as u64;
+                crate::bug_report::record_frame_underrun(regime, index, lateness_ms, buffered);
                 warn!(
                     target: "music_bot_latency",
                     stage = "frame_underrun",
-                    regime = if in_startup { "startup" } else { "midsong" },
+                    regime,
                     frame_index = index,
-                    lateness_ms = lateness.as_millis() as u64,
+                    lateness_ms,
                     buffered_frames = buffered,
                     "frame delivered late — wire-send stall (audible crackle); \
                      check buffered_frames: a high value means the consumer \
@@ -1024,6 +1027,7 @@ fn spawn_sibling(
                         let bytes = match encoder.encode_frame(&samples) {
                             Ok(b) => b,
                             Err(e) => {
+                                crate::bug_report::record_encode_error(&e);
                                 warn!(
                                     error = %e,
                                     frame_index = f.index,
