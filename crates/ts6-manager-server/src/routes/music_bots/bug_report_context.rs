@@ -106,7 +106,7 @@ mod tests {
 
     #[test]
     fn enrich_merges_absent_keys_into_context() {
-        let _guard = music_bot::bug_report::test_global_lock();
+        let _guard = music_bot::bug_report::test_global_lock_blocking();
         push_sample_stage();
 
         let raw = br#"{"pagePath":"/music-bots/42","note":"slow resolve"}"#;
@@ -128,7 +128,7 @@ mod tests {
 
     #[test]
     fn enrich_does_not_overwrite_panel_supplied_keys() {
-        let _guard = music_bot::bug_report::test_global_lock();
+        let _guard = music_bot::bug_report::test_global_lock_blocking();
         push_sample_stage();
 
         let raw = br#"{

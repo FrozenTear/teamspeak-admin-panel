@@ -152,10 +152,20 @@ pub fn snapshot() -> BugReportSnapshot {
 }
 
 /// Serialise tests (this crate and dependents) that mutate the
-/// process-wide ring. Always available so server-crate tests can take it.
-pub fn test_global_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: Mutex<()> = Mutex::new(());
-    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+/// process-wide ring. Tokio mutex so async tests can hold it across
+/// `.await` without `clippy::await_holding_lock` (std `MutexGuard`).
+pub async fn test_global_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    test_lock().lock().await
+}
+
+/// Sync counterpart for `#[test]` functions that have no runtime.
+pub fn test_global_lock_blocking() -> tokio::sync::MutexGuard<'static, ()> {
+    test_lock().blocking_lock()
+}
+
+fn test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    &LOCK
 }
 
 /// `tracing` layer that captures `music_bot_latency` (and related `yt_dlp`

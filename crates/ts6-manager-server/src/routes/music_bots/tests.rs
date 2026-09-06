@@ -1537,7 +1537,7 @@ async fn bug_report_context_requires_auth() {
 
 #[tokio::test]
 async fn bug_report_context_returns_camel_case_snapshot() {
-    let _guard = music_bot::bug_report::test_global_lock();
+    let _guard = music_bot::bug_report::test_global_lock().await;
     music_bot::bug_report::global_ring().clear();
     music_bot::bug_report::global_ring().record_stage(
         music_bot::bug_report::LatencyStage {
@@ -1582,7 +1582,7 @@ async fn bug_report_post_middleware_merges_absent_context_keys() {
     use axum::routing::post;
     use serde_json::Value;
 
-    let _guard = music_bot::bug_report::test_global_lock();
+    let _guard = music_bot::bug_report::test_global_lock().await;
     music_bot::bug_report::global_ring().clear();
     music_bot::bug_report::global_ring().record_stage(
         music_bot::bug_report::LatencyStage {
