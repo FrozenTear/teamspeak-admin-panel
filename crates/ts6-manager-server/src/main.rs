@@ -15,6 +15,8 @@ mod app_state;
 mod audit;
 #[cfg(feature = "server")]
 mod auth;
+#[cfg(feature = "server")]
+mod bug_reports;
 mod client;
 #[cfg(feature = "server")]
 mod config;
@@ -411,7 +413,10 @@ mod server_entry {
         // operator's configured reverse-proxy CIDR allow-list.
         let public_moderation_router =
             routes::public_moderation::router(cfg.moderation_trusted_proxy_cidrs.clone())
-                .with_state(state);
+                .with_state(state.clone());
+        // Operator bug reports (`POST /api/bug-reports`). RequireAuth;
+        // GitHub sink is optional (503 when env is unset).
+        let bug_reports_router = routes::bug_reports::router().with_state(state);
 
         // PURA-17: `serve_dioxus_application` registers static assets +
         // server functions and adds a fallback that serves the dx-CLI
@@ -458,6 +463,7 @@ mod server_entry {
             .merge(moderation_router)
             // PURA-307 — Phase 9.2 public report/appeal surface.
             .merge(public_moderation_router)
+            .merge(bug_reports_router)
             .serve_dioxus_application(serve_cfg, ui::App)
             .layer(web::cors_layer(&cfg.frontend_url));
         let router = web::security_headers_stack(cfg.node_env).apply(router);

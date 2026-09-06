@@ -104,6 +104,10 @@ pub struct AppState {
     /// captures the real client IP per spec §6.8 (rather than the
     /// edge-proxy's address) on deployments that sit behind one.
     pub trusted_proxy_hops: u8,
+    /// Operator bug-report sink (private GitHub Issues). Unconfigured when
+    /// token/repo are unset so `POST /api/bug-reports` can 503 without
+    /// crashing boot.
+    pub bug_reports: crate::bug_reports::BugReportSinkHandle,
 }
 
 impl AppState {
@@ -176,6 +180,7 @@ impl AppState {
             yt_api_key,
             data_dir: cfg.data_dir.clone(),
             trusted_proxy_hops: cfg.trusted_proxy_hops,
+            bug_reports: crate::bug_reports::sink_from_config(&cfg.bug_reports),
         }
     }
 }

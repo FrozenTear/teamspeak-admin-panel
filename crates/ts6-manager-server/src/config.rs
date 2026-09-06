@@ -141,6 +141,34 @@ pub struct Config {
     /// default, which is default-deny — XFF is ignored and the rate
     /// limiter keys on the direct connection IP.
     pub moderation_trusted_proxy_cidrs: Vec<ipnet::IpNet>,
+    /// Operator bug-report sink (private GitHub Issues). Unset token/repo
+    /// does **not** fail boot — `POST /api/bug-reports` returns 503 until
+    /// Contabo sets `BUG_REPORTS_GITHUB_TOKEN` + `BUG_REPORTS_GITHUB_REPO`.
+    pub bug_reports: BugReportsGithubConfig,
+}
+
+/// Env-backed GitHub Issues target for [`crate::bug_reports`].
+#[derive(Debug, Clone, Default)]
+pub struct BugReportsGithubConfig {
+    pub token: Option<String>,
+    /// `owner/name` (e.g. `FrozenTear/teamspeak-admin-panel`).
+    pub repo: Option<String>,
+    pub labels: Vec<String>,
+}
+
+impl BugReportsGithubConfig {
+    fn from_env() -> Self {
+        Self {
+            token: optional_env("BUG_REPORTS_GITHUB_TOKEN"),
+            repo: optional_env("BUG_REPORTS_GITHUB_REPO"),
+            labels: parse_env_csv("BUG_REPORTS_GITHUB_LABELS"),
+        }
+    }
+
+    pub fn is_configured(&self) -> bool {
+        self.token.as_deref().is_some_and(|s| !s.trim().is_empty())
+            && self.repo.as_deref().is_some_and(|s| !s.trim().is_empty())
+    }
 }
 
 impl Config {
@@ -208,6 +236,8 @@ impl Config {
         // PURA-307 — public moderation surface trusted-proxy allow-list.
         let moderation_trusted_proxy_cidrs = parse_env_cidrs("MODERATION_TRUSTED_PROXY_CIDRS")?;
 
+        let bug_reports = BugReportsGithubConfig::from_env();
+
         Ok(Self {
             node_env,
             host,
@@ -237,6 +267,7 @@ impl Config {
             widget_rate_limit_per_token_rpm,
             widget_rate_limit_per_ip_rpm,
             moderation_trusted_proxy_cidrs,
+            bug_reports,
         })
     }
 
@@ -261,6 +292,9 @@ impl Config {
             moq_public_url_set = self.moq_public_url.is_some(),
             yt_cookie_file_set = self.yt_cookie_file.is_some(),
             youtube_api_key_set = self.youtube_api_key.is_some(),
+            bug_reports_github_token_set = self.bug_reports.token.is_some(),
+            bug_reports_github_repo_set = self.bug_reports.repo.is_some(),
+            bug_reports_github_label_count = self.bug_reports.labels.len(),
             "ts6-manager configuration loaded"
         );
 
@@ -362,6 +396,18 @@ fn parse_env_cidrs(key: &str) -> Result<Vec<ipnet::IpNet>> {
         .collect()
 }
 
+fn parse_env_csv(key: &str) -> Vec<String> {
+    match env::var(key) {
+        Ok(v) if !v.trim().is_empty() => v
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 fn parse_bool_flag(key: &str) -> bool {
     matches!(
         env::var(key).as_deref(),
@@ -422,6 +468,27 @@ mod tests {
         assert_eq!(
             NodeEnv::from_env_string(Some("production")),
             NodeEnv::Production
+        );
+    }
+
+    #[test]
+    fn bug_reports_config_is_off_when_token_or_repo_missing() {
+        assert!(!BugReportsGithubConfig::default().is_configured());
+        assert!(
+            !BugReportsGithubConfig {
+                token: Some("tok".into()),
+                repo: None,
+                labels: Vec::new(),
+            }
+            .is_configured()
+        );
+        assert!(
+            BugReportsGithubConfig {
+                token: Some("tok".into()),
+                repo: Some("owner/name".into()),
+                labels: vec!["bug-report".into()],
+            }
+            .is_configured()
         );
     }
 }

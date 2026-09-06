@@ -9,6 +9,7 @@
 //! `ts6_manager_shared::{setup, servers}`.
 
 pub mod audit;
+pub mod bug_reports;
 pub mod control;
 pub mod metrics;
 pub mod moderation;

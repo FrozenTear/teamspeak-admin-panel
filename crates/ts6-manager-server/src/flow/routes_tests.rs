@@ -91,6 +91,7 @@ async fn setup() -> (FlowApiState, FlowEngine, i64) {
         yt_api_key: Arc::new(std::sync::RwLock::new(None)),
         data_dir: std::path::PathBuf::from("./data"),
         trusted_proxy_hops: 0,
+        bug_reports: crate::bug_reports::unconfigured_sink(),
     };
 
     let engine = FlowEngine::start(EngineDeps::new(db.clone(), Arc::new(BasicDispatcher)))
