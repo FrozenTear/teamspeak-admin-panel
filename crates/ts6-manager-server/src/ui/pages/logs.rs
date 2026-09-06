@@ -1,8 +1,9 @@
 //! `/logs` — tailing log viewer with severity filter. PURA-73.
 //!
 //! - REST: `GET /api/servers/{configId}/vs/{sid}/logs?after=…&severity=…`.
-//!   The route returns at most 500 lines per call and surfaces `last_pos`
-//!   so the next call can page forward.
+//!   The route returns at most 100 lines per call (TeamSpeak `logview`
+//!   max; larger values fail with 1541) and surfaces `last_pos` so the
+//!   next call can page forward.
 //! - WS: subscribes to `server:{configId}:logs`. Today the topic is empty
 //!   on Phase 2 (PURA-70a will wire the server-notify feed); the FE
 //!   complements it with a 5-second background poll so the operator
@@ -29,6 +30,8 @@ use crate::ui::layout::use_servers_context;
 use crate::ui::pages::active_server;
 
 const MAX_BUFFERED_LINES: usize = 1_000;
+/// TeamSpeak `logview` max per call; larger values fail with 1541.
+const REQUEST_LOG_LINES: u32 = 100;
 #[cfg(target_arch = "wasm32")]
 const POLL_INTERVAL_MS: u32 = 5_000;
 
@@ -76,7 +79,7 @@ pub fn LogsPage() -> Element {
             spawn(async move {
                 let q = LogTailQuery {
                     after: None,
-                    lines: Some(200),
+                    lines: Some(REQUEST_LOG_LINES),
                     severity: if sev.is_empty() { None } else { Some(sev) },
                 };
                 let res = fetch_logs(gate, server_id, sid, &q).await;
@@ -115,7 +118,7 @@ pub fn LogsPage() -> Element {
                     let sev = severity.read().trim().to_string();
                     let q = LogTailQuery {
                         after,
-                        lines: Some(200),
+                        lines: Some(REQUEST_LOG_LINES),
                         severity: if sev.is_empty() { None } else { Some(sev) },
                     };
                     if let Ok(r) = fetch_logs(gate.clone(), server_id, sid, &q).await {

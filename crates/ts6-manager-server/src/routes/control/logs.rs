@@ -2,9 +2,9 @@
 //! — `logview` tail. PURA-71.
 //!
 //! - `after` — pass the previous response's `last_pos` to page forward.
-//! - `lines` — capped to `MAX_LOG_LINES`. The TS upstream caps at 100 per
-//!   call anyway; we hard-stop at 500 so the route never asks for a
-//!   pathological page size.
+//! - `lines` — capped to `TS_LOGVIEW_MAX_LINES` (100). TeamSpeak's
+//!   `logview` rejects anything larger with error 1541 (`invalid
+//!   parameter size`); REST never asks TS for more than that.
 //! - `severity` — substring filter on the line text. The TS `logview`
 //!   upstream does not support filtering, so we filter on egress. This
 //!   means `lines` is the page size BEFORE filtering — undersized
@@ -20,8 +20,20 @@ use crate::auth::extractors::RequireServerAccess;
 
 use super::{access, translate_control_error};
 
-const DEFAULT_LOG_LINES: u32 = 100;
-const MAX_LOG_LINES: u32 = 500;
+/// TeamSpeak `logview` rejects `lines` above 100 with error 1541
+/// (`invalid parameter size`). REST never asks TS for more than this.
+const TS_LOGVIEW_MAX_LINES: u32 = 100;
+const DEFAULT_LOG_LINES: u32 = TS_LOGVIEW_MAX_LINES;
+/// REST query cap. Same as `TS_LOGVIEW_MAX_LINES` so the documented
+/// page size matches what we actually send upstream.
+const MAX_LOG_LINES: u32 = TS_LOGVIEW_MAX_LINES;
+
+fn clamp_logview_lines(requested: Option<u32>) -> u32 {
+    requested
+        .unwrap_or(DEFAULT_LOG_LINES)
+        .min(MAX_LOG_LINES)
+        .min(TS_LOGVIEW_MAX_LINES)
+}
 
 pub async fn tail(
     State(state): State<AppState>,
@@ -36,13 +48,16 @@ pub async fn tail(
         .await
         .map_err(translate_control_error)?;
 
-    let lines = query
-        .lines
-        .map(|n| n.min(MAX_LOG_LINES))
-        .unwrap_or(DEFAULT_LOG_LINES);
+    let lines = clamp_logview_lines(query.lines);
 
     let entries = client
-        .logview(sid, lines, true, false, query.after)
+        .logview(
+            sid,
+            lines.min(TS_LOGVIEW_MAX_LINES),
+            true,
+            false,
+            query.after,
+        )
         .await
         .map_err(translate_control_error)?;
 
@@ -73,4 +88,32 @@ pub async fn tail(
         file_size,
         lines: out_lines,
     }))
+}
+
+#[cfg(test)]
+mod clamp_tests {
+    use super::*;
+
+    #[test]
+    fn defaults_to_ts_logview_max() {
+        assert_eq!(clamp_logview_lines(None), TS_LOGVIEW_MAX_LINES);
+    }
+
+    #[test]
+    fn passes_through_values_at_or_below_max() {
+        assert_eq!(clamp_logview_lines(Some(1)), 1);
+        assert_eq!(
+            clamp_logview_lines(Some(TS_LOGVIEW_MAX_LINES)),
+            TS_LOGVIEW_MAX_LINES
+        );
+    }
+
+    #[test]
+    fn clamps_oversize_to_ts_logview_max() {
+        // The Contabo Logs page used to request 200; TS rejects that
+        // with 1541 (`invalid parameter size`).
+        assert_eq!(clamp_logview_lines(Some(200)), TS_LOGVIEW_MAX_LINES);
+        assert_eq!(clamp_logview_lines(Some(500)), TS_LOGVIEW_MAX_LINES);
+        assert_eq!(clamp_logview_lines(Some(u32::MAX)), TS_LOGVIEW_MAX_LINES);
+    }
 }
