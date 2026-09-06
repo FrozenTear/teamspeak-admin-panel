@@ -12,7 +12,6 @@
 mod audio;
 mod backoff;
 mod bot;
-mod voice_bug_report;
 mod chat;
 mod command;
 mod config;
@@ -21,6 +20,7 @@ mod runtime;
 mod state;
 mod store;
 mod supervisor;
+mod voice_bug_report;
 
 pub use backoff::{BackoffConfig, ExponentialBackoff};
 pub use chat::{ParseError as ChatParseError, ParsedCommand, parse as parse_chat_command};

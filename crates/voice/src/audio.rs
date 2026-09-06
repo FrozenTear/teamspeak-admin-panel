@@ -541,7 +541,12 @@ impl PlaybackMonitor {
                 self.underrun_events += 1;
                 let regime = if in_startup { "startup" } else { "midsong" };
                 let lateness_ms = lateness.as_millis() as u64;
-                crate::voice_bug_report::record_frame_underrun(regime, index, lateness_ms, buffered);
+                crate::voice_bug_report::record_frame_underrun(
+                    regime,
+                    index,
+                    lateness_ms,
+                    buffered,
+                );
                 warn!(
                     target: "music_bot_latency",
                     stage = "frame_underrun",
