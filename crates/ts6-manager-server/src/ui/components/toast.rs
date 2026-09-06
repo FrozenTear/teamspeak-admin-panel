@@ -25,6 +25,17 @@ pub enum ToastVariant {
 }
 
 impl ToastVariant {
+    /// Wire name written into the Report bug toast ring. Danger maps to
+    /// `"error"` so the payload matches the provisional API shape.
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            ToastVariant::Info => "info",
+            ToastVariant::Success => "success",
+            ToastVariant::Warning => "warning",
+            ToastVariant::Danger => "error",
+        }
+    }
+
     fn class(self) -> &'static str {
         match self {
             ToastVariant::Info => "toast",
@@ -51,12 +62,29 @@ impl ToastVariant {
     }
 }
 
+#[cfg(test)]
+mod wire_name_tests {
+    use super::ToastVariant;
+
+    #[test]
+    fn danger_maps_to_error_on_the_wire() {
+        assert_eq!(ToastVariant::Danger.wire_name(), "error");
+        assert_eq!(ToastVariant::Info.wire_name(), "info");
+        assert_eq!(ToastVariant::Success.wire_name(), "success");
+        assert_eq!(ToastVariant::Warning.wire_name(), "warning");
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToastEntry {
     pub id: u64,
     pub variant: ToastVariant,
     pub title: String,
     pub detail: Option<String>,
+    /// Optional outbound link (e.g. a GitHub issue created by Report bug).
+    /// Rendered as a real `<a>` in the toast body so the operator can open
+    /// it in one click.
+    pub href: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -68,12 +96,29 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 impl Toaster {
     pub fn push(&self, variant: ToastVariant, title: impl Into<String>, detail: Option<String>) {
+        self.push_with_link(variant, title, detail, None);
+    }
+
+    pub fn push_with_link(
+        &self,
+        variant: ToastVariant,
+        title: impl Into<String>,
+        detail: Option<String>,
+        href: Option<String>,
+    ) {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let title = title.into();
+        let ring_message = match detail.as_deref() {
+            Some(d) if !d.is_empty() => format!("{title}: {d}"),
+            _ => title.clone(),
+        };
+        crate::client::diagnostics::record_toast(variant.wire_name(), ring_message);
         let entry = ToastEntry {
             id,
             variant,
-            title: title.into(),
+            title,
             detail,
+            href,
         };
         // Bind the Copy Signal first so `write()` is not on a temporary (E0716/E0502).
         let mut items = self.items;
@@ -145,6 +190,15 @@ pub fn ToasterRegion() -> Element {
                                 div { class: "title", "{entry.title}" }
                                 if let Some(d) = entry.detail.as_ref() {
                                     div { class: "detail", "{d}" }
+                                }
+                                if let Some(href) = entry.href.as_ref() {
+                                    a {
+                                        class: "toast-link",
+                                        href: "{href}",
+                                        target: "_blank",
+                                        rel: "noopener noreferrer",
+                                        "{href}"
+                                    }
                                 }
                             }
                             button {

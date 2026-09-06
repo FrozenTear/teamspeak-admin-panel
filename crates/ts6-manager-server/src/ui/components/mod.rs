@@ -9,6 +9,7 @@ mod button;
 pub mod dropdown;
 mod field;
 mod input;
+pub mod report_bug;
 mod server_selector;
 mod switch;
 mod tabs;
@@ -29,6 +30,7 @@ pub use dropdown::{
 };
 pub use field::Field;
 pub use input::{PasswordInput, TextInput};
+pub use report_bug::ReportBugDialog;
 pub use server_selector::{ServerSelector, ServerSelectorVariant};
 pub use switch::Switch;
 pub use tabs::{TabItem, TabPanel, Tabs};

@@ -431,6 +431,21 @@ fn log_api_call_exit<T>(method: &str, path: &str, status: u16, result: &Result<T
             ("outcome", outcome.into()),
         ]),
     );
+    if let Err(err) = result {
+        record_api_error_for_bug_report(method, path, status, err);
+    }
+}
+
+/// Feed failed authorized calls into the Report bug ring. Session-anonymous
+/// and native-unsupported are SPA-internal and would just noise the payload.
+fn record_api_error_for_bug_report(method: &str, path: &str, status: u16, err: &ApiError) {
+    if matches!(
+        err,
+        ApiError::SessionAnonymous | ApiError::UnsupportedTarget
+    ) {
+        return;
+    }
+    crate::client::diagnostics::record_client_error(format!("{method} {path} → {status}: {err}"));
 }
 
 fn api_error_tag(err: &ApiError) -> &'static str {

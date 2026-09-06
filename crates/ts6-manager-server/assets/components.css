@@ -333,6 +333,13 @@ a:hover {
   color: var(--text-secondary);
   margin-top: 4px;
 }
+.toast .toast-link {
+  display: inline-block;
+  margin-top: var(--space-2);
+  font: var(--weight-medium) var(--text-sm) / var(--lh-sm) var(--font-sans);
+  color: var(--accent-fg);
+  word-break: break-all;
+}
 .toast .close {
   background: transparent;
   border: 0;
@@ -612,6 +619,44 @@ a:hover {
   display: flex; justify-content: flex-end; gap: var(--space-4);
 }
 
+/* ─── Report bug context preview ─────────────────────── */
+.bug-report-context {
+  padding: var(--space-5);
+  background: var(--bg-surface-sunken);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+.bug-report-context__title {
+  margin: 0 0 var(--space-4);
+  font: var(--weight-semibold) var(--text-sm) / var(--lh-sm) var(--font-sans);
+  color: var(--text-primary);
+}
+.bug-report-context__list {
+  margin: 0;
+}
+.bug-report-context__list dt {
+  margin: var(--space-3) 0 0;
+  font: var(--weight-medium) var(--text-xs) / var(--lh-sm) var(--font-sans);
+  color: var(--text-muted);
+}
+.bug-report-context__list dt:first-child { margin-top: 0; }
+.bug-report-context__list dd {
+  margin: 0;
+  font: var(--weight-regular) var(--text-sm) / var(--lh-sm) var(--font-sans);
+  color: var(--text-primary);
+  word-break: break-word;
+}
+.bug-report-context__empty { color: var(--text-muted); }
+.bug-report-context__items {
+  margin: 0;
+  padding-left: var(--space-5);
+}
+.bug-report-context__items li { margin: 0; }
+#report-bug-note.input {
+  height: auto;
+  min-height: 6.5rem;
+}
+
 /* ─── Step indicator ─────────────────────────────────── */
 .steps {
   display: flex;
@@ -745,6 +790,25 @@ a:hover {
   display: inline-flex; align-items: center; gap: var(--space-3);
   font: var(--weight-medium) var(--text-sm) / var(--lh-sm) var(--font-sans);
   color: var(--text-primary);
+}
+.header button.user {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+}
+.header button.user:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 3px;
+  border-radius: var(--radius-md);
+}
+.header .user-menu-anchor {
+  display: inline-flex;
+}
+.header .user-menu-anchor > .dropdown-anchor > .menu {
+  left: auto;
+  right: 0;
+  min-width: 12rem;
 }
 .header .avatar {
   width: 28px; height: 28px;

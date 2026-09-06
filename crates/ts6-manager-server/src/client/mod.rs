@@ -28,8 +28,10 @@
 
 pub mod api;
 pub mod auth;
+pub mod bug_reports;
 pub mod channels;
 pub mod debug;
+pub mod diagnostics;
 pub mod dioxus;
 pub mod flows;
 pub mod music_bots;

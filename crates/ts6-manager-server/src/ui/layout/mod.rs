@@ -153,6 +153,8 @@ mod tests {
     use crate::client::dioxus::{DioxusSession, provide_auth_gate};
     use crate::client::storage::MemoryStore;
     use crate::client::store::AuthState;
+    use crate::client::ws::provide_ws_hub;
+    use crate::ui::components::{provide_activity_feed, provide_toaster};
     use crate::ui::theme::{Theme, ThemeContext};
     use ts6_manager_shared::auth::UserInfo;
 
@@ -186,6 +188,11 @@ mod tests {
         // dashboard route reads it from context, so the harness must mount
         // one to avoid a "missing context" panic during chrome-snapshot tests.
         use_context_provider(|| provide_auth_gate(session));
+        // Header's Report bug dialog + ToasterRegion + activity feed all
+        // reach for these providers. Production mounts them on `App`.
+        let _ = provide_toaster();
+        let _ = provide_ws_hub();
+        let _ = provide_activity_feed();
         rsx! { Router::<Route> {} }
     }
 
