@@ -2,7 +2,7 @@
 //! ops dashboards / load-balancers can probe without speaking MoQ.
 //!
 //! Routes:
-//! - WS-1: `GET /health`, `GET /stats`, `GET /certificate.sha256`
+//! - WS-1: `GET /health`, `GET /stats`, `GET /diagnostics`, `GET /certificate.sha256`
 //! - WS-3: `POST /source`, `POST /source/stop`, `GET /track/{source_id}`
 //!
 //! The mutating handlers live in [`crate::control`]; this module owns
@@ -25,6 +25,7 @@ use ts6_ssrf::Resolver;
 
 use crate::SidecarStats;
 use crate::control::{self, ControlPlaneState, PipelineRegistry, SourceStatsSnapshot};
+use crate::diagnostics::Diagnostics;
 use crate::http_pin::PinProxy;
 use crate::origin::SidecarOrigin;
 
@@ -34,6 +35,7 @@ struct AppState {
     stats: Arc<SidecarStats>,
     fingerprint: String,
     control_plane: ControlPlaneState,
+    diagnostics: Arc<Diagnostics>,
 }
 
 /// Bound, not-yet-running axum server.
@@ -53,6 +55,7 @@ impl HttpServer {
         registry: PipelineRegistry,
         ffmpeg_path: PathBuf,
         pin_proxy: Arc<PinProxy>,
+        diagnostics: Arc<Diagnostics>,
     ) -> Result<Self> {
         let listener = TcpListener::bind(bind)
             .await
@@ -64,6 +67,7 @@ impl HttpServer {
             resolver,
             ffmpeg_path,
             pin_proxy,
+            diagnostics: diagnostics.clone(),
         };
 
         let state = AppState {
@@ -71,6 +75,7 @@ impl HttpServer {
             stats,
             fingerprint,
             control_plane: control_plane.clone(),
+            diagnostics,
         };
 
         // axum gives each handler the state it asks for via `FromRef`
@@ -80,6 +85,7 @@ impl HttpServer {
         let router = Router::new()
             .route("/health", get(health))
             .route("/stats", get(stats_handler))
+            .route("/diagnostics", get(diagnostics_handler))
             .route("/certificate.sha256", get(certificate_sha256))
             .route("/source", post(control::post_source))
             .route("/source/stop", post(control::post_source_stop))
@@ -150,6 +156,33 @@ async fn stats_handler(State(state): State<AppState>) -> impl IntoResponse {
         registered_broadcasts,
         sources,
     })
+}
+
+async fn diagnostics_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let sources = state.control_plane.registry.snapshot().await;
+    let dead = sources
+        .iter()
+        .filter(|s| !s.video.ffmpeg_alive || !s.audio.ffmpeg_alive)
+        .count();
+    let hint = if sources.is_empty() {
+        format!(
+            "ok sources=0 sessions={}",
+            state.stats.snapshot().await.active_sessions
+        )
+    } else if dead > 0 {
+        format!(
+            "degraded ffmpeg_dead={dead} sources={} sessions={}",
+            sources.len(),
+            state.stats.snapshot().await.active_sessions
+        )
+    } else {
+        format!(
+            "ok sources={} sessions={}",
+            sources.len(),
+            state.stats.snapshot().await.active_sessions
+        )
+    };
+    axum::Json(state.diagnostics.snapshot(Some(&hint)))
 }
 
 async fn certificate_sha256(State(state): State<AppState>) -> impl IntoResponse {

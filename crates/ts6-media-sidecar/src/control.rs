@@ -49,6 +49,8 @@ pub struct ControlPlaneState {
     /// On `POST /source/stop` the token is burned so a leaked proxy URL
     /// can't replay past the pipeline's lifetime.
     pub pin_proxy: Arc<PinProxy>,
+    /// In-process last-event bag for `GET /diagnostics`.
+    pub diagnostics: Arc<crate::diagnostics::Diagnostics>,
 }
 
 /// In-memory pipeline registry. `source_id → PipelineEntry`. The
@@ -286,9 +288,13 @@ pub async fn post_source(
         return Err(ApiError::InvalidRequest(err));
     }
 
-    let pinned = is_url_allowed(&req.url, state.resolver.as_ref())
-        .await
-        .map_err(ApiError::SsrfBlocked)?;
+    let pinned = match is_url_allowed(&req.url, state.resolver.as_ref()).await {
+        Ok(p) => p,
+        Err(err) => {
+            state.diagnostics.record_ssrf_reject(&err);
+            return Err(ApiError::SsrfBlocked(err));
+        }
+    };
 
     // PURA-149 → PURA-172: closing the rebinding window for plaintext HTTP.
     //
@@ -343,7 +349,8 @@ pub async fn post_source(
     };
     let cfg = PipelineConfig::new(source_id.clone(), SourceInput::Url(ffmpeg_url.clone()))
         .with_ffmpeg_path(state.ffmpeg_path.clone())
-        .with_preset(preset);
+        .with_preset(preset)
+        .with_diagnostics(state.diagnostics.clone());
 
     let pipeline = match Pipeline::start(cfg, state.origin.clone()).await {
         Ok(p) => p,
@@ -351,6 +358,10 @@ pub async fn post_source(
             if let Some(tok) = pin_token.as_deref() {
                 state.pin_proxy.registry.deregister(tok).await;
             }
+            state.diagnostics.record_moq_error(
+                "pipeline_start",
+                &crate::diagnostics::redact_for_issue(&err.to_string()),
+            );
             return Err(ApiError::Internal(err));
         }
     };
