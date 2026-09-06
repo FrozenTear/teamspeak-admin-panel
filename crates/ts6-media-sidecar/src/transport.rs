@@ -17,6 +17,7 @@ use moq_native::{Server, ServerConfig, ServerTlsConfig};
 use tracing::{debug, info, warn};
 
 use crate::SidecarStats;
+use crate::diagnostics::Diagnostics;
 use crate::origin::SidecarOrigin;
 
 /// Plumbing input for the QUIC/WebTransport listener.
@@ -68,6 +69,7 @@ pub struct Transport {
     server: Server,
     origin: Arc<SidecarOrigin>,
     stats: Arc<SidecarStats>,
+    diagnostics: Arc<Diagnostics>,
 }
 
 impl Transport {
@@ -75,6 +77,7 @@ impl Transport {
         config: TransportConfig,
         origin: Arc<SidecarOrigin>,
         stats: Arc<SidecarStats>,
+        diagnostics: Arc<Diagnostics>,
     ) -> Result<Self> {
         let server_cfg = config.into_server_config()?;
         let server = Server::new(server_cfg).context("init moq-native server")?;
@@ -82,6 +85,7 @@ impl Transport {
             server,
             origin,
             stats,
+            diagnostics,
         })
     }
 
@@ -111,6 +115,7 @@ impl Transport {
             mut server,
             origin,
             stats,
+            diagnostics,
         } = self;
 
         let local = server.local_addr().context("read transport local_addr")?;
@@ -123,6 +128,7 @@ impl Transport {
 
             let request = request.with_publish(origin.consumer());
             let stats = stats.clone();
+            let diagnostics = diagnostics.clone();
             tokio::spawn(async move {
                 stats.record_session_open().await;
                 match request.ok().await {
@@ -135,6 +141,10 @@ impl Transport {
                         info!(transport, ?url, "session closed");
                     }
                     Err(err) => {
+                        diagnostics.record_moq_error(
+                            "session_handshake",
+                            &crate::diagnostics::redact_for_issue(&err.to_string()),
+                        );
                         warn!(transport, ?url, %err, "session handshake failed");
                     }
                 }
