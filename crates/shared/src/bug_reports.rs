@@ -145,8 +145,14 @@ mod tests {
         assert_eq!(req.page_path, "/music-bots/42");
         assert_eq!(req.server_id, Some(1));
         assert_eq!(req.note.as_deref(), Some("optional operator text"));
-        assert_eq!(req.toasts.as_deref(), Some(["Failed to fetch"].as_slice()));
-        assert_eq!(req.ws_errors.as_deref(), Some(["SSE closed"].as_slice()));
+        assert_eq!(
+            req.toasts.as_deref(),
+            Some([String::from("Failed to fetch")].as_slice())
+        );
+        assert_eq!(
+            req.ws_errors.as_deref(),
+            Some([String::from("SSE closed")].as_slice())
+        );
         assert_eq!(req.release.as_deref(), Some("v1.6.9"));
     }
 
