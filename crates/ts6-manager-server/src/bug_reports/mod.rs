@@ -45,6 +45,9 @@ pub trait BugReportSink: Send + Sync {
 /// Build the production sink from boot config. Token/repo unset or a
 /// malformed `owner/name` repo → [`UnconfiguredSink`] (503 at request time).
 pub fn sink_from_config(cfg: &BugReportsGithubConfig) -> BugReportSinkHandle {
+    if !cfg.is_configured() {
+        return unconfigured_sink();
+    }
     match GitHubIssueSink::try_from_config(cfg) {
         Some(sink) => Arc::new(sink),
         None => unconfigured_sink(),
@@ -57,6 +60,7 @@ pub fn unconfigured_sink() -> BugReportSinkHandle {
 }
 
 /// In-memory sink for route tests. Records every draft; returns a canned issue.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct RecordingSink {
     pub issues: Arc<std::sync::Mutex<Vec<IssueDraft>>>,
@@ -64,6 +68,7 @@ pub struct RecordingSink {
     pub issue_number: i64,
 }
 
+#[cfg(test)]
 impl RecordingSink {
     pub fn new(issue_url: impl Into<String>, issue_number: i64) -> Self {
         Self {
@@ -78,6 +83,7 @@ impl RecordingSink {
     }
 }
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl BugReportSink for RecordingSink {
     fn is_configured(&self) -> bool {

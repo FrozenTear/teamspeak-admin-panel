@@ -124,7 +124,7 @@ fn row(key: &str, value: &str) -> String {
 }
 
 fn escape_cell(s: &str) -> String {
-    s.replace('|', "\\|").replace('\n', " ").replace('\r', " ")
+    s.replace('|', "\\|").replace(['\n', '\r'], " ")
 }
 
 fn inline_code(s: &str) -> String {
