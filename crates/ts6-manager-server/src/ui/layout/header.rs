@@ -7,7 +7,7 @@
 //!    until the live `GET /api/servers` route lands
 //!  - websocket dot (stub status; wires to the real WS hub when it lands)
 //!  - theme toggle (live — flips `data-theme="dark"`/`"light"`)
-//!  - user menu (stub — initials avatar + display name; dropdown follows)
+//!  - user menu (initials + display name; Report bug)
 //!  - logout button (live)
 
 use dioxus::prelude::*;
@@ -16,8 +16,9 @@ use crate::client::auth as auth_client;
 use crate::client::dioxus::use_session;
 use crate::client::session::SessionHandle;
 use crate::client::store::AuthState;
+use crate::ui::components::dropdown::{Dropdown, Menu, MenuItem, MenuItemKind};
 use crate::ui::components::{
-    Button, ButtonSize, ButtonVariant, ServerSelector, ServerSelectorVariant,
+    Button, ButtonSize, ButtonVariant, ReportBugDialog, ServerSelector, ServerSelectorVariant,
 };
 use crate::ui::routes::Route;
 use crate::ui::theme::{Theme, use_theme};
@@ -32,6 +33,9 @@ pub fn Header() -> Element {
     let theme_ctx = use_theme();
 
     let mut logging_out = use_signal(|| false);
+    let user_menu_open = use_signal(|| false);
+    let user_menu_active: Signal<Option<String>> = use_signal(|| None::<String>);
+    let mut report_bug_open = use_signal(|| false);
 
     let user = match &*session.state.read() {
         AuthState::Authenticated { user, .. } => user.clone(),
@@ -110,10 +114,54 @@ pub fn Header() -> Element {
                 "{toggle_icon}"
             }
 
-            span { class: "user", role: "group", "aria-label": "Account",
-                span { class: "avatar", "aria-hidden": "true", "{initials_for(&user.display_name, &user.username)}" }
-                span { class: "name", "{user.display_name}" }
-                span { class: "chev", "aria-hidden": "true", "▾" }
+            div { class: "user-menu-anchor",
+                Dropdown {
+                    trigger_id: "user-menu-trigger".to_string(),
+                    menu_id: "user-menu".to_string(),
+                    open: user_menu_open,
+                    active_id: user_menu_active,
+                    trigger: rsx! {
+                        {
+                            let aria_expanded = if *user_menu_open.read() { "true" } else { "false" };
+                            let mut open_for_toggle = user_menu_open;
+                            let mut active_for_toggle = user_menu_active;
+                            rsx! {
+                                button {
+                                    class: "user",
+                                    r#type: "button",
+                                    id: "user-menu-trigger",
+                                    "aria-haspopup": "menu",
+                                    "aria-expanded": "{aria_expanded}",
+                                    "aria-controls": "user-menu",
+                                    "aria-label": "Account menu",
+                                    onclick: move |_| {
+                                        let next = !*open_for_toggle.read();
+                                        if next {
+                                            active_for_toggle.set(Some("user-menu-report-bug".into()));
+                                        }
+                                        open_for_toggle.set(next);
+                                    },
+                                    span { class: "avatar", "aria-hidden": "true", "{initials_for(&user.display_name, &user.username)}" }
+                                    span { class: "name", "{user.display_name}" }
+                                    span { class: "chev", "aria-hidden": "true", "▾" }
+                                }
+                            }
+                        }
+                    },
+                    Menu {
+                        id: "user-menu".to_string(),
+                        labelled_by: "user-menu-trigger".to_string(),
+                        active_id: user_menu_active.read().clone(),
+                        MenuItem {
+                            id: "user-menu-report-bug".to_string(),
+                            kind: MenuItemKind::Action,
+                            onselect: move |_| {
+                                report_bug_open.set(true);
+                            },
+                            span { class: "label", "Report bug" }
+                        }
+                    }
+                }
             }
 
             div { class: "logout-btn",
@@ -125,6 +173,8 @@ pub fn Header() -> Element {
                     "Logout"
                 }
             }
+
+            ReportBugDialog { open: report_bug_open }
         }
     }
 }
@@ -253,6 +303,8 @@ mod tests {
             data: Signal::new(ServersData::Loaded(Vec::new())),
             selected: Signal::new(None),
         });
+        // ReportBugDialog (closed) still calls `use_toaster` as a hook.
+        let _ = crate::ui::components::provide_toaster();
         rsx! { Header {} }
     }
 
@@ -295,6 +347,30 @@ mod tests {
         assert!(
             html.contains(r#"aria-label="WebSocket status: connected""#),
             "websocket indicator missing aria-label describing connection state: {html}"
+        );
+    }
+
+    #[test]
+    fn user_menu_trigger_is_a_menu_button() {
+        let html = render_header_harness();
+        assert!(
+            html.contains(r#"id="user-menu-trigger""#),
+            "user menu trigger id missing: {html}"
+        );
+        assert!(
+            html.contains(r#"aria-haspopup="menu""#),
+            "user menu trigger missing aria-haspopup: {html}"
+        );
+        assert!(
+            html.contains(r#"aria-label="Account menu""#),
+            "user menu trigger missing Account menu label: {html}"
+        );
+        // Menu is closed on first paint — Report bug is not in the DOM
+        // until the operator opens the overflow. The trigger is the
+        // discoverable affordance.
+        assert!(
+            !html.contains("Report bug"),
+            "closed user menu should not paint Report bug: {html}"
         );
     }
 }

@@ -300,6 +300,7 @@ async fn run_loop(
         let mut socket = match WebSocket::open(&url) {
             Ok(s) => s,
             Err(_) => {
+                crate::client::diagnostics::record_client_error("websocket open failed");
                 state.set(ConnectionState::Disconnected);
                 sleep_backoff(&mut backoff_ms).await;
                 continue;
@@ -330,10 +331,12 @@ async fn run_loop(
 
         match drive_socket(&mut socket, &mut cmd_rx, &mut subs).await {
             DriveExit::Unauthorized => {
+                crate::client::diagnostics::record_client_error("websocket unauthorized");
                 state.set(ConnectionState::Unauthorized);
                 return;
             }
             DriveExit::Reconnect => {
+                crate::client::diagnostics::record_client_error("websocket disconnected");
                 state.set(ConnectionState::Disconnected);
                 sleep_backoff(&mut backoff_ms).await;
             }
@@ -365,8 +368,8 @@ async fn drive_socket(
         futures::pin_mut!(inbound, cmd);
         match futures::future::select(inbound, cmd).await {
             Either::Left((res, _)) => match res {
-                Some(Ok(Message::Text(text))) => {
-                    if let Ok(env) = serde_json::from_str::<WsEvent>(&text) {
+                Some(Ok(Message::Text(text))) => match serde_json::from_str::<WsEvent>(&text) {
+                    Ok(env) => {
                         if env.id != 0 {
                             if let Some(st) = subs.get_mut(&env.topic) {
                                 st.last_event_id = Some(env.id);
@@ -379,7 +382,12 @@ async fn drive_socket(
                             }
                         }
                     }
-                }
+                    Err(e) => {
+                        crate::client::diagnostics::record_client_error(format!(
+                            "websocket frame parse error: {e}"
+                        ));
+                    }
+                },
                 Some(Ok(Message::Bytes(_))) => {}
                 Some(Err(_)) | None => return DriveExit::Reconnect,
             },
