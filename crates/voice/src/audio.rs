@@ -541,7 +541,7 @@ impl PlaybackMonitor {
                 self.underrun_events += 1;
                 let regime = if in_startup { "startup" } else { "midsong" };
                 let lateness_ms = lateness.as_millis() as u64;
-                crate::bug_report::record_frame_underrun(regime, index, lateness_ms, buffered);
+                crate::voice_bug_report::record_frame_underrun(regime, index, lateness_ms, buffered);
                 warn!(
                     target: "music_bot_latency",
                     stage = "frame_underrun",
@@ -1027,7 +1027,7 @@ fn spawn_sibling(
                         let bytes = match encoder.encode_frame(&samples) {
                             Ok(b) => b,
                             Err(e) => {
-                                crate::bug_report::record_encode_error(&e);
+                                crate::voice_bug_report::record_encode_error(&e);
                                 warn!(
                                     error = %e,
                                     frame_index = f.index,

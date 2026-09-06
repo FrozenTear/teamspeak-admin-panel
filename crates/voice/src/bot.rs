@@ -223,7 +223,7 @@ pub(crate) async fn run_bot(
                                 connection = None;
                             }
                             ConnectedExit::Dropped(reason) => {
-                                crate::bug_report::record_handshake_drop(&reason);
+                                crate::voice_bug_report::record_handshake_drop(&reason);
                                 warn!(%reason, "connection dropped — auto-reconnect");
                                 drop(con_after);
                                 let _ = events.send(BotEvent::Disconnected {
@@ -249,7 +249,7 @@ pub(crate) async fn run_bot(
                         }
                     }
                     Err(err) => {
-                        crate::bug_report::record_handshake_drop(format!("{err:#}"));
+                        crate::voice_bug_report::record_handshake_drop(format!("{err:#}"));
                         error!(?err, "handshake failed");
                         let _ =
                             events.send(BotEvent::Error(BotError::Connection(format!("{err:#}"))));
@@ -325,7 +325,7 @@ fn log_loop_stall(arm: &'static str, arm_start: Instant, detail: impl FnOnce() -
     if elapsed >= LOOP_STALL_WARN {
         let elapsed_ms = elapsed.as_millis() as u64;
         let detail = detail();
-        crate::bug_report::record_connected_loop_stall(arm, elapsed_ms, &detail);
+        crate::voice_bug_report::record_connected_loop_stall(arm, elapsed_ms, &detail);
         warn!(
             target: "music_bot_latency",
             stage = "connected_loop_stall",
@@ -739,7 +739,7 @@ async fn run_wire_task(
                         // `!play` → first-audio latency breakdown.
                         if p.frames_sent == 1 {
                             let elapsed_ms = p.started_at.elapsed().as_millis() as u64;
-                            crate::bug_report::record_first_frame_on_wire(elapsed_ms);
+                            crate::voice_bug_report::record_first_frame_on_wire(elapsed_ms);
                             info!(
                                 target: "music_bot_latency",
                                 stage = "first_frame_on_wire",
@@ -768,7 +768,7 @@ async fn run_wire_task(
                             &mut p.send_monitor,
                             false,
                         ) {
-                            crate::bug_report::record_send_audio_error(&err);
+                            crate::voice_bug_report::record_send_audio_error(&err);
                             error!(?err, "send_audio failed on the wire task");
                             let epoch = p.epoch;
                             play = None;
@@ -1007,7 +1007,7 @@ async fn run_split_connected_loop(
                 }
                 Some(WireEvent::SendFailed { error, epoch }) => {
                     if epoch == audio_epoch {
-                        crate::bug_report::record_send_audio_error(&error);
+                        crate::voice_bug_report::record_send_audio_error(&error);
                         error!(error, "send_audio failed — tearing down pipeline");
                         audio::tear_down(&mut current_audio);
                         // PURA-261 — `failed: ` prefix so `LivenessTracker`
@@ -1140,7 +1140,7 @@ async fn handle_audio_msg(
                 // breakdown started by the `music_bot_latency` stage logs.
                 if active.frames_sent == 1 {
                     let elapsed_ms = active.started_at.elapsed().as_millis() as u64;
-                    crate::bug_report::record_first_frame_on_wire(elapsed_ms);
+                    crate::voice_bug_report::record_first_frame_on_wire(elapsed_ms);
                     info!(
                         target: "music_bot_latency",
                         stage = "first_frame_on_wire",
@@ -1172,7 +1172,7 @@ async fn handle_audio_msg(
                 Ok(())
             };
             if let Err(err) = send_result {
-                crate::bug_report::record_send_audio_error(&err);
+                crate::voice_bug_report::record_send_audio_error(&err);
                 error!(?err, "send_audio failed — tearing down pipeline");
                 audio::tear_down(current_audio);
                 wire.clear_audio();

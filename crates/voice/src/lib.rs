@@ -12,7 +12,7 @@
 mod audio;
 mod backoff;
 mod bot;
-mod bug_report;
+mod voice_bug_report;
 mod chat;
 mod command;
 mod config;
@@ -40,7 +40,7 @@ pub use supervisor::{BotHandle, BotInfo, BotSupervisor, SendError, spawn_bot};
 /// report (or on a panic / error path that posts to the same sink). Keys
 /// are camelCase strings; Music Bot's `musicBotLatency` / `logTail` are
 /// left untouched.
-pub use bug_report::{
+pub use voice_bug_report::{
     KEY_CONNECTED_LOOP_STALL, KEY_ENCODE_ERROR, KEY_FIRST_FRAME_ON_WIRE_MS, KEY_FRAME_UNDERRUN,
     KEY_HANDSHAKE_DROPPED, KEY_SEND_AUDIO_ERROR, KEY_VOICE_LOG_TAIL, KEY_VOICE_STATE,
     acquire_test_lock, bug_report_context, merge_voice_bug_context, reset_for_tests,
