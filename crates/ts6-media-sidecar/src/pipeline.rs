@@ -78,6 +78,9 @@ pub struct PipelineConfig {
     /// [`QualityPreset::DEFAULT`] (= `720p`) when callers don't set
     /// one explicitly.
     pub preset: QualityPreset,
+    /// Optional last-event bag. `None` for CLI/test pipelines that don't
+    /// sit behind the control-plane diagnostics endpoint.
+    pub diagnostics: Option<std::sync::Arc<crate::diagnostics::Diagnostics>>,
 }
 
 /// What FFmpeg should read from.
@@ -174,6 +177,7 @@ impl PipelineConfig {
             source,
             ffmpeg_path: PathBuf::from("ffmpeg"),
             preset: QualityPreset::DEFAULT,
+            diagnostics: None,
         }
     }
 
@@ -184,6 +188,14 @@ impl PipelineConfig {
 
     pub fn with_preset(mut self, preset: QualityPreset) -> Self {
         self.preset = preset;
+        self
+    }
+
+    pub fn with_diagnostics(
+        mut self,
+        diagnostics: std::sync::Arc<crate::diagnostics::Diagnostics>,
+    ) -> Self {
+        self.diagnostics = Some(diagnostics);
         self
     }
 }
@@ -406,6 +418,7 @@ struct SupervisorState {
     args_input: PipelineConfig,
     backoff: Duration,
     stop_requested: bool,
+    diagnostics: Option<Arc<crate::diagnostics::Diagnostics>>,
 }
 
 impl SupervisorState {
@@ -414,6 +427,7 @@ impl SupervisorState {
             role,
             name: config.name.clone(),
             ffmpeg_path: config.ffmpeg_path.clone(),
+            diagnostics: config.diagnostics.clone(),
             args_input: config,
             backoff: FFMPEG_RESTART_MIN,
             stop_requested: false,
@@ -442,8 +456,16 @@ impl SupervisorState {
                 .kill_on_drop(true)
                 .spawn();
             match spawn {
-                Ok(child) => return Some(child),
+                Ok(child) => {
+                    if let Some(d) = &self.diagnostics {
+                        d.record_ffmpeg_spawn(self.role, true, None);
+                    }
+                    return Some(child);
+                }
                 Err(err) => {
+                    if let Some(d) = &self.diagnostics {
+                        d.record_ffmpeg_spawn(self.role, false, Some(&err.kind().to_string()));
+                    }
                     warn!(broadcast = %self.name, role = self.role, %err, "ffmpeg spawn failed; backing off");
                     if wait_or_stop(self.backoff, stop_rx).await {
                         self.stop_requested = true;
@@ -490,12 +512,21 @@ impl SupervisorState {
     ) {
         let _ = child.kill().await;
         let exit = child.wait().await.ok();
+        if let (Some(d), Some(status)) = (&self.diagnostics, exit) {
+            d.record_ffmpeg_exit(self.role, status.code(), exit_signal(&status));
+        }
         match mux_result {
             Ok(()) => {
                 self.backoff = FFMPEG_RESTART_MIN;
                 info!(broadcast = %self.name, role = self.role, ?exit, "ffmpeg finished; restarting");
             }
             Err(err) => {
+                if let Some(d) = &self.diagnostics {
+                    d.record_moq_error(
+                        "pipeline_mux",
+                        &crate::diagnostics::redact_for_issue(&err.to_string()),
+                    );
+                }
                 warn!(broadcast = %self.name, role = self.role, ?exit, %err, "ffmpeg/mux failed; restarting with backoff");
             }
         }
@@ -535,6 +566,19 @@ async fn wait_or_stop(dur: Duration, stop_rx: &mut oneshot::Receiver<()>) -> boo
 
 fn next_backoff(d: Duration) -> Duration {
     (d * 2).min(FFMPEG_RESTART_MAX)
+}
+
+fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        None
+    }
 }
 
 // -----------------------------------------------------------------------
