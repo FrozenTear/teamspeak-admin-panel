@@ -98,6 +98,26 @@ pub struct LibraryEntry {
 /// same string.
 pub const RADIO_TAG: &str = "radio";
 
+/// Suggested `POST /api/bug-reports` `context` key for recent Music Bot
+/// resolve / retry / fallback stages. Not enforced by the API validator
+/// (API PR #28); Music Bot fills it when the key is absent.
+pub const BUG_REPORT_CONTEXT_KEY_MUSIC_BOT_LATENCY: &str = "musicBotLatency";
+
+/// Suggested `POST /api/bug-reports` `context` key for a short
+/// `music_bot_latency` log tail. Same pairing as
+/// [`BUG_REPORT_CONTEXT_KEY_MUSIC_BOT_LATENCY`].
+pub const BUG_REPORT_CONTEXT_KEY_LOG_TAIL: &str = "logTail";
+
+/// Snapshot Panel can `GET /api/music-bots/bug-report-context` and put
+/// into `POST /api/bug-reports` `context`. Values are already-capped
+/// strings (well under the 4k-per-value shared cap).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MusicBotBugReportContext {
+    pub music_bot_latency: String,
+    pub log_tail: String,
+}
+
 /// `POST /music-bots` body. `identityPath` defaults to
 /// `<config-dir>/bot-{id}.identity` server-side when omitted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -570,6 +590,30 @@ mod tests {
         // Wire constant — flip this and you break every existing FE / chat
         // bridge that filters by the marker.
         assert_eq!(RADIO_TAG, "radio");
+    }
+
+    #[test]
+    fn bug_report_context_keys_and_wire_are_camel_case() {
+        assert_eq!(BUG_REPORT_CONTEXT_KEY_MUSIC_BOT_LATENCY, "musicBotLatency");
+        assert_eq!(BUG_REPORT_CONTEXT_KEY_LOG_TAIL, "logTail");
+
+        let snap = MusicBotBugReportContext {
+            music_bot_latency: "resolver_resolved elapsed_ms=20 retry=0".into(),
+            log_tail: "music_bot_latency stage=resolver_resolved".into(),
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(json.contains("\"musicBotLatency\""), "got: {json}");
+        assert!(json.contains("\"logTail\""), "got: {json}");
+        assert!(
+            !json.contains("\"music_bot_latency\""),
+            "leaked snake_case key: {json}"
+        );
+        assert!(
+            !json.contains("\"log_tail\""),
+            "leaked snake_case key: {json}"
+        );
+        let back: MusicBotBugReportContext = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, snap);
     }
 
     #[test]

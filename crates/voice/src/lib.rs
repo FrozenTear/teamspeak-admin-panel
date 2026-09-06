@@ -38,3 +38,9 @@ pub use supervisor::{BotHandle, BotInfo, BotSupervisor, SendError, spawn_bot};
 /// Re-exported from `music-bot-audio` so the server crate can warm the
 /// resolver without taking a direct dependency on the audio crate.
 pub use music_bot_audio::resolver::warm_up as warm_resolver;
+
+/// In-process Music Bot latency / log ring for operator bug-report
+/// `context` (`musicBotLatency`, `logTail`). Re-exported so the panel
+/// server can install the tracing layer and snapshot without taking a
+/// direct `music-bot-audio` dependency.
+pub use music_bot_audio::bug_report;
