@@ -184,21 +184,21 @@ where
         let mut grab = FieldGrab::default();
         event.record(&mut grab);
 
-        if target == "music_bot_latency" {
-            if let Some(stage) = grab.stage.clone() {
-                let retry = grab.retry || stage_implies_retry(&stage);
-                let elapsed_ms = grab.elapsed_ms;
-                let line = format_event_line(target, &grab);
-                self.ring.record_stage(
-                    LatencyStage {
-                        stage,
-                        elapsed_ms,
-                        retry,
-                    },
-                    line,
-                );
-                return;
-            }
+        if target == "music_bot_latency"
+            && let Some(stage) = grab.stage.clone()
+        {
+            let retry = grab.retry || stage_implies_retry(&stage);
+            let elapsed_ms = grab.elapsed_ms;
+            let line = format_event_line(target, &grab);
+            self.ring.record_stage(
+                LatencyStage {
+                    stage,
+                    elapsed_ms,
+                    retry,
+                },
+                line,
+            );
+            return;
         }
         self.ring.record_line(format_event_line(target, &grab));
     }
@@ -256,10 +256,10 @@ impl FieldGrab {
             "stage" => self.stage = Some(value),
             "message" => self.message = Some(value),
             "elapsed_ms" | "phase_ms" | "lateness_ms" => {
-                if self.elapsed_ms.is_none() {
-                    if let Ok(ms) = value.parse::<u64>() {
-                        self.elapsed_ms = Some(ms);
-                    }
+                if self.elapsed_ms.is_none()
+                    && let Ok(ms) = value.parse::<u64>()
+                {
+                    self.elapsed_ms = Some(ms);
                 }
             }
             "retry" | "retrying" => {
@@ -421,9 +421,7 @@ fn redact_query_secrets(tok: &str) -> String {
                 continue;
             }
             let rest = &out[start..];
-            let end = rest
-                .find(|c: char| matches!(c, '&' | '?' | '#' | '"'))
-                .unwrap_or(rest.len());
+            let end = rest.find(['&', '?', '#', '"']).unwrap_or(rest.len());
             out.replace_range(start..start + end, "[redacted]");
         }
     }
