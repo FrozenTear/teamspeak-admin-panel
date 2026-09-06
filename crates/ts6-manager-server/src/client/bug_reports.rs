@@ -1,29 +1,27 @@
 //! Typed client for `POST /api/bug-reports`.
 //!
-//! Wire shape is locked by API PR #28 (`ts6_manager_shared::bug_reports`).
-//! Types live in this module so the Panel compiles before that PR merges;
-//! field names and optionality match the shared DTO byte-for-byte.
+//! Confirmed camelCase body (API PR #28):
 //!
 //! ```text
 //! POST /api/bug-reports   RequireAuth
-//! { pagePath, serverId?, note?, toasts[]?, wsErrors[]?, release?, context? }
+//! { pagePath, serverId?, note?, toasts[], wsErrors[], release? }
 //! → 201 { issueUrl, issueNumber }
 //! ```
 //!
-//! `toasts` / `wsErrors` are plain strings. `context` is an optional
-//! string→JSON map reserved for Music / Voice / Sidecar — Panel omits it.
-//! 404 / 501 stay tolerated until the route lands; 503 is the configured-
-//! but-token-unset sink.
+//! `toasts` and `wsErrors` are always plain string arrays (never objects).
+//! Types live in this module so the Panel compiles before the shared DTO
+//! crate lands. 404 / 501 stay tolerated until the route merges; 503 is
+//! the configured-but-token-unset sink.
 
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
 
 use crate::client::api::{self, ApiError};
 use crate::client::session::RefreshGate;
 
 /// Caps from the shared DTO so we truncate before POST.
+const MAX_PAGE_PATH_LEN: usize = 512;
 const MAX_NOTE_LEN: usize = 4096;
 const MAX_LIST_ITEMS: usize = 20;
 const MAX_LIST_ITEM_LEN: usize = 500;
@@ -38,15 +36,12 @@ pub struct BugReportRequest {
     pub server_id: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub toasts: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ws_errors: Option<Vec<String>>,
+    #[serde(default)]
+    pub toasts: Vec<String>,
+    #[serde(default)]
+    pub ws_errors: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release: Option<String>,
-    /// Seat-context bag. Panel leaves this unset; other seats fill it later.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context: Option<Map<String, Value>>,
 }
 
 /// `POST /api/bug-reports` 201 body.
@@ -102,19 +97,27 @@ pub fn build_request(
     server_id: Option<i64>,
 ) -> BugReportRequest {
     BugReportRequest {
-        page_path: page_path.into(),
+        page_path: cap_page_path(page_path),
         server_id,
         note: nonempty_truncated(note.into(), MAX_NOTE_LEN),
-        toasts: nonempty_list(crate::client::diagnostics::toast_messages()),
-        ws_errors: nonempty_list(crate::client::diagnostics::ws_error_messages()),
+        toasts: cap_list(crate::client::diagnostics::toast_messages()),
+        ws_errors: cap_list(crate::client::diagnostics::ws_error_messages()),
         release: release(),
-        context: None,
     }
 }
 
-/// Panel version stamped as `release` when the crate version is set.
+/// Panel version stamped as `release` (e.g. `v0.0.1`).
 pub fn release() -> Option<String> {
-    nonempty_truncated(env!("CARGO_PKG_VERSION"), MAX_RELEASE_LEN)
+    let raw = env!("CARGO_PKG_VERSION").trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let tagged = if raw.starts_with('v') {
+        raw.to_string()
+    } else {
+        format!("v{raw}")
+    };
+    Some(truncate_chars(&tagged, MAX_RELEASE_LEN))
 }
 
 /// SPA path used as `pagePath`. Prefers the live location (so query
@@ -143,6 +146,15 @@ pub fn page_path_from_location(fallback: &str) -> String {
     }
 }
 
+fn cap_page_path(raw: impl Into<String>) -> String {
+    let raw = raw.into();
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return "/".to_string();
+    }
+    truncate_chars(trimmed, MAX_PAGE_PATH_LEN)
+}
+
 fn nonempty_truncated(raw: impl AsRef<str>, max: usize) -> Option<String> {
     let trimmed = raw.as_ref().trim();
     if trimmed.is_empty() {
@@ -151,17 +163,12 @@ fn nonempty_truncated(raw: impl AsRef<str>, max: usize) -> Option<String> {
     Some(truncate_chars(trimmed, max))
 }
 
-fn nonempty_list(items: Vec<String>) -> Option<Vec<String>> {
-    let capped: Vec<String> = items
+fn cap_list(items: Vec<String>) -> Vec<String> {
+    items
         .into_iter()
         .filter_map(|item| nonempty_truncated(item, MAX_LIST_ITEM_LEN))
         .take(MAX_LIST_ITEMS)
-        .collect();
-    if capped.is_empty() {
-        None
-    } else {
-        Some(capped)
-    }
+        .collect()
 }
 
 fn truncate_chars(s: &str, max: usize) -> String {
@@ -182,10 +189,9 @@ mod tests {
             page_path: "/clients".into(),
             server_id: Some(1),
             note: Some("clients table stuck".into()),
-            toasts: Some(vec!["Kick failed".into()]),
-            ws_errors: Some(vec!["websocket disconnected".into()]),
-            release: Some("0.0.1".into()),
-            context: None,
+            toasts: vec!["Kick failed".into()],
+            ws_errors: vec!["websocket disconnected".into()],
+            release: Some("v1.6.9".into()),
         };
         let json = serde_json::to_value(&req).expect("serialize");
         assert_eq!(json["pagePath"], "/clients");
@@ -196,7 +202,7 @@ mod tests {
             json["wsErrors"],
             serde_json::json!(["websocket disconnected"])
         );
-        assert_eq!(json["release"], "0.0.1");
+        assert_eq!(json["release"], "v1.6.9");
         assert!(json.get("context").is_none());
         assert!(json.get("serverName").is_none());
         assert!(json.get("userAgent").is_none());
@@ -208,16 +214,16 @@ mod tests {
     }
 
     #[test]
-    fn request_omits_optional_fields_when_empty() {
+    fn request_always_sends_string_arrays_and_omits_empty_optionals() {
         let req = BugReportRequest {
             page_path: "/dashboard".into(),
             ..Default::default()
         };
         let json = serde_json::to_value(&req).expect("serialize");
         assert_eq!(json["pagePath"], "/dashboard");
-        for key in [
-            "serverId", "note", "toasts", "wsErrors", "release", "context",
-        ] {
+        assert_eq!(json["toasts"], serde_json::json!([]));
+        assert_eq!(json["wsErrors"], serde_json::json!([]));
+        for key in ["serverId", "note", "release", "context"] {
             assert!(
                 json.get(key).is_none(),
                 "expected {key} omitted, got {json}"
@@ -280,32 +286,40 @@ mod tests {
         assert_eq!(req.page_path, "/clients");
         assert_eq!(req.server_id, Some(7));
         assert_eq!(req.note.as_deref(), Some("note"));
-        assert_eq!(
-            req.toasts.as_deref(),
-            Some([String::from("saved")].as_slice())
-        );
-        assert_eq!(
-            req.ws_errors.as_deref(),
-            Some([String::from("websocket disconnected")].as_slice())
-        );
-        assert_eq!(req.release.as_deref(), Some(env!("CARGO_PKG_VERSION")));
-        assert!(req.context.is_none());
+        assert_eq!(req.toasts, vec![String::from("saved")]);
+        assert_eq!(req.ws_errors, vec![String::from("websocket disconnected")]);
+        let expected_release = format!("v{}", env!("CARGO_PKG_VERSION"));
+        assert_eq!(req.release.as_deref(), Some(expected_release.as_str()));
     }
 
     #[test]
-    fn build_request_omits_blank_note() {
+    fn build_request_omits_blank_note_and_sends_empty_arrays() {
         diagnostics::reset_for_tests();
         let req = build_request("   ", "/logs", None);
         assert!(req.note.is_none());
         assert!(req.server_id.is_none());
-        assert!(req.toasts.is_none());
-        assert!(req.ws_errors.is_none());
+        assert!(req.toasts.is_empty());
+        assert!(req.ws_errors.is_empty());
     }
 
     #[test]
-    fn release_is_crate_semver() {
+    fn build_request_trims_and_caps_page_path() {
+        diagnostics::reset_for_tests();
+        let req = build_request("", "  /clients?tab=bans  ", None);
+        assert_eq!(req.page_path, "/clients?tab=bans");
+
+        let too_long = format!("/{}", "x".repeat(MAX_PAGE_PATH_LEN + 8));
+        let req = build_request("", too_long, None);
+        assert_eq!(req.page_path.chars().count(), MAX_PAGE_PATH_LEN);
+
+        let req = build_request("", "   ", None);
+        assert_eq!(req.page_path, "/");
+    }
+
+    #[test]
+    fn release_is_v_prefixed_crate_semver() {
         let v = release().expect("CARGO_PKG_VERSION is set");
-        assert!(!v.is_empty());
-        assert!(v.chars().next().unwrap().is_ascii_digit());
+        assert!(v.starts_with('v'), "expected v-prefix, got {v}");
+        assert!(v.as_bytes().get(1).is_some_and(|c| c.is_ascii_digit()));
     }
 }
