@@ -28,8 +28,16 @@ pub fn router() -> Router<AppState> {
 async fn create_bug_report(
     RequireAuth(user): RequireAuth,
     State(state): State<AppState>,
-    Json(body): Json<CreateBugReportRequest>,
+    Json(mut body): Json<CreateBugReportRequest>,
 ) -> Response {
+    // Voice seat bag — last-known wire marks + short in-process tail.
+    // Does not overwrite Panel / Music Bot keys already on `context`.
+    let dest = body.context.get_or_insert_with(Default::default);
+    music_bot::merge_voice_bug_context(dest);
+    if dest.is_empty() {
+        body.context = None;
+    }
+
     let report = match body.validate() {
         Ok(v) => v,
         Err(msg) => return err(StatusCode::BAD_REQUEST, msg),
@@ -285,5 +293,47 @@ mod tests {
         assert!(drafts[0].body.contains("v1.6.9"));
         assert!(drafts[0].body.contains("musicBotLatency"));
         assert!(drafts[0].body.contains("resolve=20s retry=1"));
+    }
+
+    #[tokio::test]
+    async fn voice_context_is_merged_into_the_issue_without_clobbering_music_bot() {
+        {
+            let _voice = music_bot::acquire_test_lock();
+            music_bot::seed_for_tests();
+        }
+        let mut state = fresh_state().await;
+        let recorder = RecordingSink::new(
+            "https://github.com/FrozenTear/teamspeak-admin-panel/issues/101",
+            101,
+        );
+        let recorded = recorder.issues.clone();
+        state.bug_reports = recorder.handle();
+
+        let uid = seed_user(&state, "viewer5", "viewer").await;
+        let token = mint_token(&state, uid, "viewer5", "viewer");
+        let resp = post_report(app(state), Some(&token), &sample_body()).await;
+        {
+            let _voice = music_bot::acquire_test_lock();
+            music_bot::reset_for_tests();
+        }
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let drafts = recorded.lock().unwrap();
+        assert_eq!(drafts.len(), 1);
+        let body = &drafts[0].body;
+        // Music Bot keys from the Panel body survive.
+        assert!(body.contains("**musicBotLatency**"));
+        assert!(body.contains("resolve=20s retry=1"));
+        // Voice seat keys (camelCase) land in ### Context.
+        assert!(body.contains("**firstFrameOnWireMs**"));
+        assert!(body.contains("1842"));
+        assert!(body.contains("**handshakeDropped**"));
+        assert!(body.contains("**connectedLoopStall**"));
+        assert!(body.contains("**frameUnderrun**"));
+        assert!(body.contains("**voiceState**"));
+        assert!(body.contains("**voiceLogTail**"));
+        assert!(body.contains("first_frame_on_wire elapsed_ms=1842"));
+        // Seat-scoped tail — do not steal Music Bot's `logTail` key.
+        assert!(!body.contains("**logTail**"));
     }
 }
