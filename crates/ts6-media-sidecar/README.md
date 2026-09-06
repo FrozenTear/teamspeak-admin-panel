@@ -68,6 +68,7 @@ The sidecar serves an axum HTTP surface on `--http-listen` (default
 | ------ | -------------------------- | ---------------------------------------------------------------------------------------------------- |
 | GET    | `/health`                  | Cheap liveness probe. JSON: `{ status, uptime_s, sessions, broadcasts }`.                            |
 | GET    | `/stats`                   | Process + per-source counters. JSON: `{ uptime_s, active_sessions, lifetime_sessions, registered_broadcasts, sources[] }`. |
+| GET    | `/diagnostics`             | Bug-report bag (in-process only). JSON camelCase keys: `sidecarFfmpegExit`, `sidecarSsrfReject`, `sidecarMoqError`, `sidecarHealth`, `sidecarLogTail`. No secrets / no blocked IPs / no credentialed URLs. |
 | GET    | `/certificate.sha256`      | `text/plain` SHA-256 hex digest of the cert (matches `serverCertificateHashes` in WS-0).             |
 | POST   | `/source`                  | **WS-3** — start a pipeline for the given source URL. SSRF-checked. Returns `201` + `{ source_id, track }`. |
 | POST   | `/source/stop`             | **WS-3** — stop a pipeline by id. Returns `204` on success, `404` if the id is unknown.              |
@@ -80,6 +81,7 @@ All other routes return `404`.
 ```sh
 curl -sf http://127.0.0.1:7080/health   | jq .
 curl -sf http://127.0.0.1:7080/stats    | jq .
+curl -sf http://127.0.0.1:7080/diagnostics | jq .
 curl -sf http://127.0.0.1:7080/certificate.sha256
 ```
 

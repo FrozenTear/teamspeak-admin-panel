@@ -10,6 +10,7 @@
 //! is WS-5. The pinning rationale lives in ADR-0007.
 
 pub mod control;
+pub mod diagnostics;
 pub mod healthcheck;
 pub mod http;
 pub mod http_pin;
@@ -30,6 +31,7 @@ use tokio::task::JoinHandle;
 use ts6_ssrf::Resolver;
 
 pub use crate::control::PipelineRegistry;
+pub use crate::diagnostics::{Diagnostics, DiagnosticsSnapshot};
 pub use crate::http::HttpServer;
 pub use crate::http_pin::{PinProxy, PinRegistry, PinnedTarget as PinProxyTarget};
 pub use crate::origin::SidecarOrigin;
@@ -79,6 +81,9 @@ pub struct Sidecar {
     /// fetches. Bound on `127.0.0.1:0` (loopback only). Tests can inspect
     /// `pin_proxy.local_addr` + `pin_proxy.registry` directly.
     pub pin_proxy: Arc<PinProxy>,
+    /// In-process last-event bag exposed on `GET /diagnostics` for
+    /// manager bug-report `context` fold-in.
+    pub diagnostics: Arc<Diagnostics>,
     transport_task: JoinHandle<anyhow::Result<()>>,
     http_task: JoinHandle<anyhow::Result<()>>,
 }
@@ -90,11 +95,17 @@ impl Sidecar {
     pub async fn start(config: SidecarConfig) -> anyhow::Result<Self> {
         let started_at = Instant::now();
         let stats = Arc::new(SidecarStats::new(started_at));
+        let diagnostics = Arc::new(Diagnostics::new());
         let origin = Arc::new(SidecarOrigin::new());
         let registry = PipelineRegistry::new();
 
-        let transport = transport::Transport::bind(config.transport, origin.clone(), stats.clone())
-            .context("bind QUIC/WebTransport listener")?;
+        let transport = transport::Transport::bind(
+            config.transport,
+            origin.clone(),
+            stats.clone(),
+            diagnostics.clone(),
+        )
+        .context("bind QUIC/WebTransport listener")?;
         let transport_addr = transport.local_addr()?;
         let fingerprint = transport
             .primary_fingerprint()
@@ -117,6 +128,7 @@ impl Sidecar {
             registry.clone(),
             config.ffmpeg_path,
             pin_proxy.clone(),
+            diagnostics.clone(),
         )
         .await
         .context("bind control-plane HTTP listener")?;
@@ -132,6 +144,7 @@ impl Sidecar {
             origin,
             registry,
             pin_proxy,
+            diagnostics,
             transport_task,
             http_task,
         })

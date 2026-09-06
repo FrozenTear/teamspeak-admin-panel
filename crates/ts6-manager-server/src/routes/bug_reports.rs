@@ -30,10 +30,11 @@ async fn create_bug_report(
     State(state): State<AppState>,
     Json(mut body): Json<CreateBugReportRequest>,
 ) -> Response {
-    // Voice seat bag — last-known wire marks + short in-process tail.
-    // Does not overwrite Panel / Music Bot keys already on `context`.
+    // Voice + Sidecar seat bags — merge before validate so #28 caps apply.
+    // Neither overwrites Panel / Music Bot keys (or each other) already set.
     let dest = body.context.get_or_insert_with(Default::default);
     music_bot::merge_voice_bug_context(dest);
+    crate::bug_reports::fold_sidecar_context(state.sidecar.as_ref(), dest).await;
     if dest.is_empty() {
         body.context = None;
     }
@@ -293,6 +294,38 @@ mod tests {
         assert!(drafts[0].body.contains("v1.6.9"));
         assert!(drafts[0].body.contains("musicBotLatency"));
         assert!(drafts[0].body.contains("resolve=20s retry=1"));
+        assert!(drafts[0].body.contains("sidecarStatus"));
+        assert!(drafts[0].body.contains("unconfigured"));
+    }
+
+    #[tokio::test]
+    async fn folds_sidecar_diagnostics_into_context() {
+        let base = crate::control::sidecar::boot_mock_sidecar().await;
+        let mut state = fresh_state().await;
+        state.sidecar = Some(crate::control::sidecar::SidecarClient::new(base));
+        let recorder = RecordingSink::new(
+            "https://github.com/FrozenTear/teamspeak-admin-panel/issues/100",
+            100,
+        );
+        let recorded = recorder.issues.clone();
+        state.bug_reports = recorder.handle();
+
+        let uid = seed_user(&state, "viewer5", "viewer").await;
+        let token = mint_token(&state, uid, "viewer5", "viewer");
+        let resp = post_report(app(state), Some(&token), &sample_body()).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let drafts = recorded.lock().unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert!(drafts[0].body.contains("musicBotLatency"));
+        assert!(drafts[0].body.contains("sidecarFfmpegExit"));
+        assert!(drafts[0].body.contains("exit role=video code=1"));
+        assert!(drafts[0].body.contains("sidecarSsrfReject"));
+        assert!(drafts[0].body.contains("class=loopback"));
+        assert!(!drafts[0].body.contains("127.0.0.1"));
+        assert!(!drafts[0].body.contains("10.0.0"));
+        assert!(drafts[0].body.contains("sidecarHealth"));
+        assert!(drafts[0].body.contains("sidecarLogTail"));
     }
 
     #[tokio::test]

@@ -7,6 +7,7 @@
 //! - `POST /source/stop`   → tear it down.
 //! - `GET  /stats`         → snapshot of every pipeline's frames/bytes/
 //!   ffmpeg_alive counters.
+//! - `GET  /diagnostics`   → in-process bug-report bag (`sidecar*` keys).
 //! - `GET  /health`        → liveness probe.
 //!
 //! The sidecar is reachable on the operator's private network — the
@@ -125,6 +126,22 @@ pub struct HealthResponse {
     pub sessions: u64,
     #[serde(default)]
     pub broadcasts: usize,
+}
+
+/// `GET /diagnostics` body. Keys match PR #28 `context` prefixes.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticsResponse {
+    #[serde(default)]
+    pub sidecar_ffmpeg_exit: Option<String>,
+    #[serde(default)]
+    pub sidecar_ssrf_reject: Option<String>,
+    #[serde(default)]
+    pub sidecar_moq_error: Option<String>,
+    #[serde(default)]
+    pub sidecar_health: Option<String>,
+    #[serde(default)]
+    pub sidecar_log_tail: Option<String>,
 }
 
 /// Presets the FE and sidecar both understand. The sidecar's
@@ -268,6 +285,39 @@ impl SidecarClient {
         serde_json::from_slice(&bytes)
             .map_err(|e| SidecarClientError::Malformed(format!("get_health: {e}")))
     }
+
+    /// Read-only bug-report bag. Short per-request timeout so a hung
+    /// sidecar cannot stall `POST /api/bug-reports`.
+    pub async fn get_diagnostics(&self) -> SidecarResult<DiagnosticsResponse> {
+        let url = format!("{}/diagnostics", self.base_url);
+        let resp = self
+            .http
+            .get(&url)
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+            .map_err(|e| SidecarClientError::Transport(e.to_string()))?;
+        let status = resp.status();
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| SidecarClientError::Transport(e.to_string()))?;
+        if !status.is_success() {
+            return Err(SidecarClientError::Upstream {
+                status,
+                body: String::from_utf8_lossy(&bytes).into_owned(),
+            });
+        }
+        serde_json::from_slice(&bytes)
+            .map_err(|e| SidecarClientError::Malformed(format!("get_diagnostics: {e}")))
+    }
+}
+
+/// Test helper: loopback mock that speaks `/source`, `/stats`, `/health`,
+/// `/diagnostics`. Used by this module's tests and the bug-report fold-in.
+#[cfg(test)]
+pub(crate) async fn boot_mock_sidecar() -> String {
+    tests::boot_mock_sidecar().await.0
 }
 
 #[cfg(test)]
@@ -286,13 +336,13 @@ mod tests {
     use tokio::net::TcpListener;
 
     #[derive(Clone, Default)]
-    struct MockState {
+    pub(super) struct MockState {
         start_calls: Arc<Mutex<Vec<serde_json::Value>>>,
         stop_calls: Arc<Mutex<Vec<serde_json::Value>>>,
         stop_known: Arc<Mutex<bool>>,
     }
 
-    async fn boot_mock_sidecar() -> (String, MockState) {
+    pub(super) async fn boot_mock_sidecar() -> (String, MockState) {
         let state = MockState {
             stop_known: Arc::new(Mutex::new(true)),
             ..Default::default()
@@ -301,6 +351,7 @@ mod tests {
             .route("/source", post(handle_start))
             .route("/source/stop", post(handle_stop))
             .route("/stats", get(handle_stats))
+            .route("/diagnostics", get(handle_diagnostics))
             .route("/health", get(handle_health))
             .with_state(state.clone());
         let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
@@ -362,6 +413,15 @@ mod tests {
         Json(json!({"status": "ok", "uptime_s": 12, "sessions": 0, "broadcasts": 1}))
     }
 
+    async fn handle_diagnostics(State(_): State<MockState>) -> Json<serde_json::Value> {
+        Json(json!({
+            "sidecarFfmpegExit": "exit role=video code=1 signal=none ago_s=3",
+            "sidecarSsrfReject": "reason=ip_not_allowed class=loopback ago_s=9",
+            "sidecarHealth": "degraded ffmpeg_dead=1 sources=1 sessions=0",
+            "sidecarLogTail": "t+1s ssrf_reject reason=ip_not_allowed class=loopback"
+        }))
+    }
+
     #[tokio::test]
     async fn start_source_round_trip() {
         let (base, mock) = boot_mock_sidecar().await;
@@ -402,6 +462,22 @@ mod tests {
         assert_eq!(stats.sources.len(), 1);
         assert_eq!(stats.sources[0].source_id, "src-42");
         assert!(stats.sources[0].video.ffmpeg_alive);
+    }
+
+    #[tokio::test]
+    async fn get_diagnostics_parses_camel_case() {
+        let (base, _mock) = boot_mock_sidecar().await;
+        let client = SidecarClient::new(base);
+        let diag = client.get_diagnostics().await.unwrap();
+        assert_eq!(
+            diag.sidecar_ffmpeg_exit.as_deref(),
+            Some("exit role=video code=1 signal=none ago_s=3")
+        );
+        assert_eq!(
+            diag.sidecar_ssrf_reject.as_deref(),
+            Some("reason=ip_not_allowed class=loopback ago_s=9")
+        );
+        assert!(diag.sidecar_moq_error.is_none());
     }
 
     #[tokio::test]

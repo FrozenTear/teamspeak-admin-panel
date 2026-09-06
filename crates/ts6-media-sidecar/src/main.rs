@@ -126,7 +126,8 @@ async fn main() -> Result<()> {
         (Some(name), Some(url), _, _) => Some(
             Pipeline::start(
                 PipelineConfig::new(name, SourceInput::Url(url))
-                    .with_ffmpeg_path(args.ffmpeg_path.clone()),
+                    .with_ffmpeg_path(args.ffmpeg_path.clone())
+                    .with_diagnostics(sidecar.diagnostics.clone()),
                 sidecar.origin.clone(),
             )
             .await
@@ -135,7 +136,8 @@ async fn main() -> Result<()> {
         (Some(name), None, Some(video), Some(audio)) => Some(
             Pipeline::start(
                 PipelineConfig::new(name, SourceInput::Lavfi { video, audio })
-                    .with_ffmpeg_path(args.ffmpeg_path.clone()),
+                    .with_ffmpeg_path(args.ffmpeg_path.clone())
+                    .with_diagnostics(sidecar.diagnostics.clone()),
                 sidecar.origin.clone(),
             )
             .await

@@ -12,9 +12,11 @@
 
 mod github;
 mod markdown;
+pub mod sidecar_context;
 
 pub use github::{GitHubIssueSink, UnconfiguredSink};
 pub use markdown::{IssueDraft, Reporter, build_issue};
+pub use sidecar_context::fold_sidecar_context;
 
 use std::sync::Arc;
 

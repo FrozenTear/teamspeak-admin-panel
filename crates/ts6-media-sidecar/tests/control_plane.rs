@@ -207,6 +207,94 @@ async fn control_plane_start_lookup_stats_stop() {
     sidecar.shutdown();
 }
 
+/// Bug-report bag (`GET /diagnostics`): last SSRF reject + FFmpeg exit
+/// land under prefixed keys, never leaking blocked IPs or credentialed URLs.
+#[tokio::test]
+async fn diagnostics_records_ssrf_without_secrets() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("warn,ts6_media_sidecar=debug")
+        .with_test_writer()
+        .try_init();
+
+    let resolver = MockResolver::new()
+        .with("fixture.test", vec![ip("203.0.113.10")])
+        .with("private.test", vec![ip("10.0.0.42")]);
+    let sidecar = boot(Arc::new(resolver) as Arc<dyn Resolver>).await;
+    let base = format!("http://{}", sidecar.http_addr);
+    let client = reqwest::Client::new();
+
+    let empty: Value = client
+        .get(format!("{base}/diagnostics"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(empty["sidecarHealth"].as_str().unwrap().contains("ok"));
+    assert!(empty.get("sidecarSsrfReject").is_none());
+
+    let resp = client
+        .post(format!("{base}/source"))
+        .json(&serde_json::json!({
+            "url": "http://alice:s3cret@private.test/clip.mp4",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    let resp = client
+        .post(format!("{base}/source"))
+        .json(&serde_json::json!({"url": "http://127.0.0.1/local"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    let _ = client
+        .post(format!("{base}/source"))
+        .json(&serde_json::json!({"url": "http://fixture.test/clip.mp4"}))
+        .send()
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let diag: Value = client
+        .get(format!("{base}/diagnostics"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ssrf = diag["sidecarSsrfReject"]
+        .as_str()
+        .expect("sidecarSsrfReject after /source deny");
+    assert!(
+        ssrf.contains("ip_not_allowed") || ssrf.contains("resolved_to_blocked_range"),
+        "{ssrf}"
+    );
+    assert!(!ssrf.contains("10.0.0.42"), "{ssrf}");
+    assert!(!ssrf.contains("127.0.0.1"), "{ssrf}");
+    assert!(!ssrf.contains("alice"), "{ssrf}");
+    assert!(!ssrf.contains("s3cret"), "{ssrf}");
+
+    let tail = diag["sidecarLogTail"].as_str().unwrap_or("");
+    assert!(tail.contains("ssrf_reject"), "{tail}");
+    assert!(!tail.contains("alice"), "{tail}");
+    assert!(!tail.contains("s3cret"), "{tail}");
+    assert!(!tail.contains("10.0.0.42"), "{tail}");
+
+    let ffmpeg = diag["sidecarFfmpegExit"].as_str().unwrap_or("");
+    if !ffmpeg.is_empty() {
+        assert!(!ffmpeg.contains("http://"), "{ffmpeg}");
+        assert!(!ffmpeg.contains("fixture.test"), "{ffmpeg}");
+    }
+
+    sidecar.shutdown();
+}
+
 #[tokio::test]
 async fn control_plane_health_stays_cheap_with_pipelines() {
     // /health should not block on the pipeline registry's write lock.
