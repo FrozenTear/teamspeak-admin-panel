@@ -279,6 +279,7 @@ mod tests {
 
     #[test]
     fn build_request_matches_locked_shape() {
+        let _lock = diagnostics::exclusive_for_tests();
         diagnostics::reset_for_tests();
         diagnostics::record_toast("warning", "saved");
         diagnostics::record_client_error("websocket disconnected");
@@ -294,6 +295,7 @@ mod tests {
 
     #[test]
     fn build_request_omits_blank_note_and_sends_empty_arrays() {
+        let _lock = diagnostics::exclusive_for_tests();
         diagnostics::reset_for_tests();
         let req = build_request("   ", "/logs", None);
         assert!(req.note.is_none());
@@ -304,6 +306,7 @@ mod tests {
 
     #[test]
     fn build_request_trims_and_caps_page_path() {
+        let _lock = diagnostics::exclusive_for_tests();
         diagnostics::reset_for_tests();
         let req = build_request("", "  /clients?tab=bans  ", None);
         assert_eq!(req.page_path, "/clients?tab=bans");

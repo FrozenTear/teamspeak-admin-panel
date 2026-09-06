@@ -120,10 +120,22 @@ pub fn ws_error_messages() -> Vec<String> {
 }
 
 /// Wipe both rings. Test-only — production never resets mid-session.
+///
+/// Callers that reset then read must hold [`exclusive_for_tests`] for the
+/// whole sequence; the rings are process-global and `cargo test` is parallel.
 #[cfg(test)]
 pub fn reset_for_tests() {
     lock_ring(&TOASTS).clear();
     lock_ring(&CLIENT_ERRORS).clear();
+}
+
+/// Serialise tests that share the process-global rings.
+#[cfg(test)]
+pub fn exclusive_for_tests() -> std::sync::MutexGuard<'static, ()> {
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(test)]
@@ -132,6 +144,7 @@ mod tests {
 
     #[test]
     fn toast_ring_evicts_oldest_past_cap() {
+        let _lock = exclusive_for_tests();
         reset_for_tests();
         for i in 0..(MAX_TOASTS + 3) {
             record_toast("error", format!("toast-{i}"));
@@ -149,6 +162,7 @@ mod tests {
 
     #[test]
     fn client_error_ring_evicts_oldest_past_cap() {
+        let _lock = exclusive_for_tests();
         reset_for_tests();
         for i in 0..(MAX_CLIENT_ERRORS + 2) {
             record_client_error(format!("ws: drop {i}"));
@@ -161,6 +175,7 @@ mod tests {
 
     #[test]
     fn snapshots_are_empty_after_reset() {
+        let _lock = exclusive_for_tests();
         reset_for_tests();
         record_toast("info", "hello");
         record_client_error("boom");
@@ -171,6 +186,7 @@ mod tests {
 
     #[test]
     fn wire_helpers_emit_plain_strings() {
+        let _lock = exclusive_for_tests();
         reset_for_tests();
         record_toast("error", "Kick failed");
         record_client_error("SSE closed");

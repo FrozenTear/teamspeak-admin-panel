@@ -372,6 +372,7 @@ mod tests {
     }
 
     fn render_open_dialog() -> String {
+        let _lock = crate::client::diagnostics::exclusive_for_tests();
         let mut dom = VirtualDom::new(DialogHarness);
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
