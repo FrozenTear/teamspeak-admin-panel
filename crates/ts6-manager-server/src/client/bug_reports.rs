@@ -200,9 +200,41 @@ pub fn build_request(
     }
 }
 
-/// Panel version stamped as `release` (e.g. `v0.0.1`).
+/// Panel version stamped as `release` (e.g. `v1.6.11`).
+///
+/// Prefers a build-time deploy/tag stamp so Contabo reports show the
+/// image tag, not crate semver (`Cargo.toml` stays `0.0.1`).
+/// `Containerfile.fullstack` copies Release's `IMAGE_VERSION` build-arg
+/// into `TS6_RELEASE` before `dx bundle`. Local `dx serve` / `cargo test`
+/// leave those unset and fall back to `v` + `CARGO_PKG_VERSION`.
 pub fn release() -> Option<String> {
-    let raw = env!("CARGO_PKG_VERSION").trim();
+    format_release(compile_time_deploy_stamp(), env!("CARGO_PKG_VERSION"))
+}
+
+/// First non-empty compile-time stamp. `TS6_RELEASE` is what the
+/// fullstack image sets from `IMAGE_VERSION`; the rest are accepted so
+/// ad-hoc / other pipelines can stamp without renaming.
+fn compile_time_deploy_stamp() -> Option<&'static str> {
+    [
+        option_env!("TS6_RELEASE"),
+        option_env!("IMAGE_VERSION"),
+        option_env!("APP_VERSION"),
+        option_env!("GIT_TAG"),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .find(|s| !s.is_empty())
+}
+
+/// Prefer a deploy/tag string as-is (already `v1.6.11` on Release cuts,
+/// or `dev` on untagged local images). Only the crate-semver fallback
+/// gets a `v` prefix.
+fn format_release(deploy: Option<&str>, crate_version: &str) -> Option<String> {
+    if let Some(stamp) = deploy.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(truncate_chars(stamp, MAX_RELEASE_LEN));
+    }
+    let raw = crate_version.trim();
     if raw.is_empty() {
         return None;
     }
@@ -384,8 +416,7 @@ mod tests {
         assert_eq!(req.note.as_deref(), Some("note"));
         assert_eq!(req.toasts, vec![String::from("saved")]);
         assert_eq!(req.ws_errors, vec![String::from("websocket disconnected")]);
-        let expected_release = format!("v{}", env!("CARGO_PKG_VERSION"));
-        assert_eq!(req.release.as_deref(), Some(expected_release.as_str()));
+        assert_eq!(req.release, release());
         assert!(req.context.is_none());
     }
 
@@ -416,10 +447,38 @@ mod tests {
     }
 
     #[test]
-    fn release_is_v_prefixed_crate_semver() {
-        let v = release().expect("CARGO_PKG_VERSION is set");
-        assert!(v.starts_with('v'), "expected v-prefix, got {v}");
-        assert!(v.as_bytes().get(1).is_some_and(|c| c.is_ascii_digit()));
+    fn format_release_prefers_deploy_stamp_over_crate_semver() {
+        assert_eq!(
+            format_release(Some("v1.6.11"), "0.0.1").as_deref(),
+            Some("v1.6.11")
+        );
+        assert_eq!(
+            format_release(Some("  v1.6.11  "), "0.0.1").as_deref(),
+            Some("v1.6.11")
+        );
+        assert_eq!(format_release(Some("dev"), "0.0.1").as_deref(), Some("dev"));
+        assert_eq!(
+            format_release(Some("   "), "0.0.1").as_deref(),
+            Some("v0.0.1")
+        );
+        assert_eq!(format_release(None, "0.0.1").as_deref(), Some("v0.0.1"));
+        assert_eq!(format_release(None, "v1.2.3").as_deref(), Some("v1.2.3"));
+        assert_eq!(format_release(None, "   "), None);
+        assert_eq!(
+            format_release(Some(&"r".repeat(MAX_RELEASE_LEN + 8)), "0.0.1")
+                .unwrap()
+                .chars()
+                .count(),
+            MAX_RELEASE_LEN
+        );
+    }
+
+    #[test]
+    fn release_uses_compile_time_stamp_or_crate_semver() {
+        assert_eq!(
+            release(),
+            format_release(compile_time_deploy_stamp(), env!("CARGO_PKG_VERSION"))
+        );
     }
 
     #[test]

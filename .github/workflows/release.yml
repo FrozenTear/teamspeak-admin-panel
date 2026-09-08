@@ -84,6 +84,9 @@ jobs:
           push: true
           provenance: false   # provenance attestation handled by cosign below
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:${{ steps.tag.outputs.tag }}-${{ matrix.arch }}
+          # IMAGE_VERSION is the git tag (vX.Y.Z). Fullstack copies it to
+          # TS6_RELEASE before `dx bundle` so Report bug embeds the image
+          # tag; both images also write it to the OCI version label.
           build-args: |
             IMAGE_VERSION=${{ steps.tag.outputs.tag }}
             IMAGE_REVISION=${{ github.sha }}

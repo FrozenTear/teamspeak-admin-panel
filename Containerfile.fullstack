@@ -97,6 +97,15 @@ RUN scripts/check-router.sh audit_router
 # ships with zero client-side interactivity. `--platform web` pins the
 # client target to wasm32 and `--fullstack` adds the server build into
 # the same `web/` folder.
+#
+# Release (`.github/workflows/release.yml`) and `scripts/build-images.sh`
+# already pass `IMAGE_VERSION` (the git / image tag, e.g. `v1.6.11`).
+# That ARG used to be declared only in the runtime stage for OCI labels,
+# so `dx bundle` never saw it and Report bug stamped `v` +
+# `CARGO_PKG_VERSION` (`v0.0.1`). Re-declare here and export
+# `TS6_RELEASE` so rustc `option_env!` embeds the image tag.
+ARG IMAGE_VERSION=dev
+ENV TS6_RELEASE=${IMAGE_VERSION}
 RUN cd crates/ts6-manager-server && dx bundle --release --platform web --fullstack
 
 # PURA-185 post-build assertion — fail the image build loudly if the wasm
@@ -210,7 +219,9 @@ COPY --from=builder /build/target/dx/ts6-manager-server/release/web/server /usr/
 COPY --from=builder /build/target/dx/ts6-manager-server/release/web/public /usr/local/bin/public
 
 # OCI labels — populated by the release helper (scripts/build-images.sh) via
-# `--build-arg`. Defaults keep the image self-describing even on local builds.
+# `--build-arg`. The same `IMAGE_VERSION` is also consumed in the builder
+# stage (`TS6_RELEASE`) so the WASM client stamps bug-report `release`.
+# Defaults keep the image self-describing even on local builds.
 ARG IMAGE_VERSION=dev
 ARG IMAGE_REVISION=unknown
 ARG IMAGE_SOURCE="https://github.com/FrozenTear/teamspeak-admin-panel"

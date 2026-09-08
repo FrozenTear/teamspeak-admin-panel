@@ -165,6 +165,17 @@ precondition: hydrating the Dioxus SPA requires `index.html` +
 `*_bg.wasm` + the `wasm-bindgen` JS shim to all be present next to the
 server binary.
 
+### 2.2 Bug-report `release` stamp
+
+Report bug embeds a compile-time `release` string in the WASM client
+(`option_env!("TS6_RELEASE")`, then `IMAGE_VERSION` / `APP_VERSION` /
+`GIT_TAG`). Release already passed `IMAGE_VERSION=${{ tag }}` as a
+build-arg; `Containerfile.fullstack` now re-declares that ARG in the
+**builder** stage and sets `ENV TS6_RELEASE=${IMAGE_VERSION}` before
+`dx bundle`. Untagged local images stamp `dev`. `dx serve` / `cargo test`
+(no deploy env) fall back to `v` + crate semver (`0.0.1`). Do not bump
+`Cargo.toml` to match image tags — Contabo cuts are image tags.
+
 ## 3. Signing
 
 We sign images with **cosign keyless OIDC** when an external CI identity
