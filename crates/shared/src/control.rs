@@ -358,7 +358,9 @@ pub struct LogTailQuery {
     /// Omit on initial fetch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after: Option<i64>,
-    /// Max lines to return. Capped to `MAX_LOG_LINES` server-side.
+    /// Max lines to return. Capped server-side to TeamSpeak `logview`'s
+    /// per-call max (100). Asking TS for more fails with error 1541
+    /// (`invalid parameter size`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lines: Option<u32>,
     /// Minimum severity to include. Passed through as a substring filter

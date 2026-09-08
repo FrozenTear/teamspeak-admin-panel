@@ -955,6 +955,39 @@ async fn logs_filter_by_severity_substring() {
     assert_eq!(body["lastPos"], 1024);
 }
 
+#[tokio::test]
+async fn logs_clamps_oversize_lines_before_upstream_logview() {
+    let (port, mock) = boot_mock_webquery("API-KEY").await;
+    let state = fresh_state().await;
+    let server = seed_server(&state, port, "API-KEY").await;
+    let (_admin, atoken) = seed_user_with_token(&state, "alice", "admin").await;
+
+    let resp = app(state)
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/servers/{}/vs/1/logs?lines=200", server.id))
+                .header("authorization", auth_header(&atoken))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let last = mock
+        .captured_queries
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .expect("captured query");
+    assert_eq!(
+        last.get("lines").map(String::as_str),
+        Some("100"),
+        "TeamSpeak logview rejects lines>100 with error 1541"
+    );
+}
+
 // ---------------------------------------------------------------------
 // Write paths — kick / mute / move / ban
 // ---------------------------------------------------------------------
