@@ -417,5 +417,10 @@ mod tests {
         );
         assert!(html.contains("Send report"), "submit CTA missing: {html}");
         assert!(html.contains("Cancel"), "cancel missing: {html}");
+        let release = bug_reports::release().expect("release stamp");
+        assert!(
+            html.contains(&release),
+            "release {release} missing from preview: {html}"
+        );
     }
 }

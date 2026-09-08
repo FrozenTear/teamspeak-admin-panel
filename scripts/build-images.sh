@@ -14,7 +14,8 @@
 # Defaults: builds both images for the host platform with version=dev.
 #
 # Environment overrides:
-#   IMAGE_VERSION    — semver tag (default: dev)
+#   IMAGE_VERSION    — semver / image tag (default: dev). Fullstack copies
+#                      this to TS6_RELEASE so Report bug embeds the tag.
 #   IMAGE_REVISION   — git rev (default: `git rev-parse --short HEAD`)
 #   IMAGE_REGISTRY   — registry prefix to tag against (default: localhost)
 #   IMAGE_NAMESPACE  — registry namespace (default: empty when IMAGE_REGISTRY=localhost)
