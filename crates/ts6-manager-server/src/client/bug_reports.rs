@@ -456,10 +456,7 @@ mod tests {
             format_release(Some("  v1.6.11  "), "0.0.1").as_deref(),
             Some("v1.6.11")
         );
-        assert_eq!(
-            format_release(Some("dev"), "0.0.1").as_deref(),
-            Some("dev")
-        );
+        assert_eq!(format_release(Some("dev"), "0.0.1").as_deref(), Some("dev"));
         assert_eq!(
             format_release(Some("   "), "0.0.1").as_deref(),
             Some("v0.0.1")
