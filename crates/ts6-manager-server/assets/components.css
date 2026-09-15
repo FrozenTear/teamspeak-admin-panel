@@ -601,6 +601,16 @@ a:hover {
   z-index: var(--z-modal);
   overflow: hidden;
 }
+.modal.report-bug-dialog {
+  width: min(600px, calc(100vw - var(--space-8)));
+  max-height: calc(100vh - var(--space-8));
+  display: flex;
+  flex-direction: column;
+}
+.modal.report-bug-dialog .modal-body {
+  overflow-y: auto;
+  flex: 1 1 auto;
+}
 .modal-header,
 .modal-body,
 .modal-footer {
@@ -652,9 +662,11 @@ a:hover {
   padding-left: var(--space-5);
 }
 .bug-report-context__items li { margin: 0; }
-#report-bug-note.input {
+#report-bug-happened.input,
+#report-bug-expected.input,
+#report-bug-steps.input {
   height: auto;
-  min-height: 6.5rem;
+  min-height: 4.25rem;
 }
 
 /* ─── Step indicator ─────────────────────────────────── */

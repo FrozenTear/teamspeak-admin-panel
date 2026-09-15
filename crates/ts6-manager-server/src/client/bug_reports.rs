@@ -183,6 +183,30 @@ fn context_value_empty(value: &Value) -> bool {
     }
 }
 
+/// Compose dialog fields into the locked `note` string.
+///
+/// No new DTO fields — the server still receives a single optional `note`.
+/// The first non-empty line is the short human summary so the server-owned
+/// GitHub title (`[bug-report] {page} — {first 40 chars}`) stays useful.
+/// Extra sections are labeled. Empty fields are omitted.
+pub fn compose_note(happened: &str, expected: &str, steps: &str) -> String {
+    let happened = happened.trim();
+    let expected = expected.trim();
+    let steps = steps.trim();
+
+    let mut parts: Vec<String> = Vec::new();
+    if !happened.is_empty() {
+        parts.push(happened.to_string());
+    }
+    if !expected.is_empty() {
+        parts.push(format!("Expected vs heard:\n{expected}"));
+    }
+    if !steps.is_empty() {
+        parts.push(format!("Steps:\n{steps}"));
+    }
+    parts.join("\n\n")
+}
+
 /// Build the locked request from values the dialog already collected.
 pub fn build_request(
     note: impl Into<String>,
@@ -402,6 +426,62 @@ mod tests {
             status: 502,
             message: "Failed to create GitHub issue".into(),
         }));
+    }
+
+    #[test]
+    fn compose_note_joins_labeled_sections_and_skips_blanks() {
+        assert_eq!(compose_note("  ", "  ", "\n"), "");
+        assert_eq!(compose_note("stuck loading", "", ""), "stuck loading");
+        assert_eq!(
+            compose_note("", "list vs spinner", ""),
+            "Expected vs heard:\nlist vs spinner"
+        );
+        assert_eq!(
+            compose_note("", "", "switch server"),
+            "Steps:\nswitch server"
+        );
+        assert_eq!(
+            compose_note(
+                "  Clients table stayed on Loading  ",
+                "Expected the client list.\nHeard a spinner that never cleared.",
+                "1. Open Clients\n2. Switch server",
+            ),
+            "Clients table stayed on Loading\n\n\
+             Expected vs heard:\nExpected the client list.\nHeard a spinner that never cleared.\n\n\
+             Steps:\n1. Open Clients\n2. Switch server"
+        );
+    }
+
+    #[test]
+    fn compose_note_leads_with_summary_for_server_title_prefix() {
+        let note = compose_note(
+            "Clients table stayed on Loading",
+            "list vs spinner",
+            "switch server",
+        );
+        assert_eq!(
+            note.lines().next().map(str::trim),
+            Some("Clients table stayed on Loading")
+        );
+    }
+
+    #[test]
+    fn compose_note_stays_in_locked_note_field() {
+        let _lock = diagnostics::exclusive_for_tests();
+        diagnostics::reset_for_tests();
+        let note = compose_note("stuck", "expected list", "switch server");
+        let req = build_request(note, "/clients", None);
+        let json = serde_json::to_value(&req).expect("serialize");
+        assert_eq!(
+            json["note"],
+            "stuck\n\nExpected vs heard:\nexpected list\n\nSteps:\nswitch server"
+        );
+        for forbidden in ["title", "expected", "steps", "happened", "whatHappened"] {
+            assert!(
+                json.get(forbidden).is_none(),
+                "must not invent {forbidden} on the wire: {json}"
+            );
+        }
     }
 
     #[test]
