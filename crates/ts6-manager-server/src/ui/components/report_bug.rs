@@ -1,10 +1,12 @@
 //! Report bug dialog — operator-facing control that POSTs to
 //! `/api/bug-reports` with page / server / toast / WS context.
 //!
-//! No Sentry / browser SDK. The note is optional; context is always
-//! attached. Auth rides the same [`RefreshGate`] as every other operator
-//! POST. 404 / 501 are toasted as "API not landed yet" until the sibling
-//! route PR merges.
+//! No Sentry / browser SDK. Prompts are split (what happened / expected
+//! vs heard / optional steps) and composed into the locked `note` field —
+//! no extra DTO keys, no client-owned title. Context is always attached.
+//! Auth rides the same [`RefreshGate`] as every other operator POST.
+//! 404 / 501 are toasted as "API not landed yet" until the sibling route
+//! PR merges.
 
 use dioxus::prelude::*;
 
@@ -15,7 +17,7 @@ use crate::ui::components::toast::{ToastVariant, use_toaster};
 use crate::ui::components::{Button, ButtonType, ButtonVariant, Field};
 use crate::ui::layout::use_servers_context;
 
-/// Modal that collects an optional note and submits a bug report.
+/// Modal that collects a short structured note and submits a bug report.
 ///
 /// `page_path_override` is for SSR / unit tests. Production leaves it
 /// unset and reads the live location (query string included).
@@ -28,7 +30,9 @@ pub fn ReportBugDialog(
     let toaster = use_toaster();
     let servers = use_servers_context();
 
-    let mut note: Signal<String> = use_signal(String::new);
+    let mut happened: Signal<String> = use_signal(String::new);
+    let mut expected: Signal<String> = use_signal(String::new);
+    let mut steps: Signal<String> = use_signal(String::new);
     let mut submitting: Signal<bool> = use_signal(|| false);
 
     if !*open.read() {
@@ -50,12 +54,13 @@ pub fn ReportBugDialog(
     });
     let toasts = crate::client::diagnostics::toast_messages();
     let ws_errors = crate::client::diagnostics::ws_error_messages();
+    // Deploy/tag stamp when the image set one; never a second crate-semver path.
     let release = bug_reports::release();
     let busy = *submitting.read();
 
     let on_cancel = move |_| {
         if !*submitting.read() {
-            note.set(String::new());
+            reset_draft(happened, expected, steps);
             open.set(false);
         }
     };
@@ -69,13 +74,17 @@ pub fn ReportBugDialog(
             }
             submitting.set(true);
             let gate = gate.clone();
-            let body =
-                bug_reports::build_request(note.read().trim(), page_path.clone(), selected_id);
+            let note = bug_reports::compose_note(
+                happened.read().trim(),
+                expected.read().trim(),
+                steps.read().trim(),
+            );
+            let body = bug_reports::build_request(note, page_path.clone(), selected_id);
             spawn(async move {
                 match bug_reports::submit(gate, &body).await {
                     Ok(resp) => {
                         push_success_toast(toaster, &resp);
-                        note.set(String::new());
+                        reset_draft(happened, expected, steps);
                         open.set(false);
                     }
                     Err(e) => {
@@ -116,19 +125,19 @@ pub fn ReportBugDialog(
             class: "modal-backdrop",
             onclick: move |_| {
                 if !busy {
-                    note.set(String::new());
+                    reset_draft(happened, expected, steps);
                     open.set(false);
                 }
             },
             onkeydown: move |evt| {
                 if evt.key() == Key::Escape && !busy {
                     evt.prevent_default();
-                    note.set(String::new());
+                    reset_draft(happened, expected, steps);
                     open.set(false);
                 }
             },
             div {
-                class: "modal",
+                class: "modal report-bug-dialog",
                 role: "dialog",
                 "aria-modal": "true",
                 "aria-labelledby": "report-bug-title",
@@ -139,21 +148,51 @@ pub fn ReportBugDialog(
                 }
                 div { class: "modal-body stack-md",
                     p { id: "report-bug-lede", class: "info-hint",
-                        "Optional note — page path, selected server id, recent toasts, and recent connection errors are always attached. Nothing is sent to a third-party crash service."
+                        "A short human summary helps more than a one-liner. Page, server, release, recent toasts, connection errors, and seat context are always attached. Nothing is sent to a third-party crash service."
                     }
                     Field {
                         label: "What happened?".to_string(),
-                        id: Some("report-bug-note".to_string()),
+                        id: Some("report-bug-happened".to_string()),
                         optional: true,
-                        helper: Some("A sentence or two is enough. Context below is sent either way.".to_string()),
+                        helper: Some("A short sentence is enough — this leads the GitHub Issue title.".to_string()),
                         textarea {
-                            id: "report-bug-note",
+                            id: "report-bug-happened",
                             class: "input",
-                            rows: "4",
+                            rows: "3",
                             placeholder: "e.g. Clients table stayed on Loading after I switched servers",
-                            value: "{note.read()}",
+                            value: "{happened.read()}",
                             disabled: busy,
-                            oninput: move |e| note.set(e.value()),
+                            oninput: move |e| happened.set(e.value()),
+                        }
+                    }
+                    Field {
+                        label: "Expected vs heard".to_string(),
+                        id: Some("report-bug-expected".to_string()),
+                        optional: true,
+                        helper: Some("What you expected, versus what you saw or heard.".to_string()),
+                        textarea {
+                            id: "report-bug-expected",
+                            class: "input",
+                            rows: "3",
+                            placeholder: "e.g. Expected the client list. Heard a spinner that never cleared.",
+                            value: "{expected.read()}",
+                            disabled: busy,
+                            oninput: move |e| expected.set(e.value()),
+                        }
+                    }
+                    Field {
+                        label: "Steps to reproduce".to_string(),
+                        id: Some("report-bug-steps".to_string()),
+                        optional: true,
+                        helper: Some("Optional. A couple of steps is enough.".to_string()),
+                        textarea {
+                            id: "report-bug-steps",
+                            class: "input",
+                            rows: "3",
+                            placeholder: "e.g. Open Clients, switch server, wait",
+                            value: "{steps.read()}",
+                            disabled: busy,
+                            oninput: move |e| steps.set(e.value()),
                         }
                     }
                     ContextPreview {
@@ -243,6 +282,16 @@ fn SnapshotList(empty: String, items: Vec<String>) -> Element {
             }
         }
     }
+}
+
+fn reset_draft(
+    mut happened: Signal<String>,
+    mut expected: Signal<String>,
+    mut steps: Signal<String>,
+) {
+    happened.set(String::new());
+    expected.set(String::new());
+    steps.set(String::new());
 }
 
 fn push_success_toast(toaster: crate::ui::components::Toaster, resp: &BugReportResponse) {
@@ -379,7 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn open_dialog_shows_note_and_attached_context() {
+    fn open_dialog_shows_structured_prompts_and_attached_context() {
         let html = render_open_dialog();
         assert!(
             html.contains(r#"role="dialog""#),
@@ -392,11 +441,35 @@ mod tests {
         assert!(html.contains("Report bug"), "heading missing: {html}");
         assert!(
             html.contains("What happened?"),
-            "note field missing: {html}"
+            "summary field missing: {html}"
+        );
+        assert!(
+            html.contains("Expected vs heard"),
+            "expected field missing: {html}"
+        );
+        assert!(
+            html.contains("Steps to reproduce"),
+            "steps field missing: {html}"
+        );
+        assert!(
+            html.contains(r#"id="report-bug-happened""#),
+            "happened textarea missing: {html}"
+        );
+        assert!(
+            html.contains(r#"id="report-bug-expected""#),
+            "expected textarea missing: {html}"
+        );
+        assert!(
+            html.contains(r#"id="report-bug-steps""#),
+            "steps textarea missing: {html}"
         );
         assert!(
             html.contains("(optional)"),
-            "note should be marked optional: {html}"
+            "fields should be marked optional: {html}"
+        );
+        assert!(
+            !html.contains(r#"id="report-bug-title-input""#) && !html.contains("name=\"title\""),
+            "must not invent a client title field: {html}"
         );
         assert!(
             html.contains("Attached automatically"),
@@ -421,6 +494,35 @@ mod tests {
         assert!(
             html.contains(&release),
             "release {release} missing from preview: {html}"
+        );
+        // Preview must use `release()` (deploy stamp wins). Do not also
+        // render raw crate semver when that helper already chose a stamp.
+        let crate_semver = env!("CARGO_PKG_VERSION");
+        if release != crate_semver && release != format!("v{crate_semver}") {
+            assert!(
+                !html.contains(crate_semver),
+                "stale crate semver {crate_semver} leaked beside deploy stamp {release}: {html}"
+            );
+        }
+    }
+
+    #[test]
+    fn compose_note_from_dialog_fields_stays_on_locked_wire() {
+        let _lock = crate::client::diagnostics::exclusive_for_tests();
+        crate::client::diagnostics::reset_for_tests();
+        let note = bug_reports::compose_note(
+            "Clients table stayed on Loading",
+            "Expected the list. Heard a spinner.",
+            "Switch server",
+        );
+        let req = bug_reports::build_request(note, "/clients", Some(1));
+        let json = serde_json::to_value(&req).expect("serialize");
+        assert!(json.get("title").is_none(), "title is server-owned: {json}");
+        assert!(json.get("expected").is_none());
+        assert!(json.get("steps").is_none());
+        assert_eq!(
+            json["note"].as_str().and_then(|n| n.lines().next()),
+            Some("Clients table stayed on Loading")
         );
     }
 }
