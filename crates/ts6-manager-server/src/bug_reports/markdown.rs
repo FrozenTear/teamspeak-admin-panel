@@ -203,7 +203,8 @@ fn collapse_tail(value: &str) -> (Option<String>, String) {
         .filter(|l| !l.is_empty())
         .collect();
     let total = capped.len();
-    let (omitted, kept) = select_tail_lines(&capped, TAIL_DISPLAY_LINES);
+    let collapsed = collapse_event_runs(&capped);
+    let (omitted, kept) = select_tail_lines(&collapsed, TAIL_DISPLAY_LINES);
     let mut body = String::new();
     if omitted > 0 {
         body.push_str(&format!("… {omitted} earlier line"));
@@ -213,8 +214,62 @@ fn collapse_tail(value: &str) -> (Option<String>, String) {
         body.push_str(" omitted\n");
     }
     body.push_str(&kept.join("\n"));
-    let caption = (omitted > 0).then(|| format!("_last {} of {total} lines_", kept.len()));
+    let caption = if omitted > 0 {
+        Some(format!("_last {} of {total} events_", kept.len()))
+    } else if collapsed.len() < total {
+        Some(format!("_{total} events, similar runs collapsed_"))
+    } else {
+        None
+    };
     (caption, body)
+}
+
+/// First + last of a consecutive same-starter run, with a count in between.
+/// Keeps both underruns and stall bursts visible instead of dumping 12
+/// identical stall lines and dropping the older (often more interesting) marks.
+fn collapse_event_runs(lines: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let starter = event_group_key(&lines[i]);
+        let mut j = i + 1;
+        if starter.is_some() {
+            while j < lines.len() && event_group_key(&lines[j]) == starter {
+                j += 1;
+            }
+        }
+        let run = j - i;
+        if run <= 2 {
+            out.extend(lines[i..j].iter().cloned());
+        } else {
+            let name = starter.unwrap_or("event");
+            out.push(lines[i].clone());
+            out.push(format!("… {} similar {name} lines", run - 2));
+            out.push(lines[j - 1].clone());
+        }
+        i = j;
+    }
+    out
+}
+
+fn event_group_key(line: &str) -> Option<&str> {
+    let first = line.split_whitespace().next()?;
+    if !is_event_starter(first) {
+        return None;
+    }
+    // `logTail` lines all start with `music_bot_latency`; group by stage /
+    // command so underruns, stalls, and chat commands stay distinct.
+    if first == "music_bot_latency" {
+        for tok in line.split_whitespace() {
+            if let Some(stage) = tok.strip_prefix("stage=") {
+                return Some(stage);
+            }
+            if let Some(cmd) = tok.strip_prefix("command=") {
+                return Some(cmd);
+            }
+        }
+    }
+    Some(first)
 }
 
 fn split_log_lines(value: &str) -> Vec<String> {
@@ -746,11 +801,62 @@ mod tests {
         );
         assert!(
             body.lines().count() <= TAIL_DISPLAY_LINES + 1,
-            "omitted marker + at most {TAIL_DISPLAY_LINES} events"
+            "collapsed run + at most {TAIL_DISPLAY_LINES} events"
         );
-        assert!(caption.unwrap().contains("last"));
-        assert!(body.contains("… "));
-        assert!(body.contains("omitted"));
+        assert!(
+            caption.unwrap().contains("collapsed"),
+            "16 identical events should collapse"
+        );
+        assert!(body.contains("similar frame_underrun"));
+        assert!(body.contains("elapsed_ms=0"));
+        assert!(body.contains("elapsed_ms=15"));
+    }
+
+    #[test]
+    fn tail_collapse_groups_music_bot_latency_by_stage() {
+        let lines = [
+            "music_bot_latency stage=frame_underrun elapsed_ms=79 frame=1",
+            "music_bot_latency stage=frame_underrun elapsed_ms=115 frame=2",
+            "music_bot_latency stage=frame_underrun elapsed_ms=24 frame=3",
+            "music_bot_latency invoker=Vasquez93 command=Pause chat command received",
+            "music_bot_latency stage=connected_loop_stall elapsed_ms=51",
+            "music_bot_latency stage=connected_loop_stall elapsed_ms=78",
+            "music_bot_latency stage=connected_loop_stall elapsed_ms=67",
+            "music_bot_latency stage=connected_loop_stall elapsed_ms=70",
+        ];
+        let (_, body) = collapse_tail(&lines.join("\n"));
+        assert!(
+            body.contains("command=Pause"),
+            "chat command must survive: {body}"
+        );
+        assert!(body.contains("stage=frame_underrun"));
+        assert!(body.contains("stage=connected_loop_stall"));
+        assert!(
+            !body.contains("… 6 similar music_bot_latency"),
+            "must not collapse the whole tail as one run: {body}"
+        );
+    }
+
+    #[test]
+    fn tail_collapse_keeps_both_underrun_and_stall_runs() {
+        let mut events = Vec::new();
+        for i in 0..4 {
+            events.push(format!("frame_underrun elapsed_ms={i} retry=0"));
+        }
+        for i in 0..12 {
+            events.push(format!("connected_loop_stall elapsed_ms={i} retry=0"));
+        }
+        let (caption, body) = collapse_tail(&events.join(" "));
+        assert!(
+            body.contains("frame_underrun"),
+            "must not drop the older underrun run: {body}"
+        );
+        assert!(body.contains("connected_loop_stall"));
+        assert!(body.contains("similar connected_loop_stall"));
+        assert!(
+            caption.unwrap().contains("collapsed"),
+            "16 events across two runs should collapse, not omit a family"
+        );
     }
 
     #[test]
@@ -825,12 +931,19 @@ mod tests {
         assert!(draft.body.contains("buffered=249"));
         assert!(draft.body.contains("**voiceLogTail**"));
         assert!(
-            draft.body.contains("last ") && draft.body.contains(" of "),
-            "long tails should caption how many lines were kept"
+            draft.body.contains("similar frame_underrun")
+                || draft.body.contains("similar connected_loop_stall"),
+            "long same-starter bursts should collapse instead of dumping a wall"
         );
-        // Forensics: raw stall / underrun lines still present below Summary.
+        // Forensics: both mark families stay visible below Summary (not
+        // just the most recent stall run).
         assert!(draft.body[ctx..].contains("connected_loop_stall"));
         assert!(draft.body[ctx..].contains("frame_underrun"));
+        assert!(draft.body.contains("frame=21188") || draft.body.contains("elapsed_ms=18"));
+        assert!(
+            draft.body.contains("command=Pause") || draft.body.contains("Vasquez93"),
+            "music_bot_latency lines must group by stage, not collapse the whole tail"
+        );
     }
 
     #[test]
