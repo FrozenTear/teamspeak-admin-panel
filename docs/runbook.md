@@ -250,9 +250,17 @@ you must `podman pull` the target tags before play or old layers stick.
 From any cwd against a repo checkout. The script pulls both images,
 rewrites a temp manifest so sidecar cannot lag, `podman kube down`s
 **without** `--force`, plays (pod-only if `ts6-manager-secrets` already
-exists; otherwise concatenates `deploy/kube/secrets.yaml`), and curls
-`http://127.0.0.1:3001/health`. Verify the new image's signature first
-if you want — see § 5 and [`docs/ops/images.md` § 3](ops/images.md#3-signing).
+exists; otherwise concatenates `deploy/kube/secrets.yaml`), curls
+`http://127.0.0.1:3001/health`, then re-applies Contabo's soft CPU pin
+on `ts6-manager-fullstack` (`deploy/contabo/soft-pin.env` via
+`scripts/apply-fullstack-soft-pin.sh`). Kube YAML cannot persist
+`CpusetCpus` / process nice across down+play; the helper restores
+`2-5` / `-5` so every Contabo update keeps the overnight A/B pin.
+Sidecar stays unpinned unless that env file says so. Disable by
+emptying the vars, removing the file, or pointing `TS6_SOFT_PIN_ENV`
+at an override (Floki / other hosts). Never `podman kube down --force`.
+Verify the new image's signature first if you want — see § 5 and
+[`docs/ops/images.md` § 3](ops/images.md#3-signing).
 
 **Quadlet:**
 
@@ -288,6 +296,7 @@ podman kube down deploy/kube/ts6-manager.yaml    # never --force
 # If the host secret is missing: cat deploy/kube/secrets.yaml in front.
 podman kube play /tmp/ts6-manager.kube.yaml
 curl -fsS http://127.0.0.1:3001/health
+./scripts/apply-fullstack-soft-pin.sh   # Contabo soft pin; no-op if unset
 ```
 
 ### 3.5 Re-issuing secrets

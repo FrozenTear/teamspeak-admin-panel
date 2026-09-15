@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Contabo / kube upgrade: pull both GHCR images, play a temp manifest
-# with fullstack + sidecar on the same TAG, then smoke /health.
+# with fullstack + sidecar on the same TAG, smoke /health, then
+# re-apply Contabo soft CPU pin (cpuset + nice) on ts6-manager-fullstack.
 #
 # Usage (from any cwd, against a repo checkout):
 #   ./scripts/update.sh vX.Y.Z
@@ -12,7 +13,7 @@ set -euo pipefail
 usage() {
     echo "usage: $0 vX.Y.Z" >&2
     echo "  Pull both GHCR images for TAG, kube down (no --force), kube play," >&2
-    echo "  and curl http://127.0.0.1:3001/health." >&2
+    echo "  curl http://127.0.0.1:3001/health, then re-apply fullstack soft pin." >&2
     echo "example: $0 v1.6.2" >&2
     exit 2
 }
@@ -89,7 +90,19 @@ podman pull "$SIDECAR"
 echo "==> podman kube down (no --force; volumes stay)"
 # Identity is the pod name in the YAML, not the image tag.
 if podman pod exists ts6-manager; then
-    podman kube down "$MANIFEST"
+    # Stale play-state IDs on Contabo: kube down can fail with
+    # "no pod with ID … found" after the name is already gone.
+    if ! KUBE_DOWN_OUT="$(podman kube down "$MANIFEST" 2>&1)"; then
+        if printf '%s\n' "$KUBE_DOWN_OUT" | grep -qiE 'no pod with ID'; then
+            echo "    stale pod id from kube down; treating as already down"
+            printf '%s\n' "$KUBE_DOWN_OUT" | sed 's/^/    /'
+        else
+            printf '%s\n' "$KUBE_DOWN_OUT" >&2
+            die "podman kube down failed"
+        fi
+    else
+        printf '%s\n' "$KUBE_DOWN_OUT"
+    fi
 else
     echo "    no ts6-manager pod; skipping down"
 fi
@@ -120,6 +133,10 @@ if [[ "$HEALTH_OK" -ne 1 ]]; then
     die "/health did not succeed after kube play"
 fi
 echo "    $(cat "$HEALTH_OUT")"
+
+echo "==> applying fullstack soft pin (Contabo HostConfig; no-op if unset)"
+"${SCRIPT_DIR}/apply-fullstack-soft-pin.sh" \
+    || die "soft pin requested but apply failed"
 
 echo
 echo "OK: ts6-manager is on ${TAG} (fullstack + sidecar)."
