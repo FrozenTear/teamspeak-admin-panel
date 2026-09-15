@@ -285,7 +285,7 @@ mod tests {
         assert_eq!(drafts.len(), 1);
         assert_eq!(
             drafts[0].title,
-            "[bug-report] /music-bots/42 — optional operator text"
+            "[bug-report] /music-bots/42 · v1.6.9 — optional operator text"
         );
         assert!(drafts[0].body.contains("viewer4"));
         assert!(drafts[0].body.contains("/music-bots/42"));
