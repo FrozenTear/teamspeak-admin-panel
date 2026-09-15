@@ -352,7 +352,7 @@ fn select_tail_lines(lines: &[String], keep: usize) -> (usize, Vec<String>) {
     if lines.len() <= keep {
         return (0, lines.to_vec());
     }
-    let recent_n = (keep + 1) / 2;
+    let recent_n = keep.div_ceil(2);
     let recent_n = recent_n.min(lines.len());
     let split_at = lines.len() - recent_n;
     let recent = &lines[split_at..];
@@ -573,12 +573,10 @@ fn truncate_at_word(s: &str, max: usize) -> String {
     let taken: String = s.chars().take(max).collect();
     let min_keep = (max / 2).max(1);
     let mut last_break: Option<usize> = None;
-    let mut chars = 0usize;
-    for (i, ch) in taken.char_indices() {
+    for (chars, (i, ch)) in taken.char_indices().enumerate() {
         if chars >= min_keep && is_title_break(ch) {
             last_break = Some(i);
         }
-        chars += 1;
     }
     if let Some(i) = last_break {
         taken[..i]
