@@ -28,8 +28,9 @@ that tag (required — the manifest uses `imagePullPolicy: IfNotPresent`),
 writes a temp manifest so fullstack **and** sidecar share the tag,
 `podman kube down`s the committed YAML **without** `--force`, plays
 the temp file (pod-only if `podman secret exists ts6-manager-secrets`,
-otherwise concatenates `deploy/kube/secrets.yaml`), and curls
-`http://127.0.0.1:3001/health`.
+otherwise concatenates `deploy/kube/secrets.yaml`), curls
+`http://127.0.0.1:3001/health`, then re-applies the Contabo soft CPU
+pin (see [Contabo soft CPU pin](#contabo-soft-cpu-pin)).
 
 Never `podman kube down --force` — that wipes `ts6-data` / `ts6-db` /
 `ts6-music`. Confirm volumes survived with
@@ -37,6 +38,18 @@ Never `podman kube down --force` — that wipes `ts6-data` / `ts6-db` /
 
 Manual `sed` / concat / play steps are in [Appendix: manual kube
 path](#appendix-manual-kube-path).
+
+## Contabo soft CPU pin
+
+`podman kube play` does not persist HostConfig `CpusetCpus` or process
+nice. After health succeeds, `update.sh` runs
+`scripts/apply-fullstack-soft-pin.sh`, which sources
+`deploy/contabo/soft-pin.env` and re-applies `CpusetCpus=2-5` plus nice
+`-5` on `ts6-manager-fullstack` only. Sidecar stays unpinned unless
+that file sets `TS6_SIDECAR_*`. Disable by emptying the vars, removing
+the file, or pointing `TS6_SOFT_PIN_ENV` at a host-local override
+(Floki / other hosts). A requested cpuset that `podman update` cannot
+apply fails the upgrade so Contabo does not silently lose the pin.
 
 ## Bring up
 
@@ -128,6 +141,7 @@ podman kube play /tmp/ts6-manager.kube.override.yaml
 # podman kube play /tmp/ts6-manager.kube.yaml
 
 curl -fsS http://127.0.0.1:3001/health
+./scripts/apply-fullstack-soft-pin.sh   # Contabo soft pin; no-op if unset
 ```
 
 ### Override to a local build (pre-publish smoke)
