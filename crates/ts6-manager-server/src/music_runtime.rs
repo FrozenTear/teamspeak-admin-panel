@@ -720,3 +720,40 @@ impl MusicBotStore for RemoteMusicRuntime {
         .await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use music_bot::BotConfig;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn remote_front_roundtrip_does_not_own_a_local_send_loop() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = music_bot::runtime_http::router(music_bot::runtime_http::RuntimeState::new());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        let front = MusicBotFront::remote(format!("http://{addr}"));
+        assert!(front.is_remote());
+        assert!(front.wait_until_healthy(20).await);
+
+        let cfg = BotConfig::new(
+            "remote-front",
+            std::env::temp_dir().join("music-runtime-remote-front.identity"),
+        )
+        .with_auto_connect(false);
+        let id = front
+            .spawn(
+                cfg,
+                Arc::new(RwLock::new(None)),
+                Arc::new(RwLock::new(None)),
+            )
+            .await;
+        assert_ne!(id.0, 0);
+        assert_eq!(front.list().await.len(), 1);
+        assert!(front.send(id, BotCommand::Disconnect).await.is_ok());
+    }
+}
