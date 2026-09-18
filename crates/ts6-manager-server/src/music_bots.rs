@@ -22,6 +22,7 @@ use chrono::{DateTime, Utc};
 use music_bot::{BotEvent, BotId, BotState, BotSupervisor, ChannelId, Track};
 use tokio::sync::RwLock;
 use tokio::sync::broadcast;
+use tracing::warn;
 use ts6_manager_shared::music_bots as wire;
 
 use crate::music_runtime::MusicBotFront;
@@ -80,8 +81,13 @@ impl MusicBotService {
     /// is small (default 64 in `BotConfig::event_buffer`); the worker is
     /// purely a state mirror.
     pub async fn watch(&self, bot: BotId) {
-        let Some(rx) = self.supervisor.subscribe(bot).await else {
-            return;
+        let rx = match self.supervisor.subscribe(bot).await {
+            Ok(Some(rx)) => rx,
+            Ok(None) => return,
+            Err(err) => {
+                warn!(bot = %bot, error = %err, "subscribe failed; not watching");
+                return;
+            }
         };
         let liveness = Arc::clone(&self.liveness);
         let requests = Arc::clone(&self.requests);

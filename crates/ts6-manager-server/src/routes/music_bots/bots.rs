@@ -22,7 +22,9 @@ use ts6_manager_shared::music_bots as wire;
 use crate::app_state::AppState;
 use crate::auth::extractors::{RequireAuth, RequireAuthOrQueryToken};
 use crate::routes::music_bots::convert::{bot_id_to_wire, bot_state_to_wire, track_to_wire};
-use crate::routes::music_bots::{not_found, translate_send_error, validation};
+use crate::routes::music_bots::{
+    music_runtime_unavailable, not_found, translate_send_error, validation,
+};
 
 pub(super) fn router() -> Router<AppState> {
     Router::new()
@@ -40,7 +42,10 @@ async fn list(
     RequireAuth(_user): RequireAuth,
 ) -> Result<Json<Vec<wire::MusicBotSummary>>, Response> {
     let supervisor = &state.music_bots.supervisor;
-    let infos = supervisor.list().await;
+    let infos = supervisor
+        .list()
+        .await
+        .map_err(|e| music_runtime_unavailable(&e.to_string()))?;
     let mut out = Vec::with_capacity(infos.len());
     for info in infos {
         let liveness = state.music_bots.liveness.snapshot(info.id).await;
@@ -70,7 +75,12 @@ async fn detail(
     // Look the bot up in the supervisor's list — `subscribe` returns
     // `None` for a bot that was never spawned, but we want to 404 on a
     // detail GET specifically.
-    let infos = state.music_bots.supervisor.list().await;
+    let infos = state
+        .music_bots
+        .supervisor
+        .list()
+        .await
+        .map_err(|e| music_runtime_unavailable(&e.to_string()))?;
     let info = infos
         .into_iter()
         .find(|i| i.id == bot)
@@ -128,7 +138,13 @@ async fn create(
         // first connect attempt surfaces the I/O error via
         // `BotEvent::Error::Connection` — no need to abort the create.
         let _ = std::fs::create_dir_all(dir);
-        dir.join(format!("bot-{}.identity", supervisor.next_id_hint().await))
+        dir.join(format!(
+            "bot-{}.identity",
+            supervisor
+                .next_id_hint()
+                .await
+                .map_err(|e| music_runtime_unavailable(&e.to_string()))?
+        ))
     };
 
     // `auto_connect` is omittable on the wire; `BotConfig` defaults it
@@ -142,7 +158,8 @@ async fn create(
 
     let id = supervisor
         .spawn(config, state.yt_cookie.clone(), state.yt_api_key.clone())
-        .await;
+        .await
+        .map_err(|e| music_runtime_unavailable(&e.to_string()))?;
     state.music_bots.watch(id).await;
 
     // PURA-357 — persist the bot's runtime config so it survives a
@@ -274,12 +291,11 @@ async fn events_sse(
     Path(id): Path<u64>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, Response> {
     let bot = music_bot::BotId(id);
-    let rx = state
-        .music_bots
-        .supervisor
-        .subscribe(bot)
-        .await
-        .ok_or_else(|| not_found("bot not found"))?;
+    let rx = match state.music_bots.supervisor.subscribe(bot).await {
+        Ok(Some(rx)) => rx,
+        Ok(None) => return Err(not_found("bot not found")),
+        Err(err) => return Err(music_runtime_unavailable(&err.to_string())),
+    };
     let stream = BroadcastStream::new(rx).filter_map(|item| async move {
         match item {
             Ok(ev) => match wire_event(&ev) {

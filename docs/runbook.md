@@ -261,7 +261,10 @@ until cutover. Bot `TS6_BOT_CPUSET=0-1` is an in-process send-thread
 pin (option 1) — not a container-wide cpuset (that would pin
 ffmpeg/yt-dlp onto send cores). Media workers stay unpinned and may
 contend on 0-1 until fullstack pin shrinks (out of scope). Sidecar
-stays unpinned. Never `podman kube down --force`. Do not MOVE the bot
+stays unpinned. The music kube container has no `envFrom` secrets;
+fullstack `sync_settings` pushes the yt-dlp cookie / API key after
+`/health` as long as those paths stay under the shared `ts6-data`
+volume. Never `podman kube down --force`. Do not MOVE the bot
 runtime to Floki. Verify signatures first if you want — see § 5 and
 [`docs/ops/images.md` § 3](ops/images.md#3-signing).
 

@@ -256,7 +256,7 @@ mod server_entry {
                     )
                     .with_server_addr(row.serverAddr)
                     .with_auto_connect(row.autoConnect);
-                    state
+                    match state
                         .music_bots
                         .supervisor
                         .spawn_with_id(
@@ -265,8 +265,15 @@ mod server_entry {
                             state.yt_cookie.clone(),
                             state.yt_api_key.clone(),
                         )
-                        .await;
-                    state.music_bots.watch(id).await;
+                        .await
+                    {
+                        Ok(id) => state.music_bots.watch(id).await,
+                        Err(err) => tracing::warn!(
+                            bot = %id,
+                            error = %err,
+                            "rehydrate spawn failed — bot not restored this boot"
+                        ),
+                    }
                 }
                 if count > 0 {
                     tracing::info!(count, "rehydrated music bots from music_bot_runtime");

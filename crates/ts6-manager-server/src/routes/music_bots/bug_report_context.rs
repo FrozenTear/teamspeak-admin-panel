@@ -80,7 +80,8 @@ pub async fn enrich_bug_report_request(
     next.run(Request::from_parts(parts, body)).await
 }
 
-/// Pure enrichment used by the middleware and its tests.
+/// Test helper — production middleware uses [`enrich_bug_report_json_with`].
+#[cfg(test)]
 pub fn enrich_bug_report_json(bytes: &[u8]) -> Option<Vec<u8>> {
     enrich_bug_report_json_with(bytes, &music_bot::bug_report::snapshot())
 }

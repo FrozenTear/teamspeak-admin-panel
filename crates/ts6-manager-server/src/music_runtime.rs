@@ -23,6 +23,23 @@ use music_bot::{
 use tokio::sync::{Mutex, broadcast};
 use tracing::{info, warn};
 
+/// Remote music-unit hop failed. REST maps this to 5xx so Panel does
+/// not treat a down unit as “no bots” or “spawned id 0”.
+#[derive(Debug, Clone)]
+pub struct MusicRuntimeError(pub String);
+
+impl std::fmt::Display for MusicRuntimeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for MusicRuntimeError {}
+
+fn runtime_err(msg: impl Into<String>) -> MusicRuntimeError {
+    MusicRuntimeError(msg.into())
+}
+
 #[derive(Clone)]
 pub struct MusicBotFront {
     inner: FrontInner,
@@ -51,14 +68,14 @@ impl MusicBotFront {
         matches!(self.inner, FrontInner::Remote(_))
     }
 
-    pub async fn next_id_hint(&self) -> u64 {
-        self.list().await.iter().map(|i| i.id.0).max().unwrap_or(0) + 1
+    pub async fn next_id_hint(&self) -> Result<u64, MusicRuntimeError> {
+        Ok(self.list().await?.iter().map(|i| i.id.0).max().unwrap_or(0) + 1)
     }
 
-    pub async fn list(&self) -> Vec<BotInfo> {
+    pub async fn list(&self) -> Result<Vec<BotInfo>, MusicRuntimeError> {
         match &self.inner {
-            FrontInner::Local(s) => s.list().await,
-            FrontInner::Remote(r) => r.list().await.unwrap_or_default(),
+            FrontInner::Local(s) => Ok(s.list().await),
+            FrontInner::Remote(r) => r.list().await,
         }
     }
 
@@ -67,13 +84,10 @@ impl MusicBotFront {
         config: BotConfig,
         yt_cookie: Arc<RwLock<Option<PathBuf>>>,
         yt_api_key: Arc<RwLock<Option<String>>>,
-    ) -> BotId {
+    ) -> Result<BotId, MusicRuntimeError> {
         match &self.inner {
-            FrontInner::Local(s) => s.spawn(config, yt_cookie, yt_api_key).await,
-            FrontInner::Remote(r) => r
-                .spawn(SpawnRequest { config, id: None })
-                .await
-                .unwrap_or(BotId(0)),
+            FrontInner::Local(s) => Ok(s.spawn(config, yt_cookie, yt_api_key).await),
+            FrontInner::Remote(r) => r.spawn(SpawnRequest { config, id: None }).await,
         }
     }
 
@@ -83,16 +97,16 @@ impl MusicBotFront {
         config: BotConfig,
         yt_cookie: Arc<RwLock<Option<PathBuf>>>,
         yt_api_key: Arc<RwLock<Option<String>>>,
-    ) -> BotId {
+    ) -> Result<BotId, MusicRuntimeError> {
         match &self.inner {
-            FrontInner::Local(s) => s.spawn_with_id(id, config, yt_cookie, yt_api_key).await,
-            FrontInner::Remote(r) => r
-                .spawn(SpawnRequest {
+            FrontInner::Local(s) => Ok(s.spawn_with_id(id, config, yt_cookie, yt_api_key).await),
+            FrontInner::Remote(r) => {
+                r.spawn(SpawnRequest {
                     config,
                     id: Some(id.0),
                 })
                 .await
-                .unwrap_or(id),
+            }
         }
     }
 
@@ -103,9 +117,12 @@ impl MusicBotFront {
         }
     }
 
-    pub async fn subscribe(&self, id: BotId) -> Option<broadcast::Receiver<BotEvent>> {
+    pub async fn subscribe(
+        &self,
+        id: BotId,
+    ) -> Result<Option<broadcast::Receiver<BotEvent>>, MusicRuntimeError> {
         match &self.inner {
-            FrontInner::Local(s) => s.subscribe(id).await,
+            FrontInner::Local(s) => Ok(s.subscribe(id).await),
             FrontInner::Remote(r) => r.subscribe(id).await,
         }
     }
@@ -328,6 +345,8 @@ impl MusicBotFront {
 struct RemoteMusicRuntime {
     base: String,
     http: reqwest::Client,
+    /// No request timeout — `/v1/bots/{id}/events` is a long-lived SSE.
+    sse: reqwest::Client,
     pumps: Arc<Mutex<HashMap<BotId, broadcast::Sender<BotEvent>>>>,
 }
 
@@ -338,9 +357,18 @@ impl RemoteMusicRuntime {
             .timeout(Duration::from_secs(15))
             .build()
             .expect("reqwest::Client default build succeeds");
+        // reqwest 0.12 `timeout` is `Duration` (cannot disable). The
+        // events pump streams `chunk()`s, so this is only a reconnect
+        // cap — not a `text().await` body wait.
+        let sse = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(60 * 60 * 24))
+            .build()
+            .expect("reqwest::Client SSE build succeeds");
         Self {
             base,
             http,
+            sse,
             pumps: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -364,32 +392,38 @@ impl RemoteMusicRuntime {
         false
     }
 
-    async fn list(&self) -> Result<Vec<BotInfo>, String> {
+    async fn list(&self) -> Result<Vec<BotInfo>, MusicRuntimeError> {
         let resp = self
             .http
             .get(format!("{}/v1/bots", self.base))
             .send()
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| runtime_err(format!("list bots: {e}")))?;
         if !resp.status().is_success() {
-            return Err(format!("list bots: {}", resp.status()));
+            return Err(runtime_err(format!("list bots: {}", resp.status())));
         }
-        let body: ListResponse = resp.json().await.map_err(|e| e.to_string())?;
+        let body: ListResponse = resp
+            .json()
+            .await
+            .map_err(|e| runtime_err(format!("list bots: {e}")))?;
         Ok(body.bots)
     }
 
-    async fn spawn(&self, req: SpawnRequest) -> Result<BotId, String> {
+    async fn spawn(&self, req: SpawnRequest) -> Result<BotId, MusicRuntimeError> {
         let resp = self
             .http
             .post(format!("{}/v1/bots", self.base))
             .json(&req)
             .send()
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| runtime_err(format!("spawn: {e}")))?;
         if !resp.status().is_success() {
-            return Err(format!("spawn: {}", resp.status()));
+            return Err(runtime_err(format!("spawn: {}", resp.status())));
         }
-        let body: SpawnResponse = resp.json().await.map_err(|e| e.to_string())?;
+        let body: SpawnResponse = resp
+            .json()
+            .await
+            .map_err(|e| runtime_err(format!("spawn: {e}")))?;
         Ok(body.id)
     }
 
@@ -426,26 +460,28 @@ impl RemoteMusicRuntime {
         Ok(())
     }
 
-    async fn subscribe(&self, id: BotId) -> Option<broadcast::Receiver<BotEvent>> {
-        let bots = self.list().await.ok()?;
+    async fn subscribe(
+        &self,
+        id: BotId,
+    ) -> Result<Option<broadcast::Receiver<BotEvent>>, MusicRuntimeError> {
+        let bots = self.list().await?;
         if !bots.iter().any(|b| b.id == id) {
-            return None;
+            return Ok(None);
         }
         let mut pumps = self.pumps.lock().await;
-        let tx = pumps
-            .entry(id)
-            .or_insert_with(|| {
-                let (tx, _) = broadcast::channel(64);
-                let pump_tx = tx.clone();
-                let http = self.http.clone();
-                let base = self.base.clone();
-                tokio::spawn(async move {
-                    pump_events(http, base, id, pump_tx).await;
-                });
-                tx
-            })
-            .clone();
-        Some(tx.subscribe())
+        if let Some(tx) = pumps.get(&id) {
+            return Ok(Some(tx.subscribe()));
+        }
+        let (tx, rx) = broadcast::channel(64);
+        start_event_pump(
+            self.sse.clone(),
+            self.base.clone(),
+            id,
+            tx.clone(),
+            Arc::clone(&self.pumps),
+        );
+        pumps.insert(id, tx);
+        Ok(Some(rx))
     }
 
     async fn push_settings(&self, req: SettingsRequest) -> Result<(), String> {
@@ -536,8 +572,61 @@ impl RemoteMusicRuntime {
     }
 }
 
+fn start_event_pump(
+    sse: reqwest::Client,
+    base: String,
+    id: BotId,
+    tx: broadcast::Sender<BotEvent>,
+    pumps: Arc<Mutex<HashMap<BotId, broadcast::Sender<BotEvent>>>>,
+) {
+    tokio::spawn(async move {
+        pump_events(sse.clone(), base.clone(), id, tx.clone()).await;
+        let mut map = pumps.lock().await;
+        let Some(existing) = map.get(&id) else {
+            return;
+        };
+        if !existing.same_channel(&tx) {
+            return;
+        }
+        if existing.receiver_count() == 0 {
+            map.remove(&id);
+            return;
+        }
+        let restart_tx = existing.clone();
+        drop(map);
+        start_event_pump(sse, base, id, restart_tx, pumps);
+    });
+}
+
+/// Incremental SSE frame parser. Leaves a partial tail in `buf`.
+fn take_sse_events(buf: &mut String) -> Vec<BotEvent> {
+    let mut out = Vec::new();
+    loop {
+        let crlf = buf.find("\r\n\r\n");
+        let lf = buf.find("\n\n");
+        let (idx, sep_len) = match (crlf, lf) {
+            (Some(c), Some(l)) if c <= l => (c, 4),
+            (Some(c), None) => (c, 4),
+            (_, Some(l)) => (l, 2),
+            (None, None) => break,
+        };
+        let frame = buf[..idx].to_string();
+        buf.drain(..idx + sep_len);
+        for line in frame.lines() {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            let Some(data) = line.strip_prefix("data:") else {
+                continue;
+            };
+            if let Ok(ev) = serde_json::from_str::<BotEvent>(data.trim()) {
+                out.push(ev);
+            }
+        }
+    }
+    out
+}
+
 async fn pump_events(
-    http: reqwest::Client,
+    sse: reqwest::Client,
     base: String,
     id: BotId,
     tx: broadcast::Sender<BotEvent>,
@@ -545,31 +634,41 @@ async fn pump_events(
     let url = format!("{base}/v1/bots/{}/events", id.0);
     loop {
         if tx.receiver_count() == 0 {
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            continue;
+            return;
         }
-        match http.get(&url).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                let text = match resp.text().await {
-                    Ok(t) => t,
-                    Err(_) => {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        continue;
+        match sse.get(&url).send().await {
+            Ok(mut resp) if resp.status().is_success() => {
+                let mut buf = String::new();
+                loop {
+                    if tx.receiver_count() == 0 {
+                        return;
                     }
-                };
-                for frame in text.split("\n\n") {
-                    for line in frame.lines() {
-                        let Some(data) = line.strip_prefix("data:") else {
-                            continue;
-                        };
-                        if let Ok(ev) = serde_json::from_str::<BotEvent>(data.trim()) {
-                            let _ = tx.send(ev);
+                    match resp.chunk().await {
+                        Ok(Some(bytes)) => {
+                            buf.push_str(&String::from_utf8_lossy(&bytes));
+                            for ev in take_sse_events(&mut buf) {
+                                let _ = tx.send(ev);
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(err) => {
+                            warn!(error = %err, bot = %id, "music-runtime SSE chunk failed");
+                            break;
                         }
                     }
                 }
             }
-            _ => tokio::time::sleep(Duration::from_secs(1)).await,
+            Ok(resp) => {
+                warn!(status = %resp.status(), bot = %id, "music-runtime SSE HTTP error");
+            }
+            Err(err) => {
+                warn!(error = %err, bot = %id, "music-runtime SSE connect failed");
+            }
         }
+        if tx.receiver_count() == 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
 
@@ -724,8 +823,17 @@ impl MusicBotStore for RemoteMusicRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use music_bot::BotConfig;
+    use std::convert::Infallible;
+
+    use axum::Json;
+    use axum::Router;
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use axum::routing::get;
+    use futures::stream::StreamExt;
+    use music_bot::runtime_api::ListResponse;
+    use music_bot::{BotConfig, BotEvent, BotId, BotInfo};
     use tokio::net::TcpListener;
+    use tokio_stream::wrappers::BroadcastStream;
 
     #[tokio::test]
     async fn remote_front_roundtrip_does_not_own_a_local_send_loop() {
@@ -751,9 +859,109 @@ mod tests {
                 Arc::new(RwLock::new(None)),
                 Arc::new(RwLock::new(None)),
             )
-            .await;
+            .await
+            .expect("spawn must surface a real id");
         assert_ne!(id.0, 0);
-        assert_eq!(front.list().await.len(), 1);
+        assert_eq!(front.list().await.expect("list").len(), 1);
         assert!(front.send(id, BotCommand::Disconnect).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn remote_spawn_and_list_propagate_transport_errors() {
+        let front = MusicBotFront::remote("http://127.0.0.1:1");
+        let cfg = BotConfig::new(
+            "poison",
+            std::env::temp_dir().join("music-runtime-poison.identity"),
+        )
+        .with_auto_connect(false);
+        let spawn = front
+            .spawn(
+                cfg,
+                Arc::new(RwLock::new(None)),
+                Arc::new(RwLock::new(None)),
+            )
+            .await;
+        assert!(
+            spawn.is_err(),
+            "failed hop must not mint BotId(0), got {spawn:?}"
+        );
+        assert!(
+            front.list().await.is_err(),
+            "music-unit-down must not look like an empty bot list"
+        );
+    }
+
+    #[test]
+    fn take_sse_events_parses_incremental_frames_and_keeps_tail() {
+        let first = serde_json::to_string(&BotEvent::QueueEmpty).unwrap();
+        let second = serde_json::to_string(&BotEvent::LeftChannel).unwrap();
+        let mut buf = format!("data: {first}\n\ndata: {}", &second[..second.len() / 2]);
+        let evs = take_sse_events(&mut buf);
+        assert_eq!(evs.len(), 1);
+        assert!(matches!(evs[0], BotEvent::QueueEmpty));
+        assert!(buf.starts_with("data: "));
+        buf.push_str(&second[second.len() / 2..]);
+        buf.push_str("\n\n");
+        let evs = take_sse_events(&mut buf);
+        assert_eq!(evs.len(), 1);
+        assert!(matches!(evs[0], BotEvent::LeftChannel));
+        assert!(buf.is_empty());
+    }
+
+    #[tokio::test]
+    async fn remote_sse_pump_delivers_while_stream_stays_open() {
+        let (event_tx, _) = broadcast::channel::<BotEvent>(8);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let live = event_tx.clone();
+        let app = Router::new()
+            .route(
+                "/v1/bots",
+                get(|| async {
+                    Json(ListResponse {
+                        bots: vec![BotInfo {
+                            id: BotId(1),
+                            name: "sse".into(),
+                            server_addr: "x".into(),
+                        }],
+                    })
+                }),
+            )
+            .route(
+                "/v1/bots/{id}/events",
+                get(move || {
+                    let rx = live.subscribe();
+                    async move {
+                        let stream = BroadcastStream::new(rx).filter_map(|item| async move {
+                            match item {
+                                Ok(ev) => Some(Ok::<_, Infallible>(
+                                    Event::default().data(serde_json::to_string(&ev).unwrap()),
+                                )),
+                                Err(_) => None,
+                            }
+                        });
+                        Sse::new(stream)
+                            .keep_alive(KeepAlive::new().interval(Duration::from_secs(60)))
+                    }
+                }),
+            );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        let front = MusicBotFront::remote(format!("http://{addr}"));
+        let mut rx = front
+            .subscribe(BotId(1))
+            .await
+            .expect("list must succeed")
+            .expect("bot 1 exists");
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        event_tx.send(BotEvent::QueueEmpty).unwrap();
+        let ev = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("SSE pump must deliver while the stream stays open")
+            .expect("event");
+        assert!(matches!(ev, BotEvent::QueueEmpty));
     }
 }

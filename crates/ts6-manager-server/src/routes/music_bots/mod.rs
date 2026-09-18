@@ -87,6 +87,15 @@ pub(super) fn internal(message: &str) -> Response {
     err(StatusCode::INTERNAL_SERVER_ERROR, message)
 }
 
+/// Music unit hop failed (transport / non-success). Not a 404 empty list.
+pub(super) fn music_runtime_unavailable(message: &str) -> Response {
+    err_with_code(
+        StatusCode::BAD_GATEWAY,
+        message,
+        "music_runtime_unavailable",
+    )
+}
+
 /// Translate a `music_bot::StoreError` into an `ErrorBody` response. Used
 /// by every resource that touches the bot store directly.
 pub(super) fn translate_store_error(err: music_bot::StoreError) -> Response {
