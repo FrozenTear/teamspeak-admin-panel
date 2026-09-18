@@ -142,6 +142,46 @@ async fn list_requires_auth() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
+#[tokio::test]
+async fn list_and_create_are_5xx_when_music_runtime_is_down() {
+    let mut state = fresh_state().await;
+    state.music_bots = MusicBotService::remote(
+        std::env::temp_dir().join("ts6-test-music-bots-remote-down"),
+        "http://127.0.0.1:1",
+    );
+    let uid = seed_user(&state, "tester-remote").await;
+    let token = mint_token(&state, uid, "tester-remote");
+    let app = app(state);
+
+    let list = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/music-bots")
+                .header("authorization", auth_header(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list.status(), StatusCode::BAD_GATEWAY);
+
+    let create = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/music-bots")
+                .header("authorization", auth_header(&token))
+                .header("content-type", "application/json")
+                .body(json_body(&create_bot_body()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::BAD_GATEWAY);
+}
+
 async fn create_test_bot(app: &Router, token: &str) -> wire::MusicBotSummary {
     let resp = app
         .clone()
@@ -1598,9 +1638,14 @@ async fn bug_report_post_middleware_merges_absent_context_keys() {
         Json(body)
     }
 
+    let state = fresh_state().await;
     let app = Router::new()
         .route("/api/bug-reports", post(echo))
-        .layer(axum::middleware::from_fn(enrich_bug_report_request));
+        .with_state(state.clone())
+        .layer(axum::middleware::from_fn_with_state(
+            state,
+            enrich_bug_report_request,
+        ));
 
     let resp = app
         .oneshot(

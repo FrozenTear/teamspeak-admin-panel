@@ -761,7 +761,10 @@ async fn supervise(script: PathBuf, socket: PathBuf, state: Arc<SupervisorState>
             .stderr(Stdio::piped());
 
         let mut child = match cmd.spawn() {
-            Ok(child) => child,
+            Ok(child) => {
+                crate::cpuset::pin_decode_child(&child);
+                child
+            }
             Err(e) => {
                 fast_fails += 1;
                 tracing::warn!(

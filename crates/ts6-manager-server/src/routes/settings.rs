@@ -208,8 +208,13 @@ async fn put_cookies(
     // Update the live runtime Arc so the next yt-dlp invocation picks it up.
     {
         let mut guard = state.yt_cookie.write().unwrap_or_else(|e| e.into_inner());
-        *guard = Some(cookie_path);
+        *guard = Some(cookie_path.clone());
     }
+    state
+        .music_bots
+        .supervisor
+        .sync_settings(Some(Some(cookie_path)), None)
+        .await;
 
     tracing::info!(path = %path_str, "yt-dlp cookie file uploaded");
     StatusCode::NO_CONTENT.into_response()
@@ -251,6 +256,11 @@ async fn delete_cookies(_admin: RequireAdmin, State(state): State<AppState>) -> 
         let mut guard = state.yt_cookie.write().unwrap_or_else(|e| e.into_inner());
         *guard = None;
     }
+    state
+        .music_bots
+        .supervisor
+        .sync_settings(Some(None), None)
+        .await;
 
     tracing::info!("yt-dlp cookie file deleted");
     StatusCode::NO_CONTENT.into_response()
@@ -321,6 +331,11 @@ async fn put_api_key(
         let mut guard = state.yt_api_key.write().unwrap_or_else(|e| e.into_inner());
         *guard = Some(key.to_string());
     }
+    state
+        .music_bots
+        .supervisor
+        .sync_settings(None, Some(Some(key.to_string())))
+        .await;
 
     // Never log the value — presence only.
     tracing::info!("youtube api key updated via /settings");
@@ -338,6 +353,11 @@ async fn delete_api_key(_admin: RequireAdmin, State(state): State<AppState>) -> 
         let mut guard = state.yt_api_key.write().unwrap_or_else(|e| e.into_inner());
         *guard = None;
     }
+    state
+        .music_bots
+        .supervisor
+        .sync_settings(None, Some(None))
+        .await;
 
     tracing::info!("youtube api key cleared via /settings");
     StatusCode::NO_CONTENT.into_response()

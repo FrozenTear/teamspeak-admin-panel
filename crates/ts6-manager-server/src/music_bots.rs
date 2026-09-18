@@ -22,13 +22,19 @@ use chrono::{DateTime, Utc};
 use music_bot::{BotEvent, BotId, BotState, BotSupervisor, ChannelId, Track};
 use tokio::sync::RwLock;
 use tokio::sync::broadcast;
+use tracing::warn;
 use ts6_manager_shared::music_bots as wire;
+
+use crate::music_runtime::MusicBotFront;
 
 /// Service layer wired into [`crate::app_state::AppState::music_bots`].
 /// One instance per process; cheap to clone (every field is `Arc`-shared).
 #[derive(Clone)]
 pub struct MusicBotService {
-    pub supervisor: Arc<BotSupervisor>,
+    /// Local [`BotSupervisor`] or a remote `ts6-manager-music` front.
+    /// Contabo kube sets `MUSIC_RUNTIME_URL` so this is remote and
+    /// fullstack does not own a second send loop.
+    pub supervisor: MusicBotFront,
     pub identity_dir: Arc<PathBuf>,
     pub liveness: Arc<LivenessTracker>,
     pub requests: Arc<RequestLog>,
@@ -40,7 +46,7 @@ impl MusicBotService {
     /// `identityPath` receive their on-disk identity file (matches
     /// `ts6_voice_fixture::load_or_create_identity`).
     pub fn new(identity_dir: PathBuf) -> Self {
-        let supervisor = Arc::new(BotSupervisor::new());
+        let supervisor = MusicBotFront::local(Arc::new(BotSupervisor::new()));
         let liveness = Arc::new(LivenessTracker::default());
         let requests = Arc::new(RequestLog::default());
         Self {
@@ -48,6 +54,16 @@ impl MusicBotService {
             identity_dir: Arc::new(identity_dir),
             liveness,
             requests,
+        }
+    }
+
+    /// Contabo / kube: fullstack talks to `ts6-manager-music` over loopback.
+    pub fn remote(identity_dir: PathBuf, runtime_url: impl Into<String>) -> Self {
+        Self {
+            supervisor: MusicBotFront::remote(runtime_url),
+            identity_dir: Arc::new(identity_dir),
+            liveness: Arc::new(LivenessTracker::default()),
+            requests: Arc::new(RequestLog::default()),
         }
     }
 
@@ -65,8 +81,13 @@ impl MusicBotService {
     /// is small (default 64 in `BotConfig::event_buffer`); the worker is
     /// purely a state mirror.
     pub async fn watch(&self, bot: BotId) {
-        let Some(rx) = self.supervisor.subscribe(bot).await else {
-            return;
+        let rx = match self.supervisor.subscribe(bot).await {
+            Ok(Some(rx)) => rx,
+            Ok(None) => return,
+            Err(err) => {
+                warn!(bot = %bot, error = %err, "subscribe failed; not watching");
+                return;
+            }
         };
         let liveness = Arc::clone(&self.liveness);
         let requests = Arc::clone(&self.requests);

@@ -23,13 +23,15 @@ under a path like `/root/github/teamspeak-admin-panel`):
 ./scripts/update.sh v1.6.2
 ```
 
-The script is cwd-agnostic. It `podman pull`s both GHCR images for
-that tag (required — the manifest uses `imagePullPolicy: IfNotPresent`),
-writes a temp manifest so fullstack **and** sidecar share the tag,
-`podman kube down`s the committed YAML **without** `--force`, plays
-the temp file (pod-only if `podman secret exists ts6-manager-secrets`,
-otherwise concatenates `deploy/kube/secrets.yaml`), curls
-`http://127.0.0.1:3001/health`, then re-applies the Contabo soft CPU
+The script is cwd-agnostic. It `podman pull`s the fullstack, music,
+and sidecar GHCR images for that tag (required — the manifest uses
+`imagePullPolicy: IfNotPresent`), writes a temp manifest so all three
+share the tag, `podman kube down`s the committed YAML **without**
+`--force`, plays the temp file (pod-only if `podman secret exists
+ts6-manager-secrets`, otherwise concatenates
+`deploy/kube/secrets.yaml`), curls fullstack
+`http://127.0.0.1:3001/health` **and** music
+`http://127.0.0.1:3002/health`, then re-applies the Contabo soft CPU
 pin (see [Contabo soft CPU pin](#contabo-soft-cpu-pin)).
 
 Never `podman kube down --force` — that wipes `ts6-data` / `ts6-db` /
@@ -42,14 +44,30 @@ path](#appendix-manual-kube-path).
 ## Contabo soft CPU pin
 
 `podman kube play` does not persist HostConfig `CpusetCpus` or process
-nice. After health succeeds, `update.sh` runs
+nice. After both health checks succeed, `update.sh` runs
 `scripts/apply-fullstack-soft-pin.sh`, which sources
-`deploy/contabo/soft-pin.env` and re-applies `CpusetCpus=2-5` plus nice
-`-5` on `ts6-manager-fullstack` only. Sidecar stays unpinned unless
-that file sets `TS6_SIDECAR_*`. Disable by emptying the vars, removing
-the file, or pointing `TS6_SOFT_PIN_ENV` at a host-local override
-(Floki / other hosts). A requested cpuset that `podman update` cannot
-apply fails the upgrade so Contabo does not silently lose the pin.
+`deploy/contabo/soft-pin.env`.
+
+**Until cutover**, fullstack keeps the live pin `CpusetCpus=2-5` plus
+nice `-5` on `ts6-manager-fullstack`. Do not shrink that pin in this
+draft. Sidecar stays unpinned unless the file sets `TS6_SIDECAR_*`.
+
+**Music unit (option 1, nproc=6).** `TS6_BOT_CPUSET` /
+`TS6_BOT_SEND_CPUSET=0-1` is an **in-process** send-thread affinity
+(`sched_setaffinity` on `voice-rt`), not a container-wide
+`podman update --cpuset-cpus=0-1`. A whole-container 0-1 pin would
+also trap ffmpeg / yt-dlp on send cores and violates Music's
+"media workers off 0-1". With fullstack occupying 2-5, media workers
+cannot get exclusive non-0-1 cores without overlapping fullstack.
+They stay unpinned (`TS6_BOT_DECODE_CPUSET` unset) and may contend
+on 0-1 with the send loop (and with Scuffed / host noise) until
+seats + FrozenTear approve shrinking fullstack or freeing a third
+slice. The apply script only renices `ts6-manager-music` when
+`TS6_BOT_NICE` is set. Disable by emptying the vars, removing the
+file, or pointing `TS6_SOFT_PIN_ENV` at a host-local override
+(Floki / other hosts — do not MOVE the bot runtime to Floki). A
+requested container cpuset that `podman update` cannot apply fails
+the upgrade so Contabo does not silently lose the pin.
 
 ## Bring up
 
@@ -103,12 +121,11 @@ podman volume rm ts6-data ts6-db ts6-music
 
 ## Image source
 
-The committed manifest pins both images to the same release tag
-(`ghcr.io/frozentear/ts6-manager-fullstack:v1.6.2` and
-`ghcr.io/frozentear/ts6-manager-sidecar:v1.6.2`). Bump both on a
-release cut, or let `scripts/update.sh TAG` override them. Images are
-published by `.github/workflows/release.yml` — see
-`docs/ops/images.md`.
+The committed manifest pins fullstack, music, and sidecar to the same
+release tag (`…-fullstack:v1.6.2`, `…-music:v1.6.2`,
+`…-sidecar:v1.6.2`). Bump all three on a release cut, or let
+`scripts/update.sh TAG` override them. Images are published by
+`.github/workflows/release.yml` — see `docs/ops/images.md`.
 
 A blind `podman kube play` of the committed file without a prior
 `podman pull` of those tags will keep stale layers (`IfNotPresent`)
@@ -180,6 +197,7 @@ documented production layout.
 | Container port | Host port | Notes |
 |----------------|-----------|-------|
 | 3001 | 3001 | HTTP, served by the Dioxus fullstack server |
+| 3002 | 3002 | Music unit loopback control (`MUSIC_RUNTIME_URL`) |
 | 7080 | 7080 | MoQ sidecar HTTP control |
 | 4443 | 4443 (UDP) | MoQ sidecar WebTransport |
 
@@ -212,16 +230,16 @@ unaffected — that path was never on passt.
 ## Health checks
 
 The manifest defines readiness (5s delay, 10s period) and liveness
-(30s delay, 30s period) probes against `GET /health` on both
-fullstack (`:3001`) and sidecar (`:7080`). Fullstack uses kube
-`httpGet` — `podman kube play` turns that into an in-container
-`curl` HealthCmd (and *overrides* any image HEALTHCHECK), which is
-why `Containerfile.fullstack` installs curl. Sidecar uses an `exec`
-probe that runs `ts6-media-sidecar --healthcheck-url` because the
-sidecar image has neither curl nor wget; an `httpGet` probe fails at
-exec (`curl: not found`) and restart-loops ~every 105s. Quadlet
-sidecar `HealthCmd` uses the same binary invocation. Podman applies
-the liveness probe as `HealthConfig` from v4.4 onward.
+(30s delay, 30s period) probes against `GET /health`. Fullstack
+(`:3001`) uses kube `httpGet` — `podman kube play` turns that into
+an in-container `curl` HealthCmd (and *overrides* any image
+HEALTHCHECK), which is why `Containerfile.fullstack` installs curl.
+Music (`:3002`) and sidecar (`:7080`) use an `exec` probe of the
+binary `--healthcheck-url` because those images have neither curl
+nor wget; an `httpGet` probe fails at exec (`curl: not found`) and
+restart-loops ~every 105s. Do not switch music/sidecar to httpGet.
+Podman applies the liveness probe as `HealthConfig` from v4.4
+onward.
 
 ## Topology
 
@@ -231,7 +249,10 @@ Pod ts6-manager
 │    ├── PVC ts6-data  → /var/lib/ts6-manager       (state root / uploads)
 │    ├── PVC ts6-db    → /var/lib/ts6-manager/db    (SurrealKV)
 │    └── PVC ts6-music → /var/lib/ts6-manager/music
-└── container sidecar    (7080/tcp, 4443/udp, uid 10002)
+├── container music      (port 3002, uid 10001 — shared volume owner)
+│    ├── PVC ts6-data  → /var/lib/ts6-manager       (identities + cookies; no Surreal open)
+│    └── PVC ts6-music → /var/lib/ts6-manager/music (do not orphan this PVC)
+└── container sidecar    (7080/tcp, 4443/udp, uid 10002)  # stays unpinned
 ```
 
 This matches the Quadlet `ts6-manager.pod` topology in

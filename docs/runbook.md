@@ -53,7 +53,8 @@ sidecar adds two more.
 | Port | Component | Protocol | Required? | Notes |
 | --- | --- | --- | --- | --- |
 | `3001` | Fullstack admin panel | TCP | Yes | Web UI + API. Bind a reverse proxy in front for TLS. |
-| `7080` | MoQ sidecar HTTP control | TCP | Only if running the sidecar | Loopback-only inside the pod by default. |
+| `3002` | Music unit control | TCP | Contabo kube | Loopback `MUSIC_RUNTIME_URL`. Exec probe, not httpGet. |
+| `7080` | MoQ sidecar HTTP control | TCP | Only if running the sidecar | Loopback-only inside the pod by default. Unpinned. |
 | `4443` | MoQ sidecar WebTransport | UDP | Only if exposing public video | Browsers reject WebTransport on cleartext origins; terminate TLS. |
 
 For Quadlet, `127.0.0.1:3001:3001` is the default and is overridden by
@@ -236,10 +237,11 @@ log path off the manager itself.
 > If bots/flows/rules vanish after an upgrade, the `ts6-db` volume was
 > lost — restore it from a § 3.2 backup.
 
-The kube manifest pins fullstack **and** sidecar to the same release tag
-(currently `:v1.6.2`). Both GHCR images share that tag from
-`.github/workflows/release.yml`. `imagePullPolicy: IfNotPresent` means
-you must `podman pull` the target tags before play or old layers stick.
+The kube manifest pins fullstack, music, and sidecar to the same
+release tag (currently `:v1.6.2`). All three GHCR images share that
+tag from `.github/workflows/release.yml`. `imagePullPolicy: IfNotPresent`
+means you must `podman pull` the target tags before play or old
+layers stick.
 
 **Contabo / kube — `scripts/update.sh` (recommended):**
 
@@ -247,19 +249,23 @@ you must `podman pull` the target tags before play or old layers stick.
 ./scripts/update.sh v1.6.2
 ```
 
-From any cwd against a repo checkout. The script pulls both images,
-rewrites a temp manifest so sidecar cannot lag, `podman kube down`s
-**without** `--force`, plays (pod-only if `ts6-manager-secrets` already
-exists; otherwise concatenates `deploy/kube/secrets.yaml`), curls
-`http://127.0.0.1:3001/health`, then re-applies Contabo's soft CPU pin
-on `ts6-manager-fullstack` (`deploy/contabo/soft-pin.env` via
-`scripts/apply-fullstack-soft-pin.sh`). Kube YAML cannot persist
-`CpusetCpus` / process nice across down+play; the helper restores
-`2-5` / `-5` so every Contabo update keeps the overnight A/B pin.
-Sidecar stays unpinned unless that env file says so. Disable by
-emptying the vars, removing the file, or pointing `TS6_SOFT_PIN_ENV`
-at an override (Floki / other hosts). Never `podman kube down --force`.
-Verify the new image's signature first if you want — see § 5 and
+From any cwd against a repo checkout. The script pulls fullstack +
+music + sidecar, rewrites a temp manifest so music/sidecar cannot lag,
+`podman kube down`s **without** `--force`, plays (pod-only if
+`ts6-manager-secrets` already exists; otherwise concatenates
+`deploy/kube/secrets.yaml`), curls fullstack `:3001/health` and music
+`:3002/health`, then re-applies Contabo's soft CPU pin
+(`deploy/contabo/soft-pin.env` via
+`scripts/apply-fullstack-soft-pin.sh`). Fullstack stays `2-5` / `-5`
+until cutover. Bot `TS6_BOT_CPUSET=0-1` is an in-process send-thread
+pin (option 1) — not a container-wide cpuset (that would pin
+ffmpeg/yt-dlp onto send cores). Media workers stay unpinned and may
+contend on 0-1 until fullstack pin shrinks (out of scope). Sidecar
+stays unpinned. The music kube container has no `envFrom` secrets;
+fullstack `sync_settings` pushes the yt-dlp cookie / API key after
+`/health` as long as those paths stay under the shared `ts6-data`
+volume. Never `podman kube down --force`. Do not MOVE the bot
+runtime to Floki. Verify signatures first if you want — see § 5 and
 [`docs/ops/images.md` § 3](ops/images.md#3-signing).
 
 **Quadlet:**

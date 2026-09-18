@@ -9,7 +9,7 @@
 #   * CI multi-arch builds (driven by --platform)
 #
 # Usage:
-#   scripts/build-images.sh [fullstack|sidecar|all] [--platform linux/amd64,linux/arm64]
+#   scripts/build-images.sh [fullstack|music|sidecar|all] [--platform linux/amd64,linux/arm64]
 #
 # Defaults: builds both images for the host platform with version=dev.
 #
@@ -39,11 +39,13 @@ namespace="${IMAGE_NAMESPACE:-}"
 
 if [[ "$registry" == "localhost" ]]; then
     fullstack_ref="localhost/ts6-manager-fullstack:${version}"
+    music_ref="localhost/ts6-manager-music:${version}"
     sidecar_ref="localhost/ts6-manager-sidecar:${version}"
 else
     prefix="${registry}"
     [[ -n "$namespace" ]] && prefix="${prefix}/${namespace}"
     fullstack_ref="${prefix}/ts6-manager-fullstack:${version}"
+    music_ref="${prefix}/ts6-manager-music:${version}"
     sidecar_ref="${prefix}/ts6-manager-sidecar:${version}"
 fi
 
@@ -71,15 +73,19 @@ case "$target" in
     fullstack)
         build_image Containerfile.fullstack "$fullstack_ref"
         ;;
+    music)
+        build_image Containerfile.music "$music_ref"
+        ;;
     sidecar)
         build_image Containerfile.sidecar "$sidecar_ref"
         ;;
     all)
         build_image Containerfile.fullstack "$fullstack_ref"
+        build_image Containerfile.music "$music_ref"
         build_image Containerfile.sidecar "$sidecar_ref"
         ;;
     *)
-        echo "Usage: $0 [fullstack|sidecar|all] [--platform <comma-separated>]" >&2
+        echo "Usage: $0 [fullstack|music|sidecar|all] [--platform <comma-separated>]" >&2
         exit 2
         ;;
 esac
@@ -87,4 +93,4 @@ esac
 echo ""
 echo "Built images:"
 podman image ls --format "  {{.Repository}}:{{.Tag}}  {{.Size}}" \
-    | grep -E "ts6-(manager-fullstack|media-sidecar)" || true
+    | grep -E "ts6-manager-(fullstack|music|sidecar)" || true

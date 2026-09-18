@@ -56,6 +56,14 @@ jobs:
             containerfile: Containerfile.sidecar
             arch: arm64
             runner: ubuntu-24.04-arm
+          - image: ts6-manager-music
+            containerfile: Containerfile.music
+            arch: amd64
+            runner: ubuntu-latest
+          - image: ts6-manager-music
+            containerfile: Containerfile.music
+            arch: arm64
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v5
 
@@ -100,7 +108,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [ts6-manager-fullstack, ts6-manager-sidecar]
+        image: [ts6-manager-fullstack, ts6-manager-music, ts6-manager-sidecar]
     steps:
       - name: Resolve release tag
         id: tag
@@ -321,11 +329,12 @@ jobs:
             echo "./scripts/update.sh ${TAG}"
             echo '```'
             echo
-            echo "Pulls both GHCR images, keeps fullstack + sidecar on \`${TAG}\`, plays without wiping \`ts6-data\` / \`ts6-db\` / \`ts6-music\`. See \`deploy/kube/README.md\` and \`docs/runbook.md\` § 3.4."
+            echo "Pulls fullstack + music + sidecar GHCR images, keeps all three on \`${TAG}\`, plays without wiping \`ts6-data\` / \`ts6-db\` / \`ts6-music\`. See \`deploy/kube/README.md\` and \`docs/runbook.md\` § 3.4."
             echo
             echo "### Images (manifest lists, linux/amd64 + linux/arm64)"
             echo
             echo "- \`${REGISTRY}/${IMAGE_NAMESPACE}/ts6-manager-fullstack:${TAG}\`"
+            echo "- \`${REGISTRY}/${IMAGE_NAMESPACE}/ts6-manager-music:${TAG}\`"
             echo "- \`${REGISTRY}/${IMAGE_NAMESPACE}/ts6-manager-sidecar:${TAG}\`"
             echo
             echo "Verify with:"

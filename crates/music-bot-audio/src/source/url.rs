@@ -89,6 +89,7 @@ impl YtDlpSource {
             .stderr(Stdio::piped());
 
         let mut yt_dlp = cmd.spawn()?;
+        crate::cpuset::pin_decode_child(&yt_dlp);
         tracing::info!(
             target: "music_bot_latency",
             stage = "yt_dlp_spawned",
