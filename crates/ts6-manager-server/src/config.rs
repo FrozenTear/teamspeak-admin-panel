@@ -121,10 +121,11 @@ pub struct Config {
     pub log_pretty: Option<bool>,
     /// Number of trusted reverse-proxy hops in front of the listener
     /// (spec §6.8). `0` means the listener is exposed directly and
-    /// `X-Forwarded-For` is ignored. `1` means a single trusted proxy
-    /// rewrote/appended the client IP and the rate limiter trusts the
-    /// rightmost XFF entry. Larger values are accepted but discouraged
-    /// (spec mandates "exactly one proxy hop").
+    /// forwarding headers (`X-Forwarded-For`, `X-Forwarded-Proto`) are
+    /// ignored. `1` means a single trusted proxy rewrote the client IP
+    /// and scheme; the rate limiter and HSTS gate trust the rightmost
+    /// entries. Larger values are accepted but discouraged (spec
+    /// mandates "exactly one proxy hop").
     pub trusted_proxy_hops: u8,
     /// PURA-72 Slice F — per-token request budget for `/api/widget/*`.
     /// Defaults to 30 req/min; overridable via

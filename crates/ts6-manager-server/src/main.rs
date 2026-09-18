@@ -508,7 +508,8 @@ mod server_entry {
             state,
             routes::music_bots::enrich_bug_report_request,
         ));
-        let router = web::security_headers_stack(cfg.node_env).apply(router);
+        let router =
+            web::security_headers_stack(cfg.node_env, cfg.trusted_proxy_hops).apply(router);
         // PURA-48 — per-request nonce-based CSP. Layered LAST so it sits
         // outermost: on the response path it runs after every inner layer,
         // and `headers_mut().insert(CSP, …)` overrides any pre-existing CSP
