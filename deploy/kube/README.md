@@ -48,26 +48,34 @@ nice. After both health checks succeed, `update.sh` runs
 `scripts/apply-fullstack-soft-pin.sh`, which sources
 `deploy/contabo/soft-pin.env`.
 
-**Until cutover**, fullstack keeps the live pin `CpusetCpus=2-5` plus
-nice `-5` on `ts6-manager-fullstack`. Do not shrink that pin in this
-draft. Sidecar stays unpinned unless the file sets `TS6_SIDECAR_*`.
+**Apply-ready default is packing B (Robert):** fullstack
+`CpusetCpus=2-5` plus nice `-5` on `ts6-manager-fullstack`. No
+fullstack shrink. `TS6_SOFT_PIN_SHRINK_ACK` stays unset. Sidecar
+stays unpinned unless the file sets `TS6_SIDECAR_*`.
 
 **Music unit (option 1, nproc=6).** `TS6_BOT_CPUSET` /
 `TS6_BOT_SEND_CPUSET=0-1` is an **in-process** send-thread affinity
-(`sched_setaffinity` on `voice-rt`), not a container-wide
-`podman update --cpuset-cpus=0-1`. A whole-container 0-1 pin would
-also trap ffmpeg / yt-dlp on send cores and violates Music's
-"media workers off 0-1". With fullstack occupying 2-5, media workers
-cannot get exclusive non-0-1 cores without overlapping fullstack.
-They stay unpinned (`TS6_BOT_DECODE_CPUSET` unset) and may contend
-on 0-1 with the send loop (and with Scuffed / host noise) until
-seats + FrozenTear approve shrinking fullstack or freeing a third
-slice. The apply script only renices `ts6-manager-music` when
-`TS6_BOT_NICE` is set. Disable by emptying the vars, removing the
-file, or pointing `TS6_SOFT_PIN_ENV` at a host-local override
-(Floki / other hosts — do not MOVE the bot runtime to Floki). A
-requested container cpuset that `podman update` cannot apply fails
-the upgrade so Contabo does not silently lose the pin.
+(`sched_setaffinity` on `voice-rt`), not HostConfig. kube
+`TS6_BOT_DECODE_CPUSET=2-5` parks ffmpeg / yt-dlp / warm-resolver via
+`pin_decode_child` on the fullstack slice (share Axum — still off
+send `0-1`). Packing **C** (music `podman update --cpuset-cpus=0-1`)
+is **rejected** — the v1.6.15 Angerfist dig (und/C/stall
+**163/590/117**) showed container-wide 0-1 traps ffmpeg on send
+cores. The apply script refuses send-only music HostConfig.
+
+Packing **A** (fullstack→`4-5`, DECODE `2-3`, music HostConfig `0-3`)
+stays a commented gated alt and needs `TS6_SOFT_PIN_SHRINK_ACK=1`.
+DECODE must be set in this kube manifest (process env);
+`soft-pin.env` cannot inject it into a running process.
+
+Nice is host `renice` (`TS6_BOT_NICE`). `TS6_BOT_CHRT_SCHED` FIFO/RR
+is opt-in, default off (no kube privileged / `CAP_SYS_NICE` default).
+In-process `setpriority` as uid 10001 is EPERM. Disable pins by
+emptying the vars, removing `soft-pin.env`, or pointing
+`TS6_SOFT_PIN_ENV` at a host-local override (Floki / other hosts —
+do not MOVE the bot runtime to Floki). A requested container cpuset
+that `podman update` cannot apply fails the upgrade so Contabo does
+not silently lose the pin.
 
 ## Bring up
 

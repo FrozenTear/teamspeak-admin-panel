@@ -185,14 +185,16 @@ spec:
           value: "/var/lib/ts6-manager/music"
         - name: DATA_DIR
           value: "/var/lib/ts6-manager/data"
-        # Intra-container send-thread pin (option 1). NOT a container-wide
-        # HostConfig cpuset — that would also pin ffmpeg/yt-dlp onto 0-1.
-        # nproc=6; fullstack stays 2-5 until cutover. Media workers stay
-        # unpinned (may contend on 0-1) until a third slice exists.
+        # Intra-container SEND pin (option 1). NOT HostConfig.
+        # Packing B (Robert): fullstack soft-pin stays 2-5. DECODE 2-5
+        # shares Axum via pin_decode_child — never on send 0-1.
+        # Never set music HostConfig to 0-1 (packing C; apply script refuses).
         - name: TS6_BOT_CPUSET
           value: "0-1"
         - name: TS6_BOT_SEND_CPUSET
           value: "0-1"
+        - name: TS6_BOT_DECODE_CPUSET
+          value: "2-5"
         - name: TS6_BOT_NICE
           value: "-5"
       volumeMounts:

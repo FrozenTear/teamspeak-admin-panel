@@ -2,22 +2,19 @@
 //!
 //! **Packaging option (1) — intra-container send affinity.**
 //!
-//! Contabo is `nproc=6` (CPUs 0–5). Live fullstack soft pin stays
-//! `2-5` until cutover, so the only cores that do not overlap fullstack
-//! are `0-1`. A whole-container `podman update --cpuset-cpus=0-1` would
-//! also pin ffmpeg / yt-dlp onto those send cores and violate Music's
-//! "media workers off 0–1". Exclusive non-0-1 cores for media workers
-//! are impossible without overlapping fullstack or shrinking that pin
-//! (out of scope).
+//! Contabo is `nproc=6` (CPUs 0–5). **Apply-ready packing B**
+//! (Robert): fullstack soft pin stays `2-5` (no shrink).
 //!
-//! So:
 //! - `TS6_BOT_SEND_CPUSET` (preferred) or `TS6_BOT_CPUSET` pins **only**
 //!   the Voice send runtime threads (`voice-rt`) to `0-1`.
-//! - ffmpeg / yt-dlp / the Python warm resolver stay **unpinned**
-//!   unless `TS6_BOT_DECODE_CPUSET` is set (follow-up, after seats +
-//!   FrozenTear approve shrinking fullstack or freeing a third slice).
-//! - Media workers may therefore contend with the send loop on 0–1
-//!   (and with Scuffed / host noise) until that follow-up.
+//! - [`pin_decode_child`] parks ffmpeg / yt-dlp / the Python warm
+//!   resolver on `TS6_BOT_DECODE_CPUSET=2-5` (share Axum, never send
+//!   `0-1`). Packing A (`DECODE=2-3` after fullstack→`4-5`) is a
+//!   gated comment only. Packing C (HostConfig `0-1` + DECODE on send
+//!   cores) is rejected by the apply script.
+//! - A whole-container `podman update --cpuset-cpus=0-1` is **not**
+//!   implemented. v1.6.15 Angerfist dig 163/590/117: that trap made
+//!   `C_loop_deferral` worse.
 //!
 //! Both env vars accept Linux list syntax (`0-1`, `2-5`, `0,2,4`).
 //! Empty / unset → no-op. Overlap between send and decode sets is
@@ -261,5 +258,26 @@ mod tests {
         let send = parse_cpuset("0-1").unwrap();
         assert_eq!(send, vec![0, 1]);
         assert!(!sets_overlap(&send, &[]));
+    }
+
+    #[test]
+    fn packing_a_send_0_1_does_not_overlap_decode_2_3() {
+        let send = parse_cpuset("0-1").unwrap();
+        let decode = parse_cpuset("2-3").unwrap();
+        assert!(!sets_overlap(&send, &decode));
+    }
+
+    #[test]
+    fn packing_b_send_0_1_does_not_overlap_decode_2_5() {
+        let send = parse_cpuset("0-1").unwrap();
+        let decode = parse_cpuset("2-5").unwrap();
+        assert!(!sets_overlap(&send, &decode));
+    }
+
+    #[test]
+    fn packing_c_send_overlaps_decode_inside_0_1() {
+        let send = parse_cpuset("0-1").unwrap();
+        let decode = parse_cpuset("0-1").unwrap();
+        assert!(sets_overlap(&send, &decode));
     }
 }
