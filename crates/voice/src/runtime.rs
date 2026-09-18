@@ -65,8 +65,11 @@ pub(crate) fn voice_runtime() -> &'static Runtime {
             .thread_name("voice-rt")
             .on_thread_start(|| {
                 // Contabo bot unit: pin + nice the Voice send runtime
-                // only. ffmpeg / yt-dlp stay unpinned unless
-                // TS6_BOT_DECODE_CPUSET is set (music-bot-audio).
+                // only. pin_decode_child parks ffmpeg/yt-dlp when
+                // TS6_BOT_DECODE_CPUSET is set (empty until A/B pick).
+                // In-process setpriority as uid 10001 is often EPERM;
+                // host renice in apply-fullstack-soft-pin.sh is the
+                // supported nice path.
                 music_bot_audio::cpuset::pin_current_thread_send();
                 music_bot_audio::cpuset::nice_current_thread_from_env("TS6_BOT_NICE");
             })

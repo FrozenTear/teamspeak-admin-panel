@@ -6,8 +6,10 @@
 //! `music_bot_latency`) stay in-process.
 //!
 //! Intra-container affinity (option 1): `TS6_BOT_SEND_CPUSET` /
-//! `TS6_BOT_CPUSET` pins `voice-rt` send threads only. ffmpeg / yt-dlp
-//! stay unpinned unless `TS6_BOT_DECODE_CPUSET` is set later.
+//! `TS6_BOT_CPUSET` pins `voice-rt` send threads only. ffmpeg / yt-dlp /
+//! warm-resolver are parked via `pin_decode_child` when
+//! `TS6_BOT_DECODE_CPUSET` is set (empty on live Contabo until Robert
+//! picks packing A=`2-3` or B=`2-5`). Never HostConfig-only `0-1`.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
