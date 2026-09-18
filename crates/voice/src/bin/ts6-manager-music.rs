@@ -5,11 +5,10 @@
 //! fullstack. No Surreal. Wire marks (`first_frame_on_wire`,
 //! `music_bot_latency`) stay in-process.
 //!
-//! Intra-container affinity (option 1): `TS6_BOT_SEND_CPUSET` /
+//! Intra-container affinity (option 1 + packing B): `TS6_BOT_SEND_CPUSET` /
 //! `TS6_BOT_CPUSET` pins `voice-rt` send threads only. ffmpeg / yt-dlp /
-//! warm-resolver are parked via `pin_decode_child` when
-//! `TS6_BOT_DECODE_CPUSET` is set (empty on live Contabo until Robert
-//! picks packing A=`2-3` or B=`2-5`). Never HostConfig-only `0-1`.
+//! warm-resolver are parked via `pin_decode_child` on
+//! `TS6_BOT_DECODE_CPUSET=2-5` (share Axum). Never HostConfig-only `0-1`.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

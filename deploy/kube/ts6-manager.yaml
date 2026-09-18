@@ -186,16 +186,15 @@ spec:
         - name: DATA_DIR
           value: "/var/lib/ts6-manager/data"
         # Intra-container SEND pin (option 1). NOT HostConfig.
-        # Live: fullstack soft-pin stays 2-5. DECODE empty until Robert
-        # picks packing A (2-3 after fullstack→4-5) or B (2-5 share Axum).
+        # Packing B (Robert): fullstack soft-pin stays 2-5. DECODE 2-5
+        # shares Axum via pin_decode_child — never on send 0-1.
         # Never set music HostConfig to 0-1 (packing C; apply script refuses).
-        # pin_decode_child is already wired; empty value = no-op.
         - name: TS6_BOT_CPUSET
           value: "0-1"
         - name: TS6_BOT_SEND_CPUSET
           value: "0-1"
         - name: TS6_BOT_DECODE_CPUSET
-          value: ""
+          value: "2-5"
         - name: TS6_BOT_NICE
           value: "-5"
       volumeMounts:

@@ -2,16 +2,16 @@
 //!
 //! **Packaging option (1) — intra-container send affinity.**
 //!
-//! Contabo is `nproc=6` (CPUs 0–5). **Live apply-ready** fullstack
-//! soft pin stays `2-5` until Robert picks packing A or B.
+//! Contabo is `nproc=6` (CPUs 0–5). **Apply-ready packing B**
+//! (Robert): fullstack soft pin stays `2-5` (no shrink).
 //!
 //! - `TS6_BOT_SEND_CPUSET` (preferred) or `TS6_BOT_CPUSET` pins **only**
 //!   the Voice send runtime threads (`voice-rt`) to `0-1`.
 //! - [`pin_decode_child`] parks ffmpeg / yt-dlp / the Python warm
-//!   resolver when `TS6_BOT_DECODE_CPUSET` is set. Live kube value is
-//!   empty (deferred): parking A=`2-3` needs fullstack shrink to `4-5`;
-//!   parking B=`2-5` shares Axum. Packing C (HostConfig `0-1` + DECODE
-//!   on send cores) is rejected by the apply script.
+//!   resolver on `TS6_BOT_DECODE_CPUSET=2-5` (share Axum, never send
+//!   `0-1`). Packing A (`DECODE=2-3` after fullstack→`4-5`) is a
+//!   gated comment only. Packing C (HostConfig `0-1` + DECODE on send
+//!   cores) is rejected by the apply script.
 //! - A whole-container `podman update --cpuset-cpus=0-1` is **not**
 //!   implemented. v1.6.15 Angerfist dig 163/590/117: that trap made
 //!   `C_loop_deferral` worse.

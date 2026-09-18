@@ -2,9 +2,9 @@
 # Contabo / kube upgrade: pull GHCR images, play a temp manifest
 # with fullstack + music + sidecar on the same TAG, smoke /health
 # (fullstack :3001 and music :3002), then re-apply Contabo soft CPU
-# pin. Live apply-ready fullstack pin stays 2-5 until Robert picks
-# packing A (shrink ACK) or B. Bot SEND pin is in-process; this
-# script only re-applies HostConfig + host nice (never music 0-1).
+# pin. Packing B (Robert): fullstack stays 2-5 / -5. DECODE 2-5 is
+# kube env. Bot SEND pin is in-process; this script only re-applies
+# HostConfig + host nice (never music 0-1). Shrink (A) is not default.
 #
 # Usage (from any cwd, against a repo checkout):
 #   ./scripts/update.sh vX.Y.Z
@@ -17,7 +17,7 @@ usage() {
     echo "usage: $0 vX.Y.Z" >&2
     echo "  Pull fullstack + music + sidecar GHCR images for TAG, kube down" >&2
     echo "  (no --force), kube play, curl fullstack /health and music /health," >&2
-    echo "  then re-apply Contabo soft pin (live fullstack 2-5; shrink needs ACK)." >&2
+    echo "  then re-apply Contabo soft pin (packing B: fullstack 2-5; never music 0-1)." >&2
     echo "example: $0 v1.6.2" >&2
     exit 2
 }
@@ -151,7 +151,7 @@ wait_health "http://127.0.0.1:3001/health" "fullstack /health"
 echo "==> waiting for http://127.0.0.1:3002/health (music)"
 wait_health "http://127.0.0.1:3002/health" "music /health"
 
-echo "==> applying Contabo soft pin (live fullstack 2-5; SEND in-process; never music HostConfig 0-1)"
+echo "==> applying Contabo soft pin (packing B: fullstack 2-5; SEND in-process; never music HostConfig 0-1)"
 "${SCRIPT_DIR}/apply-fullstack-soft-pin.sh" \
     || die "soft pin requested but apply failed"
 

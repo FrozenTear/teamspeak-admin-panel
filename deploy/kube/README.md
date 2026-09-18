@@ -48,25 +48,25 @@ nice. After both health checks succeed, `update.sh` runs
 `scripts/apply-fullstack-soft-pin.sh`, which sources
 `deploy/contabo/soft-pin.env`.
 
-**Live apply-ready default:** fullstack `CpusetCpus=2-5` plus nice
-`-5` on `ts6-manager-fullstack`. Do **not** shrink that pin on Contabo
-until Robert picks packing **A** and sets `TS6_SOFT_PIN_SHRINK_ACK=1`.
-Sidecar stays unpinned unless the file sets `TS6_SIDECAR_*`.
+**Apply-ready default is packing B (Robert):** fullstack
+`CpusetCpus=2-5` plus nice `-5` on `ts6-manager-fullstack`. No
+fullstack shrink. `TS6_SOFT_PIN_SHRINK_ACK` stays unset. Sidecar
+stays unpinned unless the file sets `TS6_SIDECAR_*`.
 
 **Music unit (option 1, nproc=6).** `TS6_BOT_CPUSET` /
 `TS6_BOT_SEND_CPUSET=0-1` is an **in-process** send-thread affinity
-(`sched_setaffinity` on `voice-rt`), not HostConfig. Packing **C**
-(music `podman update --cpuset-cpus=0-1`) is **rejected** — the
-v1.6.15 Angerfist dig (und/C/stall **163/590/117**) showed
-container-wide 0-1 traps ffmpeg on send cores. The apply script
-refuses send-only music HostConfig.
+(`sched_setaffinity` on `voice-rt`), not HostConfig. kube
+`TS6_BOT_DECODE_CPUSET=2-5` parks ffmpeg / yt-dlp / warm-resolver via
+`pin_decode_child` on the fullstack slice (share Axum — still off
+send `0-1`). Packing **C** (music `podman update --cpuset-cpus=0-1`)
+is **rejected** — the v1.6.15 Angerfist dig (und/C/stall
+**163/590/117**) showed container-wide 0-1 traps ffmpeg on send
+cores. The apply script refuses send-only music HostConfig.
 
-`TS6_BOT_DECODE_CPUSET` is present on the music container but **empty**
-until Robert picks **A** (`2-3` after fullstack→`4-5`) or **B**
-(`2-5`, share Axum, fullstack stays `2-5`). `pin_decode_child` already
-parks ffmpeg / yt-dlp / warm-resolver when that env is set. DECODE
-must be set in this kube manifest (process env); `soft-pin.env` cannot
-inject it into a running process.
+Packing **A** (fullstack→`4-5`, DECODE `2-3`, music HostConfig `0-3`)
+stays a commented gated alt and needs `TS6_SOFT_PIN_SHRINK_ACK=1`.
+DECODE must be set in this kube manifest (process env);
+`soft-pin.env` cannot inject it into a running process.
 
 Nice is host `renice` (`TS6_BOT_NICE`). `TS6_BOT_CHRT_SCHED` FIFO/RR
 is opt-in, default off (no kube privileged / `CAP_SYS_NICE` default).

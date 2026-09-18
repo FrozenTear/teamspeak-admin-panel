@@ -7,7 +7,8 @@
 #
 # Config: deploy/contabo/soft-pin.env (or TS6_SOFT_PIN_ENV).
 #
-# APPLY-READY DEFAULT: fullstack 2-5 / nice -5 (live Contabo).
+# APPLY-READY DEFAULT: packing B — fullstack 2-5 / nice -5 (no shrink).
+# DECODE 2-5 is kube env (pin_decode_child); this script does not inject it.
 # Packing A (fullstack 4-5) is gated — requires TS6_SOFT_PIN_SHRINK_ACK=1.
 # Packing C (music HostConfig send-only 0-1) is refused.
 # SEND/DECODE in-process pins are kube env, not HostConfig.
@@ -75,7 +76,7 @@ fi
 if [[ -n "$CPUSET" ]] && is_fullstack_shrink_from_live "$CPUSET"; then
     if [[ "${TS6_SOFT_PIN_SHRINK_ACK:-}" != "1" ]]; then
         echo "error: fullstack cpuset ${CPUSET} shrinks live 2-5 (profile A)." >&2
-        echo "  Live Contabo stays 2-5 until Robert picks A and sets TS6_SOFT_PIN_SHRINK_ACK=1." >&2
+        echo "  Packing B (Robert) keeps fullstack 2-5. Shrink is packing A and needs TS6_SOFT_PIN_SHRINK_ACK=1." >&2
         echo "  Do not apply shrink via update.sh / tag without that ACK." >&2
         exit 1
     fi

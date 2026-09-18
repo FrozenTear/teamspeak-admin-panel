@@ -110,8 +110,7 @@ Measured on contabo-dev: ~6.5 s cold subprocess vs ~3.8 s warm — **−~2.7 s**
   so the `import yt_dlp` cost is paid before the first `!play`. Contabo
   kube sets `MUSIC_RUNTIME_URL`; fullstack skips the warm and the music
   unit warms instead (`ts6-manager-music`). `pin_decode_child` parks
-  that process when `TS6_BOT_DECODE_CPUSET` is set (empty until packing
-  A/B).
+  that process on `TS6_BOT_DECODE_CPUSET=2-5` (packing B; share Axum).
 - A background supervisor restarts the process on exit; after repeated fast
   crashes it gives up and leaves the subprocess fallback in effect.
 - **Every failure path falls back to the `yt-dlp` subprocess** — service down,
