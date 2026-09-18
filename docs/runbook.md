@@ -86,15 +86,17 @@ documented in [`docs/ts6-fixture.md`](ts6-fixture.md).
 Contabo already terminates TLS with host Caddy v2.11.4 for
 `scuffedcrew.no`, `news.scuffedcrew.no`, and `ow.scuffedcrew.no`.
 The panel path is the same shape: `panel.scuffedcrew.no` →
-`reverse_proxy 127.0.0.1:3001` (fullstack, `hostNetwork`).
+`reverse_proxy 127.0.0.1:3001` (fullstack is `0.0.0.0:3001` today
+via `hostNetwork`).
 
 **Not applied.** Append only after unanimous seat +1s, CoS/FrozenTear,
 and Robert. Soft pin stays packing B. Floki MOVE NO. Never SSH-apply
 from a draft PR.
 
-1. **DNS (Robert, prerequisite):** A record
-   `panel.scuffedcrew.no` → `194.163.163.153`. Let's Encrypt cannot
-   mint until this answers.
+1. **DNS (Robert, prerequisite):** A
+   `panel.scuffedcrew.no` → `194.163.163.153` and preferably AAAA →
+   `2a02:c207:2309:9279::1` (same as `ow` / `news.scuffedcrew.no`).
+   Let's Encrypt cannot mint until the A record answers.
 2. **Caddy:** append
    [`deploy/contabo/Caddyfile.panel.snippet`](../deploy/contabo/Caddyfile.panel.snippet)
    to `/etc/caddy/Caddyfile`, then `systemctl reload caddy`. Do not

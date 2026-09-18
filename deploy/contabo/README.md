@@ -76,11 +76,14 @@ Contabo already runs Caddy v2.11.4 at `/etc/caddy/Caddyfile`
 
 `panel.scuffedcrew.no` → `reverse_proxy 127.0.0.1:3001`
 
+Fullstack is `0.0.0.0:3001` today (`hostNetwork`). Once live, public
+access is the hostname, not raw `:3001`.
+
 Snippet: [`Caddyfile.panel.snippet`](Caddyfile.panel.snippet).
 
 | Step | Owner | Gate |
 |------|-------|------|
-| A record `panel.scuffedcrew.no` → `194.163.163.153` | Robert | **Prerequisite** — LE cannot mint until DNS answers |
+| A `panel.scuffedcrew.no` → `194.163.163.153` **and preferably** AAAA → `2a02:c207:2309:9279::1` (same as `ow` / `news`) | Robert | **Prerequisite** — LE cannot mint until the A record answers |
 | Append snippet to `/etc/caddy/Caddyfile`; `systemctl reload caddy` | Release | After unanimous + Robert. Never replace the existing file. Never SSH-apply from a draft PR. |
 
 **Stays internal (do not put on public Caddy):** music `:3002` and

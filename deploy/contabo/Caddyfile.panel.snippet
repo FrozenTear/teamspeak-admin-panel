@@ -11,13 +11,15 @@
 # APPEND this site block to /etc/caddy/Caddyfile. Do not replace the
 # existing file. Then: systemctl reload caddy
 #
-# DNS prerequisite (Robert): A record
-#   panel.scuffedcrew.no → 194.163.163.153
-# Let's Encrypt cannot mint until that A record exists and answers
+# DNS prerequisite (Robert), same addresses as ow/news.scuffedcrew.no:
+#   A    panel.scuffedcrew.no → 194.163.163.153
+#   AAAA panel.scuffedcrew.no → 2a02:c207:2309:9279::1  (preferred)
+# Let's Encrypt cannot mint until the A record exists and answers
 # from this host. Caddy automatic HTTPS matches the other hostnames.
 #
 # Public Caddy terminates TLS for the panel ONLY.
-#   reverse_proxy 127.0.0.1:3001   (fullstack, hostNetwork)
+#   reverse_proxy 127.0.0.1:3001   (fullstack, hostNetwork;
+#   listener is 0.0.0.0:3001 today — public path is the hostname)
 # NEVER proxy :3002 (music) or :7080 (sidecar) on public Caddy.
 # MUSIC_RUNTIME_URL stays http://127.0.0.1:3002 (Contabo-internal).
 #
