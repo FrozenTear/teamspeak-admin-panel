@@ -62,3 +62,34 @@ music unit so Report bug still attaches wire marks.
 
 Music probes are **exec** `ts6-manager-music --healthcheck-url`, not
 kube `httpGet` (Podman 5.6 → in-container curl; this image has none).
+
+## Panel HTTPS (host Caddy + Let’s Encrypt)
+
+**DRAFT — do not apply on Contabo** until unanimous seat critical +1s
+**and** CoS/FrozenTear **and** Robert. Soft pin stays packing B
+(fullstack `2-5` / `-5`). Floki MOVE NO. This section is Caddy / DNS
+/ docs only — it does not change `soft-pin.env` or packing B.
+
+Contabo already runs Caddy v2.11.4 at `/etc/caddy/Caddyfile`
+(`scuffedcrew.no` → `:3100`, `news.scuffedcrew.no` → `:8888`,
+`ow.scuffedcrew.no` → `:3000`). Panel uses the same host Caddy:
+
+`panel.scuffedcrew.no` → `reverse_proxy 127.0.0.1:3001`
+
+Fullstack is `0.0.0.0:3001` today (`hostNetwork`). Once live, public
+access is the hostname, not raw `:3001`.
+
+Snippet: [`Caddyfile.panel.snippet`](Caddyfile.panel.snippet).
+
+| Step | Owner | Gate |
+|------|-------|------|
+| A `panel.scuffedcrew.no` → `194.163.163.153` **and preferably** AAAA → `2a02:c207:2309:9279::1` (same as `ow` / `news`) | Robert | **Prerequisite** — LE cannot mint until the A record answers |
+| Append snippet to `/etc/caddy/Caddyfile`; `systemctl reload caddy` | Release | After unanimous + Robert. Never replace the existing file. Never SSH-apply from a draft PR. |
+
+**Stays internal (do not put on public Caddy):** music `:3002` and
+sidecar `:7080`. `MUSIC_RUNTIME_URL` stays
+`http://127.0.0.1:3002`.
+
+**Ownership (not this PR):** API owns the HSTS gate (no HSTS on
+cleartext `:3001`). Panel owns the `http://` absolute-URL audit.
+Do not add HSTS in the Caddy site block.

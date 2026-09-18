@@ -1,0 +1,36 @@
+# DRAFT — do not merge, do not apply on Contabo until unanimous
+# Voice / Music / API / Panel / Sidecar / Release critical +1s
+# AND CoS/FrozenTear AND Robert. Floki MOVE NO. Soft pin unchanged
+# (packing B: fullstack 2-5 / -5). Never SSH-apply from this draft.
+#
+# Host already runs Caddy v2.11.4 with /etc/caddy/Caddyfile:
+#   scuffedcrew.no       → 127.0.0.1:3100
+#   news.scuffedcrew.no  → 127.0.0.1:8888
+#   ow.scuffedcrew.no    → 127.0.0.1:3000
+#
+# APPEND this site block to /etc/caddy/Caddyfile. Do not replace the
+# existing file. Then: systemctl reload caddy
+#
+# DNS prerequisite (Robert), same addresses as ow/news.scuffedcrew.no:
+#   A    panel.scuffedcrew.no → 194.163.163.153
+#   AAAA panel.scuffedcrew.no → 2a02:c207:2309:9279::1  (preferred)
+# Let's Encrypt cannot mint until the A record exists and answers
+# from this host. Caddy automatic HTTPS matches the other hostnames.
+#
+# Public Caddy terminates TLS for the panel ONLY.
+#   reverse_proxy 127.0.0.1:3001   (fullstack, hostNetwork;
+#   listener is 0.0.0.0:3001 today — public path is the hostname)
+# NEVER proxy :3002 (music) or :7080 (sidecar) on public Caddy.
+# MUSIC_RUNTIME_URL stays http://127.0.0.1:3002 (Contabo-internal).
+#
+# Do not add HSTS here. API owns the HSTS gate (no HSTS on
+# cleartext :3001). Panel owns the http:// absolute-URL audit.
+# Release owns Caddy / DNS / docs only.
+
+panel.scuffedcrew.no {
+    encode zstd gzip
+    reverse_proxy 127.0.0.1:3001 {
+        header_up X-Forwarded-Proto {scheme}
+        header_up X-Forwarded-Host {host}
+    }
+}
