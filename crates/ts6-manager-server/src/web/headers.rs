@@ -1,9 +1,16 @@
 //! Spec §6.9 — HTTP security headers.
 //!
 //! Applied as a single `tower_http::set_header::SetResponseHeaderLayer` per
-//! header so each rule is independent and reviewable. HSTS is gated on
-//! `NODE_ENV=production` because it forces HTTPS-only at the browser level
-//! — turning that on for a localhost dev server would break the dev loop.
+//! static header so each rule is independent and reviewable. HSTS is
+//! request-gated: production **and** an actually-HTTPS request. Production
+//! alone is not enough — emitting HSTS on cleartext `:3001` trains browsers
+//! to demand TLS on a port with no certificate.
+//!
+//! HTTPS is detected either from the request URI scheme (TLS terminated
+//! on this process) or from `X-Forwarded-Proto: https` when the existing
+//! [`crate::web::proxy`] hop-count policy trusts the header. `TRUSTED_PROXY_HOPS=0`
+//! (direct listener, current Contabo host-network shape) ignores
+//! client-supplied forwarding headers.
 //!
 //! `X-Frame-Options: DENY` is the global default; the public widget routes
 //! (spec §27) override to `SAMEORIGIN` at their handler so they remain
@@ -19,18 +26,26 @@
 //! The integration tests below combine the two layers to verify the
 //! resulting CSP keeps the dx WASM SPA hydrating.
 
+use axum::extract::{Request, State};
 use axum::http::{HeaderName, HeaderValue, header};
+use axum::middleware::Next;
+use axum::response::Response;
 use tower::layer::util::Identity;
 use tower::layer::util::Stack;
 use tower_http::set_header::SetResponseHeaderLayer;
 
 use crate::config::NodeEnv;
+use crate::web::proxy;
+
+const HSTS: HeaderName = HeaderName::from_static("strict-transport-security");
+const HSTS_VALUE: HeaderValue = HeaderValue::from_static("max-age=31536000; includeSubDomains");
 
 /// Compose every security-header layer into one stacked Layer suitable for
 /// `Router::layer(...)`.
 ///
-/// HSTS is included only in production. The other headers are unconditional.
-pub fn security_headers_stack(node_env: NodeEnv) -> SecurityHeadersStack {
+/// XCTO / XFO / Referrer-Policy are unconditional. HSTS is wired only in
+/// production, and the middleware still suppresses it on cleartext.
+pub fn security_headers_stack(node_env: NodeEnv, trusted_proxy_hops: u8) -> SecurityHeadersStack {
     let xcto = SetResponseHeaderLayer::if_not_present(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
@@ -43,21 +58,13 @@ pub fn security_headers_stack(node_env: NodeEnv) -> SecurityHeadersStack {
         header::REFERRER_POLICY,
         HeaderValue::from_static("no-referrer"),
     );
-    // HSTS — production only. 6 months minimum per spec; we use 365 days.
-    let hsts = if node_env.is_production() {
-        Some(SetResponseHeaderLayer::if_not_present(
-            HeaderName::from_static("strict-transport-security"),
-            HeaderValue::from_static("max-age=31536000; includeSubDomains"),
-        ))
-    } else {
-        None
-    };
 
     SecurityHeadersStack {
         xcto,
         xfo,
         referrer,
-        hsts,
+        emit_hsts: node_env.is_production(),
+        trusted_proxy_hops,
     }
 }
 
@@ -68,20 +75,41 @@ pub struct SecurityHeadersStack {
     xcto: SetResponseHeaderLayer<HeaderValue>,
     xfo: SetResponseHeaderLayer<HeaderValue>,
     referrer: SetResponseHeaderLayer<HeaderValue>,
-    hsts: Option<SetResponseHeaderLayer<HeaderValue>>,
+    emit_hsts: bool,
+    trusted_proxy_hops: u8,
 }
 
 impl SecurityHeadersStack {
     /// Apply every header layer to the given router. Order doesn't matter
-    /// because every header has a distinct name and the layers all use
-    /// `if_not_present`.
+    /// for the static headers (distinct names, `if_not_present`). HSTS is
+    /// a request-aware middleware so it can see the URI scheme and a
+    /// trusted `X-Forwarded-Proto`.
     pub fn apply(self, router: axum::Router) -> axum::Router {
         let r = router.layer(self.xcto).layer(self.xfo).layer(self.referrer);
-        match self.hsts {
-            Some(h) => r.layer(h),
-            None => r,
+        if self.emit_hsts {
+            r.layer(axum::middleware::from_fn_with_state(
+                self.trusted_proxy_hops,
+                emit_hsts_if_https,
+            ))
+        } else {
+            r
         }
     }
+}
+
+/// Production HSTS (spec §6.9: ≥6 months; we use 365 days). Set only when
+/// the request is actually HTTPS. `if_not_present` — do not clobber a
+/// more specific value a handler already set.
+async fn emit_hsts_if_https(State(trusted_hops): State<u8>, req: Request, next: Next) -> Response {
+    let https = proxy::request_is_https(req.headers(), req.uri(), trusted_hops);
+    let mut resp = next.run(req).await;
+    if https {
+        let headers = resp.headers_mut();
+        if !headers.contains_key(&HSTS) {
+            headers.insert(HSTS, HSTS_VALUE);
+        }
+    }
+    resp
 }
 
 // `Stack` re-exports kept for callers that want to compose with their own
@@ -101,6 +129,15 @@ mod tests {
     use tower::ServiceExt;
 
     async fn fetch_root(node_env: NodeEnv) -> axum::http::Response<Body> {
+        fetch(node_env, 0, "/", None).await
+    }
+
+    async fn fetch(
+        node_env: NodeEnv,
+        trusted_proxy_hops: u8,
+        uri: &str,
+        forwarded_proto: Option<&str>,
+    ) -> axum::http::Response<Body> {
         // Mirror the production wiring in `main.rs`: static header stack on
         // the inside, the per-response nonce-CSP middleware on the outside.
         // CSP-shape assertions below then exercise the same layered result
@@ -114,12 +151,27 @@ mod tests {
                     .unwrap()
             }),
         );
-        let app = security_headers_stack(node_env).apply(app);
+        let app = security_headers_stack(node_env, trusted_proxy_hops).apply(app);
         let app = app.layer(axum::middleware::from_fn(
             super::super::csp_nonce::nonce_csp_middleware,
         ));
-        let req = Request::builder().uri("/").body(Body::empty()).unwrap();
+        let mut builder = Request::builder().uri(uri);
+        if let Some(proto) = forwarded_proto {
+            builder = builder.header("x-forwarded-proto", proto);
+        }
+        let req = builder.body(Body::empty()).unwrap();
         app.oneshot(req).await.unwrap()
+    }
+
+    fn assert_hsts_present(h: &axum::http::HeaderMap) {
+        let hsts = h
+            .get("strict-transport-security")
+            .and_then(|v| v.to_str().ok())
+            .expect("HSTS header missing");
+        assert!(hsts.contains("max-age="));
+        assert!(hsts.contains("includeSubDomains"));
+        // Spec: 6-month minimum. 31_536_000s = 365 days, comfortably above.
+        assert!(hsts.contains("31536000"));
     }
 
     /// Parse a CSP header into a directive → sources map. Source-expressions
@@ -273,7 +325,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prod_emits_runnable_csp_and_hsts() {
+    async fn prod_emits_runnable_csp_without_hsts_on_cleartext() {
+        // Contabo / kube host-network: phones hit http://IP:3001. Production
+        // NODE_ENV must not emit HSTS on that cleartext response.
         let resp = fetch_root(NodeEnv::Production).await;
         let h = resp.headers();
         assert_eq!(
@@ -294,15 +348,61 @@ mod tests {
             .and_then(|v| v.to_str().ok())
             .expect("prod: CSP header missing");
         assert_csp_runs_dx_spa("prod", csp);
+        assert!(
+            h.get("strict-transport-security").is_none(),
+            "HSTS must NOT be set on cleartext HTTP, even in production"
+        );
+    }
 
-        let hsts = h
-            .get("strict-transport-security")
+    #[tokio::test]
+    async fn prod_emits_hsts_when_trusted_proxy_marks_https() {
+        let resp = fetch(NodeEnv::Production, 1, "/", Some("https")).await;
+        let h = resp.headers();
+        assert_eq!(
+            h.get(header::X_CONTENT_TYPE_OPTIONS)
+                .and_then(|v| v.to_str().ok()),
+            Some("nosniff")
+        );
+        assert_eq!(
+            h.get(header::X_FRAME_OPTIONS).and_then(|v| v.to_str().ok()),
+            Some("DENY")
+        );
+        assert_eq!(
+            h.get(header::REFERRER_POLICY).and_then(|v| v.to_str().ok()),
+            Some("no-referrer")
+        );
+        let csp = h
+            .get(header::CONTENT_SECURITY_POLICY)
             .and_then(|v| v.to_str().ok())
-            .expect("prod: HSTS header missing");
-        assert!(hsts.contains("max-age="));
-        assert!(hsts.contains("includeSubDomains"));
-        // Spec: 6-month minimum. 31_536_000s = 365 days, comfortably above.
-        assert!(hsts.contains("31536000"));
+            .expect("prod proxied https: CSP header missing");
+        assert_csp_runs_dx_spa("prod proxied https", csp);
+        assert_hsts_present(h);
+    }
+
+    #[tokio::test]
+    async fn prod_ignores_spoofed_forwarded_proto_when_untrusted() {
+        // hops=0 (direct :3001): a client-supplied X-Forwarded-Proto must
+        // not unlock HSTS.
+        let resp = fetch(NodeEnv::Production, 0, "/", Some("https")).await;
+        assert!(
+            resp.headers().get("strict-transport-security").is_none(),
+            "untrusted X-Forwarded-Proto must not emit HSTS"
+        );
+    }
+
+    #[tokio::test]
+    async fn prod_emits_hsts_when_request_uri_is_https() {
+        let resp = fetch(NodeEnv::Production, 0, "https://panel.example.com/", None).await;
+        assert_hsts_present(resp.headers());
+    }
+
+    #[tokio::test]
+    async fn prod_no_hsts_when_trusted_proxy_marks_http() {
+        let resp = fetch(NodeEnv::Production, 1, "/", Some("http")).await;
+        assert!(
+            resp.headers().get("strict-transport-security").is_none(),
+            "trusted X-Forwarded-Proto: http is still cleartext"
+        );
     }
 
     /// Negative controls — every shape of broken CSP we've already seen, or

@@ -5,7 +5,7 @@
 //! - [`cors`] — spec §6.10 `Access-Control-Allow-Origin` allowlist driven
 //!   by `FRONTEND_URL`.
 //! - [`headers`] — spec §6.9 sensible default security headers.
-//! - [`proxy`] — spec §6.8 single-hop `X-Forwarded-For` trust policy.
+//! - [`proxy`] — spec §6.8 single-hop `X-Forwarded-For` / `X-Forwarded-Proto` trust policy.
 //! - [`rate_limit`] — spec §6.8 per-IP bucket on `/api/auth/login` and
 //!   `/api/auth/refresh`.
 

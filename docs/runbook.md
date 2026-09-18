@@ -38,7 +38,7 @@ The single hard requirement. The server boots without anything else.
 | --- | --- | --- |
 | `ENCRYPTION_KEY` | AES-256-GCM key for at-rest encryption of TS server-connection credentials and SSH host-key fingerprints. If unset, derived from `JWT_SECRET` — workable, but rotates together. | `openssl rand -base64 32` |
 | `FRONTEND_URL` | Public origin the browser hits (CORS + cookie domain). Default `http://localhost:3000`. | Operator-supplied. |
-| `TRUSTED_PROXY_HOPS` | Number of trusted reverse-proxy hops in front of the listener. `0` = ignore `X-Forwarded-For`; `1` = exactly one trusted proxy. | Set to match your TLS terminator. |
+| `TRUSTED_PROXY_HOPS` | Number of trusted reverse-proxy hops in front of the listener. `0` = ignore `X-Forwarded-For` and `X-Forwarded-Proto`; `1` = exactly one trusted proxy. Also gates HSTS. | Set to match your TLS terminator. |
 
 The full canonical env list, with comments, is
 [`deploy/quadlet/ts6-manager.env.example`](../deploy/quadlet/ts6-manager.env.example).
@@ -62,6 +62,13 @@ editing `ts6-manager.pod`. For `kube`, the pod runs with `hostNetwork: true`
 and the container ports become host ports directly — see
 [`deploy/kube/README.md` § Network mode](../deploy/kube/README.md#network-mode)
 for why this is load-bearing, not a perf tweak.
+
+HSTS (`Strict-Transport-Security`) belongs on the public TLS hostname.
+The fullstack emits it only when the request is actually HTTPS — TLS
+terminated on the process, or a trusted proxy (`TRUSTED_PROXY_HOPS ≥ 1`)
+set `X-Forwarded-Proto: https`. Bare `:3001` must not send HSTS: that
+trains browsers to rewrite `http://host:3001` to HTTPS on a port with
+no certificate.
 
 ### 1.4 First-login verification
 
