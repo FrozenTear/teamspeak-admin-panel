@@ -13,8 +13,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{get, post};
 use futures::stream::{Stream, StreamExt};
 use music_bot::{
-    BotCommand, BotConfig, BotEvent as DomainBotEvent, BotState as DomainBotState, BotSupervisor,
-    DisconnectKind,
+    BotCommand, BotConfig, BotEvent as DomainBotEvent, BotState as DomainBotState, DisconnectKind,
 };
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::{info, warn};
@@ -120,7 +119,7 @@ async fn create(
     // Allocate an id BEFORE deciding the identity path so the default
     // path embeds the (eventual) bot id and stays unique across
     // simultaneously-spawned bots without auto-rename ceremony.
-    let supervisor: &BotSupervisor = &state.music_bots.supervisor;
+    let supervisor = &state.music_bots.supervisor;
     let identity_path = if let Some(p) = req.identity_path {
         std::path::PathBuf::from(p)
     } else {
@@ -129,10 +128,7 @@ async fn create(
         // first connect attempt surfaces the I/O error via
         // `BotEvent::Error::Connection` — no need to abort the create.
         let _ = std::fs::create_dir_all(dir);
-        dir.join(format!(
-            "bot-{}.identity",
-            supervisor_next_hint(supervisor).await
-        ))
+        dir.join(format!("bot-{}.identity", supervisor.next_id_hint().await))
     };
 
     // `auto_connect` is omittable on the wire; `BotConfig` defaults it
@@ -185,15 +181,6 @@ async fn create(
             last_error: liveness.last_error.clone(),
         }),
     ))
-}
-
-/// Best-effort hint at the next bot id the supervisor will mint. Used
-/// only for the default identity-path filename — a tiny race here does
-/// not corrupt anything (the supervisor still mints a unique id, the
-/// identity file just lands at a slightly stale name).
-async fn supervisor_next_hint(supervisor: &BotSupervisor) -> u64 {
-    let infos = supervisor.list().await;
-    infos.iter().map(|i| i.id.0).max().unwrap_or(0) + 1
 }
 
 async fn shutdown(

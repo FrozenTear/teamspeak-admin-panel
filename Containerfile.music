@@ -1,0 +1,103 @@
+# TS6 Manager — Contabo Music+Voice unit
+# Multi-stage OCI Containerfile (Podman-native).
+#
+# Owns decode → Opus → TS6 wire send. Panel/API/Surreal stay on
+# Containerfile.fullstack. No Surreal in this image. Kube probes MUST
+# be exec `ts6-manager-music --healthcheck-url` (no curl in runtime).
+
+# -----------------------------------------------------------------------------
+# Stage 1 — build
+# -----------------------------------------------------------------------------
+FROM docker.io/rust:1.95-slim-bookworm AS builder
+
+WORKDIR /build
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        build-essential \
+        pkg-config \
+        libssl-dev \
+        ca-certificates \
+        cmake \
+        git \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY Cargo.toml ./
+COPY rust-toolchain.toml ./
+COPY crates ./crates
+COPY vendor ./vendor
+COPY Cargo.loc[k] ./
+COPY .cargo ./.cargo
+
+ARG IMAGE_VERSION=dev
+ENV TS6_RELEASE=${IMAGE_VERSION}
+RUN cargo build --release --locked --bin ts6-manager-music \
+    || cargo build --release --bin ts6-manager-music
+
+# -----------------------------------------------------------------------------
+# Stage 2 — runtime (non-root, ffmpeg + yt-dlp, no curl)
+# -----------------------------------------------------------------------------
+FROM docker.io/debian:bookworm-slim
+
+ARG YTDLP_VERSION=2026.03.17
+ARG DENO_VERSION=v2.7.14
+ARG TARGETARCH
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        ffmpeg \
+        libssl3 \
+        python3 \
+ && curl -fsSL -o /usr/local/bin/yt-dlp \
+        "https://github.com/yt-dlp/yt-dlp/releases/download/${YTDLP_VERSION}/yt-dlp" \
+ && chmod 0755 /usr/local/bin/yt-dlp \
+ && case "${TARGETARCH}" in \
+        amd64) deno_arch=x86_64-unknown-linux-gnu ;; \
+        arm64) deno_arch=aarch64-unknown-linux-gnu ;; \
+        *) echo "FATAL: unsupported TARGETARCH '${TARGETARCH}' for Deno install" >&2; exit 1 ;; \
+    esac \
+ && curl -fsSL -o /tmp/deno.zip \
+        "https://github.com/denoland/deno/releases/download/${DENO_VERSION}/deno-${deno_arch}.zip" \
+ && python3 -m zipfile -e /tmp/deno.zip /usr/local/bin \
+ && rm /tmp/deno.zip \
+ && chmod 0755 /usr/local/bin/deno \
+ && yt-dlp --version \
+ && deno --version \
+ && apt-get purge -y curl \
+ && apt-get autoremove -y \
+ && rm -rf /var/lib/apt/lists/* \
+ && groupadd --system --gid 10001 ts6 \
+ && useradd --system --uid 10001 --gid ts6 --shell /usr/sbin/nologin --home-dir /var/lib/ts6-manager ts6 \
+ && mkdir -p /var/lib/ts6-manager/music /var/lib/ts6-manager/data \
+ && chown -R ts6:ts6 /var/lib/ts6-manager
+
+# curl is purged after fetch — kube probes use the binary, not httpGet.
+COPY --from=builder /build/target/release/ts6-manager-music /usr/local/bin/ts6-manager-music
+
+ARG IMAGE_VERSION=dev
+ARG IMAGE_REVISION=unknown
+ARG IMAGE_SOURCE="https://github.com/FrozenTear/teamspeak-admin-panel"
+LABEL org.opencontainers.image.title="ts6-manager-music" \
+      org.opencontainers.image.description="TS6 Manager — Music+Voice unit (decode → Opus → TS6 wire send). The only send loop on Contabo." \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.source="${IMAGE_SOURCE}" \
+      org.opencontainers.image.version="${IMAGE_VERSION}" \
+      org.opencontainers.image.revision="${IMAGE_REVISION}"
+
+USER ts6:ts6
+WORKDIR /var/lib/ts6-manager
+
+ENV MUSIC_DIR=/var/lib/ts6-manager/music \
+    DATA_DIR=/var/lib/ts6-manager/data \
+    YT_DLP_ZIPAPP=/usr/local/bin/yt-dlp \
+    TS6_BOT_CPUSET=0-1 \
+    TS6_BOT_SEND_CPUSET=0-1
+
+EXPOSE 3002
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD ["/usr/local/bin/ts6-manager-music", "--healthcheck-url", "http://127.0.0.1:3002/health"]
+
+ENTRYPOINT ["/usr/local/bin/ts6-manager-music"]
+CMD ["--listen", "0.0.0.0:3002"]

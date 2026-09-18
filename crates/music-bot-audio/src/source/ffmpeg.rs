@@ -92,6 +92,7 @@ impl FfmpegSource {
             .stderr(Stdio::piped());
 
         let mut child = cmd.spawn()?;
+        crate::cpuset::pin_decode_child(&child);
         let stdout = child
             .stdout
             .take()
@@ -191,6 +192,7 @@ impl FfmpegSource {
             .stderr(Stdio::piped());
 
         let mut child = cmd.spawn()?;
+        crate::cpuset::pin_decode_child(&child);
         let stdin = child
             .stdin
             .take()

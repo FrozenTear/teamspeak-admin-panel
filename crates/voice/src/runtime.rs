@@ -63,6 +63,13 @@ pub(crate) fn voice_runtime() -> &'static Runtime {
         Builder::new_multi_thread()
             .worker_threads(VOICE_WORKER_THREADS)
             .thread_name("voice-rt")
+            .on_thread_start(|| {
+                // Contabo bot unit: pin + nice the Voice send runtime
+                // only. ffmpeg / yt-dlp stay unpinned unless
+                // TS6_BOT_DECODE_CPUSET is set (music-bot-audio).
+                music_bot_audio::cpuset::pin_current_thread_send();
+                music_bot_audio::cpuset::nice_current_thread_from_env("TS6_BOT_NICE");
+            })
             .enable_all()
             .build()
             .expect("build dedicated voice runtime")

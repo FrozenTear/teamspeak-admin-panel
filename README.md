@@ -27,6 +27,7 @@ Podman deploy.
 | --- | --- | --- | --- |
 | Fullstack admin panel | [`crates/ts6-manager-server`](crates/ts6-manager-server) | `ts6-manager-fullstack` | Dioxus 0.7 fullstack server (Axum API + WASM UI) — server management, accounts, music bot, audit. |
 | Media sidecar | [`crates/ts6-media-sidecar`](crates/ts6-media-sidecar) | `ts6-manager-sidecar` | MoQ-over-WebTransport video/audio relay. Sibling workspace. |
+| Music unit | [`crates/voice`](crates/voice) (`ts6-manager-music`) | `ts6-manager-music` | Contabo Music+Voice send loop (decode → Opus → TS6). |
 | Voice prototype | [`crates/ts6-voice-prototype`](crates/ts6-voice-prototype) | — | "Two clients can talk" reference: Opus over the TS6 wire protocol. |
 | Voice translator | [`crates/ts6-voice-translator`](crates/ts6-voice-translator) | — | TS6 ↔ WebRTC voice bridge. |
 | Music bot audio | [`crates/music-bot-audio`](crates/music-bot-audio) | — | Library helpers for the in-panel music bot. |

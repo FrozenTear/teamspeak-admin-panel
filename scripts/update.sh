@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Contabo / kube upgrade: pull both GHCR images, play a temp manifest
-# with fullstack + sidecar on the same TAG, smoke /health, then
-# re-apply Contabo soft CPU pin (cpuset + nice) on ts6-manager-fullstack.
+# Contabo / kube upgrade: pull GHCR images, play a temp manifest
+# with fullstack + music + sidecar on the same TAG, smoke /health
+# (fullstack :3001 and music :3002), then re-apply Contabo soft CPU
+# pin. Fullstack pin stays 2-5 until cutover. Bot send-thread pin is
+# in-process; this script only re-applies HostConfig + nice.
 #
 # Usage (from any cwd, against a repo checkout):
 #   ./scripts/update.sh vX.Y.Z
@@ -12,8 +14,9 @@ set -euo pipefail
 
 usage() {
     echo "usage: $0 vX.Y.Z" >&2
-    echo "  Pull both GHCR images for TAG, kube down (no --force), kube play," >&2
-    echo "  curl http://127.0.0.1:3001/health, then re-apply fullstack soft pin." >&2
+    echo "  Pull fullstack + music + sidecar GHCR images for TAG, kube down" >&2
+    echo "  (no --force), kube play, curl fullstack /health and music /health," >&2
+    echo "  then re-apply Contabo soft pin (fullstack 2-5 stays until cutover)." >&2
     echo "example: $0 v1.6.2" >&2
     exit 2
 }
@@ -33,6 +36,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 MANIFEST="${REPO_ROOT}/deploy/kube/ts6-manager.yaml"
 SECRETS="${REPO_ROOT}/deploy/kube/secrets.yaml"
 FULLSTACK="ghcr.io/frozentear/ts6-manager-fullstack:${TAG}"
+MUSIC="ghcr.io/frozentear/ts6-manager-music:${TAG}"
 SIDECAR="ghcr.io/frozentear/ts6-manager-sidecar:${TAG}"
 
 die() {
@@ -71,19 +75,23 @@ trap cleanup EXIT
 trap 'echo "FAIL: upgrade to ${TAG} did not finish. Named volumes should still be intact — never kube down --force." >&2' ERR
 
 PLAY_POD="${TMPDIR}/ts6-manager.kube.yaml"
-# Pin both images to TAG. Never leave sidecar on the committed pin.
+# Pin all three images to TAG. Never leave music or sidecar on the committed pin.
 sed -E \
     -e "s#(image:[[:space:]]+ghcr\\.io/frozentear/ts6-manager-fullstack:)[^[:space:]]+#\\1${TAG}#" \
+    -e "s#(image:[[:space:]]+ghcr\\.io/frozentear/ts6-manager-music:)[^[:space:]]+#\\1${TAG}#" \
     -e "s#(image:[[:space:]]+ghcr\\.io/frozentear/ts6-manager-sidecar:)[^[:space:]]+#\\1${TAG}#" \
     "$MANIFEST" > "$PLAY_POD"
 
 if ! grep -q "image: ${FULLSTACK}" "$PLAY_POD" \
+    || ! grep -q "image: ${MUSIC}" "$PLAY_POD" \
     || ! grep -q "image: ${SIDECAR}" "$PLAY_POD"; then
-    die "failed to rewrite both image tags to ${TAG} in the temp manifest"
+    die "failed to rewrite fullstack + music + sidecar image tags to ${TAG} in the temp manifest"
 fi
 
 echo "==> pulling ${FULLSTACK}"
 podman pull "$FULLSTACK"
+echo "==> pulling ${MUSIC}"
+podman pull "$MUSIC"
 echo "==> pulling ${SIDECAR}"
 podman pull "$SIDECAR"
 
@@ -119,26 +127,34 @@ fi
 echo "==> podman kube play ${PLAY_FILE}"
 podman kube play "$PLAY_FILE"
 
-echo "==> waiting for http://127.0.0.1:3001/health"
-HEALTH_OUT="${TMPDIR}/health.out"
-HEALTH_OK=0
-for _ in $(seq 1 45); do
-    if curl -fsS http://127.0.0.1:3001/health >"$HEALTH_OUT" 2>/dev/null; then
-        HEALTH_OK=1
-        break
+wait_health() {
+    local url="$1"
+    local label="$2"
+    local out="${TMPDIR}/health-$(echo "$label" | tr ' /' '__').out"
+    local ok=0
+    for _ in $(seq 1 45); do
+        if curl -fsS "$url" >"$out" 2>/dev/null; then
+            ok=1
+            break
+        fi
+        sleep 2
+    done
+    if [[ "$ok" -ne 1 ]]; then
+        die "${label} did not succeed after kube play"
     fi
-    sleep 2
-done
-if [[ "$HEALTH_OK" -ne 1 ]]; then
-    die "/health did not succeed after kube play"
-fi
-echo "    $(cat "$HEALTH_OUT")"
+    echo "    ${label}: $(cat "$out")"
+}
 
-echo "==> applying fullstack soft pin (Contabo HostConfig; no-op if unset)"
+echo "==> waiting for http://127.0.0.1:3001/health (fullstack)"
+wait_health "http://127.0.0.1:3001/health" "fullstack /health"
+echo "==> waiting for http://127.0.0.1:3002/health (music)"
+wait_health "http://127.0.0.1:3002/health" "music /health"
+
+echo "==> applying Contabo soft pin (fullstack 2-5 stays; bot send pin is in-process)"
 "${SCRIPT_DIR}/apply-fullstack-soft-pin.sh" \
     || die "soft pin requested but apply failed"
 
 echo
-echo "OK: ts6-manager is on ${TAG} (fullstack + sidecar)."
+echo "OK: ts6-manager is on ${TAG} (fullstack + music + sidecar)."
 echo "    volumes ts6-data / ts6-db / ts6-music were left in place."
 echo "    never run: podman kube down --force"

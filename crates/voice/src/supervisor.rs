@@ -250,6 +250,11 @@ impl BotSupervisor {
         self.bots.lock().await.get(&id).map(|h| h.subscribe())
     }
 
+    /// Best-effort hint at the next minted id (max live id + 1).
+    pub async fn next_id_hint(&self) -> u64 {
+        self.list().await.iter().map(|i| i.id.0).max().unwrap_or(0) + 1
+    }
+
     /// Snapshot of currently tracked bot IDs + their configs. Cheap so
     /// REST handlers can call it on every request.
     pub async fn list(&self) -> Vec<BotInfo> {
@@ -405,7 +410,7 @@ impl BotSupervisor {
 }
 
 /// Lightweight read-only view used by `BotSupervisor::list`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BotInfo {
     pub id: BotId,
     pub name: String,

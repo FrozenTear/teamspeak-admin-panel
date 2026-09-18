@@ -12,7 +12,7 @@
 use axum::Json;
 use axum::Router;
 use axum::body::Body;
-use axum::extract::Request;
+use axum::extract::{Request, State};
 use axum::http::Method;
 use axum::middleware::Next;
 use axum::response::Response;
@@ -33,9 +33,12 @@ pub(super) fn router() -> Router<AppState> {
 }
 
 async fn bug_report_context(
+    State(state): State<AppState>,
     RequireAuth(_user): RequireAuth,
 ) -> Json<wire::MusicBotBugReportContext> {
-    Json(to_wire(music_bot::bug_report::snapshot()))
+    Json(to_wire(
+        state.music_bots.supervisor.bug_report_snapshot().await,
+    ))
 }
 
 fn to_wire(snap: music_bot::bug_report::BugReportSnapshot) -> wire::MusicBotBugReportContext {
@@ -53,7 +56,11 @@ fn to_wire(snap: music_bot::bug_report::BugReportSnapshot) -> wire::MusicBotBugR
 /// said seats pass tails via `context` and added no new bug-report
 /// endpoints. Enriching the POST body before #28's handler validates it
 /// keeps the locked wire shape and lets #28's existing caps apply.
-pub async fn enrich_bug_report_request(req: Request, next: Next) -> Response {
+pub async fn enrich_bug_report_request(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
     if req.method() != Method::POST || req.uri().path() != "/api/bug-reports" {
         return next.run(req).await;
     }
@@ -65,7 +72,8 @@ pub async fn enrich_bug_report_request(req: Request, next: Next) -> Response {
             return next.run(Request::from_parts(parts, Body::empty())).await;
         }
     };
-    let body = match enrich_bug_report_json(&bytes) {
+    let snap = state.music_bots.supervisor.bug_report_snapshot().await;
+    let body = match enrich_bug_report_json_with(&bytes, &snap) {
         Some(enriched) => Body::from(enriched),
         None => Body::from(bytes),
     };
@@ -74,6 +82,13 @@ pub async fn enrich_bug_report_request(req: Request, next: Next) -> Response {
 
 /// Pure enrichment used by the middleware and its tests.
 pub fn enrich_bug_report_json(bytes: &[u8]) -> Option<Vec<u8>> {
+    enrich_bug_report_json_with(bytes, &music_bot::bug_report::snapshot())
+}
+
+fn enrich_bug_report_json_with(
+    bytes: &[u8],
+    snap: &music_bot::bug_report::BugReportSnapshot,
+) -> Option<Vec<u8>> {
     let mut value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
     let obj = value.as_object_mut()?;
     let ctx_entry = obj
@@ -83,7 +98,7 @@ pub fn enrich_bug_report_json(bytes: &[u8]) -> Option<Vec<u8>> {
         *ctx_entry = serde_json::json!({});
     }
     let map = ctx_entry.as_object_mut()?;
-    music_bot::bug_report::snapshot().merge_absent(map);
+    snap.merge_absent(map);
     serde_json::to_vec(&value).ok()
 }
 

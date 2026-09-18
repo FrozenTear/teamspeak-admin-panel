@@ -79,6 +79,9 @@ pub struct Config {
     pub music_dir: PathBuf,
     pub sidecar_url: Option<String>,
     pub sidecar_binary_path: Option<PathBuf>,
+    /// Contabo music unit. When set, fullstack does not spawn a Voice
+    /// send loop — it proxies lifecycle / play / SSE to `ts6-manager-music`.
+    pub music_runtime_url: Option<String>,
     /// PURA-146 (WS-8) — publicly-reachable WebTransport endpoint of the
     /// sidecar's moq-lite-04 listener. Surfaced to the public widget viewer
     /// via `GET /api/widget/{token}/video-sources` so an embedded iframe on
@@ -230,6 +233,7 @@ impl Config {
 
         let sidecar_url = optional_env("SIDECAR_URL");
         let sidecar_binary_path = optional_env("SIDECAR_BINARY_PATH").map(PathBuf::from);
+        let music_runtime_url = optional_env("MUSIC_RUNTIME_URL");
         let moq_public_url = optional_env("MOQ_PUBLIC_URL");
         let yt_cookie_file = optional_env("YT_COOKIE_FILE").map(PathBuf::from);
         let youtube_api_key = optional_env("YOUTUBE_API_KEY");
@@ -273,6 +277,7 @@ impl Config {
             music_dir,
             sidecar_url,
             sidecar_binary_path,
+            music_runtime_url,
             moq_public_url,
             yt_cookie_file,
             youtube_api_key,
@@ -308,6 +313,7 @@ impl Config {
             ssh_known_hosts_set = self.ssh_known_hosts_path.is_some(),
             sidecar_url_set = self.sidecar_url.is_some(),
             sidecar_binary_path_set = self.sidecar_binary_path.is_some(),
+            music_runtime_url_set = self.music_runtime_url.is_some(),
             moq_public_url_set = self.moq_public_url.is_some(),
             yt_cookie_file_set = self.yt_cookie_file.is_some(),
             youtube_api_key_set = self.youtube_api_key.is_some(),

@@ -11,6 +11,10 @@ description = "Music-bot product crate (PURA-117 / PURA-118 WS-1) — bot lifecy
 name = "music_bot"
 path = "src/lib.rs"
 
+[[bin]]
+name = "ts6-manager-music"
+path = "src/bin/ts6-manager-music.rs"
+
 [features]
 default = []
 # PURA-118 — gates the live integration test in `tests/lifecycle_e2e.rs`
@@ -46,12 +50,21 @@ tsclientlib = { git = "https://github.com/ReSpeak/tsclientlib", rev = "04aa24917
 # same repo).
 tsproto-packets = { git = "https://github.com/ReSpeak/tsclientlib", rev = "04aa24917abbf6a0c8442a79742d6d2d40ecf71e" }
 
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync", "fs", "io-util"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync", "fs", "io-util", "net", "signal", "process"] }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
+# Contabo music unit — internal loopback control plane + exec healthcheck.
+# Fullstack proxies here when MUSIC_RUNTIME_URL is set; this binary is
+# the only process that owns decode→Opus→TS6 wire send.
+axum = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+reqwest = { workspace = true }
+url = { workspace = true }
+tokio-stream = { version = "0.1", default-features = false, features = ["sync"] }
 # THE-922 — `bytes::Bytes` rides the `AudioMsg::Frame` mpsc from the audio
 # sibling to the wire task. The encoder hands us frames as `Bytes` carved
 # from a reused `BytesMut` (see music-bot-audio for the alloc story); the
@@ -78,6 +91,8 @@ libc = "0.2"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync", "test-util"] }
 tracing-subscriber = { workspace = true }
 serde_json = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+http-body-util = "0.1"
 # THE-986 — the `!vol`-latency regression decodes the sibling's
 # consumer-encoded Opus frames back to PCM and asserts on output amplitude.
 # Same pin as music-bot-audio's encoder, so this pulls no new libopus.

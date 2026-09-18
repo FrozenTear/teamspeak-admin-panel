@@ -33,6 +33,8 @@ mod logging;
 #[cfg(feature = "server")]
 mod music_bots;
 #[cfg(feature = "server")]
+mod music_runtime;
+#[cfg(feature = "server")]
 mod repos;
 #[cfg(feature = "server")]
 mod routes;
@@ -201,12 +203,35 @@ mod server_entry {
             *state.yt_api_key.write().unwrap_or_else(|e| e.into_inner()) = Some(row.value);
         }
 
-        // PURA-359 — start the persistent yt-dlp resolver service now, at
-        // boot, so its one-time `import yt_dlp` cost (~2 s, PURA-355) is
-        // paid well before the first `!play` instead of on the critical
-        // path of a track. Best-effort and self-supervising: if it cannot
-        // start, playback transparently uses the yt-dlp subprocess path.
-        music_bot::warm_resolver();
+        // PURA-359 — warm yt-dlp only when this process owns the send
+        // loop. Contabo kube sets MUSIC_RUNTIME_URL; the music unit
+        // warms the resolver so fullstack (Axum/Surreal/Scuffed) never
+        // runs a second decode/send path.
+        if !state.music_bots.supervisor.is_remote() {
+            music_bot::warm_resolver();
+        } else {
+            if !state.music_bots.supervisor.wait_until_healthy(30).await {
+                tracing::warn!(
+                    "MUSIC_RUNTIME_URL is set but ts6-manager-music /health did not succeed — \
+                     bot lifecycle will 5xx until the music unit is up"
+                );
+            }
+            let cookie = state
+                .yt_cookie
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let key = state
+                .yt_api_key
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            state
+                .music_bots
+                .supervisor
+                .sync_settings(Some(cookie), Some(key))
+                .await;
+        }
 
         // PURA-357 — rehydrate persisted music bots. WS-5 (PURA-123)
         // shipped the music-bot supervisor as in-memory only, so every
@@ -218,6 +243,8 @@ mod server_entry {
         // REST / FE references and chat-bridge wiring survive the
         // restart. Best-effort: a rehydration failure must not gate
         // startup, and an `auto_connect=false` bot is restored idle.
+        // When MUSIC_RUNTIME_URL is set, spawn_with_id is an HTTP hop
+        // to the music unit (the only send loop).
         match crate::repos::music_bot_runtime::list(&database).await {
             Ok(rows) => {
                 let count = rows.len();
@@ -416,7 +443,7 @@ mod server_entry {
                 .with_state(state.clone());
         // Operator bug reports (`POST /api/bug-reports`). RequireAuth;
         // GitHub sink is optional (503 when env is unset).
-        let bug_reports_router = routes::bug_reports::router().with_state(state);
+        let bug_reports_router = routes::bug_reports::router().with_state(state.clone());
 
         // PURA-17: `serve_dioxus_application` registers static assets +
         // server functions and adds a fallback that serves the dx-CLI
@@ -470,7 +497,8 @@ mod server_entry {
         // into `POST /api/bug-reports` when those keys are absent. Layered
         // on the finished router so it still wraps API PR #28's route
         // after that draft lands. Does not change #28's wire shape.
-        let router = router.layer(axum::middleware::from_fn(
+        let router = router.layer(axum::middleware::from_fn_with_state(
+            state,
             routes::music_bots::enrich_bug_report_request,
         ));
         let router = web::security_headers_stack(cfg.node_env).apply(router);

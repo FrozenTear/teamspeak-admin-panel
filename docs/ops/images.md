@@ -1,6 +1,6 @@
 # TS6 Manager OCI Images — naming, build, sign, release
 
-Authoritative reference for the two published OCI images and the sidecar
+Authoritative reference for the published OCI images and the sidecar
 binary release artefacts. Tracked under
 [PURA-160](/PURA/issues/PURA-160) (WS-OPS-Images). Sibling tracks
 (WS-OPS-Quadlet, WS-OPS-Kube, WS-Gate) reference image names and tags
@@ -23,6 +23,7 @@ Decided in coordination with CTO. Sibling tracks must match these names.
 
 ```
 ghcr.io/frozentear/ts6-manager-fullstack
+ghcr.io/frozentear/ts6-manager-music
 ghcr.io/frozentear/ts6-manager-sidecar
 ```
 
@@ -104,6 +105,7 @@ scripts/build-images.sh all
 
 # Just one.
 scripts/build-images.sh fullstack
+scripts/build-images.sh music
 scripts/build-images.sh sidecar
 
 # Release-grade multi-arch build (slow — kernel needs binfmt_misc/qemu
@@ -117,6 +119,9 @@ Both Containerfiles run a final non-root stage:
 
 * `Containerfile.fullstack` — uid:gid `10001:10001` (`ts6:ts6`), home
   `/var/lib/ts6-manager` (db + music dir, owned by the runtime user).
+* `Containerfile.music` — uid:gid `10001:10001` (same volume owner as
+  fullstack so `ts6-data` identities and `ts6-music` stay writable).
+  Isolation is the container + in-process send cpuset, not a second uid.
 * `Containerfile.sidecar` — uid:gid `10002:10002` (`sidecar:sidecar`),
   home `/var/lib/ts6-manager-sidecar`.
 

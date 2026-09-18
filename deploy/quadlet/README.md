@@ -5,9 +5,12 @@ unit files that bring the manager up as a rootless `systemd --user`
 service. Quadlet is the recommended single-host shape per impl-plan §9.
 Contabo production is `podman kube play` plus `scripts/update.sh`, not
 Quadlet — see [`deploy/kube/README.md`](../kube/README.md). Contabo's
-soft CPU pin is re-applied by `scripts/apply-fullstack-soft-pin.sh`
-after kube play (`deploy/contabo/soft-pin.env`); do not expect Quadlet
-`CPUAffinity=` to be the Contabo path.
+Music+Voice split (third container `music` / `ts6-manager-music`) and
+soft CPU pin (`scripts/apply-fullstack-soft-pin.sh` after kube play,
+`deploy/contabo/soft-pin.env`) are **kube-only**. Do not treat Quadlet
+as the Contabo cutover path. Do not expect Quadlet `CPUAffinity=` to
+be the Contabo pin. Sidecar stays unpinned. Floki MOVE is not this
+workstream.
 
 For multi-host / Kubernetes-bound deploys, use the
 `podman kube play` YAML emitted under `deploy/kube/` (sibling

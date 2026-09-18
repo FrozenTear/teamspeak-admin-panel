@@ -125,6 +125,11 @@ spec:
           value: "/var/lib/ts6-manager/data"
         - name: SIDECAR_URL
           value: "http://127.0.0.1:7080"
+        # Contabo Music+Voice split: fullstack keeps Panel/API/Surreal
+        # and proxies bot lifecycle to the sibling music unit. Unset on
+        # hosts that still run the in-process supervisor (dev / Quadlet).
+        - name: MUSIC_RUNTIME_URL
+          value: "http://127.0.0.1:3002"
       envFrom:
         - secretRef:
             name: ts6-manager-secrets
@@ -148,6 +153,68 @@ spec:
         httpGet:
           path: /health
           port: http
+        initialDelaySeconds: 30
+        periodSeconds: 30
+        timeoutSeconds: 5
+        failureThreshold: 3
+    # Contabo-only Music+Voice unit. Owns decode → Opus → TS6 wire send
+    # (the only send loop). hostNetwork inherited from the pod —
+    # containerPort 3002 IS the host port. Do not use kube httpGet:
+    # Podman 5.6 turns that into in-container curl and this image has
+    # none (sidecar pattern: exec binary --healthcheck-url).
+    - name: music
+      image: ghcr.io/frozentear/ts6-manager-music:v1.6.2
+      imagePullPolicy: IfNotPresent
+      securityContext:
+        # Same uid as fullstack so ts6-data identities + ts6-music
+        # library files stay writable (volumes are 10001 / fsGroup 10001).
+        # Isolation is the container + cpuset, not a second uid.
+        runAsUser: 10001
+        runAsGroup: 10001
+      args:
+        - "--listen"
+        - "0.0.0.0:3002"
+      ports:
+        - name: music
+          containerPort: 3002
+          protocol: TCP
+      env:
+        - name: LOG_LEVEL
+          value: "info"
+        - name: MUSIC_DIR
+          value: "/var/lib/ts6-manager/music"
+        - name: DATA_DIR
+          value: "/var/lib/ts6-manager/data"
+        # Intra-container send-thread pin (option 1). NOT a container-wide
+        # HostConfig cpuset — that would also pin ffmpeg/yt-dlp onto 0-1.
+        # nproc=6; fullstack stays 2-5 until cutover. Media workers stay
+        # unpinned (may contend on 0-1) until a third slice exists.
+        - name: TS6_BOT_CPUSET
+          value: "0-1"
+        - name: TS6_BOT_SEND_CPUSET
+          value: "0-1"
+        - name: TS6_BOT_NICE
+          value: "-5"
+      volumeMounts:
+        - name: ts6-data
+          mountPath: /var/lib/ts6-manager
+        - name: ts6-music
+          mountPath: /var/lib/ts6-manager/music
+      readinessProbe:
+        exec:
+          command:
+            - /usr/local/bin/ts6-manager-music
+            - --healthcheck-url
+            - http://127.0.0.1:3002/health
+        initialDelaySeconds: 5
+        periodSeconds: 10
+        timeoutSeconds: 3
+      livenessProbe:
+        exec:
+          command:
+            - /usr/local/bin/ts6-manager-music
+            - --healthcheck-url
+            - http://127.0.0.1:3002/health
         initialDelaySeconds: 30
         periodSeconds: 30
         timeoutSeconds: 5

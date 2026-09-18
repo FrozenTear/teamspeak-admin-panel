@@ -1598,9 +1598,14 @@ async fn bug_report_post_middleware_merges_absent_context_keys() {
         Json(body)
     }
 
+    let state = fresh_state().await;
     let app = Router::new()
         .route("/api/bug-reports", post(echo))
-        .layer(axum::middleware::from_fn(enrich_bug_report_request));
+        .with_state(state.clone())
+        .layer(axum::middleware::from_fn_with_state(
+            state,
+            enrich_bug_report_request,
+        ));
 
     let resp = app
         .oneshot(
