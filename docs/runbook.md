@@ -81,6 +81,34 @@ verification V2) — host, WebQuery port, API key, optional SSH credentials.
 If you do not have a real TS6 server handy, the local fixture path is
 documented in [`docs/ts6-fixture.md`](ts6-fixture.md).
 
+### 1.5 Contabo panel HTTPS (draft — not applied)
+
+Contabo already terminates TLS with host Caddy v2.11.4 for
+`scuffedcrew.no`, `news.scuffedcrew.no`, and `ow.scuffedcrew.no`.
+The panel path is the same shape: `panel.scuffedcrew.no` →
+`reverse_proxy 127.0.0.1:3001` (fullstack, `hostNetwork`).
+
+**Not applied.** Append only after unanimous seat +1s, CoS/FrozenTear,
+and Robert. Soft pin stays packing B. Floki MOVE NO. Never SSH-apply
+from a draft PR.
+
+1. **DNS (Robert, prerequisite):** A record
+   `panel.scuffedcrew.no` → `194.163.163.153`. Let's Encrypt cannot
+   mint until this answers.
+2. **Caddy:** append
+   [`deploy/contabo/Caddyfile.panel.snippet`](../deploy/contabo/Caddyfile.panel.snippet)
+   to `/etc/caddy/Caddyfile`, then `systemctl reload caddy`. Do not
+   replace the existing file. Do not proxy `:3002` or `:7080`.
+3. **Stays internal:** `MUSIC_RUNTIME_URL=http://127.0.0.1:3002`,
+   music `:3002`, sidecar `:7080`.
+4. **Ownership:** Release owns Caddy / DNS / this doc. API owns the
+   HSTS gate (no HSTS on cleartext `:3001`). Panel owns the
+   `http://` absolute-URL audit.
+
+Loopback smoke stays `curl -fsS http://127.0.0.1:3001/health`. Once
+live, public access is the panel hostname — not raw `:3001`. See
+[`deploy/contabo/README.md` § Panel HTTPS](../deploy/contabo/README.md#panel-https-host-caddy--lets-encrypt).
+
 ---
 
 ## 2. Healthcheck and observability

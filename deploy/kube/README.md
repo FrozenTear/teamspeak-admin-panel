@@ -214,6 +214,14 @@ listeners are on the host's network namespace directly — operators
 fronting the manager with a reverse proxy (Caddy / nginx / Traefik)
 should bind the proxy to the host and forward to `127.0.0.1:3001`.
 
+Contabo public HTTPS (draft, **not applied**): once
+`panel.scuffedcrew.no` is live on the existing host Caddy, public
+access is that hostname — not raw `:3001`. Music `:3002` and sidecar
+`:7080` stay loopback-only (`MUSIC_RUNTIME_URL` remains
+`http://127.0.0.1:3002`). Snippet + DNS gate:
+[`deploy/contabo/Caddyfile.panel.snippet`](../contabo/Caddyfile.panel.snippet).
+Soft pin / packing B / Floki MOVE NO are unchanged.
+
 ## Network mode
 
 The pod runs with `hostNetwork: true`. This is **load-bearing**, not
