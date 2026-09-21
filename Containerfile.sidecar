@@ -89,9 +89,11 @@ WORKDIR /var/lib/ts6-manager-sidecar
 #
 # The control listener is intentionally loopback by default. Operators who run
 # the sidecar as a sibling container in the same pod (Quadlet / kube YAML) keep
-# the loopback default and reach it over the pod-shared loopback. Operators
-# running it standalone override with `--http-listen 0.0.0.0:7080` and front it
-# with their own auth.
+# the loopback default and reach it over the pod-shared loopback.
+# hostNetwork deploys must NOT override this to 0.0.0.0:7080 — that publishes
+# the unauthenticated control plane (POST /source) on every host interface.
+# :7080 stays off public Caddy. Standalone operators who really want a
+# non-loopback bind front it with their own auth.
 EXPOSE 4443/udp
 EXPOSE 7080/tcp
 

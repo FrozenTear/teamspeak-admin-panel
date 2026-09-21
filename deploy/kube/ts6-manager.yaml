@@ -78,7 +78,9 @@ spec:
   # 5 s, so a fresh fixture wedges within ~30 s of operator activity.
   # hostNetwork drops passt from the call path; manager-side surface
   # area is unchanged because the pod already advertises its
-  # listeners as hostPort (3001/tcp, 7080/tcp, 4443/udp).
+  # listeners as hostPort (3001/tcp, 4443/udp). Sidecar control
+  # :7080 stays on 127.0.0.1 only — not a public host port, and
+  # not on public Caddy.
   hostNetwork: true
   securityContext:
     runAsNonRoot: true
@@ -230,8 +232,12 @@ spec:
       args:
         - "--listen"
         - "[::]:4443"
+        # Control plane has no auth (POST /source starts FFmpeg).
+        # hostNetwork + 0.0.0.0 would publish :7080 on every host
+        # interface. Fullstack uses SIDECAR_URL=http://127.0.0.1:7080.
+        # Keep this off public Caddy (panel.scuffedcrew.no → :3001).
         - "--http-listen"
-        - "0.0.0.0:7080"
+        - "127.0.0.1:7080"
         - "--tls-generate"
         - "localhost"
       ports:

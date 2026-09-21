@@ -206,7 +206,7 @@ documented production layout.
 |----------------|-----------|-------|
 | 3001 | 3001 | HTTP, served by the Dioxus fullstack server |
 | 3002 | 3002 | Music unit loopback control (`MUSIC_RUNTIME_URL`) |
-| 7080 | 7080 | MoQ sidecar HTTP control |
+| 7080 | loopback only | MoQ sidecar HTTP control (`--http-listen 127.0.0.1:7080`). Not a public listener; do not put it on Caddy. |
 | 4443 | 4443 (UDP) | MoQ sidecar WebTransport |
 
 The pod runs with `hostNetwork: true` (see "Network mode" below). All
