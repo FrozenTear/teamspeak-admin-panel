@@ -605,6 +605,72 @@ async fn http_source_routes_through_pin_proxy_and_burns_on_stop() {
     sidecar.shutdown();
 }
 
+/// Spec §9.3 lets the shared validator return `resolved_ip: None` when
+/// DNS fails. Plaintext HTTP must still be refused: FFmpeg would resolve
+/// the name again. HTTPS stays on the TLS-verify path.
+#[tokio::test]
+async fn http_source_without_pinned_ip_is_refused() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("warn,ts6_media_sidecar=debug")
+        .with_test_writer()
+        .try_init();
+
+    let resolver = MockResolver::new().nxdomain("missing.test");
+    let sidecar = boot(Arc::new(resolver) as Arc<dyn Resolver>).await;
+    let base = format!("http://{}", sidecar.http_addr);
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/source"))
+        .json(&serde_json::json!({
+            "url": "http://alice:s3cret@missing.test/clip.mp4",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "unpinned HTTP must not reach FFmpeg");
+    let err: Value = resp.json().await.unwrap();
+    assert_eq!(err["error"], "ssrf_blocked");
+    let detail = err["detail"].as_str().unwrap_or("");
+    assert!(
+        detail.contains("no validated address"),
+        "detail should explain the missing pin: {detail}"
+    );
+    assert!(!detail.contains("alice"), "{detail}");
+    assert!(!detail.contains("s3cret"), "{detail}");
+    assert_eq!(
+        sidecar.pin_proxy.registry.len().await,
+        0,
+        "refused HTTP must not register a pin token",
+    );
+    assert_eq!(sidecar.origin.len().await, 0, "no broadcast on refuse");
+
+    let diag: Value = client
+        .get(format!("{base}/diagnostics"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ssrf = diag["sidecarSsrfReject"].as_str().unwrap_or("");
+    assert!(ssrf.contains("http_unpinned"), "{ssrf}");
+    assert!(!ssrf.contains("alice"), "{ssrf}");
+    assert!(!ssrf.contains("s3cret"), "{ssrf}");
+
+    // HTTPS with the same DNS miss still starts: cert verification, not an IP pin.
+    let resp = client
+        .post(format!("{base}/source"))
+        .json(&serde_json::json!({"url": "https://missing.test/clip.mp4"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "HTTPS DNS miss stays on the TLS path");
+    assert_eq!(sidecar.pin_proxy.registry.len().await, 0);
+
+    sidecar.shutdown();
+}
+
 async fn boot(resolver: Arc<dyn Resolver>) -> Sidecar {
     let config = SidecarConfig {
         transport: TransportConfig {
