@@ -48,7 +48,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 # Contabo bot-unit send/decode cpuset (`sched_setaffinity`). Already
 # transitive via tokio; first-class so `cpuset.rs` can pin voice-rt
-# send threads and, when TS6_BOT_DECODE_CPUSET is set, ffmpeg/yt-dlp.
+# send threads and, when TS6_BOT_DECODE_CPUSET is set, decode-rt plus
+# ffmpeg/yt-dlp. Music HostConfig stays unset — never cpuset 0-1.
 libc = "0.2"
 
 [dev-dependencies]

@@ -189,7 +189,8 @@ spec:
           value: "/var/lib/ts6-manager/data"
         # Intra-container SEND pin (option 1). NOT HostConfig.
         # Packing B (Robert): fullstack soft-pin stays 2-5. DECODE 2-5
-        # shares Axum via pin_decode_child — never on send 0-1.
+        # pins decode-rt (pipeline/fetch/bridge/resolve) and
+        # pin_decode_child (ffmpeg/yt-dlp) — share Axum, never send 0-1.
         # Never set music HostConfig to 0-1 (packing C; apply script refuses).
         - name: TS6_BOT_CPUSET
           value: "0-1"

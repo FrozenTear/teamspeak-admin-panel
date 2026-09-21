@@ -109,7 +109,7 @@ impl YtDlpSource {
             .stderr
             .take()
             .ok_or_else(|| io::Error::other("yt-dlp child has no stderr"))?;
-        let stderr_task = tokio::spawn(async move {
+        let stderr_task = crate::runtime::spawn_decode(async move {
             let mut lines = BufReader::new(yt_stderr).lines();
             let mut errors = Vec::new();
             while let Ok(Some(line)) = lines.next_line().await {
@@ -123,7 +123,7 @@ impl YtDlpSource {
 
         // Bridge yt-dlp.stdout → ffmpeg.stdin in a background task. Closes
         // ffmpeg's stdin when yt-dlp finishes so ffmpeg sees clean EOF.
-        let bridge = tokio::spawn(async move {
+        let bridge = crate::runtime::spawn_decode(async move {
             let mut buf = vec![0u8; 32 * 1024];
             let mut first_bytes_logged = false;
             loop {

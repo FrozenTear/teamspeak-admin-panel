@@ -38,7 +38,8 @@ use tsproto_packets::packets::{AudioData, CodecType, OutAudio};
 use music_bot_audio::source::AudioSourceSpec;
 use music_bot_audio::{
     AudioPipeline, GainStage, OpusFrameEncoder, PcmFrame, PipelineConfig, PipelineError,
-    PipelineEvent, VolumeHandle,
+    PipelineEvent, PlaybackRoute, VolumeHandle, classify_playback_url, normalize_radio_url,
+    spawn_decode,
 };
 
 use crate::command::AudioSource;
@@ -189,7 +190,16 @@ fn source_to_spec(source: &AudioSource) -> (AudioSourceSpec, String) {
                 format!("synthetic({hz:.0}Hz)"),
             )
         }
-        AudioSource::Url(u) => (AudioSourceSpec::YtDlp { url: u.clone() }, u.clone()),
+        AudioSource::Url(u) => {
+            let spec = match classify_playback_url(u) {
+                PlaybackRoute::YtDlp => AudioSourceSpec::YtDlp { url: u.clone() },
+                PlaybackRoute::IcyRadio => AudioSourceSpec::IcyRadio {
+                    url: normalize_radio_url(u),
+                },
+                PlaybackRoute::Ffmpeg => AudioSourceSpec::Ffmpeg { input: u.clone() },
+            };
+            (spec, u.clone())
+        }
         AudioSource::LibraryPath(p) => {
             let input = p.to_string_lossy().into_owned();
             let label = format!("library:{input}");
@@ -361,9 +371,11 @@ pub(crate) async fn start_pipeline(
     let pipeline = AudioPipeline::spawn(spec, cfg).await?;
 
     // PURA-352 — set up seek retention for the new track. A library file
-    // is seekable the moment it starts; a URL source needs a one-off
-    // `yt-dlp -g` resolve, kicked off in the background so it never
-    // delays first audio. Synthetic test tones are left unseekable.
+    // is seekable the moment it starts. An extractor URL needs a one-off
+    // `yt-dlp -g` resolve, kicked off on the decode runtime so it never
+    // delays first audio or sits on the send cores. Direct media is
+    // already an ffmpeg input. Live radio is not seekable. Synthetic
+    // test tones are left unseekable.
     let seek_input: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let mut resolve: Option<JoinHandle<()>> = None;
     match source {
@@ -371,24 +383,42 @@ pub(crate) async fn start_pipeline(
             *seek_input.lock().unwrap() = Some(p.to_string_lossy().into_owned());
         }
         AudioSource::Url(u) if !u.starts_with("synthetic:") => {
-            let slot = Arc::clone(&seek_input);
-            let url = u.clone();
-            resolve = Some(tokio::spawn(async move {
-                match music_bot_audio::resolve::resolve_direct_url(&url, yt_cookie_file.as_deref())
-                    .await
-                {
-                    Ok(direct) => {
-                        debug!("PURA-352 seek: resolved direct media URL for current track");
-                        *slot.lock().unwrap() = Some(direct);
-                    }
-                    Err(err) => {
-                        warn!(
-                            ?err,
-                            "PURA-352 seek: yt-dlp URL resolve failed — seek unavailable for this track"
-                        );
-                    }
+            match classify_playback_url(u) {
+                // Extractor page: one `yt-dlp -g` off the send runtime so
+                // a later seek can respawn ffmpeg without re-extracting.
+                PlaybackRoute::YtDlp => {
+                    let slot = Arc::clone(&seek_input);
+                    let url = u.clone();
+                    resolve = Some(spawn_decode(async move {
+                        match music_bot_audio::resolve::resolve_direct_url(
+                            &url,
+                            yt_cookie_file.as_deref(),
+                        )
+                        .await
+                        {
+                            Ok(direct) => {
+                                debug!(
+                                    "PURA-352 seek: resolved direct media URL for current track"
+                                );
+                                *slot.lock().unwrap() = Some(direct);
+                            }
+                            Err(err) => {
+                                warn!(
+                                    ?err,
+                                    "PURA-352 seek: yt-dlp URL resolve failed — seek unavailable for this track"
+                                );
+                            }
+                        }
+                    }));
                 }
-            }));
+                // Already an ffmpeg `-i` input. Seek reuses the URL;
+                // do not run yt-dlp -g.
+                PlaybackRoute::Ffmpeg => {
+                    *seek_input.lock().unwrap() = Some(u.clone());
+                }
+                // Live Icecast/Shoutcast is not seekable.
+                PlaybackRoute::IcyRadio => {}
+            }
         }
         _ => {}
     }
@@ -1440,10 +1470,45 @@ mod tests {
     }
 
     #[test]
-    fn source_to_spec_url_routes_to_ytdlp() {
-        let (spec, label) = source_to_spec(&AudioSource::Url("https://example.com/x.mp3".into()));
+    fn source_to_spec_extractor_url_routes_to_ytdlp() {
+        let (spec, label) =
+            source_to_spec(&AudioSource::Url("https://youtu.be/dQw4w9WgXcQ".into()));
         assert!(matches!(spec, AudioSourceSpec::YtDlp { .. }));
+        assert_eq!(label, "https://youtu.be/dQw4w9WgXcQ");
+    }
+
+    #[test]
+    fn source_to_spec_direct_media_routes_to_ffmpeg() {
+        let (spec, label) = source_to_spec(&AudioSource::Url("https://example.com/x.mp3".into()));
+        assert!(matches!(spec, AudioSourceSpec::Ffmpeg { .. }));
         assert_eq!(label, "https://example.com/x.mp3");
+        let (hls, _) = source_to_spec(&AudioSource::Url(
+            "https://cdn.example.com/live/index.m3u8".into(),
+        ));
+        assert!(matches!(hls, AudioSourceSpec::Ffmpeg { .. }));
+    }
+
+    #[test]
+    fn source_to_spec_icecast_routes_to_icy_radio() {
+        let (spec, label) = source_to_spec(&AudioSource::Url(
+            "https://ice1.somafm.com/groovesalad-128-mp3".into(),
+        ));
+        match spec {
+            AudioSourceSpec::IcyRadio { url } => {
+                assert_eq!(url, "https://ice1.somafm.com/groovesalad-128-mp3");
+            }
+            other => panic!("expected IcyRadio, got {other:?}"),
+        }
+        assert_eq!(label, "https://ice1.somafm.com/groovesalad-128-mp3");
+
+        let (rewritten, _) =
+            source_to_spec(&AudioSource::Url("icy://stream.example.com/live".into()));
+        match rewritten {
+            AudioSourceSpec::IcyRadio { url } => {
+                assert_eq!(url, "http://stream.example.com/live");
+            }
+            other => panic!("expected IcyRadio, got {other:?}"),
+        }
     }
 
     #[test]
