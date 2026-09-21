@@ -232,11 +232,8 @@ async fn handle(
             &[SocketAddr::new(target.resolved_ip, target.port)],
         )
         .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        // Long enough for large media fetches; tighter than infinite so a
-        // wedged upstream can't pin a sidecar task forever.
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(300));
+        .redirect(reqwest::redirect::Policy::none());
+    let client_build = apply_upstream_timeouts(client_build);
     let client = match client_build.build() {
         Ok(c) => c,
         Err(err) => {
@@ -336,6 +333,24 @@ async fn handle(
             StatusCode::BAD_GATEWAY.into_response()
         }
     }
+}
+
+/// Connect deadline for the pinned upstream. Independent of body length.
+const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Idle-read deadline. Resets after each successful read, so a live or
+/// long VOD body is not killed, while a wedged upstream still fails.
+///
+/// This is deliberately not [`reqwest::ClientBuilder::timeout`]. That
+/// setting is a total deadline from connect until the body finishes, and
+/// a 5-minute cap aborts every relay that outlives it.
+const UPSTREAM_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn apply_upstream_timeouts(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    // Do not add `.timeout(...)` here. It includes the response body.
+    builder
+        .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
+        .read_timeout(UPSTREAM_READ_TIMEOUT)
 }
 
 /// RFC 7230 §6.1 + Proxy-* family — headers that MUST NOT be forwarded
@@ -662,5 +677,16 @@ mod tests {
 
         proxy.shutdown();
         upstream_task.abort();
+    }
+
+    /// The proxy used to set `ClientBuilder::timeout(300s)`, which is a
+    /// total deadline through the end of the body. A live relay dies at
+    /// that cap and the FFmpeg supervisor restart-loops. Timeouts are
+    /// connect + idle-read only.
+    #[test]
+    fn upstream_timeouts_do_not_cap_the_body() {
+        assert_eq!(UPSTREAM_CONNECT_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(UPSTREAM_READ_TIMEOUT, Duration::from_secs(30));
+        let _ = apply_upstream_timeouts(reqwest::Client::builder());
     }
 }
