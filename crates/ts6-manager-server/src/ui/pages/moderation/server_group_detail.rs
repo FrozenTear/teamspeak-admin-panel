@@ -57,7 +57,16 @@ pub fn ServerGroupDetailPage(sgid: i64) -> Element {
         Err(placeholder) => return placeholder,
     };
 
-    rsx! { ServerGroupDetailBody { server, sgid, is_admin } }
+    // Dioxus keeps hook state when only the dynamic segment changes.
+    // Duplicate pushes `ServerGroupDetailPage { sgid: new }` from this
+    // same page, so without a remount the cached group list (fetched
+    // before the copy existed) renders "Group not found" and the members
+    // resource keeps requesting the source sgid.
+    rsx! {
+        {std::iter::once(rsx! {
+            ServerGroupDetailBody { key: "{sgid}", server, sgid, is_admin }
+        })}
+    }
 }
 
 #[derive(Props, Clone, PartialEq)]
