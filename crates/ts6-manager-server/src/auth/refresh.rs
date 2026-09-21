@@ -205,6 +205,29 @@ pub async fn rotate(db: &Database, supplied: &str, lifetime: Duration) -> Result
     })
 }
 
+/// Present a refresh token to `POST /api/auth/logout`.
+///
+/// - Unknown token: no-op. Logout stays idempotent (spec §6.5.5).
+/// - Live token (`replacedBy` is none): delete that row only. Other
+///   families for the same user stay valid.
+/// - Already-rotated predecessor (`replacedBy` is set): do **not** delete
+///   just that row. The predecessor is the reuse-detection breadcrumb. A
+///   thief who rotated a stolen token and then logged the old value out
+///   would otherwise erase the signal and keep the successor for the rest
+///   of the refresh lifetime. Treat it as reuse and revoke every refresh
+///   token for the user.
+pub async fn logout(db: &Database, supplied: &str) -> Result<(), Error> {
+    let Some(row) = refresh_tokens::find_by_token(db, supplied).await? else {
+        return Ok(());
+    };
+    if row.replacedBy.is_some() {
+        revoke_user_and_warn(db, row.userId, "logout of rotated predecessor").await;
+        return Ok(());
+    }
+    refresh_tokens::delete_by_token(db, supplied).await?;
+    Ok(())
+}
+
 /// Spec §6.5.4 — supplied token does not exist; check `replacedBy` and, if
 /// found, revoke the user's entire refresh-token set.
 async fn reuse_check_or_invalid(db: &Database, supplied: &str) -> Result<(), Error> {
@@ -383,6 +406,71 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "chain replay must wipe all sessions"
+        );
+    }
+
+    #[tokio::test]
+    async fn logout_of_live_token_drops_only_that_row() {
+        let db = setup().await;
+        let uid = make_user(&db, "alice").await;
+        let live = issue_for_login(&db, uid, ONE_DAY).await.unwrap();
+        let other = issue_for_login(&db, uid, ONE_DAY).await.unwrap();
+
+        logout(&db, &live.token).await.unwrap();
+
+        assert!(
+            refresh_tokens::find_by_token(&db, &live.token)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            refresh_tokens::find_by_token(&db, &other.token)
+                .await
+                .unwrap()
+                .is_some(),
+            "logging out one family must not revoke the user's other sessions"
+        );
+    }
+
+    #[tokio::test]
+    async fn logout_of_rotated_predecessor_revokes_the_successor() {
+        // A thief who rotates a stolen refresh token and then POSTs the old
+        // value to /logout must not be able to delete the reuse breadcrumb
+        // and keep the successor for the rest of the refresh lifetime.
+        let db = setup().await;
+        let uid = make_user(&db, "alice").await;
+        let issued = issue_for_login(&db, uid, ONE_DAY).await.unwrap();
+        let rotated = rotate(&db, &issued.token, ONE_DAY).await.unwrap();
+
+        logout(&db, &issued.token).await.unwrap();
+
+        assert!(
+            refresh_tokens::list_for_user(&db, uid)
+                .await
+                .unwrap()
+                .is_empty(),
+            "logout of a predecessor must wipe the successor too"
+        );
+        assert!(
+            refresh_tokens::find_by_token(&db, &rotated.token)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn logout_unknown_token_is_a_noop() {
+        let db = setup().await;
+        let uid = make_user(&db, "alice").await;
+        let issued = issue_for_login(&db, uid, ONE_DAY).await.unwrap();
+        logout(&db, "never-issued").await.unwrap();
+        assert!(
+            refresh_tokens::find_by_token(&db, &issued.token)
+                .await
+                .unwrap()
+                .is_some()
         );
     }
 
