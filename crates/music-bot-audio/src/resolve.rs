@@ -111,6 +111,7 @@ async fn run_once(url: &str, cookie_file: Option<&Path>) -> std::io::Result<Stri
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
+    crate::cpuset::install_decode_pre_exec(&mut cmd);
     let child = cmd.spawn()?;
     crate::cpuset::pin_decode_child(&child);
     let out = match tokio::time::timeout(PROCESS_TIMEOUT, child.wait_with_output()).await {

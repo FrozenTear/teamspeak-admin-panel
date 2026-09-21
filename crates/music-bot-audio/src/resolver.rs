@@ -760,6 +760,7 @@ async fn supervise(script: PathBuf, socket: PathBuf, state: Arc<SupervisorState>
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
+        crate::cpuset::install_decode_pre_exec(&mut cmd);
 
         let mut child = match cmd.spawn() {
             Ok(child) => {
