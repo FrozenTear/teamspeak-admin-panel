@@ -9,6 +9,7 @@ pub mod active_server;
 mod admin;
 mod bans;
 mod channels;
+mod client_move;
 mod clients;
 mod dashboard_placeholder;
 #[cfg(debug_assertions)]
