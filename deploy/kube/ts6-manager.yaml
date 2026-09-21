@@ -113,7 +113,10 @@ spec:
         - name: LOG_PRETTY
           value: ""
         - name: FRONTEND_URL
-          value: "http://localhost:3000"
+          value: "https://panel.scuffedcrew.no"
+        # hops=1 matches host Caddy for panel.scuffedcrew.no (#50/#51)
+        - name: TRUSTED_PROXY_HOPS
+          value: "1"
         - name: DATABASE_URL
           value: "surrealkv:///var/lib/ts6-manager/db"
         - name: MUSIC_DIR
