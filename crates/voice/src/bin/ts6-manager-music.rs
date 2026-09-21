@@ -6,11 +6,13 @@
 //! `music_bot_latency`) stay in-process.
 //!
 //! Intra-container affinity (option 1 + packing B): `TS6_BOT_SEND_CPUSET` /
-//! `TS6_BOT_CPUSET` pins `voice-rt` send threads only. ffmpeg / yt-dlp /
+//! `TS6_BOT_CPUSET` pins `voice-rt` send threads only. Pipeline, fetch,
+//! bridge, and resolve run on `decode-rt`. ffmpeg / yt-dlp /
 //! warm-resolver inherit `TS6_BOT_DECODE_CPUSET=2-5` via a pre_exec
-//! `sched_setaffinity` (share Axum). Never HostConfig-only `0-1`.
-//! `TS6_BOT_NICE` is applied to `voice-rt` tids by the host soft-pin
-//! script; this process starts that runtime before `/health`.
+//! `sched_setaffinity` (`pin_decode_child` is a post-spawn backup);
+//! share Axum. Never HostConfig-only `0-1`. Fullstack soft pin stays
+//! `2-5`. `TS6_BOT_NICE` is applied to `voice-rt` tids by the host
+//! soft-pin script; this process starts that runtime before `/health`.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

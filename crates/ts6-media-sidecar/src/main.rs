@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{ArgGroup, Parser};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -18,7 +18,12 @@ use ts6_media_sidecar::{
 #[derive(Parser, Debug)]
 #[command(
     name = "ts6-media-sidecar",
-    about = "Phase-5 MoQ + WebTransport sidecar"
+    about = "Phase-5 MoQ + WebTransport sidecar",
+    group(
+        ArgGroup::new("boot_source")
+            .args(["source", "source_lavfi_video"])
+            .multiple(false)
+    )
 )]
 struct Args {
     /// UDP socket for QUIC / WebTransport (e.g. `[::]:4443`).
@@ -44,7 +49,11 @@ struct Args {
 
     /// Optional: start a media pipeline at boot. Becomes the broadcast
     /// name browsers subscribe to. Mutating REST control is WS-3.
-    #[arg(long = "source-name", requires = "source")]
+    ///
+    /// Requires either `--source` or the lavfi pair. Requiring only
+    /// `--source` made the documented lavfi flags unsatisfiable: they
+    /// conflict with `--source` and themselves require `--source-name`.
+    #[arg(long = "source-name", requires = "boot_source")]
     source_name: Option<String>,
 
     /// Optional: anything FFmpeg can read from. Mutually exclusive with
@@ -156,5 +165,77 @@ async fn main() -> Result<()> {
             if let Some(p) = pipeline { p.stop().await; }
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Args, clap::Error> {
+        Args::try_parse_from(std::iter::once("ts6-media-sidecar").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn lavfi_boot_flags_parse() {
+        let args = parse(&[
+            "--tls-generate",
+            "localhost",
+            "--source-name",
+            "camera-1",
+            "--source-lavfi-video",
+            "testsrc2=size=320x240:rate=15",
+            "--source-lavfi-audio",
+            "sine=frequency=440:sample_rate=48000",
+        ])
+        .expect("documented lavfi boot flags must parse");
+        assert_eq!(args.source_name.as_deref(), Some("camera-1"));
+        assert!(args.source.is_none());
+        assert_eq!(
+            args.source_lavfi_video.as_deref(),
+            Some("testsrc2=size=320x240:rate=15")
+        );
+    }
+
+    #[test]
+    fn url_boot_flags_still_parse() {
+        let args = parse(&[
+            "--tls-generate",
+            "localhost",
+            "--source-name",
+            "camera-1",
+            "--source",
+            "tests/fixtures/sample.mp4",
+        ])
+        .expect("url boot flags must parse");
+        assert_eq!(args.source.as_deref(), Some("tests/fixtures/sample.mp4"));
+    }
+
+    #[test]
+    fn source_name_alone_is_rejected() {
+        let err = parse(&["--tls-generate", "localhost", "--source-name", "camera-1"])
+            .expect_err("--source-name without an input must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("boot_source") || msg.contains("source"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn lavfi_and_url_together_are_rejected() {
+        parse(&[
+            "--tls-generate",
+            "localhost",
+            "--source-name",
+            "camera-1",
+            "--source",
+            "clip.mp4",
+            "--source-lavfi-video",
+            "testsrc2=size=320x240:rate=15",
+            "--source-lavfi-audio",
+            "sine=frequency=440",
+        ])
+        .expect_err("url and lavfi inputs conflict");
     }
 }

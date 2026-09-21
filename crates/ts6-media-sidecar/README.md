@@ -177,7 +177,7 @@ codes:
 
 | HTTP | `error`                       | When                                                              |
 | ---- | ----------------------------- | ----------------------------------------------------------------- |
-| 400  | `ssrf_blocked`                | URL fails the shared `ts6-ssrf` validator (loopback, private, …). |
+| 400  | `ssrf_blocked`                | URL fails the shared `ts6-ssrf` validator (loopback, private, …), or plaintext HTTP has no address to pin. |
 | 400  | `invalid_request`             | Missing/empty `url`, bad characters in `source_id`, …             |
 | 404  | `unknown_source_id`           | `/source/stop` or `/track/{id}` for a source not in the registry. |
 | 409  | `source_id_already_running`   | `POST /source` with a `source_id` that's already live.            |
@@ -208,11 +208,12 @@ DNS-rebinding defence in v1 splits by scheme:
   rewrites FFmpeg's `-i` to `http://127.0.0.1:<port>/<uuid>`. The
   proxy pins the outbound socket with `reqwest::resolve_to_addrs`,
   refuses `3xx` (502), and burns the token on `POST /source/stop`.
-  The initial GET's rebinding window is closed. Residual: HTTP
-  sources whose DNS failed at validate time (`resolved_ip` is `None`,
-  spec §9.3) skip the proxy; FFmpeg-initiated secondary fetches
-  (HLS/DASH absolute segment URLs) also bypass it. Those are
-  PURA-150 follow-ups, not v1 pin-proxy scope.
+  The initial GET's rebinding window is closed. If DNS does not yield
+  an address to pin (`resolved_ip` is `None`, spec §9.3), plaintext
+  HTTP is refused (`400 ssrf_blocked`) instead of being handed to
+  FFmpeg, which would resolve the name again later. Residual:
+  FFmpeg-initiated secondary fetches (HLS/DASH absolute segment URLs)
+  and HTTPS `3xx` follows are still PURA-150 follow-ups.
 
 The earlier "rewrite the FFmpeg-input URL to the resolved IP literal"
 approach (PURA-149) was reverted because it broke TLS SNI / `Host:`

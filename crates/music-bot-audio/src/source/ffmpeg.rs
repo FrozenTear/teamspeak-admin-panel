@@ -102,7 +102,7 @@ impl FfmpegSource {
             .stderr
             .take()
             .ok_or_else(|| io::Error::other("ffmpeg child has no stderr"))?;
-        tokio::spawn(async move {
+        crate::runtime::spawn_decode(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 tracing::warn!(target: "ffmpeg", "{}", line);
@@ -207,7 +207,7 @@ impl FfmpegSource {
             .stderr
             .take()
             .ok_or_else(|| io::Error::other("ffmpeg child has no stderr"))?;
-        tokio::spawn(async move {
+        crate::runtime::spawn_decode(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 tracing::warn!(target: "ffmpeg", "{}", line);
