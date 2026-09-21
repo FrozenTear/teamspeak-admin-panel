@@ -84,7 +84,7 @@ fn test_app(db: Arc<Database>) -> AppState {
         yt_cookie: Arc::new(RwLock::new(None)),
         yt_api_key: Arc::new(RwLock::new(None)),
         data_dir: PathBuf::from("./data"),
-        trusted_proxy_hops: 0,
+        proxy_trust: crate::web::proxy::ProxyTrust::direct(),
         bug_reports: crate::bug_reports::unconfigured_sink(),
     }
 }

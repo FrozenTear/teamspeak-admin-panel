@@ -48,11 +48,11 @@ use crate::web::proxy;
 pub type AuthRateLimiter = RateLimiter<IpAddr, DefaultKeyedStateStore<IpAddr>, DefaultClock>;
 
 /// Middleware state carrying both the limiter and the proxy-trust
-/// configuration. Cheap to clone (single `Arc`).
+/// configuration. Cheap to clone (`Arc`s).
 #[derive(Clone)]
 pub struct RateLimitState {
     pub limiter: Arc<AuthRateLimiter>,
-    pub trusted_hops: u8,
+    pub proxy: proxy::ProxyTrust,
 }
 
 /// Spec §6.8 quota for `POST /api/auth/login` and `POST /api/auth/refresh`:
@@ -137,7 +137,7 @@ pub async fn rate_limit_auth(
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ci| ci.0)
         .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
-    let ip = proxy::client_ip(req.headers(), peer, state.trusted_hops);
+    let ip = proxy::client_ip(req.headers(), peer, &state.proxy);
 
     match state.limiter.check_key(&ip) {
         Ok(_) => next.run(req).await,
@@ -212,7 +212,7 @@ mod tests {
     async fn fifteen_attempts_pass_sixteenth_is_429() {
         let state = RateLimitState {
             limiter: make_auth_limiter(),
-            trusted_hops: 0,
+            proxy: proxy::ProxyTrust::direct(),
         };
         let app = app(state);
 
@@ -242,7 +242,7 @@ mod tests {
     async fn rate_limit_response_carries_retry_after_header() {
         let state = RateLimitState {
             limiter: make_auth_limiter(),
-            trusted_hops: 0,
+            proxy: proxy::ProxyTrust::direct(),
         };
         let app = app(state);
 
@@ -267,7 +267,7 @@ mod tests {
     async fn distinct_ips_track_independent_buckets() {
         let state = RateLimitState {
             limiter: make_auth_limiter(),
-            trusted_hops: 0,
+            proxy: proxy::ProxyTrust::direct(),
         };
         let app = app(state);
 
@@ -284,13 +284,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn xff_keying_is_used_when_trusted_hops_set() {
+    async fn xff_keying_is_used_when_peer_is_in_proxy_cidr() {
         // Two requests from the SAME peer IP but with different XFF
-        // values — when trusted_hops=1, the limiter must key by the XFF
-        // entry, so each "client" has its own 15-burst budget.
+        // values — when hops=1 AND the peer is inside TRUSTED_PROXY_CIDRS,
+        // the limiter keys by the XFF entry, so each client has its own
+        // 15-burst budget.
         let state = RateLimitState {
             limiter: make_auth_limiter(),
-            trusted_hops: 1,
+            proxy: proxy::ProxyTrust::from_parts(1, vec!["203.0.113.0/24".parse().unwrap()]),
         };
         let app = app(state);
 
@@ -319,13 +320,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hops_without_matching_cidr_ignores_xff() {
+        // hops=1 and a crafted XFF must not split the bucket when the
+        // TCP peer is outside the proxy CIDR. Every request keys on the
+        // peer, so rotating XFF cannot buy a fresh quota.
+        let state = RateLimitState {
+            limiter: make_auth_limiter(),
+            proxy: proxy::ProxyTrust::from_parts(1, vec!["203.0.113.0/24".parse().unwrap()]),
+        };
+        let app = app(state);
+        for n in 0..15 {
+            let xff = format!("198.51.100.{n}");
+            let r = app
+                .clone()
+                .oneshot(req_from_with_xff("198.51.100.8", &xff))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::OK);
+        }
+        let burned = app
+            .oneshot(req_from_with_xff("198.51.100.8", "203.0.113.50"))
+            .await
+            .unwrap();
+        assert_eq!(burned.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
     async fn trusted_hops_zero_uses_peer_only_even_with_xff() {
         // When trusted_hops=0, attacker-supplied XFF must not let them
         // escape the limiter by rotating the header value — bucket keying
         // sticks to ConnectInfo.
         let state = RateLimitState {
             limiter: make_auth_limiter(),
-            trusted_hops: 0,
+            proxy: proxy::ProxyTrust::direct(),
         };
         let app = app(state);
 
@@ -359,11 +386,11 @@ mod tests {
     async fn auth_and_setup_buckets_are_independent() {
         let auth_state = RateLimitState {
             limiter: make_auth_limiter(),
-            trusted_hops: 0,
+            proxy: proxy::ProxyTrust::direct(),
         };
         let setup_state = RateLimitState {
             limiter: make_setup_limiter(),
-            trusted_hops: 0,
+            proxy: proxy::ProxyTrust::direct(),
         };
         // Two apps, each layered with its own limiter — mirrors how
         // `auth::routes::router` and `routes::setup::router` are wired in
