@@ -153,8 +153,9 @@ pub async fn move_channel(
 /// place the channel first under its current parent. This is `channeledit`
 /// on the existing `PUT …/channels/{cid}` route — not
 /// [`move_channel`]. TeamSpeak answers `channelmove` with the channel's
-/// current parent as `error id=770` (`channel_already_in`, "already member
-/// of channel") and leaves the order unchanged.
+/// current parent as `error id=770` (`channel_already_in`, 0x0302, "already
+/// member of channel") and leaves the order unchanged. That is a channel
+/// error, not `clientmove`.
 pub async fn reorder_channel(
     gate: Arc<RefreshGate>,
     config_id: i64,
@@ -231,5 +232,23 @@ mod tests {
         };
         let encoded = serde_json::to_value(&after_sibling).unwrap();
         assert_eq!(encoded, serde_json::json!({ "channelOrder": 20 }));
+    }
+
+    #[test]
+    fn reorder_body_matches_the_server_channeledit_request() {
+        // The Panel helper and `PUT …/channels/{cid}` do not share a struct.
+        // This pins the wire the route actually deserializes, including
+        // `channelOrder: 0` (first among siblings), which must not be dropped
+        // as "unset".
+        let body = ChannelEditRequest {
+            channel_order: Some(0),
+            ..Default::default()
+        };
+        let encoded = serde_json::to_value(&body).unwrap();
+        let server: ts6_manager_shared::control::ChannelEditRequest =
+            serde_json::from_value(encoded).unwrap();
+        assert_eq!(server.properties.channel_order, Some(0));
+        assert!(server.channel_name.is_none());
+        assert!(!server.is_empty());
     }
 }
