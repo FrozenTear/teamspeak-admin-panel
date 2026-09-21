@@ -244,10 +244,10 @@ pub fn ClientsPage() -> Element {
                     clients::move_client(gate, server_id, sid, clid, target_cid)
                         .await
                         .into();
-                if matches!(outcome, ClientMoveOutcome::Moved) {
-                    if let Some(row) = rows.write().iter_mut().find(|r| r.clid == clid) {
-                        row.cid = target_cid;
-                    }
+                if matches!(outcome, ClientMoveOutcome::Moved)
+                    && let Some(row) = rows.write().iter_mut().find(|r| r.clid == clid)
+                {
+                    row.cid = target_cid;
                 }
                 let (variant, title, detail) =
                     super::client_move::client_move_toast(&outcome, &nick, &channel);
