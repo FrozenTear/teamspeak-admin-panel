@@ -89,11 +89,13 @@ pipeline.shutdown().await;
 | `AudioSourceSpec` variant | Use for                                        | Backend                                             |
 | ------------------------- | ---------------------------------------------- | --------------------------------------------------- |
 | `SyntheticTone`           | Tests, demo, sanity checks                     | In-process sine generator                           |
-| `Ffmpeg { input }`        | Local files, simple HTTP, anything ffmpeg `-i` accepts | `ffmpeg` subprocess                                 |
-| `YtDlp { url }`           | YouTube, SoundCloud, generic media URLs        | warm resolver → direct URL → `ffmpeg`; falls back to `yt-dlp` → `ffmpeg` subprocess pipeline |
+| `Ffmpeg { input }`        | Local files, HLS (`.m3u8`), direct media URLs ffmpeg `-i` accepts | `ffmpeg` subprocess                                 |
+| `YtDlp { url }`           | Extractor sites only (YouTube, SoundCloud, …) and `ytsearch…:` | warm resolver → direct URL → `ffmpeg`; falls back to `yt-dlp` → `ffmpeg` subprocess pipeline |
 | `IcyRadio { url }`        | Shoutcast / Icecast streams; raises `NowPlaying` | reqwest HTTP fetch → ICY splitter → `ffmpeg` stdin |
 
-ICY metadata is only surfaced for the `IcyRadio` variant. yt-dlp / file / generic ffmpeg inputs do not see ICY.
+`classify_playback_url` picks the row. Live radio does not call `resolve_direct_url` (`yt-dlp -g`); a direct file or HLS URL is already the ffmpeg input. ICY metadata is only surfaced for the `IcyRadio` variant. yt-dlp / file / generic ffmpeg inputs do not see ICY.
+
+CPU affinity (packing B, no fullstack shrink): `voice-rt` pins only the wire-send path to `TS6_BOT_SEND_CPUSET=0-1`. Pipeline, ICY fetch, the yt-dlp bridge, and resolve run on `decode-rt`, pinned to `TS6_BOT_DECODE_CPUSET=2-5`. Music container HostConfig stays unset — never `0-1` (packing C).
 
 ## Persistent yt-dlp resolver (PURA-359)
 
@@ -109,8 +111,9 @@ Measured on contabo-dev: ~6.5 s cold subprocess vs ~3.8 s warm — **−~2.7 s**
 - The manager warms the resolver at boot (`music_bot::warm_resolver()`)
   so the `import yt_dlp` cost is paid before the first `!play`. Contabo
   kube sets `MUSIC_RUNTIME_URL`; fullstack skips the warm and the music
-  unit warms instead (`ts6-manager-music`). `pin_decode_child` parks
-  that process on `TS6_BOT_DECODE_CPUSET=2-5` (packing B; share Axum).
+  unit warms instead (`ts6-manager-music`). The supervisor task runs
+  on `decode-rt`, and `pin_decode_child` parks the Python process, both
+  on `TS6_BOT_DECODE_CPUSET=2-5` (packing B; share Axum, never send `0-1`).
 - A background supervisor restarts the process on exit; after repeated fast
   crashes it gives up and leaves the subprocess fallback in effect.
 - **Every failure path falls back to the `yt-dlp` subprocess** — service down,

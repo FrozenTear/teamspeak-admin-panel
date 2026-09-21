@@ -55,10 +55,11 @@ stays unpinned unless the file sets `TS6_SIDECAR_*`.
 
 **Music unit (option 1, nproc=6).** `TS6_BOT_CPUSET` /
 `TS6_BOT_SEND_CPUSET=0-1` is an **in-process** send-thread affinity
-(`sched_setaffinity` on `voice-rt`), not HostConfig. kube
-`TS6_BOT_DECODE_CPUSET=2-5` parks ffmpeg / yt-dlp / warm-resolver via
-`pin_decode_child` on the fullstack slice (share Axum — still off
-send `0-1`). Packing **C** (music `podman update --cpuset-cpus=0-1`)
+(`sched_setaffinity` on `voice-rt` wire-send threads only), not
+HostConfig. kube `TS6_BOT_DECODE_CPUSET=2-5` pins `decode-rt`
+(pipeline / fetch / bridge / resolve) and parks ffmpeg / yt-dlp /
+warm-resolver via `pin_decode_child` on the fullstack slice (share
+Axum — still off send `0-1`). Packing **C** (music `podman update --cpuset-cpus=0-1`)
 is **rejected** — the v1.6.15 Angerfist dig (und/C/stall
 **163/590/117**) showed container-wide 0-1 traps ffmpeg on send
 cores. The apply script refuses send-only music HostConfig.

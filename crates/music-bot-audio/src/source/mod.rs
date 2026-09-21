@@ -6,11 +6,13 @@ use crate::types::PipelineEvent;
 
 pub mod ffmpeg;
 pub mod icy;
+pub mod select;
 pub mod synthetic;
 pub mod url;
 
 pub use ffmpeg::FfmpegSource;
 pub use icy::IcyRadioSource;
+pub use select::{PlaybackRoute, classify_playback_url, normalize_radio_url};
 pub use synthetic::SyntheticToneSource;
 pub use url::YtDlpSource;
 
@@ -53,8 +55,10 @@ pub enum AudioSourceSpec {
     /// [`crate::resolve`]), so the decoder re-spawns at the offset without
     /// re-running yt-dlp resolution.
     FfmpegAt { input: String, start_secs: u64 },
-    /// `yt-dlp -f bestaudio -o - <url>` piped into ffmpeg. The right shape
-    /// for YouTube / SoundCloud / arbitrary "play this URL" inputs.
+    /// `yt-dlp -f bestaudio -o - <url>` piped into ffmpeg. Extractor
+    /// sites only (YouTube, SoundCloud, …). Icecast/Shoutcast uses
+    /// [`AudioSourceSpec::IcyRadio`]; HLS and direct media files use
+    /// [`AudioSourceSpec::Ffmpeg`]. See [`select::classify_playback_url`].
     YtDlp { url: String },
     /// Direct ICY HTTP fetch (Shoutcast / Icecast). Surfaces `StreamTitle`
     /// changes as `PipelineEvent::NowPlaying`.

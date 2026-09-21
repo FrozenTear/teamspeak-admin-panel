@@ -6,12 +6,15 @@
 //! (Robert): fullstack soft pin stays `2-5` (no shrink).
 //!
 //! - `TS6_BOT_SEND_CPUSET` (preferred) or `TS6_BOT_CPUSET` pins **only**
-//!   the Voice send runtime threads (`voice-rt`) to `0-1`.
+//!   the Voice wire-send threads (`voice-rt`) to `0-1`. Pipeline,
+//!   fetch, bridge, and resolve run on `decode-rt` via
+//!   [`pin_current_thread_decode`].
 //! - [`pin_decode_child`] parks ffmpeg / yt-dlp / the Python warm
 //!   resolver on `TS6_BOT_DECODE_CPUSET=2-5` (share Axum, never send
-//!   `0-1`). Packing A (`DECODE=2-3` after fullstack→`4-5`) is a
-//!   gated comment only. Packing C (HostConfig `0-1` + DECODE on send
-//!   cores) is rejected by the apply script.
+//!   `0-1`). The same set pins `decode-rt` worker threads. Packing A
+//!   (`DECODE=2-3` after fullstack→`4-5`) is a gated comment only.
+//!   Packing C (HostConfig `0-1` + DECODE on send cores) is rejected
+//!   by the apply script. Music HostConfig stays unset (or wide `0-5`).
 //! - A whole-container `podman update --cpuset-cpus=0-1` is **not**
 //!   implemented. v1.6.15 Angerfist dig 163/590/117: that trap made
 //!   `C_loop_deferral` worse.
@@ -109,6 +112,14 @@ pub fn cpuset_from_env(env_key: &str) -> Result<Option<Vec<usize>>, String> {
 /// or `TS6_BOT_CPUSET`) when set. Does not pin ffmpeg/yt-dlp.
 pub fn pin_current_thread_send() {
     pin_current_thread_from_env(effective_send_env_key());
+}
+
+/// Pin the calling thread to `TS6_BOT_DECODE_CPUSET` when set.
+///
+/// Used by `decode-rt` (pipeline / fetch / bridge / resolve). Never
+/// the send cpuset. Empty / unset is a no-op.
+pub fn pin_current_thread_decode() {
+    pin_current_thread_from_env(DECODE_CPUSET_ENV);
 }
 
 /// Pin `pid` (ffmpeg / yt-dlp / python resolver) to `TS6_BOT_DECODE_CPUSET`.

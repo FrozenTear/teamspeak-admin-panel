@@ -449,7 +449,9 @@ async fn handle_np(bot_id: BotId, store: &Arc<dyn MusicBotStore>) -> String {
 }
 
 /// Turn an arg into a `NewTrack`. Resolution order:
-///  1. A bare `http(s)://` link passes straight through to yt-dlp.
+///  1. A bare `http(s)://` link is stored as `AudioSource::Url`. Source
+///     selection (Icecast → ICY, HLS/direct media → ffmpeg, extractor
+///     sites → yt-dlp) happens when the pipeline spawns.
 ///  2. A `yt:`/`youtube:` prefix is a YouTube search — the rest of the arg
 ///     is the query. When `YOUTUBE_API_KEY` is set the search is resolved
 ///     via the YouTube Data API v3 (~300 ms; THE-933). Without it, falls

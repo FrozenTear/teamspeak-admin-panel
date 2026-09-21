@@ -22,6 +22,7 @@ pub mod pacer;
 pub mod pipeline;
 pub mod resolve;
 pub mod resolver;
+pub mod runtime;
 pub mod source;
 pub mod types;
 pub mod volume;
@@ -29,6 +30,8 @@ pub mod yt_search;
 
 pub use encoder::OpusFrameEncoder;
 pub use pipeline::AudioPipeline;
+pub use runtime::spawn_decode;
+pub use source::{PlaybackRoute, classify_playback_url, normalize_radio_url};
 pub use types::{
     PCM_FRAME_BYTES_MONO, PcmFrame, PipelineConfig, PipelineError, PipelineEvent, SAMPLE_RATE_HZ,
     SAMPLES_PER_FRAME_MONO, frame_duration,
