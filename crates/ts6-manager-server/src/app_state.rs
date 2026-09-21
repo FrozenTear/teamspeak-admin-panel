@@ -102,12 +102,11 @@ pub struct AppState {
     /// sources (`MUSIC_DIR`). Paths are canonicalised and must stay
     /// under this directory.
     pub music_dir: PathBuf,
-    /// PURA-235 — number of trusted reverse-proxy hops in front of the
-    /// listener. Used by the [`crate::auth::extractors::RequestMeta`]
-    /// extractor for the v1.1 admin audit log so the `requestIp` field
-    /// captures the real client IP per spec §6.8 (rather than the
-    /// edge-proxy's address) on deployments that sit behind one.
-    pub trusted_proxy_hops: u8,
+    /// PURA-235 — reverse-proxy trust for the audit log's `requestIp`
+    /// and any other reader of forwarding headers on [`AppState`].
+    /// Hops plus `TRUSTED_PROXY_CIDRS`. An empty CIDR list ignores
+    /// `X-Forwarded-For` even when hops is non-zero.
+    pub proxy_trust: crate::web::proxy::ProxyTrust,
     /// Operator bug-report sink (private GitHub Issues). Unconfigured when
     /// token/repo are unset so `POST /api/bug-reports` can 503 without
     /// crashing boot.
@@ -187,7 +186,10 @@ impl AppState {
             yt_api_key,
             data_dir: cfg.data_dir.clone(),
             music_dir: cfg.music_dir.clone(),
-            trusted_proxy_hops: cfg.trusted_proxy_hops,
+            proxy_trust: crate::web::proxy::ProxyTrust::from_parts(
+                cfg.trusted_proxy_hops,
+                cfg.trusted_proxy_cidrs.clone(),
+            ),
             bug_reports: crate::bug_reports::sink_from_config(&cfg.bug_reports),
         }
     }

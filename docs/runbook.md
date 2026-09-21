@@ -38,7 +38,8 @@ The single hard requirement. The server boots without anything else.
 | --- | --- | --- |
 | `ENCRYPTION_KEY` | AES-256-GCM key for at-rest encryption of TS server-connection credentials and SSH host-key fingerprints. If unset, derived from `JWT_SECRET` — workable, but rotates together. | `openssl rand -base64 32` |
 | `FRONTEND_URL` | Public origin the browser hits (CORS + cookie domain). Default `http://localhost:3000`. | Operator-supplied. |
-| `TRUSTED_PROXY_HOPS` | Number of trusted reverse-proxy hops in front of the listener. `0` = ignore `X-Forwarded-For` and `X-Forwarded-Proto`; `1` = exactly one trusted proxy. Also gates HSTS. | Set to match your TLS terminator. |
+| `TRUSTED_PROXY_HOPS` | Number of trusted reverse-proxy hops in front of the listener. `0` = ignore forwarding headers. `1` = exactly one hop, **only if** the TCP peer is also inside `TRUSTED_PROXY_CIDRS`. | Set to match your TLS terminator, together with the CIDR below. |
+| `TRUSTED_PROXY_CIDRS` | Comma-separated CIDRs of proxies allowed to send `X-Forwarded-For` and `X-Forwarded-Proto`. Empty (default) never trusts those headers, even when hops is `1`. | The proxy's peer address, e.g. `127.0.0.1/32` when Caddy dials the panel on loopback. |
 
 The full canonical env list, with comments, is
 [`deploy/quadlet/ts6-manager.env.example`](../deploy/quadlet/ts6-manager.env.example).
@@ -64,11 +65,19 @@ and the container ports become host ports directly — see
 for why this is load-bearing, not a perf tweak.
 
 HSTS (`Strict-Transport-Security`) belongs on the public TLS hostname.
-The fullstack emits it only when the request is actually HTTPS — TLS
-terminated on the process, or a trusted proxy (`TRUSTED_PROXY_HOPS ≥ 1`)
-set `X-Forwarded-Proto: https`. Bare `:3001` must not send HSTS: that
-trains browsers to rewrite `http://host:3001` to HTTPS on a port with
-no certificate.
+The fullstack emits it only when a trusted proxy set
+`X-Forwarded-Proto: https`. Trust requires both `TRUSTED_PROXY_HOPS ≥ 1`
+and a `ConnectInfo` peer inside `TRUSTED_PROXY_CIDRS`. Hop count alone
+does not count: a direct client can send the header. An absolute-form
+request URI (`GET https://…`) is not treated as HTTPS. Bare `:3001`
+must not send HSTS: that trains browsers to rewrite `http://host:3001`
+to HTTPS on a port with no certificate.
+
+A deployment that sets `TRUSTED_PROXY_HOPS=1` (including a later land of
+that setting in front of host Caddy) must also set `TRUSTED_PROXY_CIDRS`
+to Caddy's peer CIDR, or keep `:3001` unreachable except from Caddy.
+Without the CIDR, hops is a no-op and client IP / HSTS stay on the
+direct peer.
 
 ### 1.4 First-login verification
 
@@ -295,10 +304,13 @@ music + sidecar, rewrites a temp manifest so music/sidecar cannot lag,
 (`deploy/contabo/soft-pin.env` via
 `scripts/apply-fullstack-soft-pin.sh`). Packing **B** (Robert):
 fullstack stays `2-5` / `-5` (no shrink). Bot
-`TS6_BOT_CPUSET=0-1` is an in-process send-thread pin (option 1) —
-never a container-wide `0-1` cpuset (packing C; Angerfist
-163/590/117). kube `TS6_BOT_DECODE_CPUSET=2-5` parks ffmpeg/yt-dlp
-off send cores (share Axum). Sidecar stays unpinned. The music kube container has no `envFrom` secrets;
+`TS6_BOT_CPUSET=0-1` is an in-process wire-send pin on `voice-rt`
+(option 1) — never a container-wide `0-1` cpuset (packing C; Angerfist
+163/590/117). kube `TS6_BOT_DECODE_CPUSET=2-5` pins `decode-rt`
+(pipeline/fetch/bridge/resolve) and parks ffmpeg/yt-dlp off send
+cores before exec (share Axum). Host renice also targets `voice-rt`
+tids. Sidecar stays unpinned. Music HostConfig stays unset. The music
+kube container has no `envFrom` secrets;
 fullstack `sync_settings` pushes the yt-dlp cookie / API key after
 `/health` as long as those paths stay under the shared `ts6-data`
 volume. Never `podman kube down --force`. Do not MOVE the bot

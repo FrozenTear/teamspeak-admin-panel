@@ -15,8 +15,12 @@
 //! - **`webhookOut`** → a `reqwest` POST, **SSRF-gated** via
 //!   [`ts6_ssrf::is_url_allowed`] with the resolved IP pinned onto the
 //!   outbound connection so DNS rebinding cannot win between validation
-//!   and connect. Redirects are disabled so a `30x` to an internal URL
-//!   cannot bypass the gate.
+//!   and connect. Plaintext HTTP with no pin (`resolved_ip` is `None`
+//!   after a DNS failure or an empty answer) is refused — reqwest must
+//!   not resolve that name on its own. HTTPS with no pin is unchanged:
+//!   TLS hostname validation binds the name, and a DNS miss stays a
+//!   connect failure. Redirects are disabled so a `30x` to an internal
+//!   URL cannot bypass the gate.
 //! - **`logLine`** → unchanged from [`BasicDispatcher`].
 //! - **`moderate`** → an audited moderation effect bridged onto the
 //!   Phase 9.0 case model, gated by the Phase 9.1.3 false-positive
@@ -791,12 +795,22 @@ async fn dispatch_webhook(
         .await
         .map_err(|e| format!("webhookOut: URL rejected by SSRF gate: {e}"))?;
 
+    // `is_url_allowed` returns `resolved_ip: None` when DNS fails or the
+    // answer set is empty (spec §9.3). Pinning only the `Some` case lets
+    // reqwest resolve the name again, and that second lookup can land on
+    // a private or metadata address. Plaintext HTTP is fail-closed, same
+    // posture as the sidecar pin proxy: no pin, no dispatch. HTTPS is
+    // intentionally not failed closed here — there is no address to pin,
+    // and TLS certificate validation still binds the connection to the
+    // hostname. A DNS miss on HTTPS surfaces as a connect error.
+    let pin = webhook_pin(&target)?;
+
     let mut builder = reqwest::Client::builder()
         .timeout(WEBHOOK_TIMEOUT)
         // A 30x to an internal URL would bypass the SSRF gate — the
         // redirect target is never re-validated. Disable redirects.
         .redirect(reqwest::redirect::Policy::none());
-    if let Some(ip) = target.resolved_ip {
+    if let WebhookPin::Pinned(ip) = pin {
         builder = builder.resolve_to_addrs(&target.host, &[SocketAddr::new(ip, target.port)]);
     }
     let client = builder
@@ -824,6 +838,34 @@ async fn dispatch_webhook(
         return Err(format!("webhookOut: receiver responded {status}"));
     }
     Ok(())
+}
+
+/// How [`dispatch_webhook`] connects after the SSRF gate.
+#[derive(Debug)]
+enum WebhookPin {
+    /// `resolve_to_addrs` forces this IP. Used for every plaintext HTTP
+    /// target and for HTTPS targets that resolved.
+    Pinned(std::net::IpAddr),
+    /// HTTPS and the resolver returned no address. Not fail-closed:
+    /// reqwest resolves the hostname itself, and TLS checks the cert SAN.
+    /// Documented so a later edit does not treat this like plaintext HTTP.
+    HttpsUnpinned,
+}
+
+/// Fail closed on plaintext HTTP with nothing to pin. HTTPS DNS misses
+/// stay [`WebhookPin::HttpsUnpinned`].
+fn webhook_pin(target: &ts6_ssrf::PinnedTarget) -> Result<WebhookPin, String> {
+    match (target.url.scheme(), target.resolved_ip) {
+        ("http", None) => Err(
+            "webhookOut: plaintext HTTP has no pinned address; refusing (DNS failed or returned no address)"
+                .to_string(),
+        ),
+        ("http" | "https", Some(ip)) => Ok(WebhookPin::Pinned(ip)),
+        ("https", None) => Ok(WebhookPin::HttpsUnpinned),
+        (scheme, _) => Err(format!(
+            "webhookOut: unexpected scheme `{scheme}` after SSRF gate"
+        )),
+    }
 }
 
 // ---- `${trigger.*}` templating -----------------------------------------
@@ -973,6 +1015,65 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("SSRF gate"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn webhook_http_dns_failure_is_refused_before_connect() {
+        // Unknown host → MockResolver NXDOMAIN → resolved_ip None.
+        // Must not fall through to reqwest (that lookup is the SSRF).
+        let resolver = ts6_ssrf::MockResolver::new();
+        let err = dispatch_webhook(&resolver, &test_ctx(), "http://missing.example/hook", &[])
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("no pinned address"),
+            "plaintext HTTP DNS miss must fail closed, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_http_empty_answer_is_refused() {
+        let target = ts6_ssrf::PinnedTarget {
+            url: url::Url::parse("http://empty.example/hook").unwrap(),
+            host: "empty.example".into(),
+            port: 80,
+            resolved_ip: None,
+        };
+        let err = webhook_pin(&target).unwrap_err();
+        assert!(err.contains("no pinned address"), "got: {err}");
+    }
+
+    #[test]
+    fn webhook_https_dns_failure_is_not_fail_closed() {
+        // Documented exception: HTTPS with no pin is not rejected. TLS
+        // hostname validation is the binding; a later connect error is
+        // how a DNS miss surfaces. Do not flip this to a reject without
+        // calling out the change.
+        let target = ts6_ssrf::PinnedTarget {
+            url: url::Url::parse("https://missing.example/hook").unwrap(),
+            host: "missing.example".into(),
+            port: 443,
+            resolved_ip: None,
+        };
+        match webhook_pin(&target).unwrap() {
+            WebhookPin::HttpsUnpinned => {}
+            WebhookPin::Pinned(ip) => panic!("https DNS miss must stay unpinned, got {ip}"),
+        }
+    }
+
+    #[test]
+    fn webhook_http_with_resolved_ip_is_pinned() {
+        let ip: std::net::IpAddr = "203.0.113.10".parse().unwrap();
+        let target = ts6_ssrf::PinnedTarget {
+            url: url::Url::parse("http://ok.example/hook").unwrap(),
+            host: "ok.example".into(),
+            port: 80,
+            resolved_ip: Some(ip),
+        };
+        match webhook_pin(&target).unwrap() {
+            WebhookPin::Pinned(got) => assert_eq!(got, ip),
+            WebhookPin::HttpsUnpinned => panic!("http with a resolved IP must pin"),
+        }
     }
 
     #[test]

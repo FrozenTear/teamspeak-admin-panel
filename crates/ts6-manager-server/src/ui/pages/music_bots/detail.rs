@@ -55,7 +55,14 @@ pub fn BotDetailPage(bot_id: u64) -> Element {
 
     use_effect(move || match &*snapshot.read_unchecked() {
         Some(Ok(d)) => {
-            detail.set(Some(d.clone()));
+            // GET always sends `resolvingQuery: null` (SSE-only pill). A
+            // Play/reload that landed mid-resolve used to replace the
+            // whole snapshot and hide the pill until the next event.
+            let merged = {
+                let prev = detail.peek();
+                merge_rest_snapshot(prev.as_ref(), d)
+            };
+            detail.set(Some(merged));
             error.set(None);
             loading.set(false);
         }
@@ -73,29 +80,40 @@ pub fn BotDetailPage(bot_id: u64) -> Element {
     // when the session has an access JWT: events that arrive before
     // `detail` is `Some` used to be dropped, and browsers cannot set
     // `Authorization` on `EventSource` so the URL carries `?token=`
-    // (same query name as `/api/ws`). Library / playlist events still
-    // trigger a refetch because the snapshot doesn't carry that data.
-    let sse_hold: std::rc::Rc<std::cell::RefCell<Option<mb::BotEventStream>>> =
+    // (same query name as `/api/ws`). The pair stores the token the
+    // socket was opened with: access JWTs expire and the browser
+    // reconnects with the original URL, so a rotation must close and
+    // reopen. Library / playlist events still trigger a refetch because
+    // the snapshot doesn't carry that data.
+    let sse_hold: std::rc::Rc<std::cell::RefCell<Option<(String, mb::BotEventStream)>>> =
         use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(None)));
 
     use_effect({
         let sse_hold = sse_hold.clone();
         let session = session.clone();
         move || {
-            if sse_hold.borrow().is_some() {
-                return;
-            }
+            // Read the session before any early return so a later token
+            // rotation re-runs this effect. Returning while the hold is
+            // already armed used to skip the read and leave the stream
+            // on the expired JWT.
             let access = match &*session.state.read() {
                 AuthState::Authenticated { access, .. } if !access.is_empty() => access.clone(),
-                _ => return,
+                _ => {
+                    sse_hold.borrow_mut().take();
+                    return;
+                }
             };
             // Wait for the first snapshot so early events aren't applied
-            // against `None` (and dropped). `peek` after the first Some
-            // is unnecessary — the armed hold short-circuits above.
+            // against `None` (and dropped).
             if detail.peek().is_none() {
                 let _ = detail.read();
                 return;
             }
+            let open_with = sse_hold.borrow().as_ref().map(|(token, _)| token.clone());
+            if !event_source_token_changed(open_with.as_deref(), &access) {
+                return;
+            }
+            sse_hold.borrow_mut().take();
             let mut reload = reload;
             let mut detail = detail;
             let stream = mb::open_bot_event_source(bot, &access, move |ev| {
@@ -110,7 +128,7 @@ pub fn BotDetailPage(bot_id: u64) -> Element {
                     reload.with_mut(|n| *n += 1);
                 }
             });
-            *sse_hold.borrow_mut() = Some(stream);
+            *sse_hold.borrow_mut() = Some((access, stream));
         }
     });
 
@@ -1261,6 +1279,14 @@ fn prefer_resolved_title(existing: Option<&wire::Track>, incoming: &wire::Track)
 /// Copy for the Now Playing resolving pill. First warm attempt is quiet;
 /// the automatic second attempt (Music Bot PR #21 `retrying: true`) is
 /// the louder "resolving / retrying…" line.
+/// `true` when the live access JWT is not the one the `EventSource` was
+/// opened with. Native reconnect keeps the original `?token=` URL, so an
+/// expired access token (15 min) silently stops Now Playing updates
+/// unless the page closes and reopens the stream.
+fn event_source_token_changed(open_with: Option<&str>, access: &str) -> bool {
+    open_with != Some(access)
+}
+
 fn resolving_status_label(retrying: bool) -> &'static str {
     if retrying {
         "resolving / retrying…"
@@ -1272,6 +1298,55 @@ fn resolving_status_label(retrying: bool) -> &'static str {
 fn clear_resolving(d: &mut wire::MusicBotDetail) {
     d.resolving_query = None;
     d.resolving_retrying = false;
+}
+
+/// Fold a REST detail snapshot into the live view.
+///
+/// The detail route never reports an in-flight resolve (`resolving_query`
+/// is always `None` on the wire). Replacing the signal outright clears the
+/// pill that SSE just lit, which is what Play does on success — the POST
+/// returns while yt-dlp is still running, then the reload snapshot arrives
+/// and the chrome goes back to "Nothing playing". Keep the live pill unless
+/// this snapshot shows the wait is over: the bot left, a different track is
+/// now playing, or a new `last_error` landed with nothing on the wire.
+///
+/// A resolved title is kept when the snapshot restates the Play-stamped URL
+/// for the same source (`prefer_resolved_title`).
+fn merge_rest_snapshot(
+    previous: Option<&wire::MusicBotDetail>,
+    incoming: &wire::MusicBotDetail,
+) -> wire::MusicBotDetail {
+    let mut merged = incoming.clone();
+    let Some(prev) = previous else {
+        return merged;
+    };
+    if let (Some(prev_track), Some(incoming_track)) =
+        (&prev.now_playing, merged.now_playing.as_ref())
+    {
+        merged.now_playing = Some(prefer_resolved_title(Some(prev_track), incoming_track));
+    }
+    if merged.resolving_query.is_some() {
+        return merged;
+    }
+    let disconnected = matches!(
+        merged.state,
+        wire::BotState::Disconnected | wire::BotState::Disconnecting
+    );
+    let track_changed = match (&prev.now_playing, &merged.now_playing) {
+        (None, Some(_)) => true,
+        (Some(prev_track), Some(next_track)) => prev_track.id != next_track.id,
+        _ => false,
+    };
+    let new_failure = merged.now_playing.is_none()
+        && merged.last_error.is_some()
+        && merged.last_error != prev.last_error;
+    if disconnected || track_changed || new_failure {
+        merged.resolving_retrying = false;
+        return merged;
+    }
+    merged.resolving_query = prev.resolving_query.clone();
+    merged.resolving_retrying = prev.resolving_retrying;
+    merged
 }
 
 /// Reduce a single SSE event into the locally-held [`wire::MusicBotDetail`]
@@ -1685,6 +1760,67 @@ mod tests {
     fn resolving_status_label_is_quiet_then_retrying() {
         assert_eq!(resolving_status_label(false), "resolving…");
         assert_eq!(resolving_status_label(true), "resolving / retrying…");
+    }
+
+    #[test]
+    fn event_source_reopens_when_the_access_token_rotates() {
+        assert!(event_source_token_changed(None, "access-a"));
+        assert!(!event_source_token_changed(Some("access-a"), "access-a"));
+        assert!(event_source_token_changed(Some("access-a"), "access-b"));
+    }
+
+    #[test]
+    fn rest_snapshot_keeps_in_flight_resolving_pill() {
+        let mut prev = fixture(wire::BotState::InChannel);
+        prev.channel_id = Some(2);
+        prev.resolving_query = Some("never gonna".into());
+        prev.resolving_retrying = true;
+        // Cold GET: the route always sends resolvingQuery null.
+        let incoming = fixture(wire::BotState::InChannel);
+        let mut incoming = incoming;
+        incoming.channel_id = Some(2);
+        let merged = merge_rest_snapshot(Some(&prev), &incoming);
+        assert_eq!(merged.resolving_query.as_deref(), Some("never gonna"));
+        assert!(merged.resolving_retrying);
+    }
+
+    #[test]
+    fn rest_snapshot_drops_pill_when_a_new_track_or_failure_lands() {
+        let mut prev = fixture(wire::BotState::InChannel);
+        prev.resolving_query = Some("never gonna".into());
+        prev.resolving_retrying = true;
+        let mut playing = fixture(wire::BotState::Playing);
+        playing.now_playing = Some(track(7, "Never Gonna Give You Up"));
+        let merged = merge_rest_snapshot(Some(&prev), &playing);
+        assert!(merged.resolving_query.is_none());
+        assert!(!merged.resolving_retrying);
+
+        let mut failed = fixture(wire::BotState::InChannel);
+        failed.last_error = Some("yt-dlp produced 0 frames".into());
+        let merged = merge_rest_snapshot(Some(&prev), &failed);
+        assert!(merged.resolving_query.is_none());
+        assert_eq!(
+            merged.last_error.as_deref(),
+            Some("yt-dlp produced 0 frames")
+        );
+    }
+
+    #[test]
+    fn rest_snapshot_keeps_resolved_title_over_url_placeholder() {
+        let url = "https://example.com/song.mp3";
+        let mut prev = fixture(wire::BotState::Playing);
+        let mut resolved = track(7, "Never Gonna Give You Up");
+        resolved.source = wire::AudioSource::Url { url: url.into() };
+        prev.now_playing = Some(resolved);
+        let mut incoming = fixture(wire::BotState::Playing);
+        let mut placeholder = track(7, url);
+        placeholder.source = wire::AudioSource::Url { url: url.into() };
+        incoming.now_playing = Some(placeholder);
+        let merged = merge_rest_snapshot(Some(&prev), &incoming);
+        assert_eq!(
+            merged.now_playing.as_ref().map(|t| t.title.as_str()),
+            Some("Never Gonna Give You Up")
+        );
     }
 
     #[test]

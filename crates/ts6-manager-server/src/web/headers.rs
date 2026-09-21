@@ -6,11 +6,12 @@
 //! alone is not enough — emitting HSTS on cleartext `:3001` trains browsers
 //! to demand TLS on a port with no certificate.
 //!
-//! HTTPS is detected either from the request URI scheme (TLS terminated
-//! on this process) or from `X-Forwarded-Proto: https` when the existing
-//! [`crate::web::proxy`] hop-count policy trusts the header. `TRUSTED_PROXY_HOPS=0`
-//! (direct listener, current Contabo host-network shape) ignores
-//! client-supplied forwarding headers.
+//! HTTPS is detected from `X-Forwarded-Proto: https` only when the
+//! [`crate::web::proxy`] policy trusts the header: hops > 0 **and** the
+//! TCP peer is inside `TRUSTED_PROXY_CIDRS`. An absolute-form request
+//! URI (`https://…`) is not treated as HTTPS — the client controls that
+//! line. `TRUSTED_PROXY_HOPS=0`, or hops set with an empty CIDR list,
+//! ignores client-supplied forwarding headers.
 //!
 //! `X-Frame-Options: DENY` is the global default; the public widget routes
 //! (spec §27) override to `SAMEORIGIN` at their handler so they remain
@@ -45,7 +46,10 @@ const HSTS_VALUE: HeaderValue = HeaderValue::from_static("max-age=31536000; incl
 ///
 /// XCTO / XFO / Referrer-Policy are unconditional. HSTS is wired only in
 /// production, and the middleware still suppresses it on cleartext.
-pub fn security_headers_stack(node_env: NodeEnv, trusted_proxy_hops: u8) -> SecurityHeadersStack {
+pub fn security_headers_stack(
+    node_env: NodeEnv,
+    proxy_trust: proxy::ProxyTrust,
+) -> SecurityHeadersStack {
     let xcto = SetResponseHeaderLayer::if_not_present(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
@@ -64,7 +68,7 @@ pub fn security_headers_stack(node_env: NodeEnv, trusted_proxy_hops: u8) -> Secu
         xfo,
         referrer,
         emit_hsts: node_env.is_production(),
-        trusted_proxy_hops,
+        proxy_trust,
     }
 }
 
@@ -76,7 +80,7 @@ pub struct SecurityHeadersStack {
     xfo: SetResponseHeaderLayer<HeaderValue>,
     referrer: SetResponseHeaderLayer<HeaderValue>,
     emit_hsts: bool,
-    trusted_proxy_hops: u8,
+    proxy_trust: proxy::ProxyTrust,
 }
 
 impl SecurityHeadersStack {
@@ -88,7 +92,7 @@ impl SecurityHeadersStack {
         let r = router.layer(self.xcto).layer(self.xfo).layer(self.referrer);
         if self.emit_hsts {
             r.layer(axum::middleware::from_fn_with_state(
-                self.trusted_proxy_hops,
+                self.proxy_trust,
                 emit_hsts_if_https,
             ))
         } else {
@@ -100,8 +104,19 @@ impl SecurityHeadersStack {
 /// Production HSTS (spec §6.9: ≥6 months; we use 365 days). Set only when
 /// the request is actually HTTPS. `if_not_present` — do not clobber a
 /// more specific value a handler already set.
-async fn emit_hsts_if_https(State(trusted_hops): State<u8>, req: Request, next: Next) -> Response {
-    let https = proxy::request_is_https(req.headers(), req.uri(), trusted_hops);
+async fn emit_hsts_if_https(
+    State(trust): State<proxy::ProxyTrust>,
+    req: Request,
+    next: Next,
+) -> Response {
+    // Missing ConnectInfo fails closed: 0.0.0.0 is not inside a normal
+    // proxy CIDR, so a spoofed X-Forwarded-Proto cannot turn HSTS on.
+    let peer = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip())
+        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+    let https = proxy::request_is_https(req.headers(), peer, &trust);
     let mut resp = next.run(req).await;
     if https {
         let headers = resp.headers_mut();
@@ -138,6 +153,25 @@ mod tests {
         uri: &str,
         forwarded_proto: Option<&str>,
     ) -> axum::http::Response<Body> {
+        fetch_from(
+            node_env,
+            trusted_proxy_hops,
+            uri,
+            forwarded_proto,
+            // Hop-count tests that expect the proto header to count use a
+            // peer inside this CIDR. hops=0 still ignores the header.
+            Some("203.0.113.7:443"),
+        )
+        .await
+    }
+
+    async fn fetch_from(
+        node_env: NodeEnv,
+        trusted_proxy_hops: u8,
+        uri: &str,
+        forwarded_proto: Option<&str>,
+        peer: Option<&str>,
+    ) -> axum::http::Response<Body> {
         // Mirror the production wiring in `main.rs`: static header stack on
         // the inside, the per-response nonce-CSP middleware on the outside.
         // CSP-shape assertions below then exercise the same layered result
@@ -151,7 +185,11 @@ mod tests {
                     .unwrap()
             }),
         );
-        let app = security_headers_stack(node_env, trusted_proxy_hops).apply(app);
+        let trust = proxy::ProxyTrust::from_parts(
+            trusted_proxy_hops,
+            vec!["203.0.113.0/24".parse().unwrap()],
+        );
+        let app = security_headers_stack(node_env, trust).apply(app);
         let app = app.layer(axum::middleware::from_fn(
             super::super::csp_nonce::nonce_csp_middleware,
         ));
@@ -159,7 +197,12 @@ mod tests {
         if let Some(proto) = forwarded_proto {
             builder = builder.header("x-forwarded-proto", proto);
         }
-        let req = builder.body(Body::empty()).unwrap();
+        let mut req = builder.body(Body::empty()).unwrap();
+        if let Some(peer) = peer {
+            let socket: std::net::SocketAddr = peer.parse().unwrap();
+            req.extensions_mut()
+                .insert(axum::extract::ConnectInfo(socket));
+        }
         app.oneshot(req).await.unwrap()
     }
 
@@ -391,9 +434,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prod_emits_hsts_when_request_uri_is_https() {
+    async fn prod_ignores_absolute_form_https_uri() {
+        // Client-controlled request-target. Must not emit HSTS.
         let resp = fetch(NodeEnv::Production, 0, "https://panel.example.com/", None).await;
-        assert_hsts_present(resp.headers());
+        assert!(
+            resp.headers().get("strict-transport-security").is_none(),
+            "absolute-form https URI must not emit HSTS"
+        );
+    }
+
+    #[tokio::test]
+    async fn prod_ignores_forwarded_proto_from_peer_outside_cidr() {
+        let resp = fetch_from(
+            NodeEnv::Production,
+            1,
+            "/",
+            Some("https"),
+            Some("198.51.100.8:9"),
+        )
+        .await;
+        assert!(
+            resp.headers().get("strict-transport-security").is_none(),
+            "peer outside TRUSTED_PROXY_CIDRS must not unlock HSTS"
+        );
     }
 
     #[tokio::test]

@@ -51,17 +51,16 @@ use super::proxy;
 /// Per-token rate limiter. Token strings are widget-token / `player:botId`
 /// keys extracted from the URL path.
 pub type WidgetTokenRateLimiter = RateLimiter<String, DefaultKeyedStateStore<String>, DefaultClock>;
-/// Per-source-IP rate limiter, source resolution per the `trusted_hops`
+/// Per-source-IP rate limiter, source resolution per the peer-CIDR
 /// policy in [`super::proxy`].
 pub type WidgetIpRateLimiter = RateLimiter<IpAddr, DefaultKeyedStateStore<IpAddr>, DefaultClock>;
 
-/// Middleware state for [`widget_rate_limit`]. Cheap to clone — just two
-/// `Arc`s and a byte.
+/// Middleware state for [`widget_rate_limit`]. Cheap to clone — `Arc`s.
 #[derive(Clone)]
 pub struct WidgetRateLimitState {
     pub by_token: Arc<WidgetTokenRateLimiter>,
     pub by_ip: Arc<WidgetIpRateLimiter>,
-    pub trusted_hops: u8,
+    pub proxy: proxy::ProxyTrust,
 }
 
 /// Build a [`Quota`] of `rpm` cells per minute with bursts capped at the
@@ -81,11 +80,12 @@ pub fn make_widget_rate_limit_state(
     per_token_rpm: u32,
     per_ip_rpm: u32,
     trusted_hops: u8,
+    trusted_cidrs: Vec<ipnet::IpNet>,
 ) -> WidgetRateLimitState {
     WidgetRateLimitState {
         by_token: Arc::new(RateLimiter::keyed(quota_from_rpm(per_token_rpm))),
         by_ip: Arc::new(RateLimiter::keyed(quota_from_rpm(per_ip_rpm))),
-        trusted_hops,
+        proxy: proxy::ProxyTrust::from_parts(trusted_hops, trusted_cidrs),
     }
 }
 
@@ -143,7 +143,7 @@ pub async fn widget_rate_limit(
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ci| ci.0)
         .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
-    let ip = proxy::client_ip(req.headers(), peer, state.trusted_hops);
+    let ip = proxy::client_ip(req.headers(), peer, &state.proxy);
     let now = DefaultClock::default().now();
 
     if let Err(not_until) = state.by_ip.check_key(&ip) {
@@ -482,7 +482,7 @@ mod tests {
     /// `Retry-After`.
     #[tokio::test]
     async fn thirtieth_request_passes_thirty_first_is_429() {
-        let state = make_widget_rate_limit_state(30, 30, 0);
+        let state = make_widget_rate_limit_state(30, 30, 0, Vec::new());
         let app = rate_limit_app(state);
         let path = "/api/widget/sometoken/data";
         for n in 1..=30 {
@@ -516,7 +516,7 @@ mod tests {
     /// different token, must still be denied.
     #[tokio::test]
     async fn per_ip_bucket_protects_against_token_rotation() {
-        let state = make_widget_rate_limit_state(30, 30, 0);
+        let state = make_widget_rate_limit_state(30, 30, 0, Vec::new());
         let app = rate_limit_app(state);
         for _ in 0..30 {
             let _ = app
@@ -541,7 +541,7 @@ mod tests {
     /// budget is gone (protects upstream WebQuery from a botnet).
     #[tokio::test]
     async fn per_token_bucket_protects_against_ip_rotation() {
-        let state = make_widget_rate_limit_state(30, 1_000_000, 0);
+        let state = make_widget_rate_limit_state(30, 1_000_000, 0, Vec::new());
         // Per-IP allowance is large so we can exhaust the per-token bucket
         // first by walking the IP space.
         let app = rate_limit_app(state);
@@ -569,7 +569,7 @@ mod tests {
     /// the limiter isn't collapsing keys.
     #[tokio::test]
     async fn distinct_token_and_ip_use_independent_buckets() {
-        let state = make_widget_rate_limit_state(30, 30, 0);
+        let state = make_widget_rate_limit_state(30, 30, 0, Vec::new());
         let app = rate_limit_app(state);
         // Burn IP1 / tokenA bucket entirely.
         for _ in 0..30 {

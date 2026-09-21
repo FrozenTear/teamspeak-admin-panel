@@ -30,7 +30,7 @@ send `0-1` would need a third slice (packing **A**, fullstack shrink)
 — Robert's final pick is **B**: DECODE shares `2-5` with Axum instead
 of shrinking fullstack. Ignore earlier A pings.
 
-| Packing | Fullstack HostConfig | SEND (in-process) | DECODE (`pin_decode_child`) | Music HostConfig | Status |
+| Packing | Fullstack HostConfig | SEND (in-process) | DECODE (pre_exec) | Music HostConfig | Status |
 |---------|----------------------|-------------------|-----------------------------|------------------|--------|
 | **B** | `2-5` / `-5` | `0-1` | `2-5` (share Axum) | unset / `0-5` | **apply-ready (Robert)** |
 | **A** | `4-5` / `-5` (`3-5` if too tight) | `0-1` | `2-3` | prefer `0-3` | gated comment + `TS6_SOFT_PIN_SHRINK_ACK=1` |
@@ -47,10 +47,13 @@ refuses fullstack `4-5` / `3-5` unless `TS6_SOFT_PIN_SHRINK_ACK=1`
 (A is not the default; ACK stays unset).
 
 **Option (1) + B decode park:** `TS6_BOT_SEND_CPUSET` /
-`TS6_BOT_CPUSET=0-1` pins `voice-rt` only. kube
-`TS6_BOT_DECODE_CPUSET=2-5` parks ffmpeg / yt-dlp / warm-resolver via
-`pin_decode_child`. Nice is host `renice` on the music pid. `chrt`
-FIFO/RR is opt-in env, default off.
+`TS6_BOT_CPUSET=0-1` pins `voice-rt` wire-send threads only. kube
+`TS6_BOT_DECODE_CPUSET=2-5` pins `decode-rt` (pipeline / fetch /
+bridge / resolve) and parks ffmpeg / yt-dlp / warm-resolver via
+pre_exec `sched_setaffinity` before exec (`pin_decode_child` is a
+leader backup). Nice is host `renice` on the music leader and on
+`voice-rt` tids (per-thread; the leader alone is not enough). `chrt`
+FIFO/RR is opt-in env, default off. Music HostConfig stays unset.
 
 ## Control plane
 

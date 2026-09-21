@@ -412,7 +412,8 @@ impl ResolverHandle {
         let socket_path = dir.join(format!("ts6-yt-resolver-{pid}.sock"));
         std::fs::write(&script_path, RESOLVER_SCRIPT)?;
         let state = Arc::new(SupervisorState::default());
-        tokio::spawn(supervise(script_path, socket_path.clone(), state.clone()));
+        // Supervisor + its stderr reader stay on decode-rt, not voice-rt.
+        crate::runtime::spawn_decode(supervise(script_path, socket_path.clone(), state.clone()));
         Ok(Self {
             socket_path,
             state,
@@ -759,6 +760,7 @@ async fn supervise(script: PathBuf, socket: PathBuf, state: Arc<SupervisorState>
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
+        crate::cpuset::install_decode_pre_exec(&mut cmd);
 
         let mut child = match cmd.spawn() {
             Ok(child) => {

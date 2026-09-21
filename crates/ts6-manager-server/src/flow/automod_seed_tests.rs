@@ -85,7 +85,7 @@ fn test_app(db: Arc<Database>) -> AppState {
         yt_api_key: Arc::new(RwLock::new(None)),
         data_dir: PathBuf::from("./data"),
         music_dir: std::path::PathBuf::from("/data/music"),
-        trusted_proxy_hops: 0,
+        proxy_trust: crate::web::proxy::ProxyTrust::direct(),
         bug_reports: crate::bug_reports::unconfigured_sink(),
     }
 }

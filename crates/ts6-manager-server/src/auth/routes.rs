@@ -14,9 +14,11 @@
 //!   maps `InvalidOrExpired` → 401 with the spec body. Shares the auth
 //!   rate-limit bucket with `/login` (single attacker can't side-step the
 //!   budget by alternating endpoints).
-//! - `POST /api/auth/logout` — delete the refresh token. No auth required;
+//! - `POST /api/auth/logout` — delete a live refresh token. No auth required;
 //!   the refresh token IS the credential. 204 regardless of whether a row
-//!   was deleted (idempotent per spec §6.5.5).
+//!   was deleted (idempotent per spec §6.5.5). Presenting an already-rotated
+//!   predecessor revokes every refresh token for that user instead of
+//!   deleting only the breadcrumb row.
 //! - `GET /api/auth/me` — return the current user's [`UserInfo`].
 //! - `PUT /api/auth/password` — verify current, validate new, re-hash, then
 //!   revoke every refresh token for the user (spec §6.2.3). 204.
@@ -204,7 +206,12 @@ async fn refresh_handler(
 
 async fn logout(State(state): State<AppState>, Json(req): Json<LogoutRequest>) -> StatusCode {
     // Spec §6.5.5: idempotent; 204 whether or not a row existed.
-    let _ = refresh_tokens::delete_by_token(&state.db, &req.refresh_token).await;
+    // `refresh::logout` deletes a live token, and revokes the whole user
+    // set when the presented token is an already-rotated predecessor so
+    // logout cannot be used to erase the reuse-detection breadcrumb.
+    if let Err(e) = refresh::logout(&state.db, &req.refresh_token).await {
+        tracing::error!(error = %e, "logout: refresh-token update failed");
+    }
     StatusCode::NO_CONTENT
 }
 
@@ -318,7 +325,7 @@ mod tests {
             yt_api_key: std::sync::Arc::new(std::sync::RwLock::new(None)),
             data_dir: std::path::PathBuf::from("./data"),
             music_dir: std::path::PathBuf::from("/data/music"),
-            trusted_proxy_hops: 0,
+            proxy_trust: crate::web::proxy::ProxyTrust::direct(),
             bug_reports: crate::bug_reports::unconfigured_sink(),
         }
     }
@@ -361,7 +368,7 @@ mod tests {
     fn fresh_rate_limit() -> RateLimitState {
         RateLimitState {
             limiter: crate::web::rate_limit::make_auth_limiter(),
-            trusted_hops: 0,
+            proxy: crate::web::proxy::ProxyTrust::direct(),
         }
     }
 
@@ -616,6 +623,80 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(refreshed.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn logout_of_rotated_token_revokes_the_successor() {
+        let state = fresh_state().await;
+        seed_user(&state, "alice", "Hunter2!ok", "viewer").await;
+        let app = app(state);
+
+        let login = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/auth/login")
+                    .header("content-type", "application/json")
+                    .body(json_body(&LoginRequest {
+                        username: "alice".into(),
+                        password: "Hunter2!ok".into(),
+                    }))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let pair: TokenPairResponse = read_json(login).await;
+
+        let refreshed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/auth/refresh")
+                    .header("content-type", "application/json")
+                    .body(json_body(&RefreshRequest {
+                        refresh_token: pair.refresh_token.clone(),
+                    }))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refreshed.status(), StatusCode::OK);
+        let successor: TokenPairResponse = read_json(refreshed).await;
+
+        // Presenting the already-rotated token to logout must kill the
+        // successor, not just the breadcrumb row.
+        let logout = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/auth/logout")
+                    .header("content-type", "application/json")
+                    .body(json_body(&LogoutRequest {
+                        refresh_token: pair.refresh_token,
+                    }))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(logout.status(), StatusCode::NO_CONTENT);
+
+        let again = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/auth/refresh")
+                    .header("content-type", "application/json")
+                    .body(json_body(&RefreshRequest {
+                        refresh_token: successor.refresh_token,
+                    }))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(again.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

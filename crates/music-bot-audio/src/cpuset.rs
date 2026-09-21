@@ -6,12 +6,25 @@
 //! (Robert): fullstack soft pin stays `2-5` (no shrink).
 //!
 //! - `TS6_BOT_SEND_CPUSET` (preferred) or `TS6_BOT_CPUSET` pins **only**
-//!   the Voice send runtime threads (`voice-rt`) to `0-1`.
-//! - [`pin_decode_child`] parks ffmpeg / yt-dlp / the Python warm
+//!   the Voice send runtime threads (`voice-rt`) to `0-1`. Pipeline,
+//!   fetch, bridge, and resolve run on `decode-rt` via
+//!   [`pin_current_thread_decode`] (`TS6_BOT_DECODE_CPUSET=2-5`).
+//! - [`install_decode_pre_exec`] parks ffmpeg / yt-dlp / the Python warm
 //!   resolver on `TS6_BOT_DECODE_CPUSET=2-5` (share Axum, never send
-//!   `0-1`). Packing A (`DECODE=2-3` after fullstack→`4-5`) is a
-//!   gated comment only. Packing C (HostConfig `0-1` + DECODE on send
-//!   cores) is rejected by the apply script.
+//!   `0-1`) by calling `sched_setaffinity(0, …)` in a `pre_exec` hook,
+//!   so the new image inherits the mask before any worker thread exists.
+//!   [`pin_decode_child`] is only a post-spawn backup for the child
+//!   leader; it cannot rewind threads that already ran on send cores.
+//!   The same decode set pins `decode-rt` worker threads. Packing A
+//!   (`DECODE=2-3` after fullstack→`4-5`) is a gated comment only.
+//!   Packing C (HostConfig `0-1` + DECODE on send cores) is rejected
+//!   by the apply script. Music HostConfig stays unset (or wide `0-5`).
+//! - `TS6_BOT_NICE` is per-thread. [`nice_voice_rt_from_env`] walks
+//!   `/proc/<pid>/task/*/comm` for `voice-rt`. A negative nice from
+//!   uid 10001 is typically `EPERM` (no `CAP_SYS_NICE`); the host
+//!   `scripts/apply-fullstack-soft-pin.sh` renices those same tids.
+//!   `renice -p` on the container pid alone only changes the
+//!   thread-group leader.
 //! - A whole-container `podman update --cpuset-cpus=0-1` is **not**
 //!   implemented. v1.6.15 Angerfist dig 163/590/117: that trap made
 //!   `C_loop_deferral` worse.
@@ -21,6 +34,8 @@
 //! rejected at music-runtime boot when both are set.
 
 use std::env;
+use std::io;
+use std::path::Path;
 
 /// Legacy / agreed send-thread pin key. Same meaning as
 /// [`SEND_CPUSET_ENV_PREFERRED`] — **not** a container-wide HostConfig pin.
@@ -28,6 +43,12 @@ pub const SEND_CPUSET_ENV: &str = "TS6_BOT_CPUSET";
 /// Preferred alias that makes the send-thread (not container) scope obvious.
 pub const SEND_CPUSET_ENV_PREFERRED: &str = "TS6_BOT_SEND_CPUSET";
 pub const DECODE_CPUSET_ENV: &str = "TS6_BOT_DECODE_CPUSET";
+/// Host and in-process nice for Voice send threads. Negative values
+/// need `CAP_SYS_NICE` inside the container; the host script is the
+/// path that works for uid 10001.
+pub const NICE_ENV: &str = "TS6_BOT_NICE";
+/// `comm` of the dedicated voice runtime workers (`thread_name`).
+pub const VOICE_RT_THREAD_COMM: &str = "voice-rt";
 
 /// Env key actually consulted for the send-thread pin (`SEND` wins).
 pub fn effective_send_env_key() -> &'static str {
@@ -111,15 +132,107 @@ pub fn pin_current_thread_send() {
     pin_current_thread_from_env(effective_send_env_key());
 }
 
+/// Pin the calling thread to `TS6_BOT_DECODE_CPUSET` when set.
+///
+/// Used by `decode-rt` (pipeline / fetch / bridge / resolve). Never
+/// the send cpuset. Empty / unset is a no-op.
+pub fn pin_current_thread_decode() {
+    pin_current_thread_from_env(DECODE_CPUSET_ENV);
+}
+
 /// Pin `pid` (ffmpeg / yt-dlp / python resolver) to `TS6_BOT_DECODE_CPUSET`.
 pub fn pin_decode_pid(pid: u32) {
     pin_pid_from_env(DECODE_CPUSET_ENV, pid);
 }
 
 /// Convenience after `tokio::process::Command::spawn`.
+///
+/// This pins the child **leader** only. ffmpeg / yt-dlp / the warm
+/// resolver create worker threads at startup; those threads keep
+/// whatever mask was in force at `clone`. Call [`install_decode_pre_exec`]
+/// before `spawn` so the mask is inherited from the first instruction.
 pub fn pin_decode_child(child: &tokio::process::Child) {
     if let Some(pid) = child.id() {
         pin_decode_pid(pid);
+    }
+}
+
+/// Install a `pre_exec` hook that applies `TS6_BOT_DECODE_CPUSET` with
+/// `sched_setaffinity(0, …)` before `exec`.
+///
+/// Unset or empty → no hook. Invalid spec → warn and no hook. When the
+/// hook is installed, a failed `sched_setaffinity` fails the spawn so a
+/// decode child is not left free to run on send cores.
+pub fn install_decode_pre_exec(cmd: &mut tokio::process::Command) {
+    match cpuset_from_env(DECODE_CPUSET_ENV) {
+        Ok(Some(cpus)) if !cpus.is_empty() => {
+            if let Err(err) = install_affinity_pre_exec(cmd, &cpus) {
+                tracing::warn!(
+                    env_key = DECODE_CPUSET_ENV,
+                    error = %err,
+                    "failed to install decode cpuset pre_exec hook"
+                );
+            } else {
+                tracing::debug!(
+                    env_key = DECODE_CPUSET_ENV,
+                    ?cpus,
+                    "installed decode cpuset pre_exec hook"
+                );
+            }
+        }
+        Ok(_) => {}
+        Err(err) => {
+            tracing::warn!(env_key = DECODE_CPUSET_ENV, error = %err, "invalid cpuset env")
+        }
+    }
+}
+
+/// `pre_exec` hook: `sched_setaffinity(0, cpus)` in the child before `exec`.
+///
+/// Empty `cpus` installs nothing. Non-Linux is a no-op (same as [`pin_pid`]).
+/// The closure only issues the affinity syscall — no allocation, no
+/// tracing — so it stays async-signal-safe across `fork`.
+pub fn install_affinity_pre_exec(
+    cmd: &mut tokio::process::Command,
+    cpus: &[usize],
+) -> Result<(), String> {
+    if cpus.is_empty() {
+        return Ok(());
+    }
+    validate_cpu_indexes(cpus)?;
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = cmd;
+        tracing::debug!(?cpus, "decode pre_exec pin skipped on non-linux");
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let cpus = cpus.to_vec();
+        // Safety: the hook is async-signal-safe (sched_setaffinity + errno only).
+        unsafe {
+            cmd.pre_exec(move || apply_affinity_current(&cpus));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn apply_affinity_current(cpus: &[usize]) -> io::Result<()> {
+    // Safety: `set` is a local cpu_set_t; CPU_SET indexes were checked
+    // in the parent against CPU_SETSIZE before the hook was installed.
+    unsafe {
+        let mut set = std::mem::zeroed::<libc::cpu_set_t>();
+        libc::CPU_ZERO(&mut set);
+        for &cpu in cpus {
+            libc::CPU_SET(cpu, &mut set);
+        }
+        let rc = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+        if rc != 0 {
+            let err = *libc::__errno_location();
+            return Err(io::Error::from_raw_os_error(err));
+        }
+        Ok(())
     }
 }
 
@@ -168,6 +281,7 @@ pub fn pin_pid(pid: u32, cpus: &[usize]) -> Result<(), String> {
     if cpus.is_empty() {
         return Ok(());
     }
+    validate_cpu_indexes(cpus)?;
     #[cfg(not(target_os = "linux"))]
     {
         let _ = pid;
@@ -175,20 +289,20 @@ pub fn pin_pid(pid: u32, cpus: &[usize]) -> Result<(), String> {
         Ok(())
     }
     #[cfg(target_os = "linux")]
-    unsafe {
-        let mut set = std::mem::zeroed::<libc::cpu_set_t>();
-        libc::CPU_ZERO(&mut set);
-        for &cpu in cpus {
-            if cpu >= 1024 {
-                return Err(format!("cpu index {cpu} exceeds CPU_SETSIZE"));
+    {
+        // Safety: indexes were checked against CPU_SETSIZE.
+        let rc = unsafe {
+            let mut set = std::mem::zeroed::<libc::cpu_set_t>();
+            libc::CPU_ZERO(&mut set);
+            for &cpu in cpus {
+                libc::CPU_SET(cpu, &mut set);
             }
-            libc::CPU_SET(cpu, &mut set);
-        }
-        let rc = libc::sched_setaffinity(
-            pid as libc::pid_t,
-            std::mem::size_of::<libc::cpu_set_t>(),
-            &set,
-        );
+            libc::sched_setaffinity(
+                pid as libc::pid_t,
+                std::mem::size_of::<libc::cpu_set_t>(),
+                &set,
+            )
+        };
         if rc != 0 {
             let err = std::io::Error::last_os_error();
             return Err(format!("sched_setaffinity({pid}): {err}"));
@@ -197,32 +311,168 @@ pub fn pin_pid(pid: u32, cpus: &[usize]) -> Result<(), String> {
     }
 }
 
+fn validate_cpu_indexes(cpus: &[usize]) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    let limit = libc::CPU_SETSIZE as usize;
+    #[cfg(not(target_os = "linux"))]
+    let limit = 1024usize;
+    for &cpu in cpus {
+        if cpu >= limit {
+            return Err(format!("cpu index {cpu} exceeds CPU_SETSIZE"));
+        }
+    }
+    Ok(())
+}
+
+/// `comm` file bytes match `expected`.
+///
+/// Linux writes `TASK_COMM_LEN - 1` characters plus a trailing newline.
+/// A truncated longer name must not match a shorter expected comm.
+pub fn comm_matches(contents: &str, expected: &str) -> bool {
+    let name = contents.trim_matches(|c: char| c == '\n' || c == '\r' || c == '\0' || c == ' ');
+    !expected.is_empty() && name == expected
+}
+
+/// Tids under `{proc_root}/{pid}/task/*/comm` whose comm equals `expected`.
+///
+/// Missing task directory → empty list (the process or thread group is
+/// already gone). A comm file that disappears mid-walk is skipped.
+pub fn tids_with_comm_under(proc_root: &Path, pid: u32, expected: &str) -> io::Result<Vec<u32>> {
+    let task_dir = proc_root.join(pid.to_string()).join("task");
+    let entries = match std::fs::read_dir(&task_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    };
+    let mut tids = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let Some(tid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        match std::fs::read_to_string(entry.path().join("comm")) {
+            Ok(contents) if comm_matches(&contents, expected) => tids.push(tid),
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+    }
+    tids.sort_unstable();
+    Ok(tids)
+}
+
+/// `voice-rt` tids of `pid` as seen in `/proc`.
+pub fn voice_rt_tids(pid: u32) -> io::Result<Vec<u32>> {
+    tids_with_comm_under(Path::new("/proc"), pid, VOICE_RT_THREAD_COMM)
+}
+
+/// Apply `nice` to one tid.
+///
+/// `tid == 0` is the calling thread (`PRIO_PROCESS` / who 0). Any other
+/// tid is that thread only — Linux nice is not a process-wide attribute,
+/// so the thread-group leader's nice does not cover `voice-rt`.
+pub fn nice_tid(tid: u32, nice: i32) -> Result<(), String> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (tid, nice);
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let rc = unsafe { libc::setpriority(libc::PRIO_PROCESS, tid, nice) };
+        if rc != 0 {
+            let err = io::Error::last_os_error();
+            Err(format!("setpriority({tid}, {nice}): {err}"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Parse `env_key` as a nice value. `Ok(None)` when unset or empty.
+pub fn nice_from_env(env_key: &str) -> Result<Option<i32>, String> {
+    match env::var(env_key) {
+        Ok(raw) if !raw.trim().is_empty() => raw
+            .trim()
+            .parse::<i32>()
+            .map(Some)
+            .map_err(|_| format!("invalid nice value: {raw}")),
+        _ => Ok(None),
+    }
+}
+
+/// `setpriority` every tid of `pid` whose comm equals `comm`.
+pub fn nice_tids_with_comm(pid: u32, comm: &str, nice: i32) -> Result<Vec<u32>, String> {
+    let tids =
+        tids_with_comm_under(Path::new("/proc"), pid, comm).map_err(|err| err.to_string())?;
+    let mut failed = Vec::new();
+    for tid in &tids {
+        if let Err(err) = nice_tid(*tid, nice) {
+            failed.push(format!("{tid}: {err}"));
+        }
+    }
+    if failed.is_empty() {
+        Ok(tids)
+    } else {
+        Err(format!(
+            "setpriority failed for {} of {} {comm} tids: {}",
+            failed.len(),
+            tids.len(),
+            failed.join("; ")
+        ))
+    }
+}
+
 /// Apply `nice` to the calling thread (Linux per-thread nice).
 pub fn nice_current_thread_from_env(env_key: &str) {
-    let raw = match env::var(env_key) {
-        Ok(v) if !v.trim().is_empty() => v,
-        _ => return,
-    };
-    let nice: i32 = match raw.trim().parse() {
-        Ok(v) => v,
-        Err(_) => {
-            tracing::warn!(env_key, raw, "invalid nice value");
+    let nice = match nice_from_env(env_key) {
+        Ok(Some(nice)) => nice,
+        Ok(None) => return,
+        Err(err) => {
+            tracing::warn!(env_key, error = %err, "invalid nice value");
             return;
         }
     };
-    #[cfg(target_os = "linux")]
-    unsafe {
-        let rc = libc::setpriority(libc::PRIO_PROCESS, 0, nice);
-        if rc != 0 {
-            let err = std::io::Error::last_os_error();
-            tracing::warn!(env_key, nice, error = %err, "setpriority failed");
-        } else {
-            tracing::info!(env_key, nice, "niced current thread");
-        }
+    match nice_tid(0, nice) {
+        Ok(()) => tracing::info!(env_key, nice, "niced current thread"),
+        Err(err) => tracing::warn!(env_key, nice, error = %err, "setpriority failed"),
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = nice;
+}
+
+/// Once `voice-rt` workers exist, renice each of them to [`NICE_ENV`].
+///
+/// In-process `setpriority` of a negative nice is often `EPERM` for
+/// uid 10001. Failure is logged; `scripts/apply-fullstack-soft-pin.sh`
+/// performs the same comm walk as root on the host.
+pub fn nice_voice_rt_from_env() {
+    let nice = match nice_from_env(NICE_ENV) {
+        Ok(Some(nice)) => nice,
+        Ok(None) => return,
+        Err(err) => {
+            tracing::warn!(env_key = NICE_ENV, error = %err, "invalid nice value");
+            return;
+        }
+    };
+    let pid = std::process::id();
+    match nice_tids_with_comm(pid, VOICE_RT_THREAD_COMM, nice) {
+        Ok(tids) if tids.is_empty() => {
+            tracing::warn!(pid, nice, "no voice-rt tids to apply TS6_BOT_NICE");
+        }
+        Ok(tids) => {
+            tracing::info!(pid, ?tids, nice, "applied TS6_BOT_NICE to voice-rt tids");
+        }
+        Err(err) => {
+            tracing::warn!(
+                pid,
+                nice,
+                error = %err,
+                "in-process voice-rt renice failed; host apply-fullstack-soft-pin.sh renices the same tids"
+            );
+        }
     }
 }
 
@@ -279,5 +529,180 @@ mod tests {
         let send = parse_cpuset("0-1").unwrap();
         let decode = parse_cpuset("0-1").unwrap();
         assert!(sets_overlap(&send, &decode));
+    }
+
+    #[test]
+    fn comm_matches_trims_proc_newline_and_rejects_prefixes() {
+        assert!(comm_matches("voice-rt\n", "voice-rt"));
+        assert!(comm_matches("voice-rt\0\n", "voice-rt"));
+        assert!(comm_matches("voice-rt\r\n", "voice-rt"));
+        assert!(!comm_matches("voice-runtime\n", "voice-rt"));
+        assert!(!comm_matches("tokio-runtime-w\n", "voice-rt"));
+        assert!(!comm_matches("\n", "voice-rt"));
+        assert!(!comm_matches("voice-rt\n", ""));
+    }
+
+    #[test]
+    fn tids_with_comm_under_selects_only_named_tasks() {
+        let root = std::env::temp_dir().join(format!(
+            "cpuset-proc-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pid = 42u32;
+        write_comm(&root, pid, 1, "ts6-manager-mu\n");
+        write_comm(&root, pid, 11, "voice-rt\n");
+        write_comm(&root, pid, 12, "tokio-runtime-w\n");
+        write_comm(&root, pid, 13, "voice-rt\n");
+        let tids = tids_with_comm_under(&root, pid, VOICE_RT_THREAD_COMM).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(tids, vec![11, 13]);
+        assert!(
+            tids_with_comm_under(&root, pid, VOICE_RT_THREAD_COMM)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    fn write_comm(root: &std::path::Path, pid: u32, tid: u32, comm: &str) {
+        let dir = root
+            .join(pid.to_string())
+            .join("task")
+            .join(tid.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("comm"), comm).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn current_affinity(pid: u32) -> Vec<usize> {
+        unsafe {
+            let mut set = std::mem::zeroed::<libc::cpu_set_t>();
+            let rc = libc::sched_getaffinity(
+                pid as libc::pid_t,
+                std::mem::size_of::<libc::cpu_set_t>(),
+                &mut set,
+            );
+            assert_eq!(
+                rc,
+                0,
+                "sched_getaffinity: {}",
+                std::io::Error::last_os_error()
+            );
+            let mut out = Vec::new();
+            for cpu in 0..libc::CPU_SETSIZE as usize {
+                if libc::CPU_ISSET(cpu, &set) {
+                    out.push(cpu);
+                }
+            }
+            out
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn thread_nice(tid: u32) -> i32 {
+        unsafe {
+            *libc::__errno_location() = 0;
+            let rc = libc::getpriority(libc::PRIO_PROCESS, tid);
+            assert!(
+                rc != -1 || *libc::__errno_location() == 0,
+                "getpriority({tid}): {}",
+                std::io::Error::last_os_error()
+            );
+            rc
+        }
+    }
+
+    /// H1: the child must already be on the decode mask when `spawn`
+    /// returns. The only pin in this test is the pre_exec hook — there
+    /// is no post-spawn `pin_pid`.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn pre_exec_sets_child_affinity_before_spawn_returns() {
+        let parent = current_affinity(0);
+        assert!(!parent.is_empty(), "parent affinity must be non-empty");
+        let cpu = parent[0];
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("30")
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        install_affinity_pre_exec(&mut cmd, &[cpu]).unwrap();
+        let mut child = cmd.spawn().expect("spawn sleep with decode pre_exec");
+        let pid = child.id().expect("child pid");
+        let child_aff = current_affinity(pid);
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        assert_eq!(child_aff, vec![cpu]);
+        if parent.len() >= 2 {
+            assert_ne!(
+                child_aff, parent,
+                "pre_exec must narrow the child below the parent mask"
+            );
+        }
+    }
+
+    /// H3: nice is per-tid. Raising one `voice-rt` thread must not change
+    /// the thread-group leader — which is what `renice -p <container pid>`
+    /// does, and why send threads stayed at the default.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nice_targets_voice_rt_tid_and_not_the_leader() {
+        let leader = std::process::id();
+        let leader_before = thread_nice(leader);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tid_slot = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_t = std::sync::Arc::clone(&stop);
+        let tid_t = std::sync::Arc::clone(&tid_slot);
+        let started_t = std::sync::Arc::clone(&started);
+        let handle = std::thread::Builder::new()
+            .name(VOICE_RT_THREAD_COMM.into())
+            .spawn(move || {
+                let tid = std::fs::read_link("/proc/thread-self")
+                    .ok()
+                    .and_then(|p| {
+                        p.file_name()
+                            .and_then(|s| s.to_str())
+                            .and_then(|s| s.parse().ok())
+                    })
+                    .unwrap_or(0);
+                tid_t.store(tid, std::sync::atomic::Ordering::SeqCst);
+                started_t.store(true, std::sync::atomic::Ordering::SeqCst);
+                while !stop_t.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            })
+            .unwrap();
+        while !started.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let tid = tid_slot.load(std::sync::atomic::Ordering::SeqCst);
+        assert_ne!(tid, 0, "voice-rt thread published a tid");
+        assert_ne!(tid, leader, "worker tid must differ from the leader");
+        let found = voice_rt_tids(leader).unwrap();
+        assert!(
+            found.contains(&tid),
+            "comm walk must find the voice-rt tid {tid}, got {found:?}"
+        );
+
+        let before = thread_nice(tid);
+        if before < 19 {
+            nice_tid(tid, before + 1).unwrap();
+            assert_eq!(thread_nice(tid), before + 1);
+            assert_eq!(
+                thread_nice(leader),
+                leader_before,
+                "renicing a voice-rt tid must not be a leader-only nice"
+            );
+        } else {
+            nice_tid(tid, before).unwrap();
+        }
+
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        handle.join().unwrap();
     }
 }

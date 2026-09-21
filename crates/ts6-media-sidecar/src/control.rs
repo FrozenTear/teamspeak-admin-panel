@@ -207,6 +207,11 @@ impl SourceStatsSnapshot {
 pub enum ApiError {
     #[error("ssrf_blocked")]
     SsrfBlocked(#[source] SsrfError),
+    /// Plaintext HTTP whose DNS check did not yield an address to pin.
+    /// Spec §9.3 allows that at the shared validator; handing the URL to
+    /// FFmpeg would let it resolve again later (DNS rebinding).
+    #[error("ssrf_blocked")]
+    HttpUnpinned,
     #[error("invalid_request: {0}")]
     InvalidRequest(String),
     #[error("source_id_already_running")]
@@ -227,7 +232,7 @@ struct ErrorBody<'a> {
 impl ApiError {
     fn status(&self) -> StatusCode {
         match self {
-            ApiError::SsrfBlocked(_) => StatusCode::BAD_REQUEST,
+            ApiError::SsrfBlocked(_) | ApiError::HttpUnpinned => StatusCode::BAD_REQUEST,
             ApiError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
             ApiError::AlreadyRunning => StatusCode::CONFLICT,
             ApiError::UnknownSource => StatusCode::NOT_FOUND,
@@ -237,7 +242,7 @@ impl ApiError {
 
     fn error_code(&self) -> &'static str {
         match self {
-            ApiError::SsrfBlocked(_) => "ssrf_blocked",
+            ApiError::SsrfBlocked(_) | ApiError::HttpUnpinned => "ssrf_blocked",
             ApiError::InvalidRequest(_) => "invalid_request",
             ApiError::AlreadyRunning => "source_id_already_running",
             ApiError::UnknownSource => "unknown_source_id",
@@ -248,6 +253,9 @@ impl ApiError {
     fn detail(&self) -> Option<String> {
         match self {
             ApiError::SsrfBlocked(e) => Some(e.to_string()),
+            ApiError::HttpUnpinned => {
+                Some("plaintext HTTP source has no validated address to pin".into())
+            }
             ApiError::InvalidRequest(d) => Some(d.clone()),
             ApiError::AlreadyRunning | ApiError::UnknownSource => None,
             ApiError::Internal(e) => Some(e.to_string()),
@@ -295,6 +303,16 @@ pub async fn post_source(
             return Err(ApiError::SsrfBlocked(err));
         }
     };
+
+    // Plaintext HTTP with no pin is fail-closed. Spec §9.3 lets the shared
+    // validator return `resolved_ip: None` on DNS failure; FFmpeg would
+    // resolve that name again at fetch time and can land on a blocked
+    // address. HTTPS still passes through — `-tls_verify 1` binds the
+    // peer cert to the hostname.
+    if pinned.url.scheme() == "http" && pinned.resolved_ip.is_none() {
+        state.diagnostics.record_http_unpinned(&pinned.host);
+        return Err(ApiError::HttpUnpinned);
+    }
 
     // PURA-149 → PURA-172: closing the rebinding window for plaintext HTTP.
     //
@@ -433,9 +451,11 @@ pub async fn post_source_stop(
 /// HTTPS sources are passed through unchanged — TLS hostname validation
 /// already binds the connection to the cert SAN, which is a stronger
 /// guarantee than IP-pinning. Plaintext HTTP sources with a `resolved_ip`
-/// from `ts6-ssrf` are proxied. HTTP sources whose host could not be
-/// resolved (`resolved_ip` is `None` — spec §9.3 NXDOMAIN passthrough)
-/// also fall back to the direct URL because there is no IP to pin to.
+/// from `ts6-ssrf` are proxied.
+///
+/// Callers must refuse HTTP sources whose `resolved_ip` is `None`
+/// before calling this. There is no address to pin, and falling back
+/// to the original URL re-opens DNS rebinding inside FFmpeg.
 async fn pin_token_for(
     pinned: &ts6_ssrf::PinnedTarget,
     proxy: &PinProxy,

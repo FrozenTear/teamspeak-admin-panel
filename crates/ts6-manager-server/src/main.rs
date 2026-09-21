@@ -352,12 +352,16 @@ mod server_entry {
 
         // Phase 1 SECURITY (slice 4b): per-IP rate limit on the auth
         // surface. One bucket shared across `/login` and `/refresh` per
-        // spec §6.8; `trusted_proxy_hops` decides whether the limiter
-        // keys by ConnectInfo (direct listener) or by the rightmost XFF
-        // entry (single trusted proxy in front).
+        // spec §6.8; hops plus TRUSTED_PROXY_CIDRS decide whether the
+        // limiter keys by ConnectInfo or by the rightmost XFF entry.
+        // Empty CIDRs ignore XFF even when hops is 1.
+        let proxy_trust = web::proxy::ProxyTrust::from_parts(
+            cfg.trusted_proxy_hops,
+            cfg.trusted_proxy_cidrs.clone(),
+        );
         let auth_rate_limit_state = web::rate_limit::RateLimitState {
             limiter: web::rate_limit::make_auth_limiter(),
-            trusted_hops: cfg.trusted_proxy_hops,
+            proxy: proxy_trust.clone(),
         };
         // PURA-35: dedicated limiter for `POST /api/setup/init`. Same
         // 15-req / 15-min spec §6.8 quota, but its OWN GCRA bucket map
@@ -365,7 +369,7 @@ mod server_entry {
         // retry can't DoS login (R-S5.1 from PURA-22 review).
         let setup_rate_limit_state = web::rate_limit::RateLimitState {
             limiter: web::rate_limit::make_setup_limiter(),
-            trusted_hops: cfg.trusted_proxy_hops,
+            proxy: proxy_trust.clone(),
         };
 
         // Phase 1 SECURITY (slice 3 + 4a + 4b): build the stateful sub-routers
@@ -418,6 +422,7 @@ mod server_entry {
             cfg.widget_rate_limit_per_token_rpm,
             cfg.widget_rate_limit_per_ip_rpm,
             cfg.trusted_proxy_hops,
+            cfg.trusted_proxy_cidrs.clone(),
         );
         let widget_router = widgets::routes::router().with_state(state.clone()).layer(
             axum::middleware::from_fn_with_state(widget_rl_state, web::widget_rate_limit),
@@ -508,8 +513,7 @@ mod server_entry {
             state,
             routes::music_bots::enrich_bug_report_request,
         ));
-        let router =
-            web::security_headers_stack(cfg.node_env, cfg.trusted_proxy_hops).apply(router);
+        let router = web::security_headers_stack(cfg.node_env, proxy_trust).apply(router);
         // PURA-48 — per-request nonce-based CSP. Layered LAST so it sits
         // outermost: on the response path it runs after every inner layer,
         // and `headers_mut().insert(CSP, …)` overrides any pre-existing CSP

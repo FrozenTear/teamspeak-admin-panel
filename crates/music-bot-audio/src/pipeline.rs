@@ -81,7 +81,8 @@ impl AudioPipeline {
 
         let prebuffer_target = cfg.prebuffer_frames;
         let channels = cfg.channels;
-        let worker = tokio::spawn(async move {
+        // Off the voice-rt send cores (packing B: TS6_BOT_DECODE_CPUSET).
+        let worker = crate::runtime::spawn_decode(async move {
             // PURA-330 — anchor for the per-stage latency log: time from
             // worker spawn to the first full PCM frame covers the whole
             // source bring-up (yt-dlp + ffmpeg).

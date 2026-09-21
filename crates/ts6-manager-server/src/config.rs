@@ -123,10 +123,22 @@ pub struct Config {
     /// (spec §6.8). `0` means the listener is exposed directly and
     /// forwarding headers (`X-Forwarded-For`, `X-Forwarded-Proto`) are
     /// ignored. `1` means a single trusted proxy rewrote the client IP
-    /// and scheme; the rate limiter and HSTS gate trust the rightmost
-    /// entries. Larger values are accepted but discouraged (spec
+    /// and scheme. Larger values are accepted but discouraged (spec
     /// mandates "exactly one proxy hop").
+    ///
+    /// Hops alone do not enable the headers. The TCP peer must also sit
+    /// in [`Self::trusted_proxy_cidrs`]. An empty list keeps the headers
+    /// ignored even when this is `1`.
     pub trusted_proxy_hops: u8,
+    /// CIDR allow-list of reverse proxies allowed to supply
+    /// `X-Forwarded-For` and `X-Forwarded-Proto` (`TRUSTED_PROXY_CIDRS`,
+    /// comma-separated). Empty by default (never trust forwarding
+    /// headers). Pair `TRUSTED_PROXY_HOPS=1` with the proxy's peer
+    /// address, for example Caddy's `127.0.0.1/32` when the panel port
+    /// is otherwise reachable. Distinct from
+    /// [`Self::moderation_trusted_proxy_cidrs`], which only covers the
+    /// public moderation surface.
+    pub trusted_proxy_cidrs: Vec<ipnet::IpNet>,
     /// PURA-72 Slice F — per-token request budget for `/api/widget/*`.
     /// Defaults to 30 req/min; overridable via
     /// `WIDGET_RATE_LIMIT_PER_TOKEN_PER_MINUTE`. Protects upstream
@@ -248,6 +260,7 @@ impl Config {
         let log_pretty = optional_env("LOG_PRETTY").map(|raw| matches!(raw.as_str(), "1" | "true"));
 
         let trusted_proxy_hops = parse_env_u8("TRUSTED_PROXY_HOPS", 0)?;
+        let trusted_proxy_cidrs = parse_env_cidrs("TRUSTED_PROXY_CIDRS")?;
 
         // PURA-72 Slice F — widget rate-limit budgets. Default 30/min per
         // token and per IP. The two buckets are independent — see
@@ -289,6 +302,7 @@ impl Config {
             log_level,
             log_pretty,
             trusted_proxy_hops,
+            trusted_proxy_cidrs,
             widget_rate_limit_per_token_rpm,
             widget_rate_limit_per_ip_rpm,
             moderation_trusted_proxy_cidrs,
@@ -338,6 +352,15 @@ impl Config {
         if !self.encryption_key_fell_back && self.encryption_key == self.jwt_secret {
             tracing::warn!(
                 "ENCRYPTION_KEY equals JWT_SECRET; use separate values for better security"
+            );
+        }
+        if self.trusted_proxy_hops > 0 && self.trusted_proxy_cidrs.is_empty() {
+            tracing::warn!(
+                hops = self.trusted_proxy_hops,
+                "TRUSTED_PROXY_HOPS is set but TRUSTED_PROXY_CIDRS is empty; \
+                 X-Forwarded-For and X-Forwarded-Proto stay ignored. Pair hops \
+                 with the reverse proxy's peer CIDR, or keep the listener \
+                 unreachable except from that proxy."
             );
         }
         if self.ssh_tofu {
@@ -400,13 +423,13 @@ fn parse_env_u32(key: &str, default: u32) -> Result<u32> {
     }
 }
 
-/// Parse a comma-separated list of CIDR blocks (`10.0.0.0/8,192.168.0.0/16`)
-/// — the `MODERATION_TRUSTED_PROXY_CIDRS` allow-list of reverse proxies
-/// whose `X-Forwarded-For` header the public moderation surface trusts
-/// (PURA-269 §6 hook 2). An empty / unset value yields an empty list,
-/// which the resolver treats as **default-deny** — XFF is ignored and the
-/// direct peer IP is used. A malformed entry fails boot loudly rather than
-/// being silently dropped, so a typo cannot quietly weaken IP attribution.
+/// Parse a comma-separated list of CIDR blocks (`10.0.0.0/8,192.168.0.0/16`).
+/// Used for `TRUSTED_PROXY_CIDRS` (panel-wide forwarding headers) and
+/// `MODERATION_TRUSTED_PROXY_CIDRS` (public moderation surface). An empty /
+/// unset value yields an empty list, which callers treat as **default-deny**
+/// — forwarding headers are ignored and the direct peer IP is used. A
+/// malformed entry fails boot loudly rather than being silently dropped, so
+/// a typo cannot quietly weaken IP attribution.
 fn parse_env_cidrs(key: &str) -> Result<Vec<ipnet::IpNet>> {
     let raw = match env::var(key) {
         Ok(v) if !v.trim().is_empty() => v,

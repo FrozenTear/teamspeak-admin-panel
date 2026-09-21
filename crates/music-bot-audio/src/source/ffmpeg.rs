@@ -106,6 +106,7 @@ impl FfmpegSource {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
+        crate::cpuset::install_decode_pre_exec(&mut cmd);
         let mut child = cmd.spawn()?;
         crate::cpuset::pin_decode_child(&child);
         let stdout = child
@@ -116,7 +117,7 @@ impl FfmpegSource {
             .stderr
             .take()
             .ok_or_else(|| io::Error::other("ffmpeg child has no stderr"))?;
-        tokio::spawn(async move {
+        crate::runtime::spawn_decode(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 tracing::warn!(target: "ffmpeg", "{}", line);
@@ -206,6 +207,7 @@ impl FfmpegSource {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
+        crate::cpuset::install_decode_pre_exec(&mut cmd);
         let mut child = cmd.spawn()?;
         crate::cpuset::pin_decode_child(&child);
         let stdin = child
@@ -220,7 +222,7 @@ impl FfmpegSource {
             .stderr
             .take()
             .ok_or_else(|| io::Error::other("ffmpeg child has no stderr"))?;
-        tokio::spawn(async move {
+        crate::runtime::spawn_decode(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 tracing::warn!(target: "ffmpeg", "{}", line);

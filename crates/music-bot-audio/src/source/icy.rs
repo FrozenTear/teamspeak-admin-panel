@@ -98,7 +98,8 @@ impl IcyRadioSource {
             )));
         }
 
-        let fetcher = tokio::spawn(run_fetcher(
+        // Fetch + reconnect loop is non-send work: decode-rt, not voice-rt.
+        let fetcher = crate::runtime::spawn_decode(run_fetcher(
             client,
             url_owned,
             FirstAttempt { resp, metaint },
