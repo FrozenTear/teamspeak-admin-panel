@@ -1,5 +1,5 @@
-//! Spec §6.8 — single-hop reverse-proxy trust for client-IP attribution
-//! and `X-Forwarded-Proto` (HSTS).
+//! Spec §6.8 — reverse-proxy trust for client-IP attribution and
+//! `X-Forwarded-Proto` (HSTS).
 //!
 //! When the listener sits behind a trusted reverse proxy (nginx, Traefik,
 //! HAProxy, Caddy, etc.), the client's real IP arrives in `X-Forwarded-For`
@@ -7,48 +7,94 @@
 //! the back-end MUST trust **exactly one** proxy hop and MUST NOT trust
 //! client-supplied forwarding-header entries.
 //!
-//! The convention this module enforces: the trusted proxy **appends** the
-//! client IP it observed to whatever XFF the request arrived with. The
-//! rightmost entry is therefore the entry our proxy added; it is the only
-//! XFF entry we trust. Anything to the left could have been spoofed by a
-//! malicious client and is discarded.
+//! Hop count alone is not enough. `:3001` is often bound on `0.0.0.0`
+//! (host network), so any TCP peer can send `X-Forwarded-For` and
+//! `X-Forwarded-Proto`. Forwarding headers are honoured only when **both**:
+//!
+//! - `TRUSTED_PROXY_HOPS` > 0, and
+//! - the `ConnectInfo` peer address is inside `TRUSTED_PROXY_CIDRS`.
+//!
+//! An empty CIDR list (the default) never trusts forwarding headers, even
+//! when hops is 1. A deployment that sets `TRUSTED_PROXY_HOPS=1` must also
+//! set the proxy's peer CIDR (Caddy's address), or keep `:3001` unreachable
+//! except from that proxy. Hops without a CIDR does not turn the headers on.
+//!
+//! The convention this module enforces once the peer is trusted: the proxy
+//! **appends** the client IP it observed to whatever XFF the request arrived
+//! with. The rightmost entry is therefore the entry our proxy added; it is
+//! the only XFF entry we trust. Anything to the left could have been spoofed
+//! by a malicious client and is discarded.
 //!
 //! Configuration:
 //!
 //! - `TRUSTED_PROXY_HOPS=0` (default) — listener is exposed directly; XFF
-//!   is ignored and the source IP comes from `ConnectInfo<SocketAddr>`.
-//! - `TRUSTED_PROXY_HOPS=1` — single trusted proxy in front; the rightmost
-//!   XFF entry is the trusted client IP. This matches the spec's "exactly
-//!   one proxy hop" mandate.
+//!   and `X-Forwarded-Proto` are ignored. The source IP comes from
+//!   `ConnectInfo<SocketAddr>`.
+//! - `TRUSTED_PROXY_HOPS=1` plus `TRUSTED_PROXY_CIDRS=<proxy>/32` — single
+//!   trusted proxy in front; the rightmost XFF entry is the trusted client
+//!   IP. This matches the spec's "exactly one proxy hop" mandate.
 //! - `TRUSTED_PROXY_HOPS=N` (N > 1) — for chained trusted proxies (CDN +
-//!   internal LB, etc.). The Nth-from-right entry is taken. Spec advises
-//!   against this, but the parameter is honoured if operators have
-//!   audited the proxy chain.
+//!   internal LB, etc.). The Nth-from-right entry is taken, still only when
+//!   the immediate peer is inside the CIDR list. Spec advises against N > 1,
+//!   but the parameter is honoured if operators have audited the proxy chain.
 
 use std::net::IpAddr;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use axum::http::HeaderMap;
-use axum::http::Uri;
 use axum::http::header::HeaderName;
+use ipnet::IpNet;
 
 const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto");
 
+/// Hop count plus the proxy CIDR allow-list. Cheap to clone (`Arc`).
+///
+/// Empty `cidrs` is default-deny: forwarding headers are ignored even
+/// when `hops > 0`.
+#[derive(Clone, Debug)]
+pub struct ProxyTrust {
+    pub hops: u8,
+    pub cidrs: Arc<Vec<IpNet>>,
+}
+
+impl ProxyTrust {
+    pub fn from_parts(hops: u8, cidrs: Vec<IpNet>) -> Self {
+        Self {
+            hops,
+            cidrs: Arc::new(cidrs),
+        }
+    }
+
+    /// Direct listener. Forwarding headers are ignored.
+    pub fn direct() -> Self {
+        Self::from_parts(0, Vec::new())
+    }
+
+    /// True when this TCP peer is allowed to supply `X-Forwarded-*`.
+    pub fn honors_forwarding(&self, peer: IpAddr) -> bool {
+        self.hops > 0 && self.cidrs.iter().any(|net| net.contains(&peer))
+    }
+}
+
 /// Decide which IP to attribute the request to.
 ///
 /// Returns the trusted client IP per the policy in the module docs:
-/// either the Nth-from-rightmost `X-Forwarded-For` entry (when
-/// `trusted_hops > 0`) or the direct connection IP from `ConnectInfo`.
+/// either the Nth-from-rightmost `X-Forwarded-For` entry (when the peer
+/// is inside a configured proxy CIDR and `hops > 0`) or the direct
+/// connection IP from `ConnectInfo`.
 ///
-/// If `trusted_hops > 0` but XFF is missing / malformed / shorter than
-/// `trusted_hops`, the connection IP is used as a fail-safe — better to
+/// If hops are set but the peer is outside the CIDR list, XFF is ignored.
+/// If the peer is trusted but XFF is missing / malformed / shorter than
+/// `hops`, the connection IP is used as a fail-safe — better to
 /// rate-limit by the immediate peer than to fall through to a wide-open
 /// path.
-pub fn client_ip(headers: &HeaderMap, connect_info: SocketAddr, trusted_hops: u8) -> IpAddr {
-    if trusted_hops == 0 {
+pub fn client_ip(headers: &HeaderMap, connect_info: SocketAddr, trust: &ProxyTrust) -> IpAddr {
+    if !trust.honors_forwarding(connect_info.ip()) {
         return connect_info.ip();
     }
+    let trusted_hops = trust.hops;
 
     let raw = match headers.get(&X_FORWARDED_FOR).and_then(|v| v.to_str().ok()) {
         Some(s) => s,
@@ -72,17 +118,23 @@ pub fn client_ip(headers: &HeaderMap, connect_info: SocketAddr, trusted_hops: u8
         .unwrap_or_else(|_| connect_info.ip())
 }
 
-/// Trusted `X-Forwarded-Proto` token, using the same hop-count policy as
-/// [`client_ip`].
+/// Trusted `X-Forwarded-Proto` token, using the same peer-CIDR and
+/// hop-count policy as [`client_ip`].
 ///
-/// - `trusted_hops == 0` — header is ignored (direct listener). A client
-///   on bare `:3001` cannot spoof HTTPS and train HSTS.
+/// - peer outside `TRUSTED_PROXY_CIDRS`, or `hops == 0` — header is
+///   ignored. A direct client on bare `:3001` cannot spoof HTTPS and
+///   train HSTS, even if hops is set and the CIDR list is empty.
 /// - otherwise the Nth-from-right comma-separated entry is returned after
 ///   trim. Missing / short / empty headers yield `None`.
-pub fn forwarded_proto(headers: &HeaderMap, trusted_hops: u8) -> Option<&str> {
-    if trusted_hops == 0 {
+pub fn forwarded_proto<'a>(
+    headers: &'a HeaderMap,
+    peer: IpAddr,
+    trust: &ProxyTrust,
+) -> Option<&'a str> {
+    if !trust.honors_forwarding(peer) {
         return None;
     }
+    let trusted_hops = trust.hops;
 
     let raw = headers.get(&X_FORWARDED_PROTO)?.to_str().ok()?;
     let entries: Vec<&str> = raw.split(',').map(str::trim).collect();
@@ -99,16 +151,18 @@ pub fn forwarded_proto(headers: &HeaderMap, trusted_hops: u8) -> Option<&str> {
     }
 }
 
-/// True when the request is HTTPS: either the URI scheme is `https`
-/// (TLS terminated on this process) or a trusted proxy marked
-/// `X-Forwarded-Proto: https`.
+/// True when a trusted proxy marked `X-Forwarded-Proto: https`.
 ///
-/// Client-supplied `X-Forwarded-Proto` is ignored unless
-/// `trusted_hops > 0`, matching [`client_ip`].
-pub fn request_is_https(headers: &HeaderMap, uri: &Uri, trusted_hops: u8) -> bool {
-    uri.scheme_str()
-        .is_some_and(|s| s.eq_ignore_ascii_case("https"))
-        || forwarded_proto(headers, trusted_hops).is_some_and(|p| p.eq_ignore_ascii_case("https"))
+/// The request-target's URI scheme is not consulted. An absolute-form
+/// request line (`GET https://panel.example/ HTTP/1.1`) over cleartext
+/// is client-controlled and must not turn HSTS on. In-process TLS, if
+/// it is ever terminated here, has to be signalled by a trusted proxy
+/// header (or by not using this helper).
+///
+/// Client-supplied `X-Forwarded-Proto` is ignored unless the TCP peer is
+/// inside [`ProxyTrust`]'s CIDR list and hops is non-zero.
+pub fn request_is_https(headers: &HeaderMap, peer: IpAddr, trust: &ProxyTrust) -> bool {
+    forwarded_proto(headers, peer, trust).is_some_and(|p| p.eq_ignore_ascii_case("https"))
 }
 
 #[cfg(test)]
@@ -118,6 +172,15 @@ mod tests {
 
     fn peer() -> SocketAddr {
         "203.0.113.7:54321".parse().unwrap()
+    }
+
+    fn outside_peer() -> SocketAddr {
+        "198.51.100.8:9".parse().unwrap()
+    }
+
+    /// Hop-count tests assume the direct peer sits in this CIDR.
+    fn trust_for(hops: u8) -> ProxyTrust {
+        ProxyTrust::from_parts(hops, vec!["203.0.113.0/24".parse().unwrap()])
     }
 
     fn header_map(xff: Option<&str>) -> HeaderMap {
@@ -133,13 +196,13 @@ mod tests {
         // Even if the client crafts a believable XFF, hops=0 means we don't
         // trust it. Source IP must be the direct peer.
         let h = header_map(Some("198.51.100.5"));
-        let ip = client_ip(&h, peer(), 0);
+        let ip = client_ip(&h, peer(), &trust_for(0));
         assert_eq!(ip.to_string(), "203.0.113.7");
     }
 
     #[test]
     fn missing_xff_falls_back_to_peer() {
-        let ip = client_ip(&header_map(None), peer(), 1);
+        let ip = client_ip(&header_map(None), peer(), &trust_for(1));
         assert_eq!(ip.to_string(), "203.0.113.7");
     }
 
@@ -148,15 +211,32 @@ mod tests {
         // Real client at 198.51.100.5 → trusted proxy appended that IP to
         // XFF. Anything to the left is whatever the client claimed.
         let h = header_map(Some("evil-claim, 198.51.100.5"));
-        let ip = client_ip(&h, peer(), 1);
+        let ip = client_ip(&h, peer(), &trust_for(1));
         assert_eq!(ip.to_string(), "198.51.100.5");
     }
 
     #[test]
     fn one_hop_with_single_entry() {
         let h = header_map(Some("198.51.100.5"));
-        let ip = client_ip(&h, peer(), 1);
+        let ip = client_ip(&h, peer(), &trust_for(1));
         assert_eq!(ip.to_string(), "198.51.100.5");
+    }
+
+    #[test]
+    fn peer_outside_cidr_ignores_xff_even_with_hops() {
+        // hops=1 is not enough. A direct client that is not the proxy
+        // must not choose its own rate-limit / audit IP.
+        let h = header_map(Some("198.51.100.5"));
+        let ip = client_ip(&h, outside_peer(), &trust_for(1));
+        assert_eq!(ip.to_string(), "198.51.100.8");
+    }
+
+    #[test]
+    fn empty_cidr_list_ignores_xff_even_with_hops() {
+        let h = header_map(Some("198.51.100.5"));
+        let trust = ProxyTrust::from_parts(1, Vec::new());
+        let ip = client_ip(&h, peer(), &trust);
+        assert_eq!(ip.to_string(), "203.0.113.7");
     }
 
     #[test]
@@ -165,7 +245,7 @@ mod tests {
         // from right = client-as-seen-by-CDN. With hops=2, we trust the
         // CDN-attributed entry.
         let h = header_map(Some("client-claim, 198.51.100.5, 192.0.2.10"));
-        let ip = client_ip(&h, peer(), 2);
+        let ip = client_ip(&h, peer(), &trust_for(2));
         assert_eq!(ip.to_string(), "198.51.100.5");
     }
 
@@ -175,7 +255,7 @@ mod tests {
         // instead of an IP literal. Rate-limit by direct peer rather than
         // bypass the limiter entirely.
         let h = header_map(Some("evil, not-an-ip"));
-        let ip = client_ip(&h, peer(), 1);
+        let ip = client_ip(&h, peer(), &trust_for(1));
         assert_eq!(ip.to_string(), "203.0.113.7");
     }
 
@@ -184,21 +264,21 @@ mod tests {
         // hops=2 but only one XFF entry → chain shorter than the operator
         // configured for. Don't pull from out-of-bounds; use peer.
         let h = header_map(Some("198.51.100.5"));
-        let ip = client_ip(&h, peer(), 2);
+        let ip = client_ip(&h, peer(), &trust_for(2));
         assert_eq!(ip.to_string(), "203.0.113.7");
     }
 
     #[test]
     fn ipv6_in_xff_round_trips() {
         let h = header_map(Some("evil-claim, 2001:db8::1"));
-        let ip = client_ip(&h, peer(), 1);
+        let ip = client_ip(&h, peer(), &trust_for(1));
         assert_eq!(ip.to_string(), "2001:db8::1");
     }
 
     #[test]
     fn entries_with_whitespace_are_trimmed() {
         let h = header_map(Some(" 198.51.100.5 , 192.0.2.10 "));
-        let ip = client_ip(&h, peer(), 1);
+        let ip = client_ip(&h, peer(), &trust_for(1));
         assert_eq!(ip.to_string(), "192.0.2.10");
     }
 
@@ -213,34 +293,56 @@ mod tests {
     #[test]
     fn trusted_hops_zero_ignores_forwarded_proto() {
         let h = proto_map(Some("https"));
-        assert_eq!(forwarded_proto(&h, 0), None);
-        assert!(!request_is_https(&h, &Uri::from_static("/health"), 0));
+        assert_eq!(forwarded_proto(&h, peer().ip(), &trust_for(0)), None);
+        assert!(!request_is_https(&h, peer().ip(), &trust_for(0)));
     }
 
     #[test]
     fn missing_forwarded_proto_is_none() {
-        assert_eq!(forwarded_proto(&proto_map(None), 1), None);
+        assert_eq!(
+            forwarded_proto(&proto_map(None), peer().ip(), &trust_for(1)),
+            None
+        );
     }
 
     #[test]
     fn one_hop_takes_rightmost_proto() {
         let h = proto_map(Some("http, https"));
-        assert_eq!(forwarded_proto(&h, 1), Some("https"));
-        assert!(request_is_https(&h, &Uri::from_static("/health"), 1));
+        assert_eq!(
+            forwarded_proto(&h, peer().ip(), &trust_for(1)),
+            Some("https")
+        );
+        assert!(request_is_https(&h, peer().ip(), &trust_for(1)));
+    }
+
+    #[test]
+    fn peer_outside_cidr_ignores_forwarded_proto() {
+        let h = proto_map(Some("https"));
+        assert_eq!(
+            forwarded_proto(&h, outside_peer().ip(), &trust_for(1)),
+            None
+        );
+        assert!(!request_is_https(&h, outside_peer().ip(), &trust_for(1)));
     }
 
     #[test]
     fn one_hop_single_https_entry() {
         let h = proto_map(Some("https"));
-        assert_eq!(forwarded_proto(&h, 1), Some("https"));
-        assert!(request_is_https(&h, &Uri::from_static("/health"), 1));
+        assert_eq!(
+            forwarded_proto(&h, peer().ip(), &trust_for(1)),
+            Some("https")
+        );
+        assert!(request_is_https(&h, peer().ip(), &trust_for(1)));
     }
 
     #[test]
     fn one_hop_http_is_not_https() {
         let h = proto_map(Some("http"));
-        assert_eq!(forwarded_proto(&h, 1), Some("http"));
-        assert!(!request_is_https(&h, &Uri::from_static("/health"), 1));
+        assert_eq!(
+            forwarded_proto(&h, peer().ip(), &trust_for(1)),
+            Some("http")
+        );
+        assert!(!request_is_https(&h, peer().ip(), &trust_for(1)));
     }
 
     #[test]
@@ -248,33 +350,44 @@ mod tests {
         // Client claimed https; the nearest trusted proxy recorded http.
         // hops=1 → rightmost = http; hops=2 → second from right = https.
         let h = proto_map(Some("https, http"));
-        assert_eq!(forwarded_proto(&h, 2), Some("https"));
-        assert_eq!(forwarded_proto(&h, 1), Some("http"));
-        assert!(!request_is_https(&h, &Uri::from_static("/"), 1));
+        assert_eq!(
+            forwarded_proto(&h, peer().ip(), &trust_for(2)),
+            Some("https")
+        );
+        assert_eq!(
+            forwarded_proto(&h, peer().ip(), &trust_for(1)),
+            Some("http")
+        );
+        assert!(!request_is_https(&h, peer().ip(), &trust_for(1)));
     }
 
     #[test]
     fn proto_shorter_than_trusted_chain_is_none() {
         let h = proto_map(Some("https"));
-        assert_eq!(forwarded_proto(&h, 2), None);
+        assert_eq!(forwarded_proto(&h, peer().ip(), &trust_for(2)), None);
     }
 
     #[test]
     fn proto_entries_with_whitespace_are_trimmed() {
         let h = proto_map(Some(" http , https "));
-        assert_eq!(forwarded_proto(&h, 1), Some("https"));
+        assert_eq!(
+            forwarded_proto(&h, peer().ip(), &trust_for(1)),
+            Some("https")
+        );
     }
 
     #[test]
-    fn https_uri_scheme_is_trusted_without_proxy() {
+    fn absolute_form_https_uri_does_not_count_as_https() {
+        // The request line is client-controlled. A cleartext client must
+        // not train HSTS by sending `GET https://panel.example/ HTTP/1.1`.
         let h = proto_map(None);
-        let uri = Uri::from_static("https://panel.example.com/health");
-        assert!(request_is_https(&h, &uri, 0));
+        assert!(!request_is_https(&h, peer().ip(), &ProxyTrust::direct()));
+        assert!(!request_is_https(&h, peer().ip(), &trust_for(1)));
     }
 
     #[test]
     fn forwarded_proto_https_is_case_insensitive() {
         let h = proto_map(Some("HTTPS"));
-        assert!(request_is_https(&h, &Uri::from_static("/"), 1));
+        assert!(request_is_https(&h, peer().ip(), &trust_for(1)));
     }
 }

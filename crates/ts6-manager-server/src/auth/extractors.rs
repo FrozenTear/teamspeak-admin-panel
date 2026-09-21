@@ -298,7 +298,7 @@ where
             .get::<ConnectInfo<SocketAddr>>()
             .map(|c| c.0);
         let ip = connect
-            .map(|addr| proxy::client_ip(&parts.headers, addr, app.trusted_proxy_hops).to_string());
+            .map(|addr| proxy::client_ip(&parts.headers, addr, &app.proxy_trust).to_string());
         let user_agent = parts
             .headers
             .get(USER_AGENT)
@@ -504,7 +504,7 @@ mod tests {
             yt_cookie: std::sync::Arc::new(std::sync::RwLock::new(None)),
             yt_api_key: std::sync::Arc::new(std::sync::RwLock::new(None)),
             data_dir: std::path::PathBuf::from("./data"),
-            trusted_proxy_hops: 0,
+            proxy_trust: crate::web::proxy::ProxyTrust::direct(),
             bug_reports: crate::bug_reports::unconfigured_sink(),
         }
     }
