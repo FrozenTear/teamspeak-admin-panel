@@ -88,6 +88,7 @@ impl YtDlpSource {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
+        crate::cpuset::install_decode_pre_exec(&mut cmd);
         let mut yt_dlp = cmd.spawn()?;
         crate::cpuset::pin_decode_child(&yt_dlp);
         tracing::info!(

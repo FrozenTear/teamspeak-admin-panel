@@ -30,6 +30,7 @@ pub use chat::{ParseError as ChatParseError, ParsedCommand, parse as parse_chat_
 pub use command::{AudioCommand, AudioSource, BotCommand, ChannelId, QueueCommand};
 pub use config::{BotConfig, BotId};
 pub use event::{BotError, BotEvent, DisconnectKind};
+pub use runtime::ensure_voice_runtime;
 pub use state::{BotState, IllegalTransition};
 pub use store::{
     InMemoryMusicBotStore, LibraryEntry, LibraryEntryId, MusicBotStore, NewLibraryEntry, NewTrack,

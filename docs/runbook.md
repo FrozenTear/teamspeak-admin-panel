@@ -298,7 +298,8 @@ fullstack stays `2-5` / `-5` (no shrink). Bot
 `TS6_BOT_CPUSET=0-1` is an in-process send-thread pin (option 1) —
 never a container-wide `0-1` cpuset (packing C; Angerfist
 163/590/117). kube `TS6_BOT_DECODE_CPUSET=2-5` parks ffmpeg/yt-dlp
-off send cores (share Axum). Sidecar stays unpinned. The music kube container has no `envFrom` secrets;
+off send cores before exec (share Axum). Host renice also targets
+`voice-rt` tids. Sidecar stays unpinned. The music kube container has no `envFrom` secrets;
 fullstack `sync_settings` pushes the yt-dlp cookie / API key after
 `/health` as long as those paths stay under the shared `ts6-data`
 volume. Never `podman kube down --force`. Do not MOVE the bot

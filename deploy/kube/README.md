@@ -57,8 +57,8 @@ stays unpinned unless the file sets `TS6_SIDECAR_*`.
 `TS6_BOT_SEND_CPUSET=0-1` is an **in-process** send-thread affinity
 (`sched_setaffinity` on `voice-rt`), not HostConfig. kube
 `TS6_BOT_DECODE_CPUSET=2-5` parks ffmpeg / yt-dlp / warm-resolver via
-`pin_decode_child` on the fullstack slice (share Axum — still off
-send `0-1`). Packing **C** (music `podman update --cpuset-cpus=0-1`)
+a pre_exec `sched_setaffinity` (leader `pin_decode_child` is only a
+backup) on the fullstack slice (share Axum — still off send `0-1`). Packing **C** (music `podman update --cpuset-cpus=0-1`)
 is **rejected** — the v1.6.15 Angerfist dig (und/C/stall
 **163/590/117**) showed container-wide 0-1 traps ffmpeg on send
 cores. The apply script refuses send-only music HostConfig.
@@ -68,7 +68,8 @@ stays a commented gated alt and needs `TS6_SOFT_PIN_SHRINK_ACK=1`.
 DECODE must be set in this kube manifest (process env);
 `soft-pin.env` cannot inject it into a running process.
 
-Nice is host `renice` (`TS6_BOT_NICE`). `TS6_BOT_CHRT_SCHED` FIFO/RR
+Nice is host `renice` of the music leader **and** every `voice-rt` tid
+(`TS6_BOT_NICE`). `TS6_BOT_CHRT_SCHED` FIFO/RR
 is opt-in, default off (no kube privileged / `CAP_SYS_NICE` default).
 In-process `setpriority` as uid 10001 is EPERM. Disable pins by
 emptying the vars, removing `soft-pin.env`, or pointing

@@ -7,8 +7,10 @@
 //!
 //! Intra-container affinity (option 1 + packing B): `TS6_BOT_SEND_CPUSET` /
 //! `TS6_BOT_CPUSET` pins `voice-rt` send threads only. ffmpeg / yt-dlp /
-//! warm-resolver are parked via `pin_decode_child` on
-//! `TS6_BOT_DECODE_CPUSET=2-5` (share Axum). Never HostConfig-only `0-1`.
+//! warm-resolver inherit `TS6_BOT_DECODE_CPUSET=2-5` via a pre_exec
+//! `sched_setaffinity` (share Axum). Never HostConfig-only `0-1`.
+//! `TS6_BOT_NICE` is applied to `voice-rt` tids by the host soft-pin
+//! script; this process starts that runtime before `/health`.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -72,6 +74,11 @@ async fn main() -> Result<()> {
     // PURA-359 — warm yt-dlp here, not on fullstack, so import cost
     // never shares the fullstack runqueue with Axum/Surreal/Scuffed.
     music_bot::warm_resolver();
+
+    // H3 — voice-rt workers must exist before /health. update.sh applies
+    // the host renice after music health, and Linux nice does not follow
+    // the thread-group leader onto later send threads.
+    music_bot::ensure_voice_runtime();
 
     let music_dir =
         std::env::var("MUSIC_DIR").unwrap_or_else(|_| "/var/lib/ts6-manager/music".into());
