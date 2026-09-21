@@ -783,8 +783,8 @@ async fn channel_edit_order_only_is_channeledit_not_channelmove() {
         .expect("captured query");
     assert_eq!(last.get("cid").map(String::as_str), Some("4"));
     assert_eq!(last.get("channel_order").map(String::as_str), Some("0"));
-    assert!(last.get("cpid").is_none(), "{last:?}");
-    assert!(last.get("order").is_none(), "{last:?}");
+    assert!(!last.contains_key("cpid"), "{last:?}");
+    assert!(!last.contains_key("order"), "{last:?}");
 }
 
 #[tokio::test]
