@@ -229,9 +229,10 @@ async fn rejects_dns_rebinder_when_any_resolved_ip_is_private() {
 
 #[tokio::test]
 async fn allows_nxdomain_per_spec_dot_three() {
-    // Spec §9.3: DNS failure (NXDOMAIN) MUST NOT block; let downstream fail
-    // naturally. PinnedTarget.resolved_ip should be None to signal "no pin
-    // possible; let the HTTP client try its own resolve".
+    // Spec §9.3: the validator does not treat DNS failure as a block.
+    // `resolved_ip: None` means there is nothing to pin. Plaintext HTTP
+    // callers must refuse that result themselves; this test only pins the
+    // validator's contract.
     let r = MockResolver::new().nxdomain("nxdomain.example");
     let target = assert_allowed("http://nxdomain.example/", &r).await;
     assert_eq!(target.resolved_ip, None);

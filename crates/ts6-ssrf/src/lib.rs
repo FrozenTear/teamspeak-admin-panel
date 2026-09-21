@@ -45,9 +45,16 @@ const METADATA_HOSTNAMES: &[&str] = &["localhost", "metadata.google.internal", "
 /// (private-range) IP between this validation and the connect.
 ///
 /// `resolved_ip` is `None` only when the host is a DNS name and resolution
-/// failed (NXDOMAIN / timeout). Per spec §9.3 the request is allowed in that
-/// case; the downstream HTTP/FFmpeg call fails naturally with a more
-/// actionable error than a synthetic "DNS failed" rejection.
+/// failed or returned an empty set (NXDOMAIN / timeout / no records). Per
+/// spec §9.3 the validator itself still returns `Ok` — a DNS miss is not
+/// an SSRF signal by itself.
+///
+/// Callers that speak plaintext HTTP MUST treat `None` as fail-closed and
+/// refuse to connect. Otherwise the HTTP client resolves the name again
+/// and that second lookup can land on a private address. HTTPS callers
+/// may proceed without a pin: TLS hostname validation binds the connection
+/// to the certificate, and a DNS miss surfaces as a connect error. The
+/// manager webhook dispatcher and the media sidecar both follow that split.
 #[derive(Debug, Clone)]
 pub struct PinnedTarget {
     pub url: url::Url,
@@ -85,7 +92,8 @@ pub enum SsrfError {
 ///    private range (see [`ranges`]).
 /// 6. If host is a DNS name, resolve it. If any resolved IP is in a blocked
 ///    range, reject — the attacker controls DNS, so a single bad answer is
-///    enough. If resolution fails, allow per spec §9.3.
+///    enough. If resolution fails, return `resolved_ip: None` per spec §9.3.
+///    Plaintext-HTTP callers must refuse that result; see [`PinnedTarget`].
 pub async fn is_url_allowed(raw: &str, resolver: &dyn Resolver) -> Result<PinnedTarget, SsrfError> {
     // 1. Parse.
     let url = url::Url::parse(raw).map_err(|_| SsrfError::InvalidUrlFormat)?;
