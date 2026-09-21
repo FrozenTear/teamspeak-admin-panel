@@ -14,6 +14,8 @@
 //! 4. On 401 / 429 / network error, the form re-enables and renders an
 //!    inline `Banner` with a spec-verbatim error string.
 
+use std::str::FromStr;
+
 use dioxus::prelude::*;
 use ts6_manager_shared::auth::{LoginRequest, UserInfo, auth_error_strings as msg};
 
@@ -215,20 +217,43 @@ fn login_error_message(err: &AuthError) -> &'static str {
 /// Decide where to send the user after successful login.
 ///
 /// `?next=` is honoured only if it parses as a same-origin **path** — i.e.
-/// starts with `/` and is not a protocol-relative URL (`//evil.example`).
-/// Anything else falls back to `/` so a malicious link can't redirect the
-/// session off-site.
+/// starts with `/` and is not a protocol-relative URL (`//evil.example`) —
+/// and [`Route::from_str`] maps it to an operator page. Login, setup, and
+/// the catch-all 404 are not return targets (login would loop; setup
+/// bounces a finished panel straight back to `/login`). Anything else
+/// falls back to the dashboard so a malicious or stale link can't leave
+/// the operator off-site or on a blank page.
 fn post_login_target(next: Option<&str>) -> Route {
-    if let Some(raw) = next
-        && is_safe_internal_path(raw)
-        && !raw.starts_with("/login")
-    {
-        // Future routes may parse arbitrary paths via the macro's
-        // `from_str`. For PURA-14 we only ship Login + Dashboard, so
-        // any safe non-login path lands on the dashboard placeholder.
-        return Route::DashboardPlaceholder {};
+    next.and_then(route_from_safe_next)
+        .unwrap_or(Route::DashboardPlaceholder {})
+}
+
+/// Parse a captured `?next=` value into a route the operator can land on.
+fn route_from_safe_next(raw: &str) -> Option<Route> {
+    if !is_safe_internal_path(raw) || raw.starts_with("/login") {
+        return None;
     }
-    Route::DashboardPlaceholder {}
+    let without_hash = raw.split('#').next().unwrap_or(raw);
+    if let Some(route) = parse_operator_route(without_hash) {
+        return Some(route);
+    }
+    // A query the router does not declare (`/clients?x=1`) still names a
+    // real page. Retry the path alone, and drop one trailing slash so
+    // `/servers/` does not fall through the catch-all.
+    let path_only = without_hash.split('?').next().unwrap_or(without_hash);
+    let trimmed = path_only.trim_end_matches('/');
+    let path_only = if trimmed.is_empty() { "/" } else { trimmed };
+    if path_only == without_hash {
+        return None;
+    }
+    parse_operator_route(path_only)
+}
+
+fn parse_operator_route(raw: &str) -> Option<Route> {
+    match Route::from_str(raw).ok()? {
+        Route::LoginPage { .. } | Route::SetupPage {} | Route::NotFoundPage { .. } => None,
+        route => Some(route),
+    }
 }
 
 /// `?next=` is acceptable iff:
@@ -309,13 +334,52 @@ mod tests {
     }
 
     #[test]
-    fn post_login_target_uses_dashboard_for_safe_next() {
-        // Only Login + Dashboard exist today; any safe path lands on
-        // Dashboard. This test pins the contract so when more routes
-        // come online the test will fail and force the implementer to
-        // wire arbitrary path resolution properly.
-        let target = post_login_target(Some("/servers"));
-        assert_eq!(target, Route::DashboardPlaceholder {});
+    fn post_login_target_restores_the_captured_operator_route() {
+        assert_eq!(
+            post_login_target(Some("/servers")),
+            Route::ServersIndexPage {}
+        );
+        assert_eq!(
+            post_login_target(Some("/music-bots/7")),
+            Route::BotDetailPage { bot_id: 7 }
+        );
+        assert_eq!(
+            post_login_target(Some(
+                "/moderation/permissions?permsid=b_client_kick_from_server"
+            )),
+            Route::PermissionsCatalogPage {
+                permsid: Some("b_client_kick_from_server".into()),
+            }
+        );
+        assert_eq!(
+            post_login_target(Some("/moderation/server-groups/9")),
+            Route::ServerGroupDetailPage { sgid: 9 }
+        );
+    }
+
+    #[test]
+    fn post_login_target_strips_undeclared_query_and_trailing_slash() {
+        assert_eq!(
+            post_login_target(Some("/clients?unused=1")),
+            Route::ClientsPage {}
+        );
+        assert_eq!(
+            post_login_target(Some("/servers/")),
+            Route::ServersIndexPage {}
+        );
+    }
+
+    #[test]
+    fn post_login_target_rejects_auth_surfaces_and_unknown_paths() {
+        assert_eq!(
+            post_login_target(Some("/setup")),
+            Route::DashboardPlaceholder {}
+        );
+        assert_eq!(
+            post_login_target(Some("/no-such-page")),
+            Route::DashboardPlaceholder {}
+        );
+        assert_eq!(post_login_target(None), Route::DashboardPlaceholder {});
     }
 
     #[test]
