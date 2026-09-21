@@ -48,6 +48,7 @@ async fn fresh_state() -> AppState {
         yt_cookie: std::sync::Arc::new(std::sync::RwLock::new(None)),
         yt_api_key: std::sync::Arc::new(std::sync::RwLock::new(None)),
         data_dir: std::path::PathBuf::from("./data"),
+        music_dir: std::path::PathBuf::from("/data/music"),
         trusted_proxy_hops: 0,
         bug_reports: crate::bug_reports::unconfigured_sink(),
     }
@@ -1310,6 +1311,132 @@ async fn audio_play_writes_request_log_row() {
     assert_eq!(requests.len(), 1);
     assert!(requests[0].track_id.is_none());
     assert_eq!(requests[0].title, "https://example.com/song.mp3");
+}
+
+#[tokio::test]
+async fn audio_play_rejects_private_url_before_dispatch() {
+    let (app, token, _state) = make_test_app().await;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/music-bots")
+                .header("authorization", auth_header(&token))
+                .header("content-type", "application/json")
+                .body(json_body(&create_bot_body()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bot: wire::MusicBotSummary = read_json(resp).await;
+
+    let body = wire::PlayRequest {
+        source: wire::AudioSource::Url {
+            url: "http://127.0.0.1/secret".into(),
+        },
+    };
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/music-bots/{}/play", bot.id.0))
+                .header("authorization", auth_header(&token))
+                .header("content-type", "application/json")
+                .body(json_body(&body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let err: wire::ErrorBody = read_json(resp).await;
+    assert_eq!(err.code.as_deref(), Some("ssrf_blocked"));
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/music-requests?bot={}", bot.id.0))
+                .header("authorization", auth_header(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let requests: Vec<wire::MusicRequest> = read_json(resp).await;
+    assert!(
+        requests.is_empty(),
+        "rejected play must not write a request-log row"
+    );
+}
+
+#[tokio::test]
+async fn audio_play_rejects_library_path_escape() {
+    let root = std::env::temp_dir().join(format!("ts6-music-play-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("ok.mp3"), b"x").unwrap();
+
+    let mut state = fresh_state().await;
+    state.music_dir = root.clone();
+    let uid = seed_user(&state, "jail-tester").await;
+    let token = mint_token(&state, uid, "jail-tester");
+    let app = app(state);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/music-bots")
+                .header("authorization", auth_header(&token))
+                .header("content-type", "application/json")
+                .body(json_body(&create_bot_body()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bot: wire::MusicBotSummary = read_json(resp).await;
+
+    let escape = wire::PlayRequest {
+        source: wire::AudioSource::LibraryPath {
+            path: "../ok.mp3".into(),
+        },
+    };
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/music-bots/{}/play", bot.id.0))
+                .header("authorization", auth_header(&token))
+                .header("content-type", "application/json")
+                .body(json_body(&escape))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let ok = wire::PlayRequest {
+        source: wire::AudioSource::LibraryPath {
+            path: "ok.mp3".into(),
+        },
+    };
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/music-bots/{}/play", bot.id.0))
+                .header("authorization", auth_header(&token))
+                .header("content-type", "application/json")
+                .body(json_body(&ok))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[tokio::test]

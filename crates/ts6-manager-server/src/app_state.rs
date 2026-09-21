@@ -98,6 +98,10 @@ pub struct AppState {
     /// PURA-223 — on-disk directory for operator-uploaded files (e.g.
     /// `yt-cookies.txt`). Defaults to `./data`; override with `DATA_DIR`.
     pub data_dir: PathBuf,
+    /// Library root for `POST /api/music-bots/{id}/play` `libraryPath`
+    /// sources (`MUSIC_DIR`). Paths are canonicalised and must stay
+    /// under this directory.
+    pub music_dir: PathBuf,
     /// PURA-235 — number of trusted reverse-proxy hops in front of the
     /// listener. Used by the [`crate::auth::extractors::RequestMeta`]
     /// extractor for the v1.1 admin audit log so the `requestIp` field
@@ -182,6 +186,7 @@ impl AppState {
             yt_cookie,
             yt_api_key,
             data_dir: cfg.data_dir.clone(),
+            music_dir: cfg.music_dir.clone(),
             trusted_proxy_hops: cfg.trusted_proxy_hops,
             bug_reports: crate::bug_reports::sink_from_config(&cfg.bug_reports),
         }
