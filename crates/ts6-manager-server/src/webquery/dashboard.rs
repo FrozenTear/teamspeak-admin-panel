@@ -216,6 +216,7 @@ mod tests {
             yt_cookie: std::sync::Arc::new(std::sync::RwLock::new(None)),
             yt_api_key: std::sync::Arc::new(std::sync::RwLock::new(None)),
             data_dir: std::path::PathBuf::from("./data"),
+            music_dir: std::path::PathBuf::from("/data/music"),
             proxy_trust: crate::web::proxy::ProxyTrust::direct(),
             bug_reports: crate::bug_reports::unconfigured_sink(),
         }

@@ -18,6 +18,40 @@ use tokio::process::{Child, ChildStdout, Command};
 use super::PcmSource;
 use crate::types::{PipelineEvent, SAMPLE_RATE_HZ};
 
+/// True for inputs ffmpeg will fetch itself over HTTP. Everything else
+/// (library paths, `file:`, `concat:`, …) is treated as local and limited
+/// to the `file` protocol.
+pub(crate) fn ffmpeg_input_is_remote_http(input: &str) -> bool {
+    let lower = input.trim_start().to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+/// Arguments that select ffmpeg's input. Local paths are limited to the
+/// `file` protocol so a library path cannot become `concat:`, `subfile:`,
+/// `data:`, or an unpinned HTTP fetch. http(s) URLs keep reconnect flags
+/// and ffmpeg's default protocol set (seek / warm-resolver path).
+fn apply_ffmpeg_input_args(cmd: &mut Command, input: &str, start_secs: Option<u64>) {
+    // PURA-352 — input-side seek. Must precede `-i` to apply to the
+    // next input. Omitted (no `-ss`) for a normal start-at-zero play.
+    if let Some(secs) = start_secs {
+        cmd.arg("-ss").arg(secs.to_string());
+    }
+    if !ffmpeg_input_is_remote_http(input) {
+        cmd.arg("-protocol_whitelist").arg("file");
+    }
+    // `-reconnect*` are http(s)-protocol options — only valid for an
+    // http input, and ffmpeg errors if they are passed for a local file.
+    if ffmpeg_input_is_remote_http(input) {
+        cmd.arg("-reconnect")
+            .arg("1")
+            .arg("-reconnect_streamed")
+            .arg("1")
+            .arg("-reconnect_delay_max")
+            .arg("2");
+    }
+    cmd.arg("-i").arg(input);
+}
+
 pub struct FfmpegSource {
     child: Option<Child>,
     stdout: BufReader<ChildStdout>,
@@ -57,27 +91,8 @@ impl FfmpegSource {
             .arg("-loglevel")
             .arg("error")
             .arg("-nostdin");
-        // PURA-352 — input-side seek. Must precede `-i` to apply to the
-        // next input. Omitted (no `-ss`) for a normal start-at-zero play.
-        if let Some(secs) = start_secs {
-            cmd.arg("-ss").arg(secs.to_string());
-        }
-        // PURA-352 — a seek re-spawns ffmpeg directly on a resolved media
-        // URL, so ffmpeg's HTTP client now serves the rest of the track.
-        // Let it ride out transient drops instead of ending playback.
-        // `-reconnect*` are http(s)-protocol options — only valid for an
-        // http input, and ffmpeg errors if they are passed for a local file.
-        if input.starts_with("http://") || input.starts_with("https://") {
-            cmd.arg("-reconnect")
-                .arg("1")
-                .arg("-reconnect_streamed")
-                .arg("1")
-                .arg("-reconnect_delay_max")
-                .arg("2");
-        }
-        cmd.arg("-i")
-            .arg(input)
-            .arg("-vn")
+        apply_ffmpeg_input_args(&mut cmd, input, start_secs);
+        cmd.arg("-vn")
             .arg("-f")
             .arg("s16le")
             .arg("-acodec")
@@ -433,5 +448,52 @@ mod tests {
             chunk: 7,
         };
         assert_eq!(drain(&mut reader, 1).await, samples);
+    }
+}
+
+#[cfg(test)]
+mod protocol_whitelist_tests {
+    use super::{apply_ffmpeg_input_args, ffmpeg_input_is_remote_http};
+    use tokio::process::Command;
+
+    fn args_for(input: &str) -> Vec<String> {
+        let mut cmd = Command::new("ffmpeg");
+        apply_ffmpeg_input_args(&mut cmd, input, None);
+        cmd.as_std()
+            .get_args()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn local_path_is_not_remote_http() {
+        assert!(!ffmpeg_input_is_remote_http("/var/lib/music/a.mp3"));
+        assert!(!ffmpeg_input_is_remote_http("concat:http://127.0.0.1/a"));
+        assert!(!ffmpeg_input_is_remote_http("file:///etc/passwd"));
+    }
+
+    #[test]
+    fn http_and_https_are_remote() {
+        assert!(ffmpeg_input_is_remote_http("http://203.0.113.10/a.mp3"));
+        assert!(ffmpeg_input_is_remote_http("HTTPS://cdn.example/a.mp3"));
+    }
+
+    #[test]
+    fn local_input_argv_whitelists_file_protocol() {
+        let args = args_for("/var/lib/music/a.mp3");
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-protocol_whitelist" && w[1] == "file"),
+            "local ffmpeg input must set -protocol_whitelist file, got {args:?}"
+        );
+    }
+
+    #[test]
+    fn remote_http_argv_does_not_force_file_whitelist() {
+        let args = args_for("https://cdn.example/a.mp3");
+        assert!(
+            !args.iter().any(|a| a == "-protocol_whitelist"),
+            "http(s) inputs keep ffmpeg's own protocol set, got {args:?}"
+        );
     }
 }
