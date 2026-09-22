@@ -9,8 +9,10 @@
 //! Routes (admin-only writes):
 //! - `POST   /api/servers/{configId}/vs/{sid}/channels` → 201 `{cid}`
 //! - `PUT    /api/servers/{configId}/vs/{sid}/channels/{cid}` → 204
+//!   (`channeledit`, including same-parent `channelOrder` reorder)
 //! - `DELETE /api/servers/{configId}/vs/{sid}/channels/{cid}?force=0|1` → 204
 //! - `POST   /api/servers/{configId}/vs/{sid}/channels/{cid}/move` → 204
+//!   (`channelmove` — parent change only; same-parent reorder 770s)
 
 use std::sync::Arc;
 
@@ -145,6 +147,29 @@ pub async fn move_channel(
     api::authorized_post_json::<_, ()>(&gate, &api::api_base(), &path, Some(body)).await
 }
 
+/// Same-parent reorder.
+///
+/// `channel_order` is the cid of the sibling to sort *after*, or `0` to
+/// place the channel first under its current parent. This is `channeledit`
+/// on the existing `PUT …/channels/{cid}` route — not
+/// [`move_channel`]. TeamSpeak answers `channelmove` with the channel's
+/// current parent as `error id=770` (`channel_already_in`, 0x0302, "already
+/// member of channel") and leaves the order unchanged. That is a channel
+/// error, not `clientmove`.
+pub async fn reorder_channel(
+    gate: Arc<RefreshGate>,
+    config_id: i64,
+    sid: i64,
+    cid: i64,
+    channel_order: i64,
+) -> Result<(), ApiError> {
+    let body = ChannelEditRequest {
+        channel_order: Some(channel_order),
+        ..Default::default()
+    };
+    edit_channel(gate, config_id, sid, cid, &body).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,5 +210,45 @@ mod tests {
         let encoded = serde_json::to_value(&body).unwrap();
         assert_eq!(encoded["cpid"], 0);
         assert!(encoded.get("order").is_none());
+    }
+
+    #[test]
+    fn reorder_body_is_channeledit_channel_order_not_channelmove() {
+        // ↑ to the top of the sibling list sends channel_order=0. That must
+        // survive serde (it is a real predecessor id, not "unset") and must
+        // not look like a channelmove body (`cpid` / `order`).
+        let body = ChannelEditRequest {
+            channel_order: Some(0),
+            ..Default::default()
+        };
+        let encoded = serde_json::to_value(&body).unwrap();
+        assert_eq!(encoded["channelOrder"], 0);
+        assert!(encoded.get("cpid").is_none());
+        assert!(encoded.get("order").is_none());
+
+        let after_sibling = ChannelEditRequest {
+            channel_order: Some(20),
+            ..Default::default()
+        };
+        let encoded = serde_json::to_value(&after_sibling).unwrap();
+        assert_eq!(encoded, serde_json::json!({ "channelOrder": 20 }));
+    }
+
+    #[test]
+    fn reorder_body_matches_the_server_channeledit_request() {
+        // The Panel helper and `PUT …/channels/{cid}` do not share a struct.
+        // This pins the wire the route actually deserializes, including
+        // `channelOrder: 0` (first among siblings), which must not be dropped
+        // as "unset".
+        let body = ChannelEditRequest {
+            channel_order: Some(0),
+            ..Default::default()
+        };
+        let encoded = serde_json::to_value(&body).unwrap();
+        let server: ts6_manager_shared::control::ChannelEditRequest =
+            serde_json::from_value(encoded).unwrap();
+        assert_eq!(server.properties.channel_order, Some(0));
+        assert!(server.channel_name.is_none());
+        assert!(!server.is_empty());
     }
 }

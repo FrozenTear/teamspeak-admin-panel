@@ -738,6 +738,55 @@ async fn channel_edit_forwards_properties() {
     );
 }
 
+/// Sibling ↑/↓ sends only `channelOrder`. That must be WebQuery
+/// `channeledit` `channel_order`, not `channelmove` (`cpid` + `order`)
+/// and not `clientmove`. Same-parent `channelmove` is TS error 770
+/// `channel_already_in` (0x0302).
+#[tokio::test]
+async fn channel_edit_order_only_is_channeledit_not_channelmove() {
+    let (port, mock) = boot_mock_webquery("API-KEY").await;
+    let state = fresh_state().await;
+    let server = seed_server(&state, port, "API-KEY").await;
+    let (_admin, atoken) = seed_user_with_token(&state, "alice", "admin").await;
+
+    let resp = app(state)
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri(format!("/api/servers/{}/vs/1/channels/4", server.id))
+                .header("authorization", auth_header(&atoken))
+                .header("content-type", "application/json")
+                .body(json_body(&json!({ "channelOrder": 0 })))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let paths = mock.captured_paths.lock().unwrap().clone();
+    assert!(
+        paths.iter().any(|p| p.ends_with("/channeledit")),
+        "expected channeledit, got {paths:?}"
+    );
+    assert!(
+        paths
+            .iter()
+            .all(|p| !p.ends_with("/channelmove") && !p.contains("clientmove")),
+        "reorder must not call channelmove or clientmove, got {paths:?}"
+    );
+    let last = mock
+        .captured_queries
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .expect("captured query");
+    assert_eq!(last.get("cid").map(String::as_str), Some("4"));
+    assert_eq!(last.get("channel_order").map(String::as_str), Some("0"));
+    assert!(!last.contains_key("cpid"), "{last:?}");
+    assert!(!last.contains_key("order"), "{last:?}");
+}
+
 #[tokio::test]
 async fn channel_edit_rejects_empty_body() {
     let (port, _mock) = boot_mock_webquery("API-KEY").await;

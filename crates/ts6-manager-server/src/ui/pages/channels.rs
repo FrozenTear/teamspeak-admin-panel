@@ -4,9 +4,10 @@
 //! - Subscribes to `server:{configId}:channels` for live edits + the
 //!   `server:{configId}:clients` topic so the per-channel client roster
 //!   updates as people connect/move.
-//! - Tree assembly: the REST layer returns a flat list ordered by upstream
-//!   `channel_order`. We group by `pid`, recursing from the synthetic root
-//!   (channels with `pid == 0`).
+//! - Tree assembly: the REST layer returns a flat list. We group by `pid`
+//!   and order each level by the TeamSpeak `channel_order` chain (the cid
+//!   this channel sorts *after*, `0` = first), then recurse from the
+//!   synthetic root (channels with `pid == 0`).
 //! - Spacers (`[l/c/r/*]spacer<n>]…`, `[*l/r/c]…`, or all-glyph names)
 //!   render as labelled rules — same heuristic the public widget renderer
 //!   (PURA-86) uses, kept module-local for now to avoid a premature
@@ -16,7 +17,7 @@
 //! delete / move. Those handlers are admin-only (`check_admin`); the UI
 //! disables the same actions for non-admins instead of hiding the chrome.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use dioxus::prelude::*;
@@ -219,22 +220,23 @@ pub fn ChannelsPage() -> Element {
             let toaster = toaster;
             let mut bump = bump;
             spawn(async move {
-                let body = ch_api::ChannelMoveRequest {
-                    cpid: node.pid,
-                    order: Some(order),
-                };
-                match ch_api::move_channel(gate, server_id, sid, cid, &body).await {
+                // Same-parent reorder is `channeledit channel_order` (PUT).
+                // `channelmove` with the current parent returns TS 770
+                // (`channel_already_in`, "already member of channel").
+                match ch_api::reorder_channel(gate, server_id, sid, cid, order).await {
                     Ok(()) => {
                         toaster.push(
                             ToastVariant::Success,
-                            format!("Moved “{}”", node.channel_name),
+                            format!("Reordered “{}”", node.channel_name),
                             None,
                         );
                         bump();
                     }
-                    Err(e) => {
-                        toaster.push(ToastVariant::Danger, "Move failed", Some(format_error(&e)))
-                    }
+                    Err(e) => toaster.push(
+                        ToastVariant::Danger,
+                        "Reorder failed",
+                        Some(format_error(&e)),
+                    ),
                 }
             });
         }
@@ -1285,7 +1287,7 @@ fn group_by_parent(rows: &[ChannelTreeNode]) -> Arc<HashMap<i64, Vec<ChannelTree
         map.entry(c.pid).or_default().push(c);
     }
     for kids in map.values_mut() {
-        kids.sort_by_key(|c| c.channel_order);
+        sort_siblings(kids);
     }
     Arc::new(map)
 }
@@ -1306,13 +1308,78 @@ fn group_clients(rows: &[ClientListItem]) -> Arc<HashMap<i64, Vec<ClientListItem
 
 fn siblings_of(rows: &[ChannelTreeNode], pid: i64) -> Vec<ChannelTreeNode> {
     let mut kids: Vec<ChannelTreeNode> = rows.iter().filter(|c| c.pid == pid).cloned().collect();
-    kids.sort_by_key(|c| c.channel_order);
+    sort_siblings(&mut kids);
     kids
 }
 
-/// `order` for `channelmove` is the upstream sort-after channel id.
-/// Moving up inserts before the previous sibling (same `order` that
-/// sibling currently uses). Moving down sorts after the next sibling.
+/// Order one parent level the way the TeamSpeak client does.
+///
+/// `channel_order` is the cid of the sibling this channel sorts *after*
+/// (`0` = first under the parent), not a numeric rank. A numeric sort
+/// matches the desktop client only while those predecessor ids happen to
+/// increase; after a real reorder they do not (move-down swaps the chain
+/// so the middle sibling's order is smaller than the one above it).
+fn sort_siblings(kids: &mut [ChannelTreeNode]) {
+    if kids.len() < 2 {
+        return;
+    }
+    let cids: HashSet<i64> = kids.iter().map(|c| c.cid).collect();
+    // Predecessor cid → index. A consistent tree has one channel per
+    // predecessor; the first row wins if the server handed us a duplicate.
+    let mut by_pred: HashMap<i64, usize> = HashMap::with_capacity(kids.len());
+    for (i, c) in kids.iter().enumerate() {
+        by_pred.entry(c.channel_order).or_insert(i);
+    }
+
+    // Heads are the real first sibling (`order == 0`) and any row whose
+    // predecessor is not in this sibling set (broken or partial chain).
+    let mut heads: Vec<usize> = kids
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.channel_order == 0 || !cids.contains(&c.channel_order))
+        .map(|(i, _)| i)
+        .collect();
+    heads.sort_by(|&a, &b| {
+        let a_top = kids[a].channel_order == 0;
+        let b_top = kids[b].channel_order == 0;
+        b_top.cmp(&a_top).then(kids[a].cid.cmp(&kids[b].cid))
+    });
+
+    let mut ordered = Vec::with_capacity(kids.len());
+    let mut seen = vec![false; kids.len()];
+    for head in heads {
+        let mut idx = head;
+        loop {
+            if seen[idx] {
+                break;
+            }
+            seen[idx] = true;
+            ordered.push(kids[idx].clone());
+            match by_pred.get(&kids[idx].cid) {
+                Some(&next) => idx = next,
+                None => break,
+            }
+        }
+    }
+    if ordered.len() != kids.len() {
+        let mut rest: Vec<usize> = (0..kids.len()).filter(|&i| !seen[i]).collect();
+        rest.sort_by(|&a, &b| kids[a].cid.cmp(&kids[b].cid));
+        for idx in rest {
+            ordered.push(kids[idx].clone());
+        }
+    }
+    if ordered.len() == kids.len() {
+        kids.clone_from_slice(&ordered);
+    }
+}
+
+/// `channel_order` for `channeledit` is the upstream sort-after channel id
+/// (`0` = first under the parent). Moving up takes the previous sibling's
+/// slot. Moving down sorts after the next sibling.
+///
+/// Callers must pass siblings already ordered by [`sort_siblings`]. Same-parent
+/// reorder goes through `PUT` `channelOrder`, not `channelmove` — TeamSpeak
+/// returns error 770 when `cpid` is already the parent.
 fn sibling_move_order(siblings: &[ChannelTreeNode], cid: i64, up: bool) -> Option<i64> {
     let idx = siblings.iter().position(|c| c.cid == cid)?;
     if up {
@@ -1524,13 +1591,29 @@ mod tests {
     }
 
     #[test]
-    fn group_by_parent_preserves_channel_order() {
-        let rows = vec![ch(2, 0, 5, "B"), ch(1, 0, 1, "A"), ch(3, 1, 1, "A.1")];
+    fn group_by_parent_follows_channel_order_chain() {
+        // Predecessor cids, not numeric ranks. Desktop order is C, A, B.
+        // Sorting by the raw `channel_order` number would yield C, B, A.
+        let rows = vec![
+            ch(20, 0, 10, "B"),
+            ch(10, 0, 30, "A"),
+            ch(30, 0, 0, "C"),
+            ch(3, 10, 0, "A.1"),
+        ];
         let groups = group_by_parent(&rows);
         let roots: Vec<i64> = groups.get(&0).unwrap().iter().map(|c| c.cid).collect();
-        assert_eq!(roots, vec![1, 2], "channel_order asc");
-        let kids: Vec<i64> = groups.get(&1).unwrap().iter().map(|c| c.cid).collect();
+        assert_eq!(roots, vec![30, 10, 20]);
+        let kids: Vec<i64> = groups.get(&10).unwrap().iter().map(|c| c.cid).collect();
         assert_eq!(kids, vec![3]);
+    }
+
+    #[test]
+    fn sort_siblings_keeps_every_row_when_the_chain_cycles() {
+        let mut kids = vec![ch(1, 0, 2, "A"), ch(2, 0, 1, "B")];
+        sort_siblings(&mut kids);
+        let mut cids: Vec<i64> = kids.iter().map(|c| c.cid).collect();
+        cids.sort();
+        assert_eq!(cids, vec![1, 2]);
     }
 
     #[test]
@@ -1594,6 +1677,22 @@ mod tests {
         assert_eq!(sibling_move_order(&siblings, 10, true), None);
         assert_eq!(sibling_move_order(&siblings, 30, false), None);
         assert_eq!(sibling_move_order(&siblings, 10, false), Some(20));
+    }
+
+    #[test]
+    fn reorder_targets_follow_the_linked_list_not_numeric_rank() {
+        // Stored as B, A, C. Chain is C (order 0) → A (after C) → B (after A).
+        let siblings = siblings_of(
+            &[ch(20, 0, 10, "B"), ch(10, 0, 30, "A"), ch(30, 0, 0, "C")],
+            0,
+        );
+        let cids: Vec<i64> = siblings.iter().map(|c| c.cid).collect();
+        assert_eq!(cids, vec![30, 10, 20]);
+        // A up takes C's slot (first). A down sorts after B. C down sorts after A.
+        assert_eq!(sibling_move_order(&siblings, 10, true), Some(0));
+        assert_eq!(sibling_move_order(&siblings, 10, false), Some(20));
+        assert_eq!(sibling_move_order(&siblings, 30, false), Some(10));
+        assert_eq!(sibling_move_order(&siblings, 30, true), None);
     }
 
     #[test]
