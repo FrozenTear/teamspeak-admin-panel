@@ -916,7 +916,9 @@ button.client-uid-copy:focus-visible {
   gap: var(--space-2);
   align-items: center;
 }
-.inline-move .input { width: 6ch; height: 28px; padding: 0 var(--space-2); font-size: var(--text-sm); }
+.inline-move .input { height: 28px; padding: 0 var(--space-2); font-size: var(--text-sm); }
+.inline-move select.input { width: auto; min-width: 12rem; max-width: 18rem; }
+.channel-client .btn { height: 22px; padding: 0 var(--space-2); font-size: var(--text-xs); }
 
 /* Channel tree — Music-bots-adjacent density (raised panel + toolbar +
    compact rows). Hierarchy is depth-indent + a left rail; spacers render

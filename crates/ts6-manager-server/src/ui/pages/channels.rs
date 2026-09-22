@@ -14,8 +14,10 @@
 //!   shared crate.
 //!
 //! Writes pair with the drafted control routes (PR #25): create / edit /
-//! delete / move. Those handlers are admin-only (`check_admin`); the UI
-//! disables the same actions for non-admins instead of hiding the chrome.
+//! delete / channel reorder. Those handlers are admin-only (`check_admin`);
+//! the UI disables the same actions for non-admins instead of hiding the
+//! chrome. "Move user" on a client row is a separate `clientmove` and is
+//! available to moderators as well.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -92,6 +94,14 @@ pub fn ChannelsPage() -> Element {
         .user()
         .map(|u| u.role.eq_ignore_ascii_case("admin"))
         .unwrap_or(false);
+    // `clientmove` is moderator-or-admin (`check_write`). Channel reorder
+    // stays admin-only and is the ↑/↓ path, not this flag.
+    let can_move_clients = session
+        .state
+        .read()
+        .user()
+        .map(|u| u.role.eq_ignore_ascii_case("admin") || u.role.eq_ignore_ascii_case("moderator"))
+        .unwrap_or(false);
 
     let server = active_server::resolve(&servers_ctx.data.read(), &*storage);
     let Some(server) = server else {
@@ -112,6 +122,7 @@ pub fn ChannelsPage() -> Element {
     let mut channels: Signal<Vec<ChannelTreeNode>> = use_signal(Vec::new);
     let mut clients: Signal<Vec<ClientListItem>> = use_signal(Vec::new);
     let mut dialog: Signal<ChannelDialog> = use_signal(|| ChannelDialog::None);
+    let mut move_user: Signal<Option<ClientListItem>> = use_signal(|| None);
     let mut reload: Signal<u64> = use_signal(|| 0u64);
 
     let mut channels_resource = use_resource({
@@ -243,6 +254,13 @@ pub fn ChannelsPage() -> Element {
     });
 
     let dialog_now = dialog.read().clone();
+    let move_user_now = move_user.read().clone();
+    let on_move_user = can_move_clients.then(|| {
+        EventHandler::new(move |client: ClientListItem| {
+            dialog.set(ChannelDialog::None);
+            move_user.set(Some(client));
+        })
+    });
 
     rsx! {
         ChannelsChrome {
@@ -272,6 +290,7 @@ pub fn ChannelsPage() -> Element {
                 on_delete: EventHandler::new(move |n: ChannelTreeNode| dialog.set(ChannelDialog::Delete(n))),
                 on_move_up: EventHandler::new(move |cid: i64| on_reorder.call((cid, true))),
                 on_move_down: EventHandler::new(move |cid: i64| on_reorder.call((cid, false))),
+                on_move_user: on_move_user,
             }
         }
 
@@ -323,6 +342,23 @@ pub fn ChannelsPage() -> Element {
                 }
             },
             ChannelDialog::None => rsx! { "" },
+        }
+
+        if let Some(client) = move_user_now {
+            super::client_move::MoveUserModal {
+                server_id: server_id,
+                sid: sid,
+                client: client,
+                channels: channels.read().clone(),
+                on_close: EventHandler::new(move |_: ()| move_user.set(None)),
+                on_moved: EventHandler::new({
+                    let mut bump = bump;
+                    move |_: ()| {
+                        move_user.set(None);
+                        bump();
+                    }
+                }),
+            }
         }
     }
 }
@@ -378,6 +414,7 @@ struct ChannelsTreeProps {
     on_delete: EventHandler<ChannelTreeNode>,
     on_move_up: EventHandler<i64>,
     on_move_down: EventHandler<i64>,
+    on_move_user: Option<EventHandler<ClientListItem>>,
 }
 
 #[component]
@@ -443,6 +480,7 @@ fn ChannelsTree(props: ChannelsTreeProps) -> Element {
                     on_delete: props.on_delete,
                     on_move_up: props.on_move_up,
                     on_move_down: props.on_move_down,
+                    on_move_user: props.on_move_user,
                 }
             }
         }
@@ -460,6 +498,7 @@ struct ChannelChildrenProps {
     on_delete: EventHandler<ChannelTreeNode>,
     on_move_up: EventHandler<i64>,
     on_move_down: EventHandler<i64>,
+    on_move_user: Option<EventHandler<ClientListItem>>,
 }
 
 #[component]
@@ -509,7 +548,12 @@ fn ChannelChildren(props: ChannelChildrenProps) -> Element {
                                 for r in row_clients.iter() {
                                     {
                                         let r = r.clone();
-                                        rsx! { ChannelClientBadge { client: r } }
+                                        rsx! {
+                                            ChannelClientBadge {
+                                                client: r,
+                                                on_move_user: props.on_move_user,
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -526,6 +570,7 @@ fn ChannelChildren(props: ChannelChildrenProps) -> Element {
                                     on_delete: props.on_delete,
                                     on_move_up: props.on_move_up,
                                     on_move_down: props.on_move_down,
+                                    on_move_user: props.on_move_user,
                                 }
                             }
                         }
@@ -729,11 +774,12 @@ fn ChannelSpacer(props: ChannelSpacerProps) -> Element {
 #[derive(Props, Clone, PartialEq)]
 struct ChannelClientBadgeProps {
     client: ClientListItem,
+    on_move_user: Option<EventHandler<ClientListItem>>,
 }
 
 #[component]
 fn ChannelClientBadge(props: ChannelClientBadgeProps) -> Element {
-    let r = props.client;
+    let r = props.client.clone();
     let away = r.client_away != 0;
     let muted = r.client_input_muted != 0 || r.client_output_muted != 0 || r.client_is_talker == 0;
     let talking = r.client_flag_talking != 0 && !muted;
@@ -747,6 +793,8 @@ fn ChannelClientBadge(props: ChannelClientBadgeProps) -> Element {
     if talking {
         class.push_str(" is-talking");
     }
+    let on_move_user = props.on_move_user;
+    let move_client = r.clone();
     rsx! {
         li { key: "client-{r.clid}",
             class: "{class}",
@@ -757,6 +805,15 @@ fn ChannelClientBadge(props: ChannelClientBadgeProps) -> Element {
             }
             if muted {
                 span { class: "client-flag", "muted" }
+            }
+            if let Some(on_move_user) = on_move_user {
+                Button {
+                    variant: ButtonVariant::Ghost,
+                    size: ButtonSize::Small,
+                    aria_label: Some(format!("Move user {}", r.client_nickname)),
+                    onclick: move |_| on_move_user.call(move_client.clone()),
+                    "Move user"
+                }
             }
         }
     }
@@ -1442,7 +1499,7 @@ enum SpacerKind {
 
 /// Recognise TS spacer channels — spec §27.2 `[<prefix>spacer<n>]<text>`,
 /// the `[*l/r/c]…` shorthand, or names made entirely of separator glyphs.
-fn is_spacer(name: &str) -> bool {
+pub(crate) fn is_spacer(name: &str) -> bool {
     spacer_kind(name).is_some()
 }
 

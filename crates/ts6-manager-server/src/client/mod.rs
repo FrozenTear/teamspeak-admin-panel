@@ -30,6 +30,7 @@ pub mod api;
 pub mod auth;
 pub mod bug_reports;
 pub mod channels;
+pub mod clients;
 pub mod debug;
 pub mod diagnostics;
 pub mod dioxus;

@@ -22,9 +22,10 @@ use std::sync::Arc;
 
 use dioxus::prelude::*;
 use serde_json::Value;
-use ts6_manager_shared::control::{ClientListItem, KickKind, KickRequest, MoveRequest};
+use ts6_manager_shared::control::{ChannelTreeNode, ClientListItem, KickKind, KickRequest};
 
 use crate::client::api::{self, ApiError};
+use crate::client::clients::{self, ClientMoveOutcome};
 use crate::client::dioxus::{use_auth_gate, use_session};
 use crate::client::session::RefreshGate;
 use crate::client::store::AuthState;
@@ -63,6 +64,14 @@ pub fn ClientsPage() -> Element {
     let server_id = server.id;
     let server_name = server.name.clone();
     let sid = active_server::DEFAULT_VIRTUAL_SERVER_ID;
+    // Move-user is `clientmove` (`check_write`: moderator or admin).
+    // Channel ↑/↓ reorder is a different control and is not on this page.
+    let can_move_clients = session
+        .state
+        .read()
+        .user()
+        .map(|u| u.role.eq_ignore_ascii_case("admin") || u.role.eq_ignore_ascii_case("moderator"))
+        .unwrap_or(false);
 
     // Initial snapshot. Re-fires whenever the operator picks a different
     // server (the `server.id` capture is part of the future).
@@ -73,10 +82,18 @@ pub fn ClientsPage() -> Element {
             async move { fetch_clients(gate, server_id, sid).await }
         }
     });
+    let channel_snapshot = use_resource({
+        let gate = gate.clone();
+        move || {
+            let gate = gate.clone();
+            async move { fetch_channels(gate, server_id, sid).await }
+        }
+    });
 
     // Local working copy: snapshot + WS reductions. We hold this in a
     // signal so action handlers can mutate it optimistically.
     let mut rows: Signal<Vec<ClientListItem>> = use_signal(Vec::<ClientListItem>::new);
+    let mut channels: Signal<Vec<ChannelTreeNode>> = use_signal(Vec::new);
     let mut last_error: Signal<Option<ApiError>> = use_signal(|| None::<ApiError>);
     let mut loading: Signal<bool> = use_signal(|| true);
     let filter: Signal<String> = use_signal(String::new);
@@ -101,6 +118,13 @@ pub fn ClientsPage() -> Element {
                 None => loading.set(true),
             }
             server_changed_marker.set(server_id);
+        });
+    }
+    {
+        use_effect(move || {
+            if let Some(Ok(list)) = &*channel_snapshot.read_unchecked() {
+                channels.set(list.clone());
+            }
         });
     }
 
@@ -197,27 +221,37 @@ pub fn ClientsPage() -> Element {
         let gate = gate.clone();
         move |clid: i64, target_cid: i64| {
             let gate = gate.clone();
+            let current_cid = rows.read().iter().find(|r| r.clid == clid).map(|r| r.cid);
+            let nick = rows
+                .read()
+                .iter()
+                .find(|r| r.clid == clid)
+                .map(|r| r.client_nickname.clone())
+                .unwrap_or_else(|| format!("client {clid}"));
+            let channel_list = channels.read().clone();
+            let channel = super::client_move::channel_label(&channel_list, target_cid);
+            if current_cid == Some(target_cid) {
+                let (variant, title, detail) = super::client_move::client_move_toast(
+                    &ClientMoveOutcome::AlreadyThere,
+                    &nick,
+                    &channel,
+                );
+                toaster.push(variant, title, detail);
+                return;
+            }
             spawn(async move {
-                let body = MoveRequest {
-                    cid: target_cid,
-                    channel_password: None,
-                };
-                let path = format!("/api/servers/{server_id}/vs/{sid}/clients/{clid}/move");
-                match api::authorized_post_json::<_, ()>(
-                    &gate,
-                    &api::api_base(),
-                    &path,
-                    Some(&body),
-                )
-                .await
+                let outcome: ClientMoveOutcome =
+                    clients::move_client(gate, server_id, sid, clid, target_cid)
+                        .await
+                        .into();
+                if matches!(outcome, ClientMoveOutcome::Moved)
+                    && let Some(row) = rows.write().iter_mut().find(|r| r.clid == clid)
                 {
-                    Ok(()) => {
-                        toaster.push(ToastVariant::Success, format!("Moved client {clid}"), None)
-                    }
-                    Err(e) => {
-                        toaster.push(ToastVariant::Danger, "Move failed", Some(format_error(&e)))
-                    }
+                    row.cid = target_cid;
                 }
+                let (variant, title, detail) =
+                    super::client_move::client_move_toast(&outcome, &nick, &channel);
+                toaster.push(variant, title, detail);
             });
         }
     };
@@ -277,6 +311,9 @@ pub fn ClientsPage() -> Element {
                         let mv = make_move.clone();
                         EventHandler::new(move |args: (i64, i64)| mv(args.0, args.1))
                     },
+                    channels: channels.read().clone(),
+                    channels_loaded: channel_snapshot.read().is_some(),
+                    can_move: can_move_clients,
                 }
             }
         }
@@ -335,6 +372,9 @@ struct ClientsTableProps {
     on_mute: EventHandler<i64>,
     on_unmute: EventHandler<i64>,
     on_move: EventHandler<(i64, i64)>,
+    channels: Vec<ChannelTreeNode>,
+    channels_loaded: bool,
+    can_move: bool,
 }
 
 #[component]
@@ -389,7 +429,13 @@ fn ClientsTable(props: ClientsTableProps) -> Element {
                                     span { class: "client-name", "{r.client_nickname}" }
                                     UniqueIdAffordance { uid: r.client_unique_identifier.clone() }
                                 }
-                                td { "{cid}" }
+                                td {
+                                    if props.channels.is_empty() {
+                                        "{cid}"
+                                    } else {
+                                        "{super::client_move::channel_label(&props.channels, cid)}"
+                                    }
+                                }
                                 td {
                                     if muted {
                                         span {
@@ -429,7 +475,15 @@ fn ClientsTable(props: ClientsTableProps) -> Element {
                                             "Mute"
                                         }
                                     }
-                                    MoveControl { clid: clid, current_cid: cid, on_move: on_move }
+                                    if props.can_move {
+                                        MoveControl {
+                                            clid: clid,
+                                            current_cid: cid,
+                                            channels: props.channels.clone(),
+                                            channels_loaded: props.channels_loaded,
+                                            on_move: on_move,
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -444,43 +498,51 @@ fn ClientsTable(props: ClientsTableProps) -> Element {
 struct MoveControlProps {
     clid: i64,
     current_cid: i64,
+    channels: Vec<ChannelTreeNode>,
+    channels_loaded: bool,
     on_move: EventHandler<(i64, i64)>,
 }
 
 #[component]
 fn MoveControl(props: MoveControlProps) -> Element {
-    // Minimal "type a channel id" affordance until the channel-tree
-    // picker lands. Keeping it inline keeps the row keyboard-reachable;
-    // a future modal/picker will replace this control without changing
-    // the on_move contract.
-    let mut input: Signal<String> = use_signal(String::new);
+    // Pick a channel by name. This posts `clientmove`. It is not the
+    // Channels ↑/↓ reorder control.
+    let targets = super::client_move::move_target_options(&props.channels, props.current_cid);
+    let mut selected: Signal<i64> = use_signal(|| 0i64);
     let clid = props.clid;
     let on_move = props.on_move;
+    if !props.channels_loaded {
+        return rsx! { span { class: "muted", "Loading channels…" } };
+    }
+    if props.channels.is_empty() {
+        return rsx! { span { class: "muted", "Channel list unavailable" } };
+    }
+    if targets.is_empty() {
+        return rsx! { span { class: "muted", "No other channel" } };
+    }
     rsx! {
         form {
             class: "inline-move",
             onsubmit: move |evt| {
                 evt.prevent_default();
-                let raw = input.read().clone();
-                if let Ok(target) = raw.trim().parse::<i64>() {
-                    on_move.call((clid, target));
+                let target = *selected.read();
+                if target == 0 {
+                    return;
                 }
-                input.set(String::new());
+                on_move.call((clid, target));
+                selected.set(0);
             },
-            label { class: "sr-only", r#for: "move-{clid}", "Move client to channel id" }
-            input {
-                id: "move-{clid}",
-                class: "input input-sm",
-                placeholder: "cid",
-                inputmode: "numeric",
-                value: "{input.read()}",
-                oninput: move |e| input.set(e.value()),
+            super::client_move::ChannelDestinationField {
+                id: "move-{clid}".to_string(),
+                targets: targets,
+                selected: *selected.read(),
+                on_change: EventHandler::new(move |cid: i64| selected.set(cid)),
             }
             Button {
                 variant: ButtonVariant::Ghost,
                 size: ButtonSize::Small,
                 kind: crate::ui::components::ButtonType::Submit,
-                "Move"
+                "Move user"
             }
         }
     }
@@ -538,6 +600,15 @@ async fn fetch_clients(
 ) -> Result<Vec<ClientListItem>, ApiError> {
     let path = format!("/api/servers/{config_id}/vs/{sid}/clients");
     api::authorized_get_json::<Vec<ClientListItem>>(&gate, &api::api_base(), &path).await
+}
+
+async fn fetch_channels(
+    gate: Arc<RefreshGate>,
+    config_id: i64,
+    sid: i64,
+) -> Result<Vec<ChannelTreeNode>, ApiError> {
+    let path = format!("/api/servers/{config_id}/vs/{sid}/channels");
+    api::authorized_get_json(&gate, &api::api_base(), &path).await
 }
 
 fn default_reason(kind: KickKind) -> String {
