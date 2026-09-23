@@ -502,6 +502,8 @@ impl ResolverHandle {
             return Ok(track);
         }
 
+        // yt_resolver.py snapshots this path before YoutubeDL. The upload
+        // is not the writable cookiefile shared by concurrent resolves.
         let req = serde_json::json!({
             "op": "resolve",
             "url": url,

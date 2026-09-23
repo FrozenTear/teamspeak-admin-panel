@@ -32,7 +32,7 @@ of shrinking fullstack. Ignore earlier A pings.
 
 | Packing | Fullstack HostConfig | SEND (in-process) | DECODE (pre_exec) | Music HostConfig | Status |
 |---------|----------------------|-------------------|-----------------------------|------------------|--------|
-| **B** | `2-5` / `-5` | `0-1` | `2-5` (share Axum) | unset / `0-5` | **apply-ready (Robert)** |
+| **B** | `2-5` / `-5` | `0-1` | `2-5` (share Axum) | **unset** | **apply-ready (Robert)** |
 | **A** | `4-5` / `-5` (`3-5` if too tight) | `0-1` | `2-3` | prefer `0-3` | gated comment + `TS6_SOFT_PIN_SHRINK_ACK=1` |
 | **C** | `2-5` | `0-1` | inside `0-1` | **`0-1`** | **REJECT** |
 
@@ -42,9 +42,12 @@ rejected: container-wide `0-1` traps ffmpeg on send cores. Hypothesis
 (non-binding): parking DECODE on `2-5` avoids send-core contention
 without a fullstack shrink.
 
-`apply-fullstack-soft-pin.sh` refuses send-only music HostConfig and
-refuses fullstack `4-5` / `3-5` unless `TS6_SOFT_PIN_SHRINK_ACK=1`
-(A is not the default; ACK stays unset).
+`apply-fullstack-soft-pin.sh` refuses **any** music container HostConfig
+cpuset under packing B (not only literal `0-1`) and always refuses
+send-only music HostConfig. It also refuses fullstack `4-5` / `3-5`
+unless `TS6_SOFT_PIN_SHRINK_ACK=1` (A is not the default; ACK stays
+unset). A wider music cpuset such as `0-3` is packing A, and only
+after that shrink ACK.
 
 **Option (1) + B decode park:** `TS6_BOT_SEND_CPUSET` /
 `TS6_BOT_CPUSET=0-1` pins `voice-rt` wire-send threads only. kube

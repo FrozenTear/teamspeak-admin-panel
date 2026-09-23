@@ -30,6 +30,10 @@ pub struct YtDlpSource {
     /// Diagnostic events queued for the next `try_drain_events` call.
     diagnostics: Vec<PipelineEvent>,
     inner: FfmpegSource,
+    /// Private cookie snapshot. yt-dlp rewrites `--cookies` on exit; this
+    /// copy is the only path it sees. Dropped after the child is signalled
+    /// so the operator upload is never that path.
+    cookie_copy: Option<crate::cookies::CookieJarCopy>,
 }
 
 impl YtDlpSource {
@@ -46,6 +50,14 @@ impl YtDlpSource {
         // datacenter IP) is the dominant unknown in `!play` → first-audio;
         // logging time-to-first-bytes turns it into a measured number.
         let spawn_t0 = std::time::Instant::now();
+
+        // Snapshot cookies before spawning ffmpeg. A missing jar should fail
+        // the play without leaving a decoder running, and yt-dlp must not
+        // receive the operator upload (it rewrites `--cookies` on exit).
+        let cookie_copy = match cookie_file {
+            Some(p) => Some(crate::cookies::CookieJarCopy::from_source(p)?),
+            None => None,
+        };
 
         // Spawn ffmpeg first, take its stdin so we can pipe yt-dlp output in.
         let (inner, mut ffmpeg_stdin) = FfmpegSource::from_stdin(channels).await?;
@@ -77,10 +89,15 @@ impl YtDlpSource {
         // PURA-223 — cookie path plumbed from PipelineConfig (resolved from
         // `app_setting:yt_cookie_path` by the caller at play-time, with
         // `YT_COOKIE_FILE` env as the boot fallback). Needed for age-gated,
-        // region-locked, and rate-limited videos.
-        if let Some(p) = cookie_file {
-            cmd.arg("--cookies").arg(p);
-            tracing::debug!(target: "yt_dlp", cookie_file = %p.display(), "passing cookies file to yt-dlp");
+        // region-locked, and rate-limited videos. The arg is the private
+        // snapshot created above, not the uploaded jar.
+        if let Some(copy) = cookie_copy.as_ref() {
+            cmd.arg("--cookies").arg(copy.path());
+            tracing::debug!(
+                target: "yt_dlp",
+                cookie_file = %copy.path().display(),
+                "passing private cookie copy to yt-dlp",
+            );
         }
 
         cmd.arg(url)
@@ -159,6 +176,7 @@ impl YtDlpSource {
             stderr_task: Some(stderr_task),
             diagnostics: Vec::new(),
             inner,
+            cookie_copy,
         })
     }
 
@@ -255,6 +273,9 @@ impl Drop for YtDlpSource {
         {
             tracing::debug!(?e, "yt-dlp child kill failed (likely already exited)");
         }
+        // Signalled above. Drop the private jar only after that so
+        // `--cookies` was never the operator upload.
+        drop(self.cookie_copy.take());
     }
 }
 

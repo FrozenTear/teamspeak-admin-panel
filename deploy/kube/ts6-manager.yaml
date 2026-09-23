@@ -199,7 +199,8 @@ spec:
         # Packing B (Robert): fullstack soft-pin stays 2-5. DECODE 2-5
         # pins decode-rt (pipeline/fetch/bridge/resolve) and
         # pin_decode_child (ffmpeg/yt-dlp) — share Axum, never send 0-1.
-        # Never set music HostConfig to 0-1 (packing C; apply script refuses).
+        # Music HostConfig stays unset under packing B. The apply script
+        # refuses any music container cpuset, not only packing C 0-1.
         - name: TS6_BOT_CPUSET
           value: "0-1"
         - name: TS6_BOT_SEND_CPUSET
