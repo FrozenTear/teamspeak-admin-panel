@@ -114,12 +114,23 @@ fn extract_token_key(path: &str) -> Option<String> {
     let rest = path.strip_prefix("/api/widget/")?;
     let mut segments = rest.split('/').filter(|s| !s.is_empty());
     let first = segments.next()?;
-    if first == "player" {
+    let key = if first == "player" {
         let bot_id = segments.next()?;
-        return Some(format!("player:{bot_id}"));
+        format!("player:{bot_id}")
+    } else {
+        first.to_string()
+    };
+    // The segment is attacker-chosen and becomes a limiter map key. No real
+    // token is this long, so every oversized probe shares one bucket.
+    if key.len() > MAX_TOKEN_KEY_LEN {
+        return Some(OVERSIZED_TOKEN_KEY.to_string());
     }
-    Some(first.to_string())
+    Some(key)
 }
+
+/// Real widget tokens are 21 chars; `player:{botId}` is shorter still.
+const MAX_TOKEN_KEY_LEN: usize = 64;
+const OVERSIZED_TOKEN_KEY: &str = "\0oversized";
 
 /// Rate-limit middleware for `/api/widget/*`. Denies with HTTP 429 when
 /// either the per-IP or the per-token bucket is exhausted.
@@ -464,6 +475,21 @@ mod tests {
         assert_eq!(extract_token_key("/api/widget/player"), None);
         assert_eq!(extract_token_key("/api/widget/player/"), None);
         assert_eq!(extract_token_key("/widget/abc"), None); // SPA path, not API
+    }
+
+    #[test]
+    fn extract_token_key_collapses_oversized_probes() {
+        let long = "a".repeat(4096);
+        let other = "b".repeat(200);
+        let a = extract_token_key(&format!("/api/widget/{long}/data"));
+        let b = extract_token_key(&format!("/api/widget/player/{other}/data"));
+        assert_eq!(a.as_deref(), Some(OVERSIZED_TOKEN_KEY));
+        assert_eq!(a, b);
+        let real = "A".repeat(21);
+        assert_eq!(
+            extract_token_key(&format!("/api/widget/{real}/data")),
+            Some(real)
+        );
     }
 
     // -------- rate limit -------------------------------------------------
