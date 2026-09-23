@@ -43,11 +43,11 @@ pub struct ControlPlaneState {
     pub registry: PipelineRegistry,
     pub resolver: Arc<dyn Resolver>,
     pub ffmpeg_path: std::path::PathBuf,
-    /// PURA-172 — IP-pin proxy for plaintext-HTTP FFmpeg fetches. The
-    /// control plane registers one token per HTTP source against this proxy
+    /// PURA-172 — IP-pin proxy for HTTP and HTTPS FFmpeg fetches. The
+    /// control plane registers one token per source against this proxy
     /// and rewrites the FFmpeg-facing URL to `http://127.0.0.1:<port>/<token>`.
-    /// On `POST /source/stop` the token is burned so a leaked proxy URL
-    /// can't replay past the pipeline's lifetime.
+    /// On `POST /source/stop` the token (and any nested HLS pins) is burned
+    /// so a leaked proxy URL can't replay past the pipeline's lifetime.
     pub pin_proxy: Arc<PinProxy>,
     /// In-process last-event bag for `GET /diagnostics`.
     pub diagnostics: Arc<crate::diagnostics::Diagnostics>,
@@ -65,9 +65,9 @@ pub struct PipelineRegistry {
 }
 
 /// One row in the [`PipelineRegistry`]. Carries the live pipeline + an
-/// optional PURA-172 proxy token. The token is `Some` for plaintext-HTTP
-/// sources that were routed through the IP-pin proxy, `None` for HTTPS
-/// (no proxy needed — TLS already pins) and synthetic lavfi sources.
+/// optional PURA-172 proxy token. The token is `Some` for HTTP and HTTPS
+/// sources routed through the IP-pin proxy. Boot-time lavfi sources never
+/// enter this registry.
 pub(crate) struct PipelineEntry {
     pub(crate) pipeline: Pipeline,
     pub(crate) pin_token: Option<String>,
@@ -207,11 +207,13 @@ impl SourceStatsSnapshot {
 pub enum ApiError {
     #[error("ssrf_blocked")]
     SsrfBlocked(#[source] SsrfError),
-    /// Plaintext HTTP whose DNS check did not yield an address to pin.
+    /// HTTP or HTTPS whose DNS check did not yield an address to pin.
     /// Spec §9.3 allows that at the shared validator; handing the URL to
-    /// FFmpeg would let it resolve again later (DNS rebinding).
+    /// FFmpeg would let it resolve again later (DNS rebinding). TLS
+    /// hostname checks do not close that window when FFmpeg's own
+    /// resolver runs, and they do not cover nested playlist URLs.
     #[error("ssrf_blocked")]
-    HttpUnpinned,
+    Unpinned,
     #[error("invalid_request: {0}")]
     InvalidRequest(String),
     #[error("source_id_already_running")]
@@ -232,7 +234,7 @@ struct ErrorBody<'a> {
 impl ApiError {
     fn status(&self) -> StatusCode {
         match self {
-            ApiError::SsrfBlocked(_) | ApiError::HttpUnpinned => StatusCode::BAD_REQUEST,
+            ApiError::SsrfBlocked(_) | ApiError::Unpinned => StatusCode::BAD_REQUEST,
             ApiError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
             ApiError::AlreadyRunning => StatusCode::CONFLICT,
             ApiError::UnknownSource => StatusCode::NOT_FOUND,
@@ -242,7 +244,7 @@ impl ApiError {
 
     fn error_code(&self) -> &'static str {
         match self {
-            ApiError::SsrfBlocked(_) | ApiError::HttpUnpinned => "ssrf_blocked",
+            ApiError::SsrfBlocked(_) | ApiError::Unpinned => "ssrf_blocked",
             ApiError::InvalidRequest(_) => "invalid_request",
             ApiError::AlreadyRunning => "source_id_already_running",
             ApiError::UnknownSource => "unknown_source_id",
@@ -253,9 +255,7 @@ impl ApiError {
     fn detail(&self) -> Option<String> {
         match self {
             ApiError::SsrfBlocked(e) => Some(e.to_string()),
-            ApiError::HttpUnpinned => {
-                Some("plaintext HTTP source has no validated address to pin".into())
-            }
+            ApiError::Unpinned => Some("source has no validated address to pin".into()),
             ApiError::InvalidRequest(d) => Some(d.clone()),
             ApiError::AlreadyRunning | ApiError::UnknownSource => None,
             ApiError::Internal(e) => Some(e.to_string()),
@@ -304,37 +304,35 @@ pub async fn post_source(
         }
     };
 
-    // Plaintext HTTP with no pin is fail-closed. Spec §9.3 lets the shared
-    // validator return `resolved_ip: None` on DNS failure; FFmpeg would
-    // resolve that name again at fetch time and can land on a blocked
-    // address. HTTPS still passes through — `-tls_verify 1` binds the
-    // peer cert to the hostname.
-    if pinned.url.scheme() == "http" && pinned.resolved_ip.is_none() {
-        state.diagnostics.record_http_unpinned(&pinned.host);
-        return Err(ApiError::HttpUnpinned);
-    }
-
-    // PURA-149 → PURA-172: closing the rebinding window for plaintext HTTP.
+    // PURA-149 → PURA-172: closing the rebinding window for HTTP and HTTPS.
     //
     // PURA-149 reverted "rewrite URL host to IP literal" because FFmpeg's
     // own DNS at fetch time can diverge from the IP `ts6-ssrf` validated
     // (the DNS rebinding window R6 names), AND because IP-literal SNI /
     // `Host:` breaks every virtual-hosted CDN.
     //
-    // For HTTPS we leave the URL alone: TLS hostname validation already
-    // binds the connection to the cert SAN, which is a stronger guarantee
-    // than IP-pinning.
+    // Both schemes go through the sidecar-internal IP-pin proxy
+    // (`crate::http_pin::PinProxy`). The proxy's reqwest client uses
+    // `resolve_to_addrs` to force the upstream socket to
+    // `pinned.resolved_ip` while preserving the original `Host:` and, for
+    // HTTPS, the original SNI. Certificate verification happens in the
+    // proxy. FFmpeg receives `http://127.0.0.1:<port>/<token>` and never
+    // resolves the source name or follows a redirect. Nested HLS URLs are
+    // re-checked inside the proxy. The token is single-use across the
+    // pipeline lifetime — `POST /source/stop` burns it and its children.
     //
-    // For plaintext HTTP we route FFmpeg through the sidecar-internal
-    // IP-pin proxy (`crate::http_pin::PinProxy`): the proxy's reqwest
-    // client uses `resolve_to_addrs` to force the upstream socket to
-    // `pinned.resolved_ip` while preserving the original `Host:` header.
-    // FFmpeg receives `http://127.0.0.1:<port>/<token>` and never speaks
-    // to the outside resolver again. The token is single-use across the
-    // pipeline lifetime — `POST /source/stop` burns it.
+    // Spec §9.3 lets the shared validator return `resolved_ip: None` on
+    // DNS failure. That is fail-closed here for both schemes: there is
+    // no address to pin, and handing the URL to FFmpeg would let it
+    // resolve again.
     let (ffmpeg_url, pin_token) = match pin_token_for(&pinned, &state.pin_proxy).await {
-        Some((url, tok)) => (url, Some(tok)),
-        None => (pinned.url.to_string(), None),
+        PinRoute::Proxy { url, token } => (url, Some(token)),
+        PinRoute::RejectUnpinned => {
+            state
+                .diagnostics
+                .record_unpinned(pinned.url.scheme(), &pinned.host);
+            return Err(ApiError::Unpinned);
+        }
     };
 
     let mut guard = state.registry.inner.write().await;
@@ -444,26 +442,30 @@ pub async fn post_source_stop(
     }
 }
 
-/// Decide whether `pinned` should be routed through the IP-pin proxy and
-/// return the FFmpeg-facing URL + the proxy token, or `None` if the
-/// caller should use `pinned.url` directly.
+enum PinRoute {
+    Proxy {
+        url: String,
+        token: String,
+    },
+    /// No SSRF-validated address. The caller must refuse the source.
+    /// Falling through to the original URL would let FFmpeg resolve it.
+    RejectUnpinned,
+}
+
+/// Route `pinned` through the IP-pin proxy and return the FFmpeg-facing
+/// loopback URL plus the proxy token.
 ///
-/// HTTPS sources are passed through unchanged — TLS hostname validation
-/// already binds the connection to the cert SAN, which is a stronger
-/// guarantee than IP-pinning. Plaintext HTTP sources with a `resolved_ip`
-/// from `ts6-ssrf` are proxied.
-///
-/// Callers must refuse HTTP sources whose `resolved_ip` is `None`
-/// before calling this. There is no address to pin, and falling back
-/// to the original URL re-opens DNS rebinding inside FFmpeg.
-async fn pin_token_for(
-    pinned: &ts6_ssrf::PinnedTarget,
-    proxy: &PinProxy,
-) -> Option<(String, String)> {
-    if pinned.url.scheme() != "http" {
-        return None;
+/// HTTP and HTTPS both pin. HTTPS TLS is terminated in the proxy so
+/// virtual-hosted CDNs keep their hostname (SNI / `Host:`) while the
+/// socket stays on `resolved_ip`. A missing `resolved_ip` is rejected
+/// for both schemes.
+async fn pin_token_for(pinned: &ts6_ssrf::PinnedTarget, proxy: &PinProxy) -> PinRoute {
+    if pinned.url.scheme() != "http" && pinned.url.scheme() != "https" {
+        return PinRoute::RejectUnpinned;
     }
-    let resolved_ip = pinned.resolved_ip?;
+    let Some(resolved_ip) = pinned.resolved_ip else {
+        return PinRoute::RejectUnpinned;
+    };
     let target = PinProxyTarget {
         upstream_url: pinned.url.clone(),
         host: pinned.host.clone(),
@@ -472,7 +474,7 @@ async fn pin_token_for(
     };
     let token = proxy.registry.register(target).await;
     let url = proxy.proxy_url(&token);
-    Some((url, token))
+    PinRoute::Proxy { url, token }
 }
 
 pub async fn get_track(
@@ -517,6 +519,7 @@ mod tests {
     use super::*;
     use std::net::IpAddr;
     use std::str::FromStr;
+    use std::sync::Arc;
     use ts6_ssrf::MockResolver;
 
     fn ip(s: &str) -> IpAddr {
@@ -564,13 +567,13 @@ mod tests {
         assert_eq!(pinned.resolved_ip, Some(ip("93.184.216.34")));
     }
 
-    // PURA-149: URL host must round-trip to FFmpeg unchanged. The
-    // previous implementation rewrote the host to the resolved IP,
-    // which broke TLS SNI / HTTP Host header for virtual-hosted CDNs
-    // (Cloudflare, googleapis, samplelib, …) and caused FFmpeg to
-    // immediately exit with "IVF stream EOF before header".
+    // PURA-149: the upstream URL keeps its hostname so the pin proxy can
+    // send the right SNI / Host. The previous implementation rewrote the
+    // host to the resolved IP, which broke virtual-hosted CDNs
+    // (Cloudflare, googleapis, samplelib, …). FFmpeg itself only sees
+    // the loopback proxy URL.
     #[tokio::test]
-    async fn pinned_url_preserves_https_hostname_for_cdn_sources() {
+    async fn https_with_resolved_ip_is_pinned_not_handed_to_ffmpeg() {
         let resolver =
             MockResolver::new().with("download.samplelib.com", vec![ip("188.227.84.172")]);
         let pinned = is_url_allowed(
@@ -579,17 +582,78 @@ mod tests {
         )
         .await
         .expect("public CDN host must pass SSRF");
+        let proxy = PinProxy::start(Arc::new(MockResolver::new()))
+            .await
+            .expect("proxy start");
 
-        let url_for_ffmpeg = pinned.url.to_string();
+        let PinRoute::Proxy { url, token } = pin_token_for(&pinned, &proxy).await else {
+            panic!("https with a validated address must be pinned");
+        };
         assert!(
-            url_for_ffmpeg.contains("download.samplelib.com"),
-            "https URL passed to ffmpeg lost its hostname: {url_for_ffmpeg}"
+            url.starts_with("http://127.0.0.1:"),
+            "ffmpeg must fetch the loopback proxy, got {url}"
         );
         assert!(
-            !url_for_ffmpeg.contains("188.227.84.172"),
-            "https URL passed to ffmpeg was rewritten to IP literal — \
-             breaks TLS SNI / Host on virtual-hosted CDNs: {url_for_ffmpeg}"
+            !url.contains("download.samplelib.com"),
+            "ffmpeg URL must not carry the upstream host: {url}"
         );
+        assert!(
+            !url.contains("188.227.84.172"),
+            "ffmpeg URL must not be rewritten to an IP literal: {url}"
+        );
+        let stored = proxy
+            .registry
+            .lookup(&token)
+            .await
+            .expect("registered https pin");
+        assert_eq!(stored.upstream_url.scheme(), "https");
+        assert_eq!(stored.host, "download.samplelib.com");
+        assert_eq!(stored.resolved_ip, ip("188.227.84.172"));
+        assert!(
+            !stored.upstream_url.as_str().contains("188.227.84.172"),
+            "upstream URL lost its hostname: {}",
+            stored.upstream_url
+        );
+        proxy.shutdown();
+    }
+
+    #[tokio::test]
+    async fn https_without_resolved_ip_is_refused() {
+        let resolver = MockResolver::new().nxdomain("missing.test");
+        let pinned = is_url_allowed("https://missing.test/clip.mp4", &resolver)
+            .await
+            .expect("DNS miss is not an SSRF error at the shared validator");
+        assert!(pinned.resolved_ip.is_none());
+        let proxy = PinProxy::start(Arc::new(MockResolver::new()))
+            .await
+            .expect("proxy start");
+        assert!(matches!(
+            pin_token_for(&pinned, &proxy).await,
+            PinRoute::RejectUnpinned
+        ));
+        assert_eq!(proxy.registry.len().await, 0);
+        proxy.shutdown();
+    }
+
+    #[tokio::test]
+    async fn plaintext_http_with_resolved_ip_is_still_pinned() {
+        let resolver = MockResolver::new().with("example.com", vec![ip("93.184.216.34")]);
+        let pinned = is_url_allowed("http://example.com/sample.mp4", &resolver)
+            .await
+            .expect("public host must be allowed");
+        let proxy = PinProxy::start(Arc::new(MockResolver::new()))
+            .await
+            .expect("proxy start");
+        let PinRoute::Proxy { url, token } = pin_token_for(&pinned, &proxy).await else {
+            panic!("plaintext HTTP with a validated address must stay pinned");
+        };
+        assert!(url.starts_with("http://127.0.0.1:"), "{url}");
+        assert!(!url.contains("example.com"), "{url}");
+        let stored = proxy.registry.lookup(&token).await.expect("http pin");
+        assert_eq!(stored.upstream_url.scheme(), "http");
+        assert_eq!(stored.host, "example.com");
+        assert_eq!(stored.resolved_ip, ip("93.184.216.34"));
+        proxy.shutdown();
     }
 
     #[tokio::test]

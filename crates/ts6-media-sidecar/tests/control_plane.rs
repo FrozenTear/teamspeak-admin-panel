@@ -521,11 +521,10 @@ fn ffmpeg_argv_reflects_preset() {
     }
 }
 
-/// PURA-172 — assert the control plane registers an IP-pin token for
-/// plaintext-HTTP sources, leaves HTTPS sources untouched (TLS already pins
-/// to the cert SAN), and burns the token on `POST /source/stop`.
+/// PURA-172 — plaintext HTTP and HTTPS both register an IP-pin token.
+/// `POST /source/stop` burns that token (and would burn nested HLS pins).
 #[tokio::test]
-async fn http_source_routes_through_pin_proxy_and_burns_on_stop() {
+async fn http_and_https_sources_route_through_pin_proxy_and_burn_on_stop() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("warn,ts6_media_sidecar=debug")
         .with_test_writer()
@@ -560,8 +559,12 @@ async fn http_source_routes_through_pin_proxy_and_burns_on_stop() {
         1,
         "HTTP source must register one PinProxy token (PURA-172)",
     );
+    assert_eq!(
+        sidecar.pin_proxy.registry.upstream_schemes().await,
+        vec!["http".to_string()],
+    );
 
-    // --- HTTPS — must NOT register a token (TLS already pins). -------------
+    // --- HTTPS — same pin path, not a pass-through to FFmpeg. --------------
     let resp = client
         .post(format!("{base}/source"))
         .json(&serde_json::json!({"url": "https://secure.test/clip.mp4"}))
@@ -574,12 +577,14 @@ async fn http_source_routes_through_pin_proxy_and_burns_on_stop() {
 
     assert_eq!(
         sidecar.pin_proxy.registry.len().await,
-        1,
-        "HTTPS source must NOT register a PinProxy token \
-         (TLS hostname validation already pins to cert SAN — PURA-172 scope)",
+        2,
+        "HTTPS source must register a PinProxy token",
     );
+    let mut schemes = sidecar.pin_proxy.registry.upstream_schemes().await;
+    schemes.sort();
+    assert_eq!(schemes, vec!["http".to_string(), "https".to_string()]);
 
-    // --- Stop the HTTP source — token must be burned. ----------------------
+    // --- Stop the HTTP source — its token must be burned; HTTPS stays. ----
     let resp = client
         .post(format!("{base}/source/stop"))
         .json(&serde_json::json!({"source_id": http_source_id}))
@@ -589,11 +594,15 @@ async fn http_source_routes_through_pin_proxy_and_burns_on_stop() {
     assert_eq!(resp.status(), 204);
     assert_eq!(
         sidecar.pin_proxy.registry.len().await,
-        0,
-        "POST /source/stop must burn the proxy token (PURA-172 single-use AC)",
+        1,
+        "POST /source/stop must burn the plaintext proxy token",
+    );
+    assert_eq!(
+        sidecar.pin_proxy.registry.upstream_schemes().await,
+        vec!["https".to_string()],
     );
 
-    // --- Stop HTTPS — already 0, must stay 0. ------------------------------
+    // --- Stop HTTPS — its pin burns too. ----------------------------------
     let resp = client
         .post(format!("{base}/source/stop"))
         .json(&serde_json::json!({"source_id": https_source_id}))
@@ -601,13 +610,18 @@ async fn http_source_routes_through_pin_proxy_and_burns_on_stop() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 204);
+    assert_eq!(
+        sidecar.pin_proxy.registry.len().await,
+        0,
+        "POST /source/stop must burn the HTTPS proxy token",
+    );
 
     sidecar.shutdown();
 }
 
 /// Spec §9.3 lets the shared validator return `resolved_ip: None` when
-/// DNS fails. Plaintext HTTP must still be refused: FFmpeg would resolve
-/// the name again. HTTPS stays on the TLS-verify path.
+/// DNS fails. HTTP and HTTPS must both be refused: FFmpeg would resolve
+/// the name again.
 #[tokio::test]
 async fn http_source_without_pinned_ip_is_refused() {
     let _ = tracing_subscriber::fmt()
@@ -658,15 +672,43 @@ async fn http_source_without_pinned_ip_is_refused() {
     assert!(!ssrf.contains("alice"), "{ssrf}");
     assert!(!ssrf.contains("s3cret"), "{ssrf}");
 
-    // HTTPS with the same DNS miss still starts: cert verification, not an IP pin.
     let resp = client
         .post(format!("{base}/source"))
-        .json(&serde_json::json!({"url": "https://missing.test/clip.mp4"}))
+        .json(&serde_json::json!({
+            "url": "https://bob:s3cret@missing.test/clip.mp4",
+        }))
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 201, "HTTPS DNS miss stays on the TLS path");
+    assert_eq!(resp.status(), 400, "unpinned HTTPS must not reach FFmpeg");
+    let err: Value = resp.json().await.unwrap();
+    assert_eq!(err["error"], "ssrf_blocked");
+    let detail = err["detail"].as_str().unwrap_or("");
+    assert!(
+        detail.contains("no validated address"),
+        "detail should explain the missing pin: {detail}"
+    );
+    assert!(!detail.contains("bob"), "{detail}");
+    assert!(!detail.contains("s3cret"), "{detail}");
     assert_eq!(sidecar.pin_proxy.registry.len().await, 0);
+    assert_eq!(
+        sidecar.origin.len().await,
+        0,
+        "no broadcast on HTTPS refuse"
+    );
+
+    let diag: Value = client
+        .get(format!("{base}/diagnostics"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ssrf = diag["sidecarSsrfReject"].as_str().unwrap_or("");
+    assert!(ssrf.contains("https_unpinned"), "{ssrf}");
+    assert!(!ssrf.contains("bob"), "{ssrf}");
+    assert!(!ssrf.contains("s3cret"), "{ssrf}");
 
     sidecar.shutdown();
 }
