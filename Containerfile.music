@@ -100,4 +100,6 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD ["/usr/local/bin/ts6-manager-music", "--healthcheck-url", "http://127.0.0.1:3002/health"]
 
 ENTRYPOINT ["/usr/local/bin/ts6-manager-music"]
-CMD ["--listen", "0.0.0.0:3002"]
+# Loopback only. hostNetwork publishes this bind on the host, and the
+# HTTP API is unauthenticated. Fullstack uses MUSIC_RUNTIME_URL.
+CMD ["--listen", "127.0.0.1:3002"]

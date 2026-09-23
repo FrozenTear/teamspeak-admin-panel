@@ -208,7 +208,7 @@ documented production layout.
 | Container port | Host port | Notes |
 |----------------|-----------|-------|
 | 3001 | 3001 | HTTP, served by the Dioxus fullstack server |
-| 3002 | 3002 | Music unit loopback control (`MUSIC_RUNTIME_URL`) |
+| 3002 | loopback only | Music unit control (`--listen 127.0.0.1:3002`, `MUSIC_RUNTIME_URL`). Not a public listener; do not put it on Caddy. |
 | 7080 | loopback only | MoQ sidecar HTTP control (`--http-listen 127.0.0.1:7080`). Not a public listener; do not put it on Caddy. |
 | 4443 | 4443 (UDP) | MoQ sidecar WebTransport |
 
