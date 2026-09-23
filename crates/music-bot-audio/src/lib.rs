@@ -21,6 +21,7 @@ pub mod gate;
 pub mod icy;
 pub mod pacer;
 pub mod pipeline;
+mod playback_guard;
 pub mod resolve;
 pub mod resolver;
 pub mod runtime;

@@ -34,6 +34,11 @@ audiopus = "0.3.0-rc.0"
 # does not need streaming bytes from a high-level client because we do the
 # byte-arithmetic ourselves; reqwest::get + bytes_stream is the right shape.
 reqwest = { workspace = true, features = ["stream"] }
+# Playback SSRF. `gate.rs` and `playback_guard` share this validator
+# with the manager play route. `hickory` is the process resolver;
+# tests pass `MockResolver`.
+ts6-ssrf = { workspace = true, features = ["hickory"] }
+url = { workspace = true }
 
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process", "io-util", "time", "sync", "fs", "signal", "net"] }
 async-trait = { workspace = true }
@@ -51,9 +56,6 @@ serde_json = { workspace = true }
 # send threads and, when TS6_BOT_DECODE_CPUSET is set, decode-rt plus
 # ffmpeg/yt-dlp. Music HostConfig stays unset — never cpuset 0-1.
 libc = "0.2"
-# Playback SSRF gate. Same validator the manager play route uses.
-# `hickory` is the process resolver; tests pass `MockResolver`.
-ts6-ssrf = { workspace = true, features = ["hickory"] }
 
 [dev-dependencies]
 hound = "3.5"

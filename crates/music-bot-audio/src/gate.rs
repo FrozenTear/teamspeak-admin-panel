@@ -19,13 +19,15 @@
 //!   path outside the library).
 //!
 //! Redirect following, HLS segment re-checks, and ffmpeg `tls_verify`
-//! are out of scope here. The gate runs on the URL or path that is
-//! about to be opened.
+//! live in [`crate::playback_guard`]. Those paths call
+//! [`pin_remote_url`], so the host policy has one implementation.
+//! The spawn gate still runs on the URL or path that is about to be
+//! opened.
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-use ts6_ssrf::{Resolver, SsrfError, is_url_allowed};
+use ts6_ssrf::{PinnedTarget, Resolver, SsrfError, is_url_allowed};
 
 use crate::source::ffmpeg::ffmpeg_input_is_remote_http;
 use crate::source::{AudioSourceSpec, normalize_radio_url};
@@ -81,13 +83,25 @@ pub async fn allow_playback_url(raw: &str, resolver: &dyn Resolver) -> Result<St
 }
 
 async fn allow_remote_url(raw: &str, resolver: &dyn Resolver) -> Result<(), GateError> {
+    pin_remote_url(raw, resolver).await.map(|_| ())
+}
+
+/// Host policy shared with playback redirect and HLS checks.
+///
+/// Returns the pinned target so a later fetch can connect to the
+/// address this check accepted. [`allow_remote_url`] drops the pin
+/// when only allow/deny is needed.
+pub(crate) async fn pin_remote_url(
+    raw: &str,
+    resolver: &dyn Resolver,
+) -> Result<PinnedTarget, GateError> {
     let target = is_url_allowed(raw, resolver)
         .await
         .map_err(GateError::Ssrf)?;
     if target.url.scheme() == "http" && target.resolved_ip.is_none() {
         return Err(GateError::UnpinnedHttp);
     }
-    Ok(())
+    Ok(target)
 }
 
 /// Canonicalise `raw` and require a regular file inside `music_dir`.

@@ -26,30 +26,105 @@ pub(crate) fn ffmpeg_input_is_remote_http(input: &str) -> bool {
     lower.starts_with("http://") || lower.starts_with("https://")
 }
 
+/// Protocols a remote input may open.
+///
+/// `file`, `concat`, `subfile`, `data`, `unix`, `rtp`, and `udp` are
+/// excluded so an HLS playlist cannot open a local path or a datagram
+/// sink. `httpproxy` is required: ffmpeg 6.1 tunnels HTTPS through
+/// `-http_proxy` with the `httpproxy` CONNECT protocol, including HLS
+/// segment fetches (`libavformat/tls.c`).
+const REMOTE_PROTOCOL_WHITELIST: &str = "http,https,tls,tcp,crypto,httpproxy";
+
+/// `TS6_MUSIC_TLS_VERIFY` opts out of certificate checks. There is no
+/// Contabo exception; unset (and any value other than `0` / `false` /
+/// `off` / `no`) verifies. ffmpeg's own default is `tls_verify=0`.
+fn tls_verify_enabled_value(raw: Option<&str>) -> bool {
+    match raw.map(str::trim).filter(|v| !v.is_empty()) {
+        None => true,
+        Some(v) => !matches!(
+            v.to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+    }
+}
+
+fn tls_verify_enabled() -> bool {
+    match std::env::var("TS6_MUSIC_TLS_VERIFY") {
+        Ok(value) => tls_verify_enabled_value(Some(&value)),
+        Err(_) => true,
+    }
+}
+
+fn tls_ca_file() -> Option<String> {
+    std::env::var("TS6_TLS_CA_FILE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 /// Arguments that select ffmpeg's input. Local paths are limited to the
 /// `file` protocol so a library path cannot become `concat:`, `subfile:`,
-/// `data:`, or an unpinned HTTP fetch. http(s) URLs keep reconnect flags
-/// and ffmpeg's default protocol set (seek / warm-resolver path).
-fn apply_ffmpeg_input_args(cmd: &mut Command, input: &str, start_secs: Option<u64>) {
+/// `data:`, or an unpinned HTTP fetch. Remote http(s) inputs verify TLS
+/// when the source is `https`, restrict the protocol set, and send every
+/// fetch — including HLS segment URLs — through `http_proxy`.
+fn apply_ffmpeg_input_args(
+    cmd: &mut Command,
+    input: &str,
+    start_secs: Option<u64>,
+    tls_verify: bool,
+    ca_file: Option<&str>,
+    http_proxy: Option<&str>,
+) {
+    let remote = ffmpeg_input_is_remote_http(input);
+    let https = input
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("https://");
+    // `-tls_verify` is a TLS protocol option and must precede `-i`.
+    // ffmpeg 6.1 defaults it to 0, which is the H5 hole: a rebind or a
+    // nested HTTPS segment completes the handshake without checking the
+    // certificate. `ca_file` matches the sidecar (`TS6_TLS_CA_FILE`).
+    if remote && https && tls_verify {
+        cmd.arg("-tls_verify").arg("1");
+        if let Some(ca_file) = ca_file.filter(|value| !value.is_empty()) {
+            cmd.arg("-ca_file").arg(ca_file);
+        }
+    }
     // PURA-352 — input-side seek. Must precede `-i` to apply to the
     // next input. Omitted (no `-ss`) for a normal start-at-zero play.
     if let Some(secs) = start_secs {
         cmd.arg("-ss").arg(secs.to_string());
     }
-    if !ffmpeg_input_is_remote_http(input) {
-        cmd.arg("-protocol_whitelist").arg("file");
-    }
-    // `-reconnect*` are http(s)-protocol options — only valid for an
-    // http input, and ffmpeg errors if they are passed for a local file.
-    if ffmpeg_input_is_remote_http(input) {
+    if remote {
+        cmd.arg("-protocol_whitelist")
+            .arg(REMOTE_PROTOCOL_WHITELIST);
+        if let Some(proxy) = http_proxy {
+            cmd.arg("-http_proxy").arg(proxy);
+        }
+        // `-reconnect*` are http(s)-protocol options — only valid for an
+        // http input, and ffmpeg errors if they are passed for a local file.
         cmd.arg("-reconnect")
             .arg("1")
             .arg("-reconnect_streamed")
             .arg("1")
             .arg("-reconnect_delay_max")
             .arg("2");
+    } else {
+        cmd.arg("-protocol_whitelist").arg("file");
     }
     cmd.arg("-i").arg(input);
+}
+
+/// Force the child through the guard proxy. ffmpeg 6.1 reads lowercase
+/// `http_proxy` for both plaintext HTTP and the TLS CONNECT path, and
+/// copies that option onto HLS segment opens. An inherited `no_proxy`
+/// (or `NO_PROXY=*`) would skip the guard for matching segment hosts.
+fn install_playback_proxy_env(cmd: &mut Command, proxy: &str) {
+    for key in ["http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY"] {
+        cmd.env(key, proxy);
+    }
+    cmd.env("no_proxy", "");
+    cmd.env("NO_PROXY", "");
 }
 
 pub struct FfmpegSource {
@@ -63,6 +138,10 @@ pub struct FfmpegSource {
     spawned_at: std::time::Instant,
     /// PURA-330 — set once the first non-empty PCM read has been logged.
     first_pcm_logged: bool,
+    /// H5 — loopback guard for remote http(s) inputs. Held so `Drop`
+    /// aborts the accept loop with the ffmpeg child. Not read otherwise.
+    #[allow(dead_code)]
+    proxy: Option<crate::playback_guard::PlaybackProxy>,
     /// THE-983 (AR-2) — bytes left over from the previous read that did not
     /// fill a whole channel stride (2 bytes × channels). Holds 0..stride−1
     /// bytes; prepended to the next read so a short write landing on an odd
@@ -85,13 +164,38 @@ impl FfmpegSource {
         channels: u8,
         start_secs: Option<u64>,
     ) -> io::Result<Self> {
+        let remote = ffmpeg_input_is_remote_http(input);
+        if remote {
+            // Fail before spawn. The proxy checks again on every hop and
+            // every HLS segment; this is the fast path for a URL that is
+            // already blocked.
+            crate::playback_guard::authorize_playback_url(input)
+                .await
+                .map_err(|err| io::Error::other(format!("playback URL blocked: {err}")))?;
+        }
+        let proxy = if remote {
+            Some(crate::playback_guard::PlaybackProxy::start().await?)
+        } else {
+            None
+        };
+        let proxy_url = proxy.as_ref().map(|proxy| proxy.base_url());
         let mut cmd = Command::new("ffmpeg");
         cmd.kill_on_drop(true)
             .arg("-hide_banner")
             .arg("-loglevel")
             .arg("error")
             .arg("-nostdin");
-        apply_ffmpeg_input_args(&mut cmd, input, start_secs);
+        apply_ffmpeg_input_args(
+            &mut cmd,
+            input,
+            start_secs,
+            tls_verify_enabled(),
+            tls_ca_file().as_deref(),
+            proxy_url.as_deref(),
+        );
+        if let Some(proxy_url) = proxy_url.as_deref() {
+            install_playback_proxy_env(&mut cmd, proxy_url);
+        }
         cmd.arg("-vn")
             .arg("-f")
             .arg("s16le")
@@ -131,6 +235,7 @@ impl FfmpegSource {
             spawned_at: std::time::Instant::now(),
             first_pcm_logged: false,
             carry: Vec::new(),
+            proxy,
         })
     }
 
@@ -237,6 +342,7 @@ impl FfmpegSource {
                 spawned_at: std::time::Instant::now(),
                 first_pcm_logged: false,
                 carry: Vec::new(),
+                proxy: None,
             },
             stdin,
         ))
@@ -453,12 +559,25 @@ mod tests {
 
 #[cfg(test)]
 mod protocol_whitelist_tests {
-    use super::{apply_ffmpeg_input_args, ffmpeg_input_is_remote_http};
+    use super::{
+        FfmpegSource, REMOTE_PROTOCOL_WHITELIST, apply_ffmpeg_input_args,
+        ffmpeg_input_is_remote_http, install_playback_proxy_env, tls_verify_enabled,
+        tls_verify_enabled_value,
+    };
     use tokio::process::Command;
 
     fn args_for(input: &str) -> Vec<String> {
+        args_for_remote(input, true, None, None)
+    }
+
+    fn args_for_remote(
+        input: &str,
+        tls_verify: bool,
+        ca_file: Option<&str>,
+        proxy: Option<&str>,
+    ) -> Vec<String> {
         let mut cmd = Command::new("ffmpeg");
-        apply_ffmpeg_input_args(&mut cmd, input, None);
+        apply_ffmpeg_input_args(&mut cmd, input, None, tls_verify, ca_file, proxy);
         cmd.as_std()
             .get_args()
             .map(|s| s.to_string_lossy().into_owned())
@@ -489,11 +608,161 @@ mod protocol_whitelist_tests {
     }
 
     #[test]
-    fn remote_http_argv_does_not_force_file_whitelist() {
-        let args = args_for("https://cdn.example/a.mp3");
+    fn tls_verify_defaults_on_unless_explicitly_disabled() {
+        assert!(tls_verify_enabled_value(None));
+        assert!(tls_verify_enabled_value(Some("")));
+        assert!(tls_verify_enabled_value(Some("1")));
+        assert!(tls_verify_enabled_value(Some("yes")));
+        assert!(!tls_verify_enabled_value(Some("0")));
+        assert!(!tls_verify_enabled_value(Some("false")));
+        assert!(!tls_verify_enabled_value(Some("off")));
+        assert!(!tls_verify_enabled_value(Some("no")));
+        assert!(!tls_verify_enabled_value(Some(" NO ")));
+        // The process env is not required. When it is unset, the helper
+        // from_input calls agrees with the default.
+        if std::env::var_os("TS6_MUSIC_TLS_VERIFY").is_none() {
+            assert!(tls_verify_enabled());
+        }
+    }
+
+    #[test]
+    fn https_input_forces_tls_verify_before_the_url() {
+        let proxy = "http://127.0.0.1:9";
+        let args = args_for_remote("https://cdn.example/a.mp3", true, None, Some(proxy));
+        assert_eq!(
+            value_after(&args, "-tls_verify"),
+            Some("1"),
+            "https input must set -tls_verify 1, argv = {args:?}"
+        );
+        let verify_idx = args.iter().position(|a| a == "-tls_verify").unwrap();
+        let input_idx = args.iter().position(|a| a == "-i").unwrap();
         assert!(
-            !args.iter().any(|a| a == "-protocol_whitelist"),
-            "http(s) inputs keep ffmpeg's own protocol set, got {args:?}"
+            verify_idx < input_idx,
+            "-tls_verify must precede -i, argv = {args:?}"
+        );
+        assert_eq!(value_after(&args, "-http_proxy"), Some(proxy));
+        assert_eq!(
+            value_after(&args, "-protocol_whitelist"),
+            Some(REMOTE_PROTOCOL_WHITELIST)
+        );
+        assert!(
+            !REMOTE_PROTOCOL_WHITELIST
+                .split(',')
+                .any(|p| p == "file" || p == "concat" || p == "data"),
+            "remote whitelist must not include file/concat/data"
+        );
+    }
+
+    #[test]
+    fn tls_verify_opt_out_omits_the_flag() {
+        let args = args_for_remote(
+            "https://cdn.example/a.mp3",
+            false,
+            None,
+            Some("http://127.0.0.1:9"),
+        );
+        assert!(
+            !args.iter().any(|a| a == "-tls_verify"),
+            "explicit opt-out must not force -tls_verify, argv = {args:?}"
+        );
+    }
+
+    #[test]
+    fn https_ca_file_is_passed_when_set() {
+        let args = args_for_remote(
+            "https://cdn.example/a.mp3",
+            true,
+            Some("/etc/ssl/cert.pem"),
+            None,
+        );
+        assert_eq!(value_after(&args, "-ca_file"), Some("/etc/ssl/cert.pem"));
+    }
+
+    #[test]
+    fn plaintext_http_is_proxied_without_tls_verify() {
+        let args = args_for_remote(
+            "http://203.0.113.10/a.mp3",
+            true,
+            Some("/etc/ssl/cert.pem"),
+            Some("http://127.0.0.1:9"),
+        );
+        assert!(
+            !args.iter().any(|a| a == "-tls_verify"),
+            "plaintext http has no TLS peer to verify, argv = {args:?}"
+        );
+        assert_eq!(
+            value_after(&args, "-protocol_whitelist"),
+            Some(REMOTE_PROTOCOL_WHITELIST)
+        );
+        assert!(args.windows(2).any(|w| w[0] == "-http_proxy"));
+    }
+
+    fn value_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        args.windows(2)
+            .find(|w| w[0] == flag)
+            .map(|w| w[1].as_str())
+    }
+
+    #[tokio::test]
+    async fn from_input_refuses_metadata_private_and_loopback() {
+        for url in [
+            "http://169.254.169.254/latest/meta-data",
+            "http://10.1.2.3/secret",
+            "http://127.0.0.1/a.mp3",
+            "https://metadata.google.internal/computeMetadata/v1/",
+        ] {
+            let err = match FfmpegSource::from_input(url, 2, None).await {
+                Err(err) => err,
+                Ok(_) => panic!("{url} must be refused before ffmpeg"),
+            };
+            let msg = err.to_string();
+            assert!(
+                msg.contains("blocked") || msg.contains("SSRF") || msg.contains("not allowed"),
+                "{url} must be refused before ffmpeg, got {msg}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ffmpeg_metadata_url_is_refused_by_the_proxy() {
+        if std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let proxy = crate::playback_guard::PlaybackProxy::start()
+            .await
+            .expect("proxy");
+        let mut cmd = Command::new("ffmpeg");
+        cmd.kill_on_drop(true)
+            .arg("-hide_banner")
+            .arg("-loglevel")
+            .arg("error");
+        apply_ffmpeg_input_args(
+            &mut cmd,
+            "http://169.254.169.254/latest/meta-data",
+            None,
+            true,
+            None,
+            Some(&proxy.base_url()),
+        );
+        install_playback_proxy_env(&mut cmd, &proxy.base_url());
+        cmd.arg("-t").arg("1").arg("-f").arg("null").arg("-");
+        let output = tokio::time::timeout(std::time::Duration::from_secs(5), cmd.output())
+            .await
+            .expect("ffmpeg must fail fast when the proxy refuses the URL")
+            .expect("spawn ffmpeg");
+        assert!(
+            !output.status.success(),
+            "metadata URL must not decode, stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            proxy.refusals() >= 1,
+            "ffmpeg must send the URL through the guard proxy, stderr={}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 }

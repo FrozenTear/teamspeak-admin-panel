@@ -51,11 +51,8 @@ pub struct IcyRadioSource {
 
 impl IcyRadioSource {
     pub async fn new(url: &str, channels: u8) -> io::Result<Self> {
-        let client = reqwest::Client::builder()
-            .build()
-            .map_err(|e| io::Error::other(format!("reqwest build: {e}")))?;
         let t0 = std::time::Instant::now();
-        let (resp, metaint) = open_icy(&client, url).await?;
+        let (resp, metaint) = open_icy(url).await?;
         let content_type = resp
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -100,7 +97,6 @@ impl IcyRadioSource {
 
         // Fetch + reconnect loop is non-send work: decode-rt, not voice-rt.
         let fetcher = crate::runtime::spawn_decode(run_fetcher(
-            client,
             url_owned,
             FirstAttempt { resp, metaint },
             resync,
@@ -147,22 +143,58 @@ impl PcmSource for IcyRadioSource {
 /// 4xx, 5xx on the *initial* request all fail the `!radio` command rather
 /// than silently entering a reconnect loop. Mid-stream and post-startup
 /// failures are the reconnect loop's job.
-pub(crate) async fn open_icy(
-    client: &reqwest::Client,
-    url: &str,
-) -> io::Result<(reqwest::Response, Option<usize>)> {
-    let resp = client
-        .get(url)
-        .header("Icy-MetaData", "1")
-        .header("User-Agent", "music-bot-audio/0.0 (PURA-119)")
-        .send()
+pub(crate) async fn open_icy(url: &str) -> io::Result<(reqwest::Response, Option<usize>)> {
+    let resp = icy_get(url)
         .await
         .map_err(|e| io::Error::other(format!("icy GET {url}: {e}")))?;
-    let resp = resp
-        .error_for_status()
-        .map_err(|e| io::Error::other(format!("icy http status: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(io::Error::other(format!(
+            "icy http status: {}",
+            resp.status()
+        )));
+    }
     let metaint = parse_metaint(&resp);
     Ok((resp, metaint))
+}
+
+/// ICY headers sent on the initial GET and on every reconnect. Redirects
+/// are not left to reqwest: [`icy_get`] caps them and re-checks each hop.
+fn icy_headers() -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::HeaderName::from_static("icy-metadata"),
+        reqwest::header::HeaderValue::from_static("1"),
+    );
+    headers.insert(
+        reqwest::header::USER_AGENT,
+        reqwest::header::HeaderValue::from_static("music-bot-audio/0.0 (PURA-119)"),
+    );
+    headers
+}
+
+/// Loopback is allowed only in this crate's unit tests, which bind a
+/// mock Icecast server on `127.0.0.1`. The music-bot binary is not
+/// built with `cfg(test)`, so a production redirect onto loopback is
+/// still refused. Metadata and private addresses are refused either way.
+fn icy_fetch_policy() -> crate::playback_guard::FetchPolicy {
+    #[cfg(test)]
+    {
+        crate::playback_guard::FetchPolicy::allow_loopback()
+    }
+    #[cfg(not(test))]
+    {
+        crate::playback_guard::FetchPolicy::production()
+    }
+}
+
+async fn icy_get(url: &str) -> Result<reqwest::Response, crate::playback_guard::GuardError> {
+    crate::playback_guard::guarded_request(
+        reqwest::Method::GET,
+        url,
+        icy_headers(),
+        icy_fetch_policy(),
+    )
+    .await
 }
 
 /// THE-972 — map an ICY response `Content-Type` to the ffmpeg demuxer that
@@ -477,7 +509,6 @@ pub(crate) struct FirstAttempt {
 /// closed (`writer` errored), a terminal HTTP error occurred, or the station
 /// ended cleanly.
 pub(crate) async fn run_fetcher<W>(
-    client: reqwest::Client,
     url: String,
     first: FirstAttempt,
     resync: ResyncMode,
@@ -494,7 +525,7 @@ pub(crate) async fn run_fetcher<W>(
     loop {
         let (resp, metaint, spliced) = match current.take() {
             Some(c) => (c.resp, c.metaint, false),
-            None => match reconnect_get(&client, &url, &event_tx).await {
+            None => match reconnect_get(&url, &event_tx).await {
                 ReconnectOutcome::Got(resp) => {
                     let metaint = parse_metaint(&resp);
                     (resp, metaint, true)
@@ -707,18 +738,8 @@ enum ReconnectOutcome {
     Terminal,
 }
 
-async fn reconnect_get(
-    client: &reqwest::Client,
-    url: &str,
-    event_tx: &mpsc::Sender<PipelineEvent>,
-) -> ReconnectOutcome {
-    match client
-        .get(url)
-        .header("Icy-MetaData", "1")
-        .header("User-Agent", "music-bot-audio/0.0 (PURA-119)")
-        .send()
-        .await
-    {
+async fn reconnect_get(url: &str, event_tx: &mpsc::Sender<PipelineEvent>) -> ReconnectOutcome {
+    match icy_get(url).await {
         Ok(r) if r.status().is_success() => ReconnectOutcome::Got(r),
         Ok(r) if r.status().is_server_error() => {
             let _ = event_tx
@@ -738,7 +759,7 @@ async fn reconnect_get(
                 .await;
             ReconnectOutcome::Terminal
         }
-        Err(e) if is_connection_like(&e) => {
+        Err(crate::playback_guard::GuardError::Fetch(e)) if is_connection_like(&e) => {
             let _ = event_tx
                 .send(PipelineEvent::Warning(format!(
                     "icy reconnect {url}: connection error: {e} — retry"
@@ -805,6 +826,8 @@ mod tests {
         Status410,
         /// 200 OK with no body, immediately close.
         InstantEof,
+        /// 302 with an absolute or relative `Location`.
+        Redirect { location: String },
     }
 
     /// Spawn a TCP server scripted with the given responses. The Nth incoming
@@ -882,6 +905,12 @@ mod tests {
                     b"HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\nConnection: close\r\n\r\n",
                 )
                 .await?;
+            }
+            MockResponse::Redirect { location } => {
+                let header = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                sock.write_all(header.as_bytes()).await?;
             }
         }
         Ok(())
@@ -1016,14 +1045,12 @@ mod tests {
         ])
         .await;
 
-        let client = reqwest::Client::new();
-        let (resp, metaint) = open_icy(&client, &url).await.unwrap();
+        let (resp, metaint) = open_icy(&url).await.unwrap();
         assert_eq!(metaint, Some(audio_n));
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let writer = CaptureWriter { buf: buf.clone() };
         let (tx, mut rx) = mpsc::channel(128);
         let fetcher = tokio::spawn(run_fetcher(
-            client,
             url.clone(),
             FirstAttempt { resp, metaint },
             // Reconnect mechanics under test use fill bytes, not valid
@@ -1088,13 +1115,11 @@ mod tests {
         ])
         .await;
 
-        let client = reqwest::Client::new();
-        let (resp, metaint) = open_icy(&client, &url).await.unwrap();
+        let (resp, metaint) = open_icy(&url).await.unwrap();
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let writer = CaptureWriter { buf: buf.clone() };
         let (tx, mut rx) = mpsc::channel(128);
         let fetcher = tokio::spawn(run_fetcher(
-            client,
             url.clone(),
             FirstAttempt { resp, metaint },
             // Reconnect mechanics under test use fill bytes, not valid
@@ -1143,13 +1168,11 @@ mod tests {
         ])
         .await;
 
-        let client = reqwest::Client::new();
-        let (resp, metaint) = open_icy(&client, &url).await.unwrap();
+        let (resp, metaint) = open_icy(&url).await.unwrap();
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let writer = CaptureWriter { buf: buf.clone() };
         let (tx, mut rx) = mpsc::channel(128);
         let fetcher = tokio::spawn(run_fetcher(
-            client,
             url.clone(),
             FirstAttempt { resp, metaint },
             // Reconnect mechanics under test use fill bytes, not valid
@@ -1184,13 +1207,11 @@ mod tests {
     async fn instant_eof_without_audio_is_terminal() {
         let (url, _server) =
             spawn_server(vec![MockResponse::InstantEof, MockResponse::InstantEof]).await;
-        let client = reqwest::Client::new();
-        let (resp, metaint) = open_icy(&client, &url).await.unwrap();
+        let (resp, metaint) = open_icy(&url).await.unwrap();
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let writer = CaptureWriter { buf: buf.clone() };
         let (tx, mut rx) = mpsc::channel(128);
         let fetcher = tokio::spawn(run_fetcher(
-            client,
             url.clone(),
             FirstAttempt { resp, metaint },
             // Reconnect mechanics under test use fill bytes, not valid
@@ -1386,13 +1407,11 @@ mod tests {
         ])
         .await;
 
-        let client = reqwest::Client::new();
-        let (resp, metaint) = open_icy(&client, &url).await.unwrap();
+        let (resp, metaint) = open_icy(&url).await.unwrap();
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let writer = CaptureWriter { buf: buf.clone() };
         let (tx, _rx) = mpsc::channel(128);
         let fetcher = tokio::spawn(run_fetcher(
-            client,
             url.clone(),
             FirstAttempt { resp, metaint },
             ResyncMode::FrameSync(SyncKind::Mp3),
@@ -1430,13 +1449,11 @@ mod tests {
         ])
         .await;
 
-        let client = reqwest::Client::new();
-        let (resp, metaint) = open_icy(&client, &url).await.unwrap();
+        let (resp, metaint) = open_icy(&url).await.unwrap();
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let writer = CaptureWriter { buf: buf.clone() };
         let (tx, mut rx) = mpsc::channel(128);
         let fetcher = tokio::spawn(run_fetcher(
-            client,
             url.clone(),
             FirstAttempt { resp, metaint },
             ResyncMode::WarnNotSelfSync,
@@ -1521,6 +1538,53 @@ mod tests {
             )
             .await
         );
+    }
+
+    /// H5 — a station that 302s onto a metadata or private address must
+    /// fail the GET. The test server itself is loopback (allowed only
+    /// under `cfg(test)`); the hop after it is not.
+    #[tokio::test]
+    async fn open_icy_refuses_redirect_to_metadata_and_private() {
+        for location in [
+            "http://169.254.169.254/latest/meta-data",
+            "http://10.1.2.3/secret",
+            "http://metadata.google.internal/computeMetadata/v1/",
+        ] {
+            let (url, _server) = spawn_server(vec![MockResponse::Redirect {
+                location: location.to_string(),
+            }])
+            .await;
+            let err = tokio::time::timeout(Duration::from_secs(2), open_icy(&url))
+                .await
+                .unwrap_or_else(|_| panic!("{location}: refusal must not try to connect"))
+                .expect_err(location);
+            let msg = err.to_string();
+            assert!(
+                msg.contains("SSRF") || msg.contains("not allowed"),
+                "{location} redirect must be refused, got {msg}"
+            );
+        }
+    }
+
+    /// A same-host relative redirect is still followed. The second hop is
+    /// re-checked; this test server stays on loopback, which the unit-test
+    /// policy allows.
+    #[tokio::test]
+    async fn open_icy_follows_a_relative_redirect() {
+        let (url, _server) = spawn_server(vec![
+            MockResponse::Redirect {
+                location: "/ok".into(),
+            },
+            MockResponse::Ok {
+                metaint: Some(3),
+                body: b"abc".to_vec(),
+            },
+        ])
+        .await;
+        let (resp, metaint) = open_icy(&url).await.unwrap();
+        assert_eq!(metaint, Some(3));
+        let body = resp.bytes().await.unwrap();
+        assert_eq!(&body[..], b"abc");
     }
 
     // Smoke for the helper itself — keep simple so a test infrastructure

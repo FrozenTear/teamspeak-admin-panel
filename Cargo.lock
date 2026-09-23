@@ -5126,6 +5126,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ts6-ssrf",
+ "url",
 ]
 
 [[package]]
