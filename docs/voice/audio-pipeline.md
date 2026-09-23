@@ -97,6 +97,8 @@ pipeline.shutdown().await;
 
 CPU affinity (packing B, no fullstack shrink): `voice-rt` pins only the wire-send path to `TS6_BOT_SEND_CPUSET=0-1`. Pipeline, ICY fetch, the yt-dlp bridge, and resolve run on `decode-rt`, pinned to `TS6_BOT_DECODE_CPUSET=2-5`. Music container HostConfig stays unset — never `0-1` (packing C).
 
+`TS6_BOT_NICE` (`-5`) is a one-shot host renice of tids named `voice-rt` after `/health`, not an in-process capability (uid 10001, EPERM, no `CAP_SYS_NICE`). Tokio's blocking pool reuses that name and is created lazily on `spawn_blocking` / `block_in_place`; those threads are pinned to SEND `0-1` and inherit the spawning thread's nice. A music container restart drops the nice until `scripts/apply-fullstack-soft-pin.sh` runs again (Opus #66 L16). Packing B is unchanged. Do not MOVE the bot runtime to Floki.
+
 ## Persistent yt-dlp resolver (PURA-359)
 
 `YtDlp { url }` no longer spawns a fresh `yt-dlp` subprocess on every `!play`.

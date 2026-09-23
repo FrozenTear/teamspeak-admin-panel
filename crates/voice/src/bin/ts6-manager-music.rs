@@ -12,7 +12,12 @@
 //! `sched_setaffinity` (`pin_decode_child` is a post-spawn backup);
 //! share Axum. Never HostConfig-only `0-1`. Fullstack soft pin stays
 //! `2-5`. `TS6_BOT_NICE` is applied to `voice-rt` tids by the host
-//! soft-pin script; this process starts that runtime before `/health`.
+//! soft-pin script (one-shot, after `/health`). This process starts
+//! that runtime before `/health` so the workers exist for the walk.
+//! Tokio blocking-pool threads reuse the `voice-rt` comm and appear
+//! later; they inherit the spawning thread's nice. A container
+//! restart drops the nice until the script runs again. In-process
+//! `setpriority` of a negative nice is EPERM (uid 10001).
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -83,7 +88,10 @@ async fn main() -> Result<()> {
 
     // H3 — voice-rt workers must exist before /health. update.sh applies
     // the host renice after music health, and Linux nice does not follow
-    // the thread-group leader onto later send threads.
+    // the thread-group leader onto later send threads. The walk is
+    // one-shot (Opus #66 L16): blocking-pool threads that reuse the
+    // voice-rt comm are created later and inherit the spawning thread's
+    // nice. A music restart drops the nice until the script runs again.
     music_bot::ensure_voice_runtime();
 
     let music_dir =
