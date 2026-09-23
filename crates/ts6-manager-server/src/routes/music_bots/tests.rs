@@ -1420,10 +1420,11 @@ async fn audio_play_rejects_library_path_escape() {
 
     let ok = wire::PlayRequest {
         source: wire::AudioSource::LibraryPath {
-            path: "ok.mp3".into(),
+            path: "./ok.mp3".into(),
         },
     };
     let resp = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method(Method::POST)
@@ -1436,7 +1437,139 @@ async fn audio_play_rejects_library_path_escape() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+    // The request log stores the path the play command carried: the
+    // canonical file under MUSIC_DIR, not the raw `./ok.mp3`.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/music-requests?bot={}", bot.id.0))
+                .header("authorization", auth_header(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let requests: Vec<wire::MusicRequest> = read_json(resp).await;
+    assert_eq!(requests.len(), 1);
+    let canon = root.canonicalize().unwrap().join("ok.mp3");
+    match &requests[0].source {
+        wire::AudioSource::LibraryPath { path } => {
+            assert_eq!(path, &canon.to_string_lossy());
+            assert_ne!(path, "./ok.mp3");
+        }
+        other => panic!("expected library path, got {other:?}"),
+    }
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `http://203.0.113.10\@127.0.0.1/a.mp3` passes the WHATWG gate (host
+/// `203.0.113.10`) and is dialed as `127.0.0.1` by ffmpeg if the raw
+/// string is forwarded. The play route must hand the runtime the
+/// serialized URL, and must still reject a form whose parsed host is
+/// loopback.
+#[tokio::test]
+async fn audio_play_dispatches_normalized_url_and_still_blocks_loopback() {
+    let (app, token, _state) = make_test_app().await;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/music-bots")
+                .header("authorization", auth_header(&token))
+                .header("content-type", "application/json")
+                .body(json_body(&create_bot_body()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bot: wire::MusicBotSummary = read_json(resp).await;
+
+    let raw = "http://203.0.113.10\\@127.0.0.1/a.mp3";
+    let body = wire::PlayRequest {
+        source: wire::AudioSource::Url { url: raw.into() },
+    };
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/music-bots/{}/play", bot.id.0))
+                .header("authorization", auth_header(&token))
+                .header("content-type", "application/json")
+                .body(json_body(&body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/music-requests?bot={}", bot.id.0))
+                .header("authorization", auth_header(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let requests: Vec<wire::MusicRequest> = read_json(resp).await;
+    assert_eq!(requests.len(), 1);
+    let expected = "http://203.0.113.10/@127.0.0.1/a.mp3";
+    match &requests[0].source {
+        wire::AudioSource::Url { url } => {
+            assert_eq!(url, expected);
+            assert!(!url.contains('\\'));
+        }
+        other => panic!("expected url, got {other:?}"),
+    }
+    assert_eq!(requests[0].title, expected);
+
+    // Encoded backslash stays in userinfo; parsed host is loopback.
+    let blocked = wire::PlayRequest {
+        source: wire::AudioSource::Url {
+            url: "http://203.0.113.10%5c@127.0.0.1/a.mp3".into(),
+        },
+    };
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/music-bots/{}/play", bot.id.0))
+                .header("authorization", auth_header(&token))
+                .header("content-type", "application/json")
+                .body(json_body(&blocked))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let err: wire::ErrorBody = read_json(resp).await;
+    assert_eq!(err.code.as_deref(), Some("ssrf_blocked"));
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/music-requests?bot={}", bot.id.0))
+                .header("authorization", auth_header(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let requests: Vec<wire::MusicRequest> = read_json(resp).await;
+    assert_eq!(
+        requests.len(),
+        1,
+        "a blocked follow-up play must not append a request-log row"
+    );
 }
 
 #[tokio::test]
