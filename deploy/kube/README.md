@@ -71,9 +71,18 @@ DECODE must be set in this kube manifest (process env);
 `soft-pin.env` cannot inject it into a running process.
 
 Nice is host `renice` of the music leader **and** every `voice-rt` tid
-(`TS6_BOT_NICE`). `TS6_BOT_CHRT_SCHED` FIFO/RR
+(`TS6_BOT_NICE`). That walk is one-shot, after `/health`, inside
+`update.sh` (Opus #66 L16). Tokio blocking-pool threads are also
+named `voice-rt` and appear later (`spawn_blocking` /
+`block_in_place`); they stay pinned to SEND `0-1` and inherit the
+spawning thread's nice, so a parent the walk already reniced passes
+`-5` on and a parent still at 0 does not. A music container restart
+drops the nice until `apply-fullstack-soft-pin.sh` runs again.
+`TS6_BOT_CHRT_SCHED` FIFO/RR
 is opt-in, default off (no kube privileged / `CAP_SYS_NICE` default).
-In-process `setpriority` as uid 10001 is EPERM. Disable pins by
+In-process `setpriority` as uid 10001 is EPERM. Do not add
+`CAP_SYS_NICE`. Packing B stays. Do not MOVE the bot runtime to Floki.
+Disable pins by
 emptying the vars, removing `soft-pin.env`, or pointing
 `TS6_SOFT_PIN_ENV` at a host-local override (Floki / other hosts —
 do not MOVE the bot runtime to Floki). A requested container cpuset

@@ -15,7 +15,12 @@
 # SEND/DECODE in-process pins are kube env, not HostConfig.
 # Music nice: renice the container leader AND every tid whose comm is
 # voice-rt. Linux nice is per-thread; renice -p on the leader does not
-# reach send threads. The music process starts that runtime before /health.
+# reach send threads. The music process starts the voice runtime before
+# /health so those workers exist. This walk is one-shot (Opus #66 L16):
+# tokio's blocking pool reuses comm voice-rt and is created later
+# (spawn_blocking / block_in_place). Later tids inherit the spawning
+# thread's nice. A music container restart drops the nice until this
+# script runs again. Do not add CAP_SYS_NICE. Packing B values stay.
 # Sidecar stays unpinned unless TS6_SIDECAR_* are set.
 #
 # podman update failure is fatal when a cpuset was requested.
@@ -118,11 +123,14 @@ renice_matching_comm() {
     _found=$nmatched
 }
 
-# voice-rt is created at music-process boot (before /health) but a
-# short retry covers a process that is still starting its runtime.
-# Missing tids warn and do not fail the fullstack pin: an older music
-# image has no such threads yet. A renice that finds a tid and fails
-# is fatal.
+# voice-rt workers are created at music-process boot (before /health)
+# but a short retry covers a process that is still starting its
+# runtime. Tokio blocking-pool threads are also comm voice-rt and do
+# not exist yet; this walk cannot see them (Opus #66 L16). They
+# inherit the spawning thread's nice. Missing tids warn and do not
+# fail the fullstack pin: an older music image has no such threads
+# yet. A renice that finds a tid and fails is fatal. A music container
+# restart drops the nice until this script runs again.
 renice_voice_rt_tasks() {
     local pid="$1"
     local nice="$2"

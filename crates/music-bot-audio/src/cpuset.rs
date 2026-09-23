@@ -21,10 +21,16 @@
 //!   by the apply script. Music HostConfig stays unset (or wide `0-5`).
 //! - `TS6_BOT_NICE` is per-thread. [`nice_voice_rt_from_env`] walks
 //!   `/proc/<pid>/task/*/comm` for `voice-rt`. A negative nice from
-//!   uid 10001 is typically `EPERM` (no `CAP_SYS_NICE`); the host
-//!   `scripts/apply-fullstack-soft-pin.sh` renices those same tids.
+//!   uid 10001 is `EPERM` (no `CAP_SYS_NICE`). The host
+//!   `scripts/apply-fullstack-soft-pin.sh` walk is one-shot after
+//!   music `/health` and only sees tids that exist then. Tokio's
+//!   blocking pool reuses this comm and is created later
+//!   (`spawn_blocking` / `block_in_place`); Linux `clone` copies the
+//!   spawning thread's nice, so a parent the walk already reniced
+//!   passes that nice on, and a parent still at 0 does not. A music
+//!   container restart drops the nice until the script runs again.
 //!   `renice -p` on the container pid alone only changes the
-//!   thread-group leader.
+//!   thread-group leader. Do not add `CAP_SYS_NICE` to paper over it.
 //! - A whole-container `podman update --cpuset-cpus=0-1` is **not**
 //!   implemented. v1.6.15 Angerfist dig 163/590/117: that trap made
 //!   `C_loop_deferral` worse.
@@ -445,9 +451,13 @@ pub fn nice_current_thread_from_env(env_key: &str) {
 
 /// Once `voice-rt` workers exist, renice each of them to [`NICE_ENV`].
 ///
-/// In-process `setpriority` of a negative nice is often `EPERM` for
-/// uid 10001. Failure is logged; `scripts/apply-fullstack-soft-pin.sh`
-/// performs the same comm walk as root on the host.
+/// In-process `setpriority` of a negative nice is `EPERM` for uid
+/// 10001. Failure is logged. `scripts/apply-fullstack-soft-pin.sh`
+/// performs the same comm walk as root on the host, once, after music
+/// `/health`. Tids created later share this comm (tokio's blocking
+/// pool) and inherit the spawning thread's nice; the walk does not
+/// run again. A music process restart drops the nice until that
+/// script runs. Opus #66 L16.
 pub fn nice_voice_rt_from_env() {
     let nice = match nice_from_env(NICE_ENV) {
         Ok(Some(nice)) => nice,
@@ -470,7 +480,12 @@ pub fn nice_voice_rt_from_env() {
                 pid,
                 nice,
                 error = %err,
-                "in-process voice-rt renice failed; host apply-fullstack-soft-pin.sh renices the same tids"
+                "in-process voice-rt renice failed (expected EPERM for a negative \
+                 TS6_BOT_NICE without CAP_SYS_NICE). Host \
+                 apply-fullstack-soft-pin.sh is a one-shot voice-rt comm walk \
+                 after /health; a music restart drops that nice until the \
+                 script runs again. Later voice-rt tids (tokio blocking pool) \
+                 inherit the spawning thread's nice"
             );
         }
     }
@@ -704,5 +719,46 @@ mod tests {
 
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         handle.join().unwrap();
+    }
+
+    /// Linux `clone` copies the caller's nice. A `voice-rt` tid created
+    /// after the host walk therefore keeps the spawning thread's nice;
+    /// it does not reset to 0 when that parent was already reniced.
+    /// Opus #66 L16. Raising nice needs no capability; the raised value
+    /// dies with this thread.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spawned_thread_inherits_caller_nice() {
+        let parent_nice = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(i32::MIN));
+        let child_nice = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(i32::MIN));
+        let parent_slot = std::sync::Arc::clone(&parent_nice);
+        let child_slot = std::sync::Arc::clone(&child_nice);
+        let handle = std::thread::spawn(move || {
+            let before = thread_nice(0);
+            let target = before.saturating_add(3);
+            if target > 19 || nice_tid(0, target).is_err() {
+                return;
+            }
+            let now = thread_nice(0);
+            parent_slot.store(now, std::sync::atomic::Ordering::SeqCst);
+            let child_slot = std::sync::Arc::clone(&child_slot);
+            let child = std::thread::spawn(move || {
+                child_slot.store(thread_nice(0), std::sync::atomic::Ordering::SeqCst);
+            });
+            child.join().unwrap();
+        });
+        handle.join().unwrap();
+        let parent = parent_nice.load(std::sync::atomic::Ordering::SeqCst);
+        let child = child_nice.load(std::sync::atomic::Ordering::SeqCst);
+        assert_ne!(
+            parent,
+            i32::MIN,
+            "this thread must be able to raise its own nice"
+        );
+        assert_ne!(child, i32::MIN, "child must publish its nice");
+        assert_eq!(
+            child, parent,
+            "a thread spawned after renice inherits that nice (Opus #66 L16)"
+        );
     }
 }

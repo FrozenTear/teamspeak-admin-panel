@@ -77,11 +77,16 @@ pub(crate) fn voice_runtime() -> &'static Runtime {
                 // Decode children inherit that set via
                 // install_decode_pre_exec; pin_decode_child is only a
                 // leader backup. Never HostConfig cpuset 0-1 (packing C).
-                // Per-thread setpriority of TS6_BOT_NICE=-5 is often
-                // EPERM as uid 10001. The walk below targets every
-                // voice-rt tid; the host script does the same walk
-                // with permission to set a negative nice. Do not shrink
-                // the fullstack 2-5 pin.
+                // Per-thread setpriority of TS6_BOT_NICE=-5 is EPERM
+                // as uid 10001 (no CAP_SYS_NICE). This callback also
+                // runs on tokio blocking-pool threads, which reuse the
+                // voice-rt comm and are spawned lazily
+                // (spawn_blocking / block_in_place). The host walk is
+                // one-shot after /health and only sees tids that exist
+                // then. A thread spawned later inherits this thread's
+                // nice; a music restart drops it until
+                // apply-fullstack-soft-pin.sh runs again. Do not shrink
+                // the fullstack 2-5 pin. Do not add CAP_SYS_NICE.
                 music_bot_audio::cpuset::pin_current_thread_send();
                 music_bot_audio::cpuset::nice_current_thread_from_env(
                     music_bot_audio::cpuset::NICE_ENV,
@@ -91,8 +96,9 @@ pub(crate) fn voice_runtime() -> &'static Runtime {
             .build()
             .expect("build dedicated voice runtime");
         // Workers are already named voice-rt. Re-apply nice by comm so
-        // a process that can setpriority hits every send tid, not only
-        // whichever thread happened to run on_thread_start successfully.
+        // a process that can setpriority hits every send tid that
+        // exists now. Blocking-pool threads with the same comm do not
+        // exist yet; they inherit the spawning thread's nice later.
         music_bot_audio::cpuset::nice_voice_rt_from_env();
         rt
     })
@@ -102,8 +108,14 @@ pub(crate) fn voice_runtime() -> &'static Runtime {
 ///
 /// The music process calls this before it serves `/health`. Host
 /// `apply-fullstack-soft-pin.sh` runs after health and renices tids
-/// whose `comm` is `voice-rt`. The runtime is otherwise created on the
-/// first bot spawn, which is after that script has already exited.
+/// whose `comm` is `voice-rt` **at that moment**. The runtime is
+/// otherwise created on the first bot spawn, which is after that
+/// script has already exited. Tokio's blocking pool is also named
+/// `voice-rt` and stays empty until `spawn_blocking` or
+/// `block_in_place` (Opus #66 L16). Those later tids inherit the
+/// spawning thread's nice; a music container restart drops every tid
+/// back to 0 until the script runs again. In-process `setpriority` of
+/// a negative nice does not stick (EPERM, uid 10001).
 pub fn ensure_voice_runtime() {
     let _ = voice_runtime();
 }
@@ -147,6 +159,32 @@ mod tests {
         assert!(
             tids.len() >= VOICE_WORKER_THREADS,
             "voice-rt workers must be visible under /proc for host renice, got {tids:?}"
+        );
+    }
+
+    /// Opus #66 L16: tokio's blocking pool uses `thread_name`, so a
+    /// `spawn_blocking` on this runtime is also comm `voice-rt`. The
+    /// pool is empty at [`ensure_voice_runtime`]; the host one-shot
+    /// walk misses tids that appear later.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn blocking_pool_thread_comm_is_voice_rt() {
+        let comm = voice_runtime()
+            .spawn(async {
+                tokio::task::spawn_blocking(|| {
+                    std::fs::read_to_string("/proc/thread-self/comm").unwrap_or_default()
+                })
+                .await
+                .expect("blocking join")
+            })
+            .await
+            .expect("voice join");
+        assert!(
+            music_bot_audio::cpuset::comm_matches(
+                &comm,
+                music_bot_audio::cpuset::VOICE_RT_THREAD_COMM
+            ),
+            "tokio blocking pool must reuse the voice-rt comm, got {comm:?}"
         );
     }
 }

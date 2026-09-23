@@ -52,8 +52,15 @@ refuses fullstack `4-5` / `3-5` unless `TS6_SOFT_PIN_SHRINK_ACK=1`
 bridge / resolve) and parks ffmpeg / yt-dlp / warm-resolver via
 pre_exec `sched_setaffinity` before exec (`pin_decode_child` is a
 leader backup). Nice is host `renice` on the music leader and on
-`voice-rt` tids (per-thread; the leader alone is not enough). `chrt`
+`voice-rt` tids (per-thread; the leader alone is not enough). The
+walk is one-shot after music `/health` (Opus #66 L16). Tokio's
+blocking pool reuses the `voice-rt` comm and is created later; those
+threads inherit the spawning thread's nice and stay on SEND `0-1`.
+A music container restart drops the nice until
+`apply-fullstack-soft-pin.sh` runs again. In-process `setpriority`
+of `-5` is EPERM as uid 10001 — do not add `CAP_SYS_NICE`. `chrt`
 FIFO/RR is opt-in env, default off. Music HostConfig stays unset.
+Packing B stays. Floki MOVE NO.
 
 ## Control plane
 
