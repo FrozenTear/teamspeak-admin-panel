@@ -208,6 +208,9 @@ mod server_entry {
         // warms the resolver so fullstack (Axum/Surreal/Scuffed) never
         // runs a second decode/send path.
         if !state.music_bots.supervisor.is_remote() {
+            // In-process send loop. The split music unit installs this
+            // itself from its own `MUSIC_DIR`.
+            music_bot::install_music_dir(state.music_dir.clone());
             music_bot::warm_resolver();
         } else {
             if !state.music_bots.supervisor.wait_until_healthy(30).await {

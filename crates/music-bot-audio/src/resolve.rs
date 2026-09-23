@@ -63,6 +63,11 @@ const PROCESS_TIMEOUT: Duration = Duration::from_secs(25);
 /// non-timeout failure (private/unavailable video, unsupported URL) is
 /// returned immediately — retrying it would only waste another ~7 s.
 pub async fn resolve_direct_url(url: &str, cookie_file: Option<&Path>) -> std::io::Result<String> {
+    // Seek retention shells out to yt-dlp on the page URL. Spawn already
+    // gates playback, but this entry also fetches, so it checks again.
+    crate::gate::allow_playback_url(url, crate::gate::process_resolver())
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     match run_once(url, cookie_file).await {
         Ok(direct) => Ok(direct),
         Err(first) if first.kind() == std::io::ErrorKind::TimedOut => {

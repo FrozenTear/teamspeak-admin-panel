@@ -57,6 +57,12 @@ pub use voice_bug_report::{
 /// resolver without taking a direct dependency on the audio crate.
 pub use music_bot_audio::resolver::warm_up as warm_resolver;
 
+/// Install the music-library jail root (`MUSIC_DIR`) for in-process
+/// playback. The music unit binary calls
+/// [`music_bot_audio::install_music_dir`] itself; the manager calls this
+/// when it owns the send loop.
+pub use music_bot_audio::install_music_dir;
+
 /// In-process Music Bot latency / log ring for operator bug-report
 /// `context` (`musicBotLatency`, `logTail`). Re-exported so the panel
 /// server can install the tracing layer and snapshot without taking a

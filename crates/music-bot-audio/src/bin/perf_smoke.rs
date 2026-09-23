@@ -290,6 +290,7 @@ async fn main() -> Result<()> {
         prebuffer_frames: cli.prebuffer_frames.min(cli.frame_buffer),
         event_buffer: 16,
         yt_cookie_file: None,
+        music_dir: std::env::var_os("MUSIC_DIR").map(std::path::PathBuf::from),
     };
 
     // THE-972 — first-frame probes: spawn → first Opus frame, torn down

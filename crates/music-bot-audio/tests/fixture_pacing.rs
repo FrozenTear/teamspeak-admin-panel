@@ -10,6 +10,7 @@
 //! Gated behind `#[ignore]` because it shells out to `ffmpeg`. The smoke
 //! recipe and CI guidance live in `docs/voice/audio-pipeline.md`.
 
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -29,6 +30,12 @@ const CUMULATIVE_TOLERANCE_MS: i64 = 5;
 /// to wall-clock cadence, the pacer is exact. WS-1 will pre-roll similarly
 /// before starting wire transmission.
 const WARMUP_FRAMES: usize = 3;
+
+/// Library jail root for fixture playback. The relative fixture path
+/// canonicalises inside the crate directory.
+fn fixture_music_dir() -> Option<PathBuf> {
+    Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+}
 
 fn ffmpeg_available() -> bool {
     Command::new("ffmpeg")
@@ -55,6 +62,7 @@ async fn ffmpeg_fixture_paces_within_tolerance() {
         prebuffer_frames: 0,
         event_buffer: 16,
         yt_cookie_file: None,
+        music_dir: fixture_music_dir(),
     };
     let mut pipeline = AudioPipeline::spawn(
         AudioSourceSpec::Ffmpeg {
@@ -162,7 +170,10 @@ async fn ffmpeg_subprocess_cleanup_on_cancel() {
     // crashed run) shouldn't fail this test. Snapshot them and subtract.
     let baseline = pgrep_fixture();
 
-    let cfg = PipelineConfig::default();
+    let cfg = PipelineConfig {
+        music_dir: fixture_music_dir(),
+        ..PipelineConfig::default()
+    };
     let mut pipeline = AudioPipeline::spawn(
         AudioSourceSpec::Ffmpeg {
             input: FIXTURE_PATH.to_string(),
@@ -209,7 +220,10 @@ async fn ffmpeg_at_seeks_input_to_offset() {
                 input: FIXTURE_PATH.to_string(),
                 start_secs,
             },
-            PipelineConfig::default(),
+            PipelineConfig {
+                music_dir: fixture_music_dir(),
+                ..PipelineConfig::default()
+            },
         )
         .await
         .expect("spawn FfmpegAt");

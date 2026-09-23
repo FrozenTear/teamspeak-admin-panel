@@ -168,6 +168,11 @@ impl ActiveAudio {
 /// Translate a [`BotEvent`-facing](crate::command::AudioSource) source
 /// into the [`AudioPipeline`] factory request the WS-2 crate consumes.
 ///
+/// Classification only. The SSRF gate and library jail run inside
+/// [`AudioPipeline::spawn`](music_bot_audio::AudioPipeline::spawn), which
+/// every play, queue advance, radio, and chat `!play` / `!radio` awaits.
+/// A rejection comes back as [`PipelineError`] and the caller fails closed.
+///
 /// Convention: a `synthetic://` URL routes to the in-process tone
 /// generator. This is a test-only seam (the integration test in
 /// `crates/voice/tests/audio_e2e.rs` uses it to drive end-to-end audio
@@ -290,6 +295,9 @@ fn pipeline_config(yt_cookie_file: Option<PathBuf>) -> PipelineConfig {
         frame_buffer: 250,
         prebuffer_frames: 150,
         yt_cookie_file,
+        // Jail root installed at process start from `MUSIC_DIR`. `spawn`
+        // rejects a library path when this is `None`.
+        music_dir: music_bot_audio::installed_music_dir(),
         ..PipelineConfig::default()
     }
 }
@@ -1522,6 +1530,48 @@ mod tests {
         let (spec, label) = source_to_spec(&AudioSource::LibraryPath(PathBuf::from("a/b.mp3")));
         assert!(matches!(spec, AudioSourceSpec::Ffmpeg { .. }));
         assert!(label.starts_with("library:"));
+    }
+
+    /// Chat `!play` / `!radio` and queue advance call [`start_pipeline`].
+    /// A metadata URL must fail here, before yt-dlp or ffmpeg runs.
+    #[tokio::test]
+    async fn start_pipeline_rejects_metadata_url() {
+        let mut current = None;
+        let err = start_pipeline(
+            &mut current,
+            &AudioSource::Url("http://169.254.169.254/latest/meta-data".into()),
+            None,
+            &VolumeHandle::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(current.is_none(), "rejected play must not leave a pipeline");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SSRF") || msg.contains("not allowed"),
+            "got {msg}"
+        );
+    }
+
+    /// A library path with no jail root is refused. The music unit installs
+    /// `MUSIC_DIR` at boot; without that, playback must not open the path.
+    #[tokio::test]
+    async fn start_pipeline_rejects_library_path_without_jail() {
+        let mut current = None;
+        let err = start_pipeline(
+            &mut current,
+            &AudioSource::LibraryPath(PathBuf::from("../etc/passwd")),
+            None,
+            &VolumeHandle::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(current.is_none());
+        let msg = err.to_string();
+        assert!(
+            msg.contains("MUSIC_DIR") || msg.contains("library path"),
+            "got {msg}"
+        );
     }
 
     /// PURA-342 — a healthy stream delivers every frame ahead of its paced

@@ -92,6 +92,7 @@ async fn main() -> Result<()> {
         prebuffer_frames: 0,
         event_buffer: 32,
         yt_cookie_file: None,
+        music_dir: std::env::var_os("MUSIC_DIR").map(std::path::PathBuf::from),
     };
 
     let spec = match cli.source {
