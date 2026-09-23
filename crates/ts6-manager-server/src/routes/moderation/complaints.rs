@@ -47,9 +47,10 @@ pub(super) struct ComplaintListQuery {
 /// virtual server. `RequirePermission<ComplaintView>`-gated.
 pub(super) async fn list(
     State(state): State<AppState>,
-    _gate: RequirePermission<ComplaintView>,
+    gate: RequirePermission<ComplaintView>,
     Query(q): Query<ComplaintListQuery>,
 ) -> Result<Json<Vec<wire::Complaint>>, Response> {
+    super::ensure_server_read(&state, &gate.0, q.server_config_id).await?;
     let backend = backend_for(&state, q.server_config_id).await?;
     let rows = backend
         .complainlist(q.virtual_server_id, q.tcldbid)
@@ -69,6 +70,7 @@ pub(super) async fn resolve(
     Json(req): Json<wire::ResolveComplaintRequest>,
 ) -> Result<StatusCode, Response> {
     let actor = gate.0;
+    super::ensure_server_write(&state, &actor, req.server_config_id).await?;
     let backend = backend_for(&state, req.server_config_id).await?;
     let sid = req.virtual_server_id;
 

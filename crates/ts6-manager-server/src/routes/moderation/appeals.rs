@@ -45,7 +45,7 @@ pub(super) async fn uphold(
     Json(req): Json<wire::DecideAppealRequest>,
 ) -> Result<Json<wire::ModerationCase>, Response> {
     let actor = gate.0;
-    let (case, appeal) = load_appeal_under_review(&state, id).await?;
+    let (case, appeal) = load_appeal_under_review(&state, &actor, id).await?;
     let note = trimmed_note(&req.decision_note);
 
     decide_appeal(&state, appeal.id, "upheld", actor.id, note.clone()).await?;
@@ -77,7 +77,7 @@ pub(super) async fn overturn(
     Json(req): Json<wire::DecideAppealRequest>,
 ) -> Result<Json<wire::ModerationCase>, Response> {
     let actor = gate.0;
-    let (case, appeal) = load_appeal_under_review(&state, id).await?;
+    let (case, appeal) = load_appeal_under_review(&state, &actor, id).await?;
     let note = trimmed_note(&req.decision_note);
 
     // Reversal first — if the ban lift fails upstream, nothing has been
@@ -150,6 +150,7 @@ pub(super) async fn overturn(
 /// first-class `404` / `409`.
 async fn load_appeal_under_review(
     state: &AppState,
+    actor: &AuthUser,
     case_id: i64,
 ) -> Result<(ModerationCase, ModerationAppeal), Response> {
     let case = moderation_cases::find_by_id(&state.db, case_id)
@@ -159,6 +160,10 @@ async fn load_appeal_under_review(
             internal()
         })?
         .ok_or_else(|| not_found("case not found"))?;
+    // Before the status check, so a caller without a grant on the case's
+    // server does not learn whether an appeal is pending. Also runs
+    // before `lift_case_ban`, which dispatches `bandel`.
+    super::ensure_server_write(state, actor, case.serverConfigId).await?;
     if case.status != "appealed" {
         return Err(conflict("case is not under appeal"));
     }

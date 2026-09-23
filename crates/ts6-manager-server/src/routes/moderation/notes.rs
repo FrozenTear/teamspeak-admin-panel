@@ -2,7 +2,15 @@
 //!
 //! Free-text moderator notes on a subject UID, independent of cases
 //! (brief §5). Reads are gated by `moderation.note.view`, writes by
-//! `moderation.note.write`. A note write emits a `moderationNoteAdded`
+//! `moderation.note.write`.
+//!
+//! Notes are not per-server. The `moderation_note` row has no
+//! `serverConfigId`, so `check_read` / `check_write` have nothing to
+//! bind to — applying them would invent a binding the table does not
+//! store. Subject history still hides cases (and their actions) outside
+//! the caller's grants.
+//!
+//! A note write emits a `moderationNoteAdded`
 //! `admin_audit_log` row — notes are personal data, so their creation is
 //! itself an auditable moderation event.
 
