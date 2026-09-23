@@ -44,12 +44,15 @@ async fn play(
     let bot = music_bot::BotId(id);
     // Gate before the supervisor sees the source. yt-dlp and ffmpeg do
     // their own I/O; a blocked URL or a path outside MUSIC_DIR must not
-    // leave this handler.
+    // leave this handler. The command and the request-log row both carry
+    // the gated value — the raw body can disagree with the parse that
+    // passed (backslash authority, `./` library paths).
     let domain_source =
         match gate_play_source(&req.source, state.ssrf_resolver.as_ref(), &state.music_dir).await {
             Ok(source) => source,
             Err(resp) => return Err(resp),
         };
+    let played = super::convert::audio_source_to_wire(&domain_source);
     state
         .music_bots
         .supervisor
@@ -63,9 +66,9 @@ async fn play(
         .map_err(translate_send_error)?;
     // Side-effect: record a MusicRequest row mirroring the
     // `/radio-stations/{id}/play` handler. `track_id` is `None` because
-    // the play bypasses the queue. Title falls back to the source string
-    // when the caller didn't supply one (no body field for it).
-    let title = source_label(&req.source);
+    // the play bypasses the queue. Title falls back to the source that
+    // was dispatched (no body field for a title).
+    let title = source_label(&played);
     state
         .music_bots
         .requests
@@ -73,7 +76,7 @@ async fn play(
             id: 0,
             bot: wire::BotId(id),
             track_id: None,
-            source: req.source,
+            source: played,
             title,
             requested_by: None,
             requested_at: Utc::now(),
@@ -163,15 +166,21 @@ async fn dispatch_audio(
 /// Plaintext HTTP with no pinned address is refused (DNS failure or an
 /// empty answer). yt-dlp resolves names itself and there is no
 /// `resolve_to_addrs` hook on that path — handing it an unpinned `http`
-/// URL is the webhook bug. HTTPS with no pin is allowed: TLS hostname
-/// validation binds the name, same split as manager webhooks.
+/// URL is the webhook bug. HTTPS with no pin is allowed, same split as
+/// manager webhooks. This gate does not change ffmpeg TLS verification
+/// or redirect following.
 ///
-/// When plaintext HTTP *does* resolve to a public address, the original
-/// URL is forwarded. yt-dlp cannot take reqwest's `resolve_to_addrs`
-/// pin (that pin is what `flow/dispatch.rs` uses for webhooks). A name
-/// that passed the blocklist can still rebind before yt-dlp connects;
-/// closing that needs a pin proxy and is out of scope for this gate.
-/// Private, loopback, and metadata targets are rejected here either way.
+/// The returned value is what `Play` forwards. A URL is
+/// [`ts6_ssrf::is_url_allowed`]'s WHATWG serialization, not the raw
+/// request string: `http://203.0.113.10\@127.0.0.1/a.mp3` is host
+/// `203.0.113.10` here and host `127.0.0.1` in ffmpeg. A library path is
+/// the canonical file [`confine_library_path`] accepted.
+///
+/// yt-dlp cannot take reqwest's `resolve_to_addrs` pin (that pin is what
+/// `flow/dispatch.rs` uses for webhooks). A name that passed the
+/// blocklist can still rebind before yt-dlp connects; closing that needs
+/// a pin proxy and is out of scope for this gate. Private, loopback, and
+/// metadata targets are rejected here either way.
 async fn gate_play_source(
     source: &wire::AudioSource,
     resolver: &dyn Resolver,
@@ -199,7 +208,7 @@ async fn gate_play_url(url: &str, resolver: &dyn Resolver) -> Result<DomainAudio
             "ssrf_blocked",
         ));
     }
-    Ok(DomainAudioSource::Url(url.to_string()))
+    Ok(DomainAudioSource::Url(target.url.as_str().to_owned()))
 }
 
 fn ssrf_rejected(err: &SsrfError) -> Response {
@@ -357,5 +366,67 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// ffmpeg treats `\` before `@` as userinfo and dials the host after
+    /// it. The WHATWG gate sees the host before the backslash. `Play`
+    /// must receive that serialization, not the raw bytes.
+    #[tokio::test]
+    async fn play_url_forwards_whatwg_form_not_the_raw_backslash() {
+        let resolver = MockResolver::new();
+        let raw = "http://203.0.113.10\\@127.0.0.1/a.mp3";
+        match gate_play_url(raw, &resolver).await.unwrap() {
+            DomainAudioSource::Url(url) => {
+                assert_eq!(url, "http://203.0.113.10/@127.0.0.1/a.mp3");
+                assert_ne!(url, raw);
+                assert!(!url.contains('\\'));
+            }
+            other => panic!("expected url, got {other:?}"),
+        }
+
+        let resolver =
+            MockResolver::new().with("evil.example", vec!["203.0.113.10".parse().unwrap()]);
+        let raw = "http://evil.example\\@127.0.0.1/a.mp3";
+        match gate_play_url(raw, &resolver).await.unwrap() {
+            DomainAudioSource::Url(url) => {
+                assert_eq!(url, "http://evil.example/@127.0.0.1/a.mp3");
+            }
+            other => panic!("expected url, got {other:?}"),
+        }
+    }
+
+    /// A percent-encoded backslash is not a host terminator, so WHATWG
+    /// parses userinfo + host `127.0.0.1`. That must stay blocked.
+    #[tokio::test]
+    async fn play_url_rejects_encoded_backslash_userinfo_loopback() {
+        let resolver = MockResolver::new();
+        let err = gate_play_url("http://203.0.113.10%5c@127.0.0.1/a.mp3", &resolver)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        let body = http_body_util::BodyExt::collect(err.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let parsed: wire::ErrorBody = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed.code.as_deref(), Some("ssrf_blocked"));
+    }
+
+    #[tokio::test]
+    async fn play_library_forwards_canonical_path_not_the_raw_relative() {
+        let root = scratch();
+        fs::write(root.join("ok.mp3"), b"x").unwrap();
+        let resolver = MockResolver::new();
+        let source = wire::AudioSource::LibraryPath {
+            path: "./ok.mp3".into(),
+        };
+        match gate_play_source(&source, &resolver, &root).await.unwrap() {
+            DomainAudioSource::LibraryPath(path) => {
+                assert_eq!(path, root.canonicalize().unwrap().join("ok.mp3"));
+                assert_ne!(path, FsPath::new("./ok.mp3"));
+            }
+            other => panic!("expected library path, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&root);
     }
 }
