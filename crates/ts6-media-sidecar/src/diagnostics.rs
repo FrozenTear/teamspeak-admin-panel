@@ -87,10 +87,16 @@ impl Diagnostics {
         self.store_ffmpeg(format!("exit role={role} code={code} signal={signal}"));
     }
 
-    /// Plaintext HTTP was refused because DNS did not yield a pin.
-    /// Hostname only — no URL, userinfo, or address.
-    pub fn record_http_unpinned(&self, host: &str) {
-        let line = format!("reason=http_unpinned host={}", sanitize_hostname(host));
+    /// HTTP or HTTPS was refused because DNS did not yield a pin.
+    /// Hostname only — no URL, userinfo, or address. `scheme` selects
+    /// `http_unpinned` or `https_unpinned`.
+    pub fn record_unpinned(&self, scheme: &str, host: &str) {
+        let reason = if scheme == "https" {
+            "https_unpinned"
+        } else {
+            "http_unpinned"
+        };
+        let line = format!("reason={reason} host={}", sanitize_hostname(host));
         self.push_log(&format!("ssrf_reject {line}"));
         if let Ok(mut inner) = self.inner.lock() {
             inner.ssrf = Some(Timed {
@@ -98,6 +104,11 @@ impl Diagnostics {
                 value: line,
             });
         }
+    }
+
+    /// Plaintext HTTP was refused because DNS did not yield a pin.
+    pub fn record_http_unpinned(&self, host: &str) {
+        self.record_unpinned("http", host);
     }
 
     /// Record a `/source` SSRF rejection. Never stores the raw URL, userinfo,
@@ -508,6 +519,16 @@ mod tests {
         let ssrf = snap.sidecar_ssrf_reject.unwrap();
         assert!(ssrf.contains("host=[host]"), "{ssrf}");
         assert!(!ssrf.contains("10.1.2.3"), "{ssrf}");
+    }
+
+    #[test]
+    fn https_unpinned_uses_its_own_reason() {
+        let d = Diagnostics::new();
+        d.record_unpinned("https", "missing.test");
+        let snap = d.snapshot(None);
+        let ssrf = snap.sidecar_ssrf_reject.unwrap();
+        assert!(ssrf.contains("reason=https_unpinned"));
+        assert!(ssrf.contains("host=missing.test"));
     }
 
     #[test]

@@ -177,7 +177,7 @@ codes:
 
 | HTTP | `error`                       | When                                                              |
 | ---- | ----------------------------- | ----------------------------------------------------------------- |
-| 400  | `ssrf_blocked`                | URL fails the shared `ts6-ssrf` validator (loopback, private, …), or plaintext HTTP has no address to pin. |
+| 400  | `ssrf_blocked`                | URL fails the shared `ts6-ssrf` validator (loopback, private, …), or HTTP/HTTPS has no address to pin. |
 | 400  | `invalid_request`             | Missing/empty `url`, bad characters in `source_id`, …             |
 | 404  | `unknown_source_id`           | `/source/stop` or `/track/{id}` for a source not in the registry. |
 | 409  | `source_id_already_running`   | `POST /source` with a `source_id` that's already live.            |
@@ -195,25 +195,30 @@ Boot-time `--source` / `--source-lavfi-*` do **not** go through this
 validator. Those flags are a local-operator primitive (file paths,
 lavfi test patterns). `POST /source` is the untrusted-URL surface.
 
-DNS-rebinding defence in v1 splits by scheme:
+DNS-rebinding defence for `POST /source` is the loopback pin proxy
+(PURA-172, `http_pin.rs`) for **both** HTTP and HTTPS:
 
-* **HTTPS**: the original URL is handed to FFmpeg with `-tls_verify 1`
-  so the TLS peer cert must chain to a trusted CA *and* match the
-  hostname (FFmpeg defaults `tls_verify` to `0`). A DNS rebinder that
-  swaps in a private/metadata IP fails the handshake unless that host
-  can present a valid cert for the requested name. FFmpeg still
-  follows `3xx` itself — per-hop re-validation is PURA-150 / v2.
-* **HTTP**: `POST /source` registers the SSRF-pinned IP in a
-  loopback-only Host-preserving proxy (PURA-172, `http_pin.rs`) and
-  rewrites FFmpeg's `-i` to `http://127.0.0.1:<port>/<uuid>`. The
-  proxy pins the outbound socket with `reqwest::resolve_to_addrs`,
-  refuses `3xx` (502), and burns the token on `POST /source/stop`.
-  The initial GET's rebinding window is closed. If DNS does not yield
-  an address to pin (`resolved_ip` is `None`, spec §9.3), plaintext
-  HTTP is refused (`400 ssrf_blocked`) instead of being handed to
-  FFmpeg, which would resolve the name again later. Residual:
-  FFmpeg-initiated secondary fetches (HLS/DASH absolute segment URLs)
-  and HTTPS `3xx` follows are still PURA-150 follow-ups.
+* The SSRF-pinned IP is registered in the proxy and FFmpeg's `-i` is
+  rewritten to `http://127.0.0.1:<port>/<uuid>`. FFmpeg does not
+  resolve the source name.
+* The proxy pins the outbound socket with `reqwest::resolve_to_addrs`
+  and preserves `Host:`. HTTPS is terminated in the proxy: rustls
+  checks the certificate and uses the original hostname as SNI, so
+  virtual-hosted CDNs keep working without an IP-literal URL.
+* Every upstream `3xx` becomes `502`. FFmpeg never sees a `Location`.
+* HLS playlists are rewritten. Each media URI and `URI="..."`
+  attribute is resolved, re-checked with `ts6-ssrf`, and replaced with
+  a child pin URL. A nested internal URL fails the playlist. Child
+  tokens burn with the parent on `POST /source/stop`. DASH MPD and PLS
+  manifests are refused rather than forwarded unrewritten.
+* If DNS does not yield an address to pin (`resolved_ip` is `None`,
+  spec §9.3), the source is refused (`400 ssrf_blocked`) for both
+  schemes.
+* FFmpeg argv for a loopback pin URL sets
+  `-protocol_whitelist http,tcp,crypto` (no `file` / `https`). Direct
+  boot `--source https://` URLs, which do not go through this proxy,
+  set `-tls_verify 1` and
+  `-protocol_whitelist http,https,tcp,tls,crypto`.
 
 The earlier "rewrite the FFmpeg-input URL to the resolved IP literal"
 approach (PURA-149) was reverted because it broke TLS SNI / `Host:`

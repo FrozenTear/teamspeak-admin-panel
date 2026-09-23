@@ -106,7 +106,12 @@ impl SourceInput {
     fn args_for(&self, kind: TrackKind) -> Vec<String> {
         match self {
             SourceInput::Url(url) => {
-                let mut args = tls_args_for(url);
+                let mut args = Vec::new();
+                if let Some(whitelist) = protocol_whitelist_for(url) {
+                    args.push("-protocol_whitelist".into());
+                    args.push(whitelist.into());
+                }
+                args.extend(tls_args_for(url));
                 args.push("-i".into());
                 args.push(url.clone());
                 args
@@ -129,33 +134,44 @@ impl SourceInput {
     }
 }
 
+/// Protocols FFmpeg may open for a URL input. Must be passed *before* `-i`.
+///
+/// `POST /source` rewrites every HTTP(S) source to the loopback pin proxy,
+/// so the untrusted path only needs `http` and `tcp` (`crypto` covers
+/// HLS AES-128). `https`, `file`, `concat`, `subfile`, and `data` stay
+/// off that whitelist: a playlist URI the proxy failed to rewrite cannot
+/// be opened as HTTPS or as a local file. Redirects are not an FFmpeg
+/// flag here — Debian bookworm / Ubuntu 6.1 ffmpeg have no
+/// `-max_redirects`. The pin proxy answers every upstream `3xx` with 502,
+/// so FFmpeg never sees a `Location`.
+///
+/// Direct `https://` inputs (boot `--source`, which is an operator
+/// primitive and does not go through `POST /source`) still need
+/// `https`/`tls`, plus [`tls_args_for`].
+fn protocol_whitelist_for(url: &str) -> Option<&'static str> {
+    let lower = url.trim_start().to_ascii_lowercase();
+    if lower.starts_with("https://") {
+        Some("http,https,tcp,tls,crypto")
+    } else if lower.starts_with("http://") {
+        Some("http,tcp,crypto")
+    } else {
+        None
+    }
+}
+
 /// R6 (THE-1010) — force FFmpeg to verify TLS certificates on `https://`
-/// inputs.
+/// inputs that still reach FFmpeg directly (boot `--source`).
 ///
-/// Plaintext-HTTP sources never reach FFmpeg directly: the control plane
-/// rewrites them to the loopback IP-pin proxy (`http://127.0.0.1:<port>/…`,
-/// see [`crate::http_pin`]), so the DNS-rebinding window is already closed
-/// for those. `https://` sources, however, are handed to FFmpeg *verbatim*
-/// because the IP-pin trick breaks TLS SNI / `Host:` on virtual-hosted CDNs
-/// (PURA-149). The control plane's safety argument for that pass-through is
-/// "TLS hostname validation already binds the connection to the cert SAN" —
-/// **but that is only true if the TLS peer certificate is actually
-/// verified**, and FFmpeg's `tls` protocol defaults `tls_verify` to `0`
-/// (no verification). Left unset, an attacker who controls DNS for an
-/// `https` source host can rebind it to an internal / cloud-metadata IP at
-/// FFmpeg's fetch time; FFmpeg completes the TLS handshake without checking
-/// the cert and streams back internal content — a full SSRF read past the
-/// `ts6-ssrf` validator.
-///
-/// Setting `-tls_verify 1` makes FFmpeg reject any peer whose certificate
-/// does not chain to a trusted CA *and* match the requested hostname, which
-/// restores the cert-SAN binding the pass-through relies on. A rebind to
-/// `169.254.169.254` (or any internal host that cannot present a valid cert
-/// for the attacker's domain) now fails the handshake — failure-closed.
+/// `POST /source` does not use this path: HTTP and HTTPS are both rewritten
+/// to the loopback pin proxy, which verifies the upstream certificate
+/// itself. These args remain for a URL the operator passed on the command
+/// line, where FFmpeg's `tls` protocol would otherwise default
+/// `tls_verify` to `0`.
 ///
 /// `TS6_TLS_CA_FILE`, when set, pins the trust anchor to an explicit bundle
 /// (useful in minimal containers that don't ship a system trust store);
-/// otherwise FFmpeg's TLS backend uses its default store.
+/// otherwise FFmpeg's TLS backend uses its default store. The pin proxy
+/// reads the same variable when it terminates TLS for `POST /source`.
 fn tls_args_for(url: &str) -> Vec<String> {
     if !url.starts_with("https://") {
         return Vec::new();
@@ -1201,6 +1217,11 @@ mod tests {
             Some("1"),
             "https input MUST set -tls_verify 1 (R6); argv = {args:?}"
         );
+        assert_eq!(
+            value_after(&args, "-protocol_whitelist"),
+            Some("http,https,tcp,tls,crypto"),
+            "https input MUST constrain protocols; argv = {args:?}"
+        );
     }
 
     #[test]
@@ -1211,12 +1232,19 @@ mod tests {
         let cfg = PipelineConfig::new("src", SourceInput::Url("https://cdn.example/v.mp4".into()));
         let args = ffmpeg_audio_args(&cfg);
         let verify_idx = args.iter().position(|a| a == "-tls_verify");
+        let whitelist_idx = args.iter().position(|a| a == "-protocol_whitelist");
         let input_idx = args.iter().position(|a| a == "-i");
-        match (verify_idx, input_idx) {
-            (Some(v), Some(i)) => {
-                assert!(v < i, "-tls_verify must come before -i; argv = {args:?}")
+        match (verify_idx, whitelist_idx, input_idx) {
+            (Some(v), Some(w), Some(i)) => {
+                assert!(v < i, "-tls_verify must come before -i; argv = {args:?}");
+                assert!(
+                    w < i,
+                    "-protocol_whitelist must come before -i; argv = {args:?}"
+                );
             }
-            other => panic!("expected both -tls_verify and -i in argv, got {other:?}: {args:?}"),
+            other => panic!(
+                "expected -tls_verify, -protocol_whitelist, and -i in argv, got {other:?}: {args:?}"
+            ),
         }
     }
 
@@ -1234,6 +1262,18 @@ mod tests {
             !args.iter().any(|a| a == "-tls_verify"),
             "http loopback input must not carry -tls_verify; argv = {args:?}"
         );
+        assert_eq!(
+            value_after(&args, "-protocol_whitelist"),
+            Some("http,tcp,crypto"),
+            "loopback pin input must not be allowed to open https/file; argv = {args:?}"
+        );
+        let whitelist = value_after(&args, "-protocol_whitelist").unwrap();
+        assert!(
+            !whitelist
+                .split(',')
+                .any(|protocol| protocol == "https" || protocol == "file"),
+            "{whitelist}"
+        );
     }
 
     #[test]
@@ -1249,6 +1289,10 @@ mod tests {
         assert!(
             !args.iter().any(|a| a == "-tls_verify"),
             "synthetic lavfi input must not carry -tls_verify; argv = {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a == "-protocol_whitelist"),
+            "synthetic lavfi input must not carry -protocol_whitelist; argv = {args:?}"
         );
     }
 

@@ -77,7 +77,7 @@ pub struct Sidecar {
     pub fingerprint: String,
     pub origin: Arc<SidecarOrigin>,
     pub registry: PipelineRegistry,
-    /// PURA-172 — Host-preserving IP-pin proxy for plaintext-HTTP FFmpeg
+    /// PURA-172 — Host-preserving IP-pin proxy for HTTP and HTTPS FFmpeg
     /// fetches. Bound on `127.0.0.1:0` (loopback only). Tests can inspect
     /// `pin_proxy.local_addr` + `pin_proxy.registry` directly.
     pub pin_proxy: Arc<PinProxy>,
@@ -114,7 +114,7 @@ impl Sidecar {
         // PURA-172 — start the IP-pin proxy BEFORE the control plane so
         // every `POST /source` has a live proxy to register tokens against.
         let pin_proxy = Arc::new(
-            PinProxy::start()
+            PinProxy::start(config.resolver.clone())
                 .await
                 .context("start PinProxy (PURA-172)")?,
         );

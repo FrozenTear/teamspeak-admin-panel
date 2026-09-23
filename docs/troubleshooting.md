@@ -412,30 +412,32 @@ the upstream fetch fails with a `502 Bad Gateway` returned by the local
 loopback proxy and the sidecar log shows one of:
 
 ```
-WARN  ts6_media_sidecar::http_pin: PinProxy: refusing non-http upstream scheme=https host=cdn.example.org
-WARN  ts6_media_sidecar::http_pin: PinProxy: upstream attempted redirect; refusing (v1 no re-validation) status=302 host=cdn.example.org location=…
+WARN  ts6_media_sidecar::http_pin: PinProxy: refusing non-http(s) upstream scheme=file host=cdn.example.org
+WARN  ts6_media_sidecar::http_pin: PinProxy: upstream attempted redirect; refusing status=302 host=cdn.example.org location=…
+WARN  ts6_media_sidecar::http_pin: PinProxy: HLS playlist rewrite failed host=cdn.example.org reason=nested playlist url blocked
 WARN  ts6_media_sidecar::http_pin: PinProxy: upstream send failed err=… host=cdn.example.org ip=203.0.113.42
 ```
 
 **Why it happens.** The sidecar interposes a Rust-side `reqwest`-backed
-loopback proxy in front of FFmpeg's outbound HTTP fetch
-([PURA-172](https://github.com/FrozenTear/teamspeak-admin-panel/issues),
-the v1 close-out of the R6 DNS-rebinding window — the deeper v2
-[PURA-150](https://github.com/FrozenTear/teamspeak-admin-panel/issues)
-surface remains tracked separately). The proxy:
+loopback proxy in front of FFmpeg's outbound fetch
+([PURA-172](https://github.com/FrozenTear/teamspeak-admin-panel/issues)).
+HTTP and HTTPS `POST /source` URLs both go through it. The proxy:
 
-1. Requires the upstream URL to be plaintext HTTP (HTTPS is unchanged —
-   TLS validation already pins to the cert SAN).
+1. Accepts `http` and `https` upstreams. HTTPS is terminated in the
+   proxy (certificate check + original hostname as SNI) so FFmpeg only
+   speaks loopback HTTP.
 2. Pins the outbound socket to the IP `ts6-ssrf` validated against the
    private-range blocklist, regardless of any DNS the host's resolver
    would return at connect time.
-3. Refuses to follow redirects (every 3xx becomes a `502`) — re-running
-   SSRF per hop is v2 work.
-4. Preserves the original `Host:` header so virtual-hosted CDNs continue
+3. Refuses to follow redirects (every 3xx becomes a `502`).
+4. Rewrites HLS playlists and re-checks every nested URL. A nested
+   internal URL fails the playlist. DASH MPD and PLS manifests are
+   refused.
+5. Preserves the original `Host:` header so virtual-hosted CDNs continue
    to serve the right vhost.
 
-A "refusing non-http upstream" or "refusing redirect" log is **the system
-working as designed**: the upstream tried something the v1 SSRF surface
+A "refusing redirect" or "playlist rewrite failed" log is **the system
+working as designed**: the upstream tried something the SSRF surface
 will not let through. A "DNS rebinding attempt" specifically would show
 up as an upstream `send failed` against the SSRF-pinned IP, not a private-
 range IP — the rebind cannot land on a private host because the proxy
@@ -443,12 +445,14 @@ never resolved against the rebinder's response.
 
 **What to do.**
 
-- **Non-http upstream refused.** Use an HTTPS source URL — the proxy is
-  HTTP-only by design. HTTPS sources go straight to FFmpeg (TLS cert SAN
-  validation pins the connection).
+- **Non-http(s) upstream refused.** `POST /source` only accepts `http`
+  and `https`. Do not point the sidecar at `file:` or other schemes
+  through the control plane.
 - **Redirect refused.** Resolve the redirect chain off-line and supply
-  the final URL to `POST /source`. v1 will not re-validate per hop;
-  follow-the-redirect is on the v2 roadmap.
+  the final URL to `POST /source`. The proxy does not follow `3xx`.
+- **HLS rewrite failed.** A segment, key, or variant URL in the playlist
+  is not a public `http`/`https` address with a pin. Host the media on
+  a public URL and resubmit that playlist.
 - **Upstream `send failed`.** Confirm the upstream is reachable from the
   host network. If it is, the SSRF-pinned IP may be stale — restart the
   pipeline; the SSRF resolve is per `POST /source`.
