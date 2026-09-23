@@ -10,6 +10,8 @@
 //!    it, mutes/unmutes flip the muted columns. When the upstream emits
 //!    a `ts:client:connected` we don't yet know the full row, so the
 //!    component refetches the snapshot in the background and reconciles.
+//!    The move-user picker also subscribes to `server:{configId}:channels`
+//!    and refetches so create / rename / delete stay in the destination list.
 //! 3. Action buttons fire `POST` to the matching control endpoint. On
 //!    success we drop the action's row optimistically (kick) or update it
 //!    locally (mute/move) so the UI feels immediate; the WS event lands
@@ -82,7 +84,7 @@ pub fn ClientsPage() -> Element {
             async move { fetch_clients(gate, server_id, sid).await }
         }
     });
-    let channel_snapshot = use_resource({
+    let mut channel_snapshot = use_resource({
         let gate = gate.clone();
         move || {
             let gate = gate.clone();
@@ -147,6 +149,32 @@ pub fn ClientsPage() -> Element {
                 use futures::stream::StreamExt;
                 while let Some(env) = rx.next().await {
                     apply_event(&mut rows.write(), &env);
+                }
+            }
+        });
+    }
+
+    // Channel create / rename / delete land on `server:{id}:channels`.
+    // Without this, the move picker keeps the list from first load and a
+    // later channel is missing (or a deleted one is still offered).
+    {
+        let hub = hub.clone();
+        let _channels_live = use_resource(move || {
+            let hub = hub.clone();
+            let cur_server = *server_changed_marker.read();
+            async move {
+                if cur_server == 0 {
+                    return;
+                }
+                let topic = format!("server:{cur_server}:channels");
+                let mut handle = hub.subscribe(topic).await;
+                let Some(mut rx) = handle.take_receiver() else {
+                    return;
+                };
+                let _drop_guard = handle;
+                use futures::stream::StreamExt;
+                while let Some(_env) = rx.next().await {
+                    channel_snapshot.restart();
                 }
             }
         });
@@ -256,6 +284,12 @@ pub fn ClientsPage() -> Element {
         }
     };
 
+    let (channels_loaded, channels_error) = match channel_snapshot.read().as_ref() {
+        None => (false, None),
+        Some(Ok(_)) => (true, None),
+        Some(Err(e)) => (true, Some(format_error(e))),
+    };
+
     let all_rows = rows.read().clone();
     let query = filter.read().clone();
     let visible = filter_clients(&all_rows, &query);
@@ -312,7 +346,8 @@ pub fn ClientsPage() -> Element {
                         EventHandler::new(move |args: (i64, i64)| mv(args.0, args.1))
                     },
                     channels: channels.read().clone(),
-                    channels_loaded: channel_snapshot.read().is_some(),
+                    channels_loaded: channels_loaded,
+                    channels_error: channels_error,
                     can_move: can_move_clients,
                 }
             }
@@ -374,6 +409,7 @@ struct ClientsTableProps {
     on_move: EventHandler<(i64, i64)>,
     channels: Vec<ChannelTreeNode>,
     channels_loaded: bool,
+    channels_error: Option<String>,
     can_move: bool,
 }
 
@@ -481,6 +517,7 @@ fn ClientsTable(props: ClientsTableProps) -> Element {
                                             current_cid: cid,
                                             channels: props.channels.clone(),
                                             channels_loaded: props.channels_loaded,
+                                            channels_error: props.channels_error.clone(),
                                             on_move: on_move,
                                         }
                                     }
@@ -494,12 +531,44 @@ fn ClientsTable(props: ClientsTableProps) -> Element {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MovePickerPhase {
+    Loading,
+    Error,
+    Unavailable,
+    NoOther,
+    Ready,
+}
+
+/// Failed fetches are an error, including when the list is empty. "No
+/// other channel" is only the successful case where every remaining row
+/// is the user's current channel (or a spacer).
+fn move_picker_phase(
+    loaded: bool,
+    fetch_failed: bool,
+    channels_empty: bool,
+    targets_empty: bool,
+) -> MovePickerPhase {
+    if !loaded {
+        MovePickerPhase::Loading
+    } else if fetch_failed {
+        MovePickerPhase::Error
+    } else if channels_empty {
+        MovePickerPhase::Unavailable
+    } else if targets_empty {
+        MovePickerPhase::NoOther
+    } else {
+        MovePickerPhase::Ready
+    }
+}
+
 #[derive(Props, Clone, PartialEq)]
 struct MoveControlProps {
     clid: i64,
     current_cid: i64,
     channels: Vec<ChannelTreeNode>,
     channels_loaded: bool,
+    channels_error: Option<String>,
     on_move: EventHandler<(i64, i64)>,
 }
 
@@ -511,13 +580,24 @@ fn MoveControl(props: MoveControlProps) -> Element {
     let mut selected: Signal<i64> = use_signal(|| 0i64);
     let clid = props.clid;
     let on_move = props.on_move;
-    if !props.channels_loaded {
+    let phase = move_picker_phase(
+        props.channels_loaded,
+        props.channels_error.is_some(),
+        props.channels.is_empty(),
+        targets.is_empty(),
+    );
+    if phase == MovePickerPhase::Loading {
         return rsx! { span { class: "muted", "Loading channels…" } };
     }
-    if props.channels.is_empty() {
+    if let Some(err) = props.channels_error.as_ref() {
+        return rsx! {
+            span { class: "muted", role: "alert", "Could not load channels. {err}" }
+        };
+    }
+    if phase == MovePickerPhase::Unavailable {
         return rsx! { span { class: "muted", "Channel list unavailable" } };
     }
-    if targets.is_empty() {
+    if phase == MovePickerPhase::NoOther {
         return rsx! { span { class: "muted", "No other channel" } };
     }
     rsx! {
@@ -826,5 +906,33 @@ mod tests {
     #[test]
     fn copy_to_clipboard_is_a_noop_on_native() {
         copy_to_clipboard("anything");
+    }
+
+    #[test]
+    fn failed_channel_fetch_is_an_error_not_an_empty_picker() {
+        assert_eq!(
+            move_picker_phase(true, true, true, true),
+            MovePickerPhase::Error
+        );
+        assert_eq!(
+            move_picker_phase(true, true, false, false),
+            MovePickerPhase::Error
+        );
+        assert_eq!(
+            move_picker_phase(false, true, true, true),
+            MovePickerPhase::Loading
+        );
+        assert_eq!(
+            move_picker_phase(true, false, false, true),
+            MovePickerPhase::NoOther
+        );
+        assert_eq!(
+            move_picker_phase(true, false, true, true),
+            MovePickerPhase::Unavailable
+        );
+        assert_eq!(
+            move_picker_phase(true, false, false, false),
+            MovePickerPhase::Ready
+        );
     }
 }
