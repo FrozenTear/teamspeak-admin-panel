@@ -64,7 +64,10 @@ pub fn classify_playback_url(url: &str) -> PlaybackRoute {
 pub fn normalize_radio_url(url: &str) -> String {
     let trimmed = url.trim();
     for prefix in ["icy://", "icecast://", "shoutcast://"] {
-        if trimmed.len() >= prefix.len() && trimmed[..prefix.len()].eq_ignore_ascii_case(prefix) {
+        if trimmed
+            .get(..prefix.len())
+            .is_some_and(|p| p.eq_ignore_ascii_case(prefix))
+        {
             return format!("http://{}", &trimmed[prefix.len()..]);
         }
     }
@@ -235,6 +238,17 @@ fn split_host_port(authority: &str) -> Option<(&str, Option<u16>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_radio_url_does_not_split_multibyte_chars() {
+        // Byte 10 (`icecast://`.len()) falls inside the `é`.
+        let url = "https://aéicecast.example/stream";
+        assert_eq!(normalize_radio_url(url), url);
+        assert_eq!(
+            normalize_radio_url("ICECAST://radio.example/live"),
+            "http://radio.example/live"
+        );
+    }
 
     #[test]
     fn extractor_sites_and_ytsearch_stay_on_ytdlp() {
