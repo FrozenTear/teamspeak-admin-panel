@@ -63,7 +63,9 @@ warm-resolver via a pre_exec `sched_setaffinity` (leader
 Axum — still off send `0-1`). Packing **C** (music `podman update --cpuset-cpus=0-1`)
 is **rejected** — the v1.6.15 Angerfist dig (und/C/stall
 **163/590/117**) showed container-wide 0-1 traps ffmpeg on send
-cores. The apply script refuses send-only music HostConfig.
+cores. The apply script refuses any music HostConfig cpuset under
+packing B (not only send-only `0-1`) and always refuses send-only
+music HostConfig.
 
 Packing **A** (fullstack→`4-5`, DECODE `2-3`, music HostConfig `0-3`)
 stays a commented gated alt and needs `TS6_SOFT_PIN_SHRINK_ACK=1`.

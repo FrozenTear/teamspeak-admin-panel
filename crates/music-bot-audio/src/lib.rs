@@ -15,6 +15,7 @@
 //! [PURA-119]: https://teamspeak-heaven/PURA/issues/PURA-119
 
 pub mod bug_report;
+mod cookies;
 pub mod cpuset;
 pub mod encoder;
 pub mod gate;

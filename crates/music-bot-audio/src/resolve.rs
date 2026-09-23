@@ -108,8 +108,15 @@ async fn run_once(url: &str, cookie_file: Option<&Path>) -> std::io::Result<Stri
         .arg("-f")
         .arg("bestaudio")
         .arg("-g");
-    if let Some(p) = cookie_file {
-        cmd.arg("--cookies").arg(p);
+    // `--cookies` is rewritten on exit. Hold a private copy until this
+    // process has been waited (or killed on timeout) so the upload is
+    // only read.
+    let cookie_copy = match cookie_file {
+        Some(p) => Some(crate::cookies::CookieJarCopy::from_source(p)?),
+        None => None,
+    };
+    if let Some(copy) = cookie_copy.as_ref() {
+        cmd.arg("--cookies").arg(copy.path());
     }
     cmd.arg(url)
         .stdin(Stdio::null())
@@ -155,12 +162,16 @@ async fn run_once(url: &str, cookie_file: Option<&Path>) -> std::io::Result<Stri
     // `-f bestaudio -g` prints one direct URL per line; with a single
     // selected format that is one line. Take the first non-empty line.
     let stdout = String::from_utf8_lossy(&out.stdout);
-    stdout
+    let direct = stdout
         .lines()
         .map(str::trim)
         .find(|l| !l.is_empty())
         .map(str::to_string)
-        .ok_or_else(|| std::io::Error::other("yt-dlp -g produced no URL"))
+        .ok_or_else(|| std::io::Error::other("yt-dlp -g produced no URL"));
+    // `cookie_copy` stays bound through the wait above. Drop it only after
+    // yt-dlp has exited so its write-back cannot land on the upload.
+    drop(cookie_copy);
+    direct
 }
 
 /// Does `stderr` describe a transient network timeout — something a fresh
