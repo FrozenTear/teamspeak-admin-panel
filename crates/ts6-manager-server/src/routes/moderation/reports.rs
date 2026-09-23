@@ -48,7 +48,7 @@ pub(super) struct ReportListQuery {
 /// shared `list_by_status` primitive stays scope-agnostic.
 pub(super) async fn list(
     State(state): State<AppState>,
-    _gate: RequirePermission<CaseView>,
+    gate: RequirePermission<CaseView>,
     Query(q): Query<ReportListQuery>,
 ) -> Result<Json<Vec<wire::ModerationReport>>, Response> {
     let status = q.status.as_deref().unwrap_or("pending");
@@ -56,6 +56,18 @@ pub(super) async fn list(
         return Err(validation(
             "status must be one of pending / promoted / dismissed",
         ));
+    }
+    let user = gate.0;
+    // Named server: `check_read` before any row is returned. Unscoped:
+    // lens to grants (admins unfiltered).
+    let scope = if let Some(sid) = q.server_config_id {
+        super::ensure_server_read(&state, &user, sid).await?;
+        None
+    } else {
+        super::read_scope(&state, &user).await?
+    };
+    if scope.as_ref().is_some_and(|ids| ids.is_empty()) {
+        return Ok(Json(Vec::new()));
     }
     let rows = moderation_reports::list_by_status(&state.db, status)
         .await
@@ -68,6 +80,7 @@ pub(super) async fn list(
         .filter(|r| {
             q.server_config_id.is_none_or(|v| r.serverConfigId == v)
                 && q.virtual_server_id.is_none_or(|v| r.virtualServerId == v)
+                && super::in_read_scope(&scope, r.serverConfigId)
         })
         .map(report_to_wire)
         .collect();
@@ -90,7 +103,11 @@ pub(super) async fn promote(
         return Err(validation("reason is required"));
     }
 
-    let report = load_pending(&state, id).await?;
+    let report = load_report(&state, id).await?;
+    super::ensure_server_write(&state, &actor, report.serverConfigId).await?;
+    if report.status != "pending" {
+        return Err(conflict("report has already been triaged"));
+    }
 
     // A report names its accused by UID *or* free-text nickname — a
     // durable UID is not always known pre-case. The case keys on whatever
@@ -155,7 +172,11 @@ pub(super) async fn dismiss(
     Json(req): Json<wire::DismissReportRequest>,
 ) -> Result<Json<wire::ModerationReport>, Response> {
     let actor = gate.0;
-    let report = load_pending(&state, id).await?;
+    let report = load_report(&state, id).await?;
+    super::ensure_server_write(&state, &actor, report.serverConfigId).await?;
+    if report.status != "pending" {
+        return Err(conflict("report has already been triaged"));
+    }
 
     let dismissed = moderation_reports::dismiss(&state.db, report.id, Some(actor.id))
         .await
@@ -193,21 +214,19 @@ pub(super) async fn dismiss(
     Ok(Json(report_to_wire(dismissed)))
 }
 
-/// Load a report and require it to be `pending` — triage is a one-shot
-/// transition, so a `promoted` / `dismissed` report is a `409`.
-async fn load_pending(
+/// Load a report or map the absence to `404`. Callers run the grant
+/// check on the loaded row before the pending-status check, so a caller
+/// without access to the report's server does not learn whether it was
+/// already triaged.
+async fn load_report(
     state: &AppState,
     id: i64,
 ) -> Result<crate::repos::moderation_reports::ModerationReport, Response> {
-    let report = moderation_reports::find_by_id(&state.db, id)
+    moderation_reports::find_by_id(&state.db, id)
         .await
         .map_err(|e| {
             tracing::error!(err = %e, report_id = id, "moderation report lookup failed");
             internal()
         })?
-        .ok_or_else(|| not_found("report not found"))?;
-    if report.status != "pending" {
-        return Err(conflict("report has already been triaged"));
-    }
-    Ok(report)
+        .ok_or_else(|| not_found("report not found"))
 }

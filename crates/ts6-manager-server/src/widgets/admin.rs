@@ -8,10 +8,14 @@
 //!   `server_user_grant` row on. `detail` for a non-granted server returns
 //!   404, mirroring the rest of the per-server surface.
 //! - `POST` / `PATCH` / `DELETE` / `regenerate-token` →
-//!   [`crate::auth::extractors::RequireModerator`] (admin OR moderator). Spec
-//!   §7.27 originally says "Y+admin"; the issue scope and §6.13 RBAC table
-//!   ratify "admin or moderator" so this matches the canonical operator
-//!   surface.
+//!   [`crate::auth::extractors::RequireModerator`] (admin OR moderator)
+//!   **and** [`crate::routes::control::access::check_write`] on the
+//!   widget's server. A moderator needs a `server_user_grant` for that
+//!   server; admins stay unfiltered. Spec §7.27 originally says
+//!   "Y+admin"; the issue scope and §6.13 RBAC table ratify "admin or
+//!   moderator" so the role half matches the canonical operator surface.
+//!   `PATCH` cannot rebind `serverConfigId` (the wire body omits it), so
+//!   the write check is on the stored server only.
 //!
 //! Cache invalidation:
 //!
@@ -43,6 +47,7 @@ use crate::auth::extractors::{AuthUser, RequireAuth, RequireModerator};
 use crate::repos::server_connections::{self, ServerConnection};
 use crate::repos::server_user_grants;
 use crate::repos::widgets::{self as widget_repo, NewWidget, Widget, WidgetUpdate};
+use crate::routes::control::access;
 
 /// Spec §26.1 — token alphabet. URL-safe (`-` / `_`), 64 symbols / 6 bits per
 /// char. Same character set as `nanoid` and as
@@ -222,23 +227,17 @@ async fn detail(
 /// `POST /api/widgets`.
 async fn create(
     State(state): State<AppState>,
-    RequireModerator(_user): RequireModerator,
+    RequireModerator(user): RequireModerator,
     Json(req): Json<CreateWidgetRequest>,
 ) -> Result<(StatusCode, Json<WidgetSummary>), Response> {
     if req.name.trim().is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "name must not be empty"));
     }
 
-    // Confirm the target server exists. A widget that points at a deleted
-    // server is permanently 404 from the public side, so reject the bind at
-    // creation time rather than letting the row land orphaned.
-    let server = server_connections::find_by_id(&state.db, req.server_config_id)
-        .await
-        .map_err(|e| {
-            tracing::error!(err = %e, "widgets admin: server lookup on create failed");
-            internal()
-        })?
-        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "serverConfigId does not resolve"))?;
+    // `check_write` resolves the server (missing → 404) and requires a
+    // grant for non-admins. A widget bound to a server the caller cannot
+    // write would mint a token that reads that server's live tree.
+    let server = access::check_write(&state, &user, req.server_config_id).await?;
 
     let new = NewWidget {
         name: req.name,
@@ -265,7 +264,7 @@ async fn create(
 /// never a stale cache hit).
 async fn patch(
     State(state): State<AppState>,
-    RequireModerator(_user): RequireModerator,
+    RequireModerator(user): RequireModerator,
     Path(id): Path<i64>,
     Json(req): Json<UpdateWidgetRequest>,
 ) -> Result<Json<WidgetSummary>, Response> {
@@ -276,6 +275,9 @@ async fn patch(
             internal()
         })?
         .ok_or_else(not_found)?;
+    // `UpdateWidgetRequest` does not carry `serverConfigId` — rebinding a
+    // widget is a new row — so the grant check is on the stored server.
+    access::check_write(&state, &user, existing.serverConfigId).await?;
     let old_token = existing.token.clone();
 
     let patch = WidgetUpdate {
@@ -312,7 +314,7 @@ async fn patch(
 /// can't race past the eviction and re-warm the entry.
 async fn delete(
     State(state): State<AppState>,
-    RequireModerator(_user): RequireModerator,
+    RequireModerator(user): RequireModerator,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, Response> {
     let existing = match widget_repo::find_by_id(&state.db, id).await {
@@ -323,6 +325,9 @@ async fn delete(
             return Err(internal());
         }
     };
+    // Before cache eviction and the row delete, so a caller without a
+    // grant cannot drop another server's public widget cache.
+    access::check_write(&state, &user, existing.serverConfigId).await?;
     state.widget_cache.invalidate(&existing.token).await;
     widget_repo::delete(&state.db, id).await.map_err(|e| {
         tracing::error!(err = %e, widget_id = id, "widgets admin: delete failed");
@@ -351,7 +356,7 @@ async fn delete(
 /// token. No correctness loss.
 async fn regenerate_token(
     State(state): State<AppState>,
-    RequireModerator(_user): RequireModerator,
+    RequireModerator(user): RequireModerator,
     Path(id): Path<i64>,
 ) -> Result<Json<WidgetSummary>, Response> {
     let existing = widget_repo::find_by_id(&state.db, id)
@@ -361,6 +366,7 @@ async fn regenerate_token(
             internal()
         })?
         .ok_or_else(not_found)?;
+    access::check_write(&state, &user, existing.serverConfigId).await?;
     let old_token = existing.token.clone();
 
     state.widget_cache.invalidate(&old_token).await;
@@ -649,6 +655,12 @@ mod tests {
 
         for role in ["moderator", "admin"] {
             let uid = seed_user(&state, role, role).await;
+            // Moderators need a grant on the target server; admins do not.
+            if role == "moderator" {
+                server_user_grants::insert(&state.db, uid, server)
+                    .await
+                    .unwrap();
+            }
             let t = mint(&state, uid, role, role);
             let resp = app(state.clone())
                 .oneshot(
@@ -763,7 +775,131 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A moderator granted only on server A cannot mint, edit, delete, or
+    /// rotate a token for a widget on server B. An admin still can.
+    #[tokio::test]
+    async fn moderator_without_grant_cannot_write_widget_on_other_server() {
+        let state = fresh_state().await;
+        let server_a = seed_server(&state).await;
+        let server_b = seed_server(&state).await;
+        let aid = seed_user(&state, "a", "admin").await;
+        let admin_token = mint(&state, aid, "a", "admin");
+        let mid = seed_user(&state, "m", "moderator").await;
+        server_user_grants::insert(&state.db, mid, server_a)
+            .await
+            .unwrap();
+        let mod_token = mint(&state, mid, "m", "moderator");
+
+        let widget_b = create_widget_as_admin(&state, &admin_token, server_b).await;
+
+        let resp = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/widgets")
+                    .header("authorization", auth(&mod_token))
+                    .header("content-type", "application/json")
+                    .body(json(&create_body(server_b)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let patch_body = serde_json::json!({ "theme": "neon" });
+        let resp = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::PATCH)
+                    .uri(format!("/api/widgets/{}", widget_b.id))
+                    .header("authorization", auth(&mod_token))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&patch_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let resp = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/widgets/{}/regenerate-token", widget_b.id))
+                    .header("authorization", auth(&mod_token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let resp = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("/api/widgets/{}", widget_b.id))
+                    .header("authorization", auth(&mod_token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // The row and its token are unchanged.
+        let resp = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/widgets/{}", widget_b.id))
+                    .header("authorization", auth(&admin_token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let still: WidgetSummary = read_json(resp).await;
+        assert_eq!(still.token, widget_b.token);
+        assert_eq!(still.server_config_id, server_b);
+
+        // Grant on A is enough to mint a widget for A.
+        let resp = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/widgets")
+                    .header("authorization", auth(&mod_token))
+                    .header("content-type", "application/json")
+                    .body(json(&create_body(server_a)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let created: WidgetSummary = read_json(resp).await;
+        assert_eq!(created.server_config_id, server_a);
+
+        // Admin can still patch B.
+        let resp = app(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::PATCH)
+                    .uri(format!("/api/widgets/{}", widget_b.id))
+                    .header("authorization", auth(&admin_token))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&patch_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let updated: WidgetSummary = read_json(resp).await;
+        assert_eq!(updated.theme, "neon");
     }
 
     // ---------------------------------------------------------------------

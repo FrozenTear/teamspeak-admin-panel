@@ -76,6 +76,48 @@ async fn seed_user(state: &AppState, username: &str, role: &str) -> i64 {
     .id
 }
 
+/// First `server_connection` in a fresh DB is id `1`, which the fixtures
+/// below (`open_case_req`, complaint queries, seeded reports) hard-code.
+async fn seed_server(state: &AppState) -> i64 {
+    let id = insert_server(state, "Primary").await;
+    assert_eq!(id, 1, "moderation fixtures pin serverConfigId = 1");
+    id
+}
+
+async fn insert_server(state: &AppState, name: &str) -> i64 {
+    crate::repos::server_connections::insert(
+        &state.db,
+        crate::repos::server_connections::NewServerConnection {
+            name: name.into(),
+            host: "ts.example.com".into(),
+            webqueryPort: 10080,
+            apiKey: crate::crypto::seal("k").unwrap(),
+            useHttps: false,
+            sshPort: 10022,
+            sshUsername: None,
+            sshPassword: None,
+            queryBotChannel: None,
+            queryBotNickname: None,
+            sshBotNickname: None,
+            enabled: true,
+            controlPath: None,
+            sshAuthMethod: None,
+            sshPrivateKey: None,
+            sshKeyAgentSocket: None,
+            sshHostKeyFingerprint: None,
+        },
+    )
+    .await
+    .unwrap()
+    .id
+}
+
+async fn grant(state: &AppState, user_id: i64, server_id: i64) {
+    crate::repos::server_user_grants::insert(&state.db, user_id, server_id)
+        .await
+        .unwrap();
+}
+
 fn mint(state: &AppState, id: i64, username: &str, role: &str) -> String {
     jwt::mint_access(
         id,
@@ -165,7 +207,9 @@ async fn unauthenticated_request_is_rejected() {
 #[tokio::test]
 async fn moderator_opens_lists_and_reads_a_case() {
     let state = fresh_state().await;
+    seed_server(&state).await;
     let mid = seed_user(&state, "mod", "moderator").await;
+    grant(&state, mid, 1).await;
     let token = mint(&state, mid, "mod", "moderator");
     let app = app(state);
 
@@ -230,6 +274,7 @@ async fn detail_404_for_missing_case() {
 #[tokio::test]
 async fn note_action_appends_timeline_and_actions_the_case() {
     let state = fresh_state().await;
+    seed_server(&state).await;
     let aid = seed_user(&state, "admin", "admin").await;
     let token = mint(&state, aid, "admin", "admin");
     let app = app(state);
@@ -276,6 +321,7 @@ async fn note_action_appends_timeline_and_actions_the_case() {
 #[tokio::test]
 async fn action_requires_clid_for_kick() {
     let state = fresh_state().await;
+    seed_server(&state).await;
     let aid = seed_user(&state, "admin", "admin").await;
     let token = mint(&state, aid, "admin", "admin");
     let app = app(state);
@@ -308,8 +354,11 @@ async fn action_requires_clid_for_kick() {
 #[tokio::test]
 async fn action_denied_without_the_catalog_permission() {
     let state = fresh_state().await;
-    // A viewer with only `case.view` can read but cannot append a note
-    // action (needs `note.write`).
+    // `check_write` rejects viewers even when the catalog grants
+    // `case.manage` and a `server_user_grant` exists. Viewers never
+    // mutate. Catalog denial for a role that *can* pass `check_write`
+    // is `ban_ip` (the one permission a moderator lacks by default).
+    seed_server(&state).await;
     let vid = seed_user(&state, "view", "viewer").await;
     user_permissions::replace_all(
         &state.db,
@@ -322,30 +371,11 @@ async fn action_denied_without_the_catalog_permission() {
     )
     .await
     .unwrap();
+    grant(&state, vid, 1).await;
     let token = mint(&state, vid, "view", "viewer");
-    let app = app(state);
 
-    let resp = app
-        .clone()
+    let resp = app(state)
         .oneshot(post("/api/moderation/cases", &token, &open_case_req()))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let case: wire::ModerationCase = read_json(resp).await;
-
-    let note_action = wire::AppendActionRequest {
-        action_kind: "note".into(),
-        reason: "x".into(),
-        clid: None,
-        ip: None,
-        ban_duration_secs: None,
-    };
-    let resp = app
-        .oneshot(post(
-            &format!("/api/moderation/cases/{}/actions", case.id),
-            &token,
-            &note_action,
-        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -357,7 +387,9 @@ async fn ban_ip_denied_for_moderator_without_explicit_grant() {
     // A `moderator` holds the role default set — the whole catalog *except*
     // `moderation.action.ban_ip`. So a `ban_ip` action is forbidden until
     // the address gate is granted per-user (PURA-290).
+    seed_server(&state).await;
     let mid = seed_user(&state, "mod", "moderator").await;
+    grant(&state, mid, 1).await;
     let token = mint(&state, mid, "mod", "moderator");
     let app = app(state);
 
@@ -393,7 +425,9 @@ async fn ban_ip_with_grant_passes_the_gate_and_requires_an_ip() {
     // permission gate — it then reaches `ip` validation. A 400 here (rather
     // than the 403 the un-granted moderator gets above) proves the catalog
     // permission now gates a real call path.
+    seed_server(&state).await;
     let mid = seed_user(&state, "mod", "moderator").await;
+    grant(&state, mid, 1).await;
     user_permissions::replace_all(
         &state.db,
         mid,
@@ -437,6 +471,7 @@ async fn ban_ip_with_grant_passes_the_gate_and_requires_an_ip() {
 #[tokio::test]
 async fn resolve_then_reopen_walks_the_state_machine() {
     let state = fresh_state().await;
+    seed_server(&state).await;
     let aid = seed_user(&state, "admin", "admin").await;
     let token = mint(&state, aid, "admin", "admin");
     let app = app(state.clone());
@@ -524,6 +559,7 @@ async fn resolve_then_reopen_walks_the_state_machine() {
 #[tokio::test]
 async fn resolve_requires_a_resolution_note() {
     let state = fresh_state().await;
+    seed_server(&state).await;
     let aid = seed_user(&state, "admin", "admin").await;
     let token = mint(&state, aid, "admin", "admin");
     let app = app(state);
@@ -552,6 +588,7 @@ async fn resolve_requires_a_resolution_note() {
 #[tokio::test]
 async fn notes_create_list_and_history_fan_in() {
     let state = fresh_state().await;
+    seed_server(&state).await;
     let aid = seed_user(&state, "admin", "admin").await;
     let token = mint(&state, aid, "admin", "admin");
     let app = app(state);
@@ -732,6 +769,7 @@ async fn open_case(app: &Router, token: &str, req: &wire::OpenCaseRequest) -> wi
 #[tokio::test]
 async fn case_list_origin_filter_isolates_automod() {
     let state = fresh_state().await;
+    seed_server(&state).await;
     let aid = seed_user(&state, "admin", "admin").await;
     let token = mint(&state, aid, "admin", "admin");
     let app = app(state);
@@ -769,6 +807,7 @@ async fn case_list_origin_filter_isolates_automod() {
 #[tokio::test]
 async fn automod_false_positive_resolve_tags_the_resolve_action() {
     let state = fresh_state().await;
+    seed_server(&state).await;
     let aid = seed_user(&state, "admin", "admin").await;
     let token = mint(&state, aid, "admin", "admin");
     let app = app(state);
@@ -812,6 +851,7 @@ async fn automod_false_positive_resolve_tags_the_resolve_action() {
 #[tokio::test]
 async fn false_positive_flag_is_ignored_on_an_operator_case() {
     let state = fresh_state().await;
+    seed_server(&state).await;
     let aid = seed_user(&state, "admin", "admin").await;
     let token = mint(&state, aid, "admin", "admin");
     let app = app(state);
@@ -855,6 +895,7 @@ async fn false_positive_flag_is_ignored_on_an_operator_case() {
 #[tokio::test]
 async fn automod_metrics_reports_per_rule_rows() {
     let state = fresh_state().await;
+    seed_server(&state).await;
     let aid = seed_user(&state, "admin", "admin").await;
     let token = mint(&state, aid, "admin", "admin");
     let app = app(state);
@@ -907,6 +948,7 @@ async fn automod_metrics_reports_per_rule_rows() {
 #[tokio::test]
 async fn revert_is_rejected_on_a_non_automod_case() {
     let state = fresh_state().await;
+    seed_server(&state).await;
     let aid = seed_user(&state, "admin", "admin").await;
     let token = mint(&state, aid, "admin", "admin");
     let app = app(state);
@@ -927,6 +969,7 @@ async fn revert_is_rejected_on_a_non_automod_case() {
 #[tokio::test]
 async fn revert_404_for_a_missing_action() {
     let state = fresh_state().await;
+    seed_server(&state).await;
     let aid = seed_user(&state, "admin", "admin").await;
     let token = mint(&state, aid, "admin", "admin");
     let app = app(state);
@@ -946,6 +989,7 @@ async fn revert_404_for_a_missing_action() {
 #[tokio::test]
 async fn revert_rejects_an_unrevertable_action_kind() {
     let state = fresh_state().await;
+    seed_server(&state).await;
     let aid = seed_user(&state, "admin", "admin").await;
     let token = mint(&state, aid, "admin", "admin");
     let app = app(state);
@@ -1058,6 +1102,7 @@ async fn viewer_is_forbidden_on_report_list() {
 #[tokio::test]
 async fn report_list_returns_pending_then_promote_opens_a_case() {
     let state = fresh_state().await;
+    seed_server(&state).await;
     let aid = seed_user(&state, "admin", "admin").await;
     let token = mint(&state, aid, "admin", "admin");
     let report_id = seed_report(&state, "uid-bad").await;
@@ -1103,6 +1148,7 @@ async fn report_list_returns_pending_then_promote_opens_a_case() {
 #[tokio::test]
 async fn report_dismiss_closes_without_opening_a_case() {
     let state = fresh_state().await;
+    seed_server(&state).await;
     let aid = seed_user(&state, "admin", "admin").await;
     let token = mint(&state, aid, "admin", "admin");
     let report_id = seed_report(&state, "uid-noise").await;
@@ -1134,6 +1180,7 @@ async fn report_dismiss_closes_without_opening_a_case() {
 #[tokio::test]
 async fn report_promote_twice_is_a_conflict() {
     let state = fresh_state().await;
+    seed_server(&state).await;
     let aid = seed_user(&state, "admin", "admin").await;
     let token = mint(&state, aid, "admin", "admin");
     let report_id = seed_report(&state, "uid-dup").await;
@@ -1194,6 +1241,7 @@ async fn appealed_status_filter_surfaces_the_case() {
 #[tokio::test]
 async fn appeal_uphold_resolves_the_case() {
     let state = fresh_state().await;
+    seed_server(&state).await;
     let aid = seed_user(&state, "admin", "admin").await;
     let token = mint(&state, aid, "admin", "admin");
     let (case_id, _) = seed_appealed_case(&state, "uid-up").await;
@@ -1233,6 +1281,7 @@ async fn appeal_overturn_resolves_the_case() {
     // A case with no ban on its timeline — the overturn records the
     // decision with no TS6 reversal dispatch (`reversal: none`).
     let state = fresh_state().await;
+    seed_server(&state).await;
     let aid = seed_user(&state, "admin", "admin").await;
     let token = mint(&state, aid, "admin", "admin");
     let (case_id, _) = seed_appealed_case(&state, "uid-over").await;
@@ -1268,6 +1317,7 @@ async fn appeal_overturn_resolves_the_case() {
 #[tokio::test]
 async fn appeal_decision_requires_appealed_status() {
     let state = fresh_state().await;
+    seed_server(&state).await;
     let aid = seed_user(&state, "admin", "admin").await;
     let token = mint(&state, aid, "admin", "admin");
     let app = app(state);
@@ -1289,4 +1339,211 @@ async fn appeal_decision_requires_appealed_status() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CONFLICT);
+}
+
+/// Moderator granted only on server A cannot read or mutate server B.
+/// Admin stays unfiltered. Notes stay UID-scoped (no `serverConfigId`).
+#[tokio::test]
+async fn moderator_grant_on_a_cannot_touch_server_b() {
+    let state = fresh_state().await;
+    let server_a = insert_server(&state, "A").await;
+    let server_b = insert_server(&state, "B").await;
+    let mid = seed_user(&state, "mod", "moderator").await;
+    grant(&state, mid, server_a).await;
+    let aid = seed_user(&state, "admin", "admin").await;
+    let mod_token = mint(&state, mid, "mod", "moderator");
+    let admin_token = mint(&state, aid, "admin", "admin");
+    let app = app(state.clone());
+
+    let mut on_a = open_case_req();
+    on_a.server_config_id = server_a;
+    on_a.subject_uid = "uid-shared".into();
+    let case_a = open_case(&app, &mod_token, &on_a).await;
+
+    let mut on_b = open_case_req();
+    on_b.server_config_id = server_b;
+    on_b.subject_uid = "uid-shared".into();
+    let case_b = open_case(&app, &admin_token, &on_b).await;
+
+    // Opening against B is refused; A stays writable.
+    let resp = app
+        .clone()
+        .oneshot(post("/api/moderation/cases", &mod_token, &on_b))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let note = wire::AppendActionRequest {
+        action_kind: "note".into(),
+        reason: "seen it".into(),
+        clid: None,
+        ip: None,
+        ban_duration_secs: None,
+    };
+    let resp = app
+        .clone()
+        .oneshot(post(
+            &format!("/api/moderation/cases/{}/actions", case_b.id),
+            &mod_token,
+            &note,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let resp = app
+        .clone()
+        .oneshot(post(
+            &format!("/api/moderation/cases/{}/resolve", case_b.id),
+            &mod_token,
+            &wire::ResolveCaseRequest {
+                resolution_note: "nope".into(),
+                false_positive: None,
+            },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // B's case is unchanged.
+    let resp = app
+        .clone()
+        .oneshot(get(
+            &format!("/api/moderation/cases/{}", case_b.id),
+            &admin_token,
+        ))
+        .await
+        .unwrap();
+    let detail: wire::CaseDetail = read_json(resp).await;
+    assert_eq!(detail.case.status, "open");
+    assert!(detail.timeline.is_empty());
+
+    // List hides B. Detail of B is forbidden. A is visible.
+    let resp = app
+        .clone()
+        .oneshot(get("/api/moderation/cases", &mod_token))
+        .await
+        .unwrap();
+    let page: Page<wire::ModerationCase> = read_json(resp).await;
+    assert_eq!(page.total, 1);
+    assert_eq!(page.items[0].id, case_a.id);
+    assert_eq!(page.items[0].server_config_id, server_a);
+
+    let resp = app
+        .clone()
+        .oneshot(get(
+            &format!("/api/moderation/cases/{}", case_b.id),
+            &mod_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let resp = app
+        .clone()
+        .oneshot(get("/api/moderation/cases", &admin_token))
+        .await
+        .unwrap();
+    let page: Page<wire::ModerationCase> = read_json(resp).await;
+    assert_eq!(page.total, 2);
+
+    // History fans in only the granted server's case.
+    let resp = app
+        .clone()
+        .oneshot(get(
+            "/api/moderation/subjects/uid-shared/history",
+            &mod_token,
+        ))
+        .await
+        .unwrap();
+    let history: wire::SubjectHistory = read_json(resp).await;
+    assert_eq!(history.cases.len(), 1);
+    assert_eq!(history.cases[0].id, case_a.id);
+    assert!(history.actions.is_empty());
+
+    // Reports on B are hidden and cannot be triaged.
+    let report_b = crate::repos::moderation_reports::insert(
+        &state.db,
+        crate::repos::moderation_reports::NewModerationReport {
+            serverConfigId: server_b,
+            virtualServerId: 1,
+            reporterUid: "reporter-uid".into(),
+            subjectUidOrNickname: "uid-b".into(),
+            category: "harassment".into(),
+            statement: "was abusive".into(),
+            evidenceUrl: None,
+            sourceIpHash: "hash-report".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(get("/api/moderation/reports", &mod_token))
+        .await
+        .unwrap();
+    let reports: Vec<wire::ModerationReport> = read_json(resp).await;
+    assert!(reports.is_empty());
+    let resp = app
+        .clone()
+        .oneshot(get("/api/moderation/reports", &admin_token))
+        .await
+        .unwrap();
+    let reports: Vec<wire::ModerationReport> = read_json(resp).await;
+    assert_eq!(reports.len(), 1);
+    for path in ["promote", "dismiss"] {
+        let body: serde_json::Value = if path == "promote" {
+            serde_json::json!({ "reason": "no" })
+        } else {
+            serde_json::json!({})
+        };
+        let resp = app
+            .clone()
+            .oneshot(post(
+                &format!("/api/moderation/reports/{}/{path}", report_b.id),
+                &mod_token,
+                &body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{path}");
+    }
+
+    // Complaints name the server in the query / body.
+    let resp = app
+        .clone()
+        .oneshot(get(
+            &format!("/api/moderation/complaints?serverConfigId={server_b}&virtualServerId=1"),
+            &mod_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let resp = app
+        .clone()
+        .oneshot(post(
+            "/api/moderation/complaints/resolve",
+            &mod_token,
+            &wire::ResolveComplaintRequest {
+                server_config_id: server_b,
+                virtual_server_id: 1,
+                tcldbid: 5,
+                fcldbid: Some(3),
+            },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // Admin can still promote B's report.
+    let resp = app
+        .oneshot(post(
+            &format!("/api/moderation/reports/{}/promote", report_b.id),
+            &admin_token,
+            &wire::PromoteReportRequest {
+                reason: "verified".into(),
+            },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
 }

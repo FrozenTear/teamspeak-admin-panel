@@ -2,7 +2,9 @@
 //! workstream `9.0-routes` of [PURA-262](/PURA/issues/PURA-262) §7).
 //!
 //! Resources (every endpoint `RequirePermission`-gated — the action-level
-//! `moderation.*` catalog from `9.0-rbac`, layered on the coarse role gate):
+//! `moderation.*` catalog from `9.0-rbac`, layered on the coarse role gate,
+//! and on the per-server `server_user_grant` ACL from
+//! [`crate::routes::control::access`]):
 //!
 //! - `cases` — `GET /cases` (filterable by `origin`), `GET /cases/{id}`,
 //!   `POST /cases`, `POST /cases/{id}/actions`, `POST /cases/{id}/resolve`,
@@ -56,12 +58,15 @@ use axum::routing::{get, post};
 use ts6_manager_shared::moderation as wire;
 
 use crate::app_state::AppState;
+use crate::auth::extractors::AuthUser;
 use crate::control::ControlBackendError;
 use crate::repos::moderation_appeals::ModerationAppeal;
 use crate::repos::moderation_case_actions::ModerationCaseAction;
 use crate::repos::moderation_cases::ModerationCase;
 use crate::repos::moderation_notes::ModerationNote;
 use crate::repos::moderation_reports::ModerationReport;
+use crate::repos::server_user_grants;
+use crate::routes::control::access;
 
 /// Build the moderation sub-router. Absolute paths — the caller `merge`s
 /// this into the top-level router so the URIs line up with plan §7.
@@ -108,6 +113,60 @@ pub fn router() -> Router<AppState> {
             "/api/moderation/cases/{id}/appeal/overturn",
             post(appeals::overturn),
         )
+}
+
+// ---- per-server grant ACL (shared by every submodule) -----------------
+
+/// Write access on `server_config_id`: admin, or moderator with a
+/// `server_user_grant`. Same helper the control surface uses. Missing
+/// server → `404`; missing grant or a viewer → `403`.
+pub(super) async fn ensure_server_write(
+    state: &AppState,
+    user: &AuthUser,
+    server_config_id: i64,
+) -> Result<(), Response> {
+    access::check_write(state, user, server_config_id)
+        .await
+        .map(|_| ())
+}
+
+/// Read access on `server_config_id`: admin, or any role with a
+/// `server_user_grant`. Same helper as [`ensure_server_write`]'s read half.
+pub(super) async fn ensure_server_read(
+    state: &AppState,
+    user: &AuthUser,
+    server_config_id: i64,
+) -> Result<(), Response> {
+    access::check_read(state, user, server_config_id)
+        .await
+        .map(|_| ())
+}
+
+/// Servers the caller may read.
+///
+/// `None` means unfiltered (admin). `Some` is the `server_user_grant` set,
+/// which may be empty — callers must treat empty as "no rows", not "all".
+pub(super) async fn read_scope(
+    state: &AppState,
+    user: &AuthUser,
+) -> Result<Option<Vec<i64>>, Response> {
+    if user.is_admin() {
+        return Ok(None);
+    }
+    let rows = server_user_grants::list_for_user(&state.db, user.id)
+        .await
+        .map_err(|e| {
+            tracing::error!(err = %e, user_id = user.id, "moderation grant lookup failed");
+            internal()
+        })?;
+    Ok(Some(rows.into_iter().map(|g| g.serverConfigId).collect()))
+}
+
+/// `true` when `server_config_id` is inside [`read_scope`].
+pub(super) fn in_read_scope(scope: &Option<Vec<i64>>, server_config_id: i64) -> bool {
+    scope
+        .as_ref()
+        .is_none_or(|ids| ids.contains(&server_config_id))
 }
 
 // ---- error helpers (shared by every submodule) ------------------------

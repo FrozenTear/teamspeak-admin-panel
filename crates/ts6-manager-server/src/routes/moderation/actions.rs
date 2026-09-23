@@ -102,6 +102,9 @@ pub(super) async fn append(
             internal()
         })?
         .ok_or_else(|| not_found("case not found"))?;
+    // Grant check before any mint or TS6 dispatch. A moderator granted
+    // only on server A must not kick/ban against the case's server B.
+    super::ensure_server_write(&state, &actor, case.serverConfigId).await?;
     if case.status == "resolved" {
         return Err(conflict("case is resolved — reopen it before acting"));
     }

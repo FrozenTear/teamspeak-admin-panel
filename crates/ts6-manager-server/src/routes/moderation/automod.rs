@@ -68,6 +68,7 @@ pub(super) async fn revert_action(
             internal()
         })?
         .ok_or_else(|| not_found("case not found"))?;
+    super::ensure_server_write(&state, &actor, case.serverConfigId).await?;
 
     // Revert is the automod review affordance — it does not apply to
     // operator / complaint cases, which have their own `unmute` composer.
@@ -279,13 +280,24 @@ pub(super) struct MetricsQuery {
 /// `GET /api/moderation/automod/metrics` — per-`ruleKey` automod metrics.
 pub(super) async fn metrics(
     State(state): State<AppState>,
-    _gate: RequirePermission<CaseView>,
+    gate: RequirePermission<CaseView>,
     Query(q): Query<MetricsQuery>,
 ) -> Result<Json<Vec<wire::AutomodRuleMetrics>>, Response> {
+    let user = gate.0;
+    let server_config_ids = if let Some(sid) = q.server_config_id {
+        super::ensure_server_read(&state, &user, sid).await?;
+        None
+    } else {
+        match super::read_scope(&state, &user).await? {
+            Some(ids) if ids.is_empty() => return Ok(Json(Vec::new())),
+            scope => scope,
+        }
+    };
     let filter = CaseFilter {
         origin: Some("automod".to_string()),
         serverConfigId: q.server_config_id,
         virtualServerId: q.virtual_server_id,
+        serverConfigIds: server_config_ids,
         ..Default::default()
     };
     let (cases, _total) = moderation_cases::list(&state.db, &filter, METRICS_CASE_SCAN, 0)

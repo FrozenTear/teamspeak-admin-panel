@@ -44,7 +44,7 @@ pub(super) struct CaseListQuery {
 /// `GET /api/moderation/cases` — paginated case queue.
 pub(super) async fn list(
     State(state): State<AppState>,
-    _gate: RequirePermission<CaseView>,
+    gate: RequirePermission<CaseView>,
     Query(q): Query<CaseListQuery>,
 ) -> Result<Json<Page<wire::ModerationCase>>, Response> {
     if let Some(ref s) = q.status
@@ -63,12 +63,33 @@ pub(super) async fn list(
     }
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let offset = q.offset.unwrap_or(0).max(0);
+    let user = gate.0;
+    // A named server is a read of that server: `check_read` (404 if the
+    // connection is gone, 403 if the caller has no grant). An unscoped
+    // list is lensed to the caller's grants; admins stay unfiltered.
+    let server_config_ids = if let Some(sid) = q.server_config_id {
+        super::ensure_server_read(&state, &user, sid).await?;
+        None
+    } else {
+        match super::read_scope(&state, &user).await? {
+            Some(ids) if ids.is_empty() => {
+                return Ok(Json(Page {
+                    items: Vec::new(),
+                    total: 0,
+                    limit,
+                    offset,
+                }));
+            }
+            scope => scope,
+        }
+    };
     let filter = CaseFilter {
         subjectUid: q.subject_uid,
         status: q.status,
         origin: q.origin,
         serverConfigId: q.server_config_id,
         virtualServerId: q.virtual_server_id,
+        serverConfigIds: server_config_ids,
     };
     let (rows, total) = moderation_cases::list(&state.db, &filter, limit, offset)
         .await
@@ -87,7 +108,7 @@ pub(super) async fn list(
 /// `GET /api/moderation/cases/{id}` — case detail with the full timeline.
 pub(super) async fn detail(
     State(state): State<AppState>,
-    _gate: RequirePermission<CaseView>,
+    gate: RequirePermission<CaseView>,
     Path(id): Path<i64>,
 ) -> Result<Json<wire::CaseDetail>, Response> {
     let case = moderation_cases::find_by_id(&state.db, id)
@@ -97,6 +118,7 @@ pub(super) async fn detail(
             internal()
         })?
         .ok_or_else(|| not_found("case not found"))?;
+    super::ensure_server_read(&state, &gate.0, case.serverConfigId).await?;
     let timeline = moderation_case_actions::list_for_case(&state.db, id)
         .await
         .map_err(|e| {
@@ -142,6 +164,7 @@ pub(super) async fn open(
             "origin must be one of operator / complaint / automod",
         ));
     }
+    super::ensure_server_write(&state, &actor, req.server_config_id).await?;
 
     let case = moderation_cases::insert(
         &state.db,
@@ -200,6 +223,7 @@ pub(super) async fn resolve(
     }
 
     let case = load_case(&state, id).await?;
+    super::ensure_server_write(&state, &actor, case.serverConfigId).await?;
     if case.status == "resolved" {
         return Err(conflict("case is already resolved"));
     }
@@ -267,6 +291,7 @@ pub(super) async fn reopen(
     }
 
     let case = load_case(&state, id).await?;
+    super::ensure_server_write(&state, &actor, case.serverConfigId).await?;
     if case.status != "resolved" {
         return Err(conflict("only a resolved case can be reopened"));
     }

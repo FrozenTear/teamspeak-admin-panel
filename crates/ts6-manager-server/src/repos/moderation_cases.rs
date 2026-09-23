@@ -74,6 +74,11 @@ pub struct CaseFilter {
     pub origin: Option<String>,
     pub serverConfigId: Option<i64>,
     pub virtualServerId: Option<i64>,
+    /// Restrict to these servers (`serverConfigId IN …`). Non-admin list
+    /// handlers set this from `server_user_grant`. `None` means no extra
+    /// lens (admins, or a query that already named one server and passed
+    /// `check_read`). An empty `Some` matches nothing.
+    pub serverConfigIds: Option<Vec<i64>>,
 }
 
 const PROJECTION: &str = "
@@ -157,6 +162,9 @@ fn apply_filter_binds<'a>(
     if let Some(v) = filter.serverConfigId {
         q = q.bind(("serverConfigId", v));
     }
+    if let Some(v) = filter.serverConfigIds.clone() {
+        q = q.bind(("serverConfigIds", v));
+    }
     if let Some(v) = filter.virtualServerId {
         q = q.bind(("virtualServerId", v));
     }
@@ -171,6 +179,16 @@ pub async fn list(
     limit: i64,
     offset: i64,
 ) -> Result<(Vec<ModerationCase>, i64)> {
+    // An explicit empty grant set must not fall through to "no clause"
+    // (which would return every server). Callers also short-circuit, but
+    // the repo stays safe if they don't.
+    if filter
+        .serverConfigIds
+        .as_ref()
+        .is_some_and(|ids| ids.is_empty())
+    {
+        return Ok((Vec::new(), 0));
+    }
     let mut clauses: Vec<&str> = Vec::new();
     if filter.subjectUid.is_some() {
         clauses.push("subjectUid = $subjectUid");
@@ -183,6 +201,9 @@ pub async fn list(
     }
     if filter.serverConfigId.is_some() {
         clauses.push("serverConfigId = $serverConfigId");
+    }
+    if filter.serverConfigIds.is_some() {
+        clauses.push("serverConfigId IN $serverConfigIds");
     }
     if filter.virtualServerId.is_some() {
         clauses.push("virtualServerId = $virtualServerId");
