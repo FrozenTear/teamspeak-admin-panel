@@ -115,6 +115,7 @@ mod tests {
             prebuffer_frames: 0,
             event_buffer: 4,
             yt_cookie_file: None,
+            music_dir: None,
         }
     }
 

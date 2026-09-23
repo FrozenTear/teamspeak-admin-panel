@@ -51,6 +51,9 @@ serde_json = { workspace = true }
 # send threads and, when TS6_BOT_DECODE_CPUSET is set, decode-rt plus
 # ffmpeg/yt-dlp. Music HostConfig stays unset — never cpuset 0-1.
 libc = "0.2"
+# Playback SSRF gate. Same validator the manager play route uses.
+# `hickory` is the process resolver; tests pass `MockResolver`.
+ts6-ssrf = { workspace = true, features = ["hickory"] }
 
 [dev-dependencies]
 hound = "3.5"

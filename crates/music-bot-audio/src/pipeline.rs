@@ -40,11 +40,21 @@ impl AudioPipeline {
         // every `!play` / queue-advance froze the audio-drain arm for the
         // whole resolve — a multi-second mid-song gap on the wire. The
         // `LazySource` defers bring-up to the worker task's first
-        // `read_samples`, which already runs off the connected loop, so
-        // this call now returns in microseconds.
+        // `read_samples`, which already runs off the connected loop.
+        //
+        // The SSRF / library-jail check stays on this await: a DNS lookup
+        // and a path canonicalise. A rejection returns before any worker,
+        // ffmpeg, or yt-dlp exists. Chat `!play` / `!radio`, queue,
+        // playlist, library, and radio all enter through here.
         if !matches!(cfg.channels, 1 | 2) {
             return Err(PipelineError::InvalidChannels(cfg.channels));
         }
+        let installed = crate::gate::installed_music_dir();
+        let music_dir = cfg.music_dir.as_deref().or(installed.as_deref());
+        let spec =
+            crate::gate::gate_playback_spec(spec, music_dir, crate::gate::process_resolver())
+                .await
+                .map_err(|e| PipelineError::Source(e.to_string()))?;
         let (events_tx, _) = broadcast::channel::<PipelineEvent>(cfg.event_buffer);
         let source: Box<dyn PcmSource> = Box::new(LazySource::with_events(
             spec,
@@ -437,36 +447,59 @@ async fn build_source(
                             title = track.title.as_deref().unwrap_or(""),
                             "warm yt-dlp resolver returned direct media URL",
                         );
-                        match FfmpegSource::from_input(&track.direct_url, cfg.channels, None).await
+                        // The page URL was gated at spawn. The resolver's
+                        // direct media URL is a new fetch — check it before
+                        // ffmpeg opens it. A reject falls through to yt-dlp
+                        // on the already-gated page URL.
+                        if let Err(err) = crate::gate::allow_playback_url(
+                            &track.direct_url,
+                            crate::gate::process_resolver(),
+                        )
+                        .await
                         {
-                            Ok(mut src) => {
-                                // Title is already in `ResolvedTrack` — push it
-                                // as `NowPlaying` so the bot actor can fill the
-                                // queue-head / SSE chrome. Previously this was
-                                // log-only (`resolver_resolved`) and Panel
-                                // kept showing the pasted watch URL.
-                                if let Some(ev) =
-                                    now_playing_from_resolved(&url, track.title.as_deref())
-                                {
-                                    src.push_event(ev);
-                                }
-                                return Ok(Box::new(src));
+                            tracing::warn!(
+                                error = %err,
+                                "resolver direct URL rejected by playback policy — \
+                                 falling back to yt-dlp subprocess",
+                            );
+                            if let Some(vid) = &track.video_id {
+                                fallback_url = format!("https://www.youtube.com/watch?v={vid}");
                             }
-                            Err(e) => {
-                                // Preserve the video_id for the subprocess fallback even
-                                // when ffmpeg rejects the direct URL.
-                                if let Some(vid) = &track.video_id {
-                                    fallback_url = format!("https://www.youtube.com/watch?v={vid}");
+                            resolved_title = track.title.clone();
+                        } else {
+                            match FfmpegSource::from_input(&track.direct_url, cfg.channels, None)
+                                .await
+                            {
+                                Ok(mut src) => {
+                                    // Title is already in `ResolvedTrack` — push it
+                                    // as `NowPlaying` so the bot actor can fill the
+                                    // queue-head / SSE chrome. Previously this was
+                                    // log-only (`resolver_resolved`) and Panel
+                                    // kept showing the pasted watch URL.
+                                    if let Some(ev) =
+                                        now_playing_from_resolved(&url, track.title.as_deref())
+                                    {
+                                        src.push_event(ev);
+                                    }
+                                    return Ok(Box::new(src));
                                 }
-                                // Keep the resolved title for the subprocess
-                                // source so a ffmpeg-reject fallback still
-                                // fills Now Playing.
-                                resolved_title = track.title.clone();
-                                tracing::warn!(
-                                    error = %e,
-                                    "ffmpeg rejected resolver direct URL — \
-                                     falling back to yt-dlp subprocess",
-                                );
+                                Err(e) => {
+                                    // Preserve the video_id for the subprocess fallback even
+                                    // when ffmpeg rejects the direct URL.
+                                    if let Some(vid) = &track.video_id {
+                                        fallback_url =
+                                            format!("https://www.youtube.com/watch?v={vid}");
+                                    }
+                                    // Keep the resolved title for the subprocess
+                                    // source so a ffmpeg-reject fallback still
+                                    // fills Now Playing.
+                                    resolved_title = track.title.clone();
+                                    tracing::warn!(
+                                        error = %e,
+                                        "ffmpeg rejected resolver direct URL — \
+                                         falling back to yt-dlp subprocess",
+                                    );
+                                }
                             }
                         }
                     }
@@ -494,6 +527,11 @@ async fn build_source(
                     }
                 }
             }
+            // `fallback_url` may be a watch URL built from a video id,
+            // not the page URL spawn already checked.
+            crate::gate::allow_playback_url(&fallback_url, crate::gate::process_resolver())
+                .await
+                .map_err(|e| PipelineError::Source(e.to_string()))?;
             let mut src =
                 YtDlpSource::new(&fallback_url, cfg.channels, cfg.yt_cookie_file.as_deref())
                     .await

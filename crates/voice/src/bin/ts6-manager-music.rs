@@ -88,6 +88,9 @@ async fn main() -> Result<()> {
 
     let music_dir =
         std::env::var("MUSIC_DIR").unwrap_or_else(|_| "/var/lib/ts6-manager/music".into());
+    // Playback jail root. Queue, library, radio, and chat `!play` open
+    // files only after this path is canonicalised under `music_dir`.
+    music_bot_audio::install_music_dir(PathBuf::from(&music_dir));
     let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "/var/lib/ts6-manager/data".into());
     info!(
         listen = %args.listen,
@@ -99,7 +102,6 @@ async fn main() -> Result<()> {
         decode_cpuset = %std::env::var("TS6_BOT_DECODE_CPUSET").unwrap_or_default(),
         "ts6-manager-music starting (owns the only Voice send loop; no Surreal)"
     );
-    let _ = PathBuf::from(music_dir);
     let _ = PathBuf::from(data_dir);
 
     let state = music_bot::runtime_http::RuntimeState::new();

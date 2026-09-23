@@ -108,6 +108,10 @@ pub struct PipelineConfig {
     /// from `app_setting:yt_cookie_path` (DB) or `YT_COOKIE_FILE` env so
     /// a UI-uploaded cookie is effective without a manager restart.
     pub yt_cookie_file: Option<PathBuf>,
+    /// Music library root for the playback path jail. `None` falls back
+    /// to the process root from [`crate::install_music_dir`]. A local
+    /// path with neither set is rejected.
+    pub music_dir: Option<PathBuf>,
 }
 
 impl Default for PipelineConfig {
@@ -120,6 +124,7 @@ impl Default for PipelineConfig {
             prebuffer_frames: 0,
             event_buffer: 32,
             yt_cookie_file: None,
+            music_dir: None,
         }
     }
 }

@@ -17,6 +17,7 @@
 pub mod bug_report;
 pub mod cpuset;
 pub mod encoder;
+pub mod gate;
 pub mod icy;
 pub mod pacer;
 pub mod pipeline;
@@ -29,6 +30,7 @@ pub mod volume;
 pub mod yt_search;
 
 pub use encoder::OpusFrameEncoder;
+pub use gate::{install_music_dir, installed_music_dir};
 pub use pipeline::AudioPipeline;
 pub use runtime::spawn_decode;
 pub use source::{PlaybackRoute, classify_playback_url, normalize_radio_url};
