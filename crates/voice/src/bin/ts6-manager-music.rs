@@ -30,8 +30,12 @@ use tracing_subscriber::util::SubscriberInitExt;
     about = "TS6 Manager Music+Voice unit (Contabo bot container)"
 )]
 struct Args {
-    /// Loopback control plane. hostNetwork: containerPort IS host port.
-    #[arg(long, default_value = "0.0.0.0:3002")]
+    /// Loopback control plane. Default must stay `127.0.0.1:3002`:
+    /// under hostNetwork the bind address is the host address, and
+    /// this HTTP API is unauthenticated (`/v1/bots`, `/command`, play,
+    /// settings, logs). Kube args and `Containerfile.music` pass the
+    /// same flag. Health probes use `http://127.0.0.1:3002/health`.
+    #[arg(long, default_value = "127.0.0.1:3002")]
     listen: SocketAddr,
 
     /// Probe `/health` and exit (0 = healthy). Kube exec HealthCmd /
@@ -120,4 +124,16 @@ async fn main() -> Result<()> {
         })
         .await
         .context("serve music control plane")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn listen_defaults_to_loopback() {
+        let args = Args::try_parse_from(["ts6-manager-music"]).expect("default args parse");
+        assert_eq!(args.listen, "127.0.0.1:3002".parse::<SocketAddr>().unwrap());
+        assert!(args.healthcheck_url.is_none());
+    }
 }

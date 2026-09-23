@@ -78,9 +78,9 @@ spec:
   # 5 s, so a fresh fixture wedges within ~30 s of operator activity.
   # hostNetwork drops passt from the call path; manager-side surface
   # area is unchanged because the pod already advertises its
-  # listeners as hostPort (3001/tcp, 4443/udp). Sidecar control
-  # :7080 stays on 127.0.0.1 only — not a public host port, and
-  # not on public Caddy.
+  # listeners as hostPort (3001/tcp, 4443/udp). Music control
+  # :3002 and sidecar control :7080 stay on 127.0.0.1 only — not
+  # public host ports, and not on public Caddy.
   hostNetwork: true
   securityContext:
     runAsNonRoot: true
@@ -177,8 +177,13 @@ spec:
         runAsUser: 10001
         runAsGroup: 10001
       args:
+        # Control plane has no auth (/v1/bots, /command, play,
+        # settings, logs). hostNetwork + 0.0.0.0 publishes :3002 on
+        # every host interface (Opus review #66 H3). Fullstack uses
+        # MUSIC_RUNTIME_URL=http://127.0.0.1:3002; probes stay on
+        # loopback. Do not proxy :3002 through Caddy.
         - "--listen"
-        - "0.0.0.0:3002"
+        - "127.0.0.1:3002"
       ports:
         - name: music
           containerPort: 3002
