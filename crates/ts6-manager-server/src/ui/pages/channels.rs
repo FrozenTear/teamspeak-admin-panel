@@ -49,6 +49,30 @@ enum ChannelDialog {
     Delete(ChannelTreeNode),
 }
 
+/// ↑/↓ reorder is one request plus the snapshot that follows it.
+/// Clicks during either step are ignored so a second press cannot
+/// compute `channel_order` from the pre-reload sibling chain.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ReorderPhase {
+    Idle,
+    InFlight,
+    AwaitReload,
+}
+
+fn accept_reorder_click(phase: ReorderPhase) -> bool {
+    phase == ReorderPhase::Idle
+}
+
+/// A finished snapshot (success or error) ends the wait that started
+/// after the reorder request returned. In-flight requests stay locked
+/// so an unrelated refetch cannot re-enable the buttons early.
+fn reorder_phase_on_snapshot(phase: ReorderPhase) -> ReorderPhase {
+    match phase {
+        ReorderPhase::AwaitReload => ReorderPhase::Idle,
+        other => other,
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Permanence {
     Permanent,
@@ -124,6 +148,7 @@ pub fn ChannelsPage() -> Element {
     let mut dialog: Signal<ChannelDialog> = use_signal(|| ChannelDialog::None);
     let mut move_user: Signal<Option<ClientListItem>> = use_signal(|| None);
     let mut reload: Signal<u64> = use_signal(|| 0u64);
+    let mut reorder_guard: Signal<ReorderPhase> = use_signal(|| ReorderPhase::Idle);
 
     let mut channels_resource = use_resource({
         let gate = gate.clone();
@@ -147,8 +172,18 @@ pub fn ChannelsPage() -> Element {
             Some(Ok(rows)) => {
                 channels.set(rows.clone());
                 error.set(None);
+                let next = reorder_phase_on_snapshot(*reorder_guard.peek());
+                if next != *reorder_guard.peek() {
+                    reorder_guard.set(next);
+                }
             }
-            Some(Err(e)) => error.set(Some(e.clone())),
+            Some(Err(e)) => {
+                error.set(Some(e.clone()));
+                let next = reorder_phase_on_snapshot(*reorder_guard.peek());
+                if next != *reorder_guard.peek() {
+                    reorder_guard.set(next);
+                }
+            }
             None => {}
         });
     }
@@ -216,9 +251,16 @@ pub fn ChannelsPage() -> Element {
         move |_: ()| bump()
     });
 
+    let reorder_busy = *reorder_guard.read() != ReorderPhase::Idle;
     let on_reorder = EventHandler::new({
         let gate = gate.clone();
         move |(cid, up): (i64, bool)| {
+            // Ignore a second ↑/↓ until the in-flight edit has reloaded.
+            // The buttons are disabled too; this covers a click that lands
+            // before that render.
+            if !accept_reorder_click(*reorder_guard.peek()) {
+                return;
+            }
             let rows = channels.read().clone();
             let Some(node) = rows.iter().find(|c| c.cid == cid).cloned() else {
                 return;
@@ -227,9 +269,11 @@ pub fn ChannelsPage() -> Element {
             let Some(order) = sibling_move_order(&siblings, cid, up) else {
                 return;
             };
+            reorder_guard.set(ReorderPhase::InFlight);
             let gate = gate.clone();
             let toaster = toaster;
             let mut bump = bump;
+            let mut channels_resource = channels_resource;
             spawn(async move {
                 // Same-parent reorder is `channeledit channel_order` (PUT).
                 // `channelmove` with the current parent returns TS 770
@@ -241,13 +285,22 @@ pub fn ChannelsPage() -> Element {
                             format!("Reordered “{}”", node.channel_name),
                             None,
                         );
+                        // Drop the current snapshot so the effect cannot
+                        // treat it as the post-reorder reload. `bump`
+                        // refetches; buttons stay disabled until that
+                        // snapshot lands (or the refetch fails).
+                        reorder_guard.set(ReorderPhase::AwaitReload);
+                        channels_resource.clear();
                         bump();
                     }
-                    Err(e) => toaster.push(
-                        ToastVariant::Danger,
-                        "Reorder failed",
-                        Some(format_error(&e)),
-                    ),
+                    Err(e) => {
+                        toaster.push(
+                            ToastVariant::Danger,
+                            "Reorder failed",
+                            Some(format_error(&e)),
+                        );
+                        reorder_guard.set(ReorderPhase::Idle);
+                    }
                 }
             });
         }
@@ -290,6 +343,7 @@ pub fn ChannelsPage() -> Element {
                 on_delete: EventHandler::new(move |n: ChannelTreeNode| dialog.set(ChannelDialog::Delete(n))),
                 on_move_up: EventHandler::new(move |cid: i64| on_reorder.call((cid, true))),
                 on_move_down: EventHandler::new(move |cid: i64| on_reorder.call((cid, false))),
+                reorder_busy: reorder_busy,
                 on_move_user: on_move_user,
             }
         }
@@ -414,6 +468,7 @@ struct ChannelsTreeProps {
     on_delete: EventHandler<ChannelTreeNode>,
     on_move_up: EventHandler<i64>,
     on_move_down: EventHandler<i64>,
+    reorder_busy: bool,
     on_move_user: Option<EventHandler<ClientListItem>>,
 }
 
@@ -480,6 +535,7 @@ fn ChannelsTree(props: ChannelsTreeProps) -> Element {
                     on_delete: props.on_delete,
                     on_move_up: props.on_move_up,
                     on_move_down: props.on_move_down,
+                    reorder_busy: props.reorder_busy,
                     on_move_user: props.on_move_user,
                 }
             }
@@ -498,6 +554,7 @@ struct ChannelChildrenProps {
     on_delete: EventHandler<ChannelTreeNode>,
     on_move_up: EventHandler<i64>,
     on_move_down: EventHandler<i64>,
+    reorder_busy: bool,
     on_move_user: Option<EventHandler<ClientListItem>>,
 }
 
@@ -541,6 +598,7 @@ fn ChannelChildren(props: ChannelChildrenProps) -> Element {
                             on_delete: props.on_delete,
                             on_move_up: props.on_move_up,
                             on_move_down: props.on_move_down,
+                            reorder_busy: props.reorder_busy,
                         }
                         if !row_clients.is_empty() {
                             ul { class: "channel-clients",
@@ -570,6 +628,7 @@ fn ChannelChildren(props: ChannelChildrenProps) -> Element {
                                     on_delete: props.on_delete,
                                     on_move_up: props.on_move_up,
                                     on_move_down: props.on_move_down,
+                                    reorder_busy: props.reorder_busy,
                                     on_move_user: props.on_move_user,
                                 }
                             }
@@ -593,6 +652,7 @@ struct ChannelHeaderProps {
     on_delete: EventHandler<ChannelTreeNode>,
     on_move_up: EventHandler<i64>,
     on_move_down: EventHandler<i64>,
+    reorder_busy: bool,
 }
 
 #[component]
@@ -611,6 +671,7 @@ fn ChannelHeader(props: ChannelHeaderProps) -> Element {
                     on_delete: props.on_delete,
                     on_move_up: props.on_move_up,
                     on_move_down: props.on_move_down,
+                    reorder_busy: props.reorder_busy,
                 }
             }
         };
@@ -662,6 +723,7 @@ fn ChannelHeader(props: ChannelHeaderProps) -> Element {
                 on_delete: props.on_delete,
                 on_move_up: props.on_move_up,
                 on_move_down: props.on_move_down,
+                reorder_busy: props.reorder_busy,
             }
         }
     }
@@ -677,6 +739,7 @@ struct ChannelRowActionsProps {
     on_delete: EventHandler<ChannelTreeNode>,
     on_move_up: EventHandler<i64>,
     on_move_down: EventHandler<i64>,
+    reorder_busy: bool,
 }
 
 #[component]
@@ -685,26 +748,32 @@ fn ChannelRowActions(props: ChannelRowActionsProps) -> Element {
     let cid = node.cid;
     let edit_node = node.clone();
     let delete_node = node;
-    let write_title = if props.is_admin {
+    let admin_title = if props.is_admin {
         None
     } else {
         Some(ADMIN_ONLY_HINT.to_string())
     };
+    let move_title = if props.reorder_busy {
+        Some("Reordering…".to_string())
+    } else {
+        admin_title.clone()
+    };
+    let move_locked = !props.is_admin || props.reorder_busy;
     rsx! {
         div { class: "row-actions channel-row-actions",
             Button {
                 variant: ButtonVariant::Ghost,
                 size: ButtonSize::Small,
                 disabled: !props.is_admin,
-                title: write_title.clone(),
+                title: admin_title.clone(),
                 onclick: move |_| props.on_edit.call(edit_node.clone()),
                 "Edit"
             }
             Button {
                 variant: ButtonVariant::Ghost,
                 size: ButtonSize::Small,
-                disabled: !props.is_admin || props.is_first,
-                title: write_title.clone(),
+                disabled: move_locked || props.is_first,
+                title: move_title.clone(),
                 aria_label: Some("Move up".into()),
                 onclick: move |_| props.on_move_up.call(cid),
                 "↑"
@@ -712,8 +781,8 @@ fn ChannelRowActions(props: ChannelRowActionsProps) -> Element {
             Button {
                 variant: ButtonVariant::Ghost,
                 size: ButtonSize::Small,
-                disabled: !props.is_admin || props.is_last,
-                title: write_title.clone(),
+                disabled: move_locked || props.is_last,
+                title: move_title,
                 aria_label: Some("Move down".into()),
                 onclick: move |_| props.on_move_down.call(cid),
                 "↓"
@@ -722,7 +791,7 @@ fn ChannelRowActions(props: ChannelRowActionsProps) -> Element {
                 variant: ButtonVariant::Danger,
                 size: ButtonSize::Small,
                 disabled: !props.is_admin,
-                title: write_title,
+                title: admin_title,
                 onclick: move |_| props.on_delete.call(delete_node.clone()),
                 "Delete"
             }
@@ -1764,5 +1833,27 @@ mod tests {
         assert!(would_cycle(&rows, 1, 3));
         assert!(!would_cycle(&rows, 2, 0));
         assert!(!would_cycle(&rows, 3, 1));
+    }
+
+    #[test]
+    fn reorder_clicks_are_ignored_until_the_reload_snapshot() {
+        assert!(accept_reorder_click(ReorderPhase::Idle));
+        assert!(!accept_reorder_click(ReorderPhase::InFlight));
+        assert!(!accept_reorder_click(ReorderPhase::AwaitReload));
+
+        // An unrelated snapshot must not unlock a request that is still in flight.
+        assert_eq!(
+            reorder_phase_on_snapshot(ReorderPhase::InFlight),
+            ReorderPhase::InFlight
+        );
+        // The reload (or a failed reload) is what re-enables ↑/↓.
+        assert_eq!(
+            reorder_phase_on_snapshot(ReorderPhase::AwaitReload),
+            ReorderPhase::Idle
+        );
+        assert_eq!(
+            reorder_phase_on_snapshot(ReorderPhase::Idle),
+            ReorderPhase::Idle
+        );
     }
 }
