@@ -45,18 +45,17 @@ use crate::web::rate_limit::{RateLimitState, rate_limit_auth};
 /// Build the `/api/auth` sub-router. The caller nests it under `/api/auth`
 /// so the route paths in this module stay short.
 ///
-/// `/login` and `/refresh` are wrapped in the spec §6.8 per-IP rate-limit
-/// middleware via the caller-supplied [`RateLimitState`]. `/logout`,
-/// `/me`, and `/password` are unrestricted (they are either credential-
-/// less or already JWT-gated).
+/// `/login`, `/refresh`, and `/password` share the spec §6.8 per-IP
+/// rate-limit. `/logout` and `/me` stay unrestricted (`/me` is already
+/// JWT-gated; logout's credential is the refresh token itself).
 pub fn router(rate_limit: RateLimitState) -> Router<AppState> {
     let rl_layer = from_fn_with_state(rate_limit, rate_limit_auth);
     Router::new()
         .route("/login", post(login).layer(rl_layer.clone()))
-        .route("/refresh", post(refresh_handler).layer(rl_layer))
+        .route("/refresh", post(refresh_handler).layer(rl_layer.clone()))
         .route("/logout", post(logout))
         .route("/me", get(me))
-        .route("/password", put(change_password))
+        .route("/password", put(change_password).layer(rl_layer))
 }
 
 /// Build the absolute WS routes as a `Router<AppState>` so they can be
@@ -76,31 +75,36 @@ fn err(status: StatusCode, body: &str) -> Response {
     (status, Json(ErrorResponse::new(body))).into_response()
 }
 
+/// Argon2id hash of a throwaway string, same cost as a real password hash.
+/// Missing and disabled accounts verify against this (or their real hash)
+/// so login timing does not reveal which usernames exist.
+const DUMMY_PASSWORD_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$empwasH4E6JugwWKw6DSfg$PPWVIUIy4UdM35bV33EnrkyonzErMzUj4iOR3JWDsOQ";
+
 async fn login(
     State(state): State<AppState>,
     Json(req): Json<LoginRequest>,
 ) -> Result<Json<TokenPairResponse>, Response> {
-    // Constant-ish error path: same body for "no such user" and "wrong
-    // password" so we don't leak which usernames exist.
+    // Same body for "no such user", "disabled", and "wrong password".
     let invalid = || err(StatusCode::UNAUTHORIZED, "Invalid credentials");
 
     let user = users::find_by_username(&state.db, &req.username)
         .await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Internal error"))?
-        .ok_or_else(invalid)?;
-    if !user.enabled {
-        return Err(invalid());
-    }
+        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Internal error"))?;
 
-    let stored = user.passwordHash.clone();
+    // Always run Argon2. A missing user verifies the dummy hash; a
+    // disabled user verifies their real hash and is then rejected.
+    let stored = user
+        .as_ref()
+        .map(|u| u.passwordHash.clone())
+        .unwrap_or_else(|| DUMMY_PASSWORD_HASH.to_string());
     let supplied = req.password.clone();
     let ok = tokio::task::spawn_blocking(move || password::verify(&stored, &supplied))
         .await
         .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Internal error"))?
         .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Internal error"))?;
-    if !ok {
+    let Some(user) = user.filter(|u| u.enabled && ok) else {
         return Err(invalid());
-    }
+    };
 
     let access = jwt::mint_access(
         user.id,

@@ -173,21 +173,14 @@ pub async fn rotate(db: &Database, supplied: &str, lifetime: Duration) -> Result
     let new_token = generate_refresh_token();
     let new_expires = Utc::now() + lifetime;
 
-    // R5 (THE-1010) — compare-and-swap the `replacedBy` stamp. The read above
-    // and this write are separate statements, so two concurrent rotations of
-    // the same token can both pass the `replacedBy.is_some()` check. The
-    // CAS-guarded UPDATE (`… AND replacedBy IS NONE`) lets only one of them
-    // win; the loser gets `None` here and MUST bail before inserting, or the
-    // family forks into two live tokens (the orphan never trips
-    // reuse-detection). Failure-closed: the loser is treated as invalid.
-    if refresh_tokens::set_replaced_by(db, supplied, &new_token)
-        .await?
-        .is_none()
-    {
-        return Err(Error::InvalidOrExpired);
-    }
-    refresh_tokens::insert(
+    // R5 (THE-1010) + L4 — the CAS stamp and the successor insert are one
+    // transaction. Two concurrent rotations still have a single winner
+    // (`replacedBy IS NONE`). A revocation that used to land between the
+    // two statements can no longer leave the successor as an orphan.
+    // Failure-closed: the loser is treated as invalid.
+    if refresh_tokens::commit_rotation(
         db,
+        supplied,
         refresh_tokens::NewRefreshToken {
             token: new_token.clone(),
             userId: row.userId,
@@ -195,7 +188,11 @@ pub async fn rotate(db: &Database, supplied: &str, lifetime: Duration) -> Result
             family: row.family.clone(),
         },
     )
-    .await?;
+    .await?
+    .is_none()
+    {
+        return Err(Error::InvalidOrExpired);
+    }
 
     Ok(Rotated {
         token: new_token,
@@ -321,9 +318,14 @@ mod tests {
             .expect("predecessor row must survive for reuse-detection");
         assert_eq!(
             old.replacedBy.as_deref(),
-            Some(rotated.token.as_str()),
-            "old row's replacedBy must point at the new token"
+            Some(refresh_tokens::token_at_rest(&rotated.token).as_str()),
+            "old row's replacedBy stores the digest of the new token, not the bearer"
         );
+        assert_ne!(
+            old.token, issued.token,
+            "token column must not be plaintext"
+        );
+        assert_eq!(old.token, refresh_tokens::token_at_rest(&issued.token));
 
         let new = refresh_tokens::find_by_token(&db, &rotated.token)
             .await
@@ -527,10 +529,11 @@ mod tests {
         // Spec §6.5.3 step 2 — expired token row is deleted, error returned.
         let db = setup().await;
         let uid = make_user(&db, "alice").await;
-        let row = refresh_tokens::insert(
+        let plaintext = generate_refresh_token();
+        refresh_tokens::insert(
             &db,
             refresh_tokens::NewRefreshToken {
-                token: generate_refresh_token(),
+                token: plaintext.clone(),
                 userId: uid,
                 expiresAt: Utc::now() - Duration::seconds(1),
                 family: Some(generate_family_id()),
@@ -539,13 +542,13 @@ mod tests {
         .await
         .unwrap();
 
-        let err = rotate(&db, &row.token, ONE_DAY)
+        let err = rotate(&db, &plaintext, ONE_DAY)
             .await
             .expect_err("expired must error");
         assert!(matches!(err, Error::InvalidOrExpired));
 
         assert!(
-            refresh_tokens::find_by_token(&db, &row.token)
+            refresh_tokens::find_by_token(&db, &plaintext)
                 .await
                 .unwrap()
                 .is_none(),

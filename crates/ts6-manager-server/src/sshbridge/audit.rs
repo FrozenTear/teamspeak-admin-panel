@@ -337,6 +337,11 @@ fn name_is_credential(name: &str) -> bool {
         return false;
     }
     let lower = name.to_ascii_lowercase();
+    // TeamSpeak `clientmove` carries the channel password as `cpw`, which
+    // does not share a suffix with the other credential names.
+    if lower == "cpw" {
+        return true;
+    }
     CREDENTIAL_SUFFIXES.iter().any(|s| lower.ends_with(s))
 }
 
@@ -550,6 +555,15 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn redact_clientmove_channel_password() {
+        let r = redact_credentials("clientmove clid=4 cid=12 cpw=hunter2");
+        assert!(!r.contains("hunter2"));
+        assert!(r.contains("cpw=<redacted>"));
+        assert!(r.contains("clid=4"));
+        assert!(r.contains("cid=12"));
+    }
+
     fn redact_leaves_innocuous_params_alone() {
         // Innocuous TS6 params that happen to use `=` must pass through.
         // `clid`, `cid`, `sid`, `cgid` — none ends in a credential suffix.

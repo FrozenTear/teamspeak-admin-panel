@@ -424,6 +424,7 @@ mod tests {
             role: role.into(),
             is_admin: role == "admin",
             is_at_least_moderator: role == "admin" || role == "moderator",
+            access_exp: i64::MAX,
         })
     }
 

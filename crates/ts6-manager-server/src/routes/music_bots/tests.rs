@@ -24,12 +24,36 @@ use crate::app_state::AppState;
 use crate::auth::{jwt, password};
 use crate::db::{connect_in_memory, migrations};
 use crate::music_bots::MusicBotService;
-use crate::repos::users;
+use crate::repos::{server_connections, users};
 
 async fn fresh_state() -> AppState {
     let db = connect_in_memory().await.unwrap();
     migrations::run(&db).await.unwrap();
     crate::crypto::init("test-seed-pura-123");
+    server_connections::insert(
+        &db,
+        server_connections::NewServerConnection {
+            name: "local".into(),
+            host: "127.0.0.1".into(),
+            webqueryPort: 10080,
+            apiKey: "enc:00:00:00".into(),
+            useHttps: false,
+            sshPort: 10022,
+            sshUsername: None,
+            sshPassword: None,
+            queryBotChannel: None,
+            queryBotNickname: None,
+            sshBotNickname: None,
+            enabled: true,
+            controlPath: None,
+            sshAuthMethod: None,
+            sshPrivateKey: None,
+            sshKeyAgentSocket: None,
+            sshHostKeyFingerprint: None,
+        },
+    )
+    .await
+    .unwrap();
     let control = crate::control::ControlBackendPool::new(false, db.clone());
     AppState {
         db,
@@ -73,6 +97,10 @@ async fn read_json<T: serde::de::DeserializeOwned>(resp: axum::http::Response<Bo
 }
 
 async fn seed_user(state: &AppState, username: &str) -> i64 {
+    seed_user_role(state, username, "admin").await
+}
+
+async fn seed_user_role(state: &AppState, username: &str, role: &str) -> i64 {
     let pw = "Hunter2!ok".to_string();
     let hash = tokio::task::spawn_blocking(move || password::hash_new(&pw))
         .await
@@ -84,7 +112,7 @@ async fn seed_user(state: &AppState, username: &str) -> i64 {
             username: username.into(),
             passwordHash: hash,
             displayName: username.into(),
-            role: "admin".into(),
+            role: role.into(),
             enabled: true,
         },
     )
@@ -94,10 +122,14 @@ async fn seed_user(state: &AppState, username: &str) -> i64 {
 }
 
 fn mint_token(state: &AppState, id: i64, username: &str) -> String {
+    mint_token_role(state, id, username, "admin")
+}
+
+fn mint_token_role(state: &AppState, id: i64, username: &str, role: &str) -> String {
     jwt::mint_access(
         id,
         username,
-        "admin",
+        role,
         state.jwt_access_expiry,
         &state.jwt_secret,
     )
@@ -1926,4 +1958,77 @@ async fn bug_report_post_middleware_merges_absent_context_keys() {
         latency.contains("resolver_warm_retry elapsed_ms=- retry=1"),
         "{latency}"
     );
+}
+
+#[tokio::test]
+async fn create_requires_moderator_grant_and_ignores_identity_path() {
+    let state = fresh_state().await;
+    let server = server_connections::list(&state.db).await.unwrap();
+    let server_id = server[0].id;
+
+    let viewer_id = seed_user_role(&state, "viewer", "viewer").await;
+    let viewer_token = mint_token_role(&state, viewer_id, "viewer", "viewer");
+    let mod_id = seed_user_role(&state, "mod", "moderator").await;
+    let mod_token = mint_token_role(&state, mod_id, "mod", "moderator");
+    let app = app(state.clone());
+
+    let mut body = create_bot_body();
+    body.identity_path = Some("/etc/passwd".into());
+
+    let viewer = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/music-bots")
+                .header("authorization", auth_header(&viewer_token))
+                .header("content-type", "application/json")
+                .body(json_body(&body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(viewer.status(), StatusCode::FORBIDDEN);
+
+    let ungranted = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/music-bots")
+                .header("authorization", auth_header(&mod_token))
+                .header("content-type", "application/json")
+                .body(json_body(&body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ungranted.status(), StatusCode::FORBIDDEN);
+
+    crate::repos::server_user_grants::insert(&state.db, mod_id, server_id)
+        .await
+        .unwrap();
+    let created = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/music-bots")
+                .header("authorization", auth_header(&mod_token))
+                .header("content-type", "application/json")
+                .body(json_body(&body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let rows = crate::repos::music_bot_runtime::list(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(
+        rows[0].identityPath.contains("bot-") && rows[0].identityPath.ends_with(".identity"),
+        "{}",
+        rows[0].identityPath
+    );
+    assert!(!rows[0].identityPath.contains("passwd"));
 }

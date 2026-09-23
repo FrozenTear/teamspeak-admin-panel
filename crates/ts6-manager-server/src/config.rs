@@ -26,7 +26,11 @@ const DEFAULT_MUSIC_DIR: &str = "/data/music";
 const DEFAULT_DATA_DIR: &str = "./data";
 const DEFAULT_FRONTEND_URL_DEV: &str = "http://localhost:5173";
 const DEFAULT_FRONTEND_URL_PROD: &str = "http://localhost:3000";
-const DEFAULT_ACCESS_EXPIRY: &str = "4h";
+const DEFAULT_ACCESS_EXPIRY: &str = "15m";
+/// Explicit opt-in for the public dev JWT placeholder. Unset `NODE_ENV`
+/// is not enough: a bare-binary deploy must refuse to boot on the
+/// placeholder unless the operator sets this flag.
+const ALLOW_DEV_JWT_ENV: &str = "TS6_ALLOW_INSECURE_DEV_JWT";
 const DEFAULT_REFRESH_EXPIRY: &str = "30d";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,14 +215,9 @@ impl Config {
         let node_env = NodeEnv::from_env_string(env::var("NODE_ENV").ok().as_deref());
 
         let raw_jwt_secret = env::var("JWT_SECRET").ok();
-        let (jwt_secret, jwt_secret_is_placeholder) = match (raw_jwt_secret, node_env) {
-            (Some(s), _) if !s.is_empty() && s != DEV_JWT_PLACEHOLDER => (s, false),
-            (_, NodeEnv::Production) => {
-                bail!("JWT_SECRET must be set to a non-placeholder value when NODE_ENV=production");
-            }
-            (Some(s), NodeEnv::Development) if s == DEV_JWT_PLACEHOLDER => (s, true),
-            (_, NodeEnv::Development) => (DEV_JWT_PLACEHOLDER.to_string(), true),
-        };
+        let allow_dev_placeholder = env_flag_is_true(ALLOW_DEV_JWT_ENV);
+        let (jwt_secret, jwt_secret_is_placeholder) =
+            resolve_jwt_secret(raw_jwt_secret.as_deref(), node_env, allow_dev_placeholder)?;
         let jwt_secret_short = jwt_secret.len() < 32;
 
         let (encryption_key, encryption_key_fell_back) = match env::var("ENCRYPTION_KEY") {
@@ -458,10 +457,37 @@ fn parse_env_csv(key: &str) -> Vec<String> {
 }
 
 fn parse_bool_flag(key: &str) -> bool {
+    env_flag_is_true(key)
+}
+
+fn env_flag_is_true(key: &str) -> bool {
     matches!(
-        env::var(key).as_deref(),
+        env::var(key).as_deref().map(str::trim),
         Ok("true") | Ok("1") | Ok("TRUE") | Ok("True")
     )
+}
+
+/// Decide the JWT secret. The public placeholder is refused unless the
+/// caller passes `allow_dev_placeholder` (the `TS6_ALLOW_INSECURE_DEV_JWT`
+/// flag) and the process is not production.
+pub(crate) fn resolve_jwt_secret(
+    raw: Option<&str>,
+    node_env: NodeEnv,
+    allow_dev_placeholder: bool,
+) -> Result<(String, bool)> {
+    let trimmed = raw.map(str::trim).filter(|s| !s.is_empty());
+    match (trimmed, node_env) {
+        (_, NodeEnv::Production) if trimmed.is_none_or(|s| s == DEV_JWT_PLACEHOLDER) => {
+            bail!("JWT_SECRET must be set to a non-placeholder value when NODE_ENV=production");
+        }
+        (Some(secret), _) if secret != DEV_JWT_PLACEHOLDER => Ok((secret.to_string(), false)),
+        _ if allow_dev_placeholder && !node_env.is_production() => {
+            Ok((DEV_JWT_PLACEHOLDER.to_string(), true))
+        }
+        _ => bail!(
+            "JWT_SECRET is unset or the public dev placeholder. Set a real secret, or set {ALLOW_DEV_JWT_ENV}=1 to boot a local dev process with the placeholder"
+        ),
+    }
 }
 
 /// Parse `15m` / `7d` / `30s` / `2h` style durations. Numeric-only values are treated as seconds.
@@ -508,6 +534,28 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn placeholder_jwt_requires_an_explicit_dev_flag() {
+        let err = resolve_jwt_secret(None, NodeEnv::Development, false).unwrap_err();
+        assert!(err.to_string().contains("TS6_ALLOW_INSECURE_DEV_JWT"));
+        let err =
+            resolve_jwt_secret(Some(DEV_JWT_PLACEHOLDER), NodeEnv::Development, false).unwrap_err();
+        assert!(err.to_string().contains("placeholder"));
+        let (secret, placeholder) = resolve_jwt_secret(None, NodeEnv::Development, true).unwrap();
+        assert!(placeholder);
+        assert_eq!(secret, DEV_JWT_PLACEHOLDER);
+        // Production never accepts the placeholder, even with the flag.
+        assert!(resolve_jwt_secret(Some(DEV_JWT_PLACEHOLDER), NodeEnv::Production, true).is_err());
+        let (secret, placeholder) = resolve_jwt_secret(
+            Some("a-real-secret-value-32b-minimum!!"),
+            NodeEnv::Development,
+            false,
+        )
+        .unwrap();
+        assert!(!placeholder);
+        assert!(secret.starts_with("a-real-secret"));
+    }
+
     fn node_env_defaults_to_development() {
         assert_eq!(NodeEnv::from_env_string(None), NodeEnv::Development);
         assert_eq!(

@@ -135,6 +135,13 @@ async fn seed_token(state: &FlowApiState, role: &str) -> String {
     .unwrap()
 }
 
+async fn grant(state: &FlowApiState, token: &str, server_id: i64) {
+    let claims = jwt::verify_access(token, &state.app.jwt_secret).unwrap();
+    crate::repos::server_user_grants::insert(&state.app.db, claims.id, server_id)
+        .await
+        .unwrap();
+}
+
 /// A cheap unique suffix so two `seed_token` calls in one test never collide
 /// on the `users.username` unique index.
 fn uuid_like() -> u128 {
@@ -589,6 +596,7 @@ async fn convert_blocked_while_the_flow_is_enabled() {
 async fn get_run_detail_carries_node_results_for_a_v2_run() {
     let (state, _engine, server_id) = setup().await;
     let token = seed_token(&state, "viewer").await;
+    grant(&state, &token, server_id).await;
     let flow_id = insert_legacy_flow(&state, "with-runs", server_id, false).await;
 
     // A v2 run row — `nodeResults` populated, `actionResults` empty.
@@ -680,6 +688,7 @@ async fn get_run_detail_carries_node_results_for_a_v2_run() {
 async fn get_run_404s_when_the_run_belongs_to_another_flow() {
     let (state, _engine, server_id) = setup().await;
     let token = seed_token(&state, "viewer").await;
+    grant(&state, &token, server_id).await;
     let flow_a = insert_legacy_flow(&state, "flow-a", server_id, false).await;
     let flow_b = insert_legacy_flow(&state, "flow-b", server_id, false).await;
 
@@ -850,6 +859,8 @@ async fn write_routes_require_admin() {
     let (state, _engine, server_id) = setup().await;
     let admin = seed_token(&state, "admin").await;
     let viewer = seed_token(&state, "viewer").await;
+    let db = state.app.db.clone();
+    let jwt_secret = state.app.jwt_secret.clone();
 
     // Seed one flow with the admin token so the write routes have a target.
     let router = app(state);
@@ -901,8 +912,49 @@ async fn write_routes_require_admin() {
         );
     }
 
-    // A read route still works for the viewer.
-    let (status, _) = send(router, Method::GET, "/api/flows", Some(&viewer), None).await;
+    // A read route still answers 200. Without a grant the list is empty.
+    let (status, body) = send(
+        router.clone(),
+        Method::GET,
+        "/api/flows",
+        Some(&viewer),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["flows"].as_array().map(|a| a.len()), Some(0));
+    let (status, _) = send(
+        router.clone(),
+        Method::GET,
+        &format!("/api/flows/{id}"),
+        Some(&viewer),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let claims = jwt::verify_access(&viewer, &jwt_secret).unwrap();
+    crate::repos::server_user_grants::insert(&db, claims.id, server_id)
+        .await
+        .unwrap();
+    let (status, body) = send(
+        router.clone(),
+        Method::GET,
+        "/api/flows",
+        Some(&viewer),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["flows"].as_array().map(|a| a.len()), Some(1));
+    let (status, _) = send(
+        router,
+        Method::GET,
+        &format!("/api/flows/{id}"),
+        Some(&viewer),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
 }
 

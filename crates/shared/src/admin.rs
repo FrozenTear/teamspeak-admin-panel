@@ -75,7 +75,9 @@ pub struct AdminSession {
     pub family: Option<String>,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
-    pub replaced_by: Option<String>,
+    /// True when this row is a rotated predecessor. The successor refresh
+    /// token is never returned on this struct.
+    pub rotated: bool,
 }
 
 /// `GET /api/audit` element. See `docs/admin/audit-shape.md` §2 for the
@@ -195,18 +197,20 @@ mod tests {
             family: Some("fam-abc".into()),
             created_at: Utc.with_ymd_and_hms(2026, 5, 19, 13, 5, 14).unwrap(),
             expires_at: Utc.with_ymd_and_hms(2026, 5, 19, 14, 5, 14).unwrap(),
-            replaced_by: None,
+            rotated: false,
         };
         let json = serde_json::to_value(&s).unwrap();
-        for key in ["id", "family", "createdAt", "expiresAt", "replacedBy"] {
+        for key in ["id", "family", "createdAt", "expiresAt", "rotated"] {
             assert!(
                 json.get(key).is_some(),
                 "AdminSession missing key `{key}`: {json}"
             );
         }
-        // The refresh-token byte string MUST NOT ride the wire. Construction
-        // guarantees this (no `token` field exists).
+        // The refresh-token byte string and the live successor MUST NOT
+        // ride the wire. `rotated` is a bool, not the next token.
         assert!(json.get("token").is_none());
+        assert!(json.get("replacedBy").is_none());
+        assert_eq!(json.get("rotated").and_then(|v| v.as_bool()), Some(false));
     }
 
     #[test]

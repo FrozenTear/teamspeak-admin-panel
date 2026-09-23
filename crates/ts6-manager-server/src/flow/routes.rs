@@ -66,12 +66,13 @@ use ts6_manager_shared::flows::{
 };
 
 use crate::app_state::AppState;
-use crate::auth::extractors::{RequireAdmin, RequireAuth};
+use crate::auth::extractors::{AuthUser, RequireAdmin, RequireAuth};
 use crate::flow::FlowEngineHandle;
 use crate::flow::engine::{FireError, commands, graph, parse_definition};
 use crate::flow::trigger::ParsedTrigger;
 use crate::repos::bot_flow_runs::{self, BotFlowRun};
 use crate::repos::bot_flows::{self, BotFlow, BotFlowUpdate, NewBotFlow};
+use crate::routes::control::access;
 
 /// `http-api.md` §3.1 — flow name length cap.
 const MAX_NAME_LEN: usize = 120;
@@ -165,6 +166,28 @@ fn name_taken() -> Response {
         "name_taken",
         "a flow with this name already exists for the server / virtual server",
     )
+}
+
+/// Non-admins only see flows for servers they can read. Admins are
+/// unfiltered. A missing grant or missing server hides the row; a
+/// database failure propagates.
+async fn flow_hidden_from(
+    state: &FlowApiState,
+    user: &AuthUser,
+    server_config_id: i64,
+) -> Result<bool, Response> {
+    if user.is_admin() {
+        return Ok(false);
+    }
+    match access::check_read(&state.app, user, server_config_id).await {
+        Ok(_) => Ok(false),
+        Err(resp)
+            if resp.status() == StatusCode::FORBIDDEN || resp.status() == StatusCode::NOT_FOUND =>
+        {
+            Ok(true)
+        }
+        Err(resp) => Err(resp),
+    }
 }
 
 fn internal() -> Response {
@@ -471,7 +494,7 @@ struct ListFlowsQuery {
 
 /// `GET /api/flows` — list flows, optional `?virtualServerId=` / `?enabled=`.
 async fn list_flows(
-    _user: RequireAuth,
+    RequireAuth(user): RequireAuth,
     State(state): State<FlowApiState>,
     Query(query): Query<ListFlowsQuery>,
 ) -> Response {
@@ -481,6 +504,11 @@ async fn list_flows(
     };
     let mut flows = Vec::with_capacity(rows.len());
     for row in rows {
+        match flow_hidden_from(&state, &user, row.serverConfigId).await {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(resp) => return resp,
+        }
         if let Some(vsid) = query.virtual_server_id
             && row.virtualServerId != vsid
         {
@@ -581,7 +609,7 @@ async fn create_flow(
 
 /// `GET /api/flows/{id}` — fetch one flow.
 async fn get_flow(
-    _user: RequireAuth,
+    RequireAuth(user): RequireAuth,
     State(state): State<FlowApiState>,
     Path(id): Path<i64>,
 ) -> Response {
@@ -590,6 +618,11 @@ async fn get_flow(
         Ok(None) => return not_found(),
         Err(_) => return internal(),
     };
+    match flow_hidden_from(&state, &user, row.serverConfigId).await {
+        Ok(true) => return not_found(),
+        Ok(false) => {}
+        Err(resp) => return resp,
+    }
     let version = match version_of(&row.flowData) {
         Ok(v) => v,
         Err(resp) => return resp,
@@ -953,7 +986,7 @@ struct ListRunsQuery {
 /// payload: `nodeResults` is emitted empty to keep the history page light
 /// (`http-api.md` §3.2).
 async fn list_runs(
-    _user: RequireAuth,
+    RequireAuth(user): RequireAuth,
     State(state): State<FlowApiState>,
     Path(id): Path<i64>,
     Query(query): Query<ListRunsQuery>,
@@ -963,6 +996,11 @@ async fn list_runs(
         Ok(None) => return not_found(),
         Err(_) => return internal(),
     };
+    match flow_hidden_from(&state, &user, flow.serverConfigId).await {
+        Ok(true) => return not_found(),
+        Ok(false) => {}
+        Err(resp) => return resp,
+    }
     let version = match version_of(&flow.flowData) {
         Ok(v) => v,
         Err(resp) => return resp,
@@ -995,7 +1033,7 @@ async fn list_runs(
 /// array, the run-overlay source (`http-api.md` §3.2). `404` if the run is
 /// unknown or not owned by `{id}`.
 async fn get_run(
-    _user: RequireAuth,
+    RequireAuth(user): RequireAuth,
     State(state): State<FlowApiState>,
     Path((id, run_id)): Path<(i64, i64)>,
 ) -> Response {
@@ -1004,6 +1042,11 @@ async fn get_run(
         Ok(None) => return not_found(),
         Err(_) => return internal(),
     };
+    match flow_hidden_from(&state, &user, flow.serverConfigId).await {
+        Ok(true) => return not_found(),
+        Ok(false) => {}
+        Err(resp) => return resp,
+    }
     let version = match version_of(&flow.flowData) {
         Ok(v) => v,
         Err(resp) => return resp,

@@ -1506,16 +1506,32 @@ fn sort_siblings(kids: &mut [ChannelTreeNode]) {
 /// Callers must pass siblings already ordered by [`sort_siblings`]. Same-parent
 /// reorder goes through `PUT` `channelOrder`, not `channelmove` — TeamSpeak
 /// returns error 770 when `cpid` is already the parent.
+fn order_stays_in_parent(siblings: &[ChannelTreeNode], order: i64, self_cid: i64) -> bool {
+    order == 0 || siblings.iter().any(|s| s.cid == order && s.cid != self_cid)
+}
+
 fn sibling_move_order(siblings: &[ChannelTreeNode], cid: i64, up: bool) -> Option<i64> {
     let idx = siblings.iter().position(|c| c.cid == cid)?;
     if up {
         if idx == 0 {
             return None;
         }
-        Some(siblings[idx - 1].channel_order)
+        let desired = siblings[idx - 1].channel_order;
+        if order_stays_in_parent(siblings, desired, cid) {
+            return Some(desired);
+        }
+        // Broken predecessor chain: the previous sibling's channel_order
+        // names a cid outside this parent. TeamSpeak rejects that. Fall
+        // back to a cid that is actually in the sibling list (or 0).
+        if idx == 1 {
+            Some(0)
+        } else {
+            let fallback = siblings[idx - 2].cid;
+            order_stays_in_parent(siblings, fallback, cid).then_some(fallback)
+        }
     } else {
         let next = siblings.get(idx + 1)?;
-        Some(next.cid)
+        order_stays_in_parent(siblings, next.cid, cid).then_some(next.cid)
     }
 }
 
@@ -1803,6 +1819,15 @@ mod tests {
         assert_eq!(sibling_move_order(&siblings, 10, true), None);
         assert_eq!(sibling_move_order(&siblings, 30, false), None);
         assert_eq!(sibling_move_order(&siblings, 10, false), Some(20));
+    }
+
+    #[test]
+    fn sibling_move_order_does_not_send_a_cid_outside_the_parent() {
+        // Previous sibling's channel_order points at cid 999, which is not
+        // in this parent. Sending 999 makes TeamSpeak reject the edit.
+        let siblings = vec![ch(10, 0, 999, "A"), ch(20, 0, 999, "B")];
+        assert_eq!(sibling_move_order(&siblings, 20, true), Some(0));
+        assert_ne!(sibling_move_order(&siblings, 20, true), Some(999));
     }
 
     #[test]

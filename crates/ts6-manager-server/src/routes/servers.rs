@@ -147,6 +147,18 @@ async fn patch_server(
             "sshAuthMethod must be 'password', 'key', or 'agent'",
         ));
     }
+    // An empty fingerprint used to clear the pin and re-arm TOFU. Omitting
+    // the field still preserves the stored value. Clearing is not this field.
+    if req
+        .ssh_host_key_fingerprint
+        .as_deref()
+        .is_some_and(|s| s.trim().is_empty())
+    {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "sshHostKeyFingerprint cannot be empty; omit the field to keep the current pin",
+        ));
+    }
 
     let sealed_api_key = match req.api_key.as_deref() {
         Some(s) if !s.is_empty() => Some(crypto::seal(s).map_err(|e| {
@@ -191,6 +203,11 @@ async fn patch_server(
             internal()
         })?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "server not found"))?;
+
+    // Drop pooled clients so a rotated API key, SSH password, or a
+    // corrected host-key fingerprint takes effect before process restart.
+    state.webquery.remove(id).await;
+    state.control.remove(id).await;
 
     Ok(Json(server_summary_from_row(row)))
 }

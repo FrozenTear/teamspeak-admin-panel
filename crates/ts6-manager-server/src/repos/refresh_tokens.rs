@@ -11,9 +11,26 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use surrealdb::types::SurrealValue;
 
 use crate::db::Database;
+
+/// SHA-256 hex digest of a refresh-token bearer string.
+///
+/// The plaintext is what the client holds. Surreal stores only this digest
+/// in `token` and `replacedBy`, so a database read cannot be replayed as a
+/// live session and the admin sessions endpoint cannot return a successor.
+pub fn token_at_rest(token: &str) -> String {
+    hex::encode(Sha256::digest(token.as_bytes()))
+}
+
+fn is_stored_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
 
 #[allow(non_snake_case)]
 #[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
@@ -63,7 +80,7 @@ pub async fn insert(db: &Database, new: NewRefreshToken) -> Result<RefreshToken>
         .query(sql)
         // SurrealDB v3 reserves `$token` as an internal variable; use `$tok`
         // at the bind layer and reference it that way in the SurrealQL.
-        .bind(("tok", new.token))
+        .bind(("tok", token_at_rest(&new.token)))
         .bind(("userId", new.userId))
         .bind(("expiresAt", new.expiresAt))
         .bind(("family", new.family))
@@ -87,7 +104,7 @@ pub async fn find_by_token(db: &Database, token: &str) -> Result<Option<RefreshT
     let sql = format!("SELECT {PROJECTION} FROM refresh_token WHERE token = $tok LIMIT 1;");
     let mut resp = db
         .query(sql)
-        .bind(("tok", token.to_string()))
+        .bind(("tok", token_at_rest(token)))
         .await?
         .check()?;
     Ok(resp.take(0)?)
@@ -103,7 +120,7 @@ pub async fn find_predecessor_by_replaced_by(
     let sql = format!("SELECT {PROJECTION} FROM refresh_token WHERE replacedBy = $tok LIMIT 1;");
     let mut resp = db
         .query(sql)
-        .bind(("tok", successor_token.to_string()))
+        .bind(("tok", token_at_rest(successor_token)))
         .await?
         .check()?;
     Ok(resp.take(0)?)
@@ -152,21 +169,128 @@ pub async fn set_replaced_by(
     );
     let mut resp = db
         .query(sql)
-        .bind(("old", old_token.to_string()))
-        .bind(("new", new_token.to_string()))
+        .bind(("old", token_at_rest(old_token)))
+        .bind(("new", token_at_rest(new_token)))
         .await?
         .check()?;
     let rows: Vec<RefreshToken> = resp.take(0)?;
     Ok(rows.into_iter().next())
 }
 
+/// Compare-and-swap the predecessor and insert the successor in one
+/// SurrealDB transaction (L4). A revocation that lands between the two
+/// writes used to leave the successor as an orphan live token.
+///
+/// `Ok(None)` means the CAS lost (the predecessor was already rotated or
+/// deleted). Any other failure, including a rolled-back insert, is `Err`.
+pub async fn commit_rotation(
+    db: &Database,
+    old_token: &str,
+    new: NewRefreshToken,
+) -> Result<Option<()>> {
+    let sql = "
+        BEGIN TRANSACTION;
+        LET $updated = (UPDATE refresh_token MERGE { replacedBy: $newh }
+            WHERE token = $oldh AND replacedBy IS NONE);
+        IF array::len($updated) = 0 {
+            THROW \"rotation-lost\";
+        };
+        CREATE type::record('refresh_token', sequence::nextval('refresh_token_id'))
+            CONTENT {
+                token: $newh,
+                userId: $userId,
+                expiresAt: $expiresAt,
+                family: $family
+            };
+        COMMIT TRANSACTION;
+    ";
+    let result = db
+        .query(sql)
+        .bind(("oldh", token_at_rest(old_token)))
+        .bind(("newh", token_at_rest(&new.token)))
+        .bind(("userId", new.userId))
+        .bind(("expiresAt", new.expiresAt))
+        .bind(("family", new.family))
+        .await;
+    match result {
+        Ok(mut resp) => match resp.check() {
+            Ok(_) => Ok(Some(())),
+            Err(err) if err.to_string().contains("rotation-lost") => Ok(None),
+            Err(err) => Err(err).context("refresh_token rotation transaction failed"),
+        },
+        Err(err) if err.to_string().contains("rotation-lost") => Ok(None),
+        Err(err) => Err(err).context("refresh_token rotation transaction failed"),
+    }
+}
+
 pub async fn delete_by_token(db: &Database, token: &str) -> Result<()> {
     let sql = "DELETE refresh_token WHERE token = $tok;";
     db.query(sql)
-        .bind(("tok", token.to_string()))
+        .bind(("tok", token_at_rest(token)))
         .await?
         .check()?;
     Ok(())
+}
+
+/// Delete one row by its integer id. Used when the caller already holds
+/// the stored row (whose `token` column is a digest, not a bearer).
+pub async fn delete_by_id(db: &Database, id: i64) -> Result<()> {
+    let sql = "DELETE type::record('refresh_token', $id);";
+    db.query(sql).bind(("id", id)).await?.check()?;
+    Ok(())
+}
+
+/// One-shot upgrade: hash any `token` / `replacedBy` values that are still
+/// plaintext. Digests (64 lowercase hex chars) are left alone. Safe to run
+/// on every boot.
+pub async fn rehash_plaintext_tokens(db: &Database) -> Result<u64> {
+    #[allow(non_snake_case)]
+    #[derive(Debug, Deserialize, SurrealValue)]
+    #[surreal(crate = "surrealdb::types")]
+    struct Row {
+        id: i64,
+        token: String,
+        replacedBy: Option<String>,
+    }
+    let sql = "SELECT record::id(id) AS id, token, replacedBy FROM refresh_token;";
+    let mut resp = db.query(sql).await?.check()?;
+    let rows: Vec<Row> = resp.take(0)?;
+    let mut n = 0u64;
+    for row in rows {
+        let token = if is_stored_digest(&row.token) {
+            None
+        } else {
+            Some(token_at_rest(&row.token))
+        };
+        let replaced = match row.replacedBy.as_deref() {
+            Some(value) if !is_stored_digest(value) => Some(token_at_rest(value)),
+            _ => None,
+        };
+        if token.is_none() && replaced.is_none() {
+            continue;
+        }
+        let mut q = String::from("UPDATE type::record('refresh_token', $id) MERGE {");
+        if token.is_some() {
+            q.push_str(" token: $tok");
+        }
+        if replaced.is_some() {
+            if token.is_some() {
+                q.push(',');
+            }
+            q.push_str(" replacedBy: $rep");
+        }
+        q.push_str(" };");
+        let mut query = db.query(q).bind(("id", row.id));
+        if let Some(tok) = token {
+            query = query.bind(("tok", tok));
+        }
+        if let Some(rep) = replaced {
+            query = query.bind(("rep", rep));
+        }
+        query.await?.check()?;
+        n += 1;
+    }
+    Ok(n)
 }
 
 /// Spec §6.5.4 — revoke every token for a user. Used both on confirmed

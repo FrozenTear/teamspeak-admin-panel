@@ -107,9 +107,16 @@ impl SshControlClient {
     /// before the command is issued.
     async fn run_scoped(&self, sid: i64, line: &str) -> ControlResult<CommandOutcome> {
         let _guard = self.sid_gate.lock().await;
-        let use_line = format!("use sid={sid}");
-        self.execute(&use_line, Some(sid)).await?;
-        self.execute(line, Some(sid)).await
+        // One dispatch item: the notify worker's `use sid=` cannot land
+        // between this selection and the command that depends on it.
+        self.transport
+            .execute_lines(
+                vec![format!("use sid={sid}"), line.to_string()],
+                None,
+                Some(sid),
+            )
+            .await
+            .map_err(Into::into)
     }
 
     /// Convert a single record into the typed shape via JSON

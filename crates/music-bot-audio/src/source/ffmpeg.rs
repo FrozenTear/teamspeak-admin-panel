@@ -35,26 +35,6 @@ pub(crate) fn ffmpeg_input_is_remote_http(input: &str) -> bool {
 /// segment fetches (`libavformat/tls.c`).
 const REMOTE_PROTOCOL_WHITELIST: &str = "http,https,tls,tcp,crypto,httpproxy";
 
-/// `TS6_MUSIC_TLS_VERIFY` opts out of certificate checks. There is no
-/// Contabo exception; unset (and any value other than `0` / `false` /
-/// `off` / `no`) verifies. ffmpeg's own default is `tls_verify=0`.
-fn tls_verify_enabled_value(raw: Option<&str>) -> bool {
-    match raw.map(str::trim).filter(|v| !v.is_empty()) {
-        None => true,
-        Some(v) => !matches!(
-            v.to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
-        ),
-    }
-}
-
-fn tls_verify_enabled() -> bool {
-    match std::env::var("TS6_MUSIC_TLS_VERIFY") {
-        Ok(value) => tls_verify_enabled_value(Some(&value)),
-        Err(_) => true,
-    }
-}
-
 fn tls_ca_file() -> Option<String> {
     std::env::var("TS6_TLS_CA_FILE")
         .ok()
@@ -64,14 +44,14 @@ fn tls_ca_file() -> Option<String> {
 
 /// Arguments that select ffmpeg's input. Local paths are limited to the
 /// `file` protocol so a library path cannot become `concat:`, `subfile:`,
-/// `data:`, or an unpinned HTTP fetch. Remote http(s) inputs verify TLS
-/// when the source is `https`, restrict the protocol set, and send every
-/// fetch — including HLS segment URLs — through `http_proxy`.
+/// `data:`, or an unpinned HTTP fetch. Remote http(s) inputs always verify
+/// TLS when the source is `https` (ffmpeg's own default is `tls_verify=0`;
+/// there is no opt-out), restrict the protocol set, and send every fetch —
+/// including HLS segment URLs — through `http_proxy`.
 fn apply_ffmpeg_input_args(
     cmd: &mut Command,
     input: &str,
     start_secs: Option<u64>,
-    tls_verify: bool,
     ca_file: Option<&str>,
     http_proxy: Option<&str>,
 ) {
@@ -84,7 +64,7 @@ fn apply_ffmpeg_input_args(
     // ffmpeg 6.1 defaults it to 0, which is the H5 hole: a rebind or a
     // nested HTTPS segment completes the handshake without checking the
     // certificate. `ca_file` matches the sidecar (`TS6_TLS_CA_FILE`).
-    if remote && https && tls_verify {
+    if remote && https {
         cmd.arg("-tls_verify").arg("1");
         if let Some(ca_file) = ca_file.filter(|value| !value.is_empty()) {
             cmd.arg("-ca_file").arg(ca_file);
@@ -189,7 +169,6 @@ impl FfmpegSource {
             &mut cmd,
             input,
             start_secs,
-            tls_verify_enabled(),
             tls_ca_file().as_deref(),
             proxy_url.as_deref(),
         );
@@ -561,23 +540,17 @@ mod tests {
 mod protocol_whitelist_tests {
     use super::{
         FfmpegSource, REMOTE_PROTOCOL_WHITELIST, apply_ffmpeg_input_args,
-        ffmpeg_input_is_remote_http, install_playback_proxy_env, tls_verify_enabled,
-        tls_verify_enabled_value,
+        ffmpeg_input_is_remote_http, install_playback_proxy_env,
     };
     use tokio::process::Command;
 
     fn args_for(input: &str) -> Vec<String> {
-        args_for_remote(input, true, None, None)
+        args_for_remote(input, None, None)
     }
 
-    fn args_for_remote(
-        input: &str,
-        tls_verify: bool,
-        ca_file: Option<&str>,
-        proxy: Option<&str>,
-    ) -> Vec<String> {
+    fn args_for_remote(input: &str, ca_file: Option<&str>, proxy: Option<&str>) -> Vec<String> {
         let mut cmd = Command::new("ffmpeg");
-        apply_ffmpeg_input_args(&mut cmd, input, None, tls_verify, ca_file, proxy);
+        apply_ffmpeg_input_args(&mut cmd, input, None, ca_file, proxy);
         cmd.as_std()
             .get_args()
             .map(|s| s.to_string_lossy().into_owned())
@@ -608,27 +581,9 @@ mod protocol_whitelist_tests {
     }
 
     #[test]
-    fn tls_verify_defaults_on_unless_explicitly_disabled() {
-        assert!(tls_verify_enabled_value(None));
-        assert!(tls_verify_enabled_value(Some("")));
-        assert!(tls_verify_enabled_value(Some("1")));
-        assert!(tls_verify_enabled_value(Some("yes")));
-        assert!(!tls_verify_enabled_value(Some("0")));
-        assert!(!tls_verify_enabled_value(Some("false")));
-        assert!(!tls_verify_enabled_value(Some("off")));
-        assert!(!tls_verify_enabled_value(Some("no")));
-        assert!(!tls_verify_enabled_value(Some(" NO ")));
-        // The process env is not required. When it is unset, the helper
-        // from_input calls agrees with the default.
-        if std::env::var_os("TS6_MUSIC_TLS_VERIFY").is_none() {
-            assert!(tls_verify_enabled());
-        }
-    }
-
-    #[test]
     fn https_input_forces_tls_verify_before_the_url() {
         let proxy = "http://127.0.0.1:9";
-        let args = args_for_remote("https://cdn.example/a.mp3", true, None, Some(proxy));
+        let args = args_for_remote("https://cdn.example/a.mp3", None, Some(proxy));
         assert_eq!(
             value_after(&args, "-tls_verify"),
             Some("1"),
@@ -654,27 +609,22 @@ mod protocol_whitelist_tests {
     }
 
     #[test]
-    fn tls_verify_opt_out_omits_the_flag() {
+    fn https_always_verifies_tls() {
         let args = args_for_remote(
             "https://cdn.example/a.mp3",
-            false,
             None,
             Some("http://127.0.0.1:9"),
         );
-        assert!(
-            !args.iter().any(|a| a == "-tls_verify"),
-            "explicit opt-out must not force -tls_verify, argv = {args:?}"
+        assert_eq!(
+            value_after(&args, "-tls_verify"),
+            Some("1"),
+            "https input must not be able to run with tls_verify=0, argv = {args:?}"
         );
     }
 
     #[test]
     fn https_ca_file_is_passed_when_set() {
-        let args = args_for_remote(
-            "https://cdn.example/a.mp3",
-            true,
-            Some("/etc/ssl/cert.pem"),
-            None,
-        );
+        let args = args_for_remote("https://cdn.example/a.mp3", Some("/etc/ssl/cert.pem"), None);
         assert_eq!(value_after(&args, "-ca_file"), Some("/etc/ssl/cert.pem"));
     }
 
@@ -682,7 +632,6 @@ mod protocol_whitelist_tests {
     fn plaintext_http_is_proxied_without_tls_verify() {
         let args = args_for_remote(
             "http://203.0.113.10/a.mp3",
-            true,
             Some("/etc/ssl/cert.pem"),
             Some("http://127.0.0.1:9"),
         );
@@ -744,7 +693,6 @@ mod protocol_whitelist_tests {
             &mut cmd,
             "http://169.254.169.254/latest/meta-data",
             None,
-            true,
             None,
             Some(&proxy.base_url()),
         );

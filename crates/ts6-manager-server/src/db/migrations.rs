@@ -150,6 +150,12 @@ pub async fn run(db: &Database) -> Result<MigrationReport> {
         applied_now.push((*name).to_string());
     }
 
+    // M3 — hash any refresh tokens that were stored as plaintext before
+    // the at-rest digest. Idempotent: digests are skipped.
+    if let Err(err) = crate::repos::refresh_tokens::rehash_plaintext_tokens(db).await {
+        tracing::warn!(error = %err, "refresh-token at-rest rehash failed");
+    }
+
     Ok(MigrationReport {
         applied: applied_now,
         skipped,

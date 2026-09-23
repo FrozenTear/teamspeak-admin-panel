@@ -367,6 +367,37 @@ fn url_cache_enabled() -> bool {
     std::env::var_os("YT_RESOLVER_URL_CACHE_DISABLE").is_none()
 }
 
+/// Unpredictable name so a pre-created symlink at a pid-based path cannot
+/// redirect the script write. `create_new` is `O_EXCL`; `O_NOFOLLOW` refuses
+/// a final-component symlink if the name is won anyway.
+fn write_resolver_script(
+    dir: &std::path::Path,
+    nonce: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let path = dir.join(format!("ts6-yt-resolver-{nonce}.py"));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        opts.mode(0o600);
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = opts.open(&path)?;
+    file.write_all(RESOLVER_SCRIPT.as_bytes())?;
+    Ok(path)
+}
+
+fn random_resolver_nonce() -> std::io::Result<String> {
+    let mut buf = [0u8; 16];
+    let mut urandom = std::fs::File::open("/dev/urandom")?;
+    std::io::Read::read_exact(&mut urandom, &mut buf)?;
+    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
+}
+
 /// State shared between [`ResolverHandle`] and its background supervisor.
 ///
 /// The `dead` flag is set by the supervisor right before it gives up (after
@@ -406,11 +437,10 @@ impl ResolverHandle {
     /// ~2 s) in the background, so callers should [`warm_up`] at server boot
     /// well before the first `!play`.
     fn spawn() -> std::io::Result<Self> {
-        let pid = std::process::id();
         let dir = std::env::temp_dir();
-        let script_path = dir.join(format!("ts6-yt-resolver-{pid}.py"));
-        let socket_path = dir.join(format!("ts6-yt-resolver-{pid}.sock"));
-        std::fs::write(&script_path, RESOLVER_SCRIPT)?;
+        let nonce = random_resolver_nonce()?;
+        let script_path = write_resolver_script(&dir, &nonce)?;
+        let socket_path = dir.join(format!("ts6-yt-resolver-{nonce}.sock"));
         let state = Arc::new(SupervisorState::default());
         // Supervisor + its stderr reader stay on decode-rt, not voice-rt.
         crate::runtime::spawn_decode(supervise(script_path, socket_path.clone(), state.clone()));

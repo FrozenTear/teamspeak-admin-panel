@@ -337,10 +337,19 @@ const REGISTER_LINES: [&str; 4] = [
     "servernotifyregister event=textchannel id=0",
 ];
 
+/// Default virtual server. `server_connection` has no virtual-server id;
+/// sid 1 is the TeamSpeak instance default. `use` and the four registers
+/// are one dispatch batch so a scoped command cannot change sid between
+/// them.
+const NOTIFY_SID: i64 = 1;
+
 async fn register_all(transport: &TransportHandle) -> Result<(), SshBridgeError> {
-    for line in REGISTER_LINES {
-        transport.execute(line.to_string(), None, None).await?;
-    }
+    let mut lines = Vec::with_capacity(REGISTER_LINES.len() + 1);
+    lines.push(format!("use sid={NOTIFY_SID}"));
+    lines.extend(REGISTER_LINES.iter().map(|line| (*line).to_string()));
+    transport
+        .execute_lines(lines, None, Some(NOTIFY_SID))
+        .await?;
     Ok(())
 }
 
@@ -597,6 +606,7 @@ mod tests {
             role: "admin".into(),
             is_admin: true,
             is_at_least_moderator: true,
+            access_exp: i64::MAX,
         })
     }
 

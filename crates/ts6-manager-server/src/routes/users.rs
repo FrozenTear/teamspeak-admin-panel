@@ -596,8 +596,7 @@ async fn revoke_session(
         None => {
             // Family is None for any row that predates §6.5; delete the single
             // row by token in that case.
-            let token = row.token.clone();
-            let _ = refresh_tokens::delete_by_token(&state.db, &token).await;
+            let _ = refresh_tokens::delete_by_id(&state.db, row.id).await;
             audit::record(
                 &state.db,
                 Event {
@@ -689,7 +688,9 @@ fn session_to_wire(row: refresh_tokens::RefreshToken) -> AdminSession {
         family: row.family,
         created_at: row.createdAt,
         expires_at: row.expiresAt,
-        replaced_by: row.replacedBy,
+        // The stored `replacedBy` is a hash of the successor, never the
+        // live token. The admin UI only needs to know the row was rotated.
+        rotated: row.replacedBy.is_some(),
     }
 }
 

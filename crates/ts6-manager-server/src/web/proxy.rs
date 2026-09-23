@@ -96,7 +96,7 @@ pub fn client_ip(headers: &HeaderMap, connect_info: SocketAddr, trust: &ProxyTru
     }
     let trusted_hops = trust.hops;
 
-    let raw = match headers.get(&X_FORWARDED_FOR).and_then(|v| v.to_str().ok()) {
+    let raw = match joined_header_lines(headers, &X_FORWARDED_FOR) {
         Some(s) => s,
         None => return connect_info.ip(),
     };
@@ -104,7 +104,11 @@ pub fn client_ip(headers: &HeaderMap, connect_info: SocketAddr, trust: &ProxyTru
     // XFF is a comma-separated list. Parse from the right because the
     // rightmost entries are the ones nearest us (added by trusted proxies);
     // leftmost entries may have been forged by the original client.
-    let entries: Vec<&str> = raw.split(',').map(str::trim).collect();
+    let entries: Vec<&str> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
     let from_right = trusted_hops as usize;
     if entries.len() < from_right {
         // Header shorter than configured chain depth — operator
@@ -126,18 +130,18 @@ pub fn client_ip(headers: &HeaderMap, connect_info: SocketAddr, trust: &ProxyTru
 ///   train HSTS, even if hops is set and the CIDR list is empty.
 /// - otherwise the Nth-from-right comma-separated entry is returned after
 ///   trim. Missing / short / empty headers yield `None`.
-pub fn forwarded_proto<'a>(
-    headers: &'a HeaderMap,
-    peer: IpAddr,
-    trust: &ProxyTrust,
-) -> Option<&'a str> {
+pub fn forwarded_proto(headers: &HeaderMap, peer: IpAddr, trust: &ProxyTrust) -> Option<String> {
     if !trust.honors_forwarding(peer) {
         return None;
     }
     let trusted_hops = trust.hops;
 
-    let raw = headers.get(&X_FORWARDED_PROTO)?.to_str().ok()?;
-    let entries: Vec<&str> = raw.split(',').map(str::trim).collect();
+    let raw = joined_header_lines(headers, &X_FORWARDED_PROTO)?;
+    let entries: Vec<&str> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
     let from_right = trusted_hops as usize;
     if entries.len() < from_right {
         return None;
@@ -147,7 +151,25 @@ pub fn forwarded_proto<'a>(
     if candidate.is_empty() {
         None
     } else {
-        Some(candidate)
+        Some(candidate.to_string())
+    }
+}
+
+/// Join every line of `name`. A proxy that appends a second header
+/// (instead of extending the first comma-separated line) must still
+/// contribute the rightmost hop. A non-UTF-8 line fails closed (`None`).
+fn joined_header_lines(headers: &HeaderMap, name: &HeaderName) -> Option<String> {
+    let mut parts = Vec::new();
+    for value in headers.get_all(name) {
+        let text = value.to_str().ok()?;
+        if !text.is_empty() {
+            parts.push(text);
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(","))
     }
 }
 
@@ -269,6 +291,18 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn separate_xff_header_lines_are_joined() {
+        // A proxy that appends a second header line, rather than extending
+        // the client's comma-separated value, must not let the client pick
+        // the rate-limit key. hops=1 is the rightmost line.
+        let mut h = HeaderMap::new();
+        h.append(X_FORWARDED_FOR, HeaderValue::from_static("203.0.113.9"));
+        h.append(X_FORWARDED_FOR, HeaderValue::from_static("192.0.2.10"));
+        let ip = client_ip(&h, peer(), &trust_for(1));
+        assert_eq!(ip.to_string(), "192.0.2.10");
+    }
+
     fn ipv6_in_xff_round_trips() {
         let h = header_map(Some("evil-claim, 2001:db8::1"));
         let ip = client_ip(&h, peer(), &trust_for(1));
@@ -293,14 +327,17 @@ mod tests {
     #[test]
     fn trusted_hops_zero_ignores_forwarded_proto() {
         let h = proto_map(Some("https"));
-        assert_eq!(forwarded_proto(&h, peer().ip(), &trust_for(0)), None);
+        assert_eq!(
+            forwarded_proto(&h, peer().ip(), &trust_for(0)).as_deref(),
+            None
+        );
         assert!(!request_is_https(&h, peer().ip(), &trust_for(0)));
     }
 
     #[test]
     fn missing_forwarded_proto_is_none() {
         assert_eq!(
-            forwarded_proto(&proto_map(None), peer().ip(), &trust_for(1)),
+            forwarded_proto(&proto_map(None), peer().ip(), &trust_for(1)).as_deref(),
             None
         );
     }
@@ -309,7 +346,7 @@ mod tests {
     fn one_hop_takes_rightmost_proto() {
         let h = proto_map(Some("http, https"));
         assert_eq!(
-            forwarded_proto(&h, peer().ip(), &trust_for(1)),
+            forwarded_proto(&h, peer().ip(), &trust_for(1)).as_deref(),
             Some("https")
         );
         assert!(request_is_https(&h, peer().ip(), &trust_for(1)));
@@ -319,7 +356,7 @@ mod tests {
     fn peer_outside_cidr_ignores_forwarded_proto() {
         let h = proto_map(Some("https"));
         assert_eq!(
-            forwarded_proto(&h, outside_peer().ip(), &trust_for(1)),
+            forwarded_proto(&h, outside_peer().ip(), &trust_for(1)).as_deref(),
             None
         );
         assert!(!request_is_https(&h, outside_peer().ip(), &trust_for(1)));
@@ -329,7 +366,7 @@ mod tests {
     fn one_hop_single_https_entry() {
         let h = proto_map(Some("https"));
         assert_eq!(
-            forwarded_proto(&h, peer().ip(), &trust_for(1)),
+            forwarded_proto(&h, peer().ip(), &trust_for(1)).as_deref(),
             Some("https")
         );
         assert!(request_is_https(&h, peer().ip(), &trust_for(1)));
@@ -339,7 +376,7 @@ mod tests {
     fn one_hop_http_is_not_https() {
         let h = proto_map(Some("http"));
         assert_eq!(
-            forwarded_proto(&h, peer().ip(), &trust_for(1)),
+            forwarded_proto(&h, peer().ip(), &trust_for(1)).as_deref(),
             Some("http")
         );
         assert!(!request_is_https(&h, peer().ip(), &trust_for(1)));
@@ -351,11 +388,11 @@ mod tests {
         // hops=1 → rightmost = http; hops=2 → second from right = https.
         let h = proto_map(Some("https, http"));
         assert_eq!(
-            forwarded_proto(&h, peer().ip(), &trust_for(2)),
+            forwarded_proto(&h, peer().ip(), &trust_for(2)).as_deref(),
             Some("https")
         );
         assert_eq!(
-            forwarded_proto(&h, peer().ip(), &trust_for(1)),
+            forwarded_proto(&h, peer().ip(), &trust_for(1)).as_deref(),
             Some("http")
         );
         assert!(!request_is_https(&h, peer().ip(), &trust_for(1)));
@@ -364,14 +401,17 @@ mod tests {
     #[test]
     fn proto_shorter_than_trusted_chain_is_none() {
         let h = proto_map(Some("https"));
-        assert_eq!(forwarded_proto(&h, peer().ip(), &trust_for(2)), None);
+        assert_eq!(
+            forwarded_proto(&h, peer().ip(), &trust_for(2)).as_deref(),
+            None
+        );
     }
 
     #[test]
     fn proto_entries_with_whitespace_are_trimmed() {
         let h = proto_map(Some(" http , https "));
         assert_eq!(
-            forwarded_proto(&h, peer().ip(), &trust_for(1)),
+            forwarded_proto(&h, peer().ip(), &trust_for(1)).as_deref(),
             Some("https")
         );
     }

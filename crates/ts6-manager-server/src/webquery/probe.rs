@@ -35,8 +35,18 @@ pub async fn probe_webquery(
     api_key: &str,
     allow_self_signed: bool,
 ) -> TestConnectionResponse {
-    let scheme = if use_https { "https" } else { "http" };
-    let url_tried = format!("{scheme}://{host}:{webquery_port}/version");
+    let url_tried = match super::webquery_origin(host, webquery_port, use_https) {
+        Ok(origin) => format!("{origin}/version"),
+        Err(message) => {
+            return TestConnectionResponse {
+                ok: false,
+                url_tried: "invalid-host".into(),
+                kind: TestConnectionKind::Other,
+                message,
+                server_version: None,
+            };
+        }
+    };
 
     let client = match build_one_shot_client(allow_self_signed) {
         Ok(c) => c,
@@ -144,7 +154,8 @@ fn build_one_shot_client(allow_self_signed: bool) -> Result<Client, reqwest::Err
         // form. `pool_max_idle_per_host(0)` is the documented "no pool"
         // shape on reqwest.
         .pool_max_idle_per_host(0)
-        .http1_only();
+        .http1_only()
+        .redirect(reqwest::redirect::Policy::none());
     if allow_self_signed {
         builder = builder.danger_accept_invalid_certs(true);
     }

@@ -197,6 +197,24 @@ impl std::fmt::Debug for WebQueryClient {
     }
 }
 
+/// Origin for a WebQuery client. `host` must be a hostname or IP.
+/// Paths, userinfo, and query strings are rejected so a stored or
+/// wizard host cannot turn into `http://evil/path` or `http://user@host`.
+pub fn webquery_origin(host: &str, port: u16, use_https: bool) -> Result<String, String> {
+    let host = host.trim();
+    if host.is_empty() || host.contains(['/', '@', ' ', '\\', '?', '#']) || host.contains("://") {
+        return Err("host must be a hostname or IP address".into());
+    }
+    let parsed =
+        url::Host::parse(host).map_err(|_| "host is not a valid hostname or IP address")?;
+    let scheme = if use_https { "https" } else { "http" };
+    let authority = match parsed {
+        url::Host::Ipv6(ip) => format!("[{ip}]"),
+        other => other.to_string(),
+    };
+    Ok(format!("{scheme}://{authority}:{port}"))
+}
+
 impl WebQueryClient {
     /// Build a client from the decrypted parameters. Most callers use
     /// [`WebQueryClient::from_connection`] which decrypts the apiKey via
@@ -209,15 +227,18 @@ impl WebQueryClient {
         api_key: String,
         allow_self_signed: bool,
     ) -> WebQueryResult<Self> {
-        let scheme = if use_https { "https" } else { "http" };
-        let base_url = format!("{scheme}://{host}:{port}");
+        let base_url =
+            webquery_origin(host, port, use_https).map_err(WebQueryError::transport_other)?;
 
         let mut builder = Client::builder()
             .timeout(REQUEST_TIMEOUT)
             // §10.1 single-socket invariant.
             .pool_max_idle_per_host(1)
             .http1_only()
-            .pool_idle_timeout(Some(Duration::from_secs(90)));
+            .pool_idle_timeout(Some(Duration::from_secs(90)))
+            // Do not follow redirects. reqwest strips `Authorization` on
+            // redirect but keeps custom headers such as `x-api-key`.
+            .redirect(reqwest::redirect::Policy::none());
 
         if allow_self_signed {
             // `TS_ALLOW_SELF_SIGNED` is a deliberate self-host escape hatch
