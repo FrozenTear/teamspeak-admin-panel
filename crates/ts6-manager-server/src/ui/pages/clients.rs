@@ -1,4 +1,4 @@
-//! `/clients` — operator client list with kick / mute / move / poke
+//! `/clients` — operator client list with kick / talk-grant / move / poke
 //! actions and live updates over `server:{id}:clients`. PURA-73.
 //!
 //! ## Data flow
@@ -39,7 +39,7 @@ use crate::ui::components::{Banner, BannerVariant, Button, ButtonSize, ButtonVar
 use crate::ui::layout::use_servers_context;
 use crate::ui::pages::active_server;
 
-const PAGE_LEDE: &str = "Live clients on the selected server. Filter by nickname, unique ID, or channel. Kick, mute, or move without leaving the list.";
+const PAGE_LEDE: &str = "Live clients on the selected server. Filter by nickname, unique ID, or channel. Kick, grant or revoke talk, or move without leaving the list.";
 
 #[component]
 pub fn ClientsPage() -> Element {
@@ -212,13 +212,15 @@ pub fn ClientsPage() -> Element {
         }
     };
 
-    let make_mute = {
+    let make_talk = {
         let gate = gate.clone();
-        move |clid: i64, on: bool| {
+        move |clid: i64, revoke: bool| {
             let gate = gate.clone();
             spawn(async move {
-                // `on=true` → mute (revoke talker flag); `on=false` → unmute.
-                let segment = if on { "mute" } else { "unmute" };
+                // `revoke` posts `/mute`, which clears `client_is_talker`.
+                // The other branch posts `/unmute`, which tries to set it.
+                // Neither edits `client_input_muted` / `client_output_muted`.
+                let segment = if revoke { "mute" } else { "unmute" };
                 let path = format!("/api/servers/{server_id}/vs/{sid}/clients/{clid}/{segment}");
                 match api::authorized_post_json::<_, ()>(
                     &gate,
@@ -228,20 +230,14 @@ pub fn ClientsPage() -> Element {
                 )
                 .await
                 {
-                    Ok(()) => toaster.push(
-                        ToastVariant::Success,
-                        if on {
-                            format!("Muted client {clid}")
-                        } else {
-                            format!("Unmuted client {clid}")
-                        },
-                        None,
-                    ),
-                    Err(e) => toaster.push(
-                        ToastVariant::Danger,
-                        if on { "Mute failed" } else { "Unmute failed" },
-                        Some(format_error(&e)),
-                    ),
+                    Ok(()) => {
+                        let (title, detail) = talk_flag_success(revoke, clid);
+                        toaster.push(ToastVariant::Success, title, Some(detail));
+                    }
+                    Err(e) => {
+                        let (title, detail) = talk_flag_error(revoke, &e);
+                        toaster.push(ToastVariant::Danger, title, Some(detail));
+                    }
                 }
             });
         }
@@ -336,11 +332,11 @@ pub fn ClientsPage() -> Element {
                         EventHandler::new(move |clid: i64| k(clid, KickKind::Channel))
                     },
                     on_mute: {
-                        let m = make_mute.clone();
+                        let m = make_talk.clone();
                         EventHandler::new(move |clid: i64| m(clid, true))
                     },
                     on_unmute: {
-                        let m = make_mute.clone();
+                        let m = make_talk.clone();
                         EventHandler::new(move |clid: i64| m(clid, false))
                     },
                     on_move: {
@@ -477,12 +473,19 @@ fn ClientsTable(props: ClientsTableProps) -> Element {
                                     }
                                 }
                                 td {
-                                    if voice.is_muted() {
-                                        span { class: "client-flags",
+                                    span { class: "client-flags",
+                                        if voice.is_muted() {
                                             super::client_voice::VoiceFlagTags { state: voice }
+                                        } else {
+                                            "Active"
                                         }
-                                    } else {
-                                        "Active"
+                                        if show_talker_grant(r.client_is_talker) {
+                                            span {
+                                                class: "client-flag",
+                                                title: "Granted talker. Only changes who may speak in a moderated channel. Not a microphone mute.",
+                                                "talker"
+                                            }
+                                        }
                                     }
                                     if r.client_away != 0 { " · Away" }
                                 }
@@ -503,21 +506,17 @@ fn ClientsTable(props: ClientsTableProps) -> Element {
                                         Button {
                                             variant: ButtonVariant::Secondary,
                                             size: ButtonSize::Small,
-                                            title: Some(
-                                                "Restore the moderated-channel talker flag. Does not change mic or speaker mute.".into(),
-                                            ),
+                                            title: Some(GRANT_TALK_TITLE.into()),
                                             onclick: move |_| on_unmute.call(clid),
-                                            "Unmute"
+                                            "{GRANT_TALK}"
                                         }
                                     } else {
                                         Button {
                                             variant: ButtonVariant::Secondary,
                                             size: ButtonSize::Small,
-                                            title: Some(
-                                                "Revoke the moderated-channel talker flag. Does not change mic or speaker mute.".into(),
-                                            ),
+                                            title: Some(REVOKE_TALK_TITLE.into()),
                                             onclick: move |_| on_mute.call(clid),
-                                            "Mute"
+                                            "{REVOKE_TALK}"
                                         }
                                     }
                                     if props.can_move {
@@ -768,6 +767,63 @@ fn copy_to_clipboard(text: &str) {
     }
 }
 
+const REVOKE_TALK: &str = "Revoke talk";
+const GRANT_TALK: &str = "Grant talk";
+const REVOKE_TALK_TITLE: &str = "Clear the talker flag. Only changes who may speak in a moderated channel. Does not mute the microphone or speakers. In an ordinary channel the client can still speak.";
+const GRANT_TALK_TITLE: &str = "Set the talker flag. Only changes who may speak in a moderated channel. Does not mute the microphone or speakers. TeamSpeak rejects this in an ordinary channel (error 1538).";
+
+/// TeamSpeak `1538 invalid parameter` when `client_is_talker=1` is sent
+/// for a client who is not in a moderated channel.
+const UNMODERATED_CHANNEL: i64 = 1538;
+
+/// The grant is the meaningful state. `0` is the default for almost every
+/// client and is not itself a mute.
+fn show_talker_grant(client_is_talker: i64) -> bool {
+    client_is_talker != 0
+}
+
+fn talk_flag_success(revoke: bool, clid: i64) -> (String, String) {
+    if revoke {
+        (
+            format!("Revoked talk for client {clid}"),
+            "Only affects a moderated channel. Microphone and speaker mute are unchanged.".into(),
+        )
+    } else {
+        (
+            format!("Granted talk for client {clid}"),
+            "Only affects a moderated channel. TeamSpeak rejects granting talk in an ordinary channel (error 1538). Microphone and speaker mute are unchanged.".into(),
+        )
+    }
+}
+
+fn talk_flag_error(revoke: bool, err: &ApiError) -> (String, String) {
+    if upstream_code(err) == Some(UNMODERATED_CHANNEL) {
+        let title = if revoke {
+            "Revoke talk refused"
+        } else {
+            "Grant talk refused"
+        };
+        (
+            title.into(),
+            "TeamSpeak error 1538: the talker flag only applies in a moderated channel (needed talk power above 0). Granting it is rejected in an ordinary channel, where the client can already speak. Microphone and speaker mute are unchanged.".into(),
+        )
+    } else {
+        let title = if revoke {
+            "Revoke talk failed"
+        } else {
+            "Grant talk failed"
+        };
+        (title.into(), format_error(err))
+    }
+}
+
+fn upstream_code(err: &ApiError) -> Option<i64> {
+    match err {
+        ApiError::BadGateway { code, .. } => *code,
+        _ => None,
+    }
+}
+
 fn format_error(err: &ApiError) -> String {
     match err {
         ApiError::BadGateway {
@@ -890,6 +946,52 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["mic muted"]
         );
+    }
+
+    #[test]
+    fn talker_chip_only_when_the_grant_is_set() {
+        assert!(show_talker_grant(1));
+        assert!(!show_talker_grant(0));
+    }
+
+    #[test]
+    fn grant_and_revoke_toasts_do_not_say_muted() {
+        let (revoke_title, revoke_detail) = talk_flag_success(true, 9);
+        let (grant_title, grant_detail) = talk_flag_success(false, 9);
+        assert_eq!(revoke_title, "Revoked talk for client 9");
+        assert_eq!(grant_title, "Granted talk for client 9");
+        for text in [revoke_title, revoke_detail, grant_title, grant_detail] {
+            let lower = text.to_ascii_lowercase();
+            assert!(!lower.contains("muted"), "{text}");
+            assert!(!lower.contains("unmute"), "{text}");
+        }
+    }
+
+    #[test]
+    fn error_1538_explains_an_unmoderated_channel() {
+        let err = ApiError::BadGateway {
+            error: "TeamSpeak API Error".into(),
+            code: Some(1538),
+            details: Some("invalid parameter".into()),
+        };
+        let (title, detail) = talk_flag_error(false, &err);
+        assert_eq!(title, "Grant talk refused");
+        assert!(detail.contains("1538"));
+        assert!(detail.to_ascii_lowercase().contains("moderated"));
+        assert!(!detail.to_ascii_lowercase().contains("microphone muted"));
+    }
+
+    #[test]
+    fn other_upstream_errors_stay_generic() {
+        let err = ApiError::BadGateway {
+            error: "TeamSpeak API Error".into(),
+            code: Some(2568),
+            details: Some("insufficient client permissions".into()),
+        };
+        let (title, detail) = talk_flag_error(true, &err);
+        assert_eq!(title, "Revoke talk failed");
+        assert!(detail.contains("2568"));
+        assert!(detail.contains("insufficient client permissions"));
     }
 
     #[test]
