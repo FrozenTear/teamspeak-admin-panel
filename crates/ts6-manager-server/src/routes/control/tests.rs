@@ -55,6 +55,9 @@ struct MockState {
 struct MockBehavior {
     /// When set, every endpoint returns an upstream error with this code/msg.
     force_upstream_error: Mutex<Option<(i64, String)>>,
+    /// Recorded TS6 `clientdbinfo` body: no `cldbid` key. The database id
+    /// arrives as `client_database_id` (the query key is not echoed).
+    clientdbinfo_omit_cldbid: Mutex<bool>,
 }
 
 fn ok_envelope(body: Value) -> axum::response::Response {
@@ -124,6 +127,8 @@ async fn handler_dispatch(
                 "client_unique_identifier": "uid-A=",
                 "client_input_muted": "0",
                 "client_output_muted": "0",
+                "client_talk_power": "75",
+                "client_is_talker": "0",
                 "client_country": "DE",
                 "connection_client_ip": "203.0.113.10",
             },
@@ -137,19 +142,41 @@ async fn handler_dispatch(
             }
         ]),
         "channellist" => json!([
-            { "cid": "1", "pid": "0", "channel_order": "0", "channel_name": "Lobby", "channel_topic": "Welcome" },
+            { "cid": "1", "pid": "0", "channel_order": "0", "channel_name": "Lobby", "channel_topic": "Welcome", "channel_needed_talk_power": "50", "channel_forced_silence": "1" },
             { "cid": "2", "pid": "1", "channel_order": "1", "channel_name": "Voice", "channel_topic": "" }
         ]),
-        "clientdbinfo" => json!({
-            "cldbid": "100",
-            "client_unique_identifier": "uid-A=",
-            "client_nickname": "Alice",
-            "client_created": "1700000000",
-            "client_lastconnected": "1700000100",
-            "client_totalconnections": "5",
-            "client_description": "regular",
-            "client_lastip": "203.0.113.10",
-        }),
+        "clientdbinfo" => {
+            if *state.behavior.clientdbinfo_omit_cldbid.lock().unwrap() {
+                // Recorded TS6 WebQuery `clientdbinfo` body. `cldbid` is
+                // absent; the database id is `client_database_id`. Decoding
+                // this with a required `cldbid` is the 502
+                // `singleton body decode: missing field cldbid`.
+                json!({
+                    "clid": "10",
+                    "cid": "1",
+                    "client_database_id": "100",
+                    "client_nickname": "Alice",
+                    "client_unique_identifier": "uid-A=",
+                    "client_type": "0",
+                    "client_created": "1700000000",
+                    "client_lastconnected": "1700000100",
+                    "client_totalconnections": "5",
+                    "client_description": "regular",
+                    "client_lastip": "203.0.113.10"
+                })
+            } else {
+                json!({
+                    "cldbid": "100",
+                    "client_unique_identifier": "uid-A=",
+                    "client_nickname": "Alice",
+                    "client_created": "1700000000",
+                    "client_lastconnected": "1700000100",
+                    "client_totalconnections": "5",
+                    "client_description": "regular",
+                    "client_lastip": "203.0.113.10",
+                })
+            }
+        }
         "clientinfo" => json!({
             "client_unique_identifier": "uid-A=",
             "client_nickname": "Alice",
@@ -1353,6 +1380,96 @@ async fn client_detail_passes_through_with_live_when_online() {
     let live = detail.live_client.as_ref().unwrap();
     assert_eq!(live.clid, 10);
     assert_eq!(live.cid, 5);
+}
+
+/// TS6 `clientdbinfo` omits `cldbid`. The pre-fix decoder rejects that
+/// body with `singleton body decode: missing field cldbid` and the route
+/// answers 502. The recorded body below is that shape.
+#[tokio::test]
+async fn client_detail_accepts_recorded_clientdbinfo_without_cldbid() {
+    let (port, mock) = boot_mock_webquery("API-KEY").await;
+    *mock.behavior.clientdbinfo_omit_cldbid.lock().unwrap() = true;
+    let state = fresh_state().await;
+    let server = seed_server(&state, port, "API-KEY").await;
+    let (_admin, atoken) = seed_user_with_token(&state, "alice", "admin").await;
+
+    let resp = app(state)
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/servers/{}/vs/1/clients/100", server.id))
+                .header("authorization", auth_header(&atoken))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let detail: ClientDetail = read_json(resp).await;
+    assert_eq!(detail.cldbid, 100);
+    assert_eq!(detail.client_nickname, "Alice");
+    assert_eq!(detail.client_unique_identifier, "uid-A=");
+}
+
+#[tokio::test]
+async fn client_and_channel_lists_return_talk_power() {
+    let (port, mock) = boot_mock_webquery("API-KEY").await;
+    let state = fresh_state().await;
+    let server = seed_server(&state, port, "API-KEY").await;
+    let (_admin, atoken) = seed_user_with_token(&state, "alice", "admin").await;
+
+    let clients = app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/servers/{}/vs/1/clients", server.id))
+                .header("authorization", auth_header(&atoken))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(clients.status(), StatusCode::OK);
+    let rows: Vec<ClientListItem> = read_json(clients).await;
+    let alice = rows.iter().find(|r| r.clid == 10).unwrap();
+    assert_eq!(alice.client_talk_power, 75);
+    assert_eq!(alice.client_is_talker, 0);
+    assert_eq!(alice.client_nickname, "Alice");
+
+    let channels = app(state)
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/servers/{}/vs/1/channels", server.id))
+                .header("authorization", auth_header(&atoken))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(channels.status(), StatusCode::OK);
+    let nodes: Vec<ChannelTreeNode> = read_json(channels).await;
+    let lobby = nodes.iter().find(|c| c.cid == 1).unwrap();
+    assert_eq!(lobby.channel_needed_talk_power, 50);
+    assert_eq!(lobby.channel_forced_silence, 1);
+    assert_eq!(lobby.channel_name, "Lobby");
+
+    let paths = mock.captured_paths.lock().unwrap().clone();
+    let queries = mock.captured_queries.lock().unwrap().clone();
+    assert!(
+        paths
+            .iter()
+            .zip(queries.iter())
+            .any(|(path, query)| { path.contains("clientlist") && query.contains_key("-voice") }),
+        "client list must request the -voice flag that carries talk power: {paths:?} {queries:?}"
+    );
+    assert!(
+        paths
+            .iter()
+            .zip(queries.iter())
+            .any(|(path, query)| { path.contains("channellist") && query.contains_key("-voice") }),
+        "channel list must request the -voice flag that carries needed talk power: {paths:?} {queries:?}"
+    );
 }
 
 /// PURA-220 — the §7.0.2 `details` envelope on a control-route request

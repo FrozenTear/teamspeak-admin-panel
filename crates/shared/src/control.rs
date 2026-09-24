@@ -54,6 +54,13 @@ pub struct ClientListItem {
     /// Empty string for non-admin callers (spec §7.8 — admin-only field).
     #[serde(default)]
     pub connection_client_ip: String,
+    /// Talk power granted to this client (`i_client_talk_power`).
+    /// Returned with the `-voice` clientlist flag. `0` when the upstream
+    /// omits it. Compared with the channel's
+    /// [`ChannelTreeNode::channel_needed_talk_power`] to explain why a
+    /// client cannot be heard.
+    #[serde(default)]
+    pub client_talk_power: i64,
 }
 
 /// `GET /api/servers/{configId}/vs/{sid}/clients/{cldbid}` body.
@@ -124,6 +131,16 @@ pub struct ChannelTreeNode {
     pub channel_icon_id: i64,
     pub seconds_empty: i64,
     pub channel_needed_subscribe_power: i64,
+    /// Talk power a client must hold to speak in this channel. `> 0`
+    /// is a moderated channel. Returned with the `-voice` channellist
+    /// flag. `0` when the upstream omits it.
+    #[serde(default)]
+    pub channel_needed_talk_power: i64,
+    /// Upstream silence bit (`channel_forced_silence`). `1` means the
+    /// channel is silenced for everyone, independent of talk power.
+    /// `0` when the upstream omits it.
+    #[serde(default)]
+    pub channel_forced_silence: i64,
 }
 
 /// Shared optional properties forwarded to `channelcreate` / `channeledit`.

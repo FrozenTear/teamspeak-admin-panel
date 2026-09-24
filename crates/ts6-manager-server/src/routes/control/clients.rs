@@ -37,6 +37,8 @@ use super::{access, audit, translate_control_error};
 
 /// Spec §7.8 — read flag set the FE always wants for the active list.
 /// `-ip` is admin-only and is appended in [`list`] when the caller is admin.
+/// `-voice` is what asks TeamSpeak for `client_talk_power` and
+/// `client_is_talker`; those are separate properties, not extra flags.
 const BASE_CLIENT_FLAGS: &[&str] = &["uid", "away", "voice", "times", "groups", "info", "country"];
 
 pub async fn list(
@@ -479,6 +481,7 @@ fn project_client_list_item(
         client_version: e.client_version,
         client_platform: e.client_platform,
         client_country: e.client_country,
+        client_talk_power: e.client_talk_power,
         connection_client_ip: if is_admin {
             e.connection_client_ip
         } else {

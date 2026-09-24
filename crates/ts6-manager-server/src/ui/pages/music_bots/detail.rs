@@ -1512,6 +1512,7 @@ mod tests {
             last_error: None,
             resolving_query: None,
             resolving_retrying: false,
+            orphaned: false,
         }
     }
 

@@ -228,7 +228,8 @@ impl ControlBackend for SshControlClient {
     async fn clientdbinfo(&self, sid: i64, cldbid: i64) -> ControlResult<ClientDbEntry> {
         let line = format!("clientdbinfo cldbid={cldbid}");
         let outcome = self.run_scoped(sid, &line).await?;
-        Self::parse_first(&outcome.body_lines)
+        Self::parse_first::<ClientDbEntry>(&outcome.body_lines)
+            .map(|row| row.or_requested_cldbid(cldbid))
     }
 
     async fn channellist_with_flags(

@@ -84,6 +84,11 @@ pub(crate) async fn run_bot(
     // Re-armed on every successful handshake; consumed by the connected loop.
     let mut connection: Option<Connection> = None;
     let mut shutdown_requested = false;
+    // Explicit Disconnect during the initial handshake (before any failed
+    // attempt has bumped the backoff counter) must not be undone by the
+    // startup auto-connect kick. Cleared on the next explicit Connect so
+    // a bot that does get online keeps the existing reconnect behaviour.
+    let mut hold_disconnected = false;
 
     // PURA-396 — pick the connected-loop implementation once, up front. The
     // config flag is `OR`-ed with the `VOICE_SPLIT_WIRE_TASK` env var so a
@@ -107,17 +112,19 @@ pub(crate) async fn run_bot(
                     info!("shutdown done — actor exiting");
                     break 'outer;
                 }
-                let trigger = if config.auto_connect && backoff.attempts() == 0 {
-                    Some(BotCommand::Connect)
-                } else {
-                    rx.recv().await
-                };
+                let trigger =
+                    if config.auto_connect && backoff.attempts() == 0 && !hold_disconnected {
+                        Some(BotCommand::Connect)
+                    } else {
+                        rx.recv().await
+                    };
                 let Some(cmd) = trigger else {
                     info!("command channel closed — actor exiting");
                     break 'outer;
                 };
                 match cmd {
                     BotCommand::Connect => {
+                        hold_disconnected = false;
                         transition(&mut state, BotState::Connecting, &events);
                     }
                     BotCommand::Shutdown => {
@@ -141,7 +148,45 @@ pub(crate) async fn run_bot(
                 }
             }
             BotState::Connecting => {
-                match attempt_connect(&config).await {
+                // The handshake itself can sit in `wait_for_connected` for
+                // `handshake_timeout`. Read the command channel the whole
+                // time so Disconnect / Shutdown are not stuck behind a
+                // retry that never succeeds. Queue commands are applied
+                // without dropping the in-flight attempt.
+                let connect_fut = attempt_connect(&config);
+                tokio::pin!(connect_fut);
+                let connect_result = loop {
+                    tokio::select! {
+                        biased;
+                        cmd = rx.recv() => {
+                            match cmd {
+                                None => {
+                                    info!("command channel closed — actor exiting");
+                                    break 'outer;
+                                }
+                                Some(BotCommand::Shutdown) => {
+                                    finish_connect_abort(&mut state, &events, true);
+                                    shutdown_requested = true;
+                                    continue 'outer;
+                                }
+                                Some(BotCommand::Disconnect) => {
+                                    hold_disconnected = true;
+                                    finish_connect_abort(&mut state, &events, false);
+                                    continue 'outer;
+                                }
+                                Some(BotCommand::Connect) => {
+                                    debug!("Connect ignored — already Connecting");
+                                }
+                                Some(BotCommand::Queue(qc)) => {
+                                    handle_queue_command(bot_id, &store, qc, &events).await;
+                                }
+                                Some(other) => emit_rejected(&events, &other, state),
+                            }
+                        }
+                        result = connect_fut.as_mut() => break result,
+                    }
+                };
+                match connect_result {
                     Ok((con, client_id, default_channel)) => {
                         backoff.reset();
                         transition(&mut state, BotState::Connected, &events);
@@ -233,9 +278,28 @@ pub(crate) async fn run_bot(
                                 connection = None;
                                 if let Some(delay) = backoff.next_delay() {
                                     info!(?delay, attempt = backoff.attempts(), "reconnect sleep");
-                                    tokio::time::sleep(delay).await;
-                                    // Stay in Connecting (legal self-loop).
-                                    transition(&mut state, BotState::Connecting, &events);
+                                    match wait_backoff(
+                                        delay, &mut rx, &events, bot_id, &store, state,
+                                    )
+                                    .await
+                                    {
+                                        BackoffWait::Elapsed => {
+                                            // Stay in Connecting (legal self-loop).
+                                            transition(&mut state, BotState::Connecting, &events);
+                                        }
+                                        BackoffWait::Shutdown => {
+                                            finish_connect_abort(&mut state, &events, true);
+                                            shutdown_requested = true;
+                                        }
+                                        BackoffWait::Disconnect => {
+                                            hold_disconnected = true;
+                                            finish_connect_abort(&mut state, &events, false);
+                                        }
+                                        BackoffWait::Closed => {
+                                            info!("command channel closed — actor exiting");
+                                            break 'outer;
+                                        }
+                                    }
                                 } else {
                                     error!("max reconnect attempts reached — giving up");
                                     let _ = events.send(BotEvent::Error(BotError::Internal(
@@ -259,9 +323,25 @@ pub(crate) async fn run_bot(
                                 attempt = backoff.attempts(),
                                 "handshake retry sleep"
                             );
-                            tokio::time::sleep(delay).await;
-                            // Stay in Connecting.
-                            continue 'outer;
+                            match wait_backoff(delay, &mut rx, &events, bot_id, &store, state).await
+                            {
+                                BackoffWait::Elapsed => {
+                                    // Stay in Connecting.
+                                    continue 'outer;
+                                }
+                                BackoffWait::Shutdown => {
+                                    finish_connect_abort(&mut state, &events, true);
+                                    shutdown_requested = true;
+                                }
+                                BackoffWait::Disconnect => {
+                                    hold_disconnected = true;
+                                    finish_connect_abort(&mut state, &events, false);
+                                }
+                                BackoffWait::Closed => {
+                                    info!("command channel closed — actor exiting");
+                                    break 'outer;
+                                }
+                            }
                         } else {
                             error!("max handshake attempts reached — giving up");
                             transition(&mut state, BotState::Disconnected, &events);
@@ -1602,6 +1682,76 @@ fn transition(state: &mut BotState, to: BotState, events: &broadcast::Sender<Bot
     }
 }
 
+/// Why a reconnect/handshake sleep returned early.
+enum BackoffWait {
+    /// The full delay elapsed. Caller retries.
+    Elapsed,
+    /// `Shutdown` arrived. Caller exits after the disconnect transitions.
+    Shutdown,
+    /// `Disconnect` arrived. Caller lands in `Disconnected` and keeps running.
+    Disconnect,
+    /// Command channel closed.
+    Closed,
+}
+
+/// Sleep `delay`, but keep reading the command channel.
+///
+/// `Disconnect` and `Shutdown` return immediately. Queue commands are
+/// applied and the remaining delay continues, so a staged queue does not
+/// cancel the backoff or the retry. Retry limits are unchanged: this only
+/// makes the existing sleep interruptible.
+async fn wait_backoff(
+    delay: Duration,
+    rx: &mut mpsc::Receiver<BotCommand>,
+    events: &broadcast::Sender<BotEvent>,
+    bot_id: BotId,
+    store: &Arc<dyn MusicBotStore>,
+    state: BotState,
+) -> BackoffWait {
+    let deadline = Instant::now() + delay;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return BackoffWait::Elapsed;
+        }
+        tokio::select! {
+            biased;
+            cmd = rx.recv() => match cmd {
+                None => return BackoffWait::Closed,
+                Some(BotCommand::Shutdown) => return BackoffWait::Shutdown,
+                Some(BotCommand::Disconnect) => return BackoffWait::Disconnect,
+                Some(BotCommand::Connect) => {
+                    debug!("Connect ignored during backoff");
+                }
+                Some(BotCommand::Queue(qc)) => {
+                    handle_queue_command(bot_id, store, qc, events).await;
+                }
+                Some(other) => emit_rejected(events, &other, state),
+            },
+            _ = tokio::time::sleep(remaining) => return BackoffWait::Elapsed,
+        }
+    }
+}
+
+/// `Connecting` → `Disconnecting` → `Disconnected` for a handshake that
+/// never completed. There is no socket to close.
+fn finish_connect_abort(
+    state: &mut BotState,
+    events: &broadcast::Sender<BotEvent>,
+    shutdown: bool,
+) {
+    transition(state, BotState::Disconnecting, events);
+    transition(state, BotState::Disconnected, events);
+    let _ = events.send(BotEvent::Disconnected {
+        kind: if shutdown {
+            DisconnectKind::ShutdownRequested
+        } else {
+            DisconnectKind::Clean
+        },
+        reason: if shutdown { "shutdown" } else { "disconnect" }.into(),
+    });
+}
+
 fn emit_rejected(events: &broadcast::Sender<BotEvent>, cmd: &BotCommand, state: BotState) {
     let label = command_label(cmd);
     warn!(
@@ -2413,5 +2563,119 @@ mod tests {
             "a second call with nothing pending is epoch-stable"
         );
         assert!(rx.try_recv().is_err(), "and ships no further WireCmd");
+    }
+
+    /// A bot that can never finish a handshake must still leave when
+    /// `Shutdown` arrives during the connect/retry loop.
+    ///
+    /// Backoff is 30s and `max_attempts` stays `None` (unlimited — the
+    /// same policy as production). The pre-fix actor sleeps that delay
+    /// without reading the command channel, so the 3s bound fails there.
+    #[tokio::test]
+    async fn shutdown_during_connect_retry_exits_within_bound() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("ts6-bot-shutdown-{nonce}"));
+        std::fs::create_dir_all(&dir).expect("identity dir");
+        let config = BotConfig::new("never-connects", dir.join("never.identity"))
+            .with_server_addr("127.0.0.1:1")
+            .with_auto_connect(true)
+            .with_handshake_timeout(Duration::from_millis(200))
+            .with_backoff(crate::BackoffConfig {
+                initial: Duration::from_secs(30),
+                max: Duration::from_secs(60),
+                multiplier: 2.0,
+                max_attempts: None,
+            });
+        let store: Arc<dyn MusicBotStore> = Arc::new(InMemoryMusicBotStore::new());
+        let handle = crate::spawn_bot(
+            BotId(7),
+            config,
+            store,
+            Arc::new(RwLock::new(None)),
+            Arc::new(RwLock::new(None)),
+        );
+        let bound = Duration::from_secs(3);
+        let joined = tokio::time::timeout(bound, handle.shutdown()).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        let joined = joined.unwrap_or_else(|_| {
+            panic!("Shutdown during a connect that cannot succeed must exit within {bound:?}")
+        });
+        joined.expect("actor join");
+    }
+
+    /// Disconnect during the initial handshake must leave the bot
+    /// `Disconnected`. The backoff counter is still zero at that point, so
+    /// without a hold the startup auto-connect would immediately send the
+    /// bot back to `Connecting`.
+    #[tokio::test]
+    async fn disconnect_during_initial_connect_stays_disconnected() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("ts6-bot-disconnect-{nonce}"));
+        std::fs::create_dir_all(&dir).expect("identity dir");
+        let config = BotConfig::new("never-connects", dir.join("never.identity"))
+            .with_server_addr("127.0.0.1:1")
+            .with_auto_connect(true)
+            .with_handshake_timeout(Duration::from_millis(200))
+            .with_backoff(crate::BackoffConfig {
+                initial: Duration::from_secs(30),
+                max: Duration::from_secs(60),
+                multiplier: 2.0,
+                max_attempts: None,
+            });
+        let store: Arc<dyn MusicBotStore> = Arc::new(InMemoryMusicBotStore::new());
+        let handle = crate::spawn_bot(
+            BotId(8),
+            config,
+            store,
+            Arc::new(RwLock::new(None)),
+            Arc::new(RwLock::new(None)),
+        );
+        let mut events = handle.subscribe();
+        handle
+            .send(BotCommand::Disconnect)
+            .await
+            .expect("actor still running");
+        let stopped = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match events.recv().await {
+                    Ok(BotEvent::Disconnected { .. }) => return true,
+                    Ok(_) => {}
+                    Err(_) => return false,
+                }
+            }
+        })
+        .await;
+        assert!(
+            matches!(stopped, Ok(true)),
+            "Disconnect during connect must reach Disconnected within 3s"
+        );
+        let reconnected = tokio::time::timeout(Duration::from_millis(400), async {
+            loop {
+                match events.recv().await {
+                    Ok(BotEvent::StateChanged {
+                        to: BotState::Connecting,
+                        ..
+                    }) => return true,
+                    Ok(_) => {}
+                    Err(_) => return false,
+                }
+            }
+        })
+        .await;
+        assert!(
+            !matches!(reconnected, Ok(true)),
+            "explicit Disconnect must not be undone by the startup auto-connect"
+        );
+        let joined = tokio::time::timeout(Duration::from_secs(3), handle.shutdown()).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        joined
+            .expect("Shutdown after Disconnect must still exit")
+            .expect("actor join");
     }
 }

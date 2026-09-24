@@ -37,6 +37,11 @@ use super::{access, audit, bad_request, translate_control_error};
 
 /// Spec §7.7 flag set — required at the REST layer per the deviations
 /// table in [`crate::webquery::models::ChannelEntry`].
+/// `-voice` asks for `channel_needed_talk_power` (a moderated channel
+/// when that value is greater than zero). `channel_forced_silence` is
+/// the separate silence bit; it is returned when the list body includes
+/// it and is not a flag token of its own (an unknown token is a TS6
+/// 1538).
 const CHANNEL_FLAGS: &[&str] = &["topic", "flags", "voice", "limits", "icon", "secondsempty"];
 
 pub async fn list(
@@ -74,6 +79,8 @@ pub async fn list(
             channel_icon_id: c.channel_icon_id,
             seconds_empty: c.seconds_empty,
             channel_needed_subscribe_power: c.channel_needed_subscribe_power,
+            channel_needed_talk_power: c.channel_needed_talk_power,
+            channel_forced_silence: c.channel_forced_silence,
         })
         .collect();
     Ok(Json(projected))
