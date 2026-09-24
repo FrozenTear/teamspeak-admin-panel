@@ -24,7 +24,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -35,11 +35,15 @@ use tracing_subscriber::util::SubscriberInitExt;
     about = "TS6 Manager Music+Voice unit (Contabo bot container)"
 )]
 struct Args {
-    /// Loopback control plane. Default must stay `127.0.0.1:3002`:
-    /// under hostNetwork the bind address is the host address, and
-    /// this HTTP API is unauthenticated (`/v1/bots`, `/command`, play,
-    /// settings, logs). Kube args and `Containerfile.music` pass the
-    /// same flag. Health probes use `http://127.0.0.1:3002/health`.
+    /// Control-plane bind address. Default must stay `127.0.0.1:3002`:
+    /// under hostNetwork the bind address is the host address.
+    /// `MUSIC_RUNTIME_TOKEN` (environment only) requires bearer auth on
+    /// every route except `/health`. When that variable is unset, a
+    /// non-loopback bind refuses to start. When it is set, `0.0.0.0`
+    /// and `::` also refuse unless `MUSIC_RUNTIME_ALLOW_WILDCARD_BIND`
+    /// is exactly `1` or `true`. Kube args and
+    /// `Containerfile.music` pass the same loopback flag. Health probes
+    /// use `http://127.0.0.1:3002/health` and do not send a token.
     #[arg(long, default_value = "127.0.0.1:3002")]
     listen: SocketAddr,
 
@@ -77,6 +81,47 @@ async fn main() -> Result<()> {
                 .with_span_list(false),
         )
         .init();
+
+    let auth = match music_bot::runtime_http::ControlAuth::from_env() {
+        Ok(auth) => auth,
+        Err(err) => {
+            tracing::error!(%err, "refusing to start the music control API");
+            return Err(err.into());
+        }
+    };
+    let allow_wildcard = music_bot::runtime_http::parse_allow_wildcard_bind(
+        std::env::var(music_bot::runtime_http::MUSIC_RUNTIME_ALLOW_WILDCARD_BIND_ENV)
+            .ok()
+            .as_deref(),
+    );
+    let decision = match music_bot::runtime_http::decide_control_bind(
+        args.listen,
+        !auth.is_open(),
+        allow_wildcard,
+    ) {
+        Ok(decision) => decision,
+        Err(err) => {
+            tracing::error!(%err, "refusing to start the music control API");
+            return Err(err.into());
+        }
+    };
+    if decision.warn_wildcard {
+        warn!(
+            listen = %args.listen,
+            "music control API is exposed on all interfaces and must be firewalled to the private tunnel"
+        );
+    }
+    if decision.warn_public {
+        warn!(
+            listen = %args.listen,
+            "music control API is bound to a public address and should be bound to the WireGuard/private address with :3002 firewalled to the tunnel"
+        );
+    }
+    if auth.is_open() {
+        info!("music control API auth is disabled");
+    } else {
+        info!("music control API auth is enabled");
+    }
 
     music_bot_audio::cpuset::validate_send_vs_decode()
         .map_err(|e| anyhow::anyhow!(e))
@@ -124,7 +169,7 @@ async fn main() -> Result<()> {
         *state.yt_api_key.write().unwrap_or_else(|e| e.into_inner()) = Some(key);
     }
 
-    let app = music_bot::runtime_http::router(state);
+    let app = music_bot::runtime_http::router_with_auth(state, auth);
     let listener = tokio::net::TcpListener::bind(args.listen)
         .await
         .with_context(|| format!("bind {}", args.listen))?;

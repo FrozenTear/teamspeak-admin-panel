@@ -77,6 +77,18 @@ second send loop. Chat parser stays on the bot (TS client). SSE /
 NowPlaying / `music_bot_latency` + `logTail` are proxied from the
 music unit so Report bug still attaches wire marks.
 
+`MUSIC_RUNTIME_TOKEN` is optional and is not set by the kube manifest.
+When it is set, the music container and the fullstack container must
+share the same environment value, after the same trim (empty or
+whitespace-only is unset). A non-UTF-8 value makes fullstack refuse to
+start and is not printed. The token must travel over WireGuard
+only. Fullstack then sends `Authorization: Bearer`
+on every runtime call (including rehydrate and the event-stream proxy).
+Unset on this loopback deploy leaves the control API open and sends no
+header. A runtime 401 is a browser 502
+`{"error":"music_runtime_auth"}`, not a panel session expiry. Do not
+log the token.
+
 Music probes are **exec** `ts6-manager-music --healthcheck-url`, not
 kube `httpGet` (Podman 5.6 → in-container curl; this image has none).
 

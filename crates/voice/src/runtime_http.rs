@@ -2,22 +2,38 @@
 //!
 //! Fullstack proxies Panel/API here. This process owns the only
 //! `BotSupervisor` / decode → Opus → wire send loop. No Surreal.
+//!
+//! Optional shared-token auth lives in this HTTP layer.
+//! `MUSIC_RUNTIME_TOKEN` (environment only) requires
+//! `Authorization: Bearer <token>` on every route except `GET /health`.
+//! When the variable is unset the listener must be loopback, or the
+//! process refuses to start.
 
 use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use axum::Json;
 use axum::Router;
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::extract::{Path, Request, State};
+use axum::http::{HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{delete, get, post};
 use futures::stream::{Stream, StreamExt};
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::warn;
+
+/// Environment variable that holds the shared bearer token.
+///
+/// Read at startup. Never a file, a database, or a response field.
+/// Defined once in the audio crate so every child spawn can strip it.
+pub use music_bot_audio::cpuset::MUSIC_RUNTIME_TOKEN_ENV;
 
 use crate::config::BotId;
 use crate::runtime_api::{
@@ -50,9 +66,230 @@ impl Default for RuntimeState {
     }
 }
 
+/// How the control API authenticates callers.
+///
+/// Only the SHA-256 digest is stored in this auth state. The raw token
+/// is dropped after parse. `Debug` redacts the digest. Child spawns
+/// strip [`MUSIC_RUNTIME_TOKEN_ENV`] so the value is not inherited.
+#[derive(Clone, Copy)]
+pub enum ControlAuth {
+    /// No bearer check. Valid only when the listener is loopback.
+    Open,
+    /// SHA-256 of the trimmed `MUSIC_RUNTIME_TOKEN`.
+    Bearer([u8; 32]),
+}
+
+impl std::fmt::Debug for ControlAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Open => f.write_str("ControlAuth::Open"),
+            Self::Bearer(_) => f.write_str("ControlAuth::Bearer([redacted])"),
+        }
+    }
+}
+
+impl ControlAuth {
+    pub const fn open() -> Self {
+        Self::Open
+    }
+
+    pub fn is_open(&self) -> bool {
+        matches!(self, Self::Open)
+    }
+
+    /// Read [`MUSIC_RUNTIME_TOKEN_ENV`]. Missing, empty, and
+    /// whitespace-only values are [`ControlAuth::Open`]. A non-UTF-8
+    /// value refuses to start on every bind address.
+    pub fn from_env() -> Result<Self, ControlAuthError> {
+        match std::env::var_os(MUSIC_RUNTIME_TOKEN_ENV) {
+            None => Ok(Self::Open),
+            Some(value) => Self::from_os_value(Some(value.as_os_str())),
+        }
+    }
+
+    /// `None` is open. UTF-8 values follow [`Self::parse`]. A non-UTF-8
+    /// `OsStr` is [`ControlAuthError`] and does not echo the bytes.
+    pub fn from_os_value(raw: Option<&std::ffi::OsStr>) -> Result<Self, ControlAuthError> {
+        let Some(raw) = raw else {
+            return Ok(Self::Open);
+        };
+        match raw.to_str() {
+            Some(text) => Ok(Self::parse(Some(text))),
+            None => Err(ControlAuthError),
+        }
+    }
+
+    /// `None`, `""`, and whitespace-only are open. Any other value
+    /// enables bearer auth. Surrounding whitespace is ignored. Only
+    /// the SHA-256 digest is stored.
+    pub fn parse(raw: Option<&str>) -> Self {
+        let Some(raw) = raw else {
+            return Self::Open;
+        };
+        let token = raw.trim();
+        if token.is_empty() {
+            Self::Open
+        } else {
+            Self::Bearer(sha256(token.as_bytes()))
+        }
+    }
+
+    /// Refuse a non-loopback bind when auth is disabled, and refuse an
+    /// unspecified bind when auth is enabled unless the wildcard
+    /// override is passed to [`decide_control_bind`].
+    ///
+    /// This path does not read `MUSIC_RUNTIME_ALLOW_WILDCARD_BIND`.
+    /// Startup uses [`decide_control_bind`] so the override stays explicit.
+    pub fn ensure_bind_allowed(
+        &self,
+        listen: SocketAddr,
+    ) -> Result<BindDecision, ControlBindError> {
+        decide_control_bind(listen, !self.is_open(), false)
+    }
+}
+
+/// `MUSIC_RUNTIME_ALLOW_WILDCARD_BIND`. Exactly `1` or `true`
+/// (ASCII case-insensitive) allows an unspecified bind when a token
+/// is set. Anything else, including unset, is off. Discouraged.
+pub const MUSIC_RUNTIME_ALLOW_WILDCARD_BIND_ENV: &str = "MUSIC_RUNTIME_ALLOW_WILDCARD_BIND";
+
+/// Whether startup should continue, and whether it must warn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BindDecision {
+    /// One warning: the listener is on every interface and must be
+    /// firewalled to the private tunnel.
+    pub warn_wildcard: bool,
+    /// One warning: the listener is a public address. Bind the
+    /// WireGuard or private address and firewall `:3002` to the tunnel.
+    pub warn_public: bool,
+}
+
+/// `Some("1")` and `Some("true")` (any ASCII case) are on.
+/// Every other string, including surrounding whitespace, is off.
+pub fn parse_allow_wildcard_bind(raw: Option<&str>) -> bool {
+    match raw {
+        Some(value) => value.eq_ignore_ascii_case("1") || value.eq_ignore_ascii_case("true"),
+        None => false,
+    }
+}
+
+fn is_wildcard_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_unspecified(),
+        std::net::IpAddr::V6(v6) => {
+            v6.is_unspecified() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_unspecified())
+        }
+    }
+}
+
+/// 100.64.0.0/10 (RFC 6598). Some tunnels use this range.
+fn is_cgnat_v4(ip: std::net::Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    octets[0] == 100 && (octets[1] & 0xc0) == 0x40
+}
+
+/// A specific address that is not loopback, not private, and not
+/// link-local. IPv4-mapped IPv6 is classified by the embedded v4.
+///
+/// Private is IPv4 RFC 1918, IPv4 CGNAT 100.64.0.0/10, or IPv6 ULA
+/// `fc00::/7`. Link-local is 169.254.0.0/16 or `fe80::/10`.
+fn is_public_bind_addr(ip: std::net::IpAddr) -> bool {
+    let ip = match ip {
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(std::net::IpAddr::V4).unwrap_or(ip),
+        other => other,
+    };
+    if ip.is_loopback() {
+        return false;
+    }
+    match ip {
+        std::net::IpAddr::V4(v4) => !(v4.is_private() || v4.is_link_local() || is_cgnat_v4(v4)),
+        std::net::IpAddr::V6(v6) => !(v6.is_unique_local() || v6.is_unicast_link_local()),
+    }
+}
+
+/// Pure startup rule for the control listener.
+///
+/// `token_present` is true when a bearer token is configured.
+/// `allow_wildcard` is the parsed override. Neither value is read
+/// from the process environment here.
+///
+/// - No token and loopback: allow, no warning.
+/// - No token and anything else: refuse.
+/// - Token and `0.0.0.0`, `::`, or IPv4-mapped unspecified: refuse
+///   unless `allow_wildcard`, in which case allow and warn.
+/// - Token and a specific public address: allow, and set
+///   [`BindDecision::warn_public`].
+/// - Token and loopback, private, or link-local: allow, no warning.
+pub fn decide_control_bind(
+    listen: SocketAddr,
+    token_present: bool,
+    allow_wildcard: bool,
+) -> Result<BindDecision, ControlBindError> {
+    if !token_present {
+        return if listen.ip().is_loopback() {
+            Ok(BindDecision {
+                warn_wildcard: false,
+                warn_public: false,
+            })
+        } else {
+            Err(ControlBindError::Unauthenticated { listen })
+        };
+    }
+    if is_wildcard_ip(listen.ip()) {
+        return if allow_wildcard {
+            Ok(BindDecision {
+                warn_wildcard: true,
+                warn_public: false,
+            })
+        } else {
+            Err(ControlBindError::Wildcard { listen })
+        };
+    }
+    Ok(BindDecision {
+        warn_wildcard: false,
+        warn_public: is_public_bind_addr(listen.ip()),
+    })
+}
+
+/// `MUSIC_RUNTIME_TOKEN` is set to bytes that are not UTF-8.
+///
+/// The process refuses to start on every bind address. The value is
+/// not included in the message.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "MUSIC_RUNTIME_TOKEN is set but is not valid UTF-8. Refusing to start regardless of bind address. Set a UTF-8 token or unset MUSIC_RUNTIME_TOKEN"
+)]
+pub struct ControlAuthError;
+
+/// Startup failure for an unsafe control-API bind.
+#[derive(Debug, thiserror::Error)]
+pub enum ControlBindError {
+    /// No token, and the listener is not loopback.
+    #[error(
+        "MUSIC_RUNTIME_TOKEN is unset and the music control API is bound to {listen}, which is not a loopback address. Refusing to start. Set MUSIC_RUNTIME_TOKEN or bind to 127.0.0.1 / ::1 so the control API is not exposed without authentication"
+    )]
+    Unauthenticated { listen: SocketAddr },
+    /// Token is set, but the listener is `0.0.0.0`, `::`, or an
+    /// IPv4-mapped unspecified address, and the override is off.
+    #[error(
+        "MUSIC_RUNTIME_TOKEN is set but the music control API is bound to {listen}, which listens on every interface. Refusing to start. Bind the WireGuard or other private address instead. MUSIC_RUNTIME_ALLOW_WILDCARD_BIND=1 overrides this and is discouraged"
+    )]
+    Wildcard { listen: SocketAddr },
+}
+
+/// Control plane with authentication disabled.
+///
+/// Production `ts6-manager-music` uses [`router_with_auth`] after
+/// [`ControlAuth::ensure_bind_allowed`]. In-process callers on loopback
+/// keep this open router.
 pub fn router(state: RuntimeState) -> Router {
-    Router::new()
-        .route("/health", get(health))
+    router_with_auth(state, ControlAuth::open())
+}
+
+/// Same routes as [`router`], with bearer auth on every route except
+/// `GET /health` when `auth` is [`ControlAuth::Bearer`].
+pub fn router_with_auth(state: RuntimeState, auth: ControlAuth) -> Router {
+    let mut app = Router::new()
         .route("/v1/bots", get(list_bots).post(spawn_bot))
         .route("/v1/bots/{id}", delete(shutdown_bot))
         .route("/v1/bots/{id}/command", post(send_command))
@@ -60,8 +297,65 @@ pub fn router(state: RuntimeState) -> Router {
         .route("/v1/settings", post(update_settings))
         .route("/v1/bug-report-context", get(bug_report_context))
         .route("/v1/mutate", post(mutate))
-        .route("/v1/store", post(store_op))
-        .with_state(state)
+        .route("/v1/store", post(store_op));
+    if let ControlAuth::Bearer(expected) = auth {
+        app = app.route_layer(middleware::from_fn(move |req, next| async move {
+            require_bearer(expected, req, next).await
+        }));
+    }
+    // Added after `route_layer`, so `/health` is not authenticated.
+    app.route("/health", get(health)).with_state(state)
+}
+
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    let digest = Sha256::digest(bytes);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
+/// Fixed-length compare of SHA-256 digests via `subtle::ConstantTimeEq`.
+///
+/// The configured secret is already a digest; only the presented header
+/// is hashed here. Both sides are 32 bytes, so the compare does not
+/// return on the first differing token byte or on a length mismatch of
+/// the raw bearer value.
+fn token_eq(expected_sha256: [u8; 32], presented: &[u8]) -> bool {
+    bool::from(sha256(presented).ct_eq(&expected_sha256))
+}
+
+fn bearer_credential(value: &HeaderValue) -> Option<&[u8]> {
+    const SCHEME: &[u8] = b"bearer ";
+    let bytes = value.as_bytes();
+    if bytes.len() <= SCHEME.len() {
+        return None;
+    }
+    let (scheme, rest) = bytes.split_at(SCHEME.len());
+    if !scheme.eq_ignore_ascii_case(SCHEME) {
+        return None;
+    }
+    Some(rest)
+}
+
+async fn require_bearer(expected: [u8; 32], req: Request, next: Next) -> Response {
+    let ok = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(bearer_credential)
+        .is_some_and(|presented| token_eq(expected, presented));
+    if ok {
+        next.run(req).await
+    } else {
+        unauthorized()
+    }
+}
+
+fn unauthorized() -> Response {
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header(axum::http::header::WWW_AUTHENTICATE, "Bearer")
+        .body(axum::body::Body::empty())
+        .expect("empty 401")
 }
 
 async fn health(State(state): State<RuntimeState>) -> Json<HealthResponse> {
@@ -547,5 +841,462 @@ mod tests {
         let list: ListResponse = json(resp).await;
         assert_eq!(list.bots.len(), 1);
         assert_eq!(list.bots[0].name, "unit");
+    }
+
+    fn addr(text: &str) -> SocketAddr {
+        text.parse()
+            .unwrap_or_else(|_| panic!("socket addr {text}"))
+    }
+
+    fn authed(method: &str, uri: &str, token: Option<&str>, body: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if let Some(token) = token {
+            builder = builder.header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        if body.is_some() {
+            builder = builder.header(axum::http::header::CONTENT_TYPE, "application/json");
+        }
+        builder
+            .body(match body {
+                Some(json) => Body::from(json.to_string()),
+                None => Body::empty(),
+            })
+            .expect("request")
+    }
+
+    async fn assert_empty_401(resp: axum::http::Response<Body>, token: &str) {
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::WWW_AUTHENTICATE)
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer")
+        );
+        let headers = format!("{:?}", resp.headers());
+        assert!(
+            !headers.contains(token),
+            "401 headers must not echo the token: {headers}"
+        );
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(
+            bytes.is_empty(),
+            "401 body must be empty, got {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+
+    const PROTECTED: &[(&str, &str, Option<&str>)] = &[
+        ("GET", "/v1/bots", None),
+        ("POST", "/v1/bots", Some("{}")),
+        ("DELETE", "/v1/bots/1", None),
+        ("POST", "/v1/bots/1/command", Some("{}")),
+        ("GET", "/v1/bots/1/events", None),
+        ("POST", "/v1/settings", Some("{}")),
+        ("GET", "/v1/bug-report-context", None),
+        (
+            "POST",
+            "/v1/mutate",
+            Some(r#"{"op":"playlist_list","bot":1}"#),
+        ),
+        ("POST", "/v1/store", Some(r#"{"op":"queue_peek","bot":1}"#)),
+    ];
+
+    #[tokio::test]
+    async fn authorized_requests_ok_and_health_stays_open() {
+        let token = "unit-test-token";
+        let auth = ControlAuth::parse(Some(token));
+        let decision = decide_control_bind(addr("10.8.0.2:3002"), true, false).unwrap();
+        assert!(!decision.warn_wildcard);
+        assert!(!decision.warn_public);
+        let app = router_with_auth(RuntimeState::new(), auth);
+
+        let resp = app
+            .clone()
+            .oneshot(authed("GET", "/health", None, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let health: HealthResponse = json(resp).await;
+        assert_eq!(health.status, "ok");
+
+        let resp = app
+            .clone()
+            .oneshot(authed("GET", "/v1/bots", Some(token), None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/bots")
+                    .header(axum::http::header::AUTHORIZATION, format!("bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let cfg = BotConfig::new(
+            "authed",
+            std::env::temp_dir().join("music-runtime-auth.identity"),
+        )
+        .with_auto_connect(false);
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/bots")
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&SpawnRequest {
+                            config: cfg,
+                            id: None,
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let spawned: SpawnResponse = json(resp).await;
+
+        let resp = app
+            .clone()
+            .oneshot(authed(
+                "POST",
+                &format!("/v1/bots/{}/command", spawned.id.0),
+                Some(token),
+                Some(
+                    &serde_json::to_string(&SendRequest {
+                        command: BotCommand::Disconnect,
+                    })
+                    .unwrap(),
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        let resp = app
+            .clone()
+            .oneshot(authed(
+                "GET",
+                &format!("/v1/bots/{}/events", spawned.id.0),
+                Some(token),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let content_type = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            content_type.starts_with("text/event-stream"),
+            "SSE content-type, got {content_type}"
+        );
+
+        let resp = app
+            .clone()
+            .oneshot(authed(
+                "DELETE",
+                &format!("/v1/bots/{}", spawned.id.0),
+                Some(token),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let resp = app
+            .clone()
+            .oneshot(authed("POST", "/v1/settings", Some(token), Some("{}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let resp = app
+            .clone()
+            .oneshot(authed("GET", "/v1/bug-report-context", Some(token), None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .clone()
+            .oneshot(authed(
+                "POST",
+                "/v1/mutate",
+                Some(token),
+                Some(&format!(
+                    r#"{{"op":"playlist_list","bot":{}}}"#,
+                    spawned.id.0
+                )),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .oneshot(authed(
+                "POST",
+                "/v1/store",
+                Some(token),
+                Some(&format!(r#"{{"op":"queue_peek","bot":{}}}"#, spawned.id.0)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn missing_or_wrong_token_is_401_on_each_protected_route() {
+        let token = "runtime-token-do-not-echo";
+        let app = router_with_auth(RuntimeState::new(), ControlAuth::parse(Some(token)));
+
+        for (method, uri, body) in PROTECTED {
+            for presented in [None, Some("wrong-token"), Some("runtime-token-do-not-ech")] {
+                let resp = app
+                    .clone()
+                    .oneshot(authed(method, uri, presented, *body))
+                    .await
+                    .unwrap();
+                assert_empty_401(resp, token).await;
+            }
+        }
+
+        // Auth runs before the handler: a wrong token is 401, not 404.
+        let resp = app
+            .clone()
+            .oneshot(authed("GET", "/v1/bots/1/events", Some("nope"), None))
+            .await
+            .unwrap();
+        assert_empty_401(resp, token).await;
+
+        let resp = app
+            .clone()
+            .oneshot(authed("GET", "/v1/bots/1/events", Some(token), None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/bots")
+                    .header(axum::http::header::AUTHORIZATION, format!("Basic {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_empty_401(resp, token).await;
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/bots?token={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_empty_401(resp, token).await;
+
+        let resp = app
+            .oneshot(authed("GET", "/health", None, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn unset_token_on_loopback_leaves_routes_open() {
+        let auth = ControlAuth::parse(None);
+        assert!(auth.is_open());
+        assert!(auth.ensure_bind_allowed(addr("127.0.0.1:3002")).is_ok());
+        assert!(auth.ensure_bind_allowed(addr("127.0.0.2:3002")).is_ok());
+        assert!(auth.ensure_bind_allowed(addr("[::1]:3002")).is_ok());
+        let app = router_with_auth(RuntimeState::new(), auth);
+        let resp = app
+            .oneshot(authed("GET", "/v1/bots", None, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn unset_token_on_non_loopback_is_a_startup_error() {
+        let auth = ControlAuth::parse(None);
+        for raw in [
+            "0.0.0.0:3002",
+            "[::]:3002",
+            "10.1.2.3:3002",
+            "[2001:db8::1]:3002",
+            "[::ffff:127.0.0.1]:3002",
+        ] {
+            let err = auth.ensure_bind_allowed(addr(raw)).expect_err(raw);
+            let msg = err.to_string();
+            assert!(msg.contains("MUSIC_RUNTIME_TOKEN"), "{msg}");
+            assert!(msg.contains("Refusing to start"), "{msg}");
+            assert!(msg.contains("loopback"), "{msg}");
+            assert!(!msg.contains("secret"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn wildcard_bind_with_token_refuses_unless_overridden() {
+        for raw in ["0.0.0.0:3002", "[::]:3002", "[::ffff:0.0.0.0]:3002"] {
+            let err = decide_control_bind(addr(raw), true, false).expect_err(raw);
+            let msg = err.to_string();
+            assert!(msg.contains("Refusing to start"), "{msg}");
+            assert!(msg.contains("WireGuard"), "{msg}");
+            assert!(msg.contains("private"), "{msg}");
+            let allowed = decide_control_bind(addr(raw), true, true).expect(raw);
+            assert!(allowed.warn_wildcard, "{raw}");
+        }
+        let wireguard = decide_control_bind(addr("10.8.0.2:3002"), true, false).unwrap();
+        assert!(!wireguard.warn_wildcard);
+        assert!(!wireguard.warn_public);
+        let loopback = decide_control_bind(addr("127.0.0.1:3002"), true, false).unwrap();
+        assert!(!loopback.warn_wildcard);
+        assert!(!loopback.warn_public);
+        let open = decide_control_bind(addr("127.0.0.1:3002"), false, false).unwrap();
+        assert!(!open.warn_wildcard);
+        let unset = decide_control_bind(addr("0.0.0.0:3002"), false, true).expect_err("no token");
+        assert!(unset.to_string().contains("loopback"));
+    }
+
+    #[test]
+    fn public_bind_with_token_allows_with_warn() {
+        for raw in [
+            "203.0.113.5:3002",
+            "[2001:db8::1]:3002",
+            "[::ffff:203.0.113.5]:3002",
+        ] {
+            let decision = decide_control_bind(addr(raw), true, false).expect(raw);
+            assert!(!decision.warn_wildcard, "{raw}");
+            assert!(decision.warn_public, "{raw}");
+        }
+        for raw in [
+            "10.8.0.2:3002",
+            "172.20.0.1:3002",
+            "192.168.1.2:3002",
+            "100.64.0.1:3002",
+            "[fd00::1]:3002",
+            "169.254.1.1:3002",
+            "[fe80::1]:3002",
+        ] {
+            let decision = decide_control_bind(addr(raw), true, false).expect(raw);
+            assert!(!decision.warn_wildcard, "{raw}");
+            assert!(!decision.warn_public, "{raw}");
+        }
+        let unset = decide_control_bind(addr("203.0.113.5:3002"), false, false)
+            .expect_err("no token on a public address");
+        assert!(unset.to_string().contains("Refusing to start"));
+    }
+
+    #[test]
+    fn allow_wildcard_bind_override_parsing() {
+        assert!(!parse_allow_wildcard_bind(None));
+        assert!(!parse_allow_wildcard_bind(Some("")));
+        assert!(!parse_allow_wildcard_bind(Some("0")));
+        assert!(!parse_allow_wildcard_bind(Some("yes")));
+        assert!(!parse_allow_wildcard_bind(Some("false")));
+        assert!(!parse_allow_wildcard_bind(Some(" true")));
+        assert!(!parse_allow_wildcard_bind(Some("1 ")));
+        assert!(!parse_allow_wildcard_bind(Some("true ")));
+        assert!(parse_allow_wildcard_bind(Some("1")));
+        assert!(parse_allow_wildcard_bind(Some("true")));
+        assert!(parse_allow_wildcard_bind(Some("TRUE")));
+        assert!(parse_allow_wildcard_bind(Some("True")));
+    }
+
+    #[test]
+    fn empty_or_whitespace_token_is_treated_as_unset() {
+        for raw in ["", " ", "\t", "\n", " \t\r\n "] {
+            let auth = ControlAuth::parse(Some(raw));
+            assert!(auth.is_open(), "{raw:?}");
+            assert!(
+                auth.ensure_bind_allowed(addr("0.0.0.0:3002")).is_err(),
+                "{raw:?} must refuse a non-loopback bind"
+            );
+            assert!(auth.ensure_bind_allowed(addr("127.0.0.1:3002")).is_ok());
+            assert!(auth.ensure_bind_allowed(addr("[::1]:3002")).is_ok());
+        }
+        assert!(!ControlAuth::parse(Some("0")).is_open());
+        assert!(!ControlAuth::parse(Some("  x  ")).is_open());
+    }
+
+    #[tokio::test]
+    async fn whitespace_token_router_stays_open_on_loopback() {
+        let auth = ControlAuth::parse(Some(" \t "));
+        assert!(auth.ensure_bind_allowed(addr("127.0.0.1:3002")).is_ok());
+        let app = router_with_auth(RuntimeState::new(), auth);
+        let resp = app
+            .oneshot(authed("GET", "/v1/bots", None, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn surrounding_whitespace_on_the_env_value_is_not_part_of_the_token() {
+        let auth = ControlAuth::parse(Some("  unit-test-token  "));
+        assert!(!auth.is_open());
+        let app = router_with_auth(RuntimeState::new(), auth);
+        let resp = app
+            .clone()
+            .oneshot(authed("GET", "/v1/bots", Some("unit-test-token"), None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = app
+            .oneshot(authed("GET", "/v1/bots", Some("  unit-test-token  "), None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_token_refuses_to_start() {
+        use std::os::unix::ffi::OsStrExt;
+        let raw = std::ffi::OsStr::from_bytes(b"not-utf8-\xff-token");
+        let err = ControlAuth::from_os_value(Some(raw)).expect_err("non-utf8 token");
+        let msg = err.to_string();
+        assert!(msg.contains("Refusing to start"), "{msg}");
+        assert!(msg.to_lowercase().contains("utf-8"), "{msg}");
+        assert!(!msg.contains("not-utf8"), "{msg}");
+        assert!(!format!("{err:?}").contains("not-utf8"), "{err:?}");
+        // The failure is the parse result itself, so a loopback bind
+        // cannot turn a non-UTF-8 token into an open listener.
+        assert!(
+            ControlAuth::from_os_value(Some(std::ffi::OsStr::new("  \t  ")))
+                .unwrap()
+                .is_open()
+        );
+    }
+
+    #[test]
+    fn debug_output_does_not_include_the_token() {
+        let t = "super-secret-runtime-token";
+        let rendered = format!("{:?}", ControlAuth::parse(Some(t)));
+        assert!(!rendered.contains(t), "{rendered}");
+        assert!(rendered.contains("redacted"), "{rendered}");
+        let err = ControlAuth::parse(None)
+            .ensure_bind_allowed(addr("192.0.2.10:3002"))
+            .expect_err("non-loopback");
+        assert!(!err.to_string().contains(t));
     }
 }

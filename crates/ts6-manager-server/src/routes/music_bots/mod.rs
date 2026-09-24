@@ -96,30 +96,70 @@ pub(super) fn music_runtime_unavailable(message: &str) -> Response {
     )
 }
 
-/// Translate a `music_bot::StoreError` into an `ErrorBody` response. Used
-/// by every resource that touches the bot store directly.
-pub(super) fn translate_store_error(err: music_bot::StoreError) -> Response {
-    use music_bot::StoreError;
+/// Runtime rejected the bearer. 502, not 401, so the browser does not
+/// treat this as the panel session expiring. Body is exactly
+/// `{"error":"music_runtime_auth"}`.
+pub(super) fn music_runtime_auth() -> Response {
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(ErrorBody::new("music_runtime_auth")),
+    )
+        .into_response()
+}
+
+pub(super) fn map_music_runtime_error(err: crate::music_runtime::MusicRuntimeError) -> Response {
+    use crate::music_runtime::MusicRuntimeError;
     match err {
-        StoreError::PlaylistNotFound(_)
-        | StoreError::TrackNotFound(_)
-        | StoreError::LibraryEntryNotFound(_) => not_found(&err.to_string()),
-        StoreError::PlaylistExists(_) => conflict(&err.to_string()),
-        StoreError::ReorderMismatch { .. } => validation(&err.to_string()),
-        StoreError::Snapshot(_) | StoreError::Backend(_) => internal(&err.to_string()),
+        MusicRuntimeError::Unauthorized(status) if status == StatusCode::UNAUTHORIZED => {
+            music_runtime_auth()
+        }
+        MusicRuntimeError::Unauthorized(status) => {
+            music_runtime_unavailable(&format!("music runtime status {status}"))
+        }
+        MusicRuntimeError::Unavailable(message) => music_runtime_unavailable(&message),
     }
 }
 
-/// Translate a `music_bot::SendError` into an `ErrorBody` response —
-/// emitted by every lifecycle endpoint that dispatches a `BotCommand`.
-pub(super) fn translate_send_error(err: music_bot::SendError) -> Response {
-    use music_bot::SendError;
+/// Translate a store hop into an `ErrorBody` response. A runtime 401 is
+/// the [`crate::music_runtime::FrontStoreError::Unauthorized`] status,
+/// not text inside [`music_bot::StoreError::Backend`].
+pub(super) fn translate_store_error(err: crate::music_runtime::FrontStoreError) -> Response {
+    use crate::music_runtime::FrontStoreError;
+    use music_bot::StoreError;
     match err {
-        SendError::ActorGone => not_found("bot not found"),
-        SendError::Full => err_with_code(
+        FrontStoreError::Unauthorized(status) if status == StatusCode::UNAUTHORIZED => {
+            music_runtime_auth()
+        }
+        FrontStoreError::Unauthorized(status) => {
+            music_runtime_unavailable(&format!("music runtime status {status}"))
+        }
+        FrontStoreError::Store(err) => match err {
+            StoreError::PlaylistNotFound(_)
+            | StoreError::TrackNotFound(_)
+            | StoreError::LibraryEntryNotFound(_) => not_found(&err.to_string()),
+            StoreError::PlaylistExists(_) => conflict(&err.to_string()),
+            StoreError::ReorderMismatch { .. } => validation(&err.to_string()),
+            StoreError::Snapshot(_) | StoreError::Backend(_) => internal(&err.to_string()),
+        },
+    }
+}
+
+/// Translate a remote or local command failure into an `ErrorBody`.
+/// A runtime 401 is 502 `music_runtime_auth`, not 404.
+pub(super) fn translate_send_error(err: crate::music_runtime::FrontSendError) -> Response {
+    use crate::music_runtime::FrontSendError;
+    match err {
+        FrontSendError::ActorGone => not_found("bot not found"),
+        FrontSendError::Full => err_with_code(
             StatusCode::SERVICE_UNAVAILABLE,
             "bot command queue full",
             "queue_full",
         ),
+        FrontSendError::Unauthorized(status) if status == StatusCode::UNAUTHORIZED => {
+            music_runtime_auth()
+        }
+        FrontSendError::Unauthorized(status) => {
+            music_runtime_unavailable(&format!("music runtime status {status}"))
+        }
     }
 }
