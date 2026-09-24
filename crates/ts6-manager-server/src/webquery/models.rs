@@ -90,6 +90,13 @@ pub struct ChannelEntry {
     // -secondsempty
     #[serde(default, deserialize_with = "stringy::deserialize_default")]
     pub seconds_empty: i64,
+    // -voice. `> 0` is a moderated channel.
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub channel_needed_talk_power: i64,
+    /// Protocol silence bit. Not part of the grouped `-voice` flag on
+    /// every server build; decoded when the list body includes it.
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub channel_forced_silence: i64,
 }
 
 /// `clientlist` row. The §7.8 REST layer always asks for
@@ -127,6 +134,9 @@ pub struct ClientEntry {
     pub client_input_hardware: i64,
     #[serde(default, deserialize_with = "stringy::deserialize_default")]
     pub client_output_hardware: i64,
+    /// Granted talk power. Part of the `-voice` clientlist projection.
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub client_talk_power: i64,
     // Operator-set talker flag (PURA-299). Defaults to 1 (allowed); 0 means
     // talk permission revoked. Effective only in moderated channels.
     #[serde(default = "one_i64", deserialize_with = "stringy::deserialize_default")]
@@ -202,7 +212,15 @@ pub struct ClientInfo {
 /// `clientdblist` row — paginated per `?start, ?duration` (§7.8).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientDbEntry {
-    #[serde(deserialize_with = "stringy::deserialize")]
+    /// TS6 `clientdbinfo` does not always echo `cldbid` (the id was the
+    /// query key) and sometimes names the same value `client_database_id`.
+    /// `0` means neither key arrived; callers substitute the id they asked
+    /// for via [`Self::or_requested_cldbid`].
+    #[serde(
+        default,
+        alias = "client_database_id",
+        deserialize_with = "stringy::deserialize_default"
+    )]
     pub cldbid: i64,
     #[serde(default)]
     pub client_unique_identifier: String,
@@ -218,6 +236,17 @@ pub struct ClientDbEntry {
     pub client_description: String,
     #[serde(default)]
     pub client_lastip: String,
+}
+
+impl ClientDbEntry {
+    /// Fill `cldbid` from the id the caller queried when the body omitted
+    /// both `cldbid` and `client_database_id`.
+    pub fn or_requested_cldbid(mut self, requested: i64) -> Self {
+        if self.cldbid == 0 {
+            self.cldbid = requested;
+        }
+        self
+    }
 }
 
 /// `channelinfo` — full per-channel metadata (`/<sid>/channelinfo?cid=<n>`).
@@ -868,6 +897,34 @@ mod tests {
         assert_eq!(parsed.cldbid, 42);
         assert_eq!(parsed.client_totalconnections, 37);
         assert_eq!(parsed.client_lastip, "10.0.0.1");
+    }
+
+    #[test]
+    fn client_db_entry_accepts_recorded_body_without_cldbid() {
+        // Recorded TS6 `clientdbinfo` singleton. The database id is
+        // `client_database_id`; `cldbid` is not in the body. A required
+        // `cldbid` field fails this with `missing field cldbid`.
+        let raw = serde_json::json!({
+            "clid": "10",
+            "cid": "1",
+            "client_database_id": "100",
+            "client_nickname": "Alice",
+            "client_unique_identifier": "uid-A=",
+            "client_created": "1700000000",
+            "client_lastconnected": "1700000100",
+            "client_totalconnections": "5",
+            "client_description": "regular",
+            "client_lastip": "203.0.113.10"
+        });
+        let parsed: ClientDbEntry = serde_json::from_value(raw).unwrap();
+        assert_eq!(parsed.cldbid, 100);
+
+        let neither = serde_json::json!({
+            "client_nickname": "Alice",
+            "client_unique_identifier": "uid-A="
+        });
+        let parsed: ClientDbEntry = serde_json::from_value(neither).unwrap();
+        assert_eq!(parsed.or_requested_cldbid(100).cldbid, 100);
     }
 
     #[test]

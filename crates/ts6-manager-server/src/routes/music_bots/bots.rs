@@ -2,7 +2,7 @@
 //! (PURA-117 / PURA-123 WS-5).
 
 use std::convert::Infallible;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::Router;
@@ -22,7 +22,7 @@ use ts6_manager_shared::music_bots as wire;
 use crate::app_state::AppState;
 use crate::auth::extractors::{RequireAuth, RequireAuthOrQueryToken, RequireModerator};
 use crate::repos::server_connections::{self, ServerConnection};
-use crate::routes::control::access;
+use crate::routes::control::{access, audit};
 use crate::routes::music_bots::convert::{bot_id_to_wire, bot_state_to_wire, track_to_wire};
 use crate::routes::music_bots::{
     internal, map_music_runtime_error, not_found, translate_send_error, translate_store_error,
@@ -48,9 +48,9 @@ async fn list(
     let infos = supervisor.list().await.map_err(map_music_runtime_error)?;
     let mut out = Vec::with_capacity(infos.len());
     for info in infos {
-        if !caller_can_read_addr(&state, &user, &info.server_addr).await? {
+        let Some(orphaned) = bot_visibility(&state, &user, &info.server_addr).await? else {
             continue;
-        }
+        };
         let liveness = state.music_bots.liveness.snapshot(info.id).await;
         out.push(wire::MusicBotSummary {
             id: bot_id_to_wire(info.id),
@@ -63,6 +63,7 @@ async fn list(
                 .as_ref()
                 .and(liveness.now_playing_elapsed_secs),
             last_error: liveness.last_error.clone(),
+            orphaned,
         });
     }
     out.sort_by_key(|b| b.id);
@@ -88,9 +89,9 @@ async fn detail(
         .into_iter()
         .find(|i| i.id == bot)
         .ok_or_else(|| not_found("bot not found"))?;
-    if !caller_can_read_addr(&state, &user, &info.server_addr).await? {
+    let Some(orphaned) = bot_visibility(&state, &user, &info.server_addr).await? else {
         return Err(not_found("bot not found"));
-    }
+    };
     let liveness = state.music_bots.liveness.snapshot(bot).await;
     let queue = match state.music_bots.supervisor.queue_peek(bot).await {
         Ok(queue) => queue,
@@ -115,6 +116,7 @@ async fn detail(
         // light it from a live `BotEventWire::Resolving`.
         resolving_query: None,
         resolving_retrying: false,
+        orphaned,
     }))
 }
 
@@ -197,6 +199,7 @@ async fn create(
                 .as_ref()
                 .and(liveness.now_playing_elapsed_secs),
             last_error: liveness.last_error.clone(),
+            orphaned: false,
         }),
     ))
 }
@@ -206,7 +209,8 @@ async fn shutdown(
     RequireModerator(user): RequireModerator,
     Path(id): Path<u64>,
 ) -> Result<StatusCode, Response> {
-    require_bot_write(&state, &user, id).await?;
+    let started = Instant::now();
+    let binding = require_bot_write(&state, &user, id).await?;
     let bot = music_bot::BotId(id);
     state
         .music_bots
@@ -214,6 +218,22 @@ async fn shutdown(
         .shutdown_bot(bot)
         .await
         .map_err(translate_send_error)?;
+    let orphaned = binding.is_none();
+    audit::AuditEntry::success(
+        binding.as_ref().map(|server| server.id).unwrap_or(0),
+        0,
+        user.id,
+        &user.username,
+        "music_bot.shutdown",
+        Some(id as i64),
+        if orphaned {
+            "orphaned=true"
+        } else {
+            "orphaned=false"
+        },
+        started.elapsed(),
+    )
+    .emit();
 
     // PURA-357 — drop the persisted config so a deleted bot does not
     // come back on the next boot. Best-effort: the bot is already torn
@@ -307,7 +327,10 @@ async fn events_sse(
         .into_iter()
         .find(|i| i.id == bot)
         .ok_or_else(|| not_found("bot not found"))?;
-    if !caller_can_read_addr(&state, &user, &info.server_addr).await? {
+    if bot_visibility(&state, &user, &info.server_addr)
+        .await?
+        .is_none()
+    {
         return Err(not_found("bot not found"));
     }
     let rx = match state.music_bots.supervisor.subscribe(bot).await {
@@ -413,47 +436,74 @@ async fn require_server_write(
     access::check_write(state, user, server.id).await
 }
 
-/// `true` when the caller may see a bot bound to `server_addr`.
-/// An address that matches no enabled server is hidden. A database
-/// failure is returned so the handler can answer 500.
-async fn caller_can_read_addr(
-    state: &AppState,
-    user: &crate::auth::extractors::AuthUser,
-    server_addr: &str,
-) -> Result<bool, Response> {
+/// How a bot address lines up with enabled `server_connection` rows.
+enum AddrMatch {
+    /// Enabled row whose host equals the voice address host.
+    /// Boxed so the unbound variant does not carry a 376-byte row.
+    Server(Box<ServerConnection>),
+    /// No enabled server, or the address is not `host:port`. Admins may
+    /// still see and stop the bot; everyone else must not.
+    Unbound,
+}
+
+async fn match_addr(state: &AppState, server_addr: &str) -> Result<AddrMatch, Response> {
     let host = match parse_voice_host(server_addr) {
         Ok(host) => host,
-        Err(_) => return Ok(false),
+        Err(_) => return Ok(AddrMatch::Unbound),
     };
     let rows = server_connections::list(&state.db).await.map_err(|e| {
         error!(error = %e, "music-bot server lookup failed");
         internal("server lookup failed")
     })?;
-    let Some(server) = rows
-        .into_iter()
-        .find(|row| row.enabled && hosts_equal(&row.host, &host))
-    else {
-        return Ok(false);
-    };
-    if user.is_admin() {
-        return Ok(true);
-    }
-    match access::check_read(state, user, server.id).await {
-        Ok(_) => Ok(true),
-        Err(resp)
-            if resp.status() == StatusCode::FORBIDDEN || resp.status() == StatusCode::NOT_FOUND =>
+    Ok(
+        match rows
+            .into_iter()
+            .find(|row| row.enabled && hosts_equal(&row.host, &host))
         {
-            Ok(false)
+            Some(server) => AddrMatch::Server(Box::new(server)),
+            None => AddrMatch::Unbound,
+        },
+    )
+}
+
+/// `Some(orphaned)` when the caller may see a bot bound to `server_addr`.
+/// `None` hides the bot (list skip, detail/SSE 404) so a non-admin learns
+/// nothing about a bot they cannot read — including one whose address
+/// matches no enabled server. A database failure is returned so the
+/// handler can answer 500.
+async fn bot_visibility(
+    state: &AppState,
+    user: &crate::auth::extractors::AuthUser,
+    server_addr: &str,
+) -> Result<Option<bool>, Response> {
+    match match_addr(state, server_addr).await? {
+        AddrMatch::Unbound => Ok(if user.is_admin() { Some(true) } else { None }),
+        AddrMatch::Server(server) => {
+            if user.is_admin() {
+                return Ok(Some(false));
+            }
+            match access::check_read(state, user, server.id).await {
+                Ok(_) => Ok(Some(false)),
+                Err(resp)
+                    if resp.status() == StatusCode::FORBIDDEN
+                        || resp.status() == StatusCode::NOT_FOUND =>
+                {
+                    Ok(None)
+                }
+                Err(resp) => Err(resp),
+            }
         }
-        Err(resp) => Err(resp),
     }
 }
 
+/// `Ok(None)` is an admin stop of an unbound bot. `Ok(Some)` is the
+/// usual server write check. Non-admins get 404 for an unbound bot so
+/// the response does not confirm it exists.
 async fn require_bot_write(
     state: &AppState,
     user: &crate::auth::extractors::AuthUser,
     id: u64,
-) -> Result<(), Response> {
+) -> Result<Option<ServerConnection>, Response> {
     let infos = state
         .music_bots
         .supervisor
@@ -464,8 +514,19 @@ async fn require_bot_write(
         .into_iter()
         .find(|i| i.id == music_bot::BotId(id))
         .ok_or_else(|| not_found("bot not found"))?;
-    require_server_write(state, user, &info.server_addr).await?;
-    Ok(())
+    match match_addr(state, &info.server_addr).await? {
+        AddrMatch::Server(server) => {
+            access::check_write(state, user, server.id).await?;
+            Ok(Some(*server))
+        }
+        AddrMatch::Unbound => {
+            if user.is_admin() {
+                Ok(None)
+            } else {
+                Err(not_found("bot not found"))
+            }
+        }
+    }
 }
 
 /// Map a `music_bot::BotEvent` onto the wire `BotEventWire` projection.

@@ -170,6 +170,12 @@ pub struct MusicBotSummary {
     /// backward-compatible with older clients.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// The bot's `serverAddr` matches no enabled server connection.
+    /// Admins still see the row so they can stop it. Omitted when
+    /// `false` so a bot bound to a known server keeps the previous
+    /// JSON shape.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub orphaned: bool,
 }
 
 /// `GET /music-bots/{id}` body. Adds the queue snapshot and the channel
@@ -209,6 +215,9 @@ pub struct MusicBotDetail {
     /// "resolving / retrying…".
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub resolving_retrying: bool,
+    /// See [`MusicBotSummary::orphaned`]. Elided when `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub orphaned: bool,
 }
 
 /// `POST /music-library` body. Tags default to empty.
@@ -755,6 +764,7 @@ mod tests {
             last_error: None,
             resolving_query: None,
             resolving_retrying: false,
+            orphaned: false,
         };
         let json = serde_json::to_string(&detail).unwrap();
         assert!(!json.contains("resolvingQuery"), "got: {json}");
@@ -797,6 +807,7 @@ mod tests {
             last_error: None,
             resolving_query: None,
             resolving_retrying: false,
+            orphaned: false,
         };
         let json = serde_json::to_string(&detail).unwrap();
         assert!(!json.contains("nowPlayingElapsedSecs"), "got: {json}");

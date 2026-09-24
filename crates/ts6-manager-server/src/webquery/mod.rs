@@ -551,6 +551,7 @@ impl WebQueryClient {
             &[("cldbid", cldbid_s.as_str())],
         )
         .await
+        .map(|row| row.or_requested_cldbid(cldbid))
     }
 
     /// `channellist` with optional flags. Pass an empty slice for the minimal

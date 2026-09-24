@@ -2034,6 +2034,159 @@ async fn create_requires_moderator_grant_and_ignores_identity_path() {
     assert!(!rows[0].identityPath.contains("passwd"));
 }
 
+async fn get_bot_list(app: &Router, token: &str) -> Vec<wire::MusicBotSummary> {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/music-bots")
+                .header("authorization", auth_header(token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    read_json(resp).await
+}
+
+/// An admin sees a bot whose address matches no enabled server, flagged
+/// orphaned, and can stop it through DELETE. A moderator with a grant
+/// on the real server still sees the bound bot and does not see the
+/// orphan. A moderator with no grant sees neither.
+#[tokio::test]
+async fn admin_sees_and_stops_orphaned_bot_non_admin_does_not() {
+    let state = fresh_state().await;
+    let server_id = server_connections::list(&state.db).await.unwrap()[0].id;
+
+    let admin_id = seed_user_role(&state, "admin-orphan", "admin").await;
+    let admin_token = mint_token_role(&state, admin_id, "admin-orphan", "admin");
+    let mod_id = seed_user_role(&state, "mod-orphan", "moderator").await;
+    let mod_token = mint_token_role(&state, mod_id, "mod-orphan", "moderator");
+    crate::repos::server_user_grants::insert(&state.db, mod_id, server_id)
+        .await
+        .unwrap();
+    let stranger_id = seed_user_role(&state, "stranger-orphan", "moderator").await;
+    let stranger_token = mint_token_role(&state, stranger_id, "stranger-orphan", "moderator");
+
+    let cookie = state.yt_cookie.clone();
+    let api_key = state.yt_api_key.clone();
+    let bound = music_bot::BotConfig::new(
+        "bound",
+        std::env::temp_dir().join("ts6-bound-orphan.identity"),
+    )
+    .with_server_addr("127.0.0.1:9987")
+    .with_auto_connect(false);
+    state
+        .music_bots
+        .supervisor
+        .spawn(bound, cookie.clone(), api_key.clone())
+        .await
+        .unwrap();
+    let orphan = music_bot::BotConfig::new(
+        "orphan",
+        std::env::temp_dir().join("ts6-unbound-orphan.identity"),
+    )
+    .with_server_addr("10.255.255.1:9987")
+    .with_auto_connect(false);
+    let orphan_id = state
+        .music_bots
+        .supervisor
+        .spawn(orphan, cookie, api_key)
+        .await
+        .unwrap();
+
+    let app = app(state.clone());
+
+    let admin_rows = get_bot_list(&app, &admin_token).await;
+    assert_eq!(admin_rows.len(), 2);
+    let admin_bound = admin_rows.iter().find(|b| b.name == "bound").unwrap();
+    let admin_orphan = admin_rows.iter().find(|b| b.name == "orphan").unwrap();
+    assert!(!admin_bound.orphaned);
+    assert!(admin_orphan.orphaned);
+    assert_eq!(admin_orphan.id.0, orphan_id.0);
+    assert_eq!(admin_orphan.server_addr, "10.255.255.1:9987");
+
+    let mod_rows = get_bot_list(&app, &mod_token).await;
+    assert_eq!(mod_rows.len(), 1);
+    assert_eq!(mod_rows[0].name, "bound");
+    assert!(!mod_rows[0].orphaned);
+
+    let stranger_rows = get_bot_list(&app, &stranger_token).await;
+    assert!(
+        stranger_rows.is_empty(),
+        "a moderator with no grant must not see the bound bot or the orphan"
+    );
+
+    let hidden = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/music-bots/{}", orphan_id.0))
+                .header("authorization", auth_header(&mod_token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
+
+    let refused = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri(format!("/api/music-bots/{}", orphan_id.0))
+                .header("authorization", auth_header(&mod_token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::NOT_FOUND);
+    assert!(
+        state
+            .music_bots
+            .supervisor
+            .list()
+            .await
+            .unwrap()
+            .iter()
+            .any(|info| info.id == orphan_id),
+        "a non-admin stop must not tear the orphan down"
+    );
+
+    let stopped = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri(format!("/api/music-bots/{}", orphan_id.0))
+                .header("authorization", auth_header(&admin_token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stopped.status(), StatusCode::NO_CONTENT);
+    let after = get_bot_list(&app, &admin_token).await;
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].name, "bound");
+    assert!(
+        !state
+            .music_bots
+            .supervisor
+            .list()
+            .await
+            .unwrap()
+            .iter()
+            .any(|info| info.id == orphan_id),
+        "admin stop goes through the normal shutdown path"
+    );
+}
+
 const RUNTIME_TOKEN: &str = "browser-must-not-see-this-token";
 
 #[derive(Clone, Copy)]
