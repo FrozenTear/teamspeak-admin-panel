@@ -68,6 +68,12 @@ pub(crate) enum AudioMsg {
         enqueued_at: Instant,
         scheduled_at: Instant,
     },
+    /// The pacer skipped this many frames before Opus encode. Each one's
+    /// scheduled slot was more than `VOICE_MAX_CATCHUP_FRAMES` periods in
+    /// the past at the moment it would have been encoded. The send loop
+    /// counts them on `dropped_catchup_frames` and does not put them on
+    /// the wire.
+    CatchupDropped(u32),
     /// Out-of-band event from the pipeline (ICY `NowPlaying`, warnings,
     /// end-of-stream). The connected loop forwards these onto the bot's
     /// `BotEvent` broadcast.
@@ -946,6 +952,10 @@ fn spawn_sibling(
         // stops the `frames_sent`-based progress clock fast-forwarding by
         // the pause duration).
         let mut paused_total = Duration::ZERO;
+        // Frames the per-frame catch-up cap skipped before encode. Flushed
+        // onto the mpsc as one `CatchupDropped` before the next kept frame
+        // (and before `Finished`) so the send loop can count them.
+        let mut pending_drops: u32 = 0;
 
         // THE-981 (AR-7) — whether the pipeline-event broadcast still has a
         // live sender. Today `_pipeline_guard` keeps `events_tx` alive for
@@ -1058,6 +1068,21 @@ fn spawn_sibling(
                         // before the encode below so oversleep measures the
                         // timer, not the ~100 µs encode.
                         pacer.observe(slot, recv_at, std::time::Instant::now());
+                        // Drop before gain + encode. A real catch-up trickles
+                        // one overdue frame at a time; the slot is already
+                        // more than N periods in the past, so encoding it
+                        // would only throw the Opus away at the send loop.
+                        if scheduled_slot_is_stale(slot, std::time::Instant::now()) {
+                            pending_drops = pending_drops.saturating_add(1);
+                            continue;
+                        }
+                        if pending_drops > 0 {
+                            let n = pending_drops;
+                            pending_drops = 0;
+                            if tx.send(AudioMsg::CatchupDropped(n)).await.is_err() {
+                                return;
+                            }
+                        }
                         // THE-986 — gain + encode happen *here*, on the
                         // consumer side of the frame channel. The pipeline
                         // worker used to apply gain at encode time, which
@@ -1150,6 +1175,14 @@ fn spawn_sibling(
             if tx.send(AudioMsg::PipelineEvent(e)).await.is_err() {
                 return;
             }
+        }
+        if pending_drops > 0
+            && tx
+                .send(AudioMsg::CatchupDropped(pending_drops))
+                .await
+                .is_err()
+        {
+            return;
         }
         let _ = tx.send(AudioMsg::Finished).await;
     })
@@ -1461,54 +1494,62 @@ struct QueuedOpusFrame {
     scheduled_at: Instant,
 }
 
-/// How many leading (oldest) frames to drop.
+/// `true` when `age` is more than `max_catchup` frame periods.
 ///
-/// `ages` is oldest-first (`now - scheduled_at`), the pacer slot, not the
-/// hand-off stamp. When the oldest slot is later than `max_catchup` frame
-/// periods and the batch is longer than that, drop the oldest excess so
-/// only the most recent `max_catchup` frames remain. A batch of
-/// `max_catchup` or fewer is kept whole — those frames are the most recent
-/// N, even if their slots are already past. `max_catchup == 0` is cap off.
-///
-/// Queue depth alone is not lateness. A catch-up stamps every `enqueued_at`
-/// at "now", so a count of fresh hand-offs would either miss a one-by-one
-/// release or drop frames whose slots are still inside the window.
-fn stale_frames_to_drop(ages: &[Duration], max_catchup: usize, frame_period: Duration) -> usize {
-    if max_catchup == 0 || ages.len() <= max_catchup {
-        return 0;
-    }
-    let Some(&oldest) = ages.first() else {
-        return 0;
+/// This is a per-frame rule. A batch length does not matter: one overdue
+/// frame is dropped on its own, which is how a catch-up actually arrives
+/// (the pacer releases the next past-due slot, then the next). `None` and
+/// `0` are cap off and keep the frame. A slot exactly `N` periods old is
+/// kept — the threshold is "more than N × period".
+fn slot_past_catchup(age: Duration, max_catchup: Option<usize>, frame_period: Duration) -> bool {
+    let Some(max_catchup) = max_catchup.filter(|n| *n > 0) else {
+        return false;
     };
-    let window = match u32::try_from(max_catchup) {
-        Ok(n) => frame_period.saturating_mul(n),
-        Err(_) => return 0,
+    let Ok(n) = u32::try_from(max_catchup) else {
+        return false;
     };
-    if oldest <= window {
-        return 0;
-    }
-    ages.len() - max_catchup
+    age > frame_period.saturating_mul(n)
 }
 
-/// Drop the oldest stale frames in place. Returns how many were removed.
-/// `None` is cap off.
+/// Whether the pacer should skip encode for `slot`. False when
+/// `VOICE_INLINE_FLUSH` is off or the cap is off.
+fn scheduled_slot_is_stale(slot: Instant, now: Instant) -> bool {
+    let cfg = inline_flush_config();
+    if !cfg.enabled {
+        return false;
+    }
+    slot_past_catchup(
+        now.saturating_duration_since(slot),
+        cfg.max_catchup,
+        OPUS_FRAME_PERIOD,
+    )
+}
+
+/// How many of `ages` are past the per-frame cap. `max_catchup == 0` drops
+/// nothing. Test helper: production uses [`slot_past_catchup`] per frame.
+#[cfg(test)]
+fn stale_frames_to_drop(ages: &[Duration], max_catchup: usize, frame_period: Duration) -> usize {
+    ages.iter()
+        .filter(|age| slot_past_catchup(**age, Some(max_catchup), frame_period))
+        .count()
+}
+
+/// Drop every frame whose slot is past the cap. Returns how many were
+/// removed. `None` is cap off.
 fn apply_catchup_cap(
     frames: &mut Vec<QueuedOpusFrame>,
     now: Instant,
     max_catchup: Option<usize>,
 ) -> usize {
-    let Some(max_catchup) = max_catchup else {
-        return 0;
-    };
-    let ages: Vec<Duration> = frames
-        .iter()
-        .map(|f| now.saturating_duration_since(f.scheduled_at))
-        .collect();
-    let drop_n = stale_frames_to_drop(&ages, max_catchup, OPUS_FRAME_PERIOD);
-    if drop_n > 0 {
-        frames.drain(..drop_n);
-    }
-    drop_n
+    let before = frames.len();
+    frames.retain(|frame| {
+        !slot_past_catchup(
+            now.saturating_duration_since(frame.scheduled_at),
+            max_catchup,
+            OPUS_FRAME_PERIOD,
+        )
+    });
+    before - frames.len()
 }
 
 /// Messages the send loop should handle after one `recv`, in order.
@@ -1535,6 +1576,7 @@ pub(crate) struct CatchupBatch {
 fn drain_queued_frames(
     rx: &mut mpsc::Receiver<AudioMsg>,
     frames: &mut Vec<QueuedOpusFrame>,
+    noted_drops: &mut usize,
 ) -> Option<AudioMsg> {
     loop {
         match rx.try_recv() {
@@ -1548,6 +1590,9 @@ fn drain_queued_frames(
                     enqueued_at,
                     scheduled_at,
                 });
+            }
+            Ok(AudioMsg::CatchupDropped(n)) => {
+                *noted_drops += n as usize;
             }
             Ok(other) => return Some(other),
             Err(_) => return None,
@@ -1570,13 +1615,15 @@ fn frames_to_msgs(frames: Vec<QueuedOpusFrame>, trailing: Option<AudioMsg>) -> V
     messages
 }
 
-/// Like [`catchup_batch`], but with the gate and the cap passed in so tests
-/// do not touch the process environment.
+/// Like [`catchup_batch`], but with the gate, the cap, and the clock passed
+/// in. Tests pin `now` so a slot exactly N periods old stays inside the
+/// window; production passes [`Instant::now`].
 pub(crate) fn catchup_batch_with(
     first: AudioMsg,
     rx: &mut mpsc::Receiver<AudioMsg>,
     enabled: bool,
     max_catchup: Option<usize>,
+    now: Instant,
 ) -> CatchupBatch {
     if !enabled {
         return CatchupBatch {
@@ -1590,26 +1637,33 @@ pub(crate) fn catchup_batch_with(
         scheduled_at,
     } = first
     else {
-        return CatchupBatch {
-            dropped: 0,
-            messages: CatchupMessages::Single(first),
+        return if let AudioMsg::CatchupDropped(n) = first {
+            catchup_from_dropped(n, rx, max_catchup, now)
+        } else {
+            CatchupBatch {
+                dropped: 0,
+                messages: CatchupMessages::Single(first),
+            }
         };
     };
 
-    let now = Instant::now();
-    // A lone frame is never excess beyond N (N >= 1), and cap-off drops
-    // nothing. The match still applies the same rule as a longer batch.
-    let drop_one = |age: Duration| match max_catchup {
-        Some(max) => stale_frames_to_drop(&[age], max, OPUS_FRAME_PERIOD),
-        None => 0,
-    };
+    let mut noted_drops = 0usize;
 
     // Hot path: one frame and an empty queue. One `try_recv`, no heap.
+    // The cap is per frame, so this lone frame is dropped when its own
+    // slot is more than N periods old.
     match rx.try_recv() {
         Err(_) => {
-            let age = now.saturating_duration_since(scheduled_at);
-            let dropped = drop_one(age);
-            if dropped == 0 {
+            if slot_past_catchup(
+                now.saturating_duration_since(scheduled_at),
+                max_catchup,
+                OPUS_FRAME_PERIOD,
+            ) {
+                CatchupBatch {
+                    dropped: 1,
+                    messages: CatchupMessages::Multi(Vec::new()),
+                }
+            } else {
                 CatchupBatch {
                     dropped: 0,
                     messages: CatchupMessages::Single(AudioMsg::Frame {
@@ -1617,11 +1671,6 @@ pub(crate) fn catchup_batch_with(
                         enqueued_at,
                         scheduled_at,
                     }),
-                }
-            } else {
-                CatchupBatch {
-                    dropped,
-                    messages: CatchupMessages::Multi(Vec::new()),
                 }
             }
         }
@@ -1642,25 +1691,34 @@ pub(crate) fn catchup_batch_with(
                     scheduled_at: next_slot,
                 },
             ];
-            let trailing = drain_queued_frames(rx, &mut frames);
-            let dropped = apply_catchup_cap(&mut frames, now, max_catchup);
+            let trailing = drain_queued_frames(rx, &mut frames, &mut noted_drops);
+            let dropped = apply_catchup_cap(&mut frames, now, max_catchup) + noted_drops;
+            CatchupBatch {
+                dropped,
+                messages: CatchupMessages::Multi(frames_to_msgs(frames, trailing)),
+            }
+        }
+        Ok(AudioMsg::CatchupDropped(n)) => {
+            noted_drops += n as usize;
+            let mut frames = vec![QueuedOpusFrame {
+                bytes,
+                enqueued_at,
+                scheduled_at,
+            }];
+            let trailing = drain_queued_frames(rx, &mut frames, &mut noted_drops);
+            let dropped = apply_catchup_cap(&mut frames, now, max_catchup) + noted_drops;
             CatchupBatch {
                 dropped,
                 messages: CatchupMessages::Multi(frames_to_msgs(frames, trailing)),
             }
         }
         Ok(other) => {
-            let age = now.saturating_duration_since(scheduled_at);
-            let dropped = drop_one(age);
-            let frames = if dropped == 0 {
-                vec![QueuedOpusFrame {
-                    bytes,
-                    enqueued_at,
-                    scheduled_at,
-                }]
-            } else {
-                Vec::new()
-            };
+            let mut frames = vec![QueuedOpusFrame {
+                bytes,
+                enqueued_at,
+                scheduled_at,
+            }];
+            let dropped = apply_catchup_cap(&mut frames, now, max_catchup);
             CatchupBatch {
                 dropped,
                 messages: CatchupMessages::Multi(frames_to_msgs(frames, Some(other))),
@@ -1669,12 +1727,29 @@ pub(crate) fn catchup_batch_with(
     }
 }
 
+/// Fold a leading `CatchupDropped` the pacer emitted before the next frame.
+fn catchup_from_dropped(
+    n: u32,
+    rx: &mut mpsc::Receiver<AudioMsg>,
+    max_catchup: Option<usize>,
+    now: Instant,
+) -> CatchupBatch {
+    let mut noted_drops = n as usize;
+    let mut frames = Vec::new();
+    let trailing = drain_queued_frames(rx, &mut frames, &mut noted_drops);
+    let dropped = apply_catchup_cap(&mut frames, now, max_catchup) + noted_drops;
+    CatchupBatch {
+        dropped,
+        messages: CatchupMessages::Multi(frames_to_msgs(frames, trailing)),
+    }
+}
+
 /// Apply the env-gated post-stall cap to `first` plus any frames already
 /// queued behind it. When `VOICE_INLINE_FLUSH` is off this returns `first`
 /// untouched and does not read `rx`.
 pub(crate) fn catchup_batch(first: AudioMsg, rx: &mut mpsc::Receiver<AudioMsg>) -> CatchupBatch {
     let cfg = inline_flush_config();
-    let batch = catchup_batch_with(first, rx, cfg.enabled, cfg.max_catchup);
+    let batch = catchup_batch_with(first, rx, cfg.enabled, cfg.max_catchup, Instant::now());
     if batch.dropped > 0 {
         record_dropped(batch.dropped);
     }
@@ -1703,6 +1778,83 @@ static FLUSH_METERS: FlushMeters = FlushMeters {
 
 static FLUSH_LOG_START: OnceLock<Instant> = OnceLock::new();
 
+/// Samples kept for one `inline_flush` log window. Fixed storage: recording
+/// a flush does not allocate. Once the buffer is full, newer durations
+/// overwrite the oldest.
+const FLUSH_SAMPLE_CAP: usize = 64;
+
+struct FlushSamples {
+    us: [u32; FLUSH_SAMPLE_CAP],
+    /// Records since the last snapshot. May exceed [`FLUSH_SAMPLE_CAP`].
+    recorded: u32,
+}
+
+impl FlushSamples {
+    const fn new() -> Self {
+        Self {
+            us: [0; FLUSH_SAMPLE_CAP],
+            recorded: 0,
+        }
+    }
+
+    fn record(&mut self, micros: u32) {
+        let i = (self.recorded as usize) % FLUSH_SAMPLE_CAP;
+        self.us[i] = micros;
+        self.recorded = self.recorded.saturating_add(1);
+    }
+
+    /// Max and p99 (nearest-rank, µs) of the samples since the last call,
+    /// then clear the window.
+    fn snapshot_reset(&mut self) -> (u64, u64) {
+        let n = self.recorded as usize;
+        let take = n.min(FLUSH_SAMPLE_CAP);
+        let mut buf = [0u32; FLUSH_SAMPLE_CAP];
+        if n <= FLUSH_SAMPLE_CAP {
+            buf[..take].copy_from_slice(&self.us[..take]);
+        } else {
+            let start = n % FLUSH_SAMPLE_CAP;
+            buf.copy_from_slice(&self.us);
+            buf.rotate_left(start);
+        }
+        self.recorded = 0;
+        if take == 0 {
+            return (0, 0);
+        }
+        let max_us = buf[..take].iter().copied().max().unwrap_or(0) as u64;
+        (max_us, u64::from(nearest_rank_p99(&buf[..take])))
+    }
+}
+
+/// Nearest-rank p99. `ceil(0.99 * n) - 1` into the sorted sample.
+fn nearest_rank_p99(samples: &[u32]) -> u32 {
+    if samples.is_empty() {
+        return 0;
+    }
+    let mut buf = [0u32; FLUSH_SAMPLE_CAP];
+    let n = samples.len().min(FLUSH_SAMPLE_CAP);
+    buf[..n].copy_from_slice(&samples[..n]);
+    buf[..n].sort_unstable();
+    let rank = (99 * n).div_ceil(100).saturating_sub(1);
+    buf[rank]
+}
+
+static FLUSH_SAMPLES: Mutex<FlushSamples> = Mutex::new(FlushSamples::new());
+
+fn record_flush_duration(elapsed: Duration) {
+    let us = u32::try_from(elapsed.as_micros()).unwrap_or(u32::MAX);
+    FLUSH_SAMPLES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .record(us);
+}
+
+fn take_flush_timing() -> (u64, u64) {
+    FLUSH_SAMPLES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .snapshot_reset()
+}
+
 fn record_dropped(n: usize) {
     if n == 0 {
         return;
@@ -1710,6 +1862,12 @@ fn record_dropped(n: usize) {
     FLUSH_METERS
         .dropped_frames
         .fetch_add(n as u64, Ordering::Relaxed);
+}
+
+/// Count pacer drops that reached a send loop outside [`catchup_batch`]
+/// (the feature-off path returns the message as-is).
+pub(crate) fn note_catchup_drops(n: u32) {
+    record_dropped(n as usize);
 }
 
 fn record_flush_ok(packets: usize) {
@@ -1739,17 +1897,30 @@ fn warn_flush_once(err: &tsclientlib::Error) {
 
 /// Hand queued voice/ack packets to the UDP socket with one non-blocking
 /// `send_to` each. No-op when `VOICE_INLINE_FLUSH` is off. Never waits and
-/// never registers a waker: `WouldBlock` leaves the packet queued for the
-/// connection poll. Ordering, packet ids, and resend/ack accounting stay
-/// on the normal send path — a packet is popped only after `send_to`
-/// succeeds, so the later poll cannot send it again.
+/// never registers a waker.
+///
+/// `WouldBlock` leaves that packet, and everything behind it, queued.
+/// This call does not send a later packet ahead of one it failed to send,
+/// and a packet is popped only after `send_to` succeeds, so the later poll
+/// cannot write a datagram this call already wrote.
+///
+/// That is not strict wire order across calls. After `WouldBlock`, the
+/// next events poll may hand the queued packet to the ack-sender thread
+/// while a later direct `send_to` from this loop writes a newer packet
+/// first. Receivers order voice by packet id, so that overtake is minor.
+/// Packet ids and resend/ack accounting match the normal send path.
 pub(crate) fn inline_flush(con: &mut Connection) {
     if !inline_flush_is_enabled() {
         return;
     }
+    let started = Instant::now();
     match con.try_flush_outgoing() {
-        Ok(packets) => record_flush_ok(packets),
+        Ok(packets) => {
+            record_flush_duration(started.elapsed());
+            record_flush_ok(packets);
+        }
         Err(err) => {
+            record_flush_duration(started.elapsed());
             record_flush_err();
             warn_flush_once(&err);
         }
@@ -1758,7 +1929,9 @@ pub(crate) fn inline_flush(con: &mut Connection) {
 
 /// Log flush and drop counters at most once per second. `flushed_calls` is
 /// how often the sink actually took a packet; `empty_calls` is how often the
-/// flush found nothing pending. Drop lines are the same record
+/// flush found nothing pending. `flush_max_us` and `flush_p99_us` are the
+/// flush duration over that window (the syscall sits after `send_opus_frame`
+/// returns, so `t_send` does not include it). Drop lines are the same record
 /// (`dropped_since_log`), never a per-frame log.
 pub(crate) fn maybe_log_inline_flush() {
     if !inline_flush_is_enabled() {
@@ -1797,6 +1970,7 @@ pub(crate) fn maybe_log_inline_flush() {
         .logged_dropped
         .swap(dropped_frames, Ordering::Relaxed);
     let dropped_since_log = dropped_frames.saturating_sub(prev_dropped);
+    let (flush_max_us, flush_p99_us) = take_flush_timing();
     info!(
         target: "music_bot_latency",
         stage = "inline_flush",
@@ -1804,9 +1978,11 @@ pub(crate) fn maybe_log_inline_flush() {
         empty_calls,
         packets_flushed,
         flush_errors,
+        flush_max_us,
+        flush_p99_us,
         dropped_frames,
         dropped_since_log,
-        "inline flush counters — flushed_calls handed at least one packet to the outgoing sink, empty_calls found nothing pending; dropped_frames is the post-stall burst cap",
+        "inline flush counters — flushed_calls handed at least one packet to the outgoing sink, empty_calls found nothing pending; flush_max_us and flush_p99_us are this window's direct send_to cost; dropped_frames is the post-stall burst cap",
     );
 }
 
@@ -2241,6 +2417,7 @@ mod tests {
                 }
                 AudioMsg::Finished => break,
                 AudioMsg::PipelineEvent(_) => {}
+                AudioMsg::CatchupDropped(_) => {}
             }
         }
         sibling.await.expect("sibling task join");
@@ -2322,6 +2499,7 @@ mod tests {
                 }
                 AudioMsg::Finished => panic!("tone finished before the pause"),
                 AudioMsg::PipelineEvent(_) => {}
+                AudioMsg::CatchupDropped(_) => {}
             }
         }
         pause_tx.send(true).expect("sibling holds pause_rx");
@@ -2372,6 +2550,7 @@ mod tests {
                 }
                 AudioMsg::Finished => break,
                 AudioMsg::PipelineEvent(_) => {}
+                AudioMsg::CatchupDropped(_) => {}
             }
         }
         sibling.await.expect("sibling task join");
@@ -2488,6 +2667,7 @@ mod tests {
                     frames_before_last_event = frames_seen;
                 }
                 AudioMsg::Finished => break,
+                AudioMsg::CatchupDropped(_) => {}
             }
         }
         producer.await.expect("producer join");
@@ -2573,6 +2753,7 @@ mod tests {
                 }
                 AudioMsg::Finished => panic!("tone finished before the volume change"),
                 AudioMsg::PipelineEvent(_) => {}
+                AudioMsg::CatchupDropped(_) => {}
             }
         }
         // 0.5-amplitude sine peaks at ~16384; its RMS is ~11.5k.
@@ -2618,6 +2799,7 @@ mod tests {
                 }
                 AudioMsg::Finished => panic!("tone finished before silence was observed"),
                 AudioMsg::PipelineEvent(_) => {}
+                AudioMsg::CatchupDropped(_) => {}
             }
         }
         let affected_at = affected_at.expect("loop only breaks once affected");
@@ -2928,13 +3110,17 @@ mod tests {
     #[test]
     fn burst_cap_drops_oldest_down_to_the_most_recent_n() {
         let period = Duration::from_millis(20);
-        // 32 frames, the full sibling→send channel. Oldest is 620 ms > 80 ms.
+        // 32 frames, the full sibling→send channel. Oldest is 620 ms.
+        // The cap is per frame: drop every slot older than 4 × 20 ms.
+        // Ages 620, 600, …, 100 are past the window (27 frames). The frame
+        // at exactly 80 ms is kept, along with 60, 40, 20, and 0.
         let ages = ages_20ms(32);
         assert_eq!(ages[0], Duration::from_millis(620));
+        assert_eq!(ages[27], Duration::from_millis(80));
         assert_eq!(
             stale_frames_to_drop(&ages, 4, period),
-            28,
-            "keep the most recent 4 of a 32-frame stall",
+            27,
+            "drop each frame older than 4 slots; keep the one at exactly 80 ms",
         );
         // Just past the window with 5 frames: drop the one oldest.
         let just_over = [
@@ -2947,12 +3133,16 @@ mod tests {
         assert_eq!(stale_frames_to_drop(&just_over, 4, period), 1);
     }
 
+    /// A short queue does not save a frame whose own slot is past the
+    /// window. The old batch rule kept both of these because `len <= N`.
     #[test]
-    fn burst_cap_keeps_a_short_backlog_even_when_the_oldest_is_late() {
-        // Two frames, oldest 200 ms (more than 4 periods) but the count is
-        // already under the cap, so both are the "most recent N".
+    fn burst_cap_drops_a_lone_frame_older_than_n_slots() {
         let ages = [Duration::from_millis(200), Duration::from_millis(5)];
-        assert_eq!(stale_frames_to_drop(&ages, 4, Duration::from_millis(20)), 0);
+        assert_eq!(
+            stale_frames_to_drop(&ages, 4, Duration::from_millis(20)),
+            1,
+            "200 ms is more than 4 slots; the 5 ms frame is kept",
+        );
     }
 
     /// `0` is cap off. It must not drop the backlog (that silenced the bot).
@@ -3023,7 +3213,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         let now = Instant::now();
         tx.try_send(queued_frame(now, 0, 2)).unwrap();
-        let batch = catchup_batch_with(queued_frame(now, 620, 1), &mut rx, false, Some(4));
+        let batch = catchup_batch_with(queued_frame(now, 620, 1), &mut rx, false, Some(4), now);
         assert_eq!(batch.dropped, 0);
         assert_eq!(frame_ids(batch.messages), vec![1]);
         assert!(
@@ -3044,10 +3234,11 @@ mod tests {
         }
         tx.try_send(AudioMsg::PipelineEvent(PipelineEvent::EndOfStream))
             .unwrap();
-        let batch = catchup_batch_with(queued_frame(now, 620, 0), &mut rx, true, Some(4));
-        assert_eq!(batch.dropped, 28);
-        // Newest four frames (28..=31) then the event that followed them.
-        assert_eq!(frame_ids(batch.messages), vec![28, 29, 30, 31, 0xff]);
+        let batch = catchup_batch_with(queued_frame(now, 620, 0), &mut rx, true, Some(4), now);
+        // id's age is (31 - id) * 20 ms, so id 26 is 100 ms (dropped) and
+        // id 27 is exactly 80 ms (kept). Head id 0 is 620 ms.
+        assert_eq!(batch.dropped, 27);
+        assert_eq!(frame_ids(batch.messages), vec![27, 28, 29, 30, 31, 0xff]);
         assert!(rx.try_recv().is_err(), "the backlog was fully drained");
     }
 
@@ -3057,14 +3248,16 @@ mod tests {
         let now = Instant::now();
         tx.try_send(queued_frame(now, 20, 2)).unwrap();
         tx.try_send(queued_frame(now, 0, 3)).unwrap();
-        let batch = catchup_batch_with(queued_frame(now, 40, 1), &mut rx, true, Some(4));
+        let batch = catchup_batch_with(queued_frame(now, 40, 1), &mut rx, true, Some(4), now);
         assert_eq!(batch.dropped, 0, "40 ms is inside the 80 ms window");
         assert_eq!(frame_ids(batch.messages), vec![1, 2, 3]);
     }
 
-    /// 500 ms stall, then the pacer releases 25 past-due frames. Each
-    /// hand-off stamp is fresh. Exactly the oldest excess beyond N=4 is
-    /// dropped; the newest 4 slots go out.
+    /// 500 ms stall, then the pacer releases 25 past-due frames in one
+    /// batch. Each hand-off stamp is fresh. Each frame older than N slots
+    /// is dropped on its own age — the same frames a one-at-a-time trickle
+    /// of these ages drops. For this ladder that is 21 frames (500 ms down
+    /// through 100 ms); slots at 80, 60, 40, and 20 ms are kept.
     #[test]
     fn pacer_catchup_after_pause_drops_only_the_oldest_excess() {
         let period = OPUS_FRAME_PERIOD;
@@ -3074,11 +3267,13 @@ mod tests {
         let ages = pacer_catchup_slot_ages(stall, frames, period);
         assert_eq!(ages.len(), frames);
         assert_eq!(ages[0], stall, "oldest slot is the stall depth");
+        assert_eq!(ages[20], Duration::from_millis(100));
+        assert_eq!(ages[21], Duration::from_millis(80));
         assert_eq!(ages[24], Duration::from_millis(20));
         assert_eq!(
             stale_frames_to_drop(&ages, max, period),
-            frames - max,
-            "only the excess beyond {max} is dropped",
+            21,
+            "each of those 21 slots is older than 4 × 20 ms",
         );
         // The same batch measured from hand-off time (every stamp fresh)
         // is not a catch-up. That is the bug this slot clock fixes.
@@ -3092,15 +3287,110 @@ mod tests {
         for (i, age) in ages.iter().copied().enumerate().skip(1) {
             tx.try_send(released_past_due(now, age, i as u8)).unwrap();
         }
-        let batch =
-            catchup_batch_with(released_past_due(now, ages[0], 0), &mut rx, true, Some(max));
-        assert_eq!(batch.dropped, frames - max);
+        let batch = catchup_batch_with(
+            released_past_due(now, ages[0], 0),
+            &mut rx,
+            true,
+            Some(max),
+            now,
+        );
+        assert_eq!(batch.dropped, 21);
         assert_eq!(
             frame_ids(batch.messages),
             vec![21, 22, 23, 24],
-            "the newest 4 slots survive; the oldest 21 are the excess",
+            "slots at most 4 periods old survive; each older slot is dropped",
         );
         assert!(rx.try_recv().is_err(), "the release was fully drained");
+    }
+
+    /// After a 500 ms stall the overdue frames arrive one per call, which
+    /// is how a real catch-up leaves the pacer. A batch-length cap keeps
+    /// every one of them (`len <= N`). The per-frame rule drops a slot
+    /// older than N periods and keeps a fresh one.
+    #[test]
+    fn pacer_catchup_trickle_drops_frames_older_than_n_slots() {
+        let period = OPUS_FRAME_PERIOD;
+        let stall = Duration::from_millis(500);
+        let max = 4usize;
+        let ages = pacer_catchup_slot_ages(stall, 25, period);
+        let window = period.saturating_mul(4);
+        let mut dropped = 0usize;
+        let mut kept = Vec::new();
+        for (i, age) in ages.iter().copied().enumerate() {
+            let (_tx, mut rx) = mpsc::channel(1);
+            let now = Instant::now();
+            let batch = catchup_batch_with(
+                released_past_due(now, age, i as u8),
+                &mut rx,
+                true,
+                Some(max),
+                now,
+            );
+            if age > window {
+                assert_eq!(batch.dropped, 1, "age {age:?} is past {window:?}");
+                assert!(
+                    matches!(batch.messages, CatchupMessages::Multi(ref msgs) if msgs.is_empty()),
+                    "a dropped trickle frame is not sent",
+                );
+                dropped += 1;
+            } else {
+                assert_eq!(batch.dropped, 0, "age {age:?} is inside the window");
+                assert_eq!(frame_ids(batch.messages), vec![i as u8]);
+                kept.push(i as u8);
+            }
+        }
+        assert_eq!(dropped, 21);
+        assert_eq!(kept, vec![21, 22, 23, 24]);
+
+        let (_tx, mut rx) = mpsc::channel(1);
+        let now = Instant::now();
+        let kept_off =
+            catchup_batch_with(released_past_due(now, stall, 0), &mut rx, true, None, now);
+        assert_eq!(kept_off.dropped, 0, "cap off keeps a 500 ms frame");
+        assert!(slot_past_catchup(
+            Duration::from_millis(81),
+            Some(4),
+            period
+        ));
+        assert!(!slot_past_catchup(
+            Duration::from_millis(80),
+            Some(4),
+            period
+        ));
+        assert!(!slot_past_catchup(stall, None, period));
+    }
+
+    /// Fixed ring: recording does not allocate, a full window overwrites
+    /// the oldest sample, and the snapshot is max plus nearest-rank p99.
+    /// For fewer than 100 samples nearest-rank p99 is the largest value.
+    #[test]
+    fn flush_timing_window_reports_max_and_p99() {
+        assert_eq!(nearest_rank_p99(&[]), 0);
+        assert_eq!(nearest_rank_p99(&[7]), 7);
+        let mut samples: Vec<u32> = (1..=50).collect();
+        samples.reverse();
+        assert_eq!(nearest_rank_p99(&samples), 50);
+
+        let mut window = FlushSamples::new();
+        assert_eq!(window.snapshot_reset(), (0, 0));
+        window.record(12);
+        assert_eq!(window.snapshot_reset(), (12, 12));
+
+        window.record(9_999);
+        for _ in 0..FLUSH_SAMPLE_CAP {
+            window.record(3);
+        }
+        assert_eq!(
+            window.snapshot_reset(),
+            (3, 3),
+            "the sample older than the ring is gone",
+        );
+
+        for us in 1..=50 {
+            window.record(us);
+        }
+        assert_eq!(window.snapshot_reset(), (50, 50));
+        assert_eq!(window.snapshot_reset(), (0, 0), "the window was cleared");
     }
 
     /// Cap off keeps the whole post-pause release, including a 0 cap.
@@ -3112,7 +3402,8 @@ mod tests {
         for (i, age) in ages.iter().copied().enumerate().skip(1) {
             tx.try_send(released_past_due(now, age, i as u8)).unwrap();
         }
-        let batch = catchup_batch_with(released_past_due(now, ages[0], 0), &mut rx, true, None);
+        let batch =
+            catchup_batch_with(released_past_due(now, ages[0], 0), &mut rx, true, None, now);
         assert_eq!(batch.dropped, 0);
         assert_eq!(frame_ids(batch.messages).len(), 25);
     }

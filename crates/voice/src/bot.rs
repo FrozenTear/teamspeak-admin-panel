@@ -808,6 +808,16 @@ async fn consume_wire_audio_msg(
             let _ = wire_evt_tx.send(WireEvent::Pipeline(ev));
             false
         }
+        AudioMsg::CatchupDropped(n) => {
+            audio::note_catchup_drops(n);
+            if let Some(p) = play.as_mut() {
+                p.send_monitor.record_catchup_drops(u64::from(n));
+                if p.frames_sent > 0 {
+                    p.frames_sent += u64::from(n);
+                }
+            }
+            false
+        }
         AudioMsg::Finished => {
             let p = play.take().expect("guard ensures Some");
             let _ = wire_evt_tx.send(WireEvent::AudioFinished {
@@ -841,8 +851,8 @@ async fn run_wire_task(
                 let arm_start = Instant::now();
                 match msg {
                     Some(msg) => {
-                        // VOICE_INLINE_FLUSH (default off) coalesces a
-                        // post-stall backlog and drops the stale prefix.
+                        // VOICE_INLINE_FLUSH (default off) drops each
+                        // frame whose slot is more than N periods old.
                         // Off: `catchup_batch` is the single message and
                         // does not read ahead.
                         let batch = {
@@ -1213,10 +1223,10 @@ async fn run_split_connected_loop(
 /// Run one [`audio::CatchupBatch`] through [`handle_audio_msg`].
 ///
 /// When `VOICE_INLINE_FLUSH` is off the batch is a single message and this
-/// is the old one-message audio arm. When it is on, a post-stall backlog
-/// has already been trimmed; each kept frame is sent and flushed, and a
-/// send error stops the batch so a trailing `Finished` is not treated as a
-/// clean end-of-stream.
+/// is the old one-message audio arm. When it is on, frames whose slot is
+/// more than N periods old have already been dropped; each kept frame is
+/// sent and flushed, and a send error stops the batch so a trailing
+/// `Finished` is not treated as a clean end-of-stream.
 #[allow(clippy::too_many_arguments)]
 async fn drive_catchup_batch(
     batch: audio::CatchupBatch,
@@ -1380,6 +1390,16 @@ async fn handle_audio_msg(
                 audio::inline_flush(con);
             }
             "frame"
+        }
+        AudioMsg::CatchupDropped(n) => {
+            audio::note_catchup_drops(n);
+            if let Some(active) = current_audio.as_mut() {
+                active.send_monitor.record_catchup_drops(u64::from(n));
+                if active.frames_sent > 0 {
+                    active.frames_sent += u64::from(n);
+                }
+            }
+            "catchup_dropped"
         }
         AudioMsg::PipelineEvent(PipelineEvent::NowPlaying { title, source }) => {
             apply_pipeline_now_playing(bot_id, store, events, title, source).await;

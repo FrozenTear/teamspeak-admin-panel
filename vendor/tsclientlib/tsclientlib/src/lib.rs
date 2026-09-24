@@ -965,10 +965,16 @@ impl Connection {
 	/// `WouldBlock`.
 	///
 	/// Never blocks and never registers a waker. On `WouldBlock` the packet
-	/// stays queued for the normal events poll, which sends it once.
-	/// Packet ids, `SendUdpPacket`, and loss accounting match that path.
-	/// A packet this call already wrote is popped, so the events poll
-	/// cannot write it again. Does not run resend, ping, or recv.
+	/// stays queued. This call does not send a later packet ahead of one
+	/// it failed to send, and a packet it already wrote is popped, so the
+	/// events poll cannot write that datagram again. Packet ids,
+	/// `SendUdpPacket`, and loss accounting match the normal path.
+	///
+	/// This is not strict wire order across calls. After `WouldBlock`, the
+	/// normal path may hand the queued packet to the ack-sender thread
+	/// while a later direct `send_to` from the voice loop goes out first.
+	/// Receivers order voice by packet id, so that overtake is minor.
+	/// Does not run resend, ping, or recv.
 	pub fn try_flush_outgoing(&mut self) -> Result<usize> {
 		if let ConnectionState::Connected { con, .. } = &mut self.state {
 			con.client.try_flush_outgoing().map_err(|err| Error::SendPacket(err.into()))

@@ -389,9 +389,15 @@ impl Connection {
 	/// bookkeeping as the inline fallback in `poll_send_acks`. Packet ids
 	/// were assigned at encode time and are not touched. `WouldBlock`
 	/// stops the walk and leaves that packet, and everything behind it,
-	/// queued for the normal path. A later packet is never sent while an
-	/// earlier one is still queued, so order is preserved. A popped
-	/// packet cannot be sent again by `poll_send_acks`.
+	/// queued. This call does not send a later packet ahead of one it
+	/// failed to send, and a popped packet cannot be written again by
+	/// `poll_send_acks`.
+	///
+	/// That is not strict wire order across calls. After `WouldBlock`,
+	/// the next `poll_send_acks` may hand the still-queued packet to the
+	/// ack-sender thread while a later direct `send_to` from the voice
+	/// loop writes a newer packet first. Receivers order voice by packet
+	/// id, so that overtake is minor.
 	///
 	/// Does not use `ack_thread_tx` and does not register a waker. Resend,
 	/// ping, and recv stay on `poll_next`. Returns how many packets left
