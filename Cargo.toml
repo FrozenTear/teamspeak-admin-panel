@@ -145,6 +145,15 @@ web-sys = { version = "0.3", features = [
     "FileList",
     "FormData",
     "HtmlInputElement",
+    # Cross-tab refresh single-flight. `LockManager` is the Web Locks API
+    # (`navigator.locks.request`, exclusive). `Lock` types the grant
+    # callback. Both bindings are unstable; wasm32 builds already pass
+    # `--cfg=web_sys_unstable_apis`.
+    "Lock",
+    "LockManager",
+    # `storage` events so an idle tab adopts a rotation or logout that
+    # another tab wrote into the shared auth blob.
+    "StorageEvent",
 ] }
 urlencoding = "2"
 

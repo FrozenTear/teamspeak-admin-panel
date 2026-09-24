@@ -9,6 +9,9 @@
 //!   hydrates from storage and clears on logout / refresh failure.
 //! - [`session`] — single-flight refresh interceptor that wraps any
 //!   `(access_token) -> Future<Result>` closure with refresh-on-401.
+//!   Within one tab a process mutex coalesces callers; across tabs the
+//!   wasm build takes an exclusive Web Lock and re-reads `localStorage`
+//!   before rotating or invalidating.
 //! - [`api`] — generic authorized JSON fetch helper (PURA-31). Wraps the
 //!   refresh gate around `gloo-net` so any non-auth endpoint inherits the
 //!   single-flight refresh contract for free.
