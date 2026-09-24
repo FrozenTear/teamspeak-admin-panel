@@ -25,7 +25,7 @@ use crate::repos::server_connections::{self, ServerConnection};
 use crate::routes::control::access;
 use crate::routes::music_bots::convert::{bot_id_to_wire, bot_state_to_wire, track_to_wire};
 use crate::routes::music_bots::{
-    internal, map_music_runtime_error, music_runtime_auth, not_found, translate_send_error,
+    internal, map_music_runtime_error, not_found, translate_send_error, translate_store_error,
     validation,
 };
 
@@ -92,11 +92,9 @@ async fn detail(
         return Err(not_found("bot not found"));
     }
     let liveness = state.music_bots.liveness.snapshot(bot).await;
-    let queue = match state.music_bots.supervisor.store().queue_peek(bot).await {
+    let queue = match state.music_bots.supervisor.queue_peek(bot).await {
         Ok(queue) => queue,
-        Err(err) if crate::music_runtime::is_runtime_auth_store(&err) => {
-            return Err(music_runtime_auth());
-        }
+        Err(err) if err.is_unauthorized() => return Err(translate_store_error(err)),
         Err(_) => Vec::new(),
     };
     Ok(Json(wire::MusicBotDetail {

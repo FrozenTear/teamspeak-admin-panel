@@ -77,7 +77,8 @@ music unit so Report bug still attaches wire marks.
 When it is set, the music container and the fullstack container must
 share the same environment value, after the same trim (empty or
 whitespace-only is unset). A non-UTF-8 value makes fullstack refuse to
-start and is not printed. Fullstack then sends `Authorization: Bearer`
+start and is not printed. The token must travel over WireGuard
+only. Fullstack then sends `Authorization: Bearer`
 on every runtime call (including rehydrate and the event-stream proxy).
 Unset on this loopback deploy leaves the control API open and sends no
 header. A runtime 401 is a browser 502

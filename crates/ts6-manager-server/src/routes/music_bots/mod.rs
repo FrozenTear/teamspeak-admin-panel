@@ -108,28 +108,39 @@ pub(super) fn music_runtime_auth() -> Response {
 }
 
 pub(super) fn map_music_runtime_error(err: crate::music_runtime::MusicRuntimeError) -> Response {
+    use crate::music_runtime::MusicRuntimeError;
     match err {
-        crate::music_runtime::MusicRuntimeError::Auth => music_runtime_auth(),
-        crate::music_runtime::MusicRuntimeError::Unavailable(message) => {
-            music_runtime_unavailable(&message)
+        MusicRuntimeError::Unauthorized(status) if status == StatusCode::UNAUTHORIZED => {
+            music_runtime_auth()
         }
+        MusicRuntimeError::Unauthorized(status) => {
+            music_runtime_unavailable(&format!("music runtime status {status}"))
+        }
+        MusicRuntimeError::Unavailable(message) => music_runtime_unavailable(&message),
     }
 }
 
-/// Translate a `music_bot::StoreError` into an `ErrorBody` response. Used
-/// by every resource that touches the bot store directly.
-pub(super) fn translate_store_error(err: music_bot::StoreError) -> Response {
+/// Translate a store hop into an `ErrorBody` response. A runtime 401 is
+/// the [`crate::music_runtime::FrontStoreError::Unauthorized`] status,
+/// not text inside [`music_bot::StoreError::Backend`].
+pub(super) fn translate_store_error(err: crate::music_runtime::FrontStoreError) -> Response {
+    use crate::music_runtime::FrontStoreError;
     use music_bot::StoreError;
     match err {
-        StoreError::PlaylistNotFound(_)
-        | StoreError::TrackNotFound(_)
-        | StoreError::LibraryEntryNotFound(_) => not_found(&err.to_string()),
-        StoreError::PlaylistExists(_) => conflict(&err.to_string()),
-        StoreError::ReorderMismatch { .. } => validation(&err.to_string()),
-        StoreError::Backend(msg) if msg == crate::music_runtime::MUSIC_RUNTIME_AUTH_STORE => {
+        FrontStoreError::Unauthorized(status) if status == StatusCode::UNAUTHORIZED => {
             music_runtime_auth()
         }
-        StoreError::Snapshot(_) | StoreError::Backend(_) => internal(&err.to_string()),
+        FrontStoreError::Unauthorized(status) => {
+            music_runtime_unavailable(&format!("music runtime status {status}"))
+        }
+        FrontStoreError::Store(err) => match err {
+            StoreError::PlaylistNotFound(_)
+            | StoreError::TrackNotFound(_)
+            | StoreError::LibraryEntryNotFound(_) => not_found(&err.to_string()),
+            StoreError::PlaylistExists(_) => conflict(&err.to_string()),
+            StoreError::ReorderMismatch { .. } => validation(&err.to_string()),
+            StoreError::Snapshot(_) | StoreError::Backend(_) => internal(&err.to_string()),
+        },
     }
 }
 
@@ -144,6 +155,11 @@ pub(super) fn translate_send_error(err: crate::music_runtime::FrontSendError) ->
             "bot command queue full",
             "queue_full",
         ),
-        FrontSendError::Auth => music_runtime_auth(),
+        FrontSendError::Unauthorized(status) if status == StatusCode::UNAUTHORIZED => {
+            music_runtime_auth()
+        }
+        FrontSendError::Unauthorized(status) => {
+            music_runtime_unavailable(&format!("music runtime status {status}"))
+        }
     }
 }

@@ -52,7 +52,8 @@ deploy that binds the music listener to loopback (`127.0.0.1` or
 `::1`), leave the variable unset: the music process does not require a
 bearer, and fullstack sends no `Authorization` header. That is today's
 loopback behaviour. If the variable is present but not valid UTF-8,
-fullstack refuses to start. The error does not include the value.
+fullstack refuses to start. The error does not include the value. The
+token must travel over WireGuard only.
 
 When the variable is set, the music process requires
 `Authorization: Bearer <token>` on every control route except

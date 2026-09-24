@@ -2192,3 +2192,51 @@ async fn runtime_401_on_command_and_now_playing_is_browser_502() {
     let detail_status = detail.status();
     assert_runtime_auth(detail_status, &body_string(detail).await);
 }
+
+#[tokio::test]
+async fn runtime_auth_mapping_uses_http_status_not_message_text() {
+    use crate::music_runtime::{FrontSendError, FrontStoreError, MusicRuntimeError};
+    use crate::routes::music_bots::{
+        map_music_runtime_error, translate_send_error, translate_store_error,
+    };
+    use music_bot::StoreError;
+
+    let from_status =
+        translate_store_error(FrontStoreError::Unauthorized(StatusCode::UNAUTHORIZED));
+    let from_status_code = from_status.status();
+    assert_runtime_auth(from_status_code, &body_string(from_status).await);
+
+    let decoy = translate_store_error(FrontStoreError::Store(StoreError::Backend(
+        "music_runtime_auth".into(),
+    )));
+    let decoy_status = decoy.status();
+    let decoy_body = body_string(decoy).await;
+    assert_ne!(decoy_status, StatusCode::BAD_GATEWAY);
+    assert_ne!(decoy_body, r#"{"error":"music_runtime_auth"}"#);
+    assert!(
+        decoy_body.contains("music_runtime_auth"),
+        "the message text is still a backend error, not the auth mapping: {decoy_body}"
+    );
+
+    let other_status = translate_store_error(FrontStoreError::Unauthorized(StatusCode::FORBIDDEN));
+    let other_body = body_string(other_status).await;
+    assert_ne!(other_body, r#"{"error":"music_runtime_auth"}"#);
+
+    let runtime =
+        map_music_runtime_error(MusicRuntimeError::Unauthorized(StatusCode::UNAUTHORIZED));
+    let runtime_status = runtime.status();
+    assert_runtime_auth(runtime_status, &body_string(runtime).await);
+
+    let runtime_text =
+        map_music_runtime_error(MusicRuntimeError::Unavailable("music_runtime_auth".into()));
+    let runtime_text_body = body_string(runtime_text).await;
+    assert_ne!(runtime_text_body, r#"{"error":"music_runtime_auth"}"#);
+
+    let command = translate_send_error(FrontSendError::Unauthorized(StatusCode::UNAUTHORIZED));
+    let command_status = command.status();
+    assert_runtime_auth(command_status, &body_string(command).await);
+
+    let command_other = translate_send_error(FrontSendError::Unauthorized(StatusCode::FORBIDDEN));
+    let command_other_body = body_string(command_other).await;
+    assert_ne!(command_other_body, r#"{"error":"music_runtime_auth"}"#);
+}
