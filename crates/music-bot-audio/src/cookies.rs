@@ -145,7 +145,9 @@ mod tests {
     #[test]
     fn warm_resolver_cookie_self_check() {
         let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/yt_resolver.py");
-        let output = std::process::Command::new("python3")
+        let mut cmd = std::process::Command::new("python3");
+        crate::cpuset::strip_music_runtime_token(&mut cmd);
+        let output = cmd
             .arg(&script)
             .arg("--self-check-cookies")
             .output()

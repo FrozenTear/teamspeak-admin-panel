@@ -30,8 +30,10 @@ use tokio_stream::wrappers::BroadcastStream;
 use tracing::warn;
 
 /// Environment variable that holds the shared bearer token.
+///
 /// Read at startup. Never a file, a database, or a response field.
-pub const MUSIC_RUNTIME_TOKEN_ENV: &str = "MUSIC_RUNTIME_TOKEN";
+/// Defined once in the audio crate so every child spawn can strip it.
+pub use music_bot_audio::cpuset::MUSIC_RUNTIME_TOKEN_ENV;
 
 use crate::config::BotId;
 use crate::runtime_api::{
@@ -66,8 +68,9 @@ impl Default for RuntimeState {
 
 /// How the control API authenticates callers.
 ///
-/// The raw token is hashed at parse time and dropped. `Debug` redacts
-/// the digest so a startup log cannot echo the secret.
+/// Only the SHA-256 digest is stored in this auth state. The raw token
+/// is dropped after parse. `Debug` redacts the digest. Child spawns
+/// strip [`MUSIC_RUNTIME_TOKEN_ENV`] so the value is not inherited.
 #[derive(Clone, Copy)]
 pub enum ControlAuth {
     /// No bearer check. Valid only when the listener is loopback.
@@ -94,18 +97,31 @@ impl ControlAuth {
         matches!(self, Self::Open)
     }
 
-    /// Read [`MUSIC_RUNTIME_TOKEN_ENV`]. Missing, empty, whitespace-only,
-    /// and non-Unicode values are [`ControlAuth::Open`].
-    pub fn from_env() -> Self {
-        match std::env::var(MUSIC_RUNTIME_TOKEN_ENV) {
-            Ok(value) => Self::parse(Some(&value)),
-            Err(_) => Self::Open,
+    /// Read [`MUSIC_RUNTIME_TOKEN_ENV`]. Missing, empty, and
+    /// whitespace-only values are [`ControlAuth::Open`]. A non-UTF-8
+    /// value refuses to start on every bind address.
+    pub fn from_env() -> Result<Self, ControlAuthError> {
+        match std::env::var_os(MUSIC_RUNTIME_TOKEN_ENV) {
+            None => Ok(Self::Open),
+            Some(value) => Self::from_os_value(Some(value.as_os_str())),
+        }
+    }
+
+    /// `None` is open. UTF-8 values follow [`Self::parse`]. A non-UTF-8
+    /// `OsStr` is [`ControlAuthError`] and does not echo the bytes.
+    pub fn from_os_value(raw: Option<&std::ffi::OsStr>) -> Result<Self, ControlAuthError> {
+        let Some(raw) = raw else {
+            return Ok(Self::Open);
+        };
+        match raw.to_str() {
+            Some(text) => Ok(Self::parse(Some(text))),
+            None => Err(ControlAuthError),
         }
     }
 
     /// `None`, `""`, and whitespace-only are open. Any other value
-    /// enables bearer auth. Surrounding whitespace is ignored; the
-    /// raw string is not retained.
+    /// enables bearer auth. Surrounding whitespace is ignored. Only
+    /// the SHA-256 digest is stored.
     pub fn parse(raw: Option<&str>) -> Self {
         let Some(raw) = raw else {
             return Self::Open;
@@ -131,6 +147,16 @@ impl ControlAuth {
         }
     }
 }
+
+/// `MUSIC_RUNTIME_TOKEN` is set to bytes that are not UTF-8.
+///
+/// The process refuses to start on every bind address. The value is
+/// not included in the message.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "MUSIC_RUNTIME_TOKEN is set but is not valid UTF-8. Refusing to start regardless of bind address. Set a UTF-8 token or unset MUSIC_RUNTIME_TOKEN"
+)]
+pub struct ControlAuthError;
 
 /// Startup failure: the control API would be reachable without auth.
 #[derive(Debug, thiserror::Error)]
@@ -217,6 +243,7 @@ async fn require_bearer(expected: [u8; 32], req: Request, next: Next) -> Respons
 fn unauthorized() -> Response {
     Response::builder()
         .status(StatusCode::UNAUTHORIZED)
+        .header(axum::http::header::WWW_AUTHENTICATE, "Bearer")
         .body(axum::body::Body::empty())
         .expect("empty 401")
 }
@@ -729,6 +756,12 @@ mod tests {
 
     async fn assert_empty_401(resp: axum::http::Response<Body>, token: &str) {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::WWW_AUTHENTICATE)
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer")
+        );
         let headers = format!("{:?}", resp.headers());
         assert!(
             !headers.contains(token),
@@ -1057,16 +1090,35 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_token_refuses_to_start() {
+        use std::os::unix::ffi::OsStrExt;
+        let raw = std::ffi::OsStr::from_bytes(b"not-utf8-\xff-token");
+        let err = ControlAuth::from_os_value(Some(raw)).expect_err("non-utf8 token");
+        let msg = err.to_string();
+        assert!(msg.contains("Refusing to start"), "{msg}");
+        assert!(msg.to_lowercase().contains("utf-8"), "{msg}");
+        assert!(!msg.contains("not-utf8"), "{msg}");
+        assert!(!format!("{err:?}").contains("not-utf8"), "{err:?}");
+        // The failure is the parse result itself, so a loopback bind
+        // cannot turn a non-UTF-8 token into an open listener.
+        assert!(
+            ControlAuth::from_os_value(Some(std::ffi::OsStr::new("  \t  ")))
+                .unwrap()
+                .is_open()
+        );
+    }
+
     #[test]
     fn debug_output_does_not_include_the_token() {
-        let token = "super-secret-runtime-token";
-        let auth = ControlAuth::parse(Some(token));
-        let rendered = format!("{auth:?}");
-        assert!(!rendered.contains(token), "{rendered}");
+        let t = "super-secret-runtime-token";
+        let rendered = format!("{:?}", ControlAuth::parse(Some(t)));
+        assert!(!rendered.contains(t), "{rendered}");
         assert!(rendered.contains("redacted"), "{rendered}");
         let err = ControlAuth::parse(None)
             .ensure_bind_allowed(addr("192.0.2.10:3002"))
             .expect_err("non-loopback");
-        assert!(!err.to_string().contains(token));
+        assert!(!err.to_string().contains(t));
     }
 }

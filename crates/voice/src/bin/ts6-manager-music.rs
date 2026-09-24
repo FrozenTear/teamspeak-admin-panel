@@ -80,7 +80,13 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let auth = music_bot::runtime_http::ControlAuth::from_env();
+    let auth = match music_bot::runtime_http::ControlAuth::from_env() {
+        Ok(auth) => auth,
+        Err(err) => {
+            tracing::error!(%err, "refusing to start the music control API");
+            return Err(err.into());
+        }
+    };
     let bind_ok = auth.ensure_bind_allowed(args.listen);
     if let Err(err) = &bind_ok {
         tracing::error!(%err, "refusing to start the music control API");

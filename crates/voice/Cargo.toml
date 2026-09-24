@@ -81,7 +81,8 @@ async-trait = { workspace = true }
 serde_json = { workspace = true }
 # Optional bearer auth on the music control API (`MUSIC_RUNTIME_TOKEN`).
 # SHA-256 makes the subtle compare fixed-length. Both crates are already
-# workspace dependencies; the raw token is not retained after startup.
+# workspace dependencies. Only the SHA-256 digest is stored in the auth
+# state; child spawns strip `MUSIC_RUNTIME_TOKEN` from the environment.
 sha2 = { workspace = true }
 subtle = { workspace = true }
 # PURA-389a — `clock_gettime(CLOCK_THREAD_CPUTIME_ID)` for per-thread CPU

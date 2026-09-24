@@ -550,6 +550,7 @@ mod protocol_whitelist_tests {
 
     fn args_for_remote(input: &str, ca_file: Option<&str>, proxy: Option<&str>) -> Vec<String> {
         let mut cmd = Command::new("ffmpeg");
+        crate::cpuset::strip_music_runtime_token(cmd.as_std_mut());
         apply_ffmpeg_input_args(&mut cmd, input, None, ca_file, proxy);
         cmd.as_std()
             .get_args()
@@ -674,17 +675,16 @@ mod protocol_whitelist_tests {
 
     #[tokio::test]
     async fn ffmpeg_metadata_url_is_refused_by_the_proxy() {
-        if std::process::Command::new("ffmpeg")
-            .arg("-version")
-            .output()
-            .is_err()
-        {
+        let mut probe = std::process::Command::new("ffmpeg");
+        crate::cpuset::strip_music_runtime_token(&mut probe);
+        if probe.arg("-version").output().is_err() {
             return;
         }
         let proxy = crate::playback_guard::PlaybackProxy::start()
             .await
             .expect("proxy");
         let mut cmd = Command::new("ffmpeg");
+        crate::cpuset::strip_music_runtime_token(cmd.as_std_mut());
         cmd.kill_on_drop(true)
             .arg("-hide_banner")
             .arg("-loglevel")

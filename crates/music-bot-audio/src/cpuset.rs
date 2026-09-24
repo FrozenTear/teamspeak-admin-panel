@@ -49,6 +49,12 @@ pub const SEND_CPUSET_ENV: &str = "TS6_BOT_CPUSET";
 /// Preferred alias that makes the send-thread (not container) scope obvious.
 pub const SEND_CPUSET_ENV_PREFERRED: &str = "TS6_BOT_SEND_CPUSET";
 pub const DECODE_CPUSET_ENV: &str = "TS6_BOT_DECODE_CPUSET";
+/// Shared bearer for the music control API. The runtime reads it at
+/// startup and stores only a SHA-256 digest. Every child `Command` in
+/// the music crates must [`strip_music_runtime_token`] so ffmpeg,
+/// yt-dlp (and any Deno it starts), and the warm Python resolver do
+/// not inherit the value. Do not `remove_var` it in the parent.
+pub const MUSIC_RUNTIME_TOKEN_ENV: &str = "MUSIC_RUNTIME_TOKEN";
 /// Host and in-process nice for Voice send threads. Negative values
 /// need `CAP_SYS_NICE` inside the container; the host script is the
 /// path that works for uid 10001.
@@ -163,13 +169,26 @@ pub fn pin_decode_child(child: &tokio::process::Child) {
     }
 }
 
+/// Remove [`MUSIC_RUNTIME_TOKEN_ENV`] from a child environment.
+///
+/// The parent keeps the variable. `std::env::remove_var` is unsafe once
+/// other tokio threads are running, so spawn sites clear it on the
+/// `Command` only. [`install_decode_pre_exec`] does this for every
+/// decode child; other `Command::new` sites call this directly.
+pub fn strip_music_runtime_token(cmd: &mut std::process::Command) {
+    cmd.env_remove(MUSIC_RUNTIME_TOKEN_ENV);
+}
+
 /// Install a `pre_exec` hook that applies `TS6_BOT_DECODE_CPUSET` with
 /// `sched_setaffinity(0, …)` before `exec`.
 ///
-/// Unset or empty → no hook. Invalid spec → warn and no hook. When the
-/// hook is installed, a failed `sched_setaffinity` fails the spawn so a
-/// decode child is not left free to run on send cores.
+/// Always strips [`MUSIC_RUNTIME_TOKEN_ENV`], including when the cpuset
+/// is unset. Unset or empty cpuset → no affinity hook. Invalid spec →
+/// warn and no affinity hook. When the hook is installed, a failed
+/// `sched_setaffinity` fails the spawn so a decode child is not left
+/// free to run on send cores.
 pub fn install_decode_pre_exec(cmd: &mut tokio::process::Command) {
+    strip_music_runtime_token(cmd.as_std_mut());
     match cpuset_from_env(DECODE_CPUSET_ENV) {
         Ok(Some(cpus)) if !cpus.is_empty() => {
             if let Err(err) = install_affinity_pre_exec(cmd, &cpus) {
@@ -495,6 +514,47 @@ pub fn nice_voice_rt_from_env() {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn spawned_child_does_not_inherit_music_runtime_token() {
+        let token = "child-must-not-see-this-token";
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!(
+                "printf '%s' \"${{{MUSIC_RUNTIME_TOKEN_ENV}-UNSET}}\""
+            ))
+            .env(MUSIC_RUNTIME_TOKEN_ENV, token)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        install_decode_pre_exec(&mut cmd);
+        let output = cmd.output().await.expect("spawn sh");
+        let stdout = String::from_utf8(output.stdout).expect("utf-8 stdout");
+        assert_eq!(
+            stdout, "UNSET",
+            "decode child inherited the token: {stdout:?}"
+        );
+        assert!(!stdout.contains(token));
+    }
+
+    #[test]
+    fn std_command_child_does_not_inherit_music_runtime_token() {
+        let token = "std-child-must-not-see-this-token";
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!(
+                "printf '%s' \"${{{MUSIC_RUNTIME_TOKEN_ENV}-UNSET}}\""
+            ))
+            .env(MUSIC_RUNTIME_TOKEN_ENV, token)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        strip_music_runtime_token(&mut cmd);
+        let output = cmd.output().expect("spawn sh");
+        let stdout = String::from_utf8(output.stdout).expect("utf-8 stdout");
+        assert_eq!(stdout, "UNSET", "std child inherited the token: {stdout:?}");
+        assert!(!stdout.contains(token));
+    }
+
     #[test]
     fn parse_single_and_range() {
         assert_eq!(parse_cpuset("6-7").unwrap(), vec![6, 7]);
@@ -646,6 +706,7 @@ mod tests {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         install_affinity_pre_exec(&mut cmd, &[cpu]).unwrap();
+        strip_music_runtime_token(cmd.as_std_mut());
         let mut child = cmd.spawn().expect("spawn sleep with decode pre_exec");
         let pid = child.id().expect("child pid");
         let child_aff = current_affinity(pid);

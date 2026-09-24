@@ -38,8 +38,9 @@ fn fixture_music_dir() -> Option<PathBuf> {
 }
 
 fn ffmpeg_available() -> bool {
-    Command::new("ffmpeg")
-        .arg("-version")
+    let mut cmd = Command::new("ffmpeg");
+    music_bot_audio::cpuset::strip_music_runtime_token(&mut cmd);
+    cmd.arg("-version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -249,10 +250,9 @@ async fn ffmpeg_at_seeks_input_to_offset() {
 }
 
 fn pgrep_fixture() -> Vec<u32> {
-    let out = Command::new("pgrep")
-        .arg("-f")
-        .arg("sine_440_1s_mono_48k.wav")
-        .output();
+    let mut cmd = Command::new("pgrep");
+    music_bot_audio::cpuset::strip_music_runtime_token(&mut cmd);
+    let out = cmd.arg("-f").arg("sine_440_1s_mono_48k.wav").output();
     let bytes = match out {
         Ok(o) => o.stdout,
         Err(_) => return Vec::new(),
