@@ -127,6 +127,14 @@ impl SessionHandle for DioxusSession {
         *self.state.write_unchecked() = AuthState::Anonymous;
         save_state(&*self.storage, &AuthState::Anonymous);
     }
+    fn load_persisted(&self) -> AuthState {
+        load_state(&*self.storage)
+    }
+    fn adopt_memory(&self, state: AuthState) {
+        // Storage is already canonical (another tab wrote it, or it was
+        // cleared). Writing it back races a peer's newer `setItem`.
+        *self.state.write_unchecked() = state;
+    }
 }
 
 /// Pull the session out of context. Panics if no `DioxusSession` provider
@@ -219,6 +227,65 @@ pub fn rehydrate_from_storage(session: &DioxusSession) {
 /// same class of gate as PURA-232's `SessionAnonymous` short-circuit.
 pub fn should_redirect_anonymous_to_login(ready: bool, authenticated: bool) -> bool {
     ready && !authenticated
+}
+
+/// Apply a `storage` event from another tab to the in-memory session.
+///
+/// `key == None` is `localStorage.clear()`. Any other key is ignored
+/// unless it is the auth blob, so theme / ui-pref writes do not clobber
+/// the session signal. The bytes are read back from storage rather than
+/// from `StorageEvent::new_value`, which keeps one parser
+/// ([`load_state`]) for rehydrate and for cross-tab updates.
+pub fn apply_cross_tab_storage(session: &DioxusSession, key: Option<&str>) {
+    if key.is_some_and(|k| k != crate::client::store::SESSION_STORAGE_KEY) {
+        return;
+    }
+    let loaded = load_state(&*session.storage);
+    let authed = loaded.is_authenticated();
+    auth_debug::log(
+        "session.storage_event",
+        auth_debug::fields(&[("authenticated", authed.into())]),
+    );
+    *session.state.write_unchecked() = loaded;
+}
+
+/// Subscribe this session to cross-tab auth changes.
+///
+/// The browser fires `storage` in every tab except the writer, so an idle
+/// tab picks up a rotation or a logout without waiting for its next 401.
+/// The listener is removed when the component that called this hook
+/// unmounts. On native (SSR and unit tests) this is a no-op; tests call
+/// [`apply_cross_tab_storage`] directly.
+pub fn use_cross_tab_session(session: DioxusSession) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use std::rc::Rc;
+        use wasm_bindgen::JsCast;
+        use wasm_bindgen::closure::Closure;
+
+        let session_for_cb = session.clone();
+        let (_cb, func) = use_hook(move || {
+            let cb = Closure::<dyn FnMut(web_sys::StorageEvent)>::new(
+                move |event: web_sys::StorageEvent| {
+                    apply_cross_tab_storage(&session_for_cb, event.key().as_deref());
+                },
+            );
+            let func: js_sys::Function = cb.as_ref().unchecked_ref::<js_sys::Function>().clone();
+            if let Some(window) = web_sys::window() {
+                let _ = window.add_event_listener_with_callback("storage", &func);
+            }
+            (Rc::new(cb), func)
+        });
+        use_drop(move || {
+            if let Some(window) = web_sys::window() {
+                let _ = window.remove_event_listener_with_callback("storage", &func);
+            }
+        });
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = session;
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -325,6 +392,56 @@ mod tests {
         assert!(
             session.state.read().is_authenticated(),
             "rehydrate must copy the persisted blob into the signal"
+        );
+        rsx! { "" }
+    }
+
+    #[test]
+    fn cross_tab_storage_event_adopts_rotation_and_logout() {
+        let mut dom = VirtualDom::new(StorageEventHarness);
+        dom.rebuild_in_place();
+    }
+
+    #[component]
+    fn StorageEventHarness() -> Element {
+        use crate::client::store::SESSION_STORAGE_KEY;
+
+        let session = use_hook(|| {
+            let storage: SessionStorage = Arc::new(MemoryStore::new());
+            save_state(&*storage, &authed());
+            DioxusSession::new_ready(authed(), storage)
+        });
+
+        apply_cross_tab_storage(&session, Some("ts6-manager.theme"));
+        assert_eq!(
+            session.state.read().access_token(),
+            Some("access-token"),
+            "unrelated keys must not touch the session"
+        );
+
+        let rotated = AuthState::Authenticated {
+            access: "access-2".into(),
+            refresh: "refresh-2".into(),
+            user: authed().user().unwrap().clone(),
+        };
+        save_state(&*session.storage, &rotated);
+        apply_cross_tab_storage(&session, Some(SESSION_STORAGE_KEY));
+        assert_eq!(
+            session.state.read().access_token(),
+            Some("access-2"),
+            "idle tab must adopt the peer's rotated access token"
+        );
+        assert_eq!(
+            session.state.read().refresh_token(),
+            Some("refresh-2"),
+            "idle tab must adopt the peer's rotated refresh token"
+        );
+
+        save_state(&*session.storage, &AuthState::Anonymous);
+        apply_cross_tab_storage(&session, None);
+        assert!(
+            !session.state.read().is_authenticated(),
+            "localStorage.clear() from another tab logs this tab out"
         );
         rsx! { "" }
     }

@@ -25,7 +25,9 @@ pub mod tokens;
 
 use dioxus::prelude::*;
 
-use crate::client::dioxus::{provide_auth_gate, provide_session, rehydrate_from_storage};
+use crate::client::dioxus::{
+    provide_auth_gate, provide_session, rehydrate_from_storage, use_cross_tab_session,
+};
 use crate::client::ws::{provide_ws_hub, use_ws_lifecycle};
 use crate::ui::components::{provide_activity_feed, provide_toaster};
 use crate::ui::routes::Route;
@@ -66,6 +68,9 @@ pub fn App() -> Element {
             rehydrate_from_storage(&session_for_rehydrate);
         });
     }
+    // Idle tabs adopt a peer's rotation or logout as soon as that tab
+    // writes the shared auth blob, instead of waiting for a 401.
+    use_cross_tab_session(session.clone());
     rsx! {
         document::Stylesheet { href: TOKENS_CSS }
         document::Stylesheet { href: COMPONENTS_CSS }
