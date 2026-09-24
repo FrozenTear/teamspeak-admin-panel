@@ -90,9 +90,26 @@ impl std::fmt::Display for AuthError {
 
 impl std::error::Error for AuthError {}
 
+/// Bound on the wasm refresh `fetch`. A hung POST must not sit inside the
+/// cross-tab lock forever. Strictly shorter than the lock-wait timeout
+/// (`LOCK_WAIT_TIMEOUT_MS`): the no-lock fallback should only fire when the
+/// holder is dead, not just slow. The abort is a transport error, not a
+/// 401, so the gate keeps the session and does not POST again inside the
+/// same lock hold.
+pub(crate) const REFRESH_TIMEOUT_MS: u32 = 15_000;
+
+/// Transport error for a refresh whose `fetch` was aborted, including the
+/// [`REFRESH_TIMEOUT_MS`] deadline. Not a 401: callers must not
+/// invalidate the session.
+pub(crate) fn refresh_aborted_error(detail: &str) -> AuthError {
+    AuthError::Transport(format!(
+        "refresh timed out after {REFRESH_TIMEOUT_MS}ms: {detail}"
+    ))
+}
+
 /// `POST /api/auth/login` — exchange username/password for a token pair.
 pub async fn login(base: &str, req: &LoginRequest) -> Result<TokenPairResponse, AuthError> {
-    request_json(base, "POST", "/api/auth/login", None, Some(req)).await
+    request_json(base, "POST", "/api/auth/login", None, Some(req), None).await
 }
 
 /// `POST /api/auth/refresh` — rotate the refresh token, mint a new access.
@@ -110,8 +127,15 @@ pub async fn refresh(base: &str, req: &RefreshRequest) -> Result<TokenPairRespon
         ]),
     );
     let started = auth_debug::now_ms_for_duration();
-    let result: Result<TokenPairResponse, AuthError> =
-        request_json(base, "POST", "/api/auth/refresh", None, Some(req)).await;
+    let result: Result<TokenPairResponse, AuthError> = request_json(
+        base,
+        "POST",
+        "/api/auth/refresh",
+        None,
+        Some(req),
+        Some(REFRESH_TIMEOUT_MS),
+    )
+    .await;
     let (tag, payload) = match &result {
         Ok(pair) => (
             "refresh.post.ok",
@@ -181,7 +205,7 @@ pub async fn logout(base: &str, req: &LogoutRequest) -> Result<(), AuthError> {
 
 /// `GET /api/auth/me` — the current user's profile, identified by the bearer.
 pub async fn me(base: &str, access_token: &str) -> Result<UserInfo, AuthError> {
-    request_json::<(), _>(base, "GET", "/api/auth/me", Some(access_token), None).await
+    request_json::<(), _>(base, "GET", "/api/auth/me", Some(access_token), None, None).await
 }
 
 /// `PUT /api/auth/password` — server returns 204 on success.
@@ -214,12 +238,13 @@ async fn request_json<Req, Resp>(
     path: &str,
     bearer: Option<&str>,
     body: Option<&Req>,
+    timeout_ms: Option<u32>,
 ) -> Result<Resp, AuthError>
 where
     Req: Serialize,
     Resp: DeserializeOwned,
 {
-    let resp = send(base, method, path, bearer, body).await?;
+    let resp = send(base, method, path, bearer, body, timeout_ms).await?;
     let status = resp.status();
     let text = resp
         .text()
@@ -239,6 +264,7 @@ async fn request_json<Req, Resp>(
     _path: &str,
     _bearer: Option<&str>,
     _body: Option<&Req>,
+    _timeout_ms: Option<u32>,
 ) -> Result<Resp, AuthError>
 where
     Req: Serialize,
@@ -255,7 +281,7 @@ async fn request_no_content<Req: Serialize>(
     bearer: Option<&str>,
     body: Option<&Req>,
 ) -> Result<(), AuthError> {
-    let resp = send(base, method, path, bearer, body).await?;
+    let resp = send(base, method, path, bearer, body, None).await?;
     let status = resp.status();
     if status == 204 || (200..300).contains(&status) {
         Ok(())
@@ -283,6 +309,7 @@ async fn send<Req: Serialize>(
     path: &str,
     bearer: Option<&str>,
     body: Option<&Req>,
+    timeout_ms: Option<u32>,
 ) -> Result<gloo_net::http::Response, AuthError> {
     use gloo_net::http::Request;
     let url = format!("{}{}", base.trim_end_matches('/'), path);
@@ -296,6 +323,13 @@ async fn send<Req: Serialize>(
     if let Some(token) = bearer {
         builder = builder.header("authorization", &format!("Bearer {token}"));
     }
+    // Only the refresh POST passes a timeout. An AbortController aborts
+    // the fetch; that error is transport, never a 401.
+    let timeout = timeout_ms.and_then(arm_refresh_timeout);
+    if let Some(timeout) = &timeout {
+        builder = builder.abort_signal(Some(&timeout.signal));
+    }
+    let signal = timeout.as_ref().map(|timeout| timeout.signal.clone());
     let request = if let Some(b) = body {
         builder
             .header("content-type", "application/json")
@@ -306,10 +340,61 @@ async fn send<Req: Serialize>(
             .build()
             .map_err(|e| AuthError::Transport(e.to_string()))?
     };
-    request
-        .send()
-        .await
-        .map_err(|e| AuthError::Transport(e.to_string()))
+    let result = request.send().await;
+    drop(timeout);
+    result.map_err(|e| match &signal {
+        Some(signal) if signal.aborted() => refresh_aborted_error(&e.to_string()),
+        _ => AuthError::Transport(e.to_string()),
+    })
+}
+
+/// Abort the refresh `fetch` after `timeout_ms`. Drop clears the timer so
+/// a finished request does not abort a later one that reused nothing —
+/// each call has its own controller.
+#[cfg(target_arch = "wasm32")]
+struct RefreshFetchTimeout {
+    window: web_sys::Window,
+    handle: i32,
+    signal: web_sys::AbortSignal,
+    _on_timeout: wasm_bindgen::closure::Closure<dyn FnMut()>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Drop for RefreshFetchTimeout {
+    fn drop(&mut self) {
+        self.window.clear_timeout_with_handle(self.handle);
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn arm_refresh_timeout(timeout_ms: u32) -> Option<RefreshFetchTimeout> {
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen::closure::Closure;
+
+    // A missing window, a failed `AbortController`, or a failed `setTimeout`
+    // must not panic. Refresh proceeds with no deadline; that is still a
+    // normal POST, not a logout.
+    let window = web_sys::window()?;
+    let controller = web_sys::AbortController::new().ok()?;
+    let signal = controller.signal();
+    let on_timeout = Closure::wrap(Box::new(move || {
+        controller.abort();
+    }) as Box<dyn FnMut()>);
+    let Ok(timeout_ms) = i32::try_from(timeout_ms) else {
+        return None;
+    };
+    let handle = window
+        .set_timeout_with_callback_and_timeout_and_arguments_0(
+            on_timeout.as_ref().unchecked_ref(),
+            timeout_ms,
+        )
+        .ok()?;
+    Some(RefreshFetchTimeout {
+        window,
+        handle,
+        signal,
+        _on_timeout: on_timeout,
+    })
 }
 
 /// Map an HTTP status + body into the right [`AuthError`] variant. The
@@ -370,6 +455,17 @@ mod tests {
             }
             other => panic!("expected Client, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn refresh_timeout_is_transport_not_unauthorized() {
+        let err = refresh_aborted_error("AbortError");
+        assert!(
+            matches!(err, AuthError::Transport(ref msg) if msg.contains("refresh timed out")),
+            "got {err:?}"
+        );
+        assert!(!err.is_unauthorized());
+        assert!(!err.is_invalid_or_expired_token());
     }
 
     #[cfg(not(target_arch = "wasm32"))]

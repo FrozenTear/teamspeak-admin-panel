@@ -147,10 +147,15 @@ web-sys = { version = "0.3", features = [
     "HtmlInputElement",
     # Cross-tab refresh single-flight. `LockManager` is the Web Locks API
     # (`navigator.locks.request`, exclusive). `Lock` types the grant
-    # callback. Both bindings are unstable; wasm32 builds already pass
+    # callback. `LockOptions` + `AbortSignal` bound how long a tab waits
+    # for that lock. `AbortController` bounds the refresh `fetch` itself.
+    # The lock bindings are unstable; wasm32 builds already pass
     # `--cfg=web_sys_unstable_apis`.
+    "AbortController",
+    "AbortSignal",
     "Lock",
     "LockManager",
+    "LockOptions",
     # `storage` events so an idle tab adopts a rotation or logout that
     # another tab wrote into the shared auth blob.
     "StorageEvent",
