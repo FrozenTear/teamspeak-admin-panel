@@ -1232,6 +1232,10 @@ pub(crate) struct SendTimingMonitor {
     /// Frames observed across the whole play — also the per-frame index in
     /// the `audio_send_attribution` records.
     total_frames: u64,
+    /// Frames the post-stall burst cap dropped on this play. Cumulative,
+    /// same lifetime as `total_frames` — a window reset does not clear it.
+    /// Zero when `VOICE_INLINE_FLUSH` is off.
+    dropped_catchup_frames: u64,
     /// Frames observed since the last summary.
     window_frames: u64,
     /// Per-window maxes (reset by [`Self::reset_window`] after a summary).
@@ -1250,6 +1254,7 @@ impl SendTimingMonitor {
     pub(crate) fn new() -> Self {
         Self {
             total_frames: 0,
+            dropped_catchup_frames: 0,
             window_frames: 0,
             window_max_dequeue_gap: Duration::ZERO,
             window_max_t_send: Duration::ZERO,
@@ -1258,6 +1263,14 @@ impl SendTimingMonitor {
             window_max_preempt_b: Duration::ZERO,
             window_attributions: 0,
         }
+    }
+
+    /// Count frames the burst cap dropped. `VOICE_MAX_CATCHUP_FRAMES`
+    /// (default 4) is the threshold. The total is logged on
+    /// `audio_send_summary` as `dropped_catchup_frames`, immediately
+    /// after `total_frames`, and lives as long as that counter.
+    pub(crate) fn record_catchup_drops(&mut self, n: u64) {
+        self.dropped_catchup_frames = self.dropped_catchup_frames.saturating_add(n);
     }
 
     /// Record one frame's send-path timing: update the window maxes, raise
@@ -1309,6 +1322,9 @@ impl SendTimingMonitor {
             target: "music_bot_latency",
             stage = "audio_send_summary",
             total_frames = self.total_frames,
+            // Appended immediately after `total_frames`. Every field below
+            // keeps its previous name and order.
+            dropped_catchup_frames = self.dropped_catchup_frames,
             window_frames = self.window_frames,
             window_attributions = self.window_attributions,
             max_c_loop_deferral_us = self.window_max_dequeue_gap.as_micros() as u64,
@@ -2687,6 +2703,34 @@ mod tests {
             m.window_max_t_blockinplace,
             Duration::ZERO,
             "per-window maxes are cleared by the reset",
+        );
+        assert_eq!(
+            m.dropped_catchup_frames, 0,
+            "a play with no burst-cap drops reports zero",
+        );
+    }
+
+    /// Burst-cap drops accumulate next to `total_frames` and survive the
+    /// window reset that clears the per-window maxes.
+    #[test]
+    fn send_summary_accumulates_catchup_drops_across_windows() {
+        let mut m = SendTimingMonitor::new();
+        m.record_catchup_drops(28);
+        m.record_catchup_drops(4);
+        assert_eq!(m.dropped_catchup_frames, 32);
+        for _ in 0..SEND_SUMMARY_INTERVAL {
+            m.observe(SendSample {
+                dequeue_gap: Duration::from_micros(10),
+                t_send: Duration::from_micros(20),
+                t_blockinplace: Duration::from_micros(30),
+                cpu: Duration::from_micros(28),
+            });
+        }
+        assert_eq!(m.window_frames, 0, "window resets after a summary");
+        assert_eq!(m.total_frames, SEND_SUMMARY_INTERVAL);
+        assert_eq!(
+            m.dropped_catchup_frames, 32,
+            "dropped_catchup_frames is cumulative, like total_frames",
         );
     }
 

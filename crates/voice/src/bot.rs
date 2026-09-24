@@ -848,6 +848,11 @@ async fn run_wire_task(
                             audio::catchup_batch(msg, rx)
                         };
                         let dropped = batch.dropped;
+                        if dropped > 0
+                            && let Some(p) = play.as_mut()
+                        {
+                            p.send_monitor.record_catchup_drops(dropped as u64);
+                        }
                         let mut stop = false;
                         match batch.messages {
                             audio::CatchupMessages::Single(one) => {
@@ -1222,6 +1227,11 @@ async fn drive_catchup_batch(
     bot_volume: &VolumeHandle,
 ) -> &'static str {
     let dropped = batch.dropped;
+    if dropped > 0
+        && let Some(active) = current_audio.as_mut()
+    {
+        active.send_monitor.record_catchup_drops(dropped as u64);
+    }
     let mut kind = "frame";
     let mut stop = false;
     match batch.messages {
