@@ -176,7 +176,11 @@ impl AppState {
             ws_hub: Hub::new(),
             widget_cache: WidgetCache::new(),
             music_bots: match cfg.music_runtime_url.as_deref() {
-                Some(url) => MusicBotService::remote(music_bot_identity_dir, url),
+                Some(url) => MusicBotService::remote(
+                    music_bot_identity_dir,
+                    url,
+                    cfg.music_runtime_token.clone(),
+                ),
                 None => MusicBotService::new(music_bot_identity_dir),
             },
             sidecar,

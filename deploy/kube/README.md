@@ -205,7 +205,7 @@ documented production layout.
 | Container port | Host port | Notes |
 |----------------|-----------|-------|
 | 3001 | 3001 | HTTP, served by the Dioxus fullstack server |
-| 3002 | loopback only | Music unit control (`--listen 127.0.0.1:3002`, `MUSIC_RUNTIME_URL`). Not a public listener; do not put it on Caddy. |
+| 3002 | loopback only | Music unit control (`--listen 127.0.0.1:3002`, `MUSIC_RUNTIME_URL`). Not a public listener; do not put it on Caddy. Optional `MUSIC_RUNTIME_TOKEN` bearer; see below. |
 | 7080 | loopback only | MoQ sidecar HTTP control (`--http-listen 127.0.0.1:7080`). Not a public listener; do not put it on Caddy. |
 | 4443 | 4443 (UDP) | MoQ sidecar WebTransport |
 
@@ -213,6 +213,38 @@ The pod runs with `hostNetwork: true` (see "Network mode" below). All
 listeners are on the host's network namespace directly — operators
 fronting the manager with a reverse proxy (Caddy / nginx / Traefik)
 should bind the proxy to the host and forward to `127.0.0.1:3001`.
+
+`MUSIC_RUNTIME_TOKEN` is optional. Both the music process and the
+fullstack process read it from the environment only (not a file, the
+database, or a CLI flag). When it is unset and `--listen` is loopback
+(`127.0.0.1` / `::1`), the control API stays open and fullstack sends
+no `Authorization` header — that is the single-box deploy, and this
+manifest does not set the variable. Both processes trim the value the
+same way. An empty or whitespace-only value is treated as unset. A
+value that is not valid UTF-8 makes fullstack refuse to start, and the
+error does not include the value. The token must travel over
+WireGuard only. When it is set, the two containers
+must share the same value. The music process then requires
+`Authorization: Bearer <token>` on every route except `GET /health`.
+Fullstack sends that bearer on every runtime call: commands, list,
+now-playing, boot rehydrate, and the SSE event-stream proxy included. A
+runtime `401` is answered to the browser as `502`
+`{"error":"music_runtime_auth"}`, and the event stream does not
+reconnect in a loop after `401`. Do not log the token. The process
+refuses to start if the token is unset and the listener is not
+loopback, so `:3002` cannot be published on a non-loopback address
+without authentication. `/health` stays unauthenticated so the exec
+probe is unchanged.
+
+When the music runtime runs on a separate host from the panel, bind
+`--listen` to the WireGuard address, firewall `:3002` to the tunnel
+only, and set the same `MUSIC_RUNTIME_TOKEN` in both containers. The
+token is a bearer secret on plain HTTP, so it must travel only over
+the WireGuard link, never over the public internet. A wildcard bind
+(`0.0.0.0` or `::`) is refused while the token is set.
+`MUSIC_RUNTIME_ALLOW_WILDCARD_BIND=1` (or `true`) overrides that
+refusal and is discouraged: the process logs a warning, and the
+operator must still firewall `:3002` to the private tunnel.
 
 Contabo public HTTPS (draft, **not applied**): once
 `panel.scuffedcrew.no` is live on the existing host Caddy, public

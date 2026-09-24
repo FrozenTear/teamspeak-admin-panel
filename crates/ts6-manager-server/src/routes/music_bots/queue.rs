@@ -27,7 +27,7 @@ use crate::auth::extractors::RequireAuth;
 use crate::routes::music_bots::convert::{
     audio_source_from_wire, track_id_from_wire, track_to_wire,
 };
-use crate::routes::music_bots::translate_send_error;
+use crate::routes::music_bots::{translate_send_error, translate_store_error};
 
 pub(super) fn router() -> Router<AppState> {
     Router::new()
@@ -134,13 +134,11 @@ async fn reorder(
     // the authoritative live signal; this snapshot is a convenience
     // for the FE's optimistic rendering after a reorder gesture.
     tokio::time::sleep(Duration::from_millis(5)).await;
-    let queue = state
-        .music_bots
-        .supervisor
-        .store()
-        .queue_peek(bot)
-        .await
-        .unwrap_or_default();
+    let queue = match state.music_bots.supervisor.queue_peek(bot).await {
+        Ok(queue) => queue,
+        Err(err) if err.is_unauthorized() => return Err(translate_store_error(err)),
+        Err(_) => Vec::new(),
+    };
     Ok(Json(queue.iter().map(track_to_wire).collect()))
 }
 

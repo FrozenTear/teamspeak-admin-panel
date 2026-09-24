@@ -21,6 +21,7 @@ use ts6_manager_shared::music_bots as wire;
 
 use crate::app_state::AppState;
 use crate::auth::extractors::RequireAuth;
+use crate::routes::music_bots::map_music_runtime_error;
 
 /// 64 KiB is well above #28's 32 KiB context cap plus the other fields.
 const MAX_BUG_REPORT_BODY: usize = 64 * 1024;
@@ -35,10 +36,14 @@ pub(super) fn router() -> Router<AppState> {
 async fn bug_report_context(
     State(state): State<AppState>,
     RequireAuth(_user): RequireAuth,
-) -> Json<wire::MusicBotBugReportContext> {
-    Json(to_wire(
-        state.music_bots.supervisor.bug_report_snapshot().await,
-    ))
+) -> Result<Json<wire::MusicBotBugReportContext>, Response> {
+    let snap = state
+        .music_bots
+        .supervisor
+        .bug_report_snapshot()
+        .await
+        .map_err(map_music_runtime_error)?;
+    Ok(Json(to_wire(snap)))
 }
 
 fn to_wire(snap: music_bot::bug_report::BugReportSnapshot) -> wire::MusicBotBugReportContext {
@@ -72,7 +77,10 @@ pub async fn enrich_bug_report_request(
             return next.run(Request::from_parts(parts, Body::empty())).await;
         }
     };
-    let snap = state.music_bots.supervisor.bug_report_snapshot().await;
+    let snap = match state.music_bots.supervisor.bug_report_snapshot().await {
+        Ok(snap) => snap,
+        Err(_) => music_bot::bug_report::snapshot(),
+    };
     let body = match enrich_bug_report_json_with(&bytes, &snap) {
         Some(enriched) => Body::from(enriched),
         None => Body::from(bytes),

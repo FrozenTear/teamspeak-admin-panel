@@ -40,6 +40,52 @@ The single hard requirement. The server boots without anything else.
 | `FRONTEND_URL` | Public origin the browser hits (CORS + cookie domain). Default `http://localhost:3000`. | Operator-supplied. |
 | `TRUSTED_PROXY_HOPS` | Number of trusted reverse-proxy hops in front of the listener. `0` = ignore forwarding headers. `1` = exactly one hop, **only if** the TCP peer is also inside `TRUSTED_PROXY_CIDRS`. | Set to match your TLS terminator, together with the CIDR below. |
 | `TRUSTED_PROXY_CIDRS` | Comma-separated CIDRs of proxies allowed to send `X-Forwarded-For` and `X-Forwarded-Proto`. Empty (default) never trusts those headers, even when hops is `1`. | The proxy's peer address, e.g. `127.0.0.1/32` when Caddy dials the panel on loopback. |
+| `MUSIC_RUNTIME_TOKEN` | Optional shared bearer for the music control API (`:3002`). Unset on single-box loopback deploys. | `openssl rand -base64 32` |
+
+`MUSIC_RUNTIME_TOKEN` is read from the environment only (never a config
+file, the database, or a CLI flag). Fullstack uses the music crate's
+variable name and its parser (`ControlAuth`): surrounding whitespace
+is ignored, and empty or whitespace-only after that trim is unset. A
+stray space in one container's environment therefore cannot cause a
+401. On a single-box
+deploy that binds the music listener to loopback (`127.0.0.1` or
+`::1`), leave the variable unset: the music process does not require a
+bearer, and fullstack sends no `Authorization` header. That is today's
+loopback behaviour. If the variable is present but not valid UTF-8,
+fullstack refuses to start. The error does not include the value. The
+token must travel over WireGuard only.
+
+When the variable is set, the music process requires
+`Authorization: Bearer <token>` on every control route except
+`GET /health` — spawn, command, shutdown, list, now-playing, and the
+SSE event stream included. `/health` stays open so container
+healthchecks do not change. Fullstack sends that bearer on every call
+to the runtime, including commands, list/status, now-playing, boot
+rehydrate (`spawn` with the stored id), settings, bug-report context,
+and the browser event-stream proxy (`GET /v1/bots/{id}/events`). It
+also sends the header on its own
+`/health` probe; the runtime still accepts `/health` without a token,
+so the exec probe is unchanged.
+
+A runtime `401` is not forwarded to the browser (the panel would treat
+a raw 401 as its own session expiring). The browser-facing route
+answers `502` with `{"error":"music_runtime_auth"}`. The event-stream
+client does not reconnect in a loop after `401`. Do not log the token.
+If the variable is unset and `--listen` is not a loopback address, the
+music process refuses to start. Kube manifests are unchanged: the
+Contabo pod still binds `127.0.0.1:3002` and does not set the variable.
+
+When the music runtime runs on a separate host from the panel, bind
+`--listen` to the WireGuard address, firewall `:3002` so only the
+tunnel can reach it, and set the same `MUSIC_RUNTIME_TOKEN` in both
+containers. The value is a bearer token on plain HTTP, so it must
+travel only over the WireGuard link, never over the public internet.
+A wildcard bind (`0.0.0.0` or `::`) is refused while the token is set.
+`MUSIC_RUNTIME_ALLOW_WILDCARD_BIND=1` (or `true`) overrides that
+refusal and is discouraged: the process logs a warning, and `:3002`
+must still be firewalled to the private tunnel. A specific public
+address still starts, and logs a warning to bind the WireGuard or
+private address and firewall `:3002` to the tunnel.
 
 The full canonical env list, with comments, is
 [`deploy/quadlet/ts6-manager.env.example`](../deploy/quadlet/ts6-manager.env.example).
