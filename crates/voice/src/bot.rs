@@ -510,20 +510,43 @@ fn note_content_progress(
 fn log_loop_stall(arm: &'static str, arm_start: Instant, detail: impl FnOnce() -> String) {
     let elapsed = arm_start.elapsed();
     if elapsed >= LOOP_STALL_WARN {
-        let elapsed_ms = elapsed.as_millis() as u64;
-        let detail = detail();
-        crate::voice_bug_report::record_connected_loop_stall(arm, elapsed_ms, &detail);
-        warn!(
-            target: "music_bot_latency",
-            stage = "connected_loop_stall",
-            arm,
-            detail = %detail,
-            elapsed_ms,
-            "connected-loop arm body outran the 20 ms audio-frame cadence — the \
-             audio-drain arm was starved this long; correlate with a mid-song \
-             frame_underrun (buffered_frames full) to confirm it reached the wire",
-        );
+        emit_loop_stall(arm, elapsed, detail());
     }
+}
+
+/// Audio-arm stall line. A fully dropped catch-up tick logs
+/// `audio_msg=catchup_dropped dropped={n}` even when the arm finished
+/// under [`LOOP_STALL_WARN`]. Every other tick keeps that 10 ms gate.
+/// Still one line per tick — the same shape as [`log_loop_stall`], not a
+/// per-frame line.
+fn log_audio_arm_stall(
+    arm: &'static str,
+    arm_start: Instant,
+    kind: &str,
+    wire_sent: u64,
+    dropped: u64,
+) {
+    let elapsed = arm_start.elapsed();
+    if let Some(detail) =
+        audio::audio_arm_stall_detail(kind, wire_sent, dropped, elapsed, LOOP_STALL_WARN)
+    {
+        emit_loop_stall(arm, elapsed, detail);
+    }
+}
+
+fn emit_loop_stall(arm: &'static str, elapsed: Duration, detail: String) {
+    let elapsed_ms = elapsed.as_millis() as u64;
+    crate::voice_bug_report::record_connected_loop_stall(arm, elapsed_ms, &detail);
+    warn!(
+        target: "music_bot_latency",
+        stage = "connected_loop_stall",
+        arm,
+        detail = %detail,
+        elapsed_ms,
+        "connected-loop arm body outran the 20 ms audio-frame cadence — the \
+         audio-drain arm was starved this long; correlate with a mid-song \
+         frame_underrun (buffered_frames full) to confirm it reached the wire",
+    );
 }
 
 /// Stable `&'static str` name for a [`BotCommand`] — used by
@@ -631,9 +654,7 @@ async fn run_connected_loop(
                     .await;
                     (kind, 0, 0)
                 };
-                log_loop_stall("audio", arm_start, || {
-                    audio::catchup_stall_detail(kind, wire_sent, dropped)
-                });
+                log_audio_arm_stall("audio", arm_start, kind, wire_sent, dropped);
             },
             ev = async { con.events().next().await } => match ev {
                 Some(Ok(item)) => {
@@ -855,7 +876,7 @@ impl WireSink<'_> {
     /// Send an empty-payload voice packet (jitter-buffer flush).
     fn voice_stop(&mut self) {
         match self {
-            WireSink::Direct(con) => audio::send_voice_stop(con),
+            WireSink::Direct(con) => audio::send_voice_stop(*con),
             WireSink::Split(tx) => {
                 let _ = tx.send(WireCmd::VoiceStop);
             }
@@ -869,7 +890,7 @@ impl WireSink<'_> {
     fn voice_stop_and_flush(&mut self) {
         self.voice_stop();
         if let WireSink::Direct(con) = self {
-            audio::inline_flush(con);
+            audio::inline_flush(*con);
         }
     }
 
@@ -915,7 +936,7 @@ impl WireSink<'_> {
     ) -> Result<(), tsclientlib::Error> {
         match self {
             // Single-loop path keeps `block_in_place` (rollback fidelity).
-            WireSink::Direct(con) => audio::send_opus_frame(con, opus, enqueued_at, monitor, true),
+            WireSink::Direct(con) => audio::send_opus_frame(*con, opus, enqueued_at, monitor, true),
             WireSink::Split(_) => {
                 unreachable!("split path: the wire task owns frame sends")
             }
@@ -954,7 +975,7 @@ struct ConsumedAudio {
 async fn consume_wire_audio_msg(
     msg: AudioMsg,
     play: &mut Option<WirePlay>,
-    con: &mut Connection,
+    con: &mut impl audio::OutgoingVoice,
     wire_evt_tx: &mpsc::UnboundedSender<WireEvent>,
     events: &broadcast::Sender<BotEvent>,
 ) -> ConsumedAudio {
@@ -1044,6 +1065,50 @@ async fn consume_wire_audio_msg(
     }
 }
 
+/// Operations the wire send loop uses besides [`audio::OutgoingVoice`].
+/// [`Connection`] forwards to the real client. The loop test supplies a
+/// scripted stand-in so it can watch flush versus the next `events()` poll
+/// without a TeamSpeak server. Not a public hook.
+trait VoiceLoopConn: audio::OutgoingVoice {
+    async fn next_event(&mut self) -> Option<std::result::Result<StreamItem, tsclientlib::Error>>;
+
+    fn channel_move(&mut self, target: ChannelId) -> Result<()>;
+
+    fn chat_reply(&mut self, line: &str);
+
+    async fn shutdown(&mut self, reason: &str);
+
+    fn extract_chat(&self, item: &StreamItem) -> Vec<ChatLine>;
+
+    fn handle_item(&mut self, item: StreamItem) -> Option<ChannelId>;
+}
+
+impl VoiceLoopConn for Connection {
+    async fn next_event(&mut self) -> Option<std::result::Result<StreamItem, tsclientlib::Error>> {
+        self.events().next().await
+    }
+
+    fn channel_move(&mut self, target: ChannelId) -> Result<()> {
+        send_channel_move(self, target)
+    }
+
+    fn chat_reply(&mut self, line: &str) {
+        chat::send_reply(self, line);
+    }
+
+    async fn shutdown(&mut self, reason: &str) {
+        clean_disconnect(self, reason).await
+    }
+
+    fn extract_chat(&self, item: &StreamItem) -> Vec<ChatLine> {
+        extract_channel_chat(item, self)
+    }
+
+    fn handle_item(&mut self, item: StreamItem) -> Option<ChannelId> {
+        handle_stream_item(item, self)
+    }
+}
+
 /// PURA-396 §2a — the **wire task**. Sole owner of `&mut Connection`. Its
 /// `select!` has exactly three arms — a paced frame, a protocol event, a wire
 /// command — and every arm body is bounded to one cheap operation, so the
@@ -1051,7 +1116,16 @@ async fn consume_wire_audio_msg(
 /// / queue / yt-dlp work. Consumes the `Connection`; clean-disconnects it on
 /// a `WireCmd::Disconnect`.
 async fn run_wire_task(
-    mut con: Connection,
+    con: Connection,
+    wire_cmd_rx: mpsc::UnboundedReceiver<WireCmd>,
+    wire_evt_tx: mpsc::UnboundedSender<WireEvent>,
+    events: broadcast::Sender<BotEvent>,
+) {
+    run_wire_loop(con, wire_cmd_rx, wire_evt_tx, events).await
+}
+
+async fn run_wire_loop<C: VoiceLoopConn>(
+    mut con: C,
     mut wire_cmd_rx: mpsc::UnboundedReceiver<WireCmd>,
     wire_evt_tx: mpsc::UnboundedSender<WireEvent>,
     events: broadcast::Sender<BotEvent>,
@@ -1133,9 +1207,7 @@ async fn run_wire_task(
                         if audio::inline_flush_is_enabled() {
                             audio::maybe_log_inline_flush();
                         }
-                        log_loop_stall("wire_audio", arm_start, || {
-                            audio::catchup_stall_detail(kind, wire_sent, dropped)
-                        });
+                        log_audio_arm_stall("wire_audio", arm_start, kind, wire_sent, dropped);
                     }
                     None => {
                         // Sibling channel closed without a `Finished`.
@@ -1165,15 +1237,15 @@ async fn run_wire_task(
                     audio::inline_flush(&mut con);
                 }
                 Some(WireCmd::ChannelMove(target)) => {
-                    if let Err(err) = send_channel_move(&mut con, target) {
+                    if let Err(err) = con.channel_move(target) {
                         let _ = events.send(BotEvent::Error(BotError::Connection(format!(
                             "{err:#}"
                         ))));
                     }
                 }
-                Some(WireCmd::ChatReply(line)) => chat::send_reply(&mut con, &line),
+                Some(WireCmd::ChatReply(line)) => con.chat_reply(&line),
                 Some(WireCmd::Disconnect { shutdown }) => {
-                    clean_disconnect(&mut con, if shutdown { "shutdown" } else { "disconnect" })
+                    con.shutdown(if shutdown { "shutdown" } else { "disconnect" })
                         .await;
                     return;
                 }
@@ -1183,19 +1255,19 @@ async fn run_wire_task(
                     return;
                 }
             },
-            ev = async { con.events().next().await } => {
+            ev = async { con.next_event().await } => {
                 let arm_start = Instant::now();
                 match ev {
                     Some(Ok(item)) => {
                         let item_label = stream_item_label(&item);
                         // Extract chat (borrows `&item`) before the
                         // channel-update logic consumes the item.
-                        let chat_msgs = extract_channel_chat(&item, &con);
+                        let chat_msgs = con.extract_chat(&item);
                         let chat_lines = chat_msgs.len();
                         if !chat_msgs.is_empty() {
                             let _ = wire_evt_tx.send(WireEvent::Chat(chat_msgs));
                         }
-                        if let Some(channel) = handle_stream_item(item, &con) {
+                        if let Some(channel) = con.handle_item(item) {
                             let _ = wire_evt_tx.send(WireEvent::Channel(channel));
                         }
                         log_loop_stall("wire_event", arm_start, || {
@@ -1612,7 +1684,7 @@ async fn handle_audio_msg(
             } else if audio::inline_flush_is_enabled()
                 && let WireSink::Direct(con) = wire
             {
-                audio::inline_flush(con);
+                audio::inline_flush(*con);
             }
             "frame"
         }
@@ -2731,6 +2803,31 @@ mod tests {
         );
     }
 
+    /// Send-loop proof of `VOICE_INLINE_FLUSH`, on the wire task's select
+    /// (the loop that owns the connection and polls `events()`). A scripted
+    /// connection records enqueue, direct flush, and the events-poll write.
+    /// The tokio clock is paused; the test waits on yields, not sleeps.
+    #[test]
+    fn wire_send_loop_flush_order_follows_the_inline_flag() {
+        let _lock = audio::lock_flush_test_globals();
+        struct ClearOverride;
+        impl Drop for ClearOverride {
+            fn drop(&mut self) {
+                audio::set_inline_flush_override(None);
+            }
+        }
+        let _clear = ClearOverride;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .expect("paused runtime");
+        let off = rt.block_on(drive_wire_frame(false));
+        let on = rt.block_on(drive_wire_frame(true));
+        assert_flush_off(&off);
+        assert_flush_on(&on);
+    }
+
     /// PURA-396 — the `VOICE_SPLIT_WIRE_TASK` env override is parsed
     /// trimmed and case-insensitive on the common truthy spellings;
     /// anything else (incl. absent) is off.
@@ -3348,6 +3445,247 @@ mod tests {
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {
                     panic!("actor did not exit within 1s of logical time");
                 }
+            }
+        }
+    }
+
+    const FRAME_BYTES: &[u8] = b"opus-frame-1";
+
+    #[derive(Clone, Debug)]
+    enum WireStep {
+        Enqueued,
+        Flush { packets: usize, bytes: Vec<u8> },
+        Events { wrote: usize, bytes: Vec<u8> },
+    }
+
+    struct ScriptedConn {
+        queue: std::collections::VecDeque<Vec<u8>>,
+        log: Arc<std::sync::Mutex<Vec<WireStep>>>,
+    }
+
+    impl ScriptedConn {
+        fn drain_queue(&mut self) -> (usize, Vec<u8>) {
+            let packets = self.queue.len();
+            let mut bytes = Vec::new();
+            while let Some(packet) = self.queue.pop_front() {
+                bytes.extend(packet);
+            }
+            (packets, bytes)
+        }
+    }
+
+    impl audio::OutgoingVoice for ScriptedConn {
+        fn send_audio(
+            &mut self,
+            packet: tsproto_packets::packets::OutPacket,
+        ) -> std::result::Result<(), tsclientlib::Error> {
+            self.queue.push_back(packet.content().to_vec());
+            self.push(WireStep::Enqueued);
+            Ok(())
+        }
+
+        fn try_flush_outgoing(&mut self) -> std::result::Result<usize, tsclientlib::Error> {
+            let (packets, bytes) = self.drain_queue();
+            self.push(WireStep::Flush { packets, bytes });
+            Ok(packets)
+        }
+    }
+
+    impl ScriptedConn {
+        fn push(&self, step: WireStep) {
+            self.log
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(step);
+        }
+    }
+
+    impl VoiceLoopConn for ScriptedConn {
+        async fn next_event(
+            &mut self,
+        ) -> Option<std::result::Result<StreamItem, tsclientlib::Error>> {
+            // Same moment `poll_send_acks` runs inside `events()`: a
+            // packet still queued is written here, and only here, when
+            // the direct flush did not take it.
+            let (wrote, bytes) = self.drain_queue();
+            self.push(WireStep::Events { wrote, bytes });
+            std::future::pending().await
+        }
+
+        fn channel_move(&mut self, _target: ChannelId) -> Result<()> {
+            Ok(())
+        }
+
+        fn chat_reply(&mut self, _line: &str) {}
+
+        async fn shutdown(&mut self, _reason: &str) {}
+
+        fn extract_chat(&self, _item: &StreamItem) -> Vec<ChatLine> {
+            Vec::new()
+        }
+
+        fn handle_item(&mut self, _item: StreamItem) -> Option<ChannelId> {
+            None
+        }
+    }
+
+    fn contains_frame(bytes: &[u8]) -> bool {
+        bytes
+            .windows(FRAME_BYTES.len())
+            .any(|window| window == FRAME_BYTES)
+    }
+
+    async fn drive_wire_frame(flush_on: bool) -> Vec<WireStep> {
+        audio::set_inline_flush_override(Some(flush_on));
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let conn = ScriptedConn {
+            queue: std::collections::VecDeque::new(),
+            log: Arc::clone(&log),
+        };
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (evt_tx, _evt_rx) = mpsc::unbounded_channel();
+        let (events, _events_rx) = broadcast::channel(8);
+        let (audio_tx, audio_rx) = mpsc::channel(4);
+        let task = tokio::spawn(run_wire_loop(conn, cmd_rx, evt_tx, events));
+        let now = std::time::Instant::now();
+        cmd_tx
+            .send(WireCmd::InstallAudio {
+                rx: audio_rx,
+                started_at: now,
+                seek_base_secs: 0,
+                epoch: 1,
+            })
+            .expect("command channel open");
+        audio_tx
+            .send(AudioMsg::Frame {
+                bytes: bytes::Bytes::from_static(FRAME_BYTES),
+                enqueued_at: now,
+                scheduled_at: now,
+            })
+            .await
+            .expect("audio channel open");
+
+        let mut snapshot = Vec::new();
+        for _ in 0..200 {
+            snapshot = log
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            if wire_log_ready(&snapshot, flush_on) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        drop(cmd_tx);
+        task.await
+            .expect("wire loop exits when the command channel closes");
+        assert!(
+            wire_log_ready(&snapshot, flush_on),
+            "send loop did not reach the post-send events poll: {snapshot:?}"
+        );
+        snapshot
+    }
+
+    fn wire_log_ready(log: &[WireStep], flush_on: bool) -> bool {
+        let Some(send_at) = log
+            .iter()
+            .position(|step| matches!(step, WireStep::Enqueued))
+        else {
+            return false;
+        };
+        let after = &log[send_at + 1..];
+        if flush_on {
+            let flush_at = after
+                .iter()
+                .position(|step| matches!(step, WireStep::Flush { packets: 1.., .. }));
+            let events_at = after
+                .iter()
+                .position(|step| matches!(step, WireStep::Events { .. }));
+            matches!((flush_at, events_at), (Some(flush), Some(events)) if flush < events)
+        } else {
+            !log.iter()
+                .any(|step| matches!(step, WireStep::Flush { .. }))
+                && after
+                    .iter()
+                    .any(|step| matches!(step, WireStep::Events { wrote: 1.., .. }))
+        }
+    }
+
+    fn assert_flush_off(log: &[WireStep]) {
+        assert!(
+            !log.iter()
+                .any(|step| matches!(step, WireStep::Flush { .. })),
+            "flag off does not call the direct flush: {log:?}"
+        );
+        let send_at = log
+            .iter()
+            .position(|step| matches!(step, WireStep::Enqueued))
+            .expect("one send_audio");
+        assert_eq!(
+            log.iter()
+                .filter(|step| matches!(step, WireStep::Enqueued))
+                .count(),
+            1,
+            "one enqueue, same as the pre-flag send loop: {log:?}"
+        );
+        assert!(
+            log.iter()
+                .take(send_at)
+                .all(|step| !matches!(step, WireStep::Events { wrote: 1.., .. })),
+            "nothing is written before send_audio: {log:?}"
+        );
+        match log
+            .iter()
+            .skip(send_at + 1)
+            .find(|step| matches!(step, WireStep::Events { wrote: 1.., .. }))
+        {
+            Some(WireStep::Events {
+                wrote: 1, bytes, ..
+            }) => {
+                assert!(
+                    contains_frame(bytes),
+                    "the events poll writes the packet that send_audio only enqueued"
+                );
+            }
+            other => panic!(
+                "flag off writes the packet on the next events poll, got {other:?} in {log:?}"
+            ),
+        }
+    }
+
+    fn assert_flush_on(log: &[WireStep]) {
+        let send_at = log
+            .iter()
+            .position(|step| matches!(step, WireStep::Enqueued))
+            .expect("one send_audio");
+        let after = &log[send_at + 1..];
+        let flush_at = after
+            .iter()
+            .position(|step| matches!(step, WireStep::Flush { packets: 1.., .. }))
+            .expect("direct flush");
+        let events_at = after
+            .iter()
+            .position(|step| matches!(step, WireStep::Events { .. }))
+            .expect("events poll");
+        assert!(
+            flush_at < events_at,
+            "the flush writes the packet before the next events poll: {log:?}"
+        );
+        match &after[flush_at] {
+            WireStep::Flush {
+                packets: 1, bytes, ..
+            } => {
+                assert!(
+                    contains_frame(bytes),
+                    "the direct flush writes the enqueued voice packet"
+                );
+            }
+            other => panic!("expected one flushed packet, got {other:?}"),
+        }
+        match &after[events_at] {
+            WireStep::Events { wrote: 0, .. } => {}
+            other => {
+                panic!("the events poll must not write a packet the flush already wrote: {other:?}")
             }
         }
     }
