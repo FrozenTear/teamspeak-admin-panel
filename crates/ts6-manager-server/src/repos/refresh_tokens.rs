@@ -181,8 +181,13 @@ pub async fn set_replaced_by(
 /// SurrealDB transaction (L4). A revocation that lands between the two
 /// writes used to leave the successor as an orphan live token.
 ///
-/// `Ok(None)` means the CAS lost (the predecessor was already rotated or
-/// deleted). Any other failure, including a rolled-back insert, is `Err`.
+/// `Ok(None)` means the CAS lost (`THROW "rotation-lost"`, the predecessor
+/// was already rotated or deleted). A commit-time write conflict
+/// (`Transaction conflict: … This transaction can be retried`) does not
+/// contain that marker, so it is `Err` — the caller must not insert another
+/// successor. `Ok(Some)` means this transaction committed. On the mem
+/// engine that is not a promise that a concurrent transaction aborted;
+/// [`crate::auth::refresh::rotate`] checks the family afterwards.
 pub async fn commit_rotation(
     db: &Database,
     old_token: &str,
