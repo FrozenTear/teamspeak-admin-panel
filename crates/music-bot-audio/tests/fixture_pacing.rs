@@ -11,7 +11,6 @@
 //! recipe and CI guidance live in `docs/voice/audio-pipeline.md`.
 
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use music_bot_audio::AudioPipeline;
@@ -38,8 +37,7 @@ fn fixture_music_dir() -> Option<PathBuf> {
 }
 
 fn ffmpeg_available() -> bool {
-    let mut cmd = Command::new("ffmpeg");
-    music_bot_audio::cpuset::strip_music_runtime_token(&mut cmd);
+    let mut cmd = music_bot_audio::cpuset::std_music_command("ffmpeg");
     cmd.arg("-version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -250,8 +248,7 @@ async fn ffmpeg_at_seeks_input_to_offset() {
 }
 
 fn pgrep_fixture() -> Vec<u32> {
-    let mut cmd = Command::new("pgrep");
-    music_bot_audio::cpuset::strip_music_runtime_token(&mut cmd);
+    let mut cmd = music_bot_audio::cpuset::std_music_command("pgrep");
     let out = cmd.arg("-f").arg("sine_440_1s_mono_48k.wav").output();
     let bytes = match out {
         Ok(o) => o.stdout,

@@ -13,7 +13,7 @@ use std::process::Stdio;
 
 use async_trait::async_trait;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 use tokio::task::JoinHandle;
 
 use super::PcmSource;
@@ -62,7 +62,7 @@ impl YtDlpSource {
         // Spawn ffmpeg first, take its stdin so we can pipe yt-dlp output in.
         let (inner, mut ffmpeg_stdin) = FfmpegSource::from_stdin(channels).await?;
 
-        let mut cmd = Command::new("yt-dlp");
+        let mut cmd = crate::cpuset::music_command("yt-dlp");
         cmd.kill_on_drop(true)
             .arg("--quiet")
             .arg("--no-warnings")

@@ -55,8 +55,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use tokio::process::Command;
-
 /// The resolver script, embedded so it can never drift from the binary that
 /// supervises it. Written to a temp file at [`ResolverHandle::spawn`].
 const RESOLVER_SCRIPT: &str = include_str!("yt_resolver.py");
@@ -785,7 +783,7 @@ async fn supervise(script: PathBuf, socket: PathBuf, state: Arc<SupervisorState>
         let _ = std::fs::remove_file(&socket);
 
         let started = Instant::now();
-        let mut cmd = Command::new("python3");
+        let mut cmd = crate::cpuset::music_command("python3");
         cmd.arg(&script)
             .arg(&socket)
             .kill_on_drop(true)
