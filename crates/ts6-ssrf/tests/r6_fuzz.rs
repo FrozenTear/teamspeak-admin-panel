@@ -10,10 +10,10 @@
 //! 1-part integer, octal, hex, IPv4-mapped IPv6) MUST be rejected by
 //! `is_url_allowed`.
 //!
-//! Property: for every IPv6 address in the unspecified (`::`),
-//! link-local (`fe80::/10`), ULA (`fc00::/7`), loopback (`::1`), or
-//! IPv4-mapped-with-blocked-v4 ranges, the bracketed literal MUST be
-//! rejected.
+//! Property: for every IPv6 address in `::/96`, link-local (`fe80::/10`),
+//! site-local (`fec0::/10`), ULA (`fc00::/7`), multicast (`ff00::/8`),
+//! NAT64 (`64:ff9b::/96`), 6to4 with a blocked embedded v4, or
+//! IPv4-mapped-with-blocked-v4, the bracketed literal MUST be rejected.
 //!
 //! Symmetric properties cover the *allow* side: public IPv4 literals and
 //! their encoded forms MUST be allowed (modulo NXDOMAIN allow-through for
@@ -52,8 +52,7 @@ fn any_v4() -> impl Strategy<Value = Ipv4Addr> {
 
 /// Pure-Rust port of `ranges::is_blocked_ipv4` so the proptest doesn't
 /// depend on visibility of the crate-internal helper. Keep in sync with
-/// `crates/ts6-ssrf/src/ranges.rs`; the divergence test below also pins
-/// it.
+/// `crates/ts6-ssrf/src/ranges.rs`.
 fn expect_blocked_v4(v4: Ipv4Addr) -> bool {
     let o = v4.octets();
     o[0] == 0
@@ -62,18 +61,50 @@ fn expect_blocked_v4(v4: Ipv4Addr) -> bool {
         || (o[0] == 169 && o[1] == 254)
         || (o[0] == 172 && (16..=31).contains(&o[1]))
         || (o[0] == 192 && o[1] == 168)
+        || (o[0] == 100 && (o[1] & 0xC0) == 0x40)
+        || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
+        || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+        || o[0] >= 224
 }
 
 fn expect_blocked_v6(v6: Ipv6Addr) -> bool {
-    if v6.is_unspecified() || v6.is_loopback() {
+    let segs = v6.segments();
+    // ::/96
+    if segs[0] == 0 && segs[1] == 0 && segs[2] == 0 && segs[3] == 0 && segs[4] == 0 && segs[5] == 0
+    {
         return true;
     }
-    let segs = v6.segments();
     if (segs[0] & 0xFFC0) == 0xFE80 {
+        return true;
+    }
+    if (segs[0] & 0xFFC0) == 0xFEC0 {
         return true;
     }
     if (segs[0] & 0xFE00) == 0xFC00 {
         return true;
+    }
+    if (segs[0] & 0xFF00) == 0xFF00 {
+        return true;
+    }
+    if segs[0] == 0x0064
+        && segs[1] == 0xFF9B
+        && segs[2] == 0
+        && segs[3] == 0
+        && segs[4] == 0
+        && segs[5] == 0
+    {
+        return true;
+    }
+    if segs[0] == 0x2002 {
+        let embedded = Ipv4Addr::new(
+            (segs[1] >> 8) as u8,
+            (segs[1] & 0xFF) as u8,
+            (segs[2] >> 8) as u8,
+            (segs[2] & 0xFF) as u8,
+        );
+        if expect_blocked_v4(embedded) {
+            return true;
+        }
     }
     if let Some(v4) = v6.to_ipv4_mapped()
         && expect_blocked_v4(v4)
@@ -201,12 +232,9 @@ proptest! {
         prop_assert!(matches!(got, Err(SsrfError::IpNotAllowed(_))), "ULA {v6} should be rejected, got {got:?}");
     }
 
-    /// Universal IPv6 surface — any address whose canonical form sits in
-    /// loopback / link-local / ULA / ::ffff:blocked MUST be rejected;
-    /// everything else MUST be allowed. This catches off-by-one regressions
-    /// at range boundaries (e.g. `febf:ffff::` last link-local address,
-    /// `fec0::` first non-link-local, `fc00::` start of ULA, `fe00::`
-    /// outside ULA).
+    /// Universal IPv6 surface — any address in the blocklist MUST be
+    /// rejected; everything else MUST be allowed. This catches off-by-one
+    /// regressions at range boundaries.
     #[test]
     fn ipv6_any_literal_matches_expected_blocklist(
         s0 in any::<u16>(),

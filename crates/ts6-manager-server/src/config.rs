@@ -534,7 +534,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn placeholder_jwt_requires_an_explicit_dev_flag() {
         let err = resolve_jwt_secret(None, NodeEnv::Development, false).unwrap_err();
         assert!(err.to_string().contains("TS6_ALLOW_INSECURE_DEV_JWT"));
@@ -556,6 +555,7 @@ mod tests {
         assert!(secret.starts_with("a-real-secret"));
     }
 
+    #[test]
     fn node_env_defaults_to_development() {
         assert_eq!(NodeEnv::from_env_string(None), NodeEnv::Development);
         assert_eq!(

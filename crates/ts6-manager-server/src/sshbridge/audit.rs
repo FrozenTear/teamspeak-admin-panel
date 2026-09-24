@@ -555,7 +555,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn redact_clientmove_channel_password() {
         let r = redact_credentials("clientmove clid=4 cid=12 cpw=hunter2");
         assert!(!r.contains("hunter2"));
@@ -564,6 +563,7 @@ mod tests {
         assert!(r.contains("cid=12"));
     }
 
+    #[test]
     fn redact_leaves_innocuous_params_alone() {
         // Innocuous TS6 params that happen to use `=` must pass through.
         // `clid`, `cid`, `sid`, `cgid` — none ends in a credential suffix.

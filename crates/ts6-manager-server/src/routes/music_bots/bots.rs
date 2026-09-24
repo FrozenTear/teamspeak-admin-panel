@@ -20,7 +20,7 @@ use tracing::{error, info, warn};
 use ts6_manager_shared::music_bots as wire;
 
 use crate::app_state::AppState;
-use crate::auth::extractors::{AuthUser, RequireAuth, RequireAuthOrQueryToken, RequireModerator};
+use crate::auth::extractors::{RequireAuth, RequireAuthOrQueryToken, RequireModerator};
 use crate::repos::server_connections::{self, ServerConnection};
 use crate::routes::control::access;
 use crate::routes::music_bots::convert::{bot_id_to_wire, bot_state_to_wire, track_to_wire};
@@ -344,6 +344,7 @@ async fn events_sse(
 /// Rejects URLs, userinfo, and a zero port. The host is what a
 /// `server_connection` row is matched on — the voice port lives on the
 /// bot, not the connection row.
+#[allow(clippy::result_large_err)]
 fn parse_voice_host(server_addr: &str) -> Result<String, Response> {
     let addr = server_addr.trim();
     if addr.is_empty() || addr.contains(['/', '@', ' ', '\\', '?', '#']) || addr.contains("://") {

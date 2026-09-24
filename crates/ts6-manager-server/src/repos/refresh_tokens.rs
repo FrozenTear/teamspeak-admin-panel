@@ -213,7 +213,7 @@ pub async fn commit_rotation(
         .bind(("family", new.family))
         .await;
     match result {
-        Ok(mut resp) => match resp.check() {
+        Ok(resp) => match resp.check() {
             Ok(_) => Ok(Some(())),
             Err(err) if err.to_string().contains("rotation-lost") => Ok(None),
             Err(err) => Err(err).context("refresh_token rotation transaction failed"),

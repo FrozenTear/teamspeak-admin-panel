@@ -493,7 +493,10 @@ mod tests {
         // Bob's token survives.
         let bob_rows = refresh_tokens::list_for_user(&db, bob).await.unwrap();
         assert_eq!(bob_rows.len(), 1);
-        assert_eq!(bob_rows[0].token, bob_token.token);
+        assert_eq!(
+            bob_rows[0].token,
+            refresh_tokens::token_at_rest(&bob_token.token)
+        );
         // Alice's set is gone.
         assert!(
             refresh_tokens::list_for_user(&db, alice)
@@ -728,7 +731,7 @@ mod tests {
                                 .expect("predecessor must survive");
                             assert_eq!(
                                 pred.replacedBy.as_deref(),
-                                Some(rotated.token.as_str()),
+                                Some(refresh_tokens::token_at_rest(&rotated.token).as_str()),
                                 "I1 violated: rotated predecessor missing replacedBy"
                             );
                             alice_live = Some(rotated.token);
@@ -746,7 +749,7 @@ mod tests {
                                 .expect("predecessor must survive");
                             assert_eq!(
                                 pred.replacedBy.as_deref(),
-                                Some(rotated.token.as_str()),
+                                Some(refresh_tokens::token_at_rest(&rotated.token).as_str()),
                                 "I1 violated: rotated predecessor missing replacedBy"
                             );
                             bob_live = Some(rotated.token);

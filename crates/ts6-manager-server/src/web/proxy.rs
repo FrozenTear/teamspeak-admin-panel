@@ -291,7 +291,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn separate_xff_header_lines_are_joined() {
         // A proxy that appends a second header line, rather than extending
         // the client's comma-separated value, must not let the client pick
@@ -303,6 +302,7 @@ mod tests {
         assert_eq!(ip.to_string(), "192.0.2.10");
     }
 
+    #[test]
     fn ipv6_in_xff_round_trips() {
         let h = header_map(Some("evil-claim, 2001:db8::1"));
         let ip = client_ip(&h, peer(), &trust_for(1));

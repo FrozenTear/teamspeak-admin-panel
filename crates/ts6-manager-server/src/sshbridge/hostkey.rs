@@ -615,7 +615,7 @@ mod tests {
 
     #[tokio::test]
     async fn tofu_full_channel_refuses_to_pin() {
-        let (sink, mut rx) = tofu_sink();
+        let (sink, _rx) = tofu_sink();
         // Fill the channel by spamming `try_send` directly; we don't
         // care what gets stored — we just want subsequent verifier
         // emissions to drop. The for-test sink has capacity 32.
@@ -640,6 +640,5 @@ mod tests {
             !v.verify(&key_a),
             "a key that cannot be persisted must not be trusted"
         );
-        let _ = rx;
     }
 }
