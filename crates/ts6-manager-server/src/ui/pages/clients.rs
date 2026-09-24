@@ -805,7 +805,7 @@ fn talk_flag_error(revoke: bool, err: &ApiError) -> (String, String) {
         };
         (
             title.into(),
-            "TeamSpeak error 1538: the talker flag only applies in a moderated channel (needed talk power above 0). Granting it is rejected in an ordinary channel, where the client can already speak. Microphone and speaker mute are unchanged.".into(),
+            "TeamSpeak error 1538 (invalid parameter). This likely means the channel isn't moderated, or it needs talk power.".into(),
         )
     } else {
         let title = if revoke {
@@ -976,9 +976,10 @@ mod tests {
         };
         let (title, detail) = talk_flag_error(false, &err);
         assert_eq!(title, "Grant talk refused");
-        assert!(detail.contains("1538"));
-        assert!(detail.to_ascii_lowercase().contains("moderated"));
-        assert!(!detail.to_ascii_lowercase().contains("microphone muted"));
+        assert_eq!(
+            detail,
+            "TeamSpeak error 1538 (invalid parameter). This likely means the channel isn't moderated, or it needs talk power."
+        );
     }
 
     #[test]
