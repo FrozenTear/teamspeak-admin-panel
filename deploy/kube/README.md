@@ -3,9 +3,10 @@
 Start and restart this stack only with `./scripts/update.sh vX.Y.Z`.
 The script rewrites a temp copy of the manifest and plays that. Do not
 `podman kube play` the committed file: fullstack, music, and
-`ts6-manager-sidecar` are `@UNRELEASED`, which podman rejects at image
-pull. The same YAML shape is portable to a real Kubernetes cluster —
-the supported runtime here is Podman on a host ≥ 4.4. Contabo
+`ts6-manager-sidecar` are `@UNRELEASED`, which fails reference parsing
+(`invalid reference format`) before any pull. The same YAML shape is
+portable to a real Kubernetes cluster — the supported runtime here is
+Podman on a host ≥ 4.4. Contabo
 production is a git checkout plus `scripts/update.sh`, not Quadlet.
 For semantically-equivalent systemd-managed deploys, see
 `deploy/quadlet/` (sibling workstream).
@@ -31,7 +32,8 @@ The script is cwd-agnostic. It rewrites fullstack, music, and sidecar
 checkout still has the committed `@UNRELEASED` placeholder or a legacy
 `:vX.Y.Z` pin — `podman pull`s those GHCR images (required — the
 manifest uses `imagePullPolicy: IfNotPresent`), `podman kube down`s
-the committed YAML **without** `--force`, plays the temp file (pod-only
+the rewritten temp manifest **without** `--force` (same pod name;
+the committed file's image refs do not parse), plays that file (pod-only
 if `podman secret exists ts6-manager-secrets`, otherwise concatenates
 `deploy/kube/secrets.yaml`), curls fullstack
 `http://127.0.0.1:3001/health` **and** music
@@ -144,14 +146,46 @@ podman volume rm ts6-data ts6-db ts6-music
 
 The committed manifest does not pin a release tag. Fullstack, music,
 and sidecar are `ghcr.io/frozentear/ts6-manager-<name>@UNRELEASED` — not
-an image tag, so podman rejects the reference at pull. `./scripts/update.sh vX.Y.Z`
+an image tag, so podman fails reference parsing before any pull. `./scripts/update.sh vX.Y.Z`
 is what substitutes a published tag (and what still substitutes a
 legacy `:vX.Y.Z` if a live checkout has one). Images are published by
 `.github/workflows/release.yml` — see `docs/ops/images.md`.
 
-A blind `podman kube play` of the committed file fails at image pull
-instead of starting whatever layers happen to be local. Do not play
-it. `update.sh` pulls the requested tag first (`IfNotPresent`).
+A blind `podman kube play` of the committed file fails reference
+parsing (`invalid reference format`) instead of starting whatever
+layers happen to be local. Do not play it. `update.sh` pulls the
+requested tag first (`IfNotPresent`).
+
+### Override to a local build (pre-publish smoke)
+
+Not a Contabo start or restart. That path stays `./scripts/update.sh vX.Y.Z`.
+Build the three images, render a temp manifest with local tags, and play
+only that file. The substitution matches `:` or `@`, so it covers both
+`@UNRELEASED` and a legacy `:vX.Y.Z` pin.
+
+```bash
+podman build -t localhost/ts6-manager-fullstack:dev -f Containerfile.fullstack .
+podman build -t localhost/ts6-manager-music:dev -f Containerfile.music .
+podman build -t localhost/ts6-manager-sidecar:dev -f Containerfile.sidecar .
+
+sed -E \
+  -e 's#(image:[[:space:]]+)ghcr\.io/frozentear/ts6-manager-fullstack[:@][^[:space:]]+#\1localhost/ts6-manager-fullstack:dev#' \
+  -e 's#(image:[[:space:]]+)ghcr\.io/frozentear/ts6-manager-music[:@][^[:space:]]+#\1localhost/ts6-manager-music:dev#' \
+  -e 's#(image:[[:space:]]+)ghcr\.io/frozentear/ts6-manager-sidecar[:@][^[:space:]]+#\1localhost/ts6-manager-sidecar:dev#' \
+  -e 's#imagePullPolicy: IfNotPresent#imagePullPolicy: Never#' \
+  deploy/kube/ts6-manager.yaml > /tmp/ts6-manager.kube.override.yaml
+
+# Same secret rule as update.sh: concat only when the host secret is absent.
+if podman secret exists ts6-manager-secrets; then
+  podman kube play /tmp/ts6-manager.kube.override.yaml
+else
+  cat deploy/kube/secrets.yaml /tmp/ts6-manager.kube.override.yaml \
+    > /tmp/ts6-manager.kube.yaml
+  podman kube play /tmp/ts6-manager.kube.yaml
+fi
+```
+
+`imagePullPolicy: Never` keeps Podman from trying to pull the `localhost/...` names.
 
 ## Volumes
 
@@ -244,7 +278,7 @@ This matches the Quadlet `ts6-manager.pod` topology in
 ## Definition of done check
 
 - `./scripts/update.sh vX.Y.Z` is the only start/restart and succeeds on a Podman ≥ 4.4 host when that tag is published for fullstack, music, and sidecar.
-- `podman kube play` of the committed manifest fails at image pull (`@UNRELEASED` on fullstack, music, and sidecar).
+- `podman kube play` of the committed manifest fails reference parsing (`@UNRELEASED` on fullstack, music, and sidecar).
 - `curl http://localhost:3001/health` returns 200.
 - `podman kube down deploy/kube/ts6-manager.yaml` cleans up the pod.
 - Data on PVCs `ts6-data`, `ts6-db` and `ts6-music` survives `kube down` and is reachable after the next `./scripts/update.sh` — including a yt-dlp cookie uploaded via Settings.

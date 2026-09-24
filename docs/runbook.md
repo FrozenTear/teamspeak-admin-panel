@@ -214,7 +214,7 @@ For all three shapes the external smoke is the same: `curl -fsS http://127.0.0.1
 
 Kube start and restart are only `./scripts/update.sh vX.Y.Z`. Do not
 `podman kube play` the committed manifest: fullstack, music, and
-sidecar are `@UNRELEASED`, which podman rejects at image pull.
+sidecar are `@UNRELEASED`, which fails reference parsing before any pull.
 `kube down` removes the pod and containers but leaves the named
 volumes (`ts6-data`, `ts6-db`, `ts6-music`) intact, so data survives a
 restart. `ts6-data` backs the manager state root and is what keeps a
@@ -288,7 +288,7 @@ log path off the manager itself.
 
 The committed kube manifest does not pin a release tag. Fullstack,
 music, and sidecar are `@UNRELEASED` (not an image tag — podman
-rejects it at pull). `./scripts/update.sh vX.Y.Z` rewrites a temp
+fails reference parsing before any pull). `./scripts/update.sh vX.Y.Z` rewrites a temp
 copy so all three share the tag you pass. A live checkout that still
 has `:vX.Y.Z` on those images is rewritten the same way. Images are
 published by `.github/workflows/release.yml`. `imagePullPolicy: IfNotPresent`
@@ -323,7 +323,7 @@ runtime to Floki. Verify signatures first if you want — see § 5 and
 [`docs/ops/images.md` § 3](ops/images.md#3-signing).
 
 There is no hand-rolled `sed` / `podman kube play` start or restart.
-Playing the committed manifest fails at image pull (`@UNRELEASED`).
+Playing the committed manifest fails reference parsing (`@UNRELEASED`).
 
 **voice-rt nice is one-shot (Opus #66 L16).** `TS6_BOT_NICE` (`-5` in
 packing B) is not a unit property. `apply-fullstack-soft-pin.sh`

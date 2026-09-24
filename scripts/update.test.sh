@@ -82,4 +82,19 @@ fi
 rewrite_kube_image_tags "${TMP}/legacy.yaml" "${TMP}/legacy-out.yaml" "$REQUESTED"
 assert_rewritten "${TMP}/legacy-out.yaml" "legacy ${LEGACY_TAG}"
 
+# kube down must read the rewritten manifest. The committed file's
+# @UNRELEASED refs fail reference parsing; Podman 4.4–5.6 kube down
+# only uses the pod name today, and the rewritten file keeps that name.
+down="$(kube_down_manifest "$MANIFEST" "${TMP}/out.yaml")"
+if [[ "$down" != "${TMP}/out.yaml" ]]; then
+    fail "kube down target is ${down}, want the rewritten manifest"
+fi
+if kube_down_manifest "$MANIFEST" "$MANIFEST" >/dev/null 2>"${TMP}/down.err"; then
+    fail "kube down accepted the committed manifest"
+fi
+if ! grep -q "rewritten manifest" "${TMP}/down.err"; then
+    cat "${TMP}/down.err" >&2
+    fail "kube down rejection did not explain itself"
+fi
+
 echo "OK: kube image tag rewrite (placeholder and legacy tag)"

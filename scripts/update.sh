@@ -12,7 +12,7 @@
 #
 # This is the only start/restart path. The committed manifest pins
 # fullstack, music, and sidecar to KUBE_IMAGE_UNPINNED (@UNRELEASED),
-# which podman rejects. A live checkout may still have :vX.Y.Z;
+# which fails reference parsing. A live checkout may still have :vX.Y.Z;
 # rewrite_kube_image_tags substitutes either form.
 #
 # Never: podman kube down --force  (wipes ts6-data / ts6-db / ts6-music)
@@ -20,8 +20,10 @@
 set -euo pipefail
 
 # Committed image suffix in deploy/kube/ts6-manager.yaml. Not a tag and
-# not a digest (digest is algorithm:hex), so podman rejects the
-# reference instead of pulling a stale release.
+# not a digest (digest is algorithm:hex). Podman fails reference
+# parsing (`invalid reference format`) before any pull.
+# Read by scripts/update.test.sh.
+# shellcheck disable=SC2034
 KUBE_IMAGE_UNPINNED='@UNRELEASED'
 
 usage() {
@@ -29,7 +31,7 @@ usage() {
     echo "  Pull fullstack + music + sidecar GHCR images for TAG, kube down" >&2
     echo "  (no --force), kube play, curl fullstack /health and music /health," >&2
     echo "  then re-apply Contabo soft pin (packing B: fullstack 2-5; music HostConfig unset)." >&2
-    echo "example: $0 v1.6.2" >&2
+    echo "example: $0 v1.6.X" >&2
     exit 2
 }
 
@@ -50,6 +52,24 @@ rewrite_kube_image_tags() {
         -e "s#(image:[[:space:]]+ghcr\\.io/frozentear/ts6-manager-sidecar)([:@][^[:space:]]+)#\\1:${tag}#" \
         -e "s#(image:[[:space:]]+[^[:space:]]*ts6-manager-[A-Za-z0-9._-]+)([:@][^[:space:]]+)#\\1:${tag}#" \
         "$src" > "$dst"
+}
+
+# kube_down_manifest COMMITTED REWRITTEN
+# Print the file `podman kube down` should read.
+# Podman 4.4.4, 5.6.0, and current main only unmarshal metadata.name
+# (they do not parse image references), so down of the committed file
+# succeeds today. The committed images are still `@UNRELEASED`, which
+# is an invalid reference. Down uses the rewritten manifest — same pod
+# name `ts6-manager`, valid tags — so a podman that checks image refs
+# cannot abort teardown.
+kube_down_manifest() {
+    local committed="$1"
+    local rewritten="$2"
+    if [[ -z "$rewritten" || "$rewritten" == "$committed" ]]; then
+        echo "error: kube down must read the rewritten manifest, not the committed file" >&2
+        return 1
+    fi
+    printf '%s\n' "$rewritten"
 }
 
 die() {
@@ -126,11 +146,13 @@ echo "==> pulling ${SIDECAR}"
 podman pull "$SIDECAR"
 
 echo "==> podman kube down (no --force; volumes stay)"
-# Identity is the pod name in the YAML, not the image tag.
+# Identity is the pod name in the YAML, not the image tag. Down reads
+# the rewritten manifest (valid tags), not the committed @UNRELEASED file.
+DOWN_MANIFEST="$(kube_down_manifest "$MANIFEST" "$PLAY_POD")"
 if podman pod exists ts6-manager; then
     # Stale play-state IDs on Contabo: kube down can fail with
     # "no pod with ID … found" after the name is already gone.
-    if ! KUBE_DOWN_OUT="$(podman kube down "$MANIFEST" 2>&1)"; then
+    if ! KUBE_DOWN_OUT="$(podman kube down "$DOWN_MANIFEST" 2>&1)"; then
         if printf '%s\n' "$KUBE_DOWN_OUT" | grep -qiE 'no pod with ID'; then
             echo "    stale pod id from kube down; treating as already down"
             printf '%s\n' "$KUBE_DOWN_OUT" | sed 's/^/    /'
@@ -160,7 +182,8 @@ podman kube play "$PLAY_FILE"
 wait_health() {
     local url="$1"
     local label="$2"
-    local out="${TMPDIR}/health-$(echo "$label" | tr ' /' '__').out"
+    local out
+    out="${TMPDIR}/health-$(echo "$label" | tr ' /' '__').out"
     local ok=0
     for _ in $(seq 1 45); do
         if curl -fsS "$url" >"$out" 2>/dev/null; then

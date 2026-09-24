@@ -9,7 +9,7 @@ Contabo production is started and restarted only with
 `./scripts/update.sh vX.Y.Z` (rootful Podman, not Quadlet). That script
 rewrites `deploy/kube/ts6-manager.yaml` and plays the temp copy. Do not
 `podman kube play` the committed manifest — fullstack, music, and
-sidecar are `@UNRELEASED`, which podman rejects at image pull. Never
+sidecar are `@UNRELEASED`, which fails reference parsing before any pull. Never
 `podman kube down --force`.
 
 ## Topology

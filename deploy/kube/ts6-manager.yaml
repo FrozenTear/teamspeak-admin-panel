@@ -2,9 +2,9 @@
 #
 # Do not `podman kube play` this file. Fullstack, music, and
 # ts6-manager-sidecar are pinned to `@UNRELEASED`, which is not an
-# image tag (a digest must be algorithm:hex). Podman rejects that
-# reference when play tries to pull, so a manual play cannot start
-# stale layers. Start and restart the stack only with:
+# image tag (a digest must be algorithm:hex). Podman fails reference
+# parsing (`invalid reference format`) before any pull, so a manual
+# play cannot start stale layers. Start and restart the stack only with:
 #
 #   ./scripts/update.sh vX.Y.Z
 #
@@ -92,7 +92,7 @@ spec:
     fsGroup: 10001
   containers:
     # Not a release tag. `@UNRELEASED` is an invalid image reference so
-    # a direct kube play fails at pull. scripts/update.sh rewrites it
+    # a direct kube play fails at parse. scripts/update.sh rewrites it
     # (and a legacy `:vX.Y.Z` on a live checkout) to the requested tag.
     - name: fullstack
       image: ghcr.io/frozentear/ts6-manager-fullstack@UNRELEASED

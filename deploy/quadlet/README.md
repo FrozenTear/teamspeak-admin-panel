@@ -3,8 +3,8 @@
 This directory holds the [Quadlet](https://docs.podman.io/en/latest/markdown/podman-systemd.unit.5.html)
 unit files that bring the manager up as a rootless `systemd --user`
 service. Quadlet is the recommended single-host shape per impl-plan §9.
-Contabo production is `podman kube play` plus `scripts/update.sh`, not
-Quadlet — see [`deploy/kube/README.md`](../kube/README.md). Contabo's
+Contabo production is started and restarted only with `scripts/update.sh`,
+not Quadlet — see [`deploy/kube/README.md`](../kube/README.md). Contabo's
 Music+Voice split (third container `music` / `ts6-manager-music`) and
 soft CPU pin (`scripts/apply-fullstack-soft-pin.sh` after kube play,
 `deploy/contabo/soft-pin.env`) are **kube-only**. Do not treat Quadlet
