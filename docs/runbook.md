@@ -74,6 +74,16 @@ If the variable is unset and `--listen` is not a loopback address, the
 music process refuses to start. Kube manifests are unchanged: the
 Contabo pod still binds `127.0.0.1:3002` and does not set the variable.
 
+When the music runtime runs on a separate host from the panel, bind
+`--listen` to the WireGuard address, firewall `:3002` so only the
+tunnel can reach it, and set the same `MUSIC_RUNTIME_TOKEN` in both
+containers. The value is a bearer token on plain HTTP, so it must
+travel only over the WireGuard link, never over the public internet.
+A wildcard bind (`0.0.0.0` or `::`) is refused while the token is set.
+`MUSIC_RUNTIME_ALLOW_WILDCARD_BIND=1` (or `true`) overrides that
+refusal and is discouraged: the process logs a warning, and `:3002`
+must still be firewalled to the private tunnel.
+
 The full canonical env list, with comments, is
 [`deploy/quadlet/ts6-manager.env.example`](../deploy/quadlet/ts6-manager.env.example).
 Kube operators populate the same keys via the

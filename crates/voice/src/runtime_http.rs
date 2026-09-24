@@ -134,18 +134,89 @@ impl ControlAuth {
         }
     }
 
-    /// Refuse a non-loopback bind when auth is disabled.
+    /// Refuse a non-loopback bind when auth is disabled, and refuse an
+    /// unspecified bind when auth is enabled unless the wildcard
+    /// override is passed to [`decide_control_bind`].
     ///
-    /// Loopback follows [`std::net::IpAddr::is_loopback`]: `127.0.0.0/8`
-    /// and `::1`. `0.0.0.0`, `::`, and IPv4-mapped addresses are not
-    /// loopback, so they require a token.
-    pub fn ensure_bind_allowed(&self, listen: SocketAddr) -> Result<(), ControlBindError> {
-        if self.is_open() && !listen.ip().is_loopback() {
-            Err(ControlBindError { listen })
-        } else {
-            Ok(())
+    /// This path does not read `MUSIC_RUNTIME_ALLOW_WILDCARD_BIND`.
+    /// Startup uses [`decide_control_bind`] so the override stays explicit.
+    pub fn ensure_bind_allowed(
+        &self,
+        listen: SocketAddr,
+    ) -> Result<BindDecision, ControlBindError> {
+        decide_control_bind(listen, !self.is_open(), false)
+    }
+}
+
+/// `MUSIC_RUNTIME_ALLOW_WILDCARD_BIND`. Exactly `1` or `true`
+/// (ASCII case-insensitive) allows an unspecified bind when a token
+/// is set. Anything else, including unset, is off. Discouraged.
+pub const MUSIC_RUNTIME_ALLOW_WILDCARD_BIND_ENV: &str = "MUSIC_RUNTIME_ALLOW_WILDCARD_BIND";
+
+/// Whether startup should continue, and whether it must warn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BindDecision {
+    /// One warning: the listener is on every interface and must be
+    /// firewalled to the private tunnel.
+    pub warn_wildcard: bool,
+}
+
+/// `Some("1")` and `Some("true")` (any ASCII case) are on.
+/// Every other string, including surrounding whitespace, is off.
+pub fn parse_allow_wildcard_bind(raw: Option<&str>) -> bool {
+    match raw {
+        Some(value) => value.eq_ignore_ascii_case("1") || value.eq_ignore_ascii_case("true"),
+        None => false,
+    }
+}
+
+fn is_wildcard_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_unspecified(),
+        std::net::IpAddr::V6(v6) => {
+            v6.is_unspecified() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_unspecified())
         }
     }
+}
+
+/// Pure startup rule for the control listener.
+///
+/// `token_present` is true when a bearer token is configured.
+/// `allow_wildcard` is the parsed override. Neither value is read
+/// from the process environment here.
+///
+/// - No token and loopback: allow, no warning.
+/// - No token and anything else: refuse.
+/// - Token and `0.0.0.0`, `::`, or IPv4-mapped unspecified: refuse
+///   unless `allow_wildcard`, in which case allow and warn.
+/// - Token and any other address, including a private WireGuard
+///   address or loopback: allow, no warning.
+pub fn decide_control_bind(
+    listen: SocketAddr,
+    token_present: bool,
+    allow_wildcard: bool,
+) -> Result<BindDecision, ControlBindError> {
+    if !token_present {
+        return if listen.ip().is_loopback() {
+            Ok(BindDecision {
+                warn_wildcard: false,
+            })
+        } else {
+            Err(ControlBindError::Unauthenticated { listen })
+        };
+    }
+    if is_wildcard_ip(listen.ip()) {
+        return if allow_wildcard {
+            Ok(BindDecision {
+                warn_wildcard: true,
+            })
+        } else {
+            Err(ControlBindError::Wildcard { listen })
+        };
+    }
+    Ok(BindDecision {
+        warn_wildcard: false,
+    })
 }
 
 /// `MUSIC_RUNTIME_TOKEN` is set to bytes that are not UTF-8.
@@ -158,13 +229,20 @@ impl ControlAuth {
 )]
 pub struct ControlAuthError;
 
-/// Startup failure: the control API would be reachable without auth.
+/// Startup failure for an unsafe control-API bind.
 #[derive(Debug, thiserror::Error)]
-#[error(
-    "MUSIC_RUNTIME_TOKEN is unset and the music control API is bound to {listen}, which is not a loopback address. Refusing to start. Set MUSIC_RUNTIME_TOKEN or bind to 127.0.0.1 / ::1 so the control API is not exposed without authentication"
-)]
-pub struct ControlBindError {
-    listen: SocketAddr,
+pub enum ControlBindError {
+    /// No token, and the listener is not loopback.
+    #[error(
+        "MUSIC_RUNTIME_TOKEN is unset and the music control API is bound to {listen}, which is not a loopback address. Refusing to start. Set MUSIC_RUNTIME_TOKEN or bind to 127.0.0.1 / ::1 so the control API is not exposed without authentication"
+    )]
+    Unauthenticated { listen: SocketAddr },
+    /// Token is set, but the listener is `0.0.0.0`, `::`, or an
+    /// IPv4-mapped unspecified address, and the override is off.
+    #[error(
+        "MUSIC_RUNTIME_TOKEN is set but the music control API is bound to {listen}, which listens on every interface. Refusing to start. Bind the WireGuard or other private address instead. MUSIC_RUNTIME_ALLOW_WILDCARD_BIND=1 overrides this and is discouraged"
+    )]
+    Wildcard { listen: SocketAddr },
 }
 
 /// Control plane with authentication disabled.
@@ -795,7 +873,8 @@ mod tests {
     async fn authorized_requests_ok_and_health_stays_open() {
         let token = "unit-test-token";
         let auth = ControlAuth::parse(Some(token));
-        assert!(auth.ensure_bind_allowed(addr("0.0.0.0:3002")).is_ok());
+        let decision = decide_control_bind(addr("10.8.0.2:3002"), true, false).unwrap();
+        assert!(!decision.warn_wildcard);
         let app = router_with_auth(RuntimeState::new(), auth);
 
         let resp = app
@@ -1040,8 +1119,43 @@ mod tests {
             assert!(msg.contains("loopback"), "{msg}");
             assert!(!msg.contains("secret"), "{msg}");
         }
-        let enabled = ControlAuth::parse(Some("token"));
-        assert!(enabled.ensure_bind_allowed(addr("0.0.0.0:3002")).is_ok());
+    }
+
+    #[test]
+    fn wildcard_bind_with_token_refuses_unless_overridden() {
+        for raw in ["0.0.0.0:3002", "[::]:3002", "[::ffff:0.0.0.0]:3002"] {
+            let err = decide_control_bind(addr(raw), true, false).expect_err(raw);
+            let msg = err.to_string();
+            assert!(msg.contains("Refusing to start"), "{msg}");
+            assert!(msg.contains("WireGuard"), "{msg}");
+            assert!(msg.contains("private"), "{msg}");
+            let allowed = decide_control_bind(addr(raw), true, true).expect(raw);
+            assert!(allowed.warn_wildcard, "{raw}");
+        }
+        let wireguard = decide_control_bind(addr("10.8.0.2:3002"), true, false).unwrap();
+        assert!(!wireguard.warn_wildcard);
+        let loopback = decide_control_bind(addr("127.0.0.1:3002"), true, false).unwrap();
+        assert!(!loopback.warn_wildcard);
+        let open = decide_control_bind(addr("127.0.0.1:3002"), false, false).unwrap();
+        assert!(!open.warn_wildcard);
+        let unset = decide_control_bind(addr("0.0.0.0:3002"), false, true).expect_err("no token");
+        assert!(unset.to_string().contains("loopback"));
+    }
+
+    #[test]
+    fn allow_wildcard_bind_override_parsing() {
+        assert!(!parse_allow_wildcard_bind(None));
+        assert!(!parse_allow_wildcard_bind(Some("")));
+        assert!(!parse_allow_wildcard_bind(Some("0")));
+        assert!(!parse_allow_wildcard_bind(Some("yes")));
+        assert!(!parse_allow_wildcard_bind(Some("false")));
+        assert!(!parse_allow_wildcard_bind(Some(" true")));
+        assert!(!parse_allow_wildcard_bind(Some("1 ")));
+        assert!(!parse_allow_wildcard_bind(Some("true ")));
+        assert!(parse_allow_wildcard_bind(Some("1")));
+        assert!(parse_allow_wildcard_bind(Some("true")));
+        assert!(parse_allow_wildcard_bind(Some("TRUE")));
+        assert!(parse_allow_wildcard_bind(Some("True")));
     }
 
     #[test]

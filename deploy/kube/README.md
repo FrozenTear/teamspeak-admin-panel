@@ -249,6 +249,16 @@ loopback, so `:3002` cannot be published on a non-loopback address
 without authentication. `/health` stays unauthenticated so the exec
 probe is unchanged.
 
+When the music runtime runs on a separate host from the panel, bind
+`--listen` to the WireGuard address, firewall `:3002` to the tunnel
+only, and set the same `MUSIC_RUNTIME_TOKEN` in both containers. The
+token is a bearer secret on plain HTTP, so it must travel only over
+the WireGuard link, never over the public internet. A wildcard bind
+(`0.0.0.0` or `::`) is refused while the token is set.
+`MUSIC_RUNTIME_ALLOW_WILDCARD_BIND=1` (or `true`) overrides that
+refusal and is discouraged: the process logs a warning, and the
+operator must still firewall `:3002` to the private tunnel.
+
 Contabo public HTTPS (draft, **not applied**): once
 `panel.scuffedcrew.no` is live on the existing host Caddy, public
 access is that hostname — not raw `:3001`. Music `:3002` and sidecar
