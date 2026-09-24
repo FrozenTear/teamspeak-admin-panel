@@ -58,9 +58,20 @@ impl MusicBotService {
     }
 
     /// Contabo / kube: fullstack talks to `ts6-manager-music` over loopback.
-    pub fn remote(identity_dir: PathBuf, runtime_url: impl Into<String>) -> Self {
+    /// `token` is the env-only `MUSIC_RUNTIME_TOKEN`. `None` sends no
+    /// `Authorization` header.
+    pub fn remote(
+        identity_dir: PathBuf,
+        runtime_url: impl Into<String>,
+        token: Option<crate::music_runtime::MusicRuntimeToken>,
+    ) -> Self {
+        let runtime_url = runtime_url.into();
+        let supervisor = match token {
+            None => MusicBotFront::remote(runtime_url),
+            Some(token) => MusicBotFront::remote_with_token(runtime_url, Some(token)),
+        };
         Self {
-            supervisor: MusicBotFront::remote(runtime_url),
+            supervisor,
             identity_dir: Arc::new(identity_dir),
             liveness: Arc::new(LivenessTracker::default()),
             requests: Arc::new(RequestLog::default()),

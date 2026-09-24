@@ -79,9 +79,13 @@ rootless-userns rationale.
 
 ### Image source
 
-The Quadlet and Kube manifests pin
-`ghcr.io/frozentear/ts6-manager-fullstack:latest`. Image build, sign,
-and publish procedure: [`docs/ops/images.md`](docs/ops/images.md).
+Kube does not pin `:latest`. `deploy/kube/ts6-manager.yaml` uses
+`@UNRELEASED` on fullstack, music, and sidecar, which fails reference
+parsing. Start and restart that stack only with
+`./scripts/update.sh vX.Y.Z` (it rewrites those images onto the tag
+you pass). Quadlet units are a separate shape; see
+[`deploy/quadlet/README.md`](deploy/quadlet/README.md). Image build,
+sign, and publish: [`docs/ops/images.md`](docs/ops/images.md).
 
 ## Configuration
 
@@ -94,7 +98,11 @@ Minimum required env vars:
 | `MUSIC_DIR` | Music bot library directory. Default: `/var/lib/ts6-manager/music`. |
 | `PORT` | HTTP listener. Default `3001`. |
 
-Optional: `ENCRYPTION_KEY`, `LOG_LEVEL`, `LOG_PRETTY`, `FRONTEND_URL`.
+Optional: `ENCRYPTION_KEY`, `LOG_LEVEL`, `LOG_PRETTY`, `FRONTEND_URL`,
+`MUSIC_RUNTIME_URL`, `MUSIC_RUNTIME_TOKEN` (shared bearer for the music
+control API; both processes, environment only, same trim, optional on
+loopback; non-UTF-8 refuses fullstack startup; the token must travel
+over WireGuard only).
 See [`deploy/quadlet/ts6-manager.env.example`](deploy/quadlet/ts6-manager.env.example)
 for the canonical list with comments.
 

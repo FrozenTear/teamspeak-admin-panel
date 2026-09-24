@@ -205,14 +205,14 @@ fn translate(env: &WsEvent) -> Option<ActivityEntry> {
         "ts:client:muted" => (
             ToastVariant::Info,
             format!(
-                "Client {clid} muted",
+                "Client {clid} talk revoked",
                 clid = env.data.get("clid").and_then(Value::as_i64).unwrap_or(0),
             ),
         ),
         "ts:client:unmuted" => (
             ToastVariant::Info,
             format!(
-                "Client {clid} unmuted",
+                "Client {clid} granted talk",
                 clid = env.data.get("clid").and_then(Value::as_i64).unwrap_or(0),
             ),
         ),
