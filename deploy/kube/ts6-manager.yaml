@@ -1,16 +1,21 @@
-# TS6 Manager — Kubernetes-flavoured manifest for `podman kube play`.
+# TS6 Manager — Kubernetes-flavoured manifest played by scripts/update.sh.
 #
-# Brings up the manager stack rootless on a clean Podman >= 4.4 host.
-# `podman kube play` takes a single kube file (multi-file args need
-# Podman 5.0+), so concat the Secret + Pod manifest first:
+# Do not `podman kube play` this file. Fullstack, music, and
+# ts6-manager-sidecar are pinned to `@UNRELEASED`, which is not an
+# image tag (a digest must be algorithm:hex). Podman rejects that
+# reference when play tries to pull, so a manual play cannot start
+# stale layers. Start and restart the stack only with:
 #
-#   cat deploy/kube/secrets.example.yaml deploy/kube/ts6-manager.yaml \
-#     > /tmp/ts6-manager.kube.yaml
-#   podman kube play /tmp/ts6-manager.kube.yaml
+#   ./scripts/update.sh vX.Y.Z
+#
+# The script rewrites a temp copy so every ts6-manager-* image is on
+# that tag (the committed placeholder, or a legacy `:vX.Y.Z` still on
+# a live checkout), pulls, then plays. Stop with:
+#
 #   podman kube down deploy/kube/ts6-manager.yaml
 #
-# See deploy/kube/README.md for env setup, image overrides, and the
-# local-build smoke path. Topology mirrors podman-compose.yml + the
+# Never `podman kube down --force` (wipes ts6-data / ts6-db / ts6-music).
+# See deploy/kube/README.md. Topology mirrors podman-compose.yml + the
 # Quadlet pod in deploy/quadlet/ (impl-plan §9). Volumes are PVCs so
 # named-volume ownership crosses the rootless userns cleanly
 # (PURA-67).
@@ -86,10 +91,11 @@ spec:
     runAsNonRoot: true
     fsGroup: 10001
   containers:
-    # Keep fullstack + sidecar on the same release tag. Bump both on a
-    # release cut, or pass TAG to scripts/update.sh (overrides both).
+    # Not a release tag. `@UNRELEASED` is an invalid image reference so
+    # a direct kube play fails at pull. scripts/update.sh rewrites it
+    # (and a legacy `:vX.Y.Z` on a live checkout) to the requested tag.
     - name: fullstack
-      image: ghcr.io/frozentear/ts6-manager-fullstack:v1.6.2
+      image: ghcr.io/frozentear/ts6-manager-fullstack@UNRELEASED
       imagePullPolicy: IfNotPresent
       securityContext:
         runAsUser: 10001
@@ -174,7 +180,8 @@ spec:
     # Podman 5.6 turns that into in-container curl and this image has
     # none (sidecar pattern: exec binary --healthcheck-url).
     - name: music
-      image: ghcr.io/frozentear/ts6-manager-music:v1.6.2
+      # Same `@UNRELEASED` placeholder as fullstack. update.sh rewrites it.
+      image: ghcr.io/frozentear/ts6-manager-music@UNRELEASED
       imagePullPolicy: IfNotPresent
       securityContext:
         # Same uid as fullstack so ts6-data identities + ts6-music
@@ -240,7 +247,11 @@ spec:
         timeoutSeconds: 5
         failureThreshold: 3
     - name: sidecar
-      image: ghcr.io/frozentear/ts6-manager-sidecar:v1.6.2
+      # sidecar image: same `@UNRELEASED` placeholder as fullstack and
+      # music. scripts/update.sh rewrites this line onto the requested
+      # tag. A live checkout that still has `:vX.Y.Z` here is rewritten
+      # the same way — do not kube play this file as committed.
+      image: ghcr.io/frozentear/ts6-manager-sidecar@UNRELEASED
       imagePullPolicy: IfNotPresent
       securityContext:
         runAsUser: 10002

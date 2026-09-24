@@ -1,11 +1,14 @@
 # `deploy/kube/` — Kubernetes-flavoured manifest for Podman
 
-`podman kube play` reads this manifest and brings up the TS6 Manager
-stack rootless on any Podman ≥ 4.4 host. The same YAML is portable to
-a real Kubernetes cluster — but the supported runtime here is Podman.
-Contabo production is this shape: a git checkout plus
-`scripts/update.sh` — not Quadlet. For semantically-equivalent
-systemd-managed deploys, see `deploy/quadlet/` (sibling workstream).
+Start and restart this stack only with `./scripts/update.sh vX.Y.Z`.
+The script rewrites a temp copy of the manifest and plays that. Do not
+`podman kube play` the committed file: fullstack, music, and
+`ts6-manager-sidecar` are `@UNRELEASED`, which podman rejects at image
+pull. The same YAML shape is portable to a real Kubernetes cluster —
+the supported runtime here is Podman on a host ≥ 4.4. Contabo
+production is a git checkout plus `scripts/update.sh`, not Quadlet.
+For semantically-equivalent systemd-managed deploys, see
+`deploy/quadlet/` (sibling workstream).
 
 ## Files
 
@@ -20,15 +23,16 @@ On a host that already has the pod and volumes (Contabo: a checkout
 under a path like `/root/github/teamspeak-admin-panel`):
 
 ```bash
-./scripts/update.sh v1.6.2
+./scripts/update.sh vX.Y.Z
 ```
 
-The script is cwd-agnostic. It `podman pull`s the fullstack, music,
-and sidecar GHCR images for that tag (required — the manifest uses
-`imagePullPolicy: IfNotPresent`), writes a temp manifest so all three
-share the tag, `podman kube down`s the committed YAML **without**
-`--force`, plays the temp file (pod-only if `podman secret exists
-ts6-manager-secrets`, otherwise concatenates
+The script is cwd-agnostic. It rewrites fullstack, music, and sidecar
+(and any other `ts6-manager-*` image) onto that tag — whether the
+checkout still has the committed `@UNRELEASED` placeholder or a legacy
+`:vX.Y.Z` pin — `podman pull`s those GHCR images (required — the
+manifest uses `imagePullPolicy: IfNotPresent`), `podman kube down`s
+the committed YAML **without** `--force`, plays the temp file (pod-only
+if `podman secret exists ts6-manager-secrets`, otherwise concatenates
 `deploy/kube/secrets.yaml`), curls fullstack
 `http://127.0.0.1:3001/health` **and** music
 `http://127.0.0.1:3002/health`, then re-applies the Contabo soft CPU
@@ -36,10 +40,8 @@ pin (see [Contabo soft CPU pin](#contabo-soft-cpu-pin)).
 
 Never `podman kube down --force` — that wipes `ts6-data` / `ts6-db` /
 `ts6-music`. Confirm volumes survived with
-`podman volume ls --filter name=^ts6-`.
-
-Manual `sed` / concat / play steps are in [Appendix: manual kube
-path](#appendix-manual-kube-path).
+`podman volume ls --filter name=^ts6-`. There is no hand-rolled
+`sed` / `kube play` upgrade.
 
 ## Contabo soft CPU pin
 
@@ -91,22 +93,19 @@ do not MOVE the bot runtime to Floki). A requested container cpuset
 that `podman update` cannot apply fails the upgrade so Contabo does
 not silently lose the pin.
 
-## Bring up
+## Start / restart
+
+First install and every later restart use the same command. One-time,
+copy the secret template and fill it in. `update.sh` concatenates
+`secrets.yaml` when the host does not already have `podman secret
+ts6-manager-secrets`.
 
 ```bash
-# 1. Prepare your secrets (one-time).
 cp deploy/kube/secrets.example.yaml deploy/kube/secrets.yaml
 # Edit deploy/kube/secrets.yaml — set JWT_SECRET and (optionally) ENCRYPTION_KEY.
 
-# 2. Pull or build the image (see "Image source" below).
+./scripts/update.sh vX.Y.Z
 
-# 3. Play the manifest. `podman kube play` accepts a single kube file
-#    (multi-file args need Podman 5.0+), so concat the Secret + Pod
-#    manifest first.
-cat deploy/kube/secrets.yaml deploy/kube/ts6-manager.yaml > /tmp/ts6-manager.kube.yaml
-podman kube play /tmp/ts6-manager.kube.yaml
-
-# 4. Verify.
 curl http://localhost:3001/health
 podman pod ps
 podman logs ts6-manager-fullstack
@@ -143,63 +142,16 @@ podman volume rm ts6-data ts6-db ts6-music
 
 ## Image source
 
-The committed manifest pins fullstack, music, and sidecar to the same
-release tag (`…-fullstack:v1.6.2`, `…-music:v1.6.2`,
-`…-sidecar:v1.6.2`). Bump all three on a release cut, or let
-`scripts/update.sh TAG` override them. Images are published by
+The committed manifest does not pin a release tag. Fullstack, music,
+and sidecar are `ghcr.io/frozentear/ts6-manager-<name>@UNRELEASED` — not
+an image tag, so podman rejects the reference at pull. `./scripts/update.sh vX.Y.Z`
+is what substitutes a published tag (and what still substitutes a
+legacy `:vX.Y.Z` if a live checkout has one). Images are published by
 `.github/workflows/release.yml` — see `docs/ops/images.md`.
 
-A blind `podman kube play` of the committed file without a prior
-`podman pull` of those tags will keep stale layers (`IfNotPresent`)
-or, if the host still has an older `:v1.0` pin in an old checkout,
-downgrade. Always pull first — `update.sh` does this.
-
-## Appendix: manual kube path
-
-Prefer `./scripts/update.sh vX.Y.Z`. The steps below are the same
-sequence without the helper (tag override, pull, down without
-`--force`, play, health).
-
-```bash
-TAG=v1.6.2
-podman pull "ghcr.io/frozentear/ts6-manager-fullstack:${TAG}"
-podman pull "ghcr.io/frozentear/ts6-manager-sidecar:${TAG}"
-
-sed -E \
-  -e "s#(image:[[:space:]]+ghcr\\.io/frozentear/ts6-manager-fullstack:)[^[:space:]]+#\\1${TAG}#" \
-  -e "s#(image:[[:space:]]+ghcr\\.io/frozentear/ts6-manager-sidecar:)[^[:space:]]+#\\1${TAG}#" \
-  deploy/kube/ts6-manager.yaml > /tmp/ts6-manager.kube.override.yaml
-
-# If the host already has podman secret ts6-manager-secrets:
-podman kube down deploy/kube/ts6-manager.yaml   # never --force
-podman kube play /tmp/ts6-manager.kube.override.yaml
-
-# Otherwise concat secrets.yaml (copy from secrets.example.yaml first):
-# cat deploy/kube/secrets.yaml /tmp/ts6-manager.kube.override.yaml \
-#   > /tmp/ts6-manager.kube.yaml
-# podman kube play /tmp/ts6-manager.kube.yaml
-
-curl -fsS http://127.0.0.1:3001/health
-./scripts/apply-fullstack-soft-pin.sh   # Contabo soft pin; no-op if unset
-```
-
-### Override to a local build (pre-publish smoke)
-
-```bash
-podman build -t localhost/ts6-manager-fullstack:dev -f Containerfile.fullstack .
-
-# Override the image, concat with secrets, then play. `podman kube
-# play` accepts a single kube file on Podman 4.4–4.x; multi-file is
-# 5.0+.
-sed 's|image: ghcr.io/.*ts6-manager-fullstack:.*|image: localhost/ts6-manager-fullstack:dev|; s|imagePullPolicy: IfNotPresent|imagePullPolicy: Never|' \
-  deploy/kube/ts6-manager.yaml > /tmp/ts6-manager.kube.override.yaml
-cat deploy/kube/secrets.yaml /tmp/ts6-manager.kube.override.yaml \
-  > /tmp/ts6-manager.kube.yaml
-podman kube play /tmp/ts6-manager.kube.yaml
-```
-
-`imagePullPolicy: Never` prevents Podman from trying to pull the
-`localhost/...` image from a registry.
+A blind `podman kube play` of the committed file fails at image pull
+instead of starting whatever layers happen to be local. Do not play
+it. `update.sh` pulls the requested tag first (`IfNotPresent`).
 
 ## Volumes
 
@@ -291,7 +243,8 @@ This matches the Quadlet `ts6-manager.pod` topology in
 
 ## Definition of done check
 
-- `./scripts/update.sh v1.6.2` (or a first-install concat + `kube play`) succeeds on a Podman ≥ 4.4 host with the published `v1.6.2` fullstack + sidecar images available.
+- `./scripts/update.sh vX.Y.Z` is the only start/restart and succeeds on a Podman ≥ 4.4 host when that tag is published for fullstack, music, and sidecar.
+- `podman kube play` of the committed manifest fails at image pull (`@UNRELEASED` on fullstack, music, and sidecar).
 - `curl http://localhost:3001/health` returns 200.
 - `podman kube down deploy/kube/ts6-manager.yaml` cleans up the pod.
-- Data on PVCs `ts6-data`, `ts6-db` and `ts6-music` survives `kube down` and is reachable on the next `kube play` — including a yt-dlp cookie uploaded via Settings.
+- Data on PVCs `ts6-data`, `ts6-db` and `ts6-music` survives `kube down` and is reachable after the next `./scripts/update.sh` — including a yt-dlp cookie uploaded via Settings.

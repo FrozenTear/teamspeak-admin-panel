@@ -10,9 +10,19 @@
 # Usage (from any cwd, against a repo checkout):
 #   ./scripts/update.sh vX.Y.Z
 #
+# This is the only start/restart path. The committed manifest pins
+# fullstack, music, and sidecar to KUBE_IMAGE_UNPINNED (@UNRELEASED),
+# which podman rejects. A live checkout may still have :vX.Y.Z;
+# rewrite_kube_image_tags substitutes either form.
+#
 # Never: podman kube down --force  (wipes ts6-data / ts6-db / ts6-music)
 
 set -euo pipefail
+
+# Committed image suffix in deploy/kube/ts6-manager.yaml. Not a tag and
+# not a digest (digest is algorithm:hex), so podman rejects the
+# reference instead of pulling a stale release.
+KUBE_IMAGE_UNPINNED='@UNRELEASED'
 
 usage() {
     echo "usage: $0 vX.Y.Z" >&2
@@ -23,6 +33,32 @@ usage() {
     exit 2
 }
 
+# rewrite_kube_image_tags SRC DST TAG
+# Rewrite every ts6-manager-* image in SRC onto :TAG and write DST.
+# Accepts the committed @UNRELEASED placeholder and a legacy :vX.Y.Z
+# (or any other :tag / @digest) so a live host checkout still upgrades.
+# Fullstack, music, and sidecar are explicit; the last expression
+# catches any other ts6-manager-* image so a fourth container cannot
+# keep the placeholder.
+rewrite_kube_image_tags() {
+    local src="$1"
+    local dst="$2"
+    local tag="$3"
+    sed -E \
+        -e "s#(image:[[:space:]]+ghcr\\.io/frozentear/ts6-manager-fullstack)([:@][^[:space:]]+)#\\1:${tag}#" \
+        -e "s#(image:[[:space:]]+ghcr\\.io/frozentear/ts6-manager-music)([:@][^[:space:]]+)#\\1:${tag}#" \
+        -e "s#(image:[[:space:]]+ghcr\\.io/frozentear/ts6-manager-sidecar)([:@][^[:space:]]+)#\\1:${tag}#" \
+        -e "s#(image:[[:space:]]+[^[:space:]]*ts6-manager-[A-Za-z0-9._-]+)([:@][^[:space:]]+)#\\1:${tag}#" \
+        "$src" > "$dst"
+}
+
+die() {
+    echo "error: $*" >&2
+    echo "FAIL: upgrade to ${TAG} did not finish. Named volumes should still be intact — never kube down --force." >&2
+    exit 1
+}
+
+main() {
 if [[ $# -ne 1 ]]; then
     usage
 fi
@@ -40,12 +76,6 @@ SECRETS="${REPO_ROOT}/deploy/kube/secrets.yaml"
 FULLSTACK="ghcr.io/frozentear/ts6-manager-fullstack:${TAG}"
 MUSIC="ghcr.io/frozentear/ts6-manager-music:${TAG}"
 SIDECAR="ghcr.io/frozentear/ts6-manager-sidecar:${TAG}"
-
-die() {
-    echo "error: $*" >&2
-    echo "FAIL: upgrade to ${TAG} did not finish. Named volumes should still be intact — never kube down --force." >&2
-    exit 1
-}
 
 if [[ ! -f "$MANIFEST" ]]; then
     die "missing kube manifest: ${MANIFEST}"
@@ -77,12 +107,10 @@ trap cleanup EXIT
 trap 'echo "FAIL: upgrade to ${TAG} did not finish. Named volumes should still be intact — never kube down --force." >&2' ERR
 
 PLAY_POD="${TMPDIR}/ts6-manager.kube.yaml"
-# Pin all three images to TAG. Never leave music or sidecar on the committed pin.
-sed -E \
-    -e "s#(image:[[:space:]]+ghcr\\.io/frozentear/ts6-manager-fullstack:)[^[:space:]]+#\\1${TAG}#" \
-    -e "s#(image:[[:space:]]+ghcr\\.io/frozentear/ts6-manager-music:)[^[:space:]]+#\\1${TAG}#" \
-    -e "s#(image:[[:space:]]+ghcr\\.io/frozentear/ts6-manager-sidecar:)[^[:space:]]+#\\1${TAG}#" \
-    "$MANIFEST" > "$PLAY_POD"
+# Pin every ts6-manager-* image to TAG. The committed file uses
+# @UNRELEASED; a live checkout may still have :vX.Y.Z. Sidecar is
+# rewritten explicitly, same as fullstack and music.
+rewrite_kube_image_tags "$MANIFEST" "$PLAY_POD" "$TAG"
 
 if ! grep -q "image: ${FULLSTACK}" "$PLAY_POD" \
     || ! grep -q "image: ${MUSIC}" "$PLAY_POD" \
@@ -160,3 +188,8 @@ echo
 echo "OK: ts6-manager is on ${TAG} (fullstack + music + sidecar)."
 echo "    volumes ts6-data / ts6-db / ts6-music were left in place."
 echo "    never run: podman kube down --force"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
