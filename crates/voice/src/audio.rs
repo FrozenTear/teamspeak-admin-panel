@@ -72,7 +72,9 @@ pub(crate) enum AudioMsg {
     /// scheduled slot was more than `VOICE_MAX_CATCHUP_FRAMES` periods in
     /// the past at the moment it would have been encoded. The send loop
     /// counts them on `dropped_catchup_frames` and does not put them on
-    /// the wire.
+    /// the wire. With N = 4, a stall usually leaves about 3 or 4 frames
+    /// on the wire rather than exactly 4: a frame the pacer kept can age
+    /// past the limit before the send loop actually writes it.
     CatchupDropped(u32),
     /// Out-of-band event from the pipeline (ICY `NowPlaying`, warnings,
     /// end-of-stream). The connected loop forwards these onto the bot's
@@ -343,7 +345,14 @@ fn build_active(
     let (msg_tx, msg_rx) = mpsc::channel(AUDIO_MSG_BUFFER);
     let (pause_tx, pause_rx) = watch::channel(false);
     let sibling = spawn_sibling(
-        pipeline, encoder, volume, frames_rx, events_rx, pause_rx, msg_tx,
+        pipeline,
+        encoder,
+        volume,
+        frames_rx,
+        events_rx,
+        pause_rx,
+        msg_tx,
+        sibling_catchup_cap(),
     );
     ActiveAudio {
         source_label,
@@ -911,6 +920,16 @@ async fn park_while_paused(pause_rx: &mut watch::Receiver<bool>) -> Option<Durat
     Some(parked)
 }
 
+/// Cap the sibling should apply. `None` when `VOICE_INLINE_FLUSH` is off
+/// or the cap is off, so today's keep-everything behaviour stays. Tests
+/// pass a cap directly and do not touch the process environment.
+fn sibling_catchup_cap() -> Option<usize> {
+    let cfg = inline_flush_config();
+    if cfg.enabled { cfg.max_catchup } else { None }
+}
+
+// The cap is a test seam on top of the existing channel arguments.
+#[allow(clippy::too_many_arguments)]
 fn spawn_sibling(
     pipeline: AudioPipeline,
     mut encoder: OpusFrameEncoder,
@@ -919,6 +938,7 @@ fn spawn_sibling(
     mut events_rx: broadcast::Receiver<PipelineEvent>,
     mut pause_rx: watch::Receiver<bool>,
     tx: mpsc::Sender<AudioMsg>,
+    catchup_cap: Option<usize>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         // Keep `pipeline` alive for the lifetime of the sibling — its
@@ -1072,7 +1092,19 @@ fn spawn_sibling(
                         // one overdue frame at a time; the slot is already
                         // more than N periods in the past, so encoding it
                         // would only throw the Opus away at the send loop.
-                        if scheduled_slot_is_stale(slot, std::time::Instant::now()) {
+                        // `catchup_cap` is the test seam; production passes
+                        // [`sibling_catchup_cap`]. A kept frame can still
+                        // age past N before the send loop writes it, so a
+                        // stall usually leaves about 3 or 4 frames on the
+                        // wire when N is 4, not exactly 4. A re-anchor in
+                        // the music-bot-audio pacer is the product
+                        // alternative under consideration; this check would
+                        // then be the backstop.
+                        if slot_past_catchup(
+                            std::time::Instant::now().saturating_duration_since(slot),
+                            catchup_cap,
+                            OPUS_FRAME_PERIOD,
+                        ) {
                             pending_drops = pending_drops.saturating_add(1);
                             continue;
                         }
@@ -1379,8 +1411,13 @@ impl SendTimingMonitor {
             max_a_blockinplace_churn_us = self.window_max_churn_a.as_micros() as u64,
             max_t_send_us = self.window_max_t_send.as_micros() as u64,
             max_t_blockinplace_us = self.window_max_t_blockinplace.as_micros() as u64,
+            // Bucket upper bound of the 99th percentile of direct-flush
+            // durations over this ~30 s window. `u64::MAX` is the open
+            // ≥32 ms bucket. Independent of the 1 s `inline_flush` line.
+            flush_p99_us = FLUSH_TIMING.take_p99_us(),
             "audio send-path timing window — per-window maxes for the \
-             PURA-389 A/B/C residual-stall attribution",
+             PURA-389 A/B/C residual-stall attribution; flush_p99_us is the \
+             direct send_to cost over this window",
         );
     }
 
@@ -1501,6 +1538,16 @@ struct QueuedOpusFrame {
 /// (the pacer releases the next past-due slot, then the next). `None` and
 /// `0` are cap off and keep the frame. A slot exactly `N` periods old is
 /// kept — the threshold is "more than N × period".
+///
+/// In production a stall usually lets about 3 or 4 frames out when N is 4,
+/// not exactly 4. The pacer decides at encode time; the send loop decides
+/// again at send time, and a frame that was inside the window can age past
+/// it while it waits to be written.
+///
+/// A pacer re-anchor after stalls is being considered as a product
+/// alternative, owned by the music-bot-audio pacer. If that lands, this
+/// cap becomes a backstop for frames the re-anchored pacer still releases
+/// late, rather than the thing that picks which frames are worth sending.
 fn slot_past_catchup(age: Duration, max_catchup: Option<usize>, frame_period: Duration) -> bool {
     let Some(max_catchup) = max_catchup.filter(|n| *n > 0) else {
         return false;
@@ -1509,20 +1556,6 @@ fn slot_past_catchup(age: Duration, max_catchup: Option<usize>, frame_period: Du
         return false;
     };
     age > frame_period.saturating_mul(n)
-}
-
-/// Whether the pacer should skip encode for `slot`. False when
-/// `VOICE_INLINE_FLUSH` is off or the cap is off.
-fn scheduled_slot_is_stale(slot: Instant, now: Instant) -> bool {
-    let cfg = inline_flush_config();
-    if !cfg.enabled {
-        return false;
-    }
-    slot_past_catchup(
-        now.saturating_duration_since(slot),
-        cfg.max_catchup,
-        OPUS_FRAME_PERIOD,
-    )
 }
 
 /// How many of `ages` are past the per-frame cap. `max_catchup == 0` drops
@@ -1778,81 +1811,120 @@ static FLUSH_METERS: FlushMeters = FlushMeters {
 
 static FLUSH_LOG_START: OnceLock<Instant> = OnceLock::new();
 
-/// Samples kept for one `inline_flush` log window. Fixed storage: recording
-/// a flush does not allocate. Once the buffer is full, newer durations
-/// overwrite the oldest.
-const FLUSH_SAMPLE_CAP: usize = 64;
+/// Log2 duration buckets. Index 0 is `< 2 µs`. Index `k` for `1..=14` is
+/// `[2^k, 2^(k+1))` µs. Index 15 is `≥ 32 ms` and has no upper bound.
+const FLUSH_BUCKET_COUNT: usize = 16;
+/// Floor of the open top bucket, in microseconds (32 ms).
+const FLUSH_BUCKET_OVERFLOW_US: u64 = 32_768;
+const FLUSH_GE_1MS_US: u64 = 1_000;
+const FLUSH_GE_5MS_US: u64 = 5_000;
 
-struct FlushSamples {
-    us: [u32; FLUSH_SAMPLE_CAP],
-    /// Records since the last snapshot. May exceed [`FLUSH_SAMPLE_CAP`].
-    recorded: u32,
+/// Lock-free flush durations. The send path only does atomic adds and
+/// `fetch_max` — no mutex and no allocation. The 1 s line resets the max
+/// and the slow counts. The buckets stay until the ~30 s summary reads
+/// them, so a spike during a catch-up burst is not overwritten.
+struct FlushTiming {
+    max_us: AtomicU64,
+    ge_1ms: AtomicU64,
+    ge_5ms: AtomicU64,
+    buckets: [AtomicU64; FLUSH_BUCKET_COUNT],
 }
 
-impl FlushSamples {
+struct FlushSecond {
+    max_us: u64,
+    ge_1ms: u64,
+    ge_5ms: u64,
+}
+
+impl FlushTiming {
     const fn new() -> Self {
         Self {
-            us: [0; FLUSH_SAMPLE_CAP],
-            recorded: 0,
+            max_us: AtomicU64::new(0),
+            ge_1ms: AtomicU64::new(0),
+            ge_5ms: AtomicU64::new(0),
+            buckets: [const { AtomicU64::new(0) }; FLUSH_BUCKET_COUNT],
         }
     }
 
-    fn record(&mut self, micros: u32) {
-        let i = (self.recorded as usize) % FLUSH_SAMPLE_CAP;
-        self.us[i] = micros;
-        self.recorded = self.recorded.saturating_add(1);
+    fn record_us(&self, us: u64) {
+        self.max_us.fetch_max(us, Ordering::Relaxed);
+        if us >= FLUSH_GE_1MS_US {
+            self.ge_1ms.fetch_add(1, Ordering::Relaxed);
+        }
+        if us >= FLUSH_GE_5MS_US {
+            self.ge_5ms.fetch_add(1, Ordering::Relaxed);
+        }
+        self.buckets[flush_bucket_index(us)].fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Max and p99 (nearest-rank, µs) of the samples since the last call,
-    /// then clear the window.
-    fn snapshot_reset(&mut self) -> (u64, u64) {
-        let n = self.recorded as usize;
-        let take = n.min(FLUSH_SAMPLE_CAP);
-        let mut buf = [0u32; FLUSH_SAMPLE_CAP];
-        if n <= FLUSH_SAMPLE_CAP {
-            buf[..take].copy_from_slice(&self.us[..take]);
-        } else {
-            let start = n % FLUSH_SAMPLE_CAP;
-            buf.copy_from_slice(&self.us);
-            buf.rotate_left(start);
+    /// Max and slow-flush counts for the 1 s line, then clear those
+    /// counters. Buckets are left for the 30 s p99.
+    fn take_second(&self) -> FlushSecond {
+        FlushSecond {
+            max_us: self.max_us.swap(0, Ordering::Relaxed),
+            ge_1ms: self.ge_1ms.swap(0, Ordering::Relaxed),
+            ge_5ms: self.ge_5ms.swap(0, Ordering::Relaxed),
         }
-        self.recorded = 0;
-        if take == 0 {
-            return (0, 0);
+    }
+
+    /// Bucket-resolution p99 over the samples since the last call, then
+    /// clear the buckets. `0` when the window is empty.
+    fn take_p99_us(&self) -> u64 {
+        let mut counts = [0u64; FLUSH_BUCKET_COUNT];
+        for (i, bucket) in self.buckets.iter().enumerate() {
+            counts[i] = bucket.swap(0, Ordering::Relaxed);
         }
-        let max_us = buf[..take].iter().copied().max().unwrap_or(0) as u64;
-        (max_us, u64::from(nearest_rank_p99(&buf[..take])))
+        flush_p99_upper_us(&counts)
     }
 }
 
-/// Nearest-rank p99. `ceil(0.99 * n) - 1` into the sorted sample.
-fn nearest_rank_p99(samples: &[u32]) -> u32 {
-    if samples.is_empty() {
+static FLUSH_TIMING: FlushTiming = FlushTiming::new();
+
+/// Bucket index for a duration in microseconds.
+fn flush_bucket_index(us: u64) -> usize {
+    if us < 2 {
         return 0;
     }
-    let mut buf = [0u32; FLUSH_SAMPLE_CAP];
-    let n = samples.len().min(FLUSH_SAMPLE_CAP);
-    buf[..n].copy_from_slice(&samples[..n]);
-    buf[..n].sort_unstable();
-    let rank = (99 * n).div_ceil(100).saturating_sub(1);
-    buf[rank]
+    if us >= FLUSH_BUCKET_OVERFLOW_US {
+        return FLUSH_BUCKET_COUNT - 1;
+    }
+    (63 - us.leading_zeros()) as usize
 }
 
-static FLUSH_SAMPLES: Mutex<FlushSamples> = Mutex::new(FlushSamples::new());
+/// Exclusive upper bound of bucket `index`, in microseconds.
+///
+/// The top bucket (`≥ 32 ms`) has no finite ceiling and is reported as
+/// [`u64::MAX`].
+fn flush_bucket_upper_us(index: usize) -> u64 {
+    if index >= FLUSH_BUCKET_COUNT - 1 {
+        return u64::MAX;
+    }
+    1u64 << (index + 1)
+}
+
+/// Upper bound of the bucket that holds the 99th percentile.
+///
+/// Rank is `ceil(0.99 * n)` counting from the low bucket. An empty window
+/// is `0`.
+fn flush_p99_upper_us(counts: &[u64]) -> u64 {
+    let total = counts.iter().copied().sum::<u64>();
+    if total == 0 {
+        return 0;
+    }
+    let target = (99 * total).div_ceil(100);
+    let mut seen = 0u64;
+    for (i, count) in counts.iter().copied().enumerate() {
+        seen = seen.saturating_add(count);
+        if seen >= target {
+            return flush_bucket_upper_us(i);
+        }
+    }
+    flush_bucket_upper_us(counts.len().saturating_sub(1))
+}
 
 fn record_flush_duration(elapsed: Duration) {
-    let us = u32::try_from(elapsed.as_micros()).unwrap_or(u32::MAX);
-    FLUSH_SAMPLES
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .record(us);
-}
-
-fn take_flush_timing() -> (u64, u64) {
-    FLUSH_SAMPLES
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .snapshot_reset()
+    let us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+    FLUSH_TIMING.record_us(us);
 }
 
 fn record_dropped(n: usize) {
@@ -1929,10 +2001,14 @@ pub(crate) fn inline_flush(con: &mut Connection) {
 
 /// Log flush and drop counters at most once per second. `flushed_calls` is
 /// how often the sink actually took a packet; `empty_calls` is how often the
-/// flush found nothing pending. `flush_max_us` and `flush_p99_us` are the
-/// flush duration over that window (the syscall sits after `send_opus_frame`
-/// returns, so `t_send` does not include it). Drop lines are the same record
-/// (`dropped_since_log`), never a per-frame log.
+/// flush found nothing pending. `flush_max_us` is the slowest flush in the
+/// window; `flush_ge_1ms` and `flush_ge_5ms` count flushes at or above those
+/// thresholds. The syscall sits after `send_opus_frame` returns, so `t_send`
+/// does not include it. The bucket p99 is not on this line — a 1 s window
+/// at 50 frames/s is too small for a nearest-rank p99 to be anything but
+/// the max — it is logged on the ~30 s `audio_send_summary` as
+/// `flush_p99_us`. Drop lines are the same record (`dropped_since_log`),
+/// never a per-frame log.
 pub(crate) fn maybe_log_inline_flush() {
     if !inline_flush_is_enabled() {
         return;
@@ -1970,7 +2046,7 @@ pub(crate) fn maybe_log_inline_flush() {
         .logged_dropped
         .swap(dropped_frames, Ordering::Relaxed);
     let dropped_since_log = dropped_frames.saturating_sub(prev_dropped);
-    let (flush_max_us, flush_p99_us) = take_flush_timing();
+    let second = FLUSH_TIMING.take_second();
     info!(
         target: "music_bot_latency",
         stage = "inline_flush",
@@ -1978,11 +2054,12 @@ pub(crate) fn maybe_log_inline_flush() {
         empty_calls,
         packets_flushed,
         flush_errors,
-        flush_max_us,
-        flush_p99_us,
+        flush_max_us = second.max_us,
+        flush_ge_1ms = second.ge_1ms,
+        flush_ge_5ms = second.ge_5ms,
         dropped_frames,
         dropped_since_log,
-        "inline flush counters — flushed_calls handed at least one packet to the outgoing sink, empty_calls found nothing pending; flush_max_us and flush_p99_us are this window's direct send_to cost; dropped_frames is the post-stall burst cap",
+        "inline flush counters — flushed_calls handed at least one packet to the outgoing sink, empty_calls found nothing pending; flush_max_us / flush_ge_1ms / flush_ge_5ms are this second's direct send_to cost; dropped_frames is the post-stall burst cap",
     );
 }
 
@@ -2405,6 +2482,7 @@ mod tests {
             events_rx,
             pause_rx,
             msg_tx,
+            None,
         );
 
         let mut frame_count = 0usize;
@@ -2473,6 +2551,7 @@ mod tests {
             events_rx,
             pause_rx,
             msg_tx,
+            None,
         );
 
         // Let a few frames flow, then pause ≥2 s mid-play. The 600 ms tone
@@ -2654,6 +2733,7 @@ mod tests {
             events_rx,
             pause_rx,
             msg_tx,
+            None,
         );
 
         let mut frames_seen = 0usize;
@@ -2721,6 +2801,7 @@ mod tests {
             events_rx,
             pause_rx,
             msg_tx,
+            None,
         );
 
         // Decode each Opus frame back to PCM — decoded amplitude is what a
@@ -3360,37 +3441,290 @@ mod tests {
         assert!(!slot_past_catchup(stall, None, period));
     }
 
-    /// Fixed ring: recording does not allocate, a full window overwrites
-    /// the oldest sample, and the snapshot is max plus nearest-rank p99.
-    /// For fewer than 100 samples nearest-rank p99 is the largest value.
     #[test]
-    fn flush_timing_window_reports_max_and_p99() {
-        assert_eq!(nearest_rank_p99(&[]), 0);
-        assert_eq!(nearest_rank_p99(&[7]), 7);
-        let mut samples: Vec<u32> = (1..=50).collect();
-        samples.reverse();
-        assert_eq!(nearest_rank_p99(&samples), 50);
+    fn flush_bucket_boundaries() {
+        assert_eq!(flush_bucket_index(0), 0);
+        assert_eq!(flush_bucket_index(1), 0);
+        assert_eq!(flush_bucket_upper_us(0), 2);
+        assert_eq!(flush_bucket_index(2), 1);
+        assert_eq!(flush_bucket_upper_us(1), 4);
+        assert_eq!(flush_bucket_index(15), 3);
+        assert_eq!(flush_bucket_index(16), 4);
+        assert_eq!(flush_bucket_upper_us(4), 32);
+        assert_eq!(flush_bucket_index(1_023), 9);
+        assert_eq!(flush_bucket_index(1_024), 10);
+        assert_eq!(flush_bucket_upper_us(10), 2_048);
+        assert_eq!(flush_bucket_index(32_767), 14);
+        assert_eq!(flush_bucket_upper_us(14), FLUSH_BUCKET_OVERFLOW_US);
+        assert_eq!(flush_bucket_index(FLUSH_BUCKET_OVERFLOW_US), 15);
+        assert_eq!(flush_bucket_index(1_000_000), 15);
+        assert_eq!(flush_bucket_upper_us(15), u64::MAX);
 
-        let mut window = FlushSamples::new();
-        assert_eq!(window.snapshot_reset(), (0, 0));
-        window.record(12);
-        assert_eq!(window.snapshot_reset(), (12, 12));
+        let timing = FlushTiming::new();
+        timing.record_us(999);
+        timing.record_us(1_000);
+        timing.record_us(4_999);
+        timing.record_us(5_000);
+        let second = timing.take_second();
+        assert_eq!(second.ge_1ms, 3, "1000, 4999, and 5000 are ≥ 1 ms");
+        assert_eq!(second.ge_5ms, 1, "only 5000 µs is ≥ 5 ms");
+        assert_eq!(second.max_us, 5_000);
+    }
 
-        window.record(9_999);
-        for _ in 0..FLUSH_SAMPLE_CAP {
-            window.record(3);
+    /// A 10 ms spike buried in a long run of fast flushes stays in the max
+    /// and the slow counts. The old 64-sample ring dropped it.
+    #[test]
+    fn flush_spike_survives_a_burst() {
+        let timing = FlushTiming::new();
+        for _ in 0..200 {
+            timing.record_us(10);
         }
+        timing.record_us(10_000);
+        for _ in 0..200 {
+            timing.record_us(10);
+        }
+        let second = timing.take_second();
+        assert_eq!(second.max_us, 10_000);
+        assert_eq!(second.ge_1ms, 1);
+        assert_eq!(second.ge_5ms, 1);
+        // 400 fast samples sit in the [8, 16) µs bucket. Rank ceil(0.99*401)
+        // is still in that bucket; the spike is the max, not the p99.
         assert_eq!(
-            window.snapshot_reset(),
-            (3, 3),
-            "the sample older than the ring is gone",
+            timing.take_p99_us(),
+            flush_bucket_upper_us(flush_bucket_index(10))
+        );
+    }
+
+    #[test]
+    fn flush_p99_is_the_upper_bound_of_the_99th_bucket() {
+        assert_eq!(flush_p99_upper_us(&[0; 16]), 0);
+
+        let mut low = [0u64; FLUSH_BUCKET_COUNT];
+        low[flush_bucket_index(1_024)] = 100;
+        assert_eq!(flush_p99_upper_us(&low), 2_048);
+
+        // 98 fast, 2 slow. The 99th sample is in the slow bucket.
+        let mut mixed = [0u64; FLUSH_BUCKET_COUNT];
+        mixed[flush_bucket_index(10)] = 98;
+        mixed[flush_bucket_index(10_000)] = 2;
+        assert_eq!(
+            flush_p99_upper_us(&mixed),
+            flush_bucket_upper_us(flush_bucket_index(10_000)),
         );
 
-        for us in 1..=50 {
-            window.record(us);
+        let mut overflow = [0u64; FLUSH_BUCKET_COUNT];
+        overflow[15] = 100;
+        assert_eq!(flush_p99_upper_us(&overflow), u64::MAX);
+    }
+
+    #[test]
+    fn flush_windows_reset_independently() {
+        let timing = FlushTiming::new();
+        timing.record_us(10_000);
+        let first = timing.take_second();
+        assert_eq!(first.max_us, 10_000);
+        assert_eq!(first.ge_1ms, 1);
+        assert_eq!(first.ge_5ms, 1);
+        let cleared = timing.take_second();
+        assert_eq!(cleared.max_us, 0);
+        assert_eq!(cleared.ge_1ms, 0);
+        assert_eq!(cleared.ge_5ms, 0);
+        // The 1 s snapshot does not drop the spike from the 30 s buckets.
+        assert_eq!(
+            timing.take_p99_us(),
+            flush_bucket_upper_us(flush_bucket_index(10_000)),
+        );
+        assert_eq!(timing.take_p99_us(), 0, "the 30 s window was cleared");
+
+        timing.record_us(50);
+        let next = timing.take_second();
+        assert_eq!(next.max_us, 50);
+        assert_eq!(next.ge_1ms, 0);
+        assert_eq!(next.ge_5ms, 0);
+    }
+
+    /// `batch.dropped` plus any `CatchupDropped` still in the messages.
+    /// The send loop records both, so a message the batch already counted
+    /// and then left in the queue would land on `dropped_catchup_frames`
+    /// twice.
+    fn drops_as_the_send_loop_counts(batch: CatchupBatch) -> (u64, Vec<u8>) {
+        let mut n = batch.dropped as u64;
+        let msgs = match batch.messages {
+            CatchupMessages::Single(msg) => vec![msg],
+            CatchupMessages::Multi(msgs) => msgs,
+        };
+        let mut ids = Vec::new();
+        for msg in msgs {
+            match msg {
+                AudioMsg::CatchupDropped(extra) => n += u64::from(extra),
+                AudioMsg::Frame { bytes, .. } => ids.push(bytes[0]),
+                other => panic!("unexpected message in catch-up batch: {other:?}"),
+            }
         }
-        assert_eq!(window.snapshot_reset(), (50, 50));
-        assert_eq!(window.snapshot_reset(), (0, 0), "the window was cleared");
+        (n, ids)
+    }
+
+    #[test]
+    fn catchup_dropped_first_is_counted_once() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let now = Instant::now();
+        tx.try_send(queued_frame(now, 20, 1)).unwrap();
+        tx.try_send(queued_frame(now, 0, 2)).unwrap();
+        let batch = catchup_batch_with(AudioMsg::CatchupDropped(5), &mut rx, true, Some(4), now);
+        let (counted, ids) = drops_as_the_send_loop_counts(batch);
+        let mut monitor = SendTimingMonitor::new();
+        monitor.record_catchup_drops(counted);
+        assert_eq!(ids, vec![1, 2]);
+        assert_eq!(
+            monitor.dropped_catchup_frames, 5,
+            "the pacer's 5 are counted once, not again by the send path",
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn catchup_dropped_mid_queue_is_counted_once() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let now = Instant::now();
+        tx.try_send(AudioMsg::CatchupDropped(4)).unwrap();
+        tx.try_send(queued_frame(now, 0, 2)).unwrap();
+        tx.try_send(queued_frame(now, 200, 3)).unwrap();
+        let batch = catchup_batch_with(queued_frame(now, 20, 1), &mut rx, true, Some(4), now);
+        let (counted, ids) = drops_as_the_send_loop_counts(batch);
+        let mut monitor = SendTimingMonitor::new();
+        monitor.record_catchup_drops(counted);
+        assert_eq!(
+            ids,
+            vec![1, 2],
+            "the 200 ms frame is dropped by the send path"
+        );
+        assert_eq!(
+            monitor.dropped_catchup_frames, 5,
+            "pacer's 4 plus the one stale frame, each once",
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    fn pcm_at(index: u64, scheduled_at: Instant) -> PcmFrame {
+        PcmFrame {
+            samples: vec![0i16; music_bot_audio::SAMPLES_PER_FRAME_MONO],
+            index,
+            scheduled_at,
+            channels: 1,
+        }
+    }
+
+    async fn run_sibling_on(frames: Vec<PcmFrame>, cap: Option<usize>) -> Vec<AudioMsg> {
+        let mut pipeline = AudioPipeline::spawn(
+            AudioSourceSpec::SyntheticTone {
+                hz: 440.0,
+                amplitude: 0.0,
+                duration_ms: Some(40),
+            },
+            PipelineConfig::default(),
+        )
+        .await
+        .expect("spawn synthetic pipeline");
+        let _discard = pipeline.take_frames();
+        let events_rx = pipeline.events();
+        let (frames_tx, frames_rx) = mpsc::channel(64);
+        for frame in frames {
+            frames_tx.send(frame).await.expect("frame channel open");
+        }
+        drop(frames_tx);
+        let (_pause_tx, pause_rx) = watch::channel(false);
+        let (msg_tx, mut msg_rx) = mpsc::channel(64);
+        let sibling = spawn_sibling(
+            pipeline,
+            test_encoder(),
+            VolumeHandle::default(),
+            frames_rx,
+            events_rx,
+            pause_rx,
+            msg_tx,
+            cap,
+        );
+        let mut out = Vec::new();
+        while let Some(msg) = msg_rx.recv().await {
+            let finished = matches!(msg, AudioMsg::Finished);
+            out.push(msg);
+            if finished {
+                break;
+            }
+        }
+        sibling.await.expect("sibling joins");
+        out
+    }
+
+    /// The cap is a sibling parameter, so this does not read
+    /// `VOICE_INLINE_FLUSH`. Slots ten seconds overdue are skipped before
+    /// encode and reported as one `CatchupDropped`; fresh slots are encoded.
+    #[tokio::test]
+    async fn pacer_skips_overdue_slots_before_encode() {
+        let now = Instant::now();
+        let mut frames = Vec::new();
+        for i in 0..6 {
+            frames.push(pcm_at(
+                i,
+                now.checked_sub(Duration::from_secs(10)).expect("slot"),
+            ));
+        }
+        let fresh = [
+            now + Duration::from_millis(20),
+            now + Duration::from_millis(40),
+            now + Duration::from_millis(60),
+        ];
+        for (i, at) in fresh.iter().copied().enumerate() {
+            frames.push(pcm_at(6 + i as u64, at));
+        }
+        let msgs = run_sibling_on(frames, Some(4)).await;
+        let mut dropped = 0u32;
+        let mut kept = Vec::new();
+        let mut saw_frame = false;
+        let mut drop_before_frame = false;
+        for msg in &msgs {
+            match msg {
+                AudioMsg::CatchupDropped(n) => {
+                    if !saw_frame {
+                        drop_before_frame = true;
+                    }
+                    dropped += *n;
+                }
+                AudioMsg::Frame { scheduled_at, .. } => {
+                    saw_frame = true;
+                    kept.push(*scheduled_at);
+                }
+                AudioMsg::PipelineEvent(_) | AudioMsg::Finished => {}
+            }
+        }
+        assert!(
+            drop_before_frame,
+            "the skip count is queued before the next kept frame"
+        );
+        assert_eq!(dropped, 6);
+        assert_eq!(kept, fresh);
+    }
+
+    #[tokio::test]
+    async fn pacer_cap_off_encodes_overdue_frames() {
+        let now = Instant::now();
+        let frames = (0..6)
+            .map(|i| pcm_at(i, now.checked_sub(Duration::from_secs(10)).expect("slot")))
+            .collect();
+        let msgs = run_sibling_on(frames, None).await;
+        let dropped: u32 = msgs
+            .iter()
+            .map(|msg| match msg {
+                AudioMsg::CatchupDropped(n) => *n,
+                _ => 0,
+            })
+            .sum();
+        let frames_out = msgs
+            .iter()
+            .filter(|msg| matches!(msg, AudioMsg::Frame { .. }))
+            .count();
+        assert_eq!(dropped, 0);
+        assert_eq!(frames_out, 6);
     }
 
     /// Cap off keeps the whole post-pause release, including a 0 cap.
