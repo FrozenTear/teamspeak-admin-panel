@@ -86,6 +86,90 @@ pub(crate) enum AudioMsg {
     Finished,
 }
 
+/// Playback clock for one play.
+///
+/// `frames_sent` is the content position: frames handed to `send_audio`
+/// plus frames the catch-up cap dropped. Drops count even when no frame
+/// has gone out yet, so a stall before the first send still moves the
+/// position. `wire_frames` counts only real sends. The first-audible
+/// milestone is the first wire frame, not `frames_sent == 1`.
+/// `wire_frames == 0` at `Finished` means nothing was heard.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ContentClock {
+    pub frames_sent: u64,
+    pub wire_frames: u64,
+}
+
+impl ContentClock {
+    /// Record one frame put on the wire. True only for this play's first.
+    fn note_wire_frame(&mut self) -> bool {
+        let first = self.wire_frames == 0;
+        self.wire_frames = self.wire_frames.saturating_add(1);
+        self.frames_sent = self.frames_sent.saturating_add(1);
+        first
+    }
+
+    /// Count dropped frames toward the content position. This runs before
+    /// the first wire frame as well as after it.
+    fn note_dropped(&mut self, n: u64) {
+        self.frames_sent = self.frames_sent.saturating_add(n);
+    }
+
+    pub(crate) fn position_frames(&self) -> u64 {
+        self.frames_sent
+    }
+}
+
+/// Result of [`account_send_tick`].
+pub(crate) struct SendTick {
+    /// Content position after this tick.
+    pub position: u64,
+    /// True when this tick sent the play's first wire frame.
+    pub first_audible: bool,
+}
+
+/// Apply one send-loop tick to the content clock and the per-play drop
+/// counter. Both send loops call this; tests drive the same function.
+///
+/// `wire_sent` is how many Opus frames this tick handed to `send_audio`.
+/// `dropped` is how many the catch-up cap discarded. Drops move
+/// [`ContentClock::frames_sent`] even when `wire_sent` is 0. Wire frames
+/// are applied first, so a tick that both sends and drops still reports
+/// `first_audible` on the first real send.
+pub(crate) fn account_send_tick(
+    clock: &mut ContentClock,
+    monitor: &mut SendTimingMonitor,
+    wire_sent: u64,
+    dropped: u64,
+) -> SendTick {
+    let mut first_audible = false;
+    for _ in 0..wire_sent {
+        if clock.note_wire_frame() {
+            first_audible = true;
+        }
+    }
+    if dropped > 0 {
+        monitor.record_catchup_drops(dropped);
+        clock.note_dropped(dropped);
+    }
+    SendTick {
+        position: clock.position_frames(),
+        first_audible,
+    }
+}
+
+/// Stall-log detail for one catch-up tick. Log level stays with the caller.
+///
+/// A tick that sent nothing and dropped at least one frame says so, and
+/// includes the count. Any tick that sent a frame keeps the message kind.
+pub(crate) fn catchup_stall_detail(kind: &str, wire_sent: u64, dropped: u64) -> String {
+    if wire_sent == 0 && dropped > 0 {
+        format!("audio_msg=catchup_dropped dropped={dropped}")
+    } else {
+        format!("audio_msg={kind}")
+    }
+}
+
 /// Per-bot audio state. The connected loop holds an `Option<ActiveAudio>`;
 /// `Some` means a pipeline is currently spawned (frames may or may not be
 /// flowing depending on `paused`).
@@ -105,10 +189,9 @@ pub(crate) struct ActiveAudio {
     /// Flipped by `Pause` / `Resume`. The sibling parks on
     /// `pause_rx.changed()` while `*pause_rx.borrow()` is true.
     pub pause: watch::Sender<bool>,
-    /// Incremented by the connected loop each time it sends an Opus frame.
-    /// Zero at `Finished` means the pipeline produced no audio (e.g. yt-dlp
-    /// failed on a YouTube URL and ffmpeg saw empty stdin).
-    pub frames_sent: u64,
+    /// Content position and whether any frame has gone out on the wire.
+    /// See [`ContentClock`].
+    pub clock: ContentClock,
     /// PURA-330 — pipeline-spawn time. The connected loop logs total
     /// `start_pipeline` → first-Opus-frame-on-wire latency against this so
     /// the `!play` startup delay is attributable end-to-end.
@@ -358,7 +441,7 @@ fn build_active(
         source_label,
         audio_rx: Some(msg_rx),
         pause: pause_tx,
-        frames_sent: 0,
+        clock: ContentClock::default(),
         started_at,
         last_diagnostic: None,
         seek_base_secs,
@@ -1395,7 +1478,6 @@ impl SendTimingMonitor {
     }
 
     fn log_summary(&self) {
-        let flush_p99 = FLUSH_TIMING.take_p99();
         info!(
             target: "music_bot_latency",
             stage = "audio_send_summary",
@@ -1412,15 +1494,14 @@ impl SendTimingMonitor {
             max_a_blockinplace_churn_us = self.window_max_churn_a.as_micros() as u64,
             max_t_send_us = self.window_max_t_send.as_micros() as u64,
             max_t_blockinplace_us = self.window_max_t_blockinplace.as_micros() as u64,
-            // Bucket upper bound of the 99th percentile of direct-flush
-            // durations over this ~30 s window. The open ≥32 ms bucket is
-            // `flush_p99_us = 32768` with `flush_p99_overflow = true`.
-            // Independent of the 1 s `inline_flush` line.
-            flush_p99_us = flush_p99.us,
-            flush_p99_overflow = flush_p99.overflow,
+            // Flush p99 / max / slow counts / errors are process-wide.
+            // They are logged once on `inline_flush_summary`
+            // (`scope = process`), not on this per-bot line. On a
+            // single-bot host (how Contabo runs today) the earlier
+            // per-bot readings of those counters were valid, because
+            // that one bot was the whole process.
             "audio send-path timing window — per-window maxes for the \
-             PURA-389 A/B/C residual-stall attribution; flush_p99_us is the \
-             direct send_to cost over this window",
+             PURA-389 A/B/C residual-stall attribution",
         );
     }
 
@@ -1800,6 +1881,9 @@ struct FlushMeters {
     dropped_frames: AtomicU64,
     last_log_ms: AtomicU64,
     logged_dropped: AtomicU64,
+    /// Wall-clock stamp of the last process-level flush summary.
+    /// `0` means the 30 s window has not been armed yet.
+    last_summary_ms: AtomicU64,
 }
 
 static FLUSH_METERS: FlushMeters = FlushMeters {
@@ -1810,6 +1894,7 @@ static FLUSH_METERS: FlushMeters = FlushMeters {
     dropped_frames: AtomicU64::new(0),
     last_log_ms: AtomicU64::new(0),
     logged_dropped: AtomicU64::new(0),
+    last_summary_ms: AtomicU64::new(0),
 };
 
 static FLUSH_LOG_START: OnceLock<Instant> = OnceLock::new();
@@ -1830,12 +1915,21 @@ const FLUSH_GE_5MS_US: u64 = 5_000;
 
 /// Lock-free flush durations. The send path only does atomic adds and
 /// `fetch_max` — no mutex and no allocation. The 1 s line resets the max
-/// and the slow counts. The buckets stay until the ~30 s summary reads
-/// them, so a spike during a catch-up burst is not overwritten.
+/// and the slow counts. A second set of atomics, plus the buckets, stays
+/// until the process-level ~30 s summary reads them, so a spike during a
+/// catch-up burst is not overwritten. These counters are process-wide:
+/// one line per process, not one copy on every bot's `audio_send_summary`.
+/// On a single-bot host (how Contabo runs today) a per-bot reading of
+/// them was the same as the process reading, so those earlier numbers
+/// were valid.
 struct FlushTiming {
     max_us: AtomicU64,
     ge_1ms: AtomicU64,
     ge_5ms: AtomicU64,
+    summary_max_us: AtomicU64,
+    summary_ge_1ms: AtomicU64,
+    summary_ge_5ms: AtomicU64,
+    summary_errors: AtomicU64,
     buckets: [AtomicU64; FLUSH_BUCKET_COUNT],
 }
 
@@ -1845,29 +1939,50 @@ struct FlushSecond {
     ge_5ms: u64,
 }
 
+/// One process-level ~30 s flush window.
+struct FlushProcessSummary {
+    max_us: u64,
+    ge_1ms: u64,
+    ge_5ms: u64,
+    errors: u64,
+    p99: FlushP99,
+}
+
 impl FlushTiming {
     const fn new() -> Self {
         Self {
             max_us: AtomicU64::new(0),
             ge_1ms: AtomicU64::new(0),
             ge_5ms: AtomicU64::new(0),
+            summary_max_us: AtomicU64::new(0),
+            summary_ge_1ms: AtomicU64::new(0),
+            summary_ge_5ms: AtomicU64::new(0),
+            summary_errors: AtomicU64::new(0),
             buckets: [const { AtomicU64::new(0) }; FLUSH_BUCKET_COUNT],
         }
     }
 
     fn record_us(&self, us: u64) {
         self.max_us.fetch_max(us, Ordering::Relaxed);
+        self.summary_max_us.fetch_max(us, Ordering::Relaxed);
         if us >= FLUSH_GE_1MS_US {
             self.ge_1ms.fetch_add(1, Ordering::Relaxed);
+            self.summary_ge_1ms.fetch_add(1, Ordering::Relaxed);
         }
         if us >= FLUSH_GE_5MS_US {
             self.ge_5ms.fetch_add(1, Ordering::Relaxed);
+            self.summary_ge_5ms.fetch_add(1, Ordering::Relaxed);
         }
         self.buckets[flush_bucket_index(us)].fetch_add(1, Ordering::Relaxed);
     }
 
+    fn record_error(&self) {
+        self.summary_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Max and slow-flush counts for the 1 s line, then clear those
-    /// counters. Buckets are left for the 30 s p99.
+    /// counters. The process-summary copies and the buckets are left
+    /// for the 30 s line.
     fn take_second(&self) -> FlushSecond {
         FlushSecond {
             max_us: self.max_us.swap(0, Ordering::Relaxed),
@@ -1885,6 +2000,18 @@ impl FlushTiming {
             counts[i] = bucket.swap(0, Ordering::Relaxed);
         }
         flush_p99(&counts)
+    }
+
+    /// Process-wide max, slow counts, errors, and bucket p99 since the
+    /// last call, then clear them. The 1 s counters are not touched.
+    fn take_summary(&self) -> FlushProcessSummary {
+        FlushProcessSummary {
+            max_us: self.summary_max_us.swap(0, Ordering::Relaxed),
+            ge_1ms: self.summary_ge_1ms.swap(0, Ordering::Relaxed),
+            ge_5ms: self.summary_ge_5ms.swap(0, Ordering::Relaxed),
+            errors: self.summary_errors.swap(0, Ordering::Relaxed),
+            p99: self.take_p99(),
+        }
     }
 }
 
@@ -1986,6 +2113,7 @@ fn record_flush_ok(packets: usize) {
 
 fn record_flush_err() {
     FLUSH_METERS.flush_errors.fetch_add(1, Ordering::Relaxed);
+    FLUSH_TIMING.record_error();
 }
 
 fn warn_flush_once(err: &tsclientlib::Error) {
@@ -2030,18 +2158,26 @@ pub(crate) fn inline_flush(con: &mut Connection) {
     }
 }
 
+/// Wall clock between process-level flush summaries. Independent of each
+/// bot's 1500-frame `audio_send_summary`.
+const FLUSH_SUMMARY_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Log flush and drop counters at most once per second. `flushed_calls` is
 /// how often the sink actually took a packet; `empty_calls` is how often the
 /// flush found nothing pending. `flush_max_us` is the slowest flush in the
 /// window; `flush_ge_1ms` and `flush_ge_5ms` count flushes at or above those
 /// thresholds. The syscall sits after `send_opus_frame` returns, so `t_send`
-/// does not include it. The bucket p99 is not on this line — a 1 s window
-/// at 50 frames/s is too small for a nearest-rank p99 to be anything but
-/// the max — it is logged on the ~30 s `audio_send_summary` as
-/// `flush_p99_us`, with `flush_p99_overflow` set when that percentile is
-/// in the open `≥ 32 ms` bucket (`flush_p99_us` is then `32768`). Drop
-/// lines are the same record (`dropped_since_log`),
-/// never a per-frame log.
+/// does not include it. `flush_errors` on this line is the lifetime total.
+/// The bucket p99 is not on this line — a 1 s window at 50 frames/s is too
+/// small for a nearest-rank p99 to be anything but the max — and it is not
+/// on the per-bot `audio_send_summary` either. Those counters are
+/// process-wide, so the ~30 s `inline_flush_summary` line (`scope=process`)
+/// logs them once: `flush_p99_us` with `flush_p99_overflow` set when that
+/// percentile is in the open `≥ 32 ms` bucket (`flush_p99_us` is then
+/// `32768`). On a single-bot host (how Contabo runs today) the earlier
+/// per-bot readings were valid, because that bot was the whole process.
+/// Drop lines are the same 1 s record (`dropped_since_log`), never a
+/// per-frame log.
 pub(crate) fn maybe_log_inline_flush() {
     if !inline_flush_is_enabled() {
         return;
@@ -2093,6 +2229,43 @@ pub(crate) fn maybe_log_inline_flush() {
         dropped_frames,
         dropped_since_log,
         "inline flush counters — flushed_calls handed at least one packet to the outgoing sink, empty_calls found nothing pending; flush_max_us / flush_ge_1ms / flush_ge_5ms are this second's direct send_to cost; dropped_frames is the post-stall burst cap",
+    );
+    maybe_log_flush_summary(now_ms);
+}
+
+/// One process-scoped flush-timing line per ~30 s. The 1 s log's compare-
+/// exchange already admits a single caller, and this second exchange keeps
+/// the summary to one line even if that changes. The first call only arms
+/// the window so the first line covers a full sample, not the first second.
+fn maybe_log_flush_summary(now_ms: u64) {
+    let prev = FLUSH_METERS.last_summary_ms.load(Ordering::Relaxed);
+    let interval_ms = u64::try_from(FLUSH_SUMMARY_INTERVAL.as_millis()).unwrap_or(30_000);
+    if prev != 0 && now_ms.saturating_sub(prev) < interval_ms {
+        return;
+    }
+    let stamp = now_ms.max(1);
+    if FLUSH_METERS
+        .last_summary_ms
+        .compare_exchange(prev, stamp, Ordering::AcqRel, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    if prev == 0 {
+        return;
+    }
+    let summary = FLUSH_TIMING.take_summary();
+    info!(
+        target: "music_bot_latency",
+        stage = "inline_flush_summary",
+        scope = "process",
+        flush_max_us = summary.max_us,
+        flush_ge_1ms = summary.ge_1ms,
+        flush_ge_5ms = summary.ge_5ms,
+        flush_errors = summary.errors,
+        flush_p99_us = summary.p99.us,
+        flush_p99_overflow = summary.p99.overflow,
+        "process-wide direct-flush timing over ~30 s — one line per process, not per bot. On a single-bot host (how Contabo runs today) the earlier per-bot readings of these counters were valid, because that bot was the whole process. flush_p99_us is the bucket upper bound; the open ≥32 ms bucket is 32768 with flush_p99_overflow true. flush_errors counts failures since the previous process summary",
     );
 }
 
@@ -3568,13 +3741,23 @@ mod tests {
         assert_eq!(cleared.max_us, 0);
         assert_eq!(cleared.ge_1ms, 0);
         assert_eq!(cleared.ge_5ms, 0);
-        // The 1 s snapshot does not drop the spike from the 30 s buckets.
-        let p99 = timing.take_p99();
-        assert_eq!(p99.us, flush_bucket_upper_us(flush_bucket_index(10_000)));
-        assert!(!p99.overflow);
-        let cleared_p99 = timing.take_p99();
-        assert_eq!(cleared_p99.us, 0, "the 30 s window was cleared");
-        assert!(!cleared_p99.overflow);
+        // The 1 s snapshot does not drop the spike from the process summary.
+        let summary = timing.take_summary();
+        assert_eq!(summary.max_us, 10_000);
+        assert_eq!(summary.ge_1ms, 1);
+        assert_eq!(summary.ge_5ms, 1);
+        assert_eq!(
+            summary.p99.us,
+            flush_bucket_upper_us(flush_bucket_index(10_000))
+        );
+        assert!(!summary.p99.overflow);
+        let cleared = timing.take_summary();
+        assert_eq!(cleared.max_us, 0, "the process window was cleared");
+        assert_eq!(cleared.ge_1ms, 0);
+        assert_eq!(cleared.ge_5ms, 0);
+        assert_eq!(cleared.errors, 0);
+        assert_eq!(cleared.p99.us, 0);
+        assert!(!cleared.p99.overflow);
 
         timing.record_us(50);
         let next = timing.take_second();
@@ -3583,25 +3766,38 @@ mod tests {
         assert_eq!(next.ge_5ms, 0);
     }
 
-    /// `batch.dropped` plus any `CatchupDropped` still in the messages.
-    /// The send loop records both, so a message the batch already counted
-    /// and then left in the queue would land on `dropped_catchup_frames`
-    /// twice.
-    fn drops_as_the_send_loop_counts(batch: CatchupBatch) -> (u64, Vec<u8>) {
-        let mut n = batch.dropped as u64;
+    /// Drive [`account_send_tick`] the way the send loops do: one tick for
+    /// the frames the batch kept plus `batch.dropped`, then another tick
+    /// for a `CatchupDropped` the batch left in the messages. A message
+    /// the batch already folded into `dropped` and also left queued is
+    /// applied twice, so `dropped_catchup_frames` catches that regression.
+    fn account_batch_like_the_send_loop(
+        clock: &mut ContentClock,
+        monitor: &mut SendTimingMonitor,
+        batch: CatchupBatch,
+    ) -> Vec<u8> {
         let msgs = match batch.messages {
             CatchupMessages::Single(msg) => vec![msg],
             CatchupMessages::Multi(msgs) => msgs,
         };
         let mut ids = Vec::new();
+        let mut wire_sent = 0u64;
+        let mut leftover_drops = 0u64;
         for msg in msgs {
             match msg {
-                AudioMsg::CatchupDropped(extra) => n += u64::from(extra),
-                AudioMsg::Frame { bytes, .. } => ids.push(bytes[0]),
+                AudioMsg::CatchupDropped(extra) => leftover_drops += u64::from(extra),
+                AudioMsg::Frame { bytes, .. } => {
+                    ids.push(bytes[0]);
+                    wire_sent += 1;
+                }
                 other => panic!("unexpected message in catch-up batch: {other:?}"),
             }
         }
-        (n, ids)
+        account_send_tick(clock, monitor, wire_sent, batch.dropped as u64);
+        if leftover_drops > 0 {
+            account_send_tick(clock, monitor, 0, leftover_drops);
+        }
+        ids
     }
 
     #[test]
@@ -3611,14 +3807,16 @@ mod tests {
         tx.try_send(queued_frame(now, 20, 1)).unwrap();
         tx.try_send(queued_frame(now, 0, 2)).unwrap();
         let batch = catchup_batch_with(AudioMsg::CatchupDropped(5), &mut rx, true, Some(4), now);
-        let (counted, ids) = drops_as_the_send_loop_counts(batch);
+        let mut clock = ContentClock::default();
         let mut monitor = SendTimingMonitor::new();
-        monitor.record_catchup_drops(counted);
+        let ids = account_batch_like_the_send_loop(&mut clock, &mut monitor, batch);
         assert_eq!(ids, vec![1, 2]);
         assert_eq!(
             monitor.dropped_catchup_frames, 5,
             "the pacer's 5 are counted once, not again by the send path",
         );
+        assert_eq!(clock.wire_frames, 2);
+        assert_eq!(clock.position_frames(), 7);
         assert!(rx.try_recv().is_err());
     }
 
@@ -3630,9 +3828,9 @@ mod tests {
         tx.try_send(queued_frame(now, 0, 2)).unwrap();
         tx.try_send(queued_frame(now, 200, 3)).unwrap();
         let batch = catchup_batch_with(queued_frame(now, 20, 1), &mut rx, true, Some(4), now);
-        let (counted, ids) = drops_as_the_send_loop_counts(batch);
+        let mut clock = ContentClock::default();
         let mut monitor = SendTimingMonitor::new();
-        monitor.record_catchup_drops(counted);
+        let ids = account_batch_like_the_send_loop(&mut clock, &mut monitor, batch);
         assert_eq!(
             ids,
             vec![1, 2],
@@ -3642,7 +3840,117 @@ mod tests {
             monitor.dropped_catchup_frames, 5,
             "pacer's 4 plus the one stale frame, each once",
         );
+        assert_eq!(clock.wire_frames, 2);
+        assert_eq!(clock.position_frames(), 7);
         assert!(rx.try_recv().is_err());
+    }
+
+    /// A 500 ms stall released one frame per tick, which is the send
+    /// loop's catch-up. Dropped ticks move the content position before
+    /// any frame is on the wire; the first kept frame is still the
+    /// first-audible milestone.
+    #[test]
+    fn send_tick_counts_a_stall_then_catchup() {
+        let period = OPUS_FRAME_PERIOD;
+        let stall = Duration::from_millis(500);
+        let max = 4usize;
+        let ages = pacer_catchup_slot_ages(stall, 25, period);
+        let mut clock = ContentClock::default();
+        let mut monitor = SendTimingMonitor::new();
+        let mut saw_first_audible = false;
+        for (i, age) in ages.iter().copied().enumerate() {
+            let (_tx, mut rx) = mpsc::channel(1);
+            let now = Instant::now();
+            let batch = catchup_batch_with(
+                released_past_due(now, age, i as u8),
+                &mut rx,
+                true,
+                Some(max),
+                now,
+            );
+            let wire_sent = match &batch.messages {
+                CatchupMessages::Single(AudioMsg::Frame { .. }) => 1,
+                CatchupMessages::Multi(msgs) => {
+                    assert!(
+                        msgs.iter()
+                            .all(|m| !matches!(m, AudioMsg::CatchupDropped(_))),
+                        "a dropped trickle frame is not handed to the CatchupDropped handler",
+                    );
+                    msgs.iter()
+                        .filter(|m| matches!(m, AudioMsg::Frame { .. }))
+                        .count() as u64
+                }
+                _ => 0,
+            };
+            let tick = account_send_tick(&mut clock, &mut monitor, wire_sent, batch.dropped as u64);
+            if i == 0 {
+                assert_eq!(wire_sent, 0);
+                assert_eq!(batch.dropped, 1);
+                assert!(!tick.first_audible);
+                assert_eq!(clock.wire_frames, 0);
+                assert_eq!(tick.position, 1, "the drop counts before any send");
+                assert_eq!(clock.frames_sent, 1);
+                assert_eq!(clock.position_frames(), 1);
+                assert_eq!(monitor.dropped_catchup_frames, 1);
+            }
+            if tick.first_audible {
+                assert!(!saw_first_audible);
+                saw_first_audible = true;
+                assert_eq!(clock.wire_frames, 1);
+                assert_eq!(
+                    clock.frames_sent.saturating_sub(wire_sent),
+                    21,
+                    "the 21 dropped frames were already on the content clock",
+                );
+            }
+        }
+        assert!(saw_first_audible);
+        assert_eq!(monitor.dropped_catchup_frames, 21);
+        assert_eq!(clock.wire_frames, 4);
+        assert_eq!(clock.frames_sent, 25);
+        assert_eq!(clock.position_frames(), 25);
+    }
+
+    #[test]
+    fn catchup_stall_detail_names_a_fully_dropped_batch() {
+        assert_eq!(
+            catchup_stall_detail("frame", 0, 21),
+            "audio_msg=catchup_dropped dropped=21",
+        );
+        assert_eq!(catchup_stall_detail("frame", 4, 21), "audio_msg=frame");
+        assert_eq!(catchup_stall_detail("finished", 0, 0), "audio_msg=finished",);
+    }
+
+    #[test]
+    fn flush_process_summary_keeps_a_spike_the_1s_line_resets() {
+        let timing = FlushTiming::new();
+        timing.record_us(10);
+        timing.record_us(10_000);
+        timing.record_error();
+        let second = timing.take_second();
+        assert_eq!(second.max_us, 10_000);
+        assert_eq!(second.ge_1ms, 1);
+        assert_eq!(second.ge_5ms, 1);
+        let cleared = timing.take_second();
+        assert_eq!(cleared.max_us, 0);
+        let summary = timing.take_summary();
+        assert_eq!(
+            summary.max_us, 10_000,
+            "the 1 s reset does not drop the spike"
+        );
+        assert_eq!(summary.ge_1ms, 1);
+        assert_eq!(summary.ge_5ms, 1);
+        assert_eq!(summary.errors, 1);
+        assert_eq!(
+            summary.p99.us,
+            flush_bucket_upper_us(flush_bucket_index(10_000)),
+        );
+        assert!(!summary.p99.overflow);
+        let again = timing.take_summary();
+        assert_eq!(again.max_us, 0);
+        assert_eq!(again.errors, 0);
+        assert_eq!(again.p99.us, 0);
+        assert!(!again.p99.overflow);
     }
 
     fn pcm_at(index: u64, scheduled_at: Instant) -> PcmFrame {
