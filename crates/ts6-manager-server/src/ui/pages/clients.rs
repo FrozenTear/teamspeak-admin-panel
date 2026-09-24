@@ -770,7 +770,7 @@ fn copy_to_clipboard(text: &str) {
 const REVOKE_TALK: &str = "Revoke talk";
 const GRANT_TALK: &str = "Grant talk";
 const REVOKE_TALK_TITLE: &str = "Clear the talker flag. Only changes who may speak in a moderated channel. Does not mute the microphone or speakers. In an ordinary channel the client can still speak.";
-const GRANT_TALK_TITLE: &str = "Set the talker flag. Only changes who may speak in a moderated channel. Does not mute the microphone or speakers. TeamSpeak rejects this in an ordinary channel (error 1538).";
+const GRANT_TALK_TITLE: &str = "Set the talker flag. Only changes who may speak in a moderated channel. Does not mute the microphone or speakers. TeamSpeak may reject this with error 1538, which usually means the channel isn't moderated.";
 
 /// TeamSpeak `1538 invalid parameter` when `client_is_talker=1` is sent
 /// for a client who is not in a moderated channel.
@@ -791,7 +791,7 @@ fn talk_flag_success(revoke: bool, clid: i64) -> (String, String) {
     } else {
         (
             format!("Granted talk for client {clid}"),
-            "Only affects a moderated channel. TeamSpeak rejects granting talk in an ordinary channel (error 1538). Microphone and speaker mute are unchanged.".into(),
+            "Only affects a moderated channel. Microphone and speaker mute are unchanged.".into(),
         )
     }
 }
@@ -960,6 +960,11 @@ mod tests {
         let (grant_title, grant_detail) = talk_flag_success(false, 9);
         assert_eq!(revoke_title, "Revoked talk for client 9");
         assert_eq!(grant_title, "Granted talk for client 9");
+        assert_eq!(
+            grant_detail,
+            "Only affects a moderated channel. Microphone and speaker mute are unchanged."
+        );
+        assert!(GRANT_TALK_TITLE.contains("usually means"));
         for text in [revoke_title, revoke_detail, grant_title, grant_detail] {
             let lower = text.to_ascii_lowercase();
             assert!(!lower.contains("muted"), "{text}");
