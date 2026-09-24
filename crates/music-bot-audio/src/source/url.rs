@@ -100,7 +100,10 @@ impl YtDlpSource {
             );
         }
 
-        cmd.arg(url)
+        // `--` so a stored "URL" starting with `-` is never parsed as a
+        // yt-dlp option (`--exec`, `--config-locations`, ...).
+        cmd.arg("--")
+            .arg(url)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

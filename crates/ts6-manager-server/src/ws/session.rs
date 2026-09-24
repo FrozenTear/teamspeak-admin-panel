@@ -33,7 +33,7 @@ use tokio::time::{Instant, interval};
 
 use crate::db::Database;
 
-use super::auth::Principal;
+use super::auth::{Principal, credential_still_valid};
 use super::envelope::Envelope;
 use super::hub::{AuthorizeError, Hub, WidgetConnGuard};
 use super::topic::Topic;
@@ -202,6 +202,16 @@ impl SessionLoop {
                     }
                 }
                 _ = ping.tick() => {
+                    if !credential_still_valid(&self.db, &self.principal).await {
+                        let _ = self
+                            .socket
+                            .send(Message::Close(Some(CloseFrame {
+                                code: close_code::POLICY,
+                                reason: Utf8Bytes::from_static("credential no longer valid"),
+                            })))
+                            .await;
+                        return Ok(());
+                    }
                     if self.last_recv.elapsed() > POND_TIMEOUT {
                         let _ = self.socket.send(Message::Close(None)).await;
                         return Err(SessionError::PongTimeout);
@@ -300,6 +310,16 @@ impl SessionLoop {
                         return Ok(());
                     }
                 };
+                if !credential_still_valid(&self.db, &self.principal).await {
+                    let _ = self
+                        .socket
+                        .send(Message::Close(Some(CloseFrame {
+                            code: close_code::POLICY,
+                            reason: Utf8Bytes::from_static("credential no longer valid"),
+                        })))
+                        .await;
+                    return Ok(());
+                }
                 if self.subscriptions.contains_key(&parsed) {
                     // Re-subscribe is idempotent for the live channel,
                     // but we still respect the new `lastEventId` and

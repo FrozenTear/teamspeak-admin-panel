@@ -118,7 +118,10 @@ async fn run_once(url: &str, cookie_file: Option<&Path>) -> std::io::Result<Stri
     if let Some(copy) = cookie_copy.as_ref() {
         cmd.arg("--cookies").arg(copy.path());
     }
-    cmd.arg(url)
+    // `--` so a stored "URL" starting with `-` is never parsed as a
+    // yt-dlp option.
+    cmd.arg("--")
+        .arg(url)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

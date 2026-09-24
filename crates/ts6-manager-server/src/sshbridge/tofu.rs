@@ -175,26 +175,44 @@ async fn persist_capture(db: &Database, req: &TofuCaptureRequest) {
         WHERE sshHostKeyFingerprint = NONE
         RETURN record::id(id) AS id;";
 
-    let bound = db
-        .query(sql)
-        .bind(("id", req.config_id))
-        .bind(("fp", req.fingerprint.clone()))
-        .await;
-    let mut response = match bound.and_then(|r| r.check()) {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(
-                target: "sshbridge::hostkey",
-                config_id = req.config_id,
-                host = %req.host,
-                port = req.port,
-                user_id = ?req.user_id,
-                error = %e,
-                "TOFU fingerprint persistence failed; in-memory pin still \
-                 enforced for this verifier instance until process restart"
-            );
-            return;
+    let mut response = None;
+    for attempt in 1..=3 {
+        let bound = db
+            .query(sql)
+            .bind(("id", req.config_id))
+            .bind(("fp", req.fingerprint.clone()))
+            .await;
+        match bound.and_then(|r| r.check()) {
+            Ok(r) => {
+                response = Some(r);
+                break;
+            }
+            Err(e) if attempt < 3 => {
+                tracing::warn!(
+                    target: "sshbridge::hostkey",
+                    config_id = req.config_id,
+                    attempt,
+                    error = %e,
+                    "TOFU fingerprint persistence failed; retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50 * attempt)).await;
+            }
+            Err(e) => {
+                tracing::error!(
+                    target: "sshbridge::hostkey",
+                    config_id = req.config_id,
+                    host = %req.host,
+                    port = req.port,
+                    user_id = ?req.user_id,
+                    error = %e,
+                    "TOFU fingerprint persistence failed after retries"
+                );
+                return;
+            }
         }
+    }
+    let Some(mut response) = response else {
+        return;
     };
 
     let rows: Vec<i64> = response.take("id").unwrap_or_default();

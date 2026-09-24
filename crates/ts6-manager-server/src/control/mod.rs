@@ -606,6 +606,9 @@ impl ControlBackend for WebQueryClient {
 #[derive(Clone)]
 pub struct ControlBackendPool {
     inner: Arc<RwLock<HashMap<i64, Arc<dyn ControlBackend>>>>,
+    /// Serialises the first build of each config id so two concurrent
+    /// misses cannot each construct a backend (and a second TOFU verifier).
+    build_locks: Arc<tokio::sync::Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>>,
     allow_self_signed: bool,
     /// Optional path to the operator's `known_hosts` file. Sourced
     /// from `TS_SSH_KNOWN_HOSTS` at boot; `None` falls through to the
@@ -646,6 +649,7 @@ impl ControlBackendPool {
     pub fn new(allow_self_signed: bool, db: Arc<Database>) -> Self {
         Self {
             inner: Arc::new(RwLock::new(HashMap::new())),
+            build_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             allow_self_signed,
             ssh_known_hosts_path: None,
             ssh_tofu_sink: None,
@@ -687,6 +691,17 @@ impl ControlBackendPool {
                 "No connection configured for server config ID {config_id}"
             ))
         })?;
+        let gate = {
+            let mut locks = self.build_locks.lock().await;
+            locks
+                .entry(config_id)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _hold = gate.lock().await;
+        if let Some(existing) = self.inner.read().await.get(&config_id).cloned() {
+            return Ok(existing);
+        }
         let backend = self.build_backend(connection).await?;
         self.inner.write().await.insert(config_id, backend.clone());
         Ok(backend)

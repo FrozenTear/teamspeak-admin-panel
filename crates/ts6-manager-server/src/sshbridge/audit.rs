@@ -337,6 +337,11 @@ fn name_is_credential(name: &str) -> bool {
         return false;
     }
     let lower = name.to_ascii_lowercase();
+    // TeamSpeak `clientmove` carries the channel password as `cpw`, which
+    // does not share a suffix with the other credential names.
+    if lower == "cpw" {
+        return true;
+    }
     CREDENTIAL_SUFFIXES.iter().any(|s| lower.ends_with(s))
 }
 
@@ -547,6 +552,15 @@ mod tests {
         let r = redact_credentials("clientupdate Client_Login_PASSWORD=hunter2");
         assert!(!r.contains("hunter2"));
         assert!(r.contains("Client_Login_PASSWORD=<redacted>"));
+    }
+
+    #[test]
+    fn redact_clientmove_channel_password() {
+        let r = redact_credentials("clientmove clid=4 cid=12 cpw=hunter2");
+        assert!(!r.contains("hunter2"));
+        assert!(r.contains("cpw=<redacted>"));
+        assert!(r.contains("clid=4"));
+        assert!(r.contains("cid=12"));
     }
 
     #[test]

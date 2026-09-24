@@ -570,6 +570,7 @@ async fn channel_create_returns_cid_and_publishes_ws() {
         role: "admin".into(),
         is_admin: true,
         is_at_least_moderator: true,
+        access_exp: i64::MAX,
     });
     let topic = crate::ws::topic::Topic::new(server.id, crate::ws::topic::TopicKind::Channels);
     let mut sub = state
@@ -1057,6 +1058,7 @@ async fn kick_emits_ws_event_on_clients_topic() {
         role: "admin".into(),
         is_admin: true,
         is_at_least_moderator: true,
+        access_exp: i64::MAX,
     });
     let topic = crate::ws::topic::Topic::new(server.id, crate::ws::topic::TopicKind::Clients);
     let mut sub = state

@@ -848,6 +848,7 @@ mod tests {
             role: "admin".into(),
             is_admin: true,
             is_at_least_moderator: true,
+            access_exp: i64::MAX,
         });
         let topic = Topic::new(server.id, TopicKind::VideoSources);
         let mut sub = state

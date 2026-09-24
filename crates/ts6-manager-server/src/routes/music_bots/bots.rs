@@ -16,14 +16,16 @@ use music_bot::{
     BotCommand, BotConfig, BotEvent as DomainBotEvent, BotState as DomainBotState, DisconnectKind,
 };
 use tokio_stream::wrappers::BroadcastStream;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use ts6_manager_shared::music_bots as wire;
 
 use crate::app_state::AppState;
-use crate::auth::extractors::{RequireAuth, RequireAuthOrQueryToken};
+use crate::auth::extractors::{RequireAuth, RequireAuthOrQueryToken, RequireModerator};
+use crate::repos::server_connections::{self, ServerConnection};
+use crate::routes::control::access;
 use crate::routes::music_bots::convert::{bot_id_to_wire, bot_state_to_wire, track_to_wire};
 use crate::routes::music_bots::{
-    music_runtime_unavailable, not_found, translate_send_error, validation,
+    internal, music_runtime_unavailable, not_found, translate_send_error, validation,
 };
 
 pub(super) fn router() -> Router<AppState> {
@@ -39,7 +41,7 @@ pub(super) fn router() -> Router<AppState> {
 
 async fn list(
     State(state): State<AppState>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
 ) -> Result<Json<Vec<wire::MusicBotSummary>>, Response> {
     let supervisor = &state.music_bots.supervisor;
     let infos = supervisor
@@ -48,6 +50,9 @@ async fn list(
         .map_err(|e| music_runtime_unavailable(&e.to_string()))?;
     let mut out = Vec::with_capacity(infos.len());
     for info in infos {
+        if !caller_can_read_addr(&state, &user, &info.server_addr).await? {
+            continue;
+        }
         let liveness = state.music_bots.liveness.snapshot(info.id).await;
         out.push(wire::MusicBotSummary {
             id: bot_id_to_wire(info.id),
@@ -68,7 +73,7 @@ async fn list(
 
 async fn detail(
     State(state): State<AppState>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Path(id): Path<u64>,
 ) -> Result<Json<wire::MusicBotDetail>, Response> {
     let bot = music_bot::BotId(id);
@@ -85,6 +90,9 @@ async fn detail(
         .into_iter()
         .find(|i| i.id == bot)
         .ok_or_else(|| not_found("bot not found"))?;
+    if !caller_can_read_addr(&state, &user, &info.server_addr).await? {
+        return Err(not_found("bot not found"));
+    }
     let liveness = state.music_bots.liveness.snapshot(bot).await;
     let queue = state
         .music_bots
@@ -116,36 +124,33 @@ async fn detail(
 
 async fn create(
     State(state): State<AppState>,
-    RequireAuth(_user): RequireAuth,
+    RequireModerator(user): RequireModerator,
     Json(req): Json<wire::CreateBotRequest>,
 ) -> Result<(StatusCode, Json<wire::MusicBotSummary>), Response> {
     if req.name.trim().is_empty() {
         return Err(validation("name must not be empty"));
     }
-    if req.server_addr.trim().is_empty() {
-        return Err(validation("serverAddr must not be empty"));
-    }
+    // Client `identityPath` is ignored. The file is always allocated
+    // under the server's identity directory.
+    let _ = req.identity_path;
+    let _server = require_server_write(&state, &user, &req.server_addr).await?;
 
     // Allocate an id BEFORE deciding the identity path so the default
     // path embeds the (eventual) bot id and stays unique across
     // simultaneously-spawned bots without auto-rename ceremony.
     let supervisor = &state.music_bots.supervisor;
-    let identity_path = if let Some(p) = req.identity_path {
-        std::path::PathBuf::from(p)
-    } else {
-        let dir = state.music_bots.identity_dir.as_ref();
-        // Best-effort dir creation. If it fails (eg. permissions), the
-        // first connect attempt surfaces the I/O error via
-        // `BotEvent::Error::Connection` — no need to abort the create.
-        let _ = std::fs::create_dir_all(dir);
-        dir.join(format!(
-            "bot-{}.identity",
-            supervisor
-                .next_id_hint()
-                .await
-                .map_err(|e| music_runtime_unavailable(&e.to_string()))?
-        ))
-    };
+    let dir = state.music_bots.identity_dir.as_ref();
+    // Best-effort dir creation. If it fails (eg. permissions), the
+    // first connect attempt surfaces the I/O error via
+    // `BotEvent::Error::Connection` — no need to abort the create.
+    let _ = std::fs::create_dir_all(dir);
+    let identity_path = dir.join(format!(
+        "bot-{}.identity",
+        supervisor
+            .next_id_hint()
+            .await
+            .map_err(|e| music_runtime_unavailable(&e.to_string()))?
+    ));
 
     // `auto_connect` is omittable on the wire; `BotConfig` defaults it
     // to `true`, so an absent field resolves to the same value.
@@ -202,9 +207,10 @@ async fn create(
 
 async fn shutdown(
     State(state): State<AppState>,
-    RequireAuth(_user): RequireAuth,
+    RequireModerator(user): RequireModerator,
     Path(id): Path<u64>,
 ) -> Result<StatusCode, Response> {
+    require_bot_write(&state, &user, id).await?;
     let bot = music_bot::BotId(id);
     state
         .music_bots
@@ -225,9 +231,10 @@ async fn shutdown(
 
 async fn connect(
     State(state): State<AppState>,
-    RequireAuth(_user): RequireAuth,
+    RequireModerator(user): RequireModerator,
     Path(id): Path<u64>,
 ) -> Result<StatusCode, Response> {
+    require_bot_write(&state, &user, id).await?;
     state
         .music_bots
         .supervisor
@@ -239,9 +246,10 @@ async fn connect(
 
 async fn disconnect(
     State(state): State<AppState>,
-    RequireAuth(_user): RequireAuth,
+    RequireModerator(user): RequireModerator,
     Path(id): Path<u64>,
 ) -> Result<StatusCode, Response> {
+    require_bot_write(&state, &user, id).await?;
     state
         .music_bots
         .supervisor
@@ -253,10 +261,11 @@ async fn disconnect(
 
 async fn join(
     State(state): State<AppState>,
-    RequireAuth(_user): RequireAuth,
+    RequireModerator(user): RequireModerator,
     Path(id): Path<u64>,
     Json(req): Json<wire::JoinChannelRequest>,
 ) -> Result<StatusCode, Response> {
+    require_bot_write(&state, &user, id).await?;
     state
         .music_bots
         .supervisor
@@ -271,9 +280,10 @@ async fn join(
 
 async fn leave(
     State(state): State<AppState>,
-    RequireAuth(_user): RequireAuth,
+    RequireModerator(user): RequireModerator,
     Path(id): Path<u64>,
 ) -> Result<StatusCode, Response> {
+    require_bot_write(&state, &user, id).await?;
     state
         .music_bots
         .supervisor
@@ -287,10 +297,23 @@ async fn events_sse(
     State(state): State<AppState>,
     // EventSource cannot set Authorization headers. Accept Bearer *or*
     // `?token=<access_jwt>` via the same path as `/api/ws?token=…`.
-    RequireAuthOrQueryToken(_user): RequireAuthOrQueryToken,
+    RequireAuthOrQueryToken(user): RequireAuthOrQueryToken,
     Path(id): Path<u64>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, Response> {
     let bot = music_bot::BotId(id);
+    let infos = state
+        .music_bots
+        .supervisor
+        .list()
+        .await
+        .map_err(|e| music_runtime_unavailable(&e.to_string()))?;
+    let info = infos
+        .into_iter()
+        .find(|i| i.id == bot)
+        .ok_or_else(|| not_found("bot not found"))?;
+    if !caller_can_read_addr(&state, &user, &info.server_addr).await? {
+        return Err(not_found("bot not found"));
+    }
     let rx = match state.music_bots.supervisor.subscribe(bot).await {
         Ok(Some(rx)) => rx,
         Ok(None) => return Err(not_found("bot not found")),
@@ -314,6 +337,139 @@ async fn events_sse(
         }
     });
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
+}
+
+/// Host of a `host:port` or `[ipv6]:port` voice address.
+///
+/// Rejects URLs, userinfo, and a zero port. The host is what a
+/// `server_connection` row is matched on — the voice port lives on the
+/// bot, not the connection row.
+#[allow(clippy::result_large_err)]
+fn parse_voice_host(server_addr: &str) -> Result<String, Response> {
+    let addr = server_addr.trim();
+    if addr.is_empty() || addr.contains(['/', '@', ' ', '\\', '?', '#']) || addr.contains("://") {
+        return Err(validation("serverAddr must be host:port"));
+    }
+    let (host, port) = if let Some(rest) = addr.strip_prefix('[') {
+        let Some((host, after)) = rest.split_once(']') else {
+            return Err(validation("serverAddr host is invalid"));
+        };
+        let port = if after.is_empty() {
+            None
+        } else {
+            let Some(port_str) = after.strip_prefix(':') else {
+                return Err(validation("serverAddr must be host:port"));
+            };
+            Some(
+                port_str
+                    .parse::<u16>()
+                    .map_err(|_| validation("serverAddr port is invalid"))?,
+            )
+        };
+        (host.to_string(), port)
+    } else if let Some((host, port_str)) = addr.rsplit_once(':')
+        && !host.is_empty()
+        && !host.contains(':')
+    {
+        let port = port_str
+            .parse::<u16>()
+            .map_err(|_| validation("serverAddr port is invalid"))?;
+        (host.to_string(), Some(port))
+    } else if addr.contains(':') {
+        return Err(validation("serverAddr host is invalid"));
+    } else {
+        (addr.to_string(), None)
+    };
+    if port == Some(0) {
+        return Err(validation("serverAddr port is invalid"));
+    }
+    url::Host::parse(&host).map_err(|_| validation("serverAddr host is invalid"))?;
+    Ok(host)
+}
+
+fn hosts_equal(configured: &str, parsed: &str) -> bool {
+    configured
+        .trim()
+        .trim_matches(['[', ']'])
+        .eq_ignore_ascii_case(parsed)
+}
+
+async fn server_for_addr(
+    state: &AppState,
+    server_addr: &str,
+) -> Result<ServerConnection, Response> {
+    let host = parse_voice_host(server_addr)?;
+    let rows = server_connections::list(&state.db).await.map_err(|e| {
+        error!(error = %e, "music-bot server lookup failed");
+        internal("server lookup failed")
+    })?;
+    rows.into_iter()
+        .find(|row| row.enabled && hosts_equal(&row.host, &host))
+        .ok_or_else(|| validation("serverAddr does not match a configured server"))
+}
+
+async fn require_server_write(
+    state: &AppState,
+    user: &crate::auth::extractors::AuthUser,
+    server_addr: &str,
+) -> Result<ServerConnection, Response> {
+    let server = server_for_addr(state, server_addr).await?;
+    access::check_write(state, user, server.id).await
+}
+
+/// `true` when the caller may see a bot bound to `server_addr`.
+/// An address that matches no enabled server is hidden. A database
+/// failure is returned so the handler can answer 500.
+async fn caller_can_read_addr(
+    state: &AppState,
+    user: &crate::auth::extractors::AuthUser,
+    server_addr: &str,
+) -> Result<bool, Response> {
+    let host = match parse_voice_host(server_addr) {
+        Ok(host) => host,
+        Err(_) => return Ok(false),
+    };
+    let rows = server_connections::list(&state.db).await.map_err(|e| {
+        error!(error = %e, "music-bot server lookup failed");
+        internal("server lookup failed")
+    })?;
+    let Some(server) = rows
+        .into_iter()
+        .find(|row| row.enabled && hosts_equal(&row.host, &host))
+    else {
+        return Ok(false);
+    };
+    if user.is_admin() {
+        return Ok(true);
+    }
+    match access::check_read(state, user, server.id).await {
+        Ok(_) => Ok(true),
+        Err(resp)
+            if resp.status() == StatusCode::FORBIDDEN || resp.status() == StatusCode::NOT_FOUND =>
+        {
+            Ok(false)
+        }
+        Err(resp) => Err(resp),
+    }
+}
+
+async fn require_bot_write(
+    state: &AppState,
+    user: &crate::auth::extractors::AuthUser,
+    id: u64,
+) -> Result<(), Response> {
+    let infos = state
+        .music_bots
+        .supervisor
+        .list()
+        .await
+        .map_err(|e| music_runtime_unavailable(&e.to_string()))?;
+    let info = infos
+        .into_iter()
+        .find(|i| i.id == music_bot::BotId(id))
+        .ok_or_else(|| not_found("bot not found"))?;
+    require_server_write(state, user, &info.server_addr).await?;
+    Ok(())
 }
 
 /// Map a `music_bot::BotEvent` onto the wire `BotEventWire` projection.

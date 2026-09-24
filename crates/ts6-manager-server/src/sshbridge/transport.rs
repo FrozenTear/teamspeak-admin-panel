@@ -133,8 +133,13 @@ pub fn next_backoff(attempts: u32, cfg: &TransportConfig) -> Duration {
 }
 
 /// One command submitted to the dispatch loop.
+///
+/// `lines`, when non-empty, is a batch the dispatch loop runs
+/// back-to-back before it accepts another request. `line` is the audit
+/// label used when `lines` is empty (a single command).
 struct CommandRequest {
     line: String,
+    lines: Vec<String>,
     timeout: Option<Duration>,
     user_id: Option<i64>,
     virtual_server_id: Option<i64>,
@@ -245,6 +250,55 @@ impl TransportHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
         let req = CommandRequest {
             line: line.into(),
+            lines: Vec::new(),
+            timeout: None,
+            user_id,
+            virtual_server_id,
+            reply: reply_tx,
+        };
+        if self.cmd_tx.send(req).await.is_err() {
+            return Err(SshBridgeError::Transport(
+                "ssh transport task is no longer running".into(),
+            ));
+        }
+        match reply_rx.await {
+            Ok(outcome) => outcome,
+            Err(_) => Err(SshBridgeError::Transport(
+                "ssh transport reply channel was dropped".into(),
+            )),
+        }
+    }
+
+    /// Submit several wire lines as one dispatch item. The loop runs
+    /// them back-to-back, so a concurrent command cannot land between
+    /// `use sid=` and the commands that depend on that selection.
+    /// The reply is the last successful outcome, or the first failure.
+    pub async fn execute_lines(
+        &self,
+        lines: Vec<String>,
+        user_id: Option<i64>,
+        virtual_server_id: Option<i64>,
+    ) -> SshBridgeResult<CommandOutcome> {
+        if lines.is_empty() {
+            return Err(SshBridgeError::Transport(
+                "execute_lines requires at least one line".into(),
+            ));
+        }
+        if *self.host_key_mismatch.lock().await {
+            return Err(SshBridgeError::HostKeyMismatch {
+                config_id: self.config_id,
+            });
+        }
+        if *self.auth_rejected.lock().await {
+            return Err(SshBridgeError::AuthRejected {
+                config_id: self.config_id,
+            });
+        }
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let label = lines.join(" ; ");
+        let req = CommandRequest {
+            line: label,
+            lines,
             timeout: None,
             user_id,
             virtual_server_id,
@@ -468,72 +522,100 @@ async fn dispatch_loop<C: SshChannel>(
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { return SessionResult::ShuttingDown; };
                 let timeout = cmd.timeout.unwrap_or(ctx.cfg.command_timeout);
-                let result = execute_one(
-                    &mut channel,
-                    &mut parser,
-                    &cmd.line,
-                    timeout,
-                    &ctx.notify_tx,
-                ).await;
-                match result {
-                    Ok(outcome) => {
-                        let public = match super::frame_to_result(outcome.error.clone()) {
-                            Ok(()) => {
-                                let entry = AuditEntry::success(
-                                    ctx.cfg.config_id,
-                                    cmd.virtual_server_id,
-                                    cmd.user_id,
-                                    cmd.line.clone(),
-                                    outcome.latency,
-                                );
-                                entry.emit();
-                                fire_and_forget_persist(ctx.db.as_ref(), &entry);
-                                Ok(outcome)
+                // A batch (`lines`) runs to completion before the next
+                // queued command is accepted, so `use sid=` cannot be
+                // split from the commands that depend on it.
+                let wire_lines = if cmd.lines.is_empty() {
+                    vec![cmd.line.clone()]
+                } else {
+                    cmd.lines.clone()
+                };
+                let mut reply: Option<SshBridgeResult<CommandOutcome>> = None;
+                let mut stop: Option<SessionResult> = None;
+                for line in wire_lines {
+                    let result = execute_one(
+                        &mut channel,
+                        &mut parser,
+                        &line,
+                        timeout,
+                        &ctx.notify_tx,
+                    ).await;
+                    match result {
+                        Ok(outcome) => {
+                            let public = match super::frame_to_result(outcome.error.clone()) {
+                                Ok(()) => {
+                                    let entry = AuditEntry::success(
+                                        ctx.cfg.config_id,
+                                        cmd.virtual_server_id,
+                                        cmd.user_id,
+                                        line,
+                                        outcome.latency,
+                                    );
+                                    entry.emit();
+                                    fire_and_forget_persist(ctx.db.as_ref(), &entry);
+                                    Ok(outcome)
+                                }
+                                Err(SshBridgeError::Upstream { code, message }) => {
+                                    let entry = AuditEntry::upstream_error(
+                                        ctx.cfg.config_id,
+                                        cmd.virtual_server_id,
+                                        cmd.user_id,
+                                        line,
+                                        code,
+                                        message.clone(),
+                                        outcome.latency,
+                                    );
+                                    entry.emit();
+                                    fire_and_forget_persist(ctx.db.as_ref(), &entry);
+                                    Err(SshBridgeError::Upstream { code, message })
+                                }
+                                Err(other) => Err(other),
+                            };
+                            let failed = public.is_err();
+                            reply = Some(public);
+                            if failed {
+                                break;
                             }
-                            Err(SshBridgeError::Upstream { code, message }) => {
-                                let entry = AuditEntry::upstream_error(
-                                    ctx.cfg.config_id,
-                                    cmd.virtual_server_id,
-                                    cmd.user_id,
-                                    cmd.line.clone(),
-                                    code,
-                                    message.clone(),
-                                    outcome.latency,
-                                );
-                                entry.emit();
-                                fire_and_forget_persist(ctx.db.as_ref(), &entry);
-                                Err(SshBridgeError::Upstream { code, message })
-                            }
-                            Err(other) => Err(other),
-                        };
-                        let _ = cmd.reply.send(public);
+                        }
+                        Err(TransportError::AuthRejected) => {
+                            reply = Some(Err(SshBridgeError::AuthRejected {
+                                config_id: ctx.cfg.config_id,
+                            }));
+                            stop = Some(SessionResult::AuthRejected);
+                            break;
+                        }
+                        Err(e) => {
+                            let is_auth = matches!(&e, TransportError::Closed(s) | TransportError::Io(s) if looks_like_auth_failure(s));
+                            let entry = AuditEntry::transport(
+                                ctx.cfg.config_id,
+                                cmd.virtual_server_id,
+                                cmd.user_id,
+                                line,
+                                e.to_string(),
+                                Duration::from_millis(0),
+                            );
+                            entry.emit();
+                            fire_and_forget_persist(ctx.db.as_ref(), &entry);
+                            let public_err = if is_auth {
+                                SshBridgeError::AuthRejected { config_id: ctx.cfg.config_id }
+                            } else {
+                                SshBridgeError::Transport(e.to_string())
+                            };
+                            reply = Some(Err(public_err));
+                            stop = Some(if is_auth {
+                                SessionResult::AuthRejected
+                            } else {
+                                SessionResult::Reconnect
+                            });
+                            break;
+                        }
                     }
-                    Err(TransportError::AuthRejected) => {
-                        let _ = cmd.reply.send(Err(SshBridgeError::AuthRejected {
-                            config_id: ctx.cfg.config_id,
-                        }));
-                        return SessionResult::AuthRejected;
-                    }
-                    Err(e) => {
-                        let is_auth = matches!(&e, TransportError::Closed(s) | TransportError::Io(s) if looks_like_auth_failure(s));
-                        let entry = AuditEntry::transport(
-                            ctx.cfg.config_id,
-                            cmd.virtual_server_id,
-                            cmd.user_id,
-                            cmd.line.clone(),
-                            e.to_string(),
-                            Duration::from_millis(0),
-                        );
-                        entry.emit();
-                        fire_and_forget_persist(ctx.db.as_ref(), &entry);
-                        let public_err = if is_auth {
-                            SshBridgeError::AuthRejected { config_id: ctx.cfg.config_id }
-                        } else {
-                            SshBridgeError::Transport(e.to_string())
-                        };
-                        let _ = cmd.reply.send(Err(public_err));
-                        return if is_auth { SessionResult::AuthRejected } else { SessionResult::Reconnect };
-                    }
+                }
+                if let Some(public) = reply {
+                    let _ = cmd.reply.send(public);
+                }
+                if let Some(end) = stop {
+                    return end;
                 }
             }
 
@@ -632,6 +714,18 @@ async fn dispatch_loop<C: SshChannel>(
                         consecutive_keepalive_failures = 0;
                     }
                     Err(TransportError::AuthRejected) => return SessionResult::AuthRejected,
+                    // A timed-out `whoami` may still be answered later. The
+                    // next `execute_one` would consume that late reply as
+                    // its own result and desync every later command. Drop
+                    // the session instead of counting toward a threshold.
+                    Err(TransportError::Timeout) => {
+                        tracing::warn!(
+                            target: "sshbridge::keepalive",
+                            config_id = ctx.cfg.config_id,
+                            "ssh keepalive timed out — reconnecting so a late reply cannot desync commands"
+                        );
+                        return SessionResult::Reconnect;
+                    }
                     Err(e) => {
                         consecutive_keepalive_failures += 1;
                         tracing::warn!(
@@ -1343,6 +1437,7 @@ mod tests {
             .send(CommandRequest {
                 line: "cmd-one".into(),
                 timeout: None,
+                lines: Vec::new(),
                 user_id: None,
                 virtual_server_id: None,
                 reply: r1,
@@ -1353,6 +1448,7 @@ mod tests {
             .send(CommandRequest {
                 line: "cmd-two".into(),
                 timeout: None,
+                lines: Vec::new(),
                 user_id: None,
                 virtual_server_id: None,
                 reply: r2,
@@ -1363,6 +1459,7 @@ mod tests {
             .send(CommandRequest {
                 line: "cmd-three".into(),
                 timeout: None,
+                lines: Vec::new(),
                 user_id: None,
                 virtual_server_id: None,
                 reply: r3,
@@ -1591,6 +1688,7 @@ mod tests {
             .send(CommandRequest {
                 line: "post-reconnect-cmd".into(),
                 timeout: None,
+                lines: Vec::new(),
                 user_id: None,
                 virtual_server_id: None,
                 reply: reply_tx,
@@ -1635,6 +1733,7 @@ mod tests {
             .send(CommandRequest {
                 line: "clientlist".into(),
                 timeout: None,
+                lines: Vec::new(),
                 user_id: None,
                 virtual_server_id: Some(3),
                 reply: reply_tx,
@@ -1691,6 +1790,7 @@ mod tests {
             .send(CommandRequest {
                 line: "version".into(),
                 timeout: None,
+                lines: Vec::new(),
                 user_id: None,
                 virtual_server_id: None,
                 reply: reply_tx,
@@ -1729,6 +1829,7 @@ mod tests {
             .send(CommandRequest {
                 line: "version".into(),
                 timeout: None,
+                lines: Vec::new(),
                 user_id: None,
                 virtual_server_id: None,
                 reply: reply_tx,
@@ -1804,6 +1905,7 @@ mod tests {
             .send(CommandRequest {
                 line: "version".into(),
                 timeout: None,
+                lines: Vec::new(),
                 user_id: None,
                 virtual_server_id: None,
                 reply: reply_tx_a,
@@ -1814,6 +1916,7 @@ mod tests {
             .send(CommandRequest {
                 line: "hostinfo".into(),
                 timeout: None,
+                lines: Vec::new(),
                 user_id: None,
                 virtual_server_id: None,
                 reply: reply_tx_b,
@@ -2012,6 +2115,7 @@ mod tests {
             .send(CommandRequest {
                 line: "clientlist -uid".into(),
                 timeout: None,
+                lines: Vec::new(),
                 user_id: None,
                 virtual_server_id: Some(1),
                 reply: reply_tx,
@@ -2085,6 +2189,7 @@ mod tests {
             .send(CommandRequest {
                 line: "version".into(),
                 timeout: None,
+                lines: Vec::new(),
                 user_id: None,
                 virtual_server_id: None,
                 reply: reply_tx,

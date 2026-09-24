@@ -109,6 +109,13 @@ static PER_UID_LIMITER: LazyLock<UidLimiter> = LazyLock::new(|| {
     RateLimiter::keyed(quota)
 });
 
+/// Start the eviction sweeps for [`PER_IP_LIMITER`] and [`PER_UID_LIMITER`].
+/// Call once at boot from inside the Tokio runtime.
+pub fn spawn_limiter_sweeps() {
+    crate::web::rate_limit::spawn_retain_recent(&*PER_IP_LIMITER);
+    crate::web::rate_limit::spawn_retain_recent(&*PER_UID_LIMITER);
+}
+
 /// The trusted client IP resolved by [`rate_limit_and_attribute`] and
 /// stashed in request extensions for the handlers (they hash it into a
 /// `moderation_report` / `moderation_appeal` `sourceIpHash`). A newtype so

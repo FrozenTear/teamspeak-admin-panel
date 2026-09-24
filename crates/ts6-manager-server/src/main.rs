@@ -366,6 +366,7 @@ mod server_entry {
             limiter: web::rate_limit::make_auth_limiter(),
             proxy: proxy_trust.clone(),
         };
+        web::rate_limit::spawn_retain_recent(auth_rate_limit_state.limiter.clone());
         // PURA-35: dedicated limiter for `POST /api/setup/init`. Same
         // 15-req / 15-min spec §6.8 quota, but its OWN GCRA bucket map
         // — login spam can't DoS the bootstrap wizard and a stuck setup
@@ -374,6 +375,7 @@ mod server_entry {
             limiter: web::rate_limit::make_setup_limiter(),
             proxy: proxy_trust.clone(),
         };
+        web::rate_limit::spawn_retain_recent(setup_rate_limit_state.limiter.clone());
 
         // Phase 1 SECURITY (slice 3 + 4a + 4b): build the stateful sub-routers
         // once with state baked in so they compose as `Router<()>` with the
@@ -427,6 +429,8 @@ mod server_entry {
             cfg.trusted_proxy_hops,
             cfg.trusted_proxy_cidrs.clone(),
         );
+        web::rate_limit::spawn_retain_recent(widget_rl_state.by_token.clone());
+        web::rate_limit::spawn_retain_recent(widget_rl_state.by_ip.clone());
         let widget_router = widgets::routes::router().with_state(state.clone()).layer(
             axum::middleware::from_fn_with_state(widget_rl_state, web::widget_rate_limit),
         );
@@ -456,6 +460,7 @@ mod server_entry {
         let public_moderation_router =
             routes::public_moderation::router(cfg.moderation_trusted_proxy_cidrs.clone())
                 .with_state(state.clone());
+        routes::public_moderation::spawn_limiter_sweeps();
         // Operator bug reports (`POST /api/bug-reports`). RequireAuth;
         // GitHub sink is optional (503 when env is unset).
         let bug_reports_router = routes::bug_reports::router().with_state(state.clone());

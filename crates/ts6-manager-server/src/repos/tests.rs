@@ -192,7 +192,7 @@ async fn refresh_token_reuse_detection_lookup_by_replaced_by() {
     .await
     .expect("insert user");
 
-    let r1 = refresh_tokens::insert(
+    let _r1 = refresh_tokens::insert(
         &db,
         refresh_tokens::NewRefreshToken {
             token: "old-token".into(),
@@ -204,7 +204,7 @@ async fn refresh_token_reuse_detection_lookup_by_replaced_by() {
     .await
     .expect("insert r1");
 
-    refresh_tokens::set_replaced_by(&db, &r1.token, "new-token")
+    refresh_tokens::set_replaced_by(&db, "old-token", "new-token")
         .await
         .expect("rotate");
 
@@ -213,8 +213,15 @@ async fn refresh_token_reuse_detection_lookup_by_replaced_by() {
         .expect("lookup")
         .expect("predecessor must be found");
     assert_eq!(predecessor.userId, user.id);
-    assert_eq!(predecessor.token, "old-token");
-    assert_eq!(predecessor.replacedBy.as_deref(), Some("new-token"));
+    assert_eq!(
+        predecessor.token,
+        refresh_tokens::token_at_rest("old-token")
+    );
+    assert_ne!(predecessor.token, "old-token");
+    assert_eq!(
+        predecessor.replacedBy.as_deref(),
+        Some(refresh_tokens::token_at_rest("new-token").as_str())
+    );
 }
 
 #[tokio::test]

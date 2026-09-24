@@ -280,6 +280,26 @@ impl HostKeyVerifier {
         // exactly one wins the `set` and the other observes a present
         // value via the `Err(prior)` branch and falls back to strict
         // comparison.
+        let req = TofuCaptureRequest {
+            config_id: self.config_id,
+            host: self.host.clone(),
+            port: self.port,
+            fingerprint: super::tofu::fingerprint_to_storage(&observed),
+            user_id: None,
+        };
+        // Persist before the in-memory pin. A dropped capture would accept
+        // the key for this process and re-arm TOFU against a different key
+        // after restart.
+        if !sink.try_send(req) {
+            tracing::warn!(
+                target: "sshbridge::hostkey",
+                config_id = self.config_id,
+                host = %self.host,
+                port = self.port,
+                "host-key REJECTED (TOFU persistence queue is full or shut down)"
+            );
+            return false;
+        }
         match self.tofu_pin.set(observed) {
             Ok(()) => {
                 tracing::warn!(
@@ -293,14 +313,6 @@ impl HostKeyVerifier {
                      out-of-band MUST pin sshHostKeyFingerprint manually instead; \
                      TOFU's first-connect window is the MitM exposure"
                 );
-                let req = TofuCaptureRequest {
-                    config_id: self.config_id,
-                    host: self.host.clone(),
-                    port: self.port,
-                    fingerprint: super::tofu::fingerprint_to_storage(&observed),
-                    user_id: None,
-                };
-                let _ = sink.try_send(req);
                 true
             }
             Err(prior) => {
@@ -602,13 +614,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tofu_drop_on_full_channel_does_not_break_in_memory_pin() {
-        // Worst case: the TOFU worker has fallen behind and the
-        // bounded channel is full. The verifier MUST still enforce
-        // the in-memory pin — the dropped persistence event only
-        // means the row stays NULL on disk, not that the verifier
-        // forgets the key.
-        let (sink, mut rx) = tofu_sink();
+    async fn tofu_full_channel_refuses_to_pin() {
+        let (sink, _rx) = tofu_sink();
         // Fill the channel by spamming `try_send` directly; we don't
         // care what gets stored — we just want subsequent verifier
         // emissions to drop. The for-test sink has capacity 32.
@@ -623,21 +630,15 @@ mod tests {
         }
 
         let (key_a, _) = fresh_key();
-        let (key_b, _) = fresh_key();
         let v = HostKeyVerifier::new(
             HostKeyPolicy::TrustOnFirstUse { sink },
             7,
             "ts.example",
             10022,
         );
-        // First verify still succeeds (the verifier sets its OnceLock
-        // before try_send returns, and a dropped persistence event
-        // does not flip the verify decision).
-        assert!(v.verify(&key_a));
-        // Mismatch on the next call still fails — in-memory pin
-        // protects this process even with no disk-side persistence.
-        assert!(!v.verify(&key_b));
-        // Drain the receiver so the sink doesn't drop noisy.
-        while rx.try_recv().is_ok() {}
+        assert!(
+            !v.verify(&key_a),
+            "a key that cannot be persisted must not be trusted"
+        );
     }
 }

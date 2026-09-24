@@ -1583,10 +1583,10 @@ fn copy_to_clipboard(text: &str) {
     }
 }
 
-/// Derive the session badge — (label, css class). Rotated tokens (with a
-/// `replacedBy`) are spent; an expired-but-not-rotated token is forensic.
+/// Derive the session badge — (label, css class). Rotated predecessors
+/// are spent; an expired-but-not-rotated token is forensic.
 fn session_state(s: &AdminSession) -> (&'static str, &'static str) {
-    if s.replaced_by.is_some() {
+    if s.rotated {
         ("Rotated", "tag tag-neutral")
     } else if s.expires_at <= Utc::now() {
         ("Expired", "tag tag-warning")

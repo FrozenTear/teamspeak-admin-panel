@@ -21,10 +21,12 @@
 //!   next-allowed time
 //!
 //! Backed by `governor` (token-bucket / GCRA) with a `DashMap`-backed
-//! per-key state store. Eviction of dormant keys is governor's
-//! responsibility — the limiter retains keys until they replenish to
-//! full capacity, then drops them.
+//! per-key state store. governor never evicts on its own: a key stays
+//! resident until someone calls `retain_recent()`. Every keyed limiter
+//! must be handed to [`spawn_retain_recent`] or the map grows by one
+//! entry per distinct source IP (or widget token) seen since boot.
 
+use std::hash::Hash;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
@@ -105,6 +107,41 @@ pub fn make_auth_limiter() -> Arc<AuthRateLimiter> {
 /// bootstrap wizard (and a stuck setup retry can't lock out login).
 pub fn make_setup_limiter() -> Arc<AuthRateLimiter> {
     make_keyed_limiter(setup_quota())
+}
+
+/// How often [`spawn_retain_recent`] drops keys whose bucket is full again.
+pub const LIMITER_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Periodically drop keys that are indistinguishable from a fresh bucket.
+///
+/// Takes anything that derefs to a keyed limiter so both `Arc` limiters and
+/// the `LazyLock` statics on the public moderation surface can use it.
+pub fn spawn_retain_recent<K, L>(limiter: L)
+where
+    K: Hash + Eq + Clone + Send + Sync + 'static,
+    L: std::ops::Deref<Target = RateLimiter<K, DefaultKeyedStateStore<K>, DefaultClock>>
+        + Send
+        + 'static,
+{
+    spawn_retain_recent_every(limiter, LIMITER_SWEEP_INTERVAL);
+}
+
+fn spawn_retain_recent_every<K, L>(limiter: L, every: Duration)
+where
+    K: Hash + Eq + Clone + Send + Sync + 'static,
+    L: std::ops::Deref<Target = RateLimiter<K, DefaultKeyedStateStore<K>, DefaultClock>>
+        + Send
+        + 'static,
+{
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            limiter.retain_recent();
+            limiter.shrink_to_fit();
+        }
+    });
 }
 
 /// Axum middleware: per-IP rate limit on the wrapped routes.
@@ -443,6 +480,23 @@ mod tests {
         // spec's 15/15min window. Verifies the encoding choice doesn't
         // drift if the period helper is touched later.
         assert_eq!(q.replenish_interval(), Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn sweep_drops_keys_once_their_bucket_refills() {
+        let quota = Quota::with_period(Duration::from_millis(5))
+            .unwrap()
+            .allow_burst(NonZeroU32::new(1).unwrap());
+        let limiter = make_keyed_limiter(quota);
+        for n in 0..200u32 {
+            let ip = IpAddr::from(std::net::Ipv4Addr::from(0x0a00_0000 + n));
+            let _ = limiter.check_key(&ip);
+        }
+        assert_eq!(limiter.len(), 200);
+
+        spawn_retain_recent_every(limiter.clone(), Duration::from_millis(20));
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(limiter.len(), 0, "refilled keys must be evicted");
     }
 
     // Silence unused-helper warning when individual tests are commented

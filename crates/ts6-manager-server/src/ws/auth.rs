@@ -44,16 +44,20 @@ pub struct UserPrincipal {
     pub role: String,
     pub is_admin: bool,
     pub is_at_least_moderator: bool,
+    /// Access-token `exp` (unix seconds) captured at handshake. The
+    /// session loop closes the socket once this instant has passed.
+    pub access_exp: i64,
 }
 
-impl From<AuthUser> for UserPrincipal {
-    fn from(u: AuthUser) -> Self {
+impl UserPrincipal {
+    pub(crate) fn from_user(u: AuthUser, access_exp: i64) -> Self {
         Self {
             is_admin: u.is_admin(),
             is_at_least_moderator: u.is_at_least_moderator(),
             user_id: u.id,
             username: u.username,
             role: u.role,
+            access_exp,
         }
     }
 }
@@ -86,10 +90,48 @@ pub async fn resolve_principal(
     token: &str,
 ) -> Result<Principal, AuthenticateError> {
     match authenticate_token(state, token).await {
-        Ok(user) => Ok(Principal::User(user.into())),
+        Ok(user) => {
+            let access_exp = crate::auth::jwt::verify_access(token, &state.jwt_secret)
+                .map(|claims| claims.exp)
+                .unwrap_or(0);
+            Ok(Principal::User(UserPrincipal::from_user(user, access_exp)))
+        }
         Err(WsAuthError::InvalidOrExpired) => resolve_widget(state, token).await,
         Err(WsAuthError::Disabled) => Err(AuthenticateError::Unauthorized),
         Err(WsAuthError::Backend) => Err(AuthenticateError::Backend),
+    }
+}
+
+/// Re-check a live socket's credential.
+///
+/// Operators: the access token must still be unexpired, and the user
+/// row must still exist, be enabled, and hold the same role captured at
+/// handshake. Widgets: the row must still exist. A database error fails
+/// closed.
+pub(crate) async fn credential_still_valid(
+    db: &crate::db::Database,
+    principal: &Principal,
+) -> bool {
+    match principal {
+        Principal::User(user) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(i64::MAX);
+            if now >= user.access_exp {
+                return false;
+            }
+            match crate::repos::users::find_by_id(db, user.user_id).await {
+                Ok(Some(row)) => row.enabled && row.role == user.role,
+                _ => false,
+            }
+        }
+        Principal::Widget(widget) => {
+            matches!(
+                crate::repos::widgets::find_by_id(db, widget.widget_id).await,
+                Ok(Some(_))
+            )
+        }
     }
 }
 
@@ -257,5 +299,85 @@ mod tests {
 
         let err = resolve_principal(&state, &token).await.unwrap_err();
         assert!(matches!(err, AuthenticateError::Unauthorized));
+    }
+
+    #[tokio::test]
+    async fn live_session_closes_when_role_changes_or_token_expires() {
+        let state = fresh_state().await;
+        let uid = seed_user(&state, "moderator", true).await;
+        let token = jwt::mint_access(
+            uid,
+            "alice",
+            "moderator",
+            state.jwt_access_expiry,
+            &state.jwt_secret,
+        )
+        .unwrap();
+        let principal = resolve_principal(&state, &token).await.unwrap();
+        assert!(credential_still_valid(&state.db, &principal).await);
+
+        users::update(
+            &state.db,
+            uid,
+            users::UserUpdate {
+                role: Some("viewer".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!credential_still_valid(&state.db, &principal).await);
+
+        users::update(
+            &state.db,
+            uid,
+            users::UserUpdate {
+                role: Some("moderator".into()),
+                enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!credential_still_valid(&state.db, &principal).await);
+
+        let expired = Principal::User(UserPrincipal {
+            user_id: uid,
+            username: "alice".into(),
+            role: "moderator".into(),
+            is_admin: false,
+            is_at_least_moderator: true,
+            access_exp: 1,
+        });
+        assert!(!credential_still_valid(&state.db, &expired).await);
+    }
+
+    #[tokio::test]
+    async fn widget_session_closes_when_the_row_is_gone() {
+        let state = fresh_state().await;
+        let widget = widget_repo::insert(
+            &state.db,
+            widget_repo::NewWidget {
+                name: "lobby".into(),
+                token: "tok-live".into(),
+                serverConfigId: 5,
+                virtualServerId: 1,
+                theme: "auto".into(),
+                showChannelTree: true,
+                showClients: true,
+                hideEmptyChannels: false,
+                maxChannelDepth: 5,
+            },
+        )
+        .await
+        .unwrap();
+        let principal = Principal::Widget(WidgetPrincipal {
+            widget_id: widget.id,
+            server_config_id: 5,
+            virtual_server_id: 1,
+        });
+        assert!(credential_still_valid(&state.db, &principal).await);
+        widget_repo::delete(&state.db, widget.id).await.unwrap();
+        assert!(!credential_still_valid(&state.db, &principal).await);
     }
 }
