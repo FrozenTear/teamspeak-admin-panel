@@ -26,19 +26,19 @@
 //! `POST /api/auth/refresh` route semantics, the 7-day default lifetime, the
 //! 64-byte hex token format, and the family concept all match the spec.
 //!
-//! ## At-least-once execution
+//! ## Concurrent rotation
 //!
-//! Spec §6.5.3 explicitly licenses "side effects compatible with at-least-
-//! once execution", so we do not wrap rotation in a SurrealDB transaction.
-//! The race between two concurrent rotations with the same input is benign
-//! under the predecessor-preserved scheme:
-//!
-//! - If both observe `replacedBy = NONE` and both proceed, two successors
-//!   are created in the same family. Either chain rotates normally
-//!   afterwards; neither half is leaked to an attacker by this race.
-//! - If one observes the other's `replacedBy` flip first, it triggers
-//!   reuse-detection and revokes the entire user session set — the safe
-//!   default for any ambiguous replay.
+//! Spec §6.5.3 licenses side effects that tolerate at-least-once execution.
+//! A forked family is not one of those side effects: each live successor is
+//! a valid refresh credential, and rotating along either chain never looks
+//! like reuse of the predecessor. `commit_rotation` is one transaction, but
+//! SurrealDB 3.0.5's mem engine (SurrealMX, what `connect_in_memory` uses)
+//! does not always abort the losing writer when two transactions update the
+//! same record. Both can commit. After a successful commit, [`rotate`]
+//! counts unreplaced rows in the family from a new query and, if more than
+//! one is live, deletes that family and returns an error. The check does
+//! not depend on serializable isolation. A later racer that still observes
+//! the fork performs the same revoke, so the family does not stay split.
 //!
 //! ## Internal — fields are camelCase to match repo wire shapes
 #![allow(non_snake_case)]
@@ -173,11 +173,12 @@ pub async fn rotate(db: &Database, supplied: &str, lifetime: Duration) -> Result
     let new_token = generate_refresh_token();
     let new_expires = Utc::now() + lifetime;
 
-    // R5 (THE-1010) + L4 — the CAS stamp and the successor insert are one
-    // transaction. Two concurrent rotations still have a single winner
-    // (`replacedBy IS NONE`). A revocation that used to land between the
-    // two statements can no longer leave the successor as an orphan.
-    // Failure-closed: the loser is treated as invalid.
+    // R5 (THE-1010) + L4 — stamp the predecessor and insert the successor in
+    // one transaction so a revocation cannot land between the two writes.
+    // `Ok(None)` is the lost compare-and-swap (`replacedBy` already set, or
+    // the row was deleted). A storage conflict is `Err` and fails closed.
+    // `Ok(Some)` is not proof of uniqueness: the mem engine can commit two
+    // such transactions. `ensure_single_live_successor` closes that.
     if refresh_tokens::commit_rotation(
         db,
         supplied,
@@ -194,12 +195,48 @@ pub async fn rotate(db: &Database, supplied: &str, lifetime: Duration) -> Result
         return Err(Error::InvalidOrExpired);
     }
 
+    ensure_single_live_successor(db, row.family.as_deref(), &new_token).await?;
+
     Ok(Rotated {
         token: new_token,
         user_id: row.userId,
         family: row.family.unwrap_or_default(),
         expires_at: new_expires,
     })
+}
+
+/// After `commit_rotation` returns, make sure this family has at most one
+/// unreplaced row and that `new_token` is that row.
+///
+/// The count runs in a new query, so it sees every commit that landed
+/// before it started. The racer that commits second therefore observes the
+/// fork even when the engine failed to abort either transaction. Revoking
+/// the family removes both successors. A racer whose own row was removed by
+/// that revoke fails closed instead of handing the caller a dead bearer
+/// that it already treated as success.
+async fn ensure_single_live_successor(
+    db: &Database,
+    family: Option<&str>,
+    new_token: &str,
+) -> Result<(), Error> {
+    if let Some(family) = family {
+        let rows = refresh_tokens::list_for_family(db, family).await?;
+        let live = rows.iter().filter(|row| row.replacedBy.is_none()).count();
+        if live > 1 {
+            tracing::warn!(
+                family,
+                live,
+                "concurrent refresh rotation forked the family; revoking it"
+            );
+            refresh_tokens::delete_by_family(db, family).await?;
+            return Err(Error::InvalidOrExpired);
+        }
+    }
+
+    match refresh_tokens::find_by_token(db, new_token).await? {
+        Some(stored) if stored.replacedBy.is_none() => Ok(()),
+        _ => Err(Error::InvalidOrExpired),
+    }
 }
 
 /// Present a refresh token to `POST /api/auth/logout`.
@@ -263,7 +300,22 @@ mod tests {
     const ONE_DAY: Duration = Duration::days(1);
 
     async fn setup() -> std::sync::Arc<Database> {
-        let db = connect_in_memory().await.expect("in-memory connect");
+        // `TS6_TEST_DATABASE_URL` points this module's tests at another
+        // engine (for example `surrealkv:///tmp/refresh-race`). Unset keeps
+        // the mem engine the rest of the suite uses.
+        let db = match std::env::var("TS6_TEST_DATABASE_URL") {
+            Ok(url) => {
+                let db = surrealdb::engine::any::connect(&url)
+                    .await
+                    .expect("connect test database");
+                db.use_ns(crate::config::DEFAULT_DB_NAMESPACE)
+                    .use_db(crate::config::DEFAULT_DB_NAME)
+                    .await
+                    .expect("select namespace");
+                std::sync::Arc::new(db)
+            }
+            Err(_) => connect_in_memory().await.expect("in-memory connect"),
+        };
         migrations::run(&db).await.expect("migrations run");
         db
     }
@@ -592,11 +644,11 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_double_rotate_with_same_input_is_benign() {
-        // Spec §6.5.3 license: "side effects compatible with at-least-once".
-        // Two rotations against the same input may both succeed (race on
-        // set_replaced_by). The result is two siblings in the same family;
-        // a third rotation against the original still observes a populated
-        // replacedBy and triggers reuse-detection.
+        // Two rotations of one token must not leave two live chains. Zero
+        // successes is allowed: both racers can observe the fork and revoke
+        // the family before returning. A replay of the original token must
+        // still end with no sessions for the user (reuse-detection if one
+        // chain survived, or a no-op if the family was already revoked).
         let db = setup().await;
         let uid = make_user(&db, "alice").await;
         let issued = issue_for_login(&db, uid, ONE_DAY).await.unwrap();
@@ -616,23 +668,54 @@ mod tests {
 
         let successes: Vec<_> = [r1, r2].into_iter().filter_map(Result::ok).collect();
         assert!(
-            !successes.is_empty(),
-            "at least one rotation should succeed"
+            successes.len() <= 1,
+            "{} rotations succeeded — token forked into multiple live chains",
+            successes.len()
+        );
+        let rows = refresh_tokens::list_for_family(&db, &issued.family)
+            .await
+            .unwrap();
+        let live = rows.iter().filter(|r| r.replacedBy.is_none()).count();
+        assert!(
+            live <= 1,
+            "family has {live} live tokens after concurrent rotation"
         );
 
-        // A third rotation with the original supplied must trip
-        // reuse-detection and revoke the user.
-        let err = rotate(&db, &supplied, ONE_DAY)
-            .await
-            .expect_err("post-race replay must error");
-        assert!(matches!(err, Error::InvalidOrExpired));
-        assert!(
-            refresh_tokens::list_for_user(&db, uid)
+        // Replay of the original token. If a rotation committed, the
+        // predecessor is still there with `replacedBy` set (or the family
+        // was already revoked). Either way the replay must fail and leave
+        // the user with no refresh tokens — reuse-detection wipes every
+        // session when the predecessor survived. If both transactions
+        // aborted, the original row is still live and this replay is an
+        // ordinary rotation; it must not create a second chain.
+        let predecessor = refresh_tokens::find_by_token(&db, &supplied).await.unwrap();
+        let rotation_landed = match &predecessor {
+            Some(row) => row.replacedBy.is_some(),
+            None => true,
+        };
+        let replay = rotate(&db, &supplied, ONE_DAY).await;
+        if rotation_landed {
+            assert!(
+                matches!(replay, Err(Error::InvalidOrExpired)),
+                "replay of a rotated token must be reuse, got {replay:?}"
+            );
+            assert!(
+                refresh_tokens::list_for_user(&db, uid)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "reuse of a rotated token must wipe all sessions"
+            );
+        } else {
+            let rows = refresh_tokens::list_for_family(&db, &issued.family)
                 .await
-                .unwrap()
-                .is_empty(),
-            "post-race replay must wipe all sessions"
-        );
+                .unwrap();
+            let live = rows.iter().filter(|r| r.replacedBy.is_none()).count();
+            assert!(
+                live <= 1,
+                "replay of an unrotated token left {live} live rows"
+            );
+        }
     }
 
     #[tokio::test]
@@ -825,14 +908,11 @@ mod tests {
     // read of `replacedBy` and its later write. That window is the real
     // R5 residual the re-audit was asked to probe ("concurrent rotation").
     //
-    // Fire many rotations of the *same* token at once. Before the
-    // compare-and-swap in `refresh_tokens::set_replaced_by`
-    // (`… AND replacedBy IS NONE`), two racers could both pass the
-    // `replacedBy.is_some()` check and each insert their own live
-    // successor — a silent family fork whose orphan token is a fully valid
-    // refresh credential that never trips reuse-detection. The invariant:
-    // a family may end with at most ONE live token (replacedBy NONE) and at
-    // most one rotation may succeed.
+    // Fire many rotations of the *same* token at once. The compare-and-swap
+    // inside `commit_rotation` is not enough on the mem engine: two
+    // transactions can both commit. `ensure_single_live_successor` then
+    // revokes the family. The invariant: a family may end with at most ONE
+    // live token (replacedBy NONE) and at most one rotation may succeed.
     // ---------------------------------------------------------------
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_rotation_of_one_token_never_forks_the_family() {
