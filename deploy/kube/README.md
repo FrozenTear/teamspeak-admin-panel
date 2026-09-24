@@ -228,17 +228,24 @@ listeners are on the host's network namespace directly — operators
 fronting the manager with a reverse proxy (Caddy / nginx / Traefik)
 should bind the proxy to the host and forward to `127.0.0.1:3001`.
 
-`MUSIC_RUNTIME_TOKEN` is optional. The music process reads it from the
-environment only. When it is unset and `--listen` is loopback
-(`127.0.0.1` / `::1`), the control API stays open — that is the
-single-box deploy, and this manifest does not set the variable. When
-it is set, every route except `GET /health` requires
-`Authorization: Bearer <token>`. The runtime and fullstack containers
-must share the same value. An empty or whitespace-only value is
-treated as unset. The process refuses to start if the token is unset
-and the listener is not loopback, so `:3002` cannot be published on a
-non-loopback address without authentication. Do not log the token.
-`/health` stays unauthenticated so the exec probe is unchanged.
+`MUSIC_RUNTIME_TOKEN` is optional. Both the music process and the
+fullstack process read it from the environment only (not a file, the
+database, or a CLI flag). When it is unset and `--listen` is loopback
+(`127.0.0.1` / `::1`), the control API stays open and fullstack sends
+no `Authorization` header — that is the single-box deploy, and this
+manifest does not set the variable. An empty or whitespace-only value
+is treated as unset. When it is set, the two containers must share the
+same value. The music process then requires
+`Authorization: Bearer <token>` on every route except `GET /health`.
+Fullstack sends that bearer on every runtime call: commands, list,
+now-playing, boot rehydrate, and the SSE event stream included. A
+runtime `401` is answered to the browser as `502`
+`{"error":"music_runtime_auth"}`, and the event stream does not
+reconnect in a loop after `401`. Do not log the token. The process
+refuses to start if the token is unset and the listener is not
+loopback, so `:3002` cannot be published on a non-loopback address
+without authentication. `/health` stays unauthenticated so the exec
+probe is unchanged.
 
 Contabo public HTTPS (draft, **not applied**): once
 `panel.scuffedcrew.no` is live on the existing host Caddy, public

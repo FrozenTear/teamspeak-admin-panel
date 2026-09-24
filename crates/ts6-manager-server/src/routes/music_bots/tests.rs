@@ -181,6 +181,7 @@ async fn list_and_create_are_5xx_when_music_runtime_is_down() {
     state.music_bots = MusicBotService::remote(
         std::env::temp_dir().join("ts6-test-music-bots-remote-down"),
         "http://127.0.0.1:1",
+        None,
     );
     let uid = seed_user(&state, "tester-remote").await;
     let token = mint_token(&state, uid, "tester-remote");
@@ -2031,4 +2032,163 @@ async fn create_requires_moderator_grant_and_ignores_identity_path() {
         rows[0].identityPath
     );
     assert!(!rows[0].identityPath.contains("passwd"));
+}
+
+const RUNTIME_TOKEN: &str = "browser-must-not-see-this-token";
+
+#[derive(Clone, Copy)]
+enum RuntimeAuthMock {
+    /// Every runtime route answers 401.
+    Deny,
+    /// `GET /v1/bots` returns one bot. Every other route answers 401.
+    ListOpen,
+}
+
+async fn auth_runtime(mode: RuntimeAuthMock) -> String {
+    use axum::extract::{Request, State};
+    use axum::response::IntoResponse;
+    let app = axum::Router::new()
+        .fallback(
+            |State(mode): State<RuntimeAuthMock>, req: Request| async move {
+                let method = req.method().clone();
+                let path = req.uri().path().to_string();
+                if matches!(mode, RuntimeAuthMock::ListOpen)
+                    && method == Method::GET
+                    && path == "/v1/bots"
+                {
+                    return (
+                        StatusCode::OK,
+                        axum::Json(serde_json::json!({
+                            "bots": [{
+                                "id": 1,
+                                "name": "t",
+                                "server_addr": "127.0.0.1:9987"
+                            }]
+                        })),
+                    )
+                        .into_response();
+                }
+                StatusCode::UNAUTHORIZED.into_response()
+            },
+        )
+        .with_state(mode);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    format!("http://{addr}")
+}
+
+async fn body_string(resp: axum::http::Response<Body>) -> String {
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+fn assert_runtime_auth(status: StatusCode, body: &str) {
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_ne!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body, r#"{"error":"music_runtime_auth"}"#);
+    assert!(!body.contains(RUNTIME_TOKEN), "{body}");
+}
+
+#[tokio::test]
+async fn runtime_401_on_list_events_and_store_is_browser_502() {
+    let url = auth_runtime(RuntimeAuthMock::Deny).await;
+    let mut state = fresh_state().await;
+    state.music_bots = MusicBotService::remote(
+        std::env::temp_dir().join("ts6-test-music-runtime-auth"),
+        url,
+        crate::music_runtime::MusicRuntimeToken::parse(RUNTIME_TOKEN),
+    );
+    let uid = seed_user(&state, "auth-tester").await;
+    let token = mint_token(&state, uid, "auth-tester");
+    let app = app(state);
+
+    let list = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/music-bots")
+                .header("authorization", auth_header(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let list_status = list.status();
+    assert_runtime_auth(list_status, &body_string(list).await);
+
+    let events = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/music-bots/1/events")
+                .header("authorization", auth_header(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let events_status = events.status();
+    assert_runtime_auth(events_status, &body_string(events).await);
+
+    let playlists = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/playlists?bot=1")
+                .header("authorization", auth_header(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let playlists_status = playlists.status();
+    assert_runtime_auth(playlists_status, &body_string(playlists).await);
+}
+
+#[tokio::test]
+async fn runtime_401_on_command_and_now_playing_is_browser_502() {
+    let url = auth_runtime(RuntimeAuthMock::ListOpen).await;
+    let mut state = fresh_state().await;
+    state.music_bots = MusicBotService::remote(
+        std::env::temp_dir().join("ts6-test-music-runtime-auth-cmd"),
+        url,
+        crate::music_runtime::MusicRuntimeToken::parse(RUNTIME_TOKEN),
+    );
+    let uid = seed_user(&state, "auth-cmd").await;
+    let token = mint_token(&state, uid, "auth-cmd");
+    let app = app(state);
+
+    let connect = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/music-bots/1/connect")
+                .header("authorization", auth_header(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let connect_status = connect.status();
+    assert_runtime_auth(connect_status, &body_string(connect).await);
+
+    let detail = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/music-bots/1")
+                .header("authorization", auth_header(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let detail_status = detail.status();
+    assert_runtime_auth(detail_status, &body_string(detail).await);
 }

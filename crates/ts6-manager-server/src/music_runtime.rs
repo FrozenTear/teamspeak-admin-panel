@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -23,22 +24,135 @@ use music_bot::{
 use tokio::sync::{Mutex, broadcast};
 use tracing::{info, warn};
 
+/// Environment variable holding the shared bearer for the music control
+/// API. Read at process start only. Never a file, a database row, or a
+/// CLI flag. The music process reads the same name.
+pub const MUSIC_RUNTIME_TOKEN_ENV: &str = "MUSIC_RUNTIME_TOKEN";
+
+/// `StoreError::Backend` payload when the music runtime returns 401.
+/// Browser routes map this to 502 `{"error":"music_runtime_auth"}`.
+/// The string is a classifier, not a secret.
+pub const MUSIC_RUNTIME_AUTH_STORE: &str = "music_runtime_auth";
+
+/// Shared bearer presented to `ts6-manager-music`.
+///
+/// `Debug` and `Display` never include the secret. The plaintext is
+/// kept only so this process can send `Authorization`. It is not
+/// written to logs, audit rows, or response bodies.
+#[derive(Clone)]
+pub struct MusicRuntimeToken(String);
+
+impl std::fmt::Debug for MusicRuntimeToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MusicRuntimeToken([redacted])")
+    }
+}
+
+impl std::fmt::Display for MusicRuntimeToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[redacted]")
+    }
+}
+
+impl MusicRuntimeToken {
+    /// `None` when the variable is missing, empty, or whitespace-only.
+    /// Matches the music process: surrounding whitespace is stripped
+    /// and does not itself enable auth.
+    pub fn from_env() -> Option<Self> {
+        match std::env::var(MUSIC_RUNTIME_TOKEN_ENV) {
+            Ok(raw) => Self::parse(&raw),
+            Err(_) => None,
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        let token = raw.trim();
+        if token.is_empty() {
+            None
+        } else {
+            Some(Self(token.to_string()))
+        }
+    }
+
+    fn authorization_header(&self) -> Result<reqwest::header::HeaderValue, ()> {
+        let mut value = Vec::with_capacity(self.0.len() + 7);
+        value.extend_from_slice(b"Bearer ");
+        value.extend_from_slice(self.0.as_bytes());
+        reqwest::header::HeaderValue::from_bytes(&value).map_err(|_| ())
+    }
+}
+
+pub fn is_runtime_auth_store(err: &StoreError) -> bool {
+    matches!(err, StoreError::Backend(msg) if msg == MUSIC_RUNTIME_AUTH_STORE)
+}
+
+fn store_auth_error() -> StoreError {
+    StoreError::Backend(MUSIC_RUNTIME_AUTH_STORE.to_string())
+}
+
 /// Remote music-unit hop failed. REST maps this to 5xx so Panel does
 /// not treat a down unit as “no bots” or “spawned id 0”.
+///
+/// [`MusicRuntimeError::Auth`] is a runtime HTTP 401. Browser routes
+/// turn that into 502 `{"error":"music_runtime_auth"}` so the browser
+/// does not treat it as the panel session expiring. The token is not
+/// part of this error.
 #[derive(Debug, Clone)]
-pub struct MusicRuntimeError(pub String);
+pub enum MusicRuntimeError {
+    Auth,
+    Unavailable(String),
+}
+
+impl MusicRuntimeError {
+    pub fn is_auth(&self) -> bool {
+        matches!(self, Self::Auth)
+    }
+}
 
 impl std::fmt::Display for MusicRuntimeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        match self {
+            Self::Auth => f.write_str("music runtime authentication failed"),
+            Self::Unavailable(msg) => f.write_str(msg),
+        }
     }
 }
 
 impl std::error::Error for MusicRuntimeError {}
 
 fn runtime_err(msg: impl Into<String>) -> MusicRuntimeError {
-    MusicRuntimeError(msg.into())
+    MusicRuntimeError::Unavailable(msg.into())
 }
+
+/// Command / shutdown failure. [`FrontSendError::Auth`] is a runtime
+/// HTTP 401 and must not be reported as "bot not found".
+#[derive(Debug)]
+pub enum FrontSendError {
+    ActorGone,
+    Full,
+    Auth,
+}
+
+impl From<SendError> for FrontSendError {
+    fn from(err: SendError) -> Self {
+        match err {
+            SendError::ActorGone => Self::ActorGone,
+            SendError::Full => Self::Full,
+        }
+    }
+}
+
+impl std::fmt::Display for FrontSendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ActorGone => f.write_str("bot actor has exited"),
+            Self::Full => f.write_str("bot command queue is full"),
+            Self::Auth => f.write_str("music runtime authentication failed"),
+        }
+    }
+}
+
+impl std::error::Error for FrontSendError {}
 
 #[derive(Clone)]
 pub struct MusicBotFront {
@@ -59,8 +173,17 @@ impl MusicBotFront {
     }
 
     pub fn remote(base_url: impl Into<String>) -> Self {
+        Self::remote_with_token(base_url, None)
+    }
+
+    /// `token` is `None` when `MUSIC_RUNTIME_TOKEN` is unset. That is
+    /// today's loopback behaviour: no `Authorization` header.
+    pub fn remote_with_token(
+        base_url: impl Into<String>,
+        token: Option<MusicRuntimeToken>,
+    ) -> Self {
         Self {
-            inner: FrontInner::Remote(RemoteMusicRuntime::new(base_url)),
+            inner: FrontInner::Remote(RemoteMusicRuntime::new(base_url, token)),
         }
     }
 
@@ -110,9 +233,9 @@ impl MusicBotFront {
         }
     }
 
-    pub async fn send(&self, id: BotId, cmd: BotCommand) -> Result<(), SendError> {
+    pub async fn send(&self, id: BotId, cmd: BotCommand) -> Result<(), FrontSendError> {
         match &self.inner {
-            FrontInner::Local(s) => s.send(id, cmd).await,
+            FrontInner::Local(s) => s.send(id, cmd).await.map_err(FrontSendError::from),
             FrontInner::Remote(r) => r.send(id, cmd).await,
         }
     }
@@ -127,9 +250,9 @@ impl MusicBotFront {
         }
     }
 
-    pub async fn shutdown_bot(&self, id: BotId) -> Result<(), SendError> {
+    pub async fn shutdown_bot(&self, id: BotId) -> Result<(), FrontSendError> {
         match &self.inner {
-            FrontInner::Local(s) => s.shutdown_bot(id).await,
+            FrontInner::Local(s) => s.shutdown_bot(id).await.map_err(FrontSendError::from),
             FrontInner::Remote(r) => r.shutdown_bot(id).await,
         }
     }
@@ -321,14 +444,20 @@ impl MusicBotFront {
                     yt_api_key,
                 })
                 .await
+            && !err.is_auth()
         {
             warn!(error = %err, "failed to push yt settings to music runtime");
         }
     }
 
-    pub async fn bug_report_snapshot(&self) -> music_bot::bug_report::BugReportSnapshot {
+    /// `Err(Auth)` when the runtime rejects the bearer. Other remote
+    /// failures fall back to the in-process snapshot so a down unit
+    /// does not blank the bug-report context.
+    pub async fn bug_report_snapshot(
+        &self,
+    ) -> Result<music_bot::bug_report::BugReportSnapshot, MusicRuntimeError> {
         match &self.inner {
-            FrontInner::Local(_) => music_bot::bug_report::snapshot(),
+            FrontInner::Local(_) => Ok(music_bot::bug_report::snapshot()),
             FrontInner::Remote(r) => r.bug_report_snapshot().await,
         }
     }
@@ -347,11 +476,17 @@ struct RemoteMusicRuntime {
     http: reqwest::Client,
     /// No request timeout — `/v1/bots/{id}/events` is a long-lived SSE.
     sse: reqwest::Client,
+    /// `None` when `MUSIC_RUNTIME_TOKEN` is unset. Not logged.
+    token: Option<MusicRuntimeToken>,
     pumps: Arc<Mutex<HashMap<BotId, broadcast::Sender<BotEvent>>>>,
+    /// Set when the event stream is rejected with 401. Further
+    /// subscriptions fail closed without opening another stream, so a
+    /// browser `EventSource` reconnect cannot hammer the runtime.
+    sse_auth_failed: Arc<AtomicBool>,
 }
 
 impl RemoteMusicRuntime {
-    fn new(base_url: impl Into<String>) -> Self {
+    fn new(base_url: impl Into<String>, token: Option<MusicRuntimeToken>) -> Self {
         let base = base_url.into().trim_end_matches('/').to_string();
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
@@ -369,22 +504,70 @@ impl RemoteMusicRuntime {
             base,
             http,
             sse,
+            token,
             pumps: Arc::new(Mutex::new(HashMap::new())),
+            sse_auth_failed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Attach `Authorization` when a token is configured. Header
+    /// failure is treated as auth failure and does not log the token.
+    fn authorize(
+        &self,
+        builder: reqwest::RequestBuilder,
+    ) -> Result<reqwest::RequestBuilder, MusicRuntimeError> {
+        let Some(token) = &self.token else {
+            return Ok(builder);
+        };
+        match token.authorization_header() {
+            Ok(value) => Ok(builder.header(reqwest::header::AUTHORIZATION, value)),
+            Err(()) => {
+                warn!("music runtime token cannot be encoded as an Authorization header");
+                Err(MusicRuntimeError::Auth)
+            }
+        }
+    }
+
+    /// One warn per rejected call. The message does not include the
+    /// token, the header, or the response body.
+    fn log_unauthorized(&self, op: &'static str) {
+        warn!(
+            op,
+            "music runtime returned 401; panel routes answer 502 music_runtime_auth"
+        );
+    }
+
+    fn reject_unauthorized(
+        &self,
+        op: &'static str,
+        status: reqwest::StatusCode,
+    ) -> Result<(), MusicRuntimeError> {
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            self.log_unauthorized(op);
+            Err(MusicRuntimeError::Auth)
+        } else {
+            Ok(())
         }
     }
 
     async fn wait_until_healthy(&self, attempts: u32) -> bool {
         for i in 0..attempts {
-            if self
-                .http
-                .get(format!("{}/health", self.base))
-                .send()
-                .await
-                .map(|r| r.status().is_success())
-                .unwrap_or(false)
-            {
-                info!(url = %self.base, "music runtime healthy");
-                return true;
+            let req = match self.authorize(self.http.get(format!("{}/health", self.base))) {
+                Ok(req) => req,
+                // A token that cannot be encoded will not become valid
+                // on retry. `authorize` already logged once.
+                Err(_) => return false,
+            };
+            match req.send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    info!(url = %self.base, "music runtime healthy");
+                    return true;
+                }
+                Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED => {
+                    self.log_unauthorized("health");
+                    return false;
+                }
+                _ => {}
             }
             tokio::time::sleep(Duration::from_millis(400 + u64::from(i) * 100)).await;
         }
@@ -394,11 +577,11 @@ impl RemoteMusicRuntime {
 
     async fn list(&self) -> Result<Vec<BotInfo>, MusicRuntimeError> {
         let resp = self
-            .http
-            .get(format!("{}/v1/bots", self.base))
+            .authorize(self.http.get(format!("{}/v1/bots", self.base)))?
             .send()
             .await
             .map_err(|e| runtime_err(format!("list bots: {e}")))?;
+        self.reject_unauthorized("list", resp.status())?;
         if !resp.status().is_success() {
             return Err(runtime_err(format!("list bots: {}", resp.status())));
         }
@@ -411,12 +594,11 @@ impl RemoteMusicRuntime {
 
     async fn spawn(&self, req: SpawnRequest) -> Result<BotId, MusicRuntimeError> {
         let resp = self
-            .http
-            .post(format!("{}/v1/bots", self.base))
-            .json(&req)
+            .authorize(self.http.post(format!("{}/v1/bots", self.base)).json(&req))?
             .send()
             .await
             .map_err(|e| runtime_err(format!("spawn: {e}")))?;
+        self.reject_unauthorized("spawn", resp.status())?;
         if !resp.status().is_success() {
             return Err(runtime_err(format!("spawn: {}", resp.status())));
         }
@@ -427,35 +609,37 @@ impl RemoteMusicRuntime {
         Ok(body.id)
     }
 
-    async fn send(&self, id: BotId, command: BotCommand) -> Result<(), SendError> {
-        let resp = self
-            .http
-            .post(format!("{}/v1/bots/{}/command", self.base, id.0))
-            .json(&SendRequest { command })
-            .send()
-            .await
-            .map_err(|_| SendError::ActorGone)?;
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(SendError::ActorGone);
+    async fn send(&self, id: BotId, command: BotCommand) -> Result<(), FrontSendError> {
+        let resp = match self.authorize(
+            self.http
+                .post(format!("{}/v1/bots/{}/command", self.base, id.0))
+                .json(&SendRequest { command }),
+        ) {
+            Ok(req) => req.send().await.map_err(|_| FrontSendError::ActorGone)?,
+            Err(_) => return Err(FrontSendError::Auth),
+        };
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            self.log_unauthorized("command");
+            return Err(FrontSendError::Auth);
         }
-        if !resp.status().is_success() {
-            return Err(SendError::ActorGone);
+        if resp.status() == reqwest::StatusCode::NOT_FOUND || !resp.status().is_success() {
+            return Err(FrontSendError::ActorGone);
         }
         Ok(())
     }
 
-    async fn shutdown_bot(&self, id: BotId) -> Result<(), SendError> {
-        let resp = self
-            .http
-            .delete(format!("{}/v1/bots/{}", self.base, id.0))
-            .send()
-            .await
-            .map_err(|_| SendError::ActorGone)?;
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(SendError::ActorGone);
+    async fn shutdown_bot(&self, id: BotId) -> Result<(), FrontSendError> {
+        let resp = match self.authorize(self.http.delete(format!("{}/v1/bots/{}", self.base, id.0)))
+        {
+            Ok(req) => req.send().await.map_err(|_| FrontSendError::ActorGone)?,
+            Err(_) => return Err(FrontSendError::Auth),
+        };
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            self.log_unauthorized("shutdown");
+            return Err(FrontSendError::Auth);
         }
-        if !resp.status().is_success() {
-            return Err(SendError::ActorGone);
+        if resp.status() == reqwest::StatusCode::NOT_FOUND || !resp.status().is_success() {
+            return Err(FrontSendError::ActorGone);
         }
         Ok(())
     }
@@ -464,66 +648,84 @@ impl RemoteMusicRuntime {
         &self,
         id: BotId,
     ) -> Result<Option<broadcast::Receiver<BotEvent>>, MusicRuntimeError> {
+        if self.sse_auth_failed.load(Ordering::SeqCst) {
+            return Err(MusicRuntimeError::Auth);
+        }
         let bots = self.list().await?;
         if !bots.iter().any(|b| b.id == id) {
             return Ok(None);
+        }
+        if self.sse_auth_failed.load(Ordering::SeqCst) {
+            return Err(MusicRuntimeError::Auth);
         }
         let mut pumps = self.pumps.lock().await;
         if let Some(tx) = pumps.get(&id) {
             return Ok(Some(tx.subscribe()));
         }
         let (tx, rx) = broadcast::channel(64);
-        start_event_pump(
-            self.sse.clone(),
-            self.base.clone(),
+        start_event_pump(EventPump {
+            sse: self.sse.clone(),
+            base: self.base.clone(),
+            token: self.token.clone(),
             id,
-            tx.clone(),
-            Arc::clone(&self.pumps),
-        );
+            tx: tx.clone(),
+            pumps: Arc::clone(&self.pumps),
+            sse_auth_failed: Arc::clone(&self.sse_auth_failed),
+        });
         pumps.insert(id, tx);
         Ok(Some(rx))
     }
 
-    async fn push_settings(&self, req: SettingsRequest) -> Result<(), String> {
+    async fn push_settings(&self, req: SettingsRequest) -> Result<(), MusicRuntimeError> {
         let resp = self
-            .http
-            .post(format!("{}/v1/settings", self.base))
-            .json(&req)
+            .authorize(
+                self.http
+                    .post(format!("{}/v1/settings", self.base))
+                    .json(&req),
+            )?
             .send()
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| runtime_err(e.to_string()))?;
+        self.reject_unauthorized("settings", resp.status())?;
         if !resp.status().is_success() {
-            return Err(format!("settings: {}", resp.status()));
+            return Err(runtime_err(format!("settings: {}", resp.status())));
         }
         Ok(())
     }
 
-    async fn bug_report_snapshot(&self) -> music_bot::bug_report::BugReportSnapshot {
-        match self
-            .http
-            .get(format!("{}/v1/bug-report-context", self.base))
+    async fn bug_report_snapshot(
+        &self,
+    ) -> Result<music_bot::bug_report::BugReportSnapshot, MusicRuntimeError> {
+        let resp = match self
+            .authorize(
+                self.http
+                    .get(format!("{}/v1/bug-report-context", self.base)),
+            )?
             .send()
             .await
         {
-            Ok(resp) if resp.status().is_success() => {
-                match resp.json::<BugReportContextResponse>().await {
-                    Ok(body) => music_bot::bug_report::BugReportSnapshot {
-                        music_bot_latency: body.music_bot_latency,
-                        log_tail: body.log_tail,
-                    },
-                    Err(err) => {
-                        warn!(error = %err, "malformed music-runtime bug-report context");
-                        music_bot::bug_report::snapshot()
-                    }
-                }
-            }
-            Ok(resp) => {
-                warn!(status = %resp.status(), "music-runtime bug-report context failed");
-                music_bot::bug_report::snapshot()
-            }
+            Ok(resp) => resp,
             Err(err) => {
                 warn!(error = %err, "music-runtime bug-report context transport failed");
-                music_bot::bug_report::snapshot()
+                return Ok(music_bot::bug_report::snapshot());
+            }
+        };
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            self.log_unauthorized("bug-report-context");
+            return Err(MusicRuntimeError::Auth);
+        }
+        if !resp.status().is_success() {
+            warn!(status = %resp.status(), "music-runtime bug-report context failed");
+            return Ok(music_bot::bug_report::snapshot());
+        }
+        match resp.json::<BugReportContextResponse>().await {
+            Ok(body) => Ok(music_bot::bug_report::BugReportSnapshot {
+                music_bot_latency: body.music_bot_latency,
+                log_tail: body.log_tail,
+            }),
+            Err(err) => {
+                warn!(error = %err, "malformed music-runtime bug-report context");
+                Ok(music_bot::bug_report::snapshot())
             }
         }
     }
@@ -534,26 +736,31 @@ impl RemoteMusicRuntime {
     }
 
     async fn mutate_value<T: serde::de::DeserializeOwned>(&self, op: MutateOp) -> StoreResult<T> {
-        self.post_value("/v1/mutate", &op).await
+        self.post_value("/v1/mutate", "mutate", &op).await
     }
 
     async fn store_value<T: serde::de::DeserializeOwned>(&self, op: StoreOp) -> StoreResult<T> {
-        self.post_value("/v1/store", &op).await
+        self.post_value("/v1/store", "store", &op).await
     }
 
     async fn post_value<T: serde::de::DeserializeOwned>(
         &self,
         path: &str,
+        op: &'static str,
         body: &impl serde::Serialize,
     ) -> StoreResult<T> {
-        let resp = self
-            .http
-            .post(format!("{}{path}", self.base))
-            .json(body)
+        let builder = self
+            .authorize(self.http.post(format!("{}{path}", self.base)).json(body))
+            .map_err(|_| store_auth_error())?;
+        let resp = builder
             .send()
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))?;
         let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            self.log_unauthorized(op);
+            return Err(store_auth_error());
+        }
         let bytes = resp
             .bytes()
             .await
@@ -572,29 +779,44 @@ impl RemoteMusicRuntime {
     }
 }
 
-fn start_event_pump(
+struct EventPump {
     sse: reqwest::Client,
     base: String,
+    token: Option<MusicRuntimeToken>,
     id: BotId,
     tx: broadcast::Sender<BotEvent>,
     pumps: Arc<Mutex<HashMap<BotId, broadcast::Sender<BotEvent>>>>,
-) {
+    sse_auth_failed: Arc<AtomicBool>,
+}
+
+fn start_event_pump(pump: EventPump) {
     tokio::spawn(async move {
-        pump_events(sse.clone(), base.clone(), id, tx.clone()).await;
-        let mut map = pumps.lock().await;
-        let Some(existing) = map.get(&id) else {
+        let end = pump_events(&pump).await;
+        let mut map = pump.pumps.lock().await;
+        let Some(existing) = map.get(&pump.id) else {
             return;
         };
-        if !existing.same_channel(&tx) {
+        if !existing.same_channel(&pump.tx) {
             return;
         }
-        if existing.receiver_count() == 0 {
-            map.remove(&id);
+        // Auth failure stops the pump. Do not restart: a 1s reconnect
+        // loop would hammer the runtime, and the browser's own
+        // EventSource retry is refused by `sse_auth_failed`.
+        if matches!(end, PumpEnd::Auth) || existing.receiver_count() == 0 {
+            map.remove(&pump.id);
             return;
         }
-        let restart_tx = existing.clone();
+        let restart = EventPump {
+            sse: pump.sse.clone(),
+            base: pump.base.clone(),
+            token: pump.token.clone(),
+            id: pump.id,
+            tx: existing.clone(),
+            pumps: Arc::clone(&pump.pumps),
+            sse_auth_failed: Arc::clone(&pump.sse_auth_failed),
+        };
         drop(map);
-        start_event_pump(sse, base, id, restart_tx, pumps);
+        start_event_pump(restart);
     });
 }
 
@@ -625,48 +847,76 @@ fn take_sse_events(buf: &mut String) -> Vec<BotEvent> {
     out
 }
 
-async fn pump_events(
-    sse: reqwest::Client,
-    base: String,
-    id: BotId,
-    tx: broadcast::Sender<BotEvent>,
-) {
-    let url = format!("{base}/v1/bots/{}/events", id.0);
+enum PumpEnd {
+    Idle,
+    Auth,
+}
+
+async fn pump_events(pump: &EventPump) -> PumpEnd {
+    let url = format!("{}/v1/bots/{}/events", pump.base, pump.id.0);
     loop {
-        if tx.receiver_count() == 0 {
-            return;
+        if pump.sse_auth_failed.load(Ordering::SeqCst) {
+            return PumpEnd::Auth;
         }
-        match sse.get(&url).send().await {
+        if pump.tx.receiver_count() == 0 {
+            return PumpEnd::Idle;
+        }
+        let mut builder = pump.sse.get(&url);
+        if let Some(token) = &pump.token {
+            match token.authorization_header() {
+                Ok(value) => builder = builder.header(reqwest::header::AUTHORIZATION, value),
+                Err(()) => {
+                    pump.sse_auth_failed.store(true, Ordering::SeqCst);
+                    warn!(
+                        bot = %pump.id,
+                        "music runtime token cannot be encoded as an Authorization header; event stream stopped"
+                    );
+                    return PumpEnd::Auth;
+                }
+            }
+        }
+        match builder.send().await {
             Ok(mut resp) if resp.status().is_success() => {
                 let mut buf = String::new();
                 loop {
-                    if tx.receiver_count() == 0 {
-                        return;
+                    if pump.tx.receiver_count() == 0 {
+                        return PumpEnd::Idle;
                     }
                     match resp.chunk().await {
                         Ok(Some(bytes)) => {
                             buf.push_str(&String::from_utf8_lossy(&bytes));
                             for ev in take_sse_events(&mut buf) {
-                                let _ = tx.send(ev);
+                                let _ = pump.tx.send(ev);
                             }
                         }
                         Ok(None) => break,
                         Err(err) => {
-                            warn!(error = %err, bot = %id, "music-runtime SSE chunk failed");
+                            warn!(error = %err, bot = %pump.id, "music-runtime SSE chunk failed");
                             break;
                         }
                     }
                 }
             }
+            Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED => {
+                pump.sse_auth_failed.store(true, Ordering::SeqCst);
+                warn!(
+                    bot = %pump.id,
+                    "music runtime returned 401 on the event stream; not reconnecting"
+                );
+                return PumpEnd::Auth;
+            }
             Ok(resp) => {
-                warn!(status = %resp.status(), bot = %id, "music-runtime SSE HTTP error");
+                warn!(status = %resp.status(), bot = %pump.id, "music-runtime SSE HTTP error");
             }
             Err(err) => {
-                warn!(error = %err, bot = %id, "music-runtime SSE connect failed");
+                warn!(error = %err, bot = %pump.id, "music-runtime SSE connect failed");
             }
         }
-        if tx.receiver_count() == 0 {
-            return;
+        if pump.sse_auth_failed.load(Ordering::SeqCst) {
+            return PumpEnd::Auth;
+        }
+        if pump.tx.receiver_count() == 0 {
+            return PumpEnd::Idle;
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
@@ -825,8 +1075,12 @@ mod tests {
     use super::*;
     use std::convert::Infallible;
 
+    use tracing_subscriber::layer::SubscriberExt;
+
     use axum::Json;
     use axum::Router;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
     use axum::response::sse::{Event, KeepAlive, Sse};
     use axum::routing::get;
     use futures::stream::StreamExt;
@@ -963,5 +1217,365 @@ mod tests {
             .expect("SSE pump must deliver while the stream stays open")
             .expect("event");
         assert!(matches!(ev, BotEvent::QueueEmpty));
+    }
+
+    #[derive(Clone)]
+    struct HitLog {
+        hits: Arc<Mutex<Vec<Hit>>>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct Hit {
+        method: String,
+        path: String,
+        authorization: Option<String>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum MockMode {
+        Allow,
+        /// `GET /v1/bots` stays open so subscribe can start the pump.
+        /// The event stream answers 401.
+        EventsUnauthorized,
+    }
+
+    async fn serve_mock(mode: MockMode) -> (String, HitLog) {
+        let log = HitLog {
+            hits: Arc::new(Mutex::new(Vec::new())),
+        };
+        let state = (log.clone(), mode);
+        let app = Router::new()
+            .route("/health", get(|| async { "ok" }))
+            .route(
+                "/v1/bots",
+                get(|| async {
+                    Json(ListResponse {
+                        bots: vec![BotInfo {
+                            id: BotId(1),
+                            name: "t".into(),
+                            server_addr: "127.0.0.1:9987".into(),
+                        }],
+                    })
+                })
+                .post(|Json(body): Json<serde_json::Value>| async move {
+                    let id = body.get("id").and_then(|v| v.as_u64()).unwrap_or(1);
+                    Json(serde_json::json!({ "id": id }))
+                }),
+            )
+            .route(
+                "/v1/bots/{id}",
+                axum::routing::delete(|| async { StatusCode::NO_CONTENT }),
+            )
+            .route(
+                "/v1/bots/{id}/command",
+                axum::routing::post(|| async { StatusCode::NO_CONTENT }),
+            )
+            .route(
+                "/v1/bots/{id}/events",
+                get(|| async {
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                        "data: {}\n\n",
+                    )
+                }),
+            )
+            .route(
+                "/v1/settings",
+                axum::routing::post(|| async { StatusCode::NO_CONTENT }),
+            )
+            .route(
+                "/v1/bug-report-context",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "music_bot_latency": "",
+                        "log_tail": ""
+                    }))
+                }),
+            )
+            .route(
+                "/v1/mutate",
+                axum::routing::post(|| async { Json(serde_json::json!([])) }),
+            )
+            .route(
+                "/v1/store",
+                axum::routing::post(|Json(body): Json<serde_json::Value>| async move {
+                    if body.get("op").and_then(|op| op.as_str()) == Some("queue_current") {
+                        Json(serde_json::Value::Null)
+                    } else {
+                        Json(serde_json::json!([]))
+                    }
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(state, record_hit));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        (format!("http://{addr}"), log)
+    }
+
+    async fn record_hit(
+        axum::extract::State((log, mode)): axum::extract::State<(HitLog, MockMode)>,
+        req: axum::extract::Request,
+        next: axum::middleware::Next,
+    ) -> axum::response::Response {
+        let authorization = req
+            .headers()
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let method = req.method().to_string();
+        let path = req.uri().path().to_string();
+        log.hits.lock().await.push(Hit {
+            method,
+            path: path.clone(),
+            authorization,
+        });
+        if matches!(mode, MockMode::EventsUnauthorized) && path.ends_with("/events") {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        next.run(req).await
+    }
+
+    fn bearer_token() -> MusicRuntimeToken {
+        MusicRuntimeToken::parse("panel-runtime-token-test").unwrap()
+    }
+
+    async fn exercise_remote_calls(front: &MusicBotFront) {
+        assert!(front.wait_until_healthy(3).await);
+        front.list().await.expect("list");
+        let cfg = BotConfig::new(
+            "rehydrate",
+            std::env::temp_dir().join("music-runtime-token-rehydrate.identity"),
+        )
+        .with_auto_connect(false);
+        front
+            .spawn_with_id(
+                BotId(4),
+                cfg,
+                Arc::new(RwLock::new(None)),
+                Arc::new(RwLock::new(None)),
+            )
+            .await
+            .expect("rehydrate spawn");
+        front
+            .send(BotId(1), BotCommand::Disconnect)
+            .await
+            .expect("command");
+        front.shutdown_bot(BotId(1)).await.expect("shutdown");
+        front
+            .store()
+            .queue_current(BotId(1))
+            .await
+            .expect("now playing");
+        front.playlist_list(BotId(1)).await.expect("mutate");
+        front.sync_settings(Some(None), Some(None)).await;
+        front.bug_report_snapshot().await.expect("bug report");
+        let rx = front
+            .subscribe(BotId(1))
+            .await
+            .expect("subscribe list")
+            .expect("bot exists");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(rx);
+    }
+
+    fn assert_paths_covered(hits: &[Hit]) {
+        let has = |method: &str, path: &str| {
+            hits.iter()
+                .any(|hit| hit.method == method && hit.path == path)
+        };
+        assert!(has("GET", "/health"), "health: {hits:?}");
+        assert!(has("GET", "/v1/bots"), "list: {hits:?}");
+        assert!(has("POST", "/v1/bots"), "rehydrate: {hits:?}");
+        assert!(has("POST", "/v1/bots/1/command"), "command: {hits:?}");
+        assert!(has("DELETE", "/v1/bots/1"), "shutdown: {hits:?}");
+        assert!(has("POST", "/v1/store"), "now playing: {hits:?}");
+        assert!(has("POST", "/v1/mutate"), "mutate: {hits:?}");
+        assert!(has("POST", "/v1/settings"), "settings: {hits:?}");
+        assert!(has("GET", "/v1/bug-report-context"), "bug report: {hits:?}");
+        assert!(has("GET", "/v1/bots/1/events"), "event stream: {hits:?}");
+    }
+
+    #[tokio::test]
+    async fn bearer_header_is_sent_on_every_runtime_call_when_token_is_set() {
+        let (url, log) = serve_mock(MockMode::Allow).await;
+        let front = MusicBotFront::remote_with_token(url, Some(bearer_token()));
+        exercise_remote_calls(&front).await;
+        let hits = log.hits.lock().await.clone();
+        assert_paths_covered(&hits);
+        for hit in &hits {
+            assert_eq!(
+                hit.authorization.as_deref(),
+                Some("Bearer panel-runtime-token-test"),
+                "{} {} sent {:?}",
+                hit.method,
+                hit.path,
+                hit.authorization
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unset_token_sends_no_authorization_header() {
+        let (url, log) = serve_mock(MockMode::Allow).await;
+        let front = MusicBotFront::remote(url);
+        exercise_remote_calls(&front).await;
+        let hits = log.hits.lock().await.clone();
+        assert_paths_covered(&hits);
+        for hit in &hits {
+            assert!(
+                hit.authorization.is_none(),
+                "{} {} sent {:?}",
+                hit.method,
+                hit.path,
+                hit.authorization
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn event_stream_does_not_reconnect_after_401() {
+        let (url, log) = serve_mock(MockMode::EventsUnauthorized).await;
+        let front = MusicBotFront::remote_with_token(url, Some(bearer_token()));
+        let rx = front
+            .subscribe(BotId(1))
+            .await
+            .expect("list is open")
+            .expect("bot exists");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let again = front.subscribe(BotId(1)).await;
+        assert!(
+            again.expect_err("auth latch").is_auth(),
+            "a second subscribe must not open another event stream"
+        );
+        drop(rx);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let hits = log.hits.lock().await.clone();
+        let events: Vec<_> = hits
+            .iter()
+            .filter(|hit| hit.path.ends_with("/events"))
+            .collect();
+        assert_eq!(
+            events.len(),
+            1,
+            "401 must not retry the event stream, saw {events:?}"
+        );
+        assert_eq!(
+            events[0].authorization.as_deref(),
+            Some("Bearer panel-runtime-token-test")
+        );
+    }
+
+    struct LogCapture(Arc<std::sync::Mutex<String>>);
+
+    impl<S> tracing_subscriber::Layer<S> for LogCapture
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut buf = self.0.lock().expect("log buffer");
+            use std::fmt::Write;
+            let _ = write!(
+                buf,
+                "{} {}",
+                event.metadata().target(),
+                event.metadata().level()
+            );
+            event.record(&mut FieldCapture(&mut buf));
+            buf.push('\n');
+        }
+    }
+
+    struct FieldCapture<'a>(&'a mut String);
+
+    impl tracing::field::Visit for FieldCapture<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write;
+            let _ = write!(self.0, " {}={value:?}", field.name());
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            use std::fmt::Write;
+            let _ = write!(self.0, " {}={value}", field.name());
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn token_is_absent_from_debug_display_and_auth_logs() {
+        const SECRET: &str = "super-secret-music-runtime-token";
+        let token = MusicRuntimeToken::parse(SECRET).unwrap();
+        let rendered = format!("{token:?} {token}");
+        assert!(!rendered.contains(SECRET), "{rendered}");
+        #[derive(Debug)]
+        struct Probe {
+            music_runtime_token: Option<MusicRuntimeToken>,
+        }
+        let probe_value = Probe {
+            music_runtime_token: Some(token.clone()),
+        };
+        assert!(probe_value.music_runtime_token.is_some());
+        let probe = format!("{probe_value:?}");
+        assert!(!probe.contains(SECRET), "{probe}");
+
+        let logs = Arc::new(std::sync::Mutex::new(String::new()));
+        let subscriber = tracing_subscriber::registry().with(LogCapture(Arc::clone(&logs)));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let log = HitLog {
+            hits: Arc::new(Mutex::new(Vec::new())),
+        };
+        let app = Router::new().route("/v1/bots", get(|| async { StatusCode::UNAUTHORIZED }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let front = MusicBotFront::remote_with_token(format!("http://{addr}"), Some(token));
+        let err = front.list().await.expect_err("401");
+        let shown = format!("{err} {err:?}");
+        assert!(err.is_auth());
+        assert!(!shown.contains(SECRET), "{shown}");
+        let text = logs.lock().expect("log buffer").clone();
+        assert!(
+            text.contains("music_runtime_auth"),
+            "expected one auth warn, got {text}"
+        );
+        assert!(!text.contains(SECRET), "{text}");
+        drop(log);
+    }
+
+    #[test]
+    fn blank_env_token_is_unset_and_trimmed_value_is_redacted() {
+        struct ClearEnv;
+        impl Drop for ClearEnv {
+            fn drop(&mut self) {
+                unsafe {
+                    std::env::remove_var(MUSIC_RUNTIME_TOKEN_ENV);
+                }
+            }
+        }
+        let _clear = ClearEnv;
+        unsafe {
+            std::env::remove_var(MUSIC_RUNTIME_TOKEN_ENV);
+        }
+        assert!(MusicRuntimeToken::from_env().is_none());
+        assert!(MusicRuntimeToken::parse("").is_none());
+        assert!(MusicRuntimeToken::parse(" \t\n").is_none());
+        unsafe {
+            std::env::set_var(MUSIC_RUNTIME_TOKEN_ENV, "  trimmed-secret  ");
+        }
+        let token = MusicRuntimeToken::from_env().expect("trimmed token");
+        assert_eq!(
+            token.authorization_header().unwrap().to_str().unwrap(),
+            "Bearer trimmed-secret"
+        );
+        let rendered = format!("{token:?} {token}");
+        assert!(!rendered.contains("trimmed-secret"), "{rendered}");
     }
 }

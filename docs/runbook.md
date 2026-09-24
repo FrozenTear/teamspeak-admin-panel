@@ -43,19 +43,31 @@ The single hard requirement. The server boots without anything else.
 | `MUSIC_RUNTIME_TOKEN` | Optional shared bearer for the music control API (`:3002`). Unset on single-box loopback deploys. | `openssl rand -base64 32` |
 
 `MUSIC_RUNTIME_TOKEN` is read from the environment only (never a config
-file or the database). When it is set, the music process requires
+file, the database, or a CLI flag). Empty or whitespace-only is treated
+as unset. The music process and the fullstack process must be given the
+same value. On a single-box deploy that binds the music listener to
+loopback (`127.0.0.1` or `::1`), leave the variable unset: the music
+process does not require a bearer, and fullstack sends no
+`Authorization` header. That is today's loopback behaviour.
+
+When the variable is set, the music process requires
 `Authorization: Bearer <token>` on every control route except
-`GET /health` — spawn, command, shutdown, list, and the SSE event
-stream included. `/health` stays open so container healthchecks do not
-change. The runtime container and the fullstack container must be given
-the same value. On a single-box deploy that binds the music listener to
-loopback (`127.0.0.1` or `::1`), leave the variable unset: authentication
-stays off, which is today's behavior. An empty or whitespace-only value
-is treated as unset. If the variable is unset and `--listen` is not a
-loopback address, the music process refuses to start, so the control
-API cannot be exposed on the network without authentication. Do not log
-the token. Kube manifests are unchanged: the Contabo pod still binds
-`127.0.0.1:3002` and does not set the variable.
+`GET /health` — spawn, command, shutdown, list, now-playing, and the
+SSE event stream included. `/health` stays open so container
+healthchecks do not change. Fullstack sends that bearer on every call
+to the runtime, including commands, list/status, now-playing, boot
+rehydrate (`spawn` with the stored id), settings, bug-report context,
+and the SSE subscription. It also sends the header on its own
+`/health` probe; the runtime still accepts `/health` without a token,
+so the exec probe is unchanged.
+
+A runtime `401` is not forwarded to the browser (the panel would treat
+a raw 401 as its own session expiring). The browser-facing route
+answers `502` with `{"error":"music_runtime_auth"}`. The event-stream
+client does not reconnect in a loop after `401`. Do not log the token.
+If the variable is unset and `--listen` is not a loopback address, the
+music process refuses to start. Kube manifests are unchanged: the
+Contabo pod still binds `127.0.0.1:3002` and does not set the variable.
 
 The full canonical env list, with comments, is
 [`deploy/quadlet/ts6-manager.env.example`](../deploy/quadlet/ts6-manager.env.example).
