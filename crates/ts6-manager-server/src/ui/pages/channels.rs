@@ -850,8 +850,10 @@ struct ChannelClientBadgeProps {
 fn ChannelClientBadge(props: ChannelClientBadgeProps) -> Element {
     let r = props.client.clone();
     let away = r.client_away != 0;
-    let muted = r.client_input_muted != 0 || r.client_output_muted != 0 || r.client_is_talker == 0;
-    let talking = r.client_flag_talking != 0 && !muted;
+    // Talker grant (`client_is_talker`) is not a mute. See `client_voice`.
+    let voice = super::client_voice::ClientVoiceState::from_client(&r);
+    let muted = voice.is_muted();
+    let talking = voice.shows_talking(r.client_flag_talking);
     let mut class = String::from("channel-client");
     if away {
         class.push_str(" is-away");
@@ -872,9 +874,7 @@ fn ChannelClientBadge(props: ChannelClientBadgeProps) -> Element {
             if away {
                 span { class: "client-flag", title: "{r.client_away_message}", "away" }
             }
-            if muted {
-                span { class: "client-flag", "muted" }
-            }
+            super::client_voice::VoiceFlagTags { state: voice }
             if let Some(on_move_user) = on_move_user {
                 Button {
                     variant: ButtonVariant::Ghost,

@@ -40,6 +40,52 @@ The single hard requirement. The server boots without anything else.
 | `FRONTEND_URL` | Public origin the browser hits (CORS + cookie domain). Default `http://localhost:3000`. | Operator-supplied. |
 | `TRUSTED_PROXY_HOPS` | Number of trusted reverse-proxy hops in front of the listener. `0` = ignore forwarding headers. `1` = exactly one hop, **only if** the TCP peer is also inside `TRUSTED_PROXY_CIDRS`. | Set to match your TLS terminator, together with the CIDR below. |
 | `TRUSTED_PROXY_CIDRS` | Comma-separated CIDRs of proxies allowed to send `X-Forwarded-For` and `X-Forwarded-Proto`. Empty (default) never trusts those headers, even when hops is `1`. | The proxy's peer address, e.g. `127.0.0.1/32` when Caddy dials the panel on loopback. |
+| `MUSIC_RUNTIME_TOKEN` | Optional shared bearer for the music control API (`:3002`). Unset on single-box loopback deploys. | `openssl rand -base64 32` |
+
+`MUSIC_RUNTIME_TOKEN` is read from the environment only (never a config
+file, the database, or a CLI flag). Fullstack uses the music crate's
+variable name and its parser (`ControlAuth`): surrounding whitespace
+is ignored, and empty or whitespace-only after that trim is unset. A
+stray space in one container's environment therefore cannot cause a
+401. On a single-box
+deploy that binds the music listener to loopback (`127.0.0.1` or
+`::1`), leave the variable unset: the music process does not require a
+bearer, and fullstack sends no `Authorization` header. That is today's
+loopback behaviour. If the variable is present but not valid UTF-8,
+fullstack refuses to start. The error does not include the value. The
+token must travel over WireGuard only.
+
+When the variable is set, the music process requires
+`Authorization: Bearer <token>` on every control route except
+`GET /health` — spawn, command, shutdown, list, now-playing, and the
+SSE event stream included. `/health` stays open so container
+healthchecks do not change. Fullstack sends that bearer on every call
+to the runtime, including commands, list/status, now-playing, boot
+rehydrate (`spawn` with the stored id), settings, bug-report context,
+and the browser event-stream proxy (`GET /v1/bots/{id}/events`). It
+also sends the header on its own
+`/health` probe; the runtime still accepts `/health` without a token,
+so the exec probe is unchanged.
+
+A runtime `401` is not forwarded to the browser (the panel would treat
+a raw 401 as its own session expiring). The browser-facing route
+answers `502` with `{"error":"music_runtime_auth"}`. The event-stream
+client does not reconnect in a loop after `401`. Do not log the token.
+If the variable is unset and `--listen` is not a loopback address, the
+music process refuses to start. Kube manifests are unchanged: the
+Contabo pod still binds `127.0.0.1:3002` and does not set the variable.
+
+When the music runtime runs on a separate host from the panel, bind
+`--listen` to the WireGuard address, firewall `:3002` so only the
+tunnel can reach it, and set the same `MUSIC_RUNTIME_TOKEN` in both
+containers. The value is a bearer token on plain HTTP, so it must
+travel only over the WireGuard link, never over the public internet.
+A wildcard bind (`0.0.0.0` or `::`) is refused while the token is set.
+`MUSIC_RUNTIME_ALLOW_WILDCARD_BIND=1` (or `true`) overrides that
+refusal and is discouraged: the process logs a warning, and `:3002`
+must still be firewalled to the private tunnel. A specific public
+address still starts, and logs a warning to bind the WireGuard or
+private address and firewall `:3002` to the tunnel.
 
 The full canonical env list, with comments, is
 [`deploy/quadlet/ts6-manager.env.example`](../deploy/quadlet/ts6-manager.env.example).
@@ -209,10 +255,13 @@ For all three shapes the external smoke is the same: `curl -fsS http://127.0.0.1
 | Shape | Start | Stop | Restart |
 | --- | --- | --- | --- |
 | Quadlet | `systemctl --user start ts6-manager-pod.service` | `systemctl --user stop ts6-manager-pod.service` | `systemctl --user restart ts6-manager-pod.service` |
-| Kube | `cat deploy/kube/secrets.yaml deploy/kube/ts6-manager.yaml > /tmp/ts6-manager.kube.yaml && podman kube play /tmp/ts6-manager.kube.yaml` (skip the concat if `podman secret exists ts6-manager-secrets`) | `podman kube down deploy/kube/ts6-manager.yaml` (never `--force`) | `./scripts/update.sh vX.Y.Z` |
+| Kube | `./scripts/update.sh vX.Y.Z` | `podman kube down deploy/kube/ts6-manager.yaml` (never `--force`) | `./scripts/update.sh vX.Y.Z` |
 | Compose | `podman-compose up -d fullstack` | `podman-compose down` | `podman-compose restart fullstack` |
 
-Kube `kube down` removes the pod and containers but leaves the named
+Kube start and restart are only `./scripts/update.sh vX.Y.Z`. Do not
+`podman kube play` the committed manifest: fullstack, music, and
+sidecar are `@UNRELEASED`, which fails reference parsing before any pull.
+`kube down` removes the pod and containers but leaves the named
 volumes (`ts6-data`, `ts6-db`, `ts6-music`) intact, so data survives a
 restart. `ts6-data` backs the manager state root and is what keeps a
 yt-dlp cookie uploaded via Settings from being wiped on redeploy
@@ -283,20 +332,22 @@ log path off the manager itself.
 > If bots/flows/rules vanish after an upgrade, the `ts6-db` volume was
 > lost — restore it from a § 3.2 backup.
 
-The kube manifest pins fullstack, music, and sidecar to the same
-release tag (currently `:v1.6.2`). All three GHCR images share that
-tag from `.github/workflows/release.yml`. `imagePullPolicy: IfNotPresent`
-means you must `podman pull` the target tags before play or old
-layers stick.
+The committed kube manifest does not pin a release tag. Fullstack,
+music, and sidecar are `@UNRELEASED` (not an image tag — podman
+fails reference parsing before any pull). `./scripts/update.sh vX.Y.Z` rewrites a temp
+copy so all three share the tag you pass. A live checkout that still
+has `:vX.Y.Z` on those images is rewritten the same way. Images are
+published by `.github/workflows/release.yml`. `imagePullPolicy: IfNotPresent`
+means the script pulls the target tags before play or old layers stick.
 
-**Contabo / kube — `scripts/update.sh` (recommended):**
+**Contabo / kube — `scripts/update.sh` (only start / restart):**
 
 ```sh
-./scripts/update.sh v1.6.2
+./scripts/update.sh vX.Y.Z
 ```
 
 From any cwd against a repo checkout. The script pulls fullstack +
-music + sidecar, rewrites a temp manifest so music/sidecar cannot lag,
+music + sidecar, rewrites a temp manifest so music and sidecar cannot lag,
 `podman kube down`s **without** `--force`, plays (pod-only if
 `ts6-manager-secrets` already exists; otherwise concatenates
 `deploy/kube/secrets.yaml`), curls fullstack `:3001/health` and music
@@ -316,6 +367,9 @@ fullstack `sync_settings` pushes the yt-dlp cookie / API key after
 volume. Never `podman kube down --force`. Do not MOVE the bot
 runtime to Floki. Verify signatures first if you want — see § 5 and
 [`docs/ops/images.md` § 3](ops/images.md#3-signing).
+
+There is no hand-rolled `sed` / `podman kube play` start or restart.
+Playing the committed manifest fails reference parsing (`@UNRELEASED`).
 
 **voice-rt nice is one-shot (Opus #66 L16).** `TS6_BOT_NICE` (`-5` in
 packing B) is not a unit property. `apply-fullstack-soft-pin.sh`
@@ -356,25 +410,6 @@ podman auto-update              # apply
 Only enable auto-update against immutable `vX.Y.Z` tags — pointing it at a
 floating `latest` tag will roll silently on every push and breaks the
 "every running instance has a known signature" property.
-
-#### Appendix: manual kube upgrade
-
-Prefer `./scripts/update.sh vX.Y.Z`. Same sequence by hand:
-
-```sh
-TAG=v1.6.2
-podman pull "ghcr.io/frozentear/ts6-manager-fullstack:${TAG}"
-podman pull "ghcr.io/frozentear/ts6-manager-sidecar:${TAG}"
-sed -E \
-  -e "s#(image:[[:space:]]+ghcr\\.io/frozentear/ts6-manager-fullstack:)[^[:space:]]+#\\1${TAG}#" \
-  -e "s#(image:[[:space:]]+ghcr\\.io/frozentear/ts6-manager-sidecar:)[^[:space:]]+#\\1${TAG}#" \
-  deploy/kube/ts6-manager.yaml > /tmp/ts6-manager.kube.yaml
-podman kube down deploy/kube/ts6-manager.yaml    # never --force
-# If the host secret is missing: cat deploy/kube/secrets.yaml in front.
-podman kube play /tmp/ts6-manager.kube.yaml
-curl -fsS http://127.0.0.1:3001/health
-./scripts/apply-fullstack-soft-pin.sh   # Contabo soft pin; no-op if unset
-```
 
 ### 3.5 Re-issuing secrets
 
