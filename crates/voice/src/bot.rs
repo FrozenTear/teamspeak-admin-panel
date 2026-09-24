@@ -494,7 +494,7 @@ async fn run_connected_loop(
                 Some(BotCommand::Disconnect) => {
                     if audio::tear_down(&mut current_audio) {
                         audio::send_voice_stop(con);
-                        audio::inline_flush(con).await;
+                        audio::inline_flush(con);
                         let _ = events.send(BotEvent::AudioFinished {
                             reason: "disconnect".into(),
                         });
@@ -504,7 +504,7 @@ async fn run_connected_loop(
                 Some(BotCommand::Shutdown) => {
                     if audio::tear_down(&mut current_audio) {
                         audio::send_voice_stop(con);
-                        audio::inline_flush(con).await;
+                        audio::inline_flush(con);
                         let _ = events.send(BotEvent::AudioFinished {
                             reason: "shutdown".into(),
                         });
@@ -670,10 +670,10 @@ impl WireSink<'_> {
     /// of the packet just enqueued. No-op flush when `VOICE_INLINE_FLUSH`
     /// is off. The split path flushes inside the wire task, which is the
     /// task that actually calls `send_audio`.
-    async fn voice_stop_and_flush(&mut self) {
+    fn voice_stop_and_flush(&mut self) {
         self.voice_stop();
         if let WireSink::Direct(con) = self {
-            audio::inline_flush(con).await;
+            audio::inline_flush(con);
         }
     }
 
@@ -755,7 +755,9 @@ async fn consume_wire_audio_msg(
     events: &broadcast::Sender<BotEvent>,
 ) -> bool {
     match msg {
-        AudioMsg::Frame { bytes, enqueued_at } => {
+        AudioMsg::Frame {
+            bytes, enqueued_at, ..
+        } => {
             let Some(p) = play.as_mut() else {
                 return true;
             };
@@ -799,7 +801,7 @@ async fn consume_wire_audio_msg(
                 return true;
             }
             // Same wake-up as the enqueue. No-op unless VOICE_INLINE_FLUSH.
-            audio::inline_flush(con).await;
+            audio::inline_flush(con);
             false
         }
         AudioMsg::PipelineEvent(ev) => {
@@ -924,7 +926,7 @@ async fn run_wire_task(
                 }
                 Some(WireCmd::VoiceStop) => {
                     audio::send_voice_stop(&mut con);
-                    audio::inline_flush(&mut con).await;
+                    audio::inline_flush(&mut con);
                 }
                 Some(WireCmd::ChannelMove(target)) => {
                     if let Err(err) = send_channel_move(&mut con, target) {
@@ -1307,7 +1309,7 @@ async fn handle_audio_msg(
         warn!("audio sibling channel closed without Finished — tearing down");
         if audio::tear_down(current_audio) {
             wire.clear_audio();
-            wire.voice_stop_and_flush().await;
+            wire.voice_stop_and_flush();
             let _ = events.send(BotEvent::AudioFinished {
                 reason: "failed: audio pipeline channel closed unexpectedly".into(),
             });
@@ -1315,7 +1317,9 @@ async fn handle_audio_msg(
         return "sibling_closed";
     };
     match msg {
-        AudioMsg::Frame { bytes, enqueued_at } => {
+        AudioMsg::Frame {
+            bytes, enqueued_at, ..
+        } => {
             // PURA-389a — the send + its A/B/C timing happen inside this
             // `if let` so `active` (and its `send_monitor`) is borrowed only
             // here; `send_result` owns its data, freeing `current_audio` for
@@ -1373,7 +1377,7 @@ async fn handle_audio_msg(
             } else if audio::inline_flush_is_enabled()
                 && let WireSink::Direct(con) = wire
             {
-                audio::inline_flush(con).await;
+                audio::inline_flush(con);
             }
             "frame"
         }
@@ -1409,7 +1413,7 @@ async fn handle_audio_msg(
             "end_of_stream"
         }
         AudioMsg::Finished => {
-            wire.voice_stop_and_flush().await;
+            wire.voice_stop_and_flush();
             // PURA-261 — a pipeline that drained without ever producing
             // a frame means yt-dlp / ffmpeg failed (bad URL, bot-gated
             // video, codec error). Flag it with the `failed: ` reason
@@ -1505,7 +1509,7 @@ async fn handle_audio_command(
         AudioCommand::Stop => {
             if audio::tear_down(current_audio) {
                 wire.clear_audio();
-                wire.voice_stop_and_flush().await;
+                wire.voice_stop_and_flush();
                 let _ = events.send(BotEvent::AudioFinished {
                     reason: "stopped".into(),
                 });
@@ -1531,7 +1535,7 @@ async fn handle_audio_command(
             let was_active = audio::tear_down(current_audio);
             if was_active {
                 wire.clear_audio();
-                wire.voice_stop_and_flush().await;
+                wire.voice_stop_and_flush();
             }
             // PURA-261 — emit `AudioFinished` BEFORE the queue advance:
             // `LivenessTracker` clears `now_playing` on `AudioFinished`,
@@ -1552,7 +1556,7 @@ async fn handle_audio_command(
                     info!(secs, "AudioCommand::Seek — re-spawned pipeline at offset");
                     // Flush the wire so the TS jitter buffer drops the gap
                     // between the old and the post-seek frames cleanly.
-                    wire.voice_stop_and_flush().await;
+                    wire.voice_stop_and_flush();
                     // Snap the FE progress clock to the seek target now —
                     // the next `Progress` tick (offset + frames/50) only
                     // lands a second into the post-seek pre-buffer.
@@ -2198,7 +2202,7 @@ async fn apply_chat_audio_action(
             // `AudioFinished` would clear that fresh `now_playing`.
             if audio::tear_down(current_audio) {
                 wire.clear_audio();
-                wire.voice_stop_and_flush().await;
+                wire.voice_stop_and_flush();
                 debug!("chat command replaced the queue head — restarting pipeline");
             }
             auto_start_pending_track(current_audio, store, bot_id, events, yt_cookie, bot_volume)
@@ -2211,7 +2215,7 @@ async fn apply_chat_audio_action(
             // state. Mirrors `AudioCommand::Stop`.
             if audio::tear_down(current_audio) {
                 wire.clear_audio();
-                wire.voice_stop_and_flush().await;
+                wire.voice_stop_and_flush();
                 let _ = events.send(BotEvent::AudioFinished {
                     reason: "stopped".into(),
                 });

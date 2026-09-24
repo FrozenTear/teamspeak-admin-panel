@@ -26,6 +26,24 @@ pub trait Socket {
 	fn poll_send_to(
 		&self, cx: &mut Context, buf: &[u8], target: SocketAddr,
 	) -> Poll<io::Result<usize>>;
+	/// Non-blocking send. Must not register a waker.
+	///
+	/// The default polls with a no-op waker and maps `Pending` to
+	/// [`io::ErrorKind::WouldBlock`]. A socket that stores the waker passed
+	/// to `poll_send_to` (tokio's `UdpSocket` does, and that waker is the
+	/// reactor registration shared with recv) has to override this so a
+	/// direct flush cannot replace the recv waker.
+	fn try_send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+		let waker = std::task::Waker::noop();
+		let mut cx = Context::from_waker(waker);
+		match self.poll_send_to(&mut cx, buf, target) {
+			Poll::Ready(res) => res,
+			Poll::Pending => Err(io::Error::new(
+				io::ErrorKind::WouldBlock,
+				"udp send would block",
+			)),
+		}
+	}
 	fn local_addr(&self) -> io::Result<SocketAddr>;
 
 	/// PURA-403 fix — duplicate the underlying fd into a second
@@ -150,6 +168,13 @@ impl Socket for UdpSocket {
 		&self, cx: &mut Context, buf: &[u8], target: SocketAddr,
 	) -> Poll<io::Result<usize>> {
 		self.poll_send_to(cx, buf, target)
+	}
+
+	/// Syscall only. `UdpSocket::try_send_to` does not register a waker, so
+	/// a direct flush from the voice task cannot clobber the recv
+	/// registration `poll_recv_from` installed.
+	fn try_send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+		UdpSocket::try_send_to(self, buf, target)
 	}
 
 	fn local_addr(&self) -> io::Result<SocketAddr> { self.local_addr() }
@@ -350,27 +375,76 @@ impl Connection {
 		Ok(flushed)
 	}
 
-	/// Flush the non-command outgoing queue (voice, acks, anything else
-	/// parked in `acks_to_send`) onto the socket or the ack-sender thread.
+	/// Write queued non-command packets (voice, acks) with a non-blocking
+	/// `send_to` on the UDP socket.
 	///
-	/// `send_packet` for a voice frame only enqueues. The datagram is
-	/// written when [`Stream::poll_next`] runs the same helper this method
-	/// calls. TS6 Voice holds `&mut Connection` on the send loop and calls
-	/// this immediately after `send_audio` so the flush happens in that
-	/// wake-up instead of waiting for the next connection poll.
+	/// `send_packet` only enqueues. [`Stream::poll_next`] later runs
+	/// [`Self::poll_send_acks`], which on a production socket hands the
+	/// queue to the ack-sender thread. That does not remove a wake-up:
+	/// the connection's events arm already calls `poll_send_acks` in the
+	/// same poll. This method syscalls `send_to` from the caller instead.
 	///
-	/// Returns how many packets left the queue (`0` if nothing was
-	/// pending). On the inline-socket fallback a `Pending` send stops the
-	/// walk and leaves the rest queued; pass the waker of the task that
-	/// also polls the connection so that registration is not replaced with
-	/// a no-op. The ack-sender-thread path never blocks and does not touch
-	/// the UDP socket waker.
+	/// Walks the queue front to back. A successful send fires
+	/// `SendUdpPacket`, runs `handle_loss_outgoing`, and pops — the same
+	/// bookkeeping as the inline fallback in `poll_send_acks`. Packet ids
+	/// were assigned at encode time and are not touched. `WouldBlock`
+	/// stops the walk and leaves that packet, and everything behind it,
+	/// queued for the normal path. A later packet is never sent while an
+	/// earlier one is still queued, so order is preserved. A popped
+	/// packet cannot be sent again by `poll_send_acks`.
 	///
-	/// Resend, ping, and incoming recv stay on `poll_next`. Both paths pop
-	/// the same queue under `&mut self`, so interleaving them cannot
-	/// double-send or skip an ack.
-	pub fn poll_flush_outgoing(&mut self, cx: &mut Context) -> Result<usize> {
-		self.poll_send_acks(cx)
+	/// Does not use `ack_thread_tx` and does not register a waker. Resend,
+	/// ping, and recv stay on `poll_next`. Returns how many packets left
+	/// the queue (`0` if nothing was pending or the first send would block).
+	pub fn try_flush_outgoing(&mut self) -> Result<usize> {
+		let mut flushed = 0usize;
+		while let Some(packet) = self.acks_to_send.front() {
+			match self.try_send_udp_packet(packet) {
+				Ok(true) => {
+					self.resender.handle_loss_outgoing(packet);
+				}
+				Ok(false) => break,
+				Err(e) => return Err(e),
+			}
+			self.acks_to_send.pop_front();
+			flushed += 1;
+		}
+		Ok(flushed)
+	}
+
+	/// Same as [`Self::try_flush_outgoing`]. `cx` is unused: polling the
+	/// tokio socket with a caller waker would replace the recv
+	/// registration, and a no-op waker would too.
+	pub fn poll_flush_outgoing(&mut self, _cx: &mut Context) -> Result<usize> {
+		self.try_flush_outgoing()
+	}
+
+	/// `Ok(true)` sent the whole datagram. `Ok(false)` is `WouldBlock`;
+	/// the packet stays queued. The `SendUdpPacket` event fires only once
+	/// the syscall has accepted the bytes, matching
+	/// [`Self::static_poll_send_udp_packet`].
+	fn try_send_udp_packet(&self, packet: &OutUdpPacket) -> Result<bool> {
+		let data = packet.data().data();
+		let send_result = loop {
+			match self.udp_socket.try_send_to(data, self.address) {
+				Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+				other => break other,
+			}
+		};
+		match send_result {
+			Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(false),
+			Err(e) => Err(Error::Network(e)),
+			Ok(size) => {
+				self.send_event(&Event::SendUdpPacket(packet));
+				if size != data.len() {
+					Err(Error::Network(std::io::Error::other(
+						"Failed to send whole udp packet",
+					)))
+				} else {
+					Ok(true)
+				}
+			}
+		}
 	}
 
 	fn poll_incoming_udp_packet(&mut self, cx: &mut Context) -> Poll<Result<StreamItem>> {

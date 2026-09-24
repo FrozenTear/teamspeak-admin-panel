@@ -953,26 +953,34 @@ impl Connection {
 		}
 	}
 
-	/// Flush packets queued by [`send_audio`] (and any pending acks) onto
-	/// the outgoing sink without waiting for the next [`events`] poll.
+	/// Write packets queued by [`send_audio`] (and any pending acks) with a
+	/// non-blocking `send_to` on the UDP socket, without waiting for the
+	/// next [`events`] poll.
 	///
 	/// [`send_audio`] only enqueues. The voice send loop calls this in the
-	/// same wake-up so the datagram is handed to the socket, or to the
-	/// ack-sender thread, immediately. Returns how many packets were handed
-	/// off; `0` means the queue was empty.
+	/// same wake-up so the datagram leaves from that task. Pushing the
+	/// queue at the ack-sender thread does not save that wake: the events
+	/// arm already runs the same push. Returns how many packets were
+	/// written; `0` means the queue was empty or the first send returned
+	/// `WouldBlock`.
 	///
-	/// Non-blocking: the ack-sender path is a channel push, and the inline
-	/// fallback stops on `Poll::Pending` and leaves the packet queued.
-	/// Does not run resend, ping, or recv — the normal [`events`] poll
-	/// still owns those and flushes whatever this call left behind. Safe to
-	/// interleave with that poll; both drain one queue under `&mut self`,
-	/// so ack handling is unchanged.
-	pub fn poll_flush_outgoing(&mut self, cx: &mut Context) -> Result<usize> {
+	/// Never blocks and never registers a waker. On `WouldBlock` the packet
+	/// stays queued for the normal events poll, which sends it once.
+	/// Packet ids, `SendUdpPacket`, and loss accounting match that path.
+	/// A packet this call already wrote is popped, so the events poll
+	/// cannot write it again. Does not run resend, ping, or recv.
+	pub fn try_flush_outgoing(&mut self) -> Result<usize> {
 		if let ConnectionState::Connected { con, .. } = &mut self.state {
-			con.client.poll_flush_outgoing(cx).map_err(|err| Error::SendPacket(err.into()))
+			con.client.try_flush_outgoing().map_err(|err| Error::SendPacket(err.into()))
 		} else {
 			Err(Error::NotConnected)
 		}
+	}
+
+	/// [`Self::try_flush_outgoing`]. The context is ignored so this cannot
+	/// replace the socket's recv waker.
+	pub fn poll_flush_outgoing(&mut self, _cx: &mut Context) -> Result<usize> {
+		self.try_flush_outgoing()
 	}
 
 	/// Download a file from a channel of the connected TeamSpeak server.

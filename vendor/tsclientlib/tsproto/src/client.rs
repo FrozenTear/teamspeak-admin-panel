@@ -712,8 +712,12 @@ mod tests {
 	use std::cell::Cell;
 	use std::collections::VecDeque;
 	use std::io;
+	use std::pin::Pin;
+	use std::sync::atomic::{AtomicBool, Ordering};
 	use std::sync::{Arc, Mutex};
 	use std::task::Waker;
+
+	use futures::Stream;
 
 	use anyhow::{Result, bail};
 	use num_traits::ToPrimitive;
@@ -808,6 +812,14 @@ mod tests {
 		}
 
 		fn local_addr(&self) -> io::Result<SocketAddr> { Ok(self.addr) }
+	}
+
+	impl SimulatedSocket {
+		/// Datagrams sitting in this socket's receive queue, oldest first.
+		/// Does not pop them.
+		fn pending_datagrams(&self) -> Vec<Vec<u8>> {
+			self.state.lock().unwrap().buffer[self.i].iter().cloned().collect()
+		}
 	}
 
 	impl SimulatedMixSocket {
@@ -1209,5 +1221,137 @@ mod tests {
 	#[tokio::test]
 	async fn some_out_of_order() -> Result<()> {
 		out_of_order_test(vec![5, 3, 7, 8, 2, 0, 6, 1]).await
+	}
+
+	fn voice_packet(payload: &[u8]) -> OutPacket {
+		OutAudio::new(&AudioData::C2S { id: 0, codec: CodecType::OpusVoice, data: payload })
+	}
+
+	fn datagram_contains(datagram: &[u8], needle: &[u8]) -> bool {
+		datagram.windows(needle.len()).any(|window| window == needle)
+	}
+
+	/// Fallback socket (`SimulatedSocket`: no ack-sender thread). `send_packet`
+	/// only enqueues. The direct flush writes the datagrams, in order, before
+	/// the next events poll, and that poll does not write them again.
+	#[tokio::test]
+	async fn direct_flush_on_fallback_socket_runs_before_events_poll() -> Result<()> {
+		let addr: SocketAddr = "127.0.0.1:0".parse()?;
+		let (client_sock, server_sock) = SimulatedSocket::pair(addr, addr);
+		let mut state =
+			TestConnection::new_with_sockets(Box::new(client_sock), Box::new(server_sock.clone()))?;
+		state.set_connected();
+		state.client.params.as_mut().unwrap().voice_encryption = false;
+
+		let seen = Arc::new(Mutex::new(Vec::new()));
+		let seen_cb = seen.clone();
+		state.client.event_listeners.push(Box::new(move |event| {
+			if let Event::SendUdpPacket(packet) = event {
+				seen_cb.lock().unwrap().push((
+					packet.packet_id(),
+					packet.generation_id(),
+					packet.packet_type(),
+				));
+			}
+		}));
+
+		let id0 = state.client.send_packet(voice_packet(b"FRAME-OLDER"))?;
+		let id1 = state.client.send_packet(voice_packet(b"FRAME-NEWER"))?;
+		assert!(
+			server_sock.pending_datagrams().is_empty(),
+			"send_packet only enqueues on the fallback socket",
+		);
+
+		assert_eq!(state.client.try_flush_outgoing()?, 2);
+		let dgrams = server_sock.pending_datagrams();
+		assert_eq!(dgrams.len(), 2, "flush writes before any events poll");
+		assert!(
+			datagram_contains(&dgrams[0], b"FRAME-OLDER"),
+			"oldest packet is sent first",
+		);
+		assert!(datagram_contains(&dgrams[1], b"FRAME-NEWER"));
+
+		let fired = seen.lock().unwrap();
+		assert_eq!(fired.len(), 2, "one SendUdpPacket per datagram");
+		assert_eq!(fired[0].0, id0.part.packet_id);
+		assert_eq!(fired[0].1, id0.part.generation_id);
+		assert_eq!(fired[0].2, PacketType::Voice);
+		assert_eq!(fired[1].0, id1.part.packet_id);
+		assert_eq!(fired[1].1, id1.part.generation_id);
+		drop(fired);
+
+		let waker = std::task::Waker::noop();
+		let mut cx = Context::from_waker(&waker);
+		let _ = Pin::new(&mut state.client).poll_next(&mut cx);
+		assert_eq!(
+			server_sock.pending_datagrams().len(),
+			2,
+			"the events poll must not send the flushed packets again",
+		);
+		assert_eq!(state.client.try_flush_outgoing()?, 0);
+		assert_eq!(seen.lock().unwrap().len(), 2);
+		Ok(())
+	}
+
+	/// `poll_send_to` returns `Pending` while sends are gated. The direct
+	/// flush must leave the packet queued; the events poll (normal path)
+	/// then sends it once.
+	struct GateSocket {
+		inner: SimulatedSocket,
+		block_send: Arc<AtomicBool>,
+	}
+
+	impl Socket for GateSocket {
+		fn poll_recv_from(
+			&self, cx: &mut Context, buf: &mut ReadBuf,
+		) -> Poll<io::Result<SocketAddr>> {
+			self.inner.poll_recv_from(cx, buf)
+		}
+
+		fn poll_send_to(
+			&self, cx: &mut Context, buf: &[u8], target: SocketAddr,
+		) -> Poll<io::Result<usize>> {
+			if self.block_send.load(Ordering::SeqCst) {
+				// Pending without storing `cx`'s waker. The direct flush
+				// reaches this through a no-op waker; storing it would drop
+				// a real recv registration on a socket that keeps one.
+				return Poll::Pending;
+			}
+			self.inner.poll_send_to(cx, buf, target)
+		}
+
+		fn local_addr(&self) -> io::Result<SocketAddr> { self.inner.local_addr() }
+	}
+
+	#[tokio::test]
+	async fn direct_flush_would_block_leaves_packet_for_events_poll() -> Result<()> {
+		let addr: SocketAddr = "127.0.0.1:0".parse()?;
+		let (client_sock, server_sock) = SimulatedSocket::pair(addr, addr);
+		let block_send = Arc::new(AtomicBool::new(true));
+		let gate = GateSocket { inner: client_sock, block_send: block_send.clone() };
+		let mut state =
+			TestConnection::new_with_sockets(Box::new(gate), Box::new(server_sock.clone()))?;
+		state.set_connected();
+		state.client.params.as_mut().unwrap().voice_encryption = false;
+
+		state.client.send_packet(voice_packet(b"BLOCKED-FRAME"))?;
+		state.client.send_packet(voice_packet(b"STILL-QUEUED"))?;
+		assert_eq!(state.client.try_flush_outgoing()?, 0);
+		assert!(
+			server_sock.pending_datagrams().is_empty(),
+			"WouldBlock leaves every packet queued, including the one behind",
+		);
+
+		block_send.store(false, Ordering::SeqCst);
+		let waker = std::task::Waker::noop();
+		let mut cx = Context::from_waker(&waker);
+		let _ = Pin::new(&mut state.client).poll_next(&mut cx);
+		let dgrams = server_sock.pending_datagrams();
+		assert_eq!(dgrams.len(), 2, "the events poll sends the queued packets once");
+		assert!(datagram_contains(&dgrams[0], b"BLOCKED-FRAME"));
+		assert!(datagram_contains(&dgrams[1], b"STILL-QUEUED"));
+		assert_eq!(state.client.try_flush_outgoing()?, 0, "already sent, so no second write");
+		assert_eq!(server_sock.pending_datagrams().len(), 2);
+		Ok(())
 	}
 }
