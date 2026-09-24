@@ -92,8 +92,9 @@ Contabo already runs Caddy v2.11.4 at `/etc/caddy/Caddyfile`
 Fullstack is `0.0.0.0:3001` today (`hostNetwork`). Once live, public
 access is the hostname, not raw `:3001`. Contabo kube fullstack env
 (`deploy/kube/ts6-manager.yaml`) sets
-`FRONTEND_URL=https://panel.scuffedcrew.no` and `TRUSTED_PROXY_HOPS=1`
-(hops=1 matches host Caddy; #50/#51).
+`FRONTEND_URL=https://panel.scuffedcrew.no`, `TRUSTED_PROXY_HOPS=1`,
+and `TRUSTED_PROXY_CIDRS=127.0.0.1/32` (host Caddy on loopback; an
+empty CIDR list trusts no proxy headers; #50/#51).
 
 Snippet: [`Caddyfile.panel.snippet`](Caddyfile.panel.snippet).
 
