@@ -7,7 +7,9 @@
 //!    the live list. Spec §7.8.
 //! 2. A WS subscription on `server:{configId}:clients` reduces over the
 //!    snapshot — `ts:client:moved` updates the row's `cid`, kicks remove
-//!    it, mutes/unmutes flip the muted columns. When the upstream emits
+//!    it, `ts:client:muted` / `ts:client:unmuted` flip `client_is_talker`
+//!    (the moderated-channel talk grant those endpoints change). They do
+//!    not carry mic or speaker mute. When the upstream emits
 //!    a `ts:client:connected` we don't yet know the full row, so the
 //!    component refetches the snapshot in the background and reconciles.
 //!    The move-user picker also subscribes to `server:{configId}:channels`
@@ -451,9 +453,11 @@ fn ClientsTable(props: ClientsTableProps) -> Element {
                         let r = r.clone();
                         let clid = r.clid;
                         let cid = r.cid;
-                        // Silenced = operator revoked the talker flag.
-                        // Effective in moderated channels only.
-                        let muted = r.client_is_talker == 0;
+                        let voice = super::client_voice::ClientVoiceState::from_client(&r);
+                        // Mute / Unmute posts the talker-flag endpoints.
+                        // `client_is_talker == 0` is the revoked grant, not
+                        // a mic or speaker mute (that is `voice` above).
+                        let talker_revoked = r.client_is_talker == 0;
                         let on_kick_server = props.on_kick_server;
                         let on_kick_channel = props.on_kick_channel;
                         let on_mute = props.on_mute;
@@ -473,10 +477,9 @@ fn ClientsTable(props: ClientsTableProps) -> Element {
                                     }
                                 }
                                 td {
-                                    if muted {
-                                        span {
-                                            title: "Silenced via talker flag — effective in moderated channels only",
-                                            "Silenced"
+                                    if voice.is_muted() {
+                                        span { class: "client-flags",
+                                            super::client_voice::VoiceFlagTags { state: voice }
                                         }
                                     } else {
                                         "Active"
@@ -496,10 +499,13 @@ fn ClientsTable(props: ClientsTableProps) -> Element {
                                         onclick: move |_| on_kick_server.call(clid),
                                         "Kick from server"
                                     }
-                                    if muted {
+                                    if talker_revoked {
                                         Button {
                                             variant: ButtonVariant::Secondary,
                                             size: ButtonSize::Small,
+                                            title: Some(
+                                                "Restore the moderated-channel talker flag. Does not change mic or speaker mute.".into(),
+                                            ),
                                             onclick: move |_| on_unmute.call(clid),
                                             "Unmute"
                                         }
@@ -507,6 +513,9 @@ fn ClientsTable(props: ClientsTableProps) -> Element {
                                         Button {
                                             variant: ButtonVariant::Secondary,
                                             size: ButtonSize::Small,
+                                            title: Some(
+                                                "Revoke the moderated-channel talker flag. Does not change mic or speaker mute.".into(),
+                                            ),
                                             onclick: move |_| on_mute.call(clid),
                                             "Mute"
                                         }
@@ -655,6 +664,8 @@ fn apply_event(rows: &mut Vec<ClientListItem>, env: &WsEvent) {
                 row.cid = cid;
             }
         }
+        // Payloads are `{clid, talker}` from the talker-flag endpoints.
+        // They do not include `client_input_muted` / `client_output_muted`.
         "ts:client:muted" => {
             if let Some(clid) = env.data.get("clid").and_then(Value::as_i64)
                 && let Some(row) = rows.iter_mut().find(|r| r.clid == clid)
@@ -833,9 +844,13 @@ mod tests {
     }
 
     #[test]
-    fn mute_clears_talker_flag() {
+    fn mute_clears_talker_flag_and_leaves_mic_flags() {
         let mut rows = vec![ClientListItem {
             client_is_talker: 1,
+            client_input_muted: 0,
+            client_output_muted: 0,
+            client_input_hardware: 1,
+            client_output_hardware: 1,
             ..row(3)
         }];
         apply_event(
@@ -843,12 +858,20 @@ mod tests {
             &evt("ts:client:muted", json!({"clid": 3, "talker": false})),
         );
         assert_eq!(rows[0].client_is_talker, 0);
+        assert_eq!(rows[0].client_input_muted, 0);
+        assert_eq!(rows[0].client_output_muted, 0);
+        let voice = crate::ui::pages::client_voice::ClientVoiceState::from_client(&rows[0]);
+        assert!(!voice.is_muted());
     }
 
     #[test]
-    fn unmute_restores_talker_flag() {
+    fn unmute_restores_talker_flag_and_leaves_mic_flags() {
         let mut rows = vec![ClientListItem {
             client_is_talker: 0,
+            client_input_muted: 1,
+            client_output_muted: 0,
+            client_input_hardware: 1,
+            client_output_hardware: 1,
             ..row(4)
         }];
         apply_event(
@@ -856,6 +879,17 @@ mod tests {
             &evt("ts:client:unmuted", json!({"clid": 4, "talker": true})),
         );
         assert_eq!(rows[0].client_is_talker, 1);
+        assert_eq!(rows[0].client_input_muted, 1);
+        let voice = crate::ui::pages::client_voice::ClientVoiceState::from_client(&rows[0]);
+        assert!(voice.is_muted());
+        assert_eq!(
+            voice
+                .tags()
+                .into_iter()
+                .map(|tag| tag.label)
+                .collect::<Vec<_>>(),
+            ["mic muted"]
+        );
     }
 
     #[test]
