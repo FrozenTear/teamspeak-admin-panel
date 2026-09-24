@@ -1414,7 +1414,7 @@ impl SendTimingMonitor {
             max_t_blockinplace_us = self.window_max_t_blockinplace.as_micros() as u64,
             // Bucket upper bound of the 99th percentile of direct-flush
             // durations over this ~30 s window. The open ≥32 ms bucket is
-            // `flush_p99_us = 32000` with `flush_p99_overflow = true`.
+            // `flush_p99_us = 32768` with `flush_p99_overflow = true`.
             // Independent of the 1 s `inline_flush` line.
             flush_p99_us = flush_p99.us,
             flush_p99_overflow = flush_p99.overflow,
@@ -1821,9 +1821,10 @@ const FLUSH_BUCKET_COUNT: usize = 16;
 /// above this land in the top bucket.
 const FLUSH_BUCKET_OVERFLOW_US: u64 = 32_768;
 /// `flush_p99_us` when the 99th percentile is in that open bucket.
-/// 32 ms as a decimal microsecond count, so the log field stays a plain
-/// number. Paired with `flush_p99_overflow = true`.
-const FLUSH_P99_OVERFLOW_US: u64 = 32_000;
+/// Same number as the exclusive upper bound of the bucket just below
+/// (`32768` µs), so the logged value stays at or above that neighbor.
+/// Paired with `flush_p99_overflow = true`.
+const FLUSH_P99_OVERFLOW_US: u64 = 32_768;
 const FLUSH_GE_1MS_US: u64 = 1_000;
 const FLUSH_GE_5MS_US: u64 = 5_000;
 
@@ -1918,7 +1919,7 @@ fn flush_bucket_upper_us(index: usize) -> u64 {
 ///
 /// Rank is `ceil(0.99 * n)` counting from the low bucket. An empty window
 /// is `us == 0`, `overflow == false`. The open top bucket (`≥ 32 ms`) is
-/// `us == 32000`, `overflow == true`.
+/// `us == 32768`, `overflow == true`.
 fn flush_p99(counts: &[u64]) -> FlushP99 {
     let total = counts.iter().copied().sum::<u64>();
     if total == 0 {
@@ -2038,7 +2039,7 @@ pub(crate) fn inline_flush(con: &mut Connection) {
 /// at 50 frames/s is too small for a nearest-rank p99 to be anything but
 /// the max — it is logged on the ~30 s `audio_send_summary` as
 /// `flush_p99_us`, with `flush_p99_overflow` set when that percentile is
-/// in the open `≥ 32 ms` bucket (`flush_p99_us` is then `32000`). Drop
+/// in the open `≥ 32 ms` bucket (`flush_p99_us` is then `32768`). Drop
 /// lines are the same record (`dropped_since_log`),
 /// never a per-frame log.
 pub(crate) fn maybe_log_inline_flush() {
@@ -3551,7 +3552,7 @@ mod tests {
         let mut overflow = [0u64; FLUSH_BUCKET_COUNT];
         overflow[15] = 100;
         let overflow_p99 = flush_p99(&overflow);
-        assert_eq!(overflow_p99.us, 32_000);
+        assert_eq!(overflow_p99.us, 32_768);
         assert!(overflow_p99.overflow);
     }
 
