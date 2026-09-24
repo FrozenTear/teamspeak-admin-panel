@@ -413,16 +413,36 @@ async fn run_connected_loop(
                 // contention on a `frame`, or an ~11 s yt-dlp auto-advance
                 // on a `finished`, both stall the loop here.
                 let arm_start = Instant::now();
-                let kind = handle_audio_msg(
-                    &mut WireSink::Direct(&mut *con),
-                    audio_msg,
-                    &mut current_audio,
-                    bot_id,
-                    store,
-                    events,
-                    &yt_cookie,
-                    &bot_volume,
-                ).await;
+                let kind = if let Some(msg) = audio_msg {
+                    let batch = {
+                        let rx = current_audio.as_mut().unwrap().audio_rx.as_mut().unwrap();
+                        audio::catchup_batch(msg, rx)
+                    };
+                    drive_catchup_batch(
+                        batch,
+                        con,
+                        &mut current_audio,
+                        bot_id,
+                        store,
+                        events,
+                        &yt_cookie,
+                        &bot_volume,
+                    )
+                    .await
+                } else {
+                    // Sibling closed. Same path as before the catch-up gate.
+                    handle_audio_msg(
+                        &mut WireSink::Direct(&mut *con),
+                        None,
+                        &mut current_audio,
+                        bot_id,
+                        store,
+                        events,
+                        &yt_cookie,
+                        &bot_volume,
+                    )
+                    .await
+                };
                 log_loop_stall("audio", arm_start, || format!("audio_msg={kind}"));
             },
             ev = async { con.events().next().await } => match ev {
@@ -474,6 +494,7 @@ async fn run_connected_loop(
                 Some(BotCommand::Disconnect) => {
                     if audio::tear_down(&mut current_audio) {
                         audio::send_voice_stop(con);
+                        audio::inline_flush(con).await;
                         let _ = events.send(BotEvent::AudioFinished {
                             reason: "disconnect".into(),
                         });
@@ -483,6 +504,7 @@ async fn run_connected_loop(
                 Some(BotCommand::Shutdown) => {
                     if audio::tear_down(&mut current_audio) {
                         audio::send_voice_stop(con);
+                        audio::inline_flush(con).await;
                         let _ = events.send(BotEvent::AudioFinished {
                             reason: "shutdown".into(),
                         });
@@ -644,6 +666,17 @@ impl WireSink<'_> {
         }
     }
 
+    /// [`Self::voice_stop`] plus, on the single-loop path, an inline flush
+    /// of the packet just enqueued. No-op flush when `VOICE_INLINE_FLUSH`
+    /// is off. The split path flushes inside the wire task, which is the
+    /// task that actually calls `send_audio`.
+    async fn voice_stop_and_flush(&mut self) {
+        self.voice_stop();
+        if let WireSink::Direct(con) = self {
+            audio::inline_flush(con).await;
+        }
+    }
+
     /// Drop the wire task's installed frame receiver. No-op on the
     /// single-loop path — there the receiver lives inside `ActiveAudio` and
     /// is already gone with the `audio::tear_down` the caller just ran.
@@ -711,6 +744,79 @@ struct WirePlay {
     epoch: u64,
 }
 
+/// Handle one message on the wire task. Returns `true` when the caller
+/// should stop walking a coalesced batch (a `send_audio` error tore the
+/// play down; a trailing `Finished` from that batch must not also run).
+async fn consume_wire_audio_msg(
+    msg: AudioMsg,
+    play: &mut Option<WirePlay>,
+    con: &mut Connection,
+    wire_evt_tx: &mpsc::UnboundedSender<WireEvent>,
+    events: &broadcast::Sender<BotEvent>,
+) -> bool {
+    match msg {
+        AudioMsg::Frame { bytes, enqueued_at } => {
+            let Some(p) = play.as_mut() else {
+                return true;
+            };
+            p.frames_sent += 1;
+            // PURA-330 — first audible frame; closes the
+            // `!play` → first-audio latency breakdown.
+            if p.frames_sent == 1 {
+                let elapsed_ms = p.started_at.elapsed().as_millis() as u64;
+                crate::voice_bug_report::record_first_frame_on_wire(elapsed_ms);
+                info!(
+                    target: "music_bot_latency",
+                    stage = "first_frame_on_wire",
+                    elapsed_ms,
+                    "first Opus frame sent on the wire — playback audible",
+                );
+                // THE-927 — clear any dashboard "Resolving
+                // YouTube…" pill the chat command lit up.
+                let _ = events.send(BotEvent::FirstFrameOnWire);
+            }
+            // PURA-347 — once-per-second playback-progress tick,
+            // offset by the PURA-352 seek base.
+            if p.frames_sent.is_multiple_of(FRAMES_PER_PROGRESS_TICK) {
+                let _ = events.send(BotEvent::Progress {
+                    elapsed_secs: p.seek_base_secs + p.frames_sent / FRAMES_PER_PROGRESS_TICK,
+                });
+            }
+            // PURA-396 2b — `false`: no `block_in_place`. The
+            // wire task does nothing but wire I/O, so wrapping
+            // the microsecond send buys only churn (candidate A).
+            if let Err(err) =
+                audio::send_opus_frame(con, &bytes, enqueued_at, &mut p.send_monitor, false)
+            {
+                crate::voice_bug_report::record_send_audio_error(&err);
+                error!(?err, "send_audio failed on the wire task");
+                let epoch = p.epoch;
+                *play = None;
+                let _ = wire_evt_tx.send(WireEvent::SendFailed {
+                    error: err.to_string(),
+                    epoch,
+                });
+                return true;
+            }
+            // Same wake-up as the enqueue. No-op unless VOICE_INLINE_FLUSH.
+            audio::inline_flush(con).await;
+            false
+        }
+        AudioMsg::PipelineEvent(ev) => {
+            let _ = wire_evt_tx.send(WireEvent::Pipeline(ev));
+            false
+        }
+        AudioMsg::Finished => {
+            let p = play.take().expect("guard ensures Some");
+            let _ = wire_evt_tx.send(WireEvent::AudioFinished {
+                frames_sent: p.frames_sent,
+                epoch: p.epoch,
+            });
+            false
+        }
+    }
+}
+
 /// PURA-396 §2a — the **wire task**. Sole owner of `&mut Connection`. Its
 /// `select!` has exactly three arms — a paced frame, a protocol event, a wire
 /// command — and every arm body is bounded to one cheap operation, so the
@@ -732,61 +838,60 @@ async fn run_wire_task(
             msg = async { play.as_mut().unwrap().rx.recv().await }, if play.is_some() => {
                 let arm_start = Instant::now();
                 match msg {
-                    Some(AudioMsg::Frame { bytes, enqueued_at }) => {
-                        let p = play.as_mut().unwrap();
-                        p.frames_sent += 1;
-                        // PURA-330 — first audible frame; closes the
-                        // `!play` → first-audio latency breakdown.
-                        if p.frames_sent == 1 {
-                            let elapsed_ms = p.started_at.elapsed().as_millis() as u64;
-                            crate::voice_bug_report::record_first_frame_on_wire(elapsed_ms);
-                            info!(
-                                target: "music_bot_latency",
-                                stage = "first_frame_on_wire",
-                                elapsed_ms,
-                                "first Opus frame sent on the wire — playback audible",
-                            );
-                            // THE-927 — clear any dashboard "Resolving
-                            // YouTube…" pill the chat command lit up.
-                            let _ = events.send(BotEvent::FirstFrameOnWire);
+                    Some(msg) => {
+                        // VOICE_INLINE_FLUSH (default off) coalesces a
+                        // post-stall backlog and drops the stale prefix.
+                        // Off: `catchup_batch` is the single message and
+                        // does not read ahead.
+                        let batch = {
+                            let rx = &mut play.as_mut().unwrap().rx;
+                            audio::catchup_batch(msg, rx)
+                        };
+                        let dropped = batch.dropped;
+                        let mut stop = false;
+                        match batch.messages {
+                            audio::CatchupMessages::Single(one) => {
+                                // One message: nothing follows it in this batch,
+                                // so the stop flag has no further work to skip.
+                                let _ = consume_wire_audio_msg(
+                                    one,
+                                    &mut play,
+                                    &mut con,
+                                    &wire_evt_tx,
+                                    &events,
+                                )
+                                .await;
+                            }
+                            audio::CatchupMessages::Multi(many) => {
+                                for one in many {
+                                    if stop {
+                                        break;
+                                    }
+                                    stop = consume_wire_audio_msg(
+                                        one,
+                                        &mut play,
+                                        &mut con,
+                                        &wire_evt_tx,
+                                        &events,
+                                    )
+                                    .await;
+                                }
+                            }
                         }
-                        // PURA-347 — once-per-second playback-progress tick,
-                        // offset by the PURA-352 seek base.
-                        if p.frames_sent.is_multiple_of(FRAMES_PER_PROGRESS_TICK) {
-                            let _ = events.send(BotEvent::Progress {
-                                elapsed_secs: p.seek_base_secs
-                                    + p.frames_sent / FRAMES_PER_PROGRESS_TICK,
-                            });
+                        // Count dropped frames on the playback clock once a
+                        // real frame has been sent, so the progress bar
+                        // jumps with the audio that was skipped. Doing it
+                        // after the sends keeps `frames_sent == 1` as the
+                        // first-audible-frame milestone.
+                        if dropped > 0
+                            && let Some(p) = play.as_mut()
+                            && p.frames_sent > 0
+                        {
+                            p.frames_sent += dropped as u64;
                         }
-                        // PURA-396 2b — `false`: no `block_in_place`. The
-                        // wire task does nothing but wire I/O, so wrapping
-                        // the microsecond send buys only churn (candidate A).
-                        if let Err(err) = audio::send_opus_frame(
-                            &mut con,
-                            &bytes,
-                            enqueued_at,
-                            &mut p.send_monitor,
-                            false,
-                        ) {
-                            crate::voice_bug_report::record_send_audio_error(&err);
-                            error!(?err, "send_audio failed on the wire task");
-                            let epoch = p.epoch;
-                            play = None;
-                            let _ = wire_evt_tx.send(WireEvent::SendFailed {
-                                error: err.to_string(),
-                                epoch,
-                            });
+                        if audio::inline_flush_is_enabled() {
+                            audio::maybe_log_inline_flush();
                         }
-                    }
-                    Some(AudioMsg::PipelineEvent(ev)) => {
-                        let _ = wire_evt_tx.send(WireEvent::Pipeline(ev));
-                    }
-                    Some(AudioMsg::Finished) => {
-                        let p = play.take().expect("guard ensures Some");
-                        let _ = wire_evt_tx.send(WireEvent::AudioFinished {
-                            frames_sent: p.frames_sent,
-                            epoch: p.epoch,
-                        });
                     }
                     None => {
                         // Sibling channel closed without a `Finished`.
@@ -812,7 +917,10 @@ async fn run_wire_task(
                 Some(WireCmd::ClearAudio) => {
                     play = None;
                 }
-                Some(WireCmd::VoiceStop) => audio::send_voice_stop(&mut con),
+                Some(WireCmd::VoiceStop) => {
+                    audio::send_voice_stop(&mut con);
+                    audio::inline_flush(&mut con).await;
+                }
                 Some(WireCmd::ChannelMove(target)) => {
                     if let Err(err) = send_channel_move(&mut con, target) {
                         let _ = events.send(BotEvent::Error(BotError::Connection(format!(
@@ -1095,6 +1203,76 @@ async fn run_split_connected_loop(
     exit
 }
 
+/// Run one [`audio::CatchupBatch`] through [`handle_audio_msg`].
+///
+/// When `VOICE_INLINE_FLUSH` is off the batch is a single message and this
+/// is the old one-message audio arm. When it is on, a post-stall backlog
+/// has already been trimmed; each kept frame is sent and flushed, and a
+/// send error stops the batch so a trailing `Finished` is not treated as a
+/// clean end-of-stream.
+#[allow(clippy::too_many_arguments)]
+async fn drive_catchup_batch(
+    batch: audio::CatchupBatch,
+    con: &mut Connection,
+    current_audio: &mut Option<ActiveAudio>,
+    bot_id: BotId,
+    store: &Arc<dyn MusicBotStore>,
+    events: &broadcast::Sender<BotEvent>,
+    yt_cookie: &Arc<RwLock<Option<PathBuf>>>,
+    bot_volume: &VolumeHandle,
+) -> &'static str {
+    let dropped = batch.dropped;
+    let mut kind = "frame";
+    let mut stop = false;
+    match batch.messages {
+        audio::CatchupMessages::Single(msg) => {
+            kind = handle_audio_msg(
+                &mut WireSink::Direct(con),
+                Some(msg),
+                current_audio,
+                bot_id,
+                store,
+                events,
+                yt_cookie,
+                bot_volume,
+            )
+            .await;
+        }
+        audio::CatchupMessages::Multi(msgs) => {
+            for msg in msgs {
+                if stop {
+                    break;
+                }
+                let had_audio = current_audio.is_some();
+                kind = handle_audio_msg(
+                    &mut WireSink::Direct(con),
+                    Some(msg),
+                    current_audio,
+                    bot_id,
+                    store,
+                    events,
+                    yt_cookie,
+                    bot_volume,
+                )
+                .await;
+                if had_audio && current_audio.is_none() {
+                    stop = true;
+                }
+            }
+        }
+    }
+    if dropped > 0
+        && let Some(active) = current_audio.as_mut()
+        && active.frames_sent > 0
+    {
+        active.frames_sent += dropped as u64;
+    }
+    if audio::inline_flush_is_enabled() {
+        audio::maybe_log_inline_flush();
+    }
+    kind
+}
+
 /// PURA-154 — drain a message from the audio sibling task.
 ///
 /// PURA-358 — returns a `&'static str` naming the message kind handled, so
@@ -1119,7 +1297,7 @@ async fn handle_audio_msg(
         warn!("audio sibling channel closed without Finished — tearing down");
         if audio::tear_down(current_audio) {
             wire.clear_audio();
-            wire.voice_stop();
+            wire.voice_stop_and_flush().await;
             let _ = events.send(BotEvent::AudioFinished {
                 reason: "failed: audio pipeline channel closed unexpectedly".into(),
             });
@@ -1182,6 +1360,10 @@ async fn handle_audio_msg(
                 let _ = events.send(BotEvent::AudioFinished {
                     reason: format!("failed: audio send error — {err}"),
                 });
+            } else if audio::inline_flush_is_enabled()
+                && let WireSink::Direct(con) = wire
+            {
+                audio::inline_flush(con).await;
             }
             "frame"
         }
@@ -1217,7 +1399,7 @@ async fn handle_audio_msg(
             "end_of_stream"
         }
         AudioMsg::Finished => {
-            wire.voice_stop();
+            wire.voice_stop_and_flush().await;
             // PURA-261 — a pipeline that drained without ever producing
             // a frame means yt-dlp / ffmpeg failed (bad URL, bot-gated
             // video, codec error). Flag it with the `failed: ` reason
@@ -1313,7 +1495,7 @@ async fn handle_audio_command(
         AudioCommand::Stop => {
             if audio::tear_down(current_audio) {
                 wire.clear_audio();
-                wire.voice_stop();
+                wire.voice_stop_and_flush().await;
                 let _ = events.send(BotEvent::AudioFinished {
                     reason: "stopped".into(),
                 });
@@ -1339,7 +1521,7 @@ async fn handle_audio_command(
             let was_active = audio::tear_down(current_audio);
             if was_active {
                 wire.clear_audio();
-                wire.voice_stop();
+                wire.voice_stop_and_flush().await;
             }
             // PURA-261 — emit `AudioFinished` BEFORE the queue advance:
             // `LivenessTracker` clears `now_playing` on `AudioFinished`,
@@ -1360,7 +1542,7 @@ async fn handle_audio_command(
                     info!(secs, "AudioCommand::Seek — re-spawned pipeline at offset");
                     // Flush the wire so the TS jitter buffer drops the gap
                     // between the old and the post-seek frames cleanly.
-                    wire.voice_stop();
+                    wire.voice_stop_and_flush().await;
                     // Snap the FE progress clock to the seek target now —
                     // the next `Progress` tick (offset + frames/50) only
                     // lands a second into the post-seek pre-buffer.
@@ -2006,7 +2188,7 @@ async fn apply_chat_audio_action(
             // `AudioFinished` would clear that fresh `now_playing`.
             if audio::tear_down(current_audio) {
                 wire.clear_audio();
-                wire.voice_stop();
+                wire.voice_stop_and_flush().await;
                 debug!("chat command replaced the queue head — restarting pipeline");
             }
             auto_start_pending_track(current_audio, store, bot_id, events, yt_cookie, bot_volume)
@@ -2019,7 +2201,7 @@ async fn apply_chat_audio_action(
             // state. Mirrors `AudioCommand::Stop`.
             if audio::tear_down(current_audio) {
                 wire.clear_audio();
-                wire.voice_stop();
+                wire.voice_stop_and_flush().await;
                 let _ = events.send(BotEvent::AudioFinished {
                     reason: "stopped".into(),
                 });

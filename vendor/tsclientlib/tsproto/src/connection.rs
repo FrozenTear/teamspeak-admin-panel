@@ -350,6 +350,29 @@ impl Connection {
 		Ok(flushed)
 	}
 
+	/// Flush the non-command outgoing queue (voice, acks, anything else
+	/// parked in `acks_to_send`) onto the socket or the ack-sender thread.
+	///
+	/// `send_packet` for a voice frame only enqueues. The datagram is
+	/// written when [`Stream::poll_next`] runs the same helper this method
+	/// calls. TS6 Voice holds `&mut Connection` on the send loop and calls
+	/// this immediately after `send_audio` so the flush happens in that
+	/// wake-up instead of waiting for the next connection poll.
+	///
+	/// Returns how many packets left the queue (`0` if nothing was
+	/// pending). On the inline-socket fallback a `Pending` send stops the
+	/// walk and leaves the rest queued; pass the waker of the task that
+	/// also polls the connection so that registration is not replaced with
+	/// a no-op. The ack-sender-thread path never blocks and does not touch
+	/// the UDP socket waker.
+	///
+	/// Resend, ping, and incoming recv stay on `poll_next`. Both paths pop
+	/// the same queue under `&mut self`, so interleaving them cannot
+	/// double-send or skip an ack.
+	pub fn poll_flush_outgoing(&mut self, cx: &mut Context) -> Result<usize> {
+		self.poll_send_acks(cx)
+	}
+
 	fn poll_incoming_udp_packet(&mut self, cx: &mut Context) -> Poll<Result<StreamItem>> {
 		if self.acks_to_send.len() >= UDP_SINK_CAPACITY {
 			return Poll::Pending;

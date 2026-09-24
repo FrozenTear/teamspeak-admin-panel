@@ -25,7 +25,9 @@
 //! (≈ 5 s on fast sources) drains.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -1217,8 +1219,9 @@ fn dominant_candidate(c: Duration, a: Duration, b: Duration) -> &'static str {
 ///    sibling→loop mpsc waiting for the connected loop to poll the audio
 ///    arm — the in-crate-visible leg of "flush deferral behind a busy
 ///    event arm". The deeper `poll_send_acks` flush leg lives inside
-///    `tsclientlib` and would need an upstream shim, deliberately left out
-///    of PURA-389a scope (moratorium-gated — see the issue).
+///    `tsclientlib`. `VOICE_INLINE_FLUSH` (default off) is the later
+///    env-gated hook that drives that flush from the send loop; the
+///    attribution counters above are unchanged either way.
 ///
 /// Per frame: a WARN (`audio_send_attribution`) on any frame past
 /// [`SEND_ATTRIBUTION_WARN`], naming the dominant candidate. Per window: an
@@ -1327,6 +1330,384 @@ impl SendTimingMonitor {
         self.window_max_preempt_b = Duration::ZERO;
         self.window_attributions = 0;
     }
+}
+
+/// Opus frame period on the TS voice wire. The sibling paces to this, so a
+/// backlog's oldest `enqueued_at` is how far the send loop is behind real time.
+const OPUS_FRAME_PERIOD: Duration = Duration::from_millis(20);
+
+/// Default for `VOICE_MAX_CATCHUP_FRAMES` when the env var is unset or not
+/// a number. Four frames is 80 ms: enough to absorb one scheduling hiccup
+/// without dumping a full channel (32 frames, ~640 ms) after a stall.
+const DEFAULT_MAX_CATCHUP_FRAMES: usize = 4;
+
+/// How often the inline-flush / burst-cap counters are logged. Never per frame.
+const INLINE_FLUSH_LOG_INTERVAL: Duration = Duration::from_secs(1);
+
+/// `VOICE_INLINE_FLUSH` gate, read once. Unset is off.
+struct InlineFlushConfig {
+    enabled: bool,
+    max_catchup: usize,
+}
+
+fn inline_flush_config() -> &'static InlineFlushConfig {
+    static CFG: OnceLock<InlineFlushConfig> = OnceLock::new();
+    CFG.get_or_init(|| {
+        let enabled = inline_flush_enabled(std::env::var("VOICE_INLINE_FLUSH").ok().as_deref());
+        let max_catchup =
+            parse_max_catchup_frames(std::env::var("VOICE_MAX_CATCHUP_FRAMES").ok().as_deref());
+        if enabled {
+            info!(
+                max_catchup_frames = max_catchup,
+                "VOICE_INLINE_FLUSH=1 — flush the outgoing sink after send_audio and cap post-stall bursts",
+            );
+        }
+        InlineFlushConfig {
+            enabled,
+            max_catchup,
+        }
+    })
+}
+
+/// Whether the send loop should flush after `send_audio` and cap catch-up.
+/// Unset / empty / anything but the usual truthy spellings is off, same
+/// spellings as `VOICE_SPLIT_WIRE_TASK`.
+pub(crate) fn inline_flush_is_enabled() -> bool {
+    inline_flush_config().enabled
+}
+
+/// Pure parse of `VOICE_INLINE_FLUSH`. `None` (unset) is off.
+fn inline_flush_enabled(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on"),
+    )
+}
+
+/// Pure parse of `VOICE_MAX_CATCHUP_FRAMES`. Unset, empty, or non-numeric
+/// keeps [`DEFAULT_MAX_CATCHUP_FRAMES`].
+fn parse_max_catchup_frames(value: Option<&str>) -> usize {
+    let Some(raw) = value.map(str::trim).filter(|s| !s.is_empty()) else {
+        return DEFAULT_MAX_CATCHUP_FRAMES;
+    };
+    raw.parse::<usize>().unwrap_or(DEFAULT_MAX_CATCHUP_FRAMES)
+}
+
+/// One Opus frame held for the post-stall cap, oldest-first.
+struct QueuedOpusFrame {
+    bytes: Bytes,
+    enqueued_at: Instant,
+}
+
+/// How many frame-periods the send loop is behind, from a backlog.
+///
+/// Two signals, and the larger one wins:
+/// * queue depth — each waiting frame is one period of audio that has not
+///   gone out yet, including a stall where every `enqueued_at` is "now"
+///   because the producer dumped an already-due backlog in one go;
+/// * age of the oldest frame — `oldest / frame_period`, for a short queue
+///   whose head has been sitting.
+fn frames_behind(ages: &[Duration], frame_period: Duration) -> usize {
+    let by_count = ages.len();
+    let Some(&oldest) = ages.first() else {
+        return 0;
+    };
+    let period_ms = frame_period.as_millis();
+    if period_ms == 0 {
+        return by_count;
+    }
+    let by_time = usize::try_from(oldest.as_millis() / period_ms).unwrap_or(usize::MAX);
+    by_count.max(by_time)
+}
+
+/// How many leading (oldest) frames to drop.
+///
+/// `ages` is oldest-first (`now - enqueued_at`). When the loop is more than
+/// `max_catchup` frames behind real time, drop the oldest frames so only the
+/// most recent `max_catchup` remain. A backlog of `max_catchup` or fewer is
+/// kept whole — there is nothing older than "the most recent N" to drop.
+fn stale_frames_to_drop(ages: &[Duration], max_catchup: usize, frame_period: Duration) -> usize {
+    if frames_behind(ages, frame_period) <= max_catchup {
+        return 0;
+    }
+    ages.len().saturating_sub(max_catchup)
+}
+
+/// Drop the oldest stale frames in place. Returns how many were removed.
+fn apply_catchup_cap(frames: &mut Vec<QueuedOpusFrame>, now: Instant, max_catchup: usize) -> usize {
+    let ages: Vec<Duration> = frames
+        .iter()
+        .map(|f| now.saturating_duration_since(f.enqueued_at))
+        .collect();
+    let drop_n = stale_frames_to_drop(&ages, max_catchup, OPUS_FRAME_PERIOD);
+    if drop_n > 0 {
+        frames.drain(..drop_n);
+    }
+    drop_n
+}
+
+/// Messages the send loop should handle after one `recv`, in order.
+pub(crate) enum CatchupMessages {
+    /// Feature off, a non-frame, or a single on-time frame with an empty
+    /// queue behind it. No further `try_recv` was consumed.
+    Single(AudioMsg),
+    /// Feature on and the queue behind the head was drained. May be empty
+    /// when every queued frame was stale and nothing non-frame followed.
+    Multi(Vec<AudioMsg>),
+}
+
+/// Result of [`catchup_batch`] / [`catchup_batch_with`].
+pub(crate) struct CatchupBatch {
+    /// Oldest frames dropped by the post-stall cap.
+    pub dropped: usize,
+    pub messages: CatchupMessages,
+}
+
+/// Pull contiguous `Frame`s already sitting in `rx`. Stops at the first
+/// non-frame so a `PipelineEvent` / `Finished` stays in order behind the
+/// frames that preceded it. `Empty` and `Disconnected` both return `None`;
+/// a disconnect still surfaces as `recv() == None` on the next loop.
+fn drain_queued_frames(
+    rx: &mut mpsc::Receiver<AudioMsg>,
+    frames: &mut Vec<QueuedOpusFrame>,
+) -> Option<AudioMsg> {
+    loop {
+        match rx.try_recv() {
+            Ok(AudioMsg::Frame { bytes, enqueued_at }) => {
+                frames.push(QueuedOpusFrame { bytes, enqueued_at });
+            }
+            Ok(other) => return Some(other),
+            Err(_) => return None,
+        }
+    }
+}
+
+fn frames_to_msgs(frames: Vec<QueuedOpusFrame>, trailing: Option<AudioMsg>) -> Vec<AudioMsg> {
+    let mut messages = Vec::with_capacity(frames.len() + usize::from(trailing.is_some()));
+    for frame in frames {
+        messages.push(AudioMsg::Frame {
+            bytes: frame.bytes,
+            enqueued_at: frame.enqueued_at,
+        });
+    }
+    if let Some(trailing) = trailing {
+        messages.push(trailing);
+    }
+    messages
+}
+
+/// Like [`catchup_batch`], but with the gate and the cap passed in so tests
+/// do not touch the process environment.
+pub(crate) fn catchup_batch_with(
+    first: AudioMsg,
+    rx: &mut mpsc::Receiver<AudioMsg>,
+    enabled: bool,
+    max_catchup: usize,
+) -> CatchupBatch {
+    if !enabled {
+        return CatchupBatch {
+            dropped: 0,
+            messages: CatchupMessages::Single(first),
+        };
+    }
+    let AudioMsg::Frame { bytes, enqueued_at } = first else {
+        return CatchupBatch {
+            dropped: 0,
+            messages: CatchupMessages::Single(first),
+        };
+    };
+
+    // Hot path: one frame, nothing else queued, and it is not past the cap.
+    // One `try_recv` and no heap traffic.
+    match rx.try_recv() {
+        Err(_) => {
+            let age = Instant::now().saturating_duration_since(enqueued_at);
+            let dropped = stale_frames_to_drop(&[age], max_catchup, OPUS_FRAME_PERIOD);
+            if dropped == 0 {
+                CatchupBatch {
+                    dropped: 0,
+                    messages: CatchupMessages::Single(AudioMsg::Frame { bytes, enqueued_at }),
+                }
+            } else {
+                CatchupBatch {
+                    dropped,
+                    messages: CatchupMessages::Multi(Vec::new()),
+                }
+            }
+        }
+        Ok(AudioMsg::Frame {
+            bytes: next_bytes,
+            enqueued_at: next_at,
+        }) => {
+            let mut frames = vec![
+                QueuedOpusFrame { bytes, enqueued_at },
+                QueuedOpusFrame {
+                    bytes: next_bytes,
+                    enqueued_at: next_at,
+                },
+            ];
+            let trailing = drain_queued_frames(rx, &mut frames);
+            let dropped = apply_catchup_cap(&mut frames, Instant::now(), max_catchup);
+            CatchupBatch {
+                dropped,
+                messages: CatchupMessages::Multi(frames_to_msgs(frames, trailing)),
+            }
+        }
+        Ok(other) => {
+            let age = Instant::now().saturating_duration_since(enqueued_at);
+            let dropped = stale_frames_to_drop(&[age], max_catchup, OPUS_FRAME_PERIOD);
+            let frames = if dropped == 0 {
+                vec![QueuedOpusFrame { bytes, enqueued_at }]
+            } else {
+                Vec::new()
+            };
+            CatchupBatch {
+                dropped,
+                messages: CatchupMessages::Multi(frames_to_msgs(frames, Some(other))),
+            }
+        }
+    }
+}
+
+/// Apply the env-gated post-stall cap to `first` plus any frames already
+/// queued behind it. When `VOICE_INLINE_FLUSH` is off this returns `first`
+/// untouched and does not read `rx`.
+pub(crate) fn catchup_batch(first: AudioMsg, rx: &mut mpsc::Receiver<AudioMsg>) -> CatchupBatch {
+    let cfg = inline_flush_config();
+    let batch = catchup_batch_with(first, rx, cfg.enabled, cfg.max_catchup);
+    if batch.dropped > 0 {
+        record_dropped(batch.dropped);
+    }
+    batch
+}
+
+struct FlushMeters {
+    flushed_calls: AtomicU64,
+    empty_calls: AtomicU64,
+    packets_flushed: AtomicU64,
+    flush_errors: AtomicU64,
+    dropped_frames: AtomicU64,
+    last_log_ms: AtomicU64,
+    logged_dropped: AtomicU64,
+}
+
+static FLUSH_METERS: FlushMeters = FlushMeters {
+    flushed_calls: AtomicU64::new(0),
+    empty_calls: AtomicU64::new(0),
+    packets_flushed: AtomicU64::new(0),
+    flush_errors: AtomicU64::new(0),
+    dropped_frames: AtomicU64::new(0),
+    last_log_ms: AtomicU64::new(0),
+    logged_dropped: AtomicU64::new(0),
+};
+
+static FLUSH_LOG_START: OnceLock<Instant> = OnceLock::new();
+
+fn record_dropped(n: usize) {
+    if n == 0 {
+        return;
+    }
+    FLUSH_METERS
+        .dropped_frames
+        .fetch_add(n as u64, Ordering::Relaxed);
+}
+
+fn record_flush_ok(packets: usize) {
+    if packets == 0 {
+        FLUSH_METERS.empty_calls.fetch_add(1, Ordering::Relaxed);
+    } else {
+        FLUSH_METERS.flushed_calls.fetch_add(1, Ordering::Relaxed);
+        FLUSH_METERS
+            .packets_flushed
+            .fetch_add(packets as u64, Ordering::Relaxed);
+    }
+}
+
+fn record_flush_err() {
+    FLUSH_METERS.flush_errors.fetch_add(1, Ordering::Relaxed);
+}
+
+fn warn_flush_once(err: &tsclientlib::Error) {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    if ONCE.set(()).is_ok() {
+        warn!(
+            ?err,
+            "inline flush failed; the packet stays queued for the connection poll leg",
+        );
+    }
+}
+
+/// Hand queued voice/ack packets to the outgoing sink. No-op when
+/// `VOICE_INLINE_FLUSH` is off. Never waits: one `poll` of the sink, then
+/// return. The ack-sender path is a non-blocking channel push; the inline
+/// fallback registers this task's waker and leaves a `Pending` packet queued
+/// for the normal connection poll.
+pub(crate) async fn inline_flush(con: &mut Connection) {
+    if !inline_flush_is_enabled() {
+        return;
+    }
+    let result = std::future::poll_fn(|cx| Poll::Ready(con.poll_flush_outgoing(cx))).await;
+    match result {
+        Ok(packets) => record_flush_ok(packets),
+        Err(err) => {
+            record_flush_err();
+            warn_flush_once(&err);
+        }
+    }
+}
+
+/// Log flush and drop counters at most once per second. `flushed_calls` is
+/// how often the sink actually took a packet; `empty_calls` is how often the
+/// flush found nothing pending. Drop lines are the same record
+/// (`dropped_since_log`), never a per-frame log.
+pub(crate) fn maybe_log_inline_flush() {
+    if !inline_flush_is_enabled() {
+        return;
+    }
+    let flushed_calls = FLUSH_METERS.flushed_calls.load(Ordering::Relaxed);
+    let empty_calls = FLUSH_METERS.empty_calls.load(Ordering::Relaxed);
+    let packets_flushed = FLUSH_METERS.packets_flushed.load(Ordering::Relaxed);
+    let flush_errors = FLUSH_METERS.flush_errors.load(Ordering::Relaxed);
+    let dropped_frames = FLUSH_METERS.dropped_frames.load(Ordering::Relaxed);
+    if flushed_calls == 0 && empty_calls == 0 && flush_errors == 0 && dropped_frames == 0 {
+        return;
+    }
+    let now_ms = u64::try_from(
+        FLUSH_LOG_START
+            .get_or_init(Instant::now)
+            .elapsed()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX);
+    let prev = FLUSH_METERS.last_log_ms.load(Ordering::Relaxed);
+    let interval_ms = u64::try_from(INLINE_FLUSH_LOG_INTERVAL.as_millis()).unwrap_or(1000);
+    if prev != 0 && now_ms.saturating_sub(prev) < interval_ms {
+        return;
+    }
+    // `0` means "never logged". Elapsed can be 0 on the first frame.
+    let stamp = now_ms.max(1);
+    if FLUSH_METERS
+        .last_log_ms
+        .compare_exchange(prev, stamp, Ordering::AcqRel, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    let prev_dropped = FLUSH_METERS
+        .logged_dropped
+        .swap(dropped_frames, Ordering::Relaxed);
+    let dropped_since_log = dropped_frames.saturating_sub(prev_dropped);
+    info!(
+        target: "music_bot_latency",
+        stage = "inline_flush",
+        flushed_calls,
+        empty_calls,
+        packets_flushed,
+        flush_errors,
+        dropped_frames,
+        dropped_since_log,
+        "inline flush counters — flushed_calls handed at least one packet to the outgoing sink, empty_calls found nothing pending; dropped_frames is the post-stall burst cap",
+    );
 }
 
 /// Send one 20 ms Opus frame on the wire. Wraps the bytes in the C2S
@@ -2307,5 +2688,186 @@ mod tests {
             Duration::ZERO,
             "per-window maxes are cleared by the reset",
         );
+    }
+
+    /// `VOICE_INLINE_FLUSH` unset (and every non-truthy spelling) is off.
+    #[test]
+    fn inline_flush_env_unset_is_off() {
+        assert!(
+            !inline_flush_enabled(None),
+            "unset VOICE_INLINE_FLUSH is off"
+        );
+        for v in ["", "0", "false", "off", "no", "2"] {
+            assert!(!inline_flush_enabled(Some(v)), "{v:?} should be off");
+        }
+        for v in ["1", "true", "TRUE", " yes ", "On"] {
+            assert!(inline_flush_enabled(Some(v)), "{v:?} should be on");
+        }
+    }
+
+    /// `VOICE_MAX_CATCHUP_FRAMES` unset keeps the default of 4.
+    #[test]
+    fn max_catchup_frames_defaults_when_unset() {
+        assert_eq!(parse_max_catchup_frames(None), 4);
+        assert_eq!(parse_max_catchup_frames(Some("")), 4);
+        assert_eq!(parse_max_catchup_frames(Some("nope")), 4);
+        assert_eq!(parse_max_catchup_frames(Some(" 6 ")), 6);
+        assert_eq!(parse_max_catchup_frames(Some("0")), 0);
+    }
+
+    fn ages_20ms(n: usize) -> Vec<Duration> {
+        // Oldest first, 20 ms apart, newest age 0.
+        (0..n)
+            .rev()
+            .map(|i| Duration::from_millis(i as u64 * 20))
+            .collect()
+    }
+
+    #[test]
+    fn burst_cap_keeps_a_backlog_that_is_not_behind_real_time() {
+        let period = OPUS_FRAME_PERIOD;
+        assert_eq!(stale_frames_to_drop(&[], 4, period), 0);
+        assert_eq!(
+            stale_frames_to_drop(&[Duration::from_millis(1)], 4, period),
+            0,
+            "a fresh frame is sent",
+        );
+        // Oldest is 50 ms and only three frames are waiting: inside the cap.
+        let ages = [
+            Duration::from_millis(50),
+            Duration::from_millis(30),
+            Duration::from_millis(10),
+        ];
+        assert_eq!(stale_frames_to_drop(&ages, 4, period), 0);
+        // Five frames with the oldest exactly 4 periods old: the queue is
+        // one frame over the cap, so the oldest one is the burst.
+        let on_limit = [
+            Duration::from_millis(80),
+            Duration::from_millis(60),
+            Duration::from_millis(40),
+            Duration::from_millis(20),
+            Duration::ZERO,
+        ];
+        assert_eq!(stale_frames_to_drop(&on_limit, 4, period), 1);
+    }
+
+    /// A producer dump stamps every frame "now". Queue depth is still how
+    /// many frame-periods of audio would hit the server in one wake-up.
+    #[test]
+    fn burst_cap_limits_a_same_instant_backlog() {
+        let ages = vec![Duration::ZERO; 32];
+        assert_eq!(
+            stale_frames_to_drop(&ages, 4, OPUS_FRAME_PERIOD),
+            28,
+            "32 frames queued at the same instant still cap at 4",
+        );
+    }
+
+    #[test]
+    fn burst_cap_drops_oldest_down_to_the_most_recent_n() {
+        let period = Duration::from_millis(20);
+        // 32 frames, the full sibling→send channel. Oldest is 620 ms > 80 ms.
+        let ages = ages_20ms(32);
+        assert_eq!(ages[0], Duration::from_millis(620));
+        assert_eq!(
+            stale_frames_to_drop(&ages, 4, period),
+            28,
+            "keep the most recent 4 of a 32-frame stall",
+        );
+        // Just past the window with 5 frames: drop the one oldest.
+        let just_over = [
+            Duration::from_millis(81),
+            Duration::from_millis(60),
+            Duration::from_millis(40),
+            Duration::from_millis(20),
+            Duration::ZERO,
+        ];
+        assert_eq!(stale_frames_to_drop(&just_over, 4, period), 1);
+    }
+
+    #[test]
+    fn burst_cap_keeps_a_short_backlog_even_when_the_oldest_is_late() {
+        // Two frames, oldest 200 ms (more than 4 periods) but the count is
+        // already under the cap, so both are the "most recent N".
+        let ages = [Duration::from_millis(200), Duration::from_millis(5)];
+        assert_eq!(stale_frames_to_drop(&ages, 4, Duration::from_millis(20)), 0);
+    }
+
+    #[test]
+    fn burst_cap_zero_max_drops_the_stale_backlog() {
+        let ages = [Duration::from_millis(20), Duration::ZERO];
+        assert_eq!(stale_frames_to_drop(&ages, 0, Duration::from_millis(20)), 2);
+        // A cap of zero keeps nothing once any frame is waiting.
+        assert_eq!(
+            stale_frames_to_drop(&[Duration::ZERO], 0, Duration::from_millis(20)),
+            1
+        );
+    }
+
+    fn queued_frame(now: Instant, age_ms: u64, id: u8) -> AudioMsg {
+        AudioMsg::Frame {
+            bytes: Bytes::from(vec![id]),
+            enqueued_at: now
+                .checked_sub(Duration::from_millis(age_ms))
+                .expect("age fits in the clock"),
+        }
+    }
+
+    fn frame_ids(messages: CatchupMessages) -> Vec<u8> {
+        let msgs = match messages {
+            CatchupMessages::Single(msg) => vec![msg],
+            CatchupMessages::Multi(msgs) => msgs,
+        };
+        msgs.into_iter()
+            .map(|msg| match msg {
+                AudioMsg::Frame { bytes, .. } => bytes[0],
+                AudioMsg::PipelineEvent(PipelineEvent::EndOfStream) => 0xff,
+                other => panic!("unexpected message in catch-up batch: {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn catchup_batch_disabled_does_not_read_the_queue() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let now = Instant::now();
+        tx.try_send(queued_frame(now, 0, 2)).unwrap();
+        let batch = catchup_batch_with(queued_frame(now, 620, 1), &mut rx, false, 4);
+        assert_eq!(batch.dropped, 0);
+        assert_eq!(frame_ids(batch.messages), vec![1]);
+        assert!(
+            matches!(rx.try_recv(), Ok(AudioMsg::Frame { bytes, .. }) if bytes[0] == 2),
+            "a disabled gate must leave the queued frame for the normal recv loop",
+        );
+    }
+
+    #[test]
+    fn catchup_batch_keeps_the_newest_frames_and_a_trailing_event() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let now = Instant::now();
+        // Head is the oldest (id 0, 620 ms). The channel holds ids 1..=31
+        // then an end-of-stream, oldest-first.
+        for id in 1u8..32 {
+            let age = u64::from(31 - id) * 20;
+            tx.try_send(queued_frame(now, age, id)).unwrap();
+        }
+        tx.try_send(AudioMsg::PipelineEvent(PipelineEvent::EndOfStream))
+            .unwrap();
+        let batch = catchup_batch_with(queued_frame(now, 620, 0), &mut rx, true, 4);
+        assert_eq!(batch.dropped, 28);
+        // Newest four frames (28..=31) then the event that followed them.
+        assert_eq!(frame_ids(batch.messages), vec![28, 29, 30, 31, 0xff]);
+        assert!(rx.try_recv().is_err(), "the backlog was fully drained");
+    }
+
+    #[test]
+    fn catchup_batch_on_time_backlog_is_kept_in_order() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let now = Instant::now();
+        tx.try_send(queued_frame(now, 20, 2)).unwrap();
+        tx.try_send(queued_frame(now, 0, 3)).unwrap();
+        let batch = catchup_batch_with(queued_frame(now, 40, 1), &mut rx, true, 4);
+        assert_eq!(batch.dropped, 0, "40 ms is inside the 80 ms window");
+        assert_eq!(frame_ids(batch.messages), vec![1, 2, 3]);
     }
 }

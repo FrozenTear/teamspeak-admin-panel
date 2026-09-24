@@ -953,6 +953,28 @@ impl Connection {
 		}
 	}
 
+	/// Flush packets queued by [`send_audio`] (and any pending acks) onto
+	/// the outgoing sink without waiting for the next [`events`] poll.
+	///
+	/// [`send_audio`] only enqueues. The voice send loop calls this in the
+	/// same wake-up so the datagram is handed to the socket, or to the
+	/// ack-sender thread, immediately. Returns how many packets were handed
+	/// off; `0` means the queue was empty.
+	///
+	/// Non-blocking: the ack-sender path is a channel push, and the inline
+	/// fallback stops on `Poll::Pending` and leaves the packet queued.
+	/// Does not run resend, ping, or recv — the normal [`events`] poll
+	/// still owns those and flushes whatever this call left behind. Safe to
+	/// interleave with that poll; both drain one queue under `&mut self`,
+	/// so ack handling is unchanged.
+	pub fn poll_flush_outgoing(&mut self, cx: &mut Context) -> Result<usize> {
+		if let ConnectionState::Connected { con, .. } = &mut self.state {
+			con.client.poll_flush_outgoing(cx).map_err(|err| Error::SendPacket(err.into()))
+		} else {
+			Err(Error::NotConnected)
+		}
+	}
+
 	/// Download a file from a channel of the connected TeamSpeak server.
 	///
 	/// Returns the size of the file and a tcp stream of the requested file.
