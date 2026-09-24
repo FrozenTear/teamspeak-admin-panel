@@ -214,6 +214,20 @@ jobs:
         if: always()
         run: docker rm -f ts6-fixture || true
 
+  # Shell guards. No Rust toolchain: update.test.sh checks kube image
+  # rewrite, and apply-fullstack-soft-pin.test.sh checks renice targeting.
+  script-tests:
+    name: script tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: kube image tag rewrite
+        run: ./scripts/update.test.sh
+
+      - name: soft-pin renice targeting
+        run: ./scripts/apply-fullstack-soft-pin.test.sh
+
   fuzz-short:
     name: fuzz suite (short)
     runs-on: ubuntu-latest

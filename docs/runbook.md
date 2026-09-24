@@ -209,10 +209,13 @@ For all three shapes the external smoke is the same: `curl -fsS http://127.0.0.1
 | Shape | Start | Stop | Restart |
 | --- | --- | --- | --- |
 | Quadlet | `systemctl --user start ts6-manager-pod.service` | `systemctl --user stop ts6-manager-pod.service` | `systemctl --user restart ts6-manager-pod.service` |
-| Kube | `cat deploy/kube/secrets.yaml deploy/kube/ts6-manager.yaml > /tmp/ts6-manager.kube.yaml && podman kube play /tmp/ts6-manager.kube.yaml` (skip the concat if `podman secret exists ts6-manager-secrets`) | `podman kube down deploy/kube/ts6-manager.yaml` (never `--force`) | `./scripts/update.sh vX.Y.Z` |
+| Kube | `./scripts/update.sh vX.Y.Z` | `podman kube down deploy/kube/ts6-manager.yaml` (never `--force`) | `./scripts/update.sh vX.Y.Z` |
 | Compose | `podman-compose up -d fullstack` | `podman-compose down` | `podman-compose restart fullstack` |
 
-Kube `kube down` removes the pod and containers but leaves the named
+Kube start and restart are only `./scripts/update.sh vX.Y.Z`. Do not
+`podman kube play` the committed manifest: fullstack, music, and
+sidecar are `@UNRELEASED`, which fails reference parsing before any pull.
+`kube down` removes the pod and containers but leaves the named
 volumes (`ts6-data`, `ts6-db`, `ts6-music`) intact, so data survives a
 restart. `ts6-data` backs the manager state root and is what keeps a
 yt-dlp cookie uploaded via Settings from being wiped on redeploy
@@ -283,20 +286,22 @@ log path off the manager itself.
 > If bots/flows/rules vanish after an upgrade, the `ts6-db` volume was
 > lost — restore it from a § 3.2 backup.
 
-The kube manifest pins fullstack, music, and sidecar to the same
-release tag (currently `:v1.6.2`). All three GHCR images share that
-tag from `.github/workflows/release.yml`. `imagePullPolicy: IfNotPresent`
-means you must `podman pull` the target tags before play or old
-layers stick.
+The committed kube manifest does not pin a release tag. Fullstack,
+music, and sidecar are `@UNRELEASED` (not an image tag — podman
+fails reference parsing before any pull). `./scripts/update.sh vX.Y.Z` rewrites a temp
+copy so all three share the tag you pass. A live checkout that still
+has `:vX.Y.Z` on those images is rewritten the same way. Images are
+published by `.github/workflows/release.yml`. `imagePullPolicy: IfNotPresent`
+means the script pulls the target tags before play or old layers stick.
 
-**Contabo / kube — `scripts/update.sh` (recommended):**
+**Contabo / kube — `scripts/update.sh` (only start / restart):**
 
 ```sh
-./scripts/update.sh v1.6.2
+./scripts/update.sh vX.Y.Z
 ```
 
 From any cwd against a repo checkout. The script pulls fullstack +
-music + sidecar, rewrites a temp manifest so music/sidecar cannot lag,
+music + sidecar, rewrites a temp manifest so music and sidecar cannot lag,
 `podman kube down`s **without** `--force`, plays (pod-only if
 `ts6-manager-secrets` already exists; otherwise concatenates
 `deploy/kube/secrets.yaml`), curls fullstack `:3001/health` and music
@@ -316,6 +321,9 @@ fullstack `sync_settings` pushes the yt-dlp cookie / API key after
 volume. Never `podman kube down --force`. Do not MOVE the bot
 runtime to Floki. Verify signatures first if you want — see § 5 and
 [`docs/ops/images.md` § 3](ops/images.md#3-signing).
+
+There is no hand-rolled `sed` / `podman kube play` start or restart.
+Playing the committed manifest fails reference parsing (`@UNRELEASED`).
 
 **voice-rt nice is one-shot (Opus #66 L16).** `TS6_BOT_NICE` (`-5` in
 packing B) is not a unit property. `apply-fullstack-soft-pin.sh`
@@ -356,25 +364,6 @@ podman auto-update              # apply
 Only enable auto-update against immutable `vX.Y.Z` tags — pointing it at a
 floating `latest` tag will roll silently on every push and breaks the
 "every running instance has a known signature" property.
-
-#### Appendix: manual kube upgrade
-
-Prefer `./scripts/update.sh vX.Y.Z`. Same sequence by hand:
-
-```sh
-TAG=v1.6.2
-podman pull "ghcr.io/frozentear/ts6-manager-fullstack:${TAG}"
-podman pull "ghcr.io/frozentear/ts6-manager-sidecar:${TAG}"
-sed -E \
-  -e "s#(image:[[:space:]]+ghcr\\.io/frozentear/ts6-manager-fullstack:)[^[:space:]]+#\\1${TAG}#" \
-  -e "s#(image:[[:space:]]+ghcr\\.io/frozentear/ts6-manager-sidecar:)[^[:space:]]+#\\1${TAG}#" \
-  deploy/kube/ts6-manager.yaml > /tmp/ts6-manager.kube.yaml
-podman kube down deploy/kube/ts6-manager.yaml    # never --force
-# If the host secret is missing: cat deploy/kube/secrets.yaml in front.
-podman kube play /tmp/ts6-manager.kube.yaml
-curl -fsS http://127.0.0.1:3001/health
-./scripts/apply-fullstack-soft-pin.sh   # Contabo soft pin; no-op if unset
-```
 
 ### 3.5 Re-issuing secrets
 
