@@ -52,10 +52,11 @@ impl ClientVoiceState {
     }
 
     /// `client_flag_talking` is the server's "sending voice" bit.
-    /// A missing talker grant does not suppress it. An actual mute does,
-    /// so the talking dot and a mute chip are not shown together.
+    /// A missing talker grant does not suppress it. Speaker mute does not
+    /// either: output mute only stops playback. Only a muted or disabled
+    /// microphone hides the talking dot.
     pub fn shows_talking(self, client_flag_talking: i64) -> bool {
-        client_flag_talking != 0 && !self.is_muted()
+        client_flag_talking != 0 && !self.mic_muted && !self.mic_disabled
     }
 
     pub fn tags(self) -> Vec<VoiceTag> {
@@ -165,7 +166,7 @@ mod tests {
         }));
         assert!(state.is_muted());
         assert_eq!(labels(state), ["sound muted"]);
-        assert!(!state.shows_talking(1));
+        assert!(state.shows_talking(1));
     }
 
     #[test]
@@ -185,12 +186,31 @@ mod tests {
         }));
         assert!(mic.is_muted());
         assert_eq!(labels(mic), ["mic off"]);
+        assert!(!mic.shows_talking(1));
 
         let sound = ClientVoiceState::from_client(&client(|c| {
             c.client_input_hardware = 1;
             c.client_output_hardware = 0;
         }));
         assert_eq!(labels(sound), ["sound off"]);
+        assert!(sound.shows_talking(1));
+    }
+
+    #[test]
+    fn output_mute_still_shows_talking_input_mute_does_not() {
+        let speakers = ClientVoiceState::from_client(&client(|c| {
+            c.client_output_muted = 1;
+            c.client_flag_talking = 1;
+        }));
+        assert!(speakers.is_muted());
+        assert!(speakers.shows_talking(1));
+
+        let mic = ClientVoiceState::from_client(&client(|c| {
+            c.client_input_muted = 1;
+            c.client_flag_talking = 1;
+        }));
+        assert!(mic.is_muted());
+        assert!(!mic.shows_talking(1));
     }
 
     #[test]
