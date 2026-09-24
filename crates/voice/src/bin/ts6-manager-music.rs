@@ -111,6 +111,12 @@ async fn main() -> Result<()> {
             "music control API is exposed on all interfaces and must be firewalled to the private tunnel"
         );
     }
+    if decision.warn_public {
+        warn!(
+            listen = %args.listen,
+            "music control API is bound to a public address and should be bound to the WireGuard/private address with :3002 firewalled to the tunnel"
+        );
+    }
     if auth.is_open() {
         info!("music control API auth is disabled");
     } else {

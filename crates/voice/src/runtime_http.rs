@@ -159,6 +159,9 @@ pub struct BindDecision {
     /// One warning: the listener is on every interface and must be
     /// firewalled to the private tunnel.
     pub warn_wildcard: bool,
+    /// One warning: the listener is a public address. Bind the
+    /// WireGuard or private address and firewall `:3002` to the tunnel.
+    pub warn_public: bool,
 }
 
 /// `Some("1")` and `Some("true")` (any ASCII case) are on.
@@ -179,6 +182,31 @@ fn is_wildcard_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
+/// 100.64.0.0/10 (RFC 6598). Some tunnels use this range.
+fn is_cgnat_v4(ip: std::net::Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    octets[0] == 100 && (octets[1] & 0xc0) == 0x40
+}
+
+/// A specific address that is not loopback, not private, and not
+/// link-local. IPv4-mapped IPv6 is classified by the embedded v4.
+///
+/// Private is IPv4 RFC 1918, IPv4 CGNAT 100.64.0.0/10, or IPv6 ULA
+/// `fc00::/7`. Link-local is 169.254.0.0/16 or `fe80::/10`.
+fn is_public_bind_addr(ip: std::net::IpAddr) -> bool {
+    let ip = match ip {
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(std::net::IpAddr::V4).unwrap_or(ip),
+        other => other,
+    };
+    if ip.is_loopback() {
+        return false;
+    }
+    match ip {
+        std::net::IpAddr::V4(v4) => !(v4.is_private() || v4.is_link_local() || is_cgnat_v4(v4)),
+        std::net::IpAddr::V6(v6) => !(v6.is_unique_local() || v6.is_unicast_link_local()),
+    }
+}
+
 /// Pure startup rule for the control listener.
 ///
 /// `token_present` is true when a bearer token is configured.
@@ -189,8 +217,9 @@ fn is_wildcard_ip(ip: std::net::IpAddr) -> bool {
 /// - No token and anything else: refuse.
 /// - Token and `0.0.0.0`, `::`, or IPv4-mapped unspecified: refuse
 ///   unless `allow_wildcard`, in which case allow and warn.
-/// - Token and any other address, including a private WireGuard
-///   address or loopback: allow, no warning.
+/// - Token and a specific public address: allow, and set
+///   [`BindDecision::warn_public`].
+/// - Token and loopback, private, or link-local: allow, no warning.
 pub fn decide_control_bind(
     listen: SocketAddr,
     token_present: bool,
@@ -200,6 +229,7 @@ pub fn decide_control_bind(
         return if listen.ip().is_loopback() {
             Ok(BindDecision {
                 warn_wildcard: false,
+                warn_public: false,
             })
         } else {
             Err(ControlBindError::Unauthenticated { listen })
@@ -209,6 +239,7 @@ pub fn decide_control_bind(
         return if allow_wildcard {
             Ok(BindDecision {
                 warn_wildcard: true,
+                warn_public: false,
             })
         } else {
             Err(ControlBindError::Wildcard { listen })
@@ -216,6 +247,7 @@ pub fn decide_control_bind(
     }
     Ok(BindDecision {
         warn_wildcard: false,
+        warn_public: is_public_bind_addr(listen.ip()),
     })
 }
 
@@ -875,6 +907,7 @@ mod tests {
         let auth = ControlAuth::parse(Some(token));
         let decision = decide_control_bind(addr("10.8.0.2:3002"), true, false).unwrap();
         assert!(!decision.warn_wildcard);
+        assert!(!decision.warn_public);
         let app = router_with_auth(RuntimeState::new(), auth);
 
         let resp = app
@@ -1134,12 +1167,43 @@ mod tests {
         }
         let wireguard = decide_control_bind(addr("10.8.0.2:3002"), true, false).unwrap();
         assert!(!wireguard.warn_wildcard);
+        assert!(!wireguard.warn_public);
         let loopback = decide_control_bind(addr("127.0.0.1:3002"), true, false).unwrap();
         assert!(!loopback.warn_wildcard);
+        assert!(!loopback.warn_public);
         let open = decide_control_bind(addr("127.0.0.1:3002"), false, false).unwrap();
         assert!(!open.warn_wildcard);
         let unset = decide_control_bind(addr("0.0.0.0:3002"), false, true).expect_err("no token");
         assert!(unset.to_string().contains("loopback"));
+    }
+
+    #[test]
+    fn public_bind_with_token_allows_with_warn() {
+        for raw in [
+            "203.0.113.5:3002",
+            "[2001:db8::1]:3002",
+            "[::ffff:203.0.113.5]:3002",
+        ] {
+            let decision = decide_control_bind(addr(raw), true, false).expect(raw);
+            assert!(!decision.warn_wildcard, "{raw}");
+            assert!(decision.warn_public, "{raw}");
+        }
+        for raw in [
+            "10.8.0.2:3002",
+            "172.20.0.1:3002",
+            "192.168.1.2:3002",
+            "100.64.0.1:3002",
+            "[fd00::1]:3002",
+            "169.254.1.1:3002",
+            "[fe80::1]:3002",
+        ] {
+            let decision = decide_control_bind(addr(raw), true, false).expect(raw);
+            assert!(!decision.warn_wildcard, "{raw}");
+            assert!(!decision.warn_public, "{raw}");
+        }
+        let unset = decide_control_bind(addr("203.0.113.5:3002"), false, false)
+            .expect_err("no token on a public address");
+        assert!(unset.to_string().contains("Refusing to start"));
     }
 
     #[test]

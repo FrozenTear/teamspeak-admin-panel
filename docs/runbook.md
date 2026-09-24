@@ -82,7 +82,9 @@ travel only over the WireGuard link, never over the public internet.
 A wildcard bind (`0.0.0.0` or `::`) is refused while the token is set.
 `MUSIC_RUNTIME_ALLOW_WILDCARD_BIND=1` (or `true`) overrides that
 refusal and is discouraged: the process logs a warning, and `:3002`
-must still be firewalled to the private tunnel.
+must still be firewalled to the private tunnel. A specific public
+address still starts, and logs a warning to bind the WireGuard or
+private address and firewall `:3002` to the tunnel.
 
 The full canonical env list, with comments, is
 [`deploy/quadlet/ts6-manager.env.example`](../deploy/quadlet/ts6-manager.env.example).
