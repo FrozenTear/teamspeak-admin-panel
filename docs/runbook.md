@@ -43,10 +43,11 @@ The single hard requirement. The server boots without anything else.
 | `MUSIC_RUNTIME_TOKEN` | Optional shared bearer for the music control API (`:3002`). Unset on single-box loopback deploys. | `openssl rand -base64 32` |
 
 `MUSIC_RUNTIME_TOKEN` is read from the environment only (never a config
-file, the database, or a CLI flag). Both processes trim the value the
-same way: surrounding whitespace is ignored, and empty or
-whitespace-only after that trim is unset. A stray space in one
-container's environment therefore cannot cause a 401. On a single-box
+file, the database, or a CLI flag). Fullstack uses the music crate's
+variable name and its parser (`ControlAuth`): surrounding whitespace
+is ignored, and empty or whitespace-only after that trim is unset. A
+stray space in one container's environment therefore cannot cause a
+401. On a single-box
 deploy that binds the music listener to loopback (`127.0.0.1` or
 `::1`), leave the variable unset: the music process does not require a
 bearer, and fullstack sends no `Authorization` header. That is today's

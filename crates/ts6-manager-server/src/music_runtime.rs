@@ -25,9 +25,10 @@ use tokio::sync::{Mutex, broadcast};
 use tracing::{info, warn};
 
 /// Environment variable holding the shared bearer for the music control
-/// API. Read at process start only. Never a file, a database row, or a
-/// CLI flag. The music process reads the same name.
-pub const MUSIC_RUNTIME_TOKEN_ENV: &str = "MUSIC_RUNTIME_TOKEN";
+/// API. This is the music crate's constant (`music-bot-audio`), re-exported
+/// by the runtime. Read at process start only. Never a file, a database
+/// row, or a CLI flag.
+pub use music_bot::runtime_http::MUSIC_RUNTIME_TOKEN_ENV;
 
 /// `StoreError::Backend` payload when the music runtime returns 401.
 /// Browser routes map this to 502 `{"error":"music_runtime_auth"}`.
@@ -54,23 +55,13 @@ impl std::fmt::Display for MusicRuntimeToken {
     }
 }
 
-/// `MUSIC_RUNTIME_TOKEN` is set to bytes that are not UTF-8.
-///
-/// Fullstack refuses to start. The value is not included in the
-/// message or in `Debug`.
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "MUSIC_RUNTIME_TOKEN is set but is not valid UTF-8. Refusing to start. Set a UTF-8 token or unset MUSIC_RUNTIME_TOKEN"
-)]
-pub struct MusicRuntimeTokenError;
-
 impl MusicRuntimeToken {
     /// Missing, empty, and whitespace-only values are `Ok(None)` (no
-    /// `Authorization` header). Surrounding whitespace is stripped,
-    /// matching the music process, so a stray space in one container
-    /// cannot 401. A present non-UTF-8 value is an error and does not
-    /// mean "no auth".
-    pub fn from_env() -> Result<Option<Self>, MusicRuntimeTokenError> {
+    /// `Authorization` header). Open-vs-bearer and the non-UTF-8
+    /// refusal come from [`music_bot::runtime_http::ControlAuth`], so a
+    /// stray space cannot disagree with the music process. A present
+    /// non-UTF-8 value is that error and does not mean "no auth".
+    pub fn from_env() -> Result<Option<Self>, music_bot::runtime_http::ControlAuthError> {
         match std::env::var_os(MUSIC_RUNTIME_TOKEN_ENV) {
             None => Ok(None),
             Some(value) => Self::from_os_value(Some(value.as_os_str())),
@@ -78,23 +69,28 @@ impl MusicRuntimeToken {
     }
 
     /// `None` is unset. UTF-8 values follow [`Self::parse`]. A non-UTF-8
-    /// `OsStr` is [`MusicRuntimeTokenError`] and does not echo the bytes.
+    /// `OsStr` is the runtime's [`music_bot::runtime_http::ControlAuthError`]
+    /// and does not echo the bytes.
     pub fn from_os_value(
         raw: Option<&std::ffi::OsStr>,
-    ) -> Result<Option<Self>, MusicRuntimeTokenError> {
-        let Some(raw) = raw else {
+    ) -> Result<Option<Self>, music_bot::runtime_http::ControlAuthError> {
+        let auth = music_bot::runtime_http::ControlAuth::from_os_value(raw)?;
+        if auth.is_open() {
             return Ok(None);
-        };
-        match raw.to_str() {
-            Some(text) => Ok(Self::parse(text)),
-            None => Err(MusicRuntimeTokenError),
         }
+        let text = raw.and_then(|value| value.to_str()).unwrap_or("");
+        Ok(Self::parse(text))
     }
 
     /// `None`, `""`, and whitespace-only are unset. Any other value is
-    /// the trimmed bearer the music process hashes. The untrimmed
-    /// bytes are not what the runtime compares.
+    /// the trimmed bearer [`music_bot::runtime_http::ControlAuth::parse`]
+    /// hashes. The runtime does not trim the presented bearer.
+    /// `ControlAuth` stores only the digest, so the credential sent is
+    /// that same `trim`.
     pub fn parse(raw: &str) -> Option<Self> {
+        if music_bot::runtime_http::ControlAuth::parse(Some(raw)).is_open() {
+            return None;
+        }
         let token = raw.trim();
         if token.is_empty() {
             None
@@ -1716,10 +1712,6 @@ mod tests {
         assert!(!runtime.is_open());
         let rendered = format!("{token:?} {token}");
         assert!(!rendered.contains("trimmed-secret"), "{rendered}");
-        assert_eq!(
-            MUSIC_RUNTIME_TOKEN_ENV,
-            music_bot::runtime_http::MUSIC_RUNTIME_TOKEN_ENV
-        );
     }
 
     #[cfg(unix)]
