@@ -219,7 +219,7 @@ documented production layout.
 | Container port | Host port | Notes |
 |----------------|-----------|-------|
 | 3001 | 3001 | HTTP, served by the Dioxus fullstack server |
-| 3002 | loopback only | Music unit control (`--listen 127.0.0.1:3002`, `MUSIC_RUNTIME_URL`). Not a public listener; do not put it on Caddy. |
+| 3002 | loopback only | Music unit control (`--listen 127.0.0.1:3002`, `MUSIC_RUNTIME_URL`). Not a public listener; do not put it on Caddy. Optional `MUSIC_RUNTIME_TOKEN` bearer; see below. |
 | 7080 | loopback only | MoQ sidecar HTTP control (`--http-listen 127.0.0.1:7080`). Not a public listener; do not put it on Caddy. |
 | 4443 | 4443 (UDP) | MoQ sidecar WebTransport |
 
@@ -227,6 +227,18 @@ The pod runs with `hostNetwork: true` (see "Network mode" below). All
 listeners are on the host's network namespace directly — operators
 fronting the manager with a reverse proxy (Caddy / nginx / Traefik)
 should bind the proxy to the host and forward to `127.0.0.1:3001`.
+
+`MUSIC_RUNTIME_TOKEN` is optional. The music process reads it from the
+environment only. When it is unset and `--listen` is loopback
+(`127.0.0.1` / `::1`), the control API stays open — that is the
+single-box deploy, and this manifest does not set the variable. When
+it is set, every route except `GET /health` requires
+`Authorization: Bearer <token>`. The runtime and fullstack containers
+must share the same value. An empty or whitespace-only value is
+treated as unset. The process refuses to start if the token is unset
+and the listener is not loopback, so `:3002` cannot be published on a
+non-loopback address without authentication. Do not log the token.
+`/health` stays unauthenticated so the exec probe is unchanged.
 
 Contabo public HTTPS (draft, **not applied**): once
 `panel.scuffedcrew.no` is live on the existing host Caddy, public

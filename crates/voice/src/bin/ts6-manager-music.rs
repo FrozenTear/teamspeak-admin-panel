@@ -35,11 +35,13 @@ use tracing_subscriber::util::SubscriberInitExt;
     about = "TS6 Manager Music+Voice unit (Contabo bot container)"
 )]
 struct Args {
-    /// Loopback control plane. Default must stay `127.0.0.1:3002`:
-    /// under hostNetwork the bind address is the host address, and
-    /// this HTTP API is unauthenticated (`/v1/bots`, `/command`, play,
-    /// settings, logs). Kube args and `Containerfile.music` pass the
-    /// same flag. Health probes use `http://127.0.0.1:3002/health`.
+    /// Control-plane bind address. Default must stay `127.0.0.1:3002`:
+    /// under hostNetwork the bind address is the host address.
+    /// `MUSIC_RUNTIME_TOKEN` (environment only) requires bearer auth on
+    /// every route except `/health`. When that variable is unset, a
+    /// non-loopback bind refuses to start. Kube args and
+    /// `Containerfile.music` pass the same loopback flag. Health probes
+    /// use `http://127.0.0.1:3002/health` and do not send a token.
     #[arg(long, default_value = "127.0.0.1:3002")]
     listen: SocketAddr,
 
@@ -77,6 +79,18 @@ async fn main() -> Result<()> {
                 .with_span_list(false),
         )
         .init();
+
+    let auth = music_bot::runtime_http::ControlAuth::from_env();
+    let bind_ok = auth.ensure_bind_allowed(args.listen);
+    if let Err(err) = &bind_ok {
+        tracing::error!(%err, "refusing to start the music control API");
+    }
+    bind_ok?;
+    if auth.is_open() {
+        info!("music control API auth is disabled");
+    } else {
+        info!("music control API auth is enabled");
+    }
 
     music_bot_audio::cpuset::validate_send_vs_decode()
         .map_err(|e| anyhow::anyhow!(e))
@@ -124,7 +138,7 @@ async fn main() -> Result<()> {
         *state.yt_api_key.write().unwrap_or_else(|e| e.into_inner()) = Some(key);
     }
 
-    let app = music_bot::runtime_http::router(state);
+    let app = music_bot::runtime_http::router_with_auth(state, auth);
     let listener = tokio::net::TcpListener::bind(args.listen)
         .await
         .with_context(|| format!("bind {}", args.listen))?;

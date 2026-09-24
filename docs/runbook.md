@@ -40,6 +40,22 @@ The single hard requirement. The server boots without anything else.
 | `FRONTEND_URL` | Public origin the browser hits (CORS + cookie domain). Default `http://localhost:3000`. | Operator-supplied. |
 | `TRUSTED_PROXY_HOPS` | Number of trusted reverse-proxy hops in front of the listener. `0` = ignore forwarding headers. `1` = exactly one hop, **only if** the TCP peer is also inside `TRUSTED_PROXY_CIDRS`. | Set to match your TLS terminator, together with the CIDR below. |
 | `TRUSTED_PROXY_CIDRS` | Comma-separated CIDRs of proxies allowed to send `X-Forwarded-For` and `X-Forwarded-Proto`. Empty (default) never trusts those headers, even when hops is `1`. | The proxy's peer address, e.g. `127.0.0.1/32` when Caddy dials the panel on loopback. |
+| `MUSIC_RUNTIME_TOKEN` | Optional shared bearer for the music control API (`:3002`). Unset on single-box loopback deploys. | `openssl rand -base64 32` |
+
+`MUSIC_RUNTIME_TOKEN` is read from the environment only (never a config
+file or the database). When it is set, the music process requires
+`Authorization: Bearer <token>` on every control route except
+`GET /health` — spawn, command, shutdown, list, and the SSE event
+stream included. `/health` stays open so container healthchecks do not
+change. The runtime container and the fullstack container must be given
+the same value. On a single-box deploy that binds the music listener to
+loopback (`127.0.0.1` or `::1`), leave the variable unset: authentication
+stays off, which is today's behavior. An empty or whitespace-only value
+is treated as unset. If the variable is unset and `--listen` is not a
+loopback address, the music process refuses to start, so the control
+API cannot be exposed on the network without authentication. Do not log
+the token. Kube manifests are unchanged: the Contabo pod still binds
+`127.0.0.1:3002` and does not set the variable.
 
 The full canonical env list, with comments, is
 [`deploy/quadlet/ts6-manager.env.example`](../deploy/quadlet/ts6-manager.env.example).

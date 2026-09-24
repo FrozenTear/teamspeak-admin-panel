@@ -2,22 +2,36 @@
 //!
 //! Fullstack proxies Panel/API here. This process owns the only
 //! `BotSupervisor` / decode → Opus → wire send loop. No Surreal.
+//!
+//! Optional shared-token auth lives in this HTTP layer.
+//! `MUSIC_RUNTIME_TOKEN` (environment only) requires
+//! `Authorization: Bearer <token>` on every route except `GET /health`.
+//! When the variable is unset the listener must be loopback, or the
+//! process refuses to start.
 
 use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use axum::Json;
 use axum::Router;
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::extract::{Path, Request, State};
+use axum::http::{HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{delete, get, post};
 use futures::stream::{Stream, StreamExt};
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::warn;
+
+/// Environment variable that holds the shared bearer token.
+/// Read at startup. Never a file, a database, or a response field.
+pub const MUSIC_RUNTIME_TOKEN_ENV: &str = "MUSIC_RUNTIME_TOKEN";
 
 use crate::config::BotId;
 use crate::runtime_api::{
@@ -50,9 +64,96 @@ impl Default for RuntimeState {
     }
 }
 
+/// How the control API authenticates callers.
+///
+/// The raw token is hashed at parse time and dropped. `Debug` redacts
+/// the digest so a startup log cannot echo the secret.
+#[derive(Clone, Copy)]
+pub enum ControlAuth {
+    /// No bearer check. Valid only when the listener is loopback.
+    Open,
+    /// SHA-256 of the trimmed `MUSIC_RUNTIME_TOKEN`.
+    Bearer([u8; 32]),
+}
+
+impl std::fmt::Debug for ControlAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Open => f.write_str("ControlAuth::Open"),
+            Self::Bearer(_) => f.write_str("ControlAuth::Bearer([redacted])"),
+        }
+    }
+}
+
+impl ControlAuth {
+    pub const fn open() -> Self {
+        Self::Open
+    }
+
+    pub fn is_open(&self) -> bool {
+        matches!(self, Self::Open)
+    }
+
+    /// Read [`MUSIC_RUNTIME_TOKEN_ENV`]. Missing, empty, whitespace-only,
+    /// and non-Unicode values are [`ControlAuth::Open`].
+    pub fn from_env() -> Self {
+        match std::env::var(MUSIC_RUNTIME_TOKEN_ENV) {
+            Ok(value) => Self::parse(Some(&value)),
+            Err(_) => Self::Open,
+        }
+    }
+
+    /// `None`, `""`, and whitespace-only are open. Any other value
+    /// enables bearer auth. Surrounding whitespace is ignored; the
+    /// raw string is not retained.
+    pub fn parse(raw: Option<&str>) -> Self {
+        let Some(raw) = raw else {
+            return Self::Open;
+        };
+        let token = raw.trim();
+        if token.is_empty() {
+            Self::Open
+        } else {
+            Self::Bearer(sha256(token.as_bytes()))
+        }
+    }
+
+    /// Refuse a non-loopback bind when auth is disabled.
+    ///
+    /// Loopback follows [`std::net::IpAddr::is_loopback`]: `127.0.0.0/8`
+    /// and `::1`. `0.0.0.0`, `::`, and IPv4-mapped addresses are not
+    /// loopback, so they require a token.
+    pub fn ensure_bind_allowed(&self, listen: SocketAddr) -> Result<(), ControlBindError> {
+        if self.is_open() && !listen.ip().is_loopback() {
+            Err(ControlBindError { listen })
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Startup failure: the control API would be reachable without auth.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "MUSIC_RUNTIME_TOKEN is unset and the music control API is bound to {listen}, which is not a loopback address. Refusing to start. Set MUSIC_RUNTIME_TOKEN or bind to 127.0.0.1 / ::1 so the control API is not exposed without authentication"
+)]
+pub struct ControlBindError {
+    listen: SocketAddr,
+}
+
+/// Control plane with authentication disabled.
+///
+/// Production `ts6-manager-music` uses [`router_with_auth`] after
+/// [`ControlAuth::ensure_bind_allowed`]. In-process callers on loopback
+/// keep this open router.
 pub fn router(state: RuntimeState) -> Router {
-    Router::new()
-        .route("/health", get(health))
+    router_with_auth(state, ControlAuth::open())
+}
+
+/// Same routes as [`router`], with bearer auth on every route except
+/// `GET /health` when `auth` is [`ControlAuth::Bearer`].
+pub fn router_with_auth(state: RuntimeState, auth: ControlAuth) -> Router {
+    let mut app = Router::new()
         .route("/v1/bots", get(list_bots).post(spawn_bot))
         .route("/v1/bots/{id}", delete(shutdown_bot))
         .route("/v1/bots/{id}/command", post(send_command))
@@ -60,8 +161,64 @@ pub fn router(state: RuntimeState) -> Router {
         .route("/v1/settings", post(update_settings))
         .route("/v1/bug-report-context", get(bug_report_context))
         .route("/v1/mutate", post(mutate))
-        .route("/v1/store", post(store_op))
-        .with_state(state)
+        .route("/v1/store", post(store_op));
+    if let ControlAuth::Bearer(expected) = auth {
+        app = app.route_layer(middleware::from_fn(move |req, next| async move {
+            require_bearer(expected, req, next).await
+        }));
+    }
+    // Added after `route_layer`, so `/health` is not authenticated.
+    app.route("/health", get(health)).with_state(state)
+}
+
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    let digest = Sha256::digest(bytes);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
+/// Fixed-length compare of SHA-256 digests via `subtle::ConstantTimeEq`.
+///
+/// The configured secret is already a digest; only the presented header
+/// is hashed here. Both sides are 32 bytes, so the compare does not
+/// return on the first differing token byte or on a length mismatch of
+/// the raw bearer value.
+fn token_eq(expected_sha256: [u8; 32], presented: &[u8]) -> bool {
+    bool::from(sha256(presented).ct_eq(&expected_sha256))
+}
+
+fn bearer_credential(value: &HeaderValue) -> Option<&[u8]> {
+    const SCHEME: &[u8] = b"bearer ";
+    let bytes = value.as_bytes();
+    if bytes.len() <= SCHEME.len() {
+        return None;
+    }
+    let (scheme, rest) = bytes.split_at(SCHEME.len());
+    if !scheme.eq_ignore_ascii_case(SCHEME) {
+        return None;
+    }
+    Some(rest)
+}
+
+async fn require_bearer(expected: [u8; 32], req: Request, next: Next) -> Response {
+    let ok = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(bearer_credential)
+        .is_some_and(|presented| token_eq(expected, presented));
+    if ok {
+        next.run(req).await
+    } else {
+        unauthorized()
+    }
+}
+
+fn unauthorized() -> Response {
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .body(axum::body::Body::empty())
+        .expect("empty 401")
 }
 
 async fn health(State(state): State<RuntimeState>) -> Json<HealthResponse> {
@@ -547,5 +704,369 @@ mod tests {
         let list: ListResponse = json(resp).await;
         assert_eq!(list.bots.len(), 1);
         assert_eq!(list.bots[0].name, "unit");
+    }
+
+    fn addr(text: &str) -> SocketAddr {
+        text.parse()
+            .unwrap_or_else(|_| panic!("socket addr {text}"))
+    }
+
+    fn authed(method: &str, uri: &str, token: Option<&str>, body: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if let Some(token) = token {
+            builder = builder.header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        if body.is_some() {
+            builder = builder.header(axum::http::header::CONTENT_TYPE, "application/json");
+        }
+        builder
+            .body(match body {
+                Some(json) => Body::from(json.to_string()),
+                None => Body::empty(),
+            })
+            .expect("request")
+    }
+
+    async fn assert_empty_401(resp: axum::http::Response<Body>, token: &str) {
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let headers = format!("{:?}", resp.headers());
+        assert!(
+            !headers.contains(token),
+            "401 headers must not echo the token: {headers}"
+        );
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(
+            bytes.is_empty(),
+            "401 body must be empty, got {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+
+    const PROTECTED: &[(&str, &str, Option<&str>)] = &[
+        ("GET", "/v1/bots", None),
+        ("POST", "/v1/bots", Some("{}")),
+        ("DELETE", "/v1/bots/1", None),
+        ("POST", "/v1/bots/1/command", Some("{}")),
+        ("GET", "/v1/bots/1/events", None),
+        ("POST", "/v1/settings", Some("{}")),
+        ("GET", "/v1/bug-report-context", None),
+        (
+            "POST",
+            "/v1/mutate",
+            Some(r#"{"op":"playlist_list","bot":1}"#),
+        ),
+        ("POST", "/v1/store", Some(r#"{"op":"queue_peek","bot":1}"#)),
+    ];
+
+    #[tokio::test]
+    async fn authorized_requests_ok_and_health_stays_open() {
+        let token = "unit-test-token";
+        let auth = ControlAuth::parse(Some(token));
+        assert!(auth.ensure_bind_allowed(addr("0.0.0.0:3002")).is_ok());
+        let app = router_with_auth(RuntimeState::new(), auth);
+
+        let resp = app
+            .clone()
+            .oneshot(authed("GET", "/health", None, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let health: HealthResponse = json(resp).await;
+        assert_eq!(health.status, "ok");
+
+        let resp = app
+            .clone()
+            .oneshot(authed("GET", "/v1/bots", Some(token), None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/bots")
+                    .header(axum::http::header::AUTHORIZATION, format!("bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let cfg = BotConfig::new(
+            "authed",
+            std::env::temp_dir().join("music-runtime-auth.identity"),
+        )
+        .with_auto_connect(false);
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/bots")
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&SpawnRequest {
+                            config: cfg,
+                            id: None,
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let spawned: SpawnResponse = json(resp).await;
+
+        let resp = app
+            .clone()
+            .oneshot(authed(
+                "POST",
+                &format!("/v1/bots/{}/command", spawned.id.0),
+                Some(token),
+                Some(
+                    &serde_json::to_string(&SendRequest {
+                        command: BotCommand::Disconnect,
+                    })
+                    .unwrap(),
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        let resp = app
+            .clone()
+            .oneshot(authed(
+                "GET",
+                &format!("/v1/bots/{}/events", spawned.id.0),
+                Some(token),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let content_type = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            content_type.starts_with("text/event-stream"),
+            "SSE content-type, got {content_type}"
+        );
+
+        let resp = app
+            .clone()
+            .oneshot(authed(
+                "DELETE",
+                &format!("/v1/bots/{}", spawned.id.0),
+                Some(token),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let resp = app
+            .clone()
+            .oneshot(authed("POST", "/v1/settings", Some(token), Some("{}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let resp = app
+            .clone()
+            .oneshot(authed("GET", "/v1/bug-report-context", Some(token), None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .clone()
+            .oneshot(authed(
+                "POST",
+                "/v1/mutate",
+                Some(token),
+                Some(&format!(
+                    r#"{{"op":"playlist_list","bot":{}}}"#,
+                    spawned.id.0
+                )),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .oneshot(authed(
+                "POST",
+                "/v1/store",
+                Some(token),
+                Some(&format!(r#"{{"op":"queue_peek","bot":{}}}"#, spawned.id.0)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn missing_or_wrong_token_is_401_on_each_protected_route() {
+        let token = "runtime-token-do-not-echo";
+        let app = router_with_auth(RuntimeState::new(), ControlAuth::parse(Some(token)));
+
+        for (method, uri, body) in PROTECTED {
+            for presented in [None, Some("wrong-token"), Some("runtime-token-do-not-ech")] {
+                let resp = app
+                    .clone()
+                    .oneshot(authed(method, uri, presented, *body))
+                    .await
+                    .unwrap();
+                assert_empty_401(resp, token).await;
+            }
+        }
+
+        // Auth runs before the handler: a wrong token is 401, not 404.
+        let resp = app
+            .clone()
+            .oneshot(authed("GET", "/v1/bots/1/events", Some("nope"), None))
+            .await
+            .unwrap();
+        assert_empty_401(resp, token).await;
+
+        let resp = app
+            .clone()
+            .oneshot(authed("GET", "/v1/bots/1/events", Some(token), None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/bots")
+                    .header(axum::http::header::AUTHORIZATION, format!("Basic {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_empty_401(resp, token).await;
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/bots?token={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_empty_401(resp, token).await;
+
+        let resp = app
+            .oneshot(authed("GET", "/health", None, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn unset_token_on_loopback_leaves_routes_open() {
+        let auth = ControlAuth::parse(None);
+        assert!(auth.is_open());
+        assert!(auth.ensure_bind_allowed(addr("127.0.0.1:3002")).is_ok());
+        assert!(auth.ensure_bind_allowed(addr("127.0.0.2:3002")).is_ok());
+        assert!(auth.ensure_bind_allowed(addr("[::1]:3002")).is_ok());
+        let app = router_with_auth(RuntimeState::new(), auth);
+        let resp = app
+            .oneshot(authed("GET", "/v1/bots", None, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn unset_token_on_non_loopback_is_a_startup_error() {
+        let auth = ControlAuth::parse(None);
+        for raw in [
+            "0.0.0.0:3002",
+            "[::]:3002",
+            "10.1.2.3:3002",
+            "[2001:db8::1]:3002",
+            "[::ffff:127.0.0.1]:3002",
+        ] {
+            let err = auth.ensure_bind_allowed(addr(raw)).expect_err(raw);
+            let msg = err.to_string();
+            assert!(msg.contains("MUSIC_RUNTIME_TOKEN"), "{msg}");
+            assert!(msg.contains("Refusing to start"), "{msg}");
+            assert!(msg.contains("loopback"), "{msg}");
+            assert!(!msg.contains("secret"), "{msg}");
+        }
+        let enabled = ControlAuth::parse(Some("token"));
+        assert!(enabled.ensure_bind_allowed(addr("0.0.0.0:3002")).is_ok());
+    }
+
+    #[test]
+    fn empty_or_whitespace_token_is_treated_as_unset() {
+        for raw in ["", " ", "\t", "\n", " \t\r\n "] {
+            let auth = ControlAuth::parse(Some(raw));
+            assert!(auth.is_open(), "{raw:?}");
+            assert!(
+                auth.ensure_bind_allowed(addr("0.0.0.0:3002")).is_err(),
+                "{raw:?} must refuse a non-loopback bind"
+            );
+            assert!(auth.ensure_bind_allowed(addr("127.0.0.1:3002")).is_ok());
+            assert!(auth.ensure_bind_allowed(addr("[::1]:3002")).is_ok());
+        }
+        assert!(!ControlAuth::parse(Some("0")).is_open());
+        assert!(!ControlAuth::parse(Some("  x  ")).is_open());
+    }
+
+    #[tokio::test]
+    async fn whitespace_token_router_stays_open_on_loopback() {
+        let auth = ControlAuth::parse(Some(" \t "));
+        assert!(auth.ensure_bind_allowed(addr("127.0.0.1:3002")).is_ok());
+        let app = router_with_auth(RuntimeState::new(), auth);
+        let resp = app
+            .oneshot(authed("GET", "/v1/bots", None, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn surrounding_whitespace_on_the_env_value_is_not_part_of_the_token() {
+        let auth = ControlAuth::parse(Some("  unit-test-token  "));
+        assert!(!auth.is_open());
+        let app = router_with_auth(RuntimeState::new(), auth);
+        let resp = app
+            .clone()
+            .oneshot(authed("GET", "/v1/bots", Some("unit-test-token"), None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = app
+            .oneshot(authed("GET", "/v1/bots", Some("  unit-test-token  "), None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn debug_output_does_not_include_the_token() {
+        let token = "super-secret-runtime-token";
+        let auth = ControlAuth::parse(Some(token));
+        let rendered = format!("{auth:?}");
+        assert!(!rendered.contains(token), "{rendered}");
+        assert!(rendered.contains("redacted"), "{rendered}");
+        let err = ControlAuth::parse(None)
+            .ensure_bind_allowed(addr("192.0.2.10:3002"))
+            .expect_err("non-loopback");
+        assert!(!err.to_string().contains(token));
     }
 }
