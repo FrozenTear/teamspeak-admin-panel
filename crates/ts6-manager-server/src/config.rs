@@ -250,7 +250,7 @@ impl Config {
         let sidecar_url = optional_env("SIDECAR_URL");
         let sidecar_binary_path = optional_env("SIDECAR_BINARY_PATH").map(PathBuf::from);
         let music_runtime_url = optional_env("MUSIC_RUNTIME_URL");
-        let music_runtime_token = crate::music_runtime::MusicRuntimeToken::from_env();
+        let music_runtime_token = crate::music_runtime::MusicRuntimeToken::from_env()?;
         let moq_public_url = optional_env("MOQ_PUBLIC_URL");
         let yt_cookie_file = optional_env("YT_COOKIE_FILE").map(PathBuf::from);
         let youtube_api_key = optional_env("YOUTUBE_API_KEY");

@@ -233,12 +233,14 @@ fullstack process read it from the environment only (not a file, the
 database, or a CLI flag). When it is unset and `--listen` is loopback
 (`127.0.0.1` / `::1`), the control API stays open and fullstack sends
 no `Authorization` header — that is the single-box deploy, and this
-manifest does not set the variable. An empty or whitespace-only value
-is treated as unset. When it is set, the two containers must share the
-same value. The music process then requires
+manifest does not set the variable. Both processes trim the value the
+same way. An empty or whitespace-only value is treated as unset. A
+value that is not valid UTF-8 makes fullstack refuse to start, and the
+error does not include the value. When it is set, the two containers
+must share the same value. The music process then requires
 `Authorization: Bearer <token>` on every route except `GET /health`.
 Fullstack sends that bearer on every runtime call: commands, list,
-now-playing, boot rehydrate, and the SSE event stream included. A
+now-playing, boot rehydrate, and the SSE event-stream proxy included. A
 runtime `401` is answered to the browser as `502`
 `{"error":"music_runtime_auth"}`, and the event stream does not
 reconnect in a loop after `401`. Do not log the token. The process

@@ -96,7 +96,8 @@ Minimum required env vars:
 
 Optional: `ENCRYPTION_KEY`, `LOG_LEVEL`, `LOG_PRETTY`, `FRONTEND_URL`,
 `MUSIC_RUNTIME_URL`, `MUSIC_RUNTIME_TOKEN` (shared bearer for the music
-control API; both processes, environment only, optional on loopback).
+control API; both processes, environment only, same trim, optional on
+loopback; non-UTF-8 refuses fullstack startup).
 See [`deploy/quadlet/ts6-manager.env.example`](deploy/quadlet/ts6-manager.env.example)
 for the canonical list with comments.
 

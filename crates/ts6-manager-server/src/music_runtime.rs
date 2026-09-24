@@ -54,17 +54,46 @@ impl std::fmt::Display for MusicRuntimeToken {
     }
 }
 
+/// `MUSIC_RUNTIME_TOKEN` is set to bytes that are not UTF-8.
+///
+/// Fullstack refuses to start. The value is not included in the
+/// message or in `Debug`.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "MUSIC_RUNTIME_TOKEN is set but is not valid UTF-8. Refusing to start. Set a UTF-8 token or unset MUSIC_RUNTIME_TOKEN"
+)]
+pub struct MusicRuntimeTokenError;
+
 impl MusicRuntimeToken {
-    /// `None` when the variable is missing, empty, or whitespace-only.
-    /// Matches the music process: surrounding whitespace is stripped
-    /// and does not itself enable auth.
-    pub fn from_env() -> Option<Self> {
-        match std::env::var(MUSIC_RUNTIME_TOKEN_ENV) {
-            Ok(raw) => Self::parse(&raw),
-            Err(_) => None,
+    /// Missing, empty, and whitespace-only values are `Ok(None)` (no
+    /// `Authorization` header). Surrounding whitespace is stripped,
+    /// matching the music process, so a stray space in one container
+    /// cannot 401. A present non-UTF-8 value is an error and does not
+    /// mean "no auth".
+    pub fn from_env() -> Result<Option<Self>, MusicRuntimeTokenError> {
+        match std::env::var_os(MUSIC_RUNTIME_TOKEN_ENV) {
+            None => Ok(None),
+            Some(value) => Self::from_os_value(Some(value.as_os_str())),
         }
     }
 
+    /// `None` is unset. UTF-8 values follow [`Self::parse`]. A non-UTF-8
+    /// `OsStr` is [`MusicRuntimeTokenError`] and does not echo the bytes.
+    pub fn from_os_value(
+        raw: Option<&std::ffi::OsStr>,
+    ) -> Result<Option<Self>, MusicRuntimeTokenError> {
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        match raw.to_str() {
+            Some(text) => Ok(Self::parse(text)),
+            None => Err(MusicRuntimeTokenError),
+        }
+    }
+
+    /// `None`, `""`, and whitespace-only are unset. Any other value is
+    /// the trimmed bearer the music process hashes. The untrimmed
+    /// bytes are not what the runtime compares.
     pub fn parse(raw: &str) -> Option<Self> {
         let token = raw.trim();
         if token.is_empty() {
@@ -1550,8 +1579,107 @@ mod tests {
         drop(log);
     }
 
+    fn token_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|err| err.into_inner())
+    }
+
+    #[test]
+    fn debug_format_of_token_wrapper_does_not_contain_the_raw_token() {
+        const SECRET: &str = "super-secret-runtime-token";
+        let token = MusicRuntimeToken::parse(SECRET).unwrap();
+        let rendered = format!("{token:?}");
+        assert_eq!(rendered, "MusicRuntimeToken([redacted])");
+        assert!(!rendered.contains(SECRET), "{rendered}");
+        assert!(!format!("{token}").contains(SECRET));
+    }
+
+    #[tokio::test]
+    async fn whitespace_only_token_sends_no_authorization_header() {
+        for raw in ["", " ", "\t", "\n", " \t\r\n "] {
+            assert!(
+                MusicRuntimeToken::parse(raw).is_none(),
+                "whitespace-only must be unset, matching the runtime: {raw:?}"
+            );
+        }
+        let (url, log) = serve_mock(MockMode::Allow).await;
+        let front = MusicBotFront::remote_with_token(url, MusicRuntimeToken::parse(" \t "));
+        exercise_remote_calls(&front).await;
+        let hits = log.hits.lock().await.clone();
+        assert_paths_covered(&hits);
+        for hit in &hits {
+            assert!(
+                hit.authorization.is_none(),
+                "{} {} sent {:?}",
+                hit.method,
+                hit.path,
+                hit.authorization
+            );
+        }
+        let events: Vec<_> = hits
+            .iter()
+            .filter(|hit| hit.path.ends_with("/events"))
+            .collect();
+        assert!(!events.is_empty(), "event stream was not called");
+        assert!(events.iter().all(|hit| hit.authorization.is_none()));
+    }
+
+    #[tokio::test]
+    async fn padded_token_matches_runtime_compare_on_list_and_event_stream() {
+        const RAW: &str = "  padded-runtime-token  ";
+        const TRIMMED: &str = "padded-runtime-token";
+        let panel = MusicRuntimeToken::parse(RAW).expect("padded token");
+        assert_eq!(
+            panel.authorization_header().unwrap().to_str().unwrap(),
+            format!("Bearer {TRIMMED}"),
+            "the runtime hashes the trimmed value and does not trim the presented bearer"
+        );
+        assert!(!format!("{panel:?}").contains(TRIMMED));
+
+        let auth = music_bot::runtime_http::ControlAuth::parse(Some(RAW));
+        assert!(!auth.is_open());
+        let state = music_bot::runtime_http::RuntimeState::new();
+        let id = state
+            .supervisor
+            .spawn(
+                BotConfig::new(
+                    "padded",
+                    std::env::temp_dir().join("music-runtime-padded-token.identity"),
+                )
+                .with_auto_connect(false),
+                Arc::new(RwLock::new(None)),
+                Arc::new(RwLock::new(None)),
+            )
+            .await;
+        let app = music_bot::runtime_http::router_with_auth(state, auth);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        let front = MusicBotFront::remote_with_token(format!("http://{addr}"), Some(panel));
+        let bots = front
+            .list()
+            .await
+            .expect("runtime accepted the trimmed bearer");
+        assert!(bots.iter().any(|bot| bot.id == id));
+        let rx = front
+            .subscribe(id)
+            .await
+            .expect("event stream accepted the trimmed bearer")
+            .expect("spawned bot");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        front
+            .subscribe(id)
+            .await
+            .expect("event-stream 401 would stop further subscriptions");
+        drop(rx);
+    }
+
     #[test]
     fn blank_env_token_is_unset_and_trimmed_value_is_redacted() {
+        let _lock = token_env_lock();
         struct ClearEnv;
         impl Drop for ClearEnv {
             fn drop(&mut self) {
@@ -1564,18 +1692,84 @@ mod tests {
         unsafe {
             std::env::remove_var(MUSIC_RUNTIME_TOKEN_ENV);
         }
-        assert!(MusicRuntimeToken::from_env().is_none());
+        assert!(MusicRuntimeToken::from_env().unwrap().is_none());
         assert!(MusicRuntimeToken::parse("").is_none());
         assert!(MusicRuntimeToken::parse(" \t\n").is_none());
         unsafe {
+            std::env::set_var(MUSIC_RUNTIME_TOKEN_ENV, " \t\n ");
+        }
+        assert!(
+            MusicRuntimeToken::from_env().unwrap().is_none(),
+            "whitespace-only env is unset"
+        );
+        unsafe {
             std::env::set_var(MUSIC_RUNTIME_TOKEN_ENV, "  trimmed-secret  ");
         }
-        let token = MusicRuntimeToken::from_env().expect("trimmed token");
+        let token = MusicRuntimeToken::from_env()
+            .unwrap()
+            .expect("trimmed token");
         assert_eq!(
             token.authorization_header().unwrap().to_str().unwrap(),
             "Bearer trimmed-secret"
         );
+        let runtime = music_bot::runtime_http::ControlAuth::parse(Some("  trimmed-secret  "));
+        assert!(!runtime.is_open());
         let rendered = format!("{token:?} {token}");
         assert!(!rendered.contains("trimmed-secret"), "{rendered}");
+        assert_eq!(
+            MUSIC_RUNTIME_TOKEN_ENV,
+            music_bot::runtime_http::MUSIC_RUNTIME_TOKEN_ENV
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_token_fails_fullstack_startup_without_printing_the_value() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let _lock = token_env_lock();
+        let raw = std::ffi::OsStr::from_bytes(b"not-utf8-\xff-token");
+        let err = MusicRuntimeToken::from_os_value(Some(raw)).expect_err("non-utf8 token");
+        let msg = err.to_string();
+        assert!(msg.contains("Refusing to start"), "{msg}");
+        assert!(msg.to_lowercase().contains("utf-8"), "{msg}");
+        assert!(!msg.contains("not-utf8"), "{msg}");
+        assert!(!format!("{err:?}").contains("not-utf8"), "{err:?}");
+        assert!(
+            MusicRuntimeToken::from_os_value(Some(std::ffi::OsStr::new("  \t  ")))
+                .unwrap()
+                .is_none()
+        );
+
+        struct Restore {
+            jwt: Option<String>,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                unsafe {
+                    std::env::remove_var(MUSIC_RUNTIME_TOKEN_ENV);
+                    match &self.jwt {
+                        Some(value) => std::env::set_var("JWT_SECRET", value),
+                        None => std::env::remove_var("JWT_SECRET"),
+                    }
+                }
+            }
+        }
+        let _restore = Restore {
+            jwt: std::env::var("JWT_SECRET").ok(),
+        };
+        unsafe {
+            std::env::set_var(
+                "JWT_SECRET",
+                "config-load-test-jwt-secret-not-a-music-token",
+            );
+            std::env::set_var(MUSIC_RUNTIME_TOKEN_ENV, raw);
+        }
+        let err = crate::config::Config::load().expect_err("startup must refuse a non-utf8 token");
+        let msg = err.to_string();
+        assert!(msg.contains("Refusing to start"), "{msg}");
+        assert!(msg.to_lowercase().contains("utf-8"), "{msg}");
+        assert!(!msg.contains("not-utf8"), "{msg}");
+        assert!(!format!("{err:?}").contains("not-utf8"), "{err:?}");
     }
 }
