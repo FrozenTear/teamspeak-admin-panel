@@ -317,6 +317,28 @@ volume. Never `podman kube down --force`. Do not MOVE the bot
 runtime to Floki. Verify signatures first if you want — see § 5 and
 [`docs/ops/images.md` § 3](ops/images.md#3-signing).
 
+**voice-rt nice is one-shot (Opus #66 L16).** `TS6_BOT_NICE` (`-5` in
+packing B) is not a unit property. `apply-fullstack-soft-pin.sh`
+renices the music leader and every tid whose `comm` is `voice-rt`
+after music `/health`, then exits. Music HostConfig stays unset, and
+in-process `setpriority` of that negative nice is EPERM as uid 10001
+(no `CAP_SYS_NICE`). A music container restart therefore starts SEND
+threads at nice 0 until that script runs again — `update.sh` is the
+path that calls it. Do not add `CAP_SYS_NICE`. Do not change packing B
+(`fullstack` `2-5` / `-5`, music HostConfig unset, SEND `0-1`, DECODE
+`2-5`). Do not MOVE the bot runtime to Floki.
+
+Tokio's blocking pool uses the same thread name `voice-rt` and the
+same start hook, so those threads are pinned to SEND `0-1` too. The
+pool is empty at boot and grows on `spawn_blocking` /
+`block_in_place` (the single-loop send path). The walk cannot see
+tids that do not exist yet. Linux clone copies the spawning thread's
+nice: a blocking thread created from a worker the script already
+reniced is born at that nice, and a blocking thread created from a
+parent that is still 0 (restart, or a parent the walk missed) stays
+at 0. Re-running the script renices whatever `voice-rt` tids exist
+then. It does not stick across a later restart.
+
 **Quadlet:**
 
 1. Verify the new image's signature with cosign — see § 5 below.

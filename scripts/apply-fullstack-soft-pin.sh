@@ -11,11 +11,19 @@
 # DECODE 2-5 is kube env (pre_exec sched_setaffinity before exec, with
 # pin_decode_child as a leader-thread backup). This script does not inject it.
 # Packing A (fullstack 4-5) is gated — requires TS6_SOFT_PIN_SHRINK_ACK=1.
-# Packing C (music HostConfig send-only 0-1) is refused.
-# SEND/DECODE in-process pins are kube env, not HostConfig.
+# Packing B refuses any music container HostConfig cpuset, not only
+# literal send-only 0-1. Music HostConfig stays unset. SEND 0-1 and
+# DECODE 2-5 are in-process kube env, not HostConfig.
+# Packing C (music HostConfig on send-only cores) is always refused,
+# including when a shrink ACK is set.
 # Music nice: renice the container leader AND every tid whose comm is
 # voice-rt. Linux nice is per-thread; renice -p on the leader does not
-# reach send threads. The music process starts that runtime before /health.
+# reach send threads. The music process starts the voice runtime before
+# /health so those workers exist. This walk is one-shot (Opus #66 L16):
+# tokio's blocking pool reuses comm voice-rt and is created later
+# (spawn_blocking / block_in_place). Later tids inherit the spawning
+# thread's nice. A music container restart drops the nice until this
+# script runs again. Do not add CAP_SYS_NICE. Packing B values stay.
 # Sidecar stays unpinned unless TS6_SIDECAR_* are set.
 #
 # podman update failure is fatal when a cpuset was requested.
@@ -41,6 +49,41 @@ is_send_only_music_cpuset() {
         0-1|0,1|1,0|0|1) return 0 ;;
         *) return 1 ;;
     esac
+}
+
+# Packing B is the apply-ready default. Packing A is a fullstack shrink
+# together with TS6_SOFT_PIN_SHRINK_ACK=1. ACK without a shrink is still
+# packing B, so a music cpuset cannot be applied beside live fullstack 2-5.
+packing_b_in_effect() {
+    if [[ "${TS6_SOFT_PIN_SHRINK_ACK:-}" == "1" ]] && [[ -n "${CPUSET:-}" ]] && is_fullstack_shrink_from_live "$CPUSET"; then
+        return 1
+    fi
+    return 0
+}
+
+# Refuse music container HostConfig under packing B (any cpuset) and
+# always refuse send-only cores. Empty means unset and is allowed.
+# Prints a warning plus the reason on stderr. Returns 1 when refused.
+music_hostconfig_allowed() {
+    local spec
+    spec="$(normalize_cpuset "$1")"
+    if [[ -z "$spec" ]]; then
+        return 0
+    fi
+    if is_send_only_music_cpuset "$spec"; then
+        echo "warning: TS6_BOT_CONTAINER_CPUSET=${spec} is a music container HostConfig cpuset on send-only cores." >&2
+        echo "error: packing C refused — container-wide send cores trap ffmpeg on the wire-send path (Angerfist v1.6.15: und/C/stall 163/590/117)." >&2
+        echo "  Packing B keeps music HostConfig unset. SEND 0-1 and DECODE 2-5 are in-process, not HostConfig." >&2
+        return 1
+    fi
+    if packing_b_in_effect; then
+        echo "warning: TS6_BOT_CONTAINER_CPUSET=${spec} sets a music container HostConfig cpuset under packing B." >&2
+        echo "error: packing B refuses any music HostConfig cpuset, not only literal 0-1. Music HostConfig stays unset." >&2
+        echo "  Fullstack HostConfig stays 2-5. SEND 0-1 / DECODE 2-5 stay in-process (kube env)." >&2
+        echo "  A wider music cpuset (for example 0-3) is packing A: fullstack shrink plus TS6_SOFT_PIN_SHRINK_ACK=1." >&2
+        return 1
+    fi
+    return 0
 }
 
 # Profile A shrinks live 2-5. Refuse unless Robert ACK is set.
@@ -118,11 +161,14 @@ renice_matching_comm() {
     _found=$nmatched
 }
 
-# voice-rt is created at music-process boot (before /health) but a
-# short retry covers a process that is still starting its runtime.
-# Missing tids warn and do not fail the fullstack pin: an older music
-# image has no such threads yet. A renice that finds a tid and fails
-# is fatal.
+# voice-rt workers are created at music-process boot (before /health)
+# but a short retry covers a process that is still starting its
+# runtime. Tokio blocking-pool threads are also comm voice-rt and do
+# not exist yet; this walk cannot see them (Opus #66 L16). They
+# inherit the spawning thread's nice. Missing tids warn and do not
+# fail the fullstack pin: an older music image has no such threads
+# yet. A renice that finds a tid and fails is fatal. A music container
+# restart drops the nice until this script runs again.
 renice_voice_rt_tasks() {
     local pid="$1"
     local nice="$2"
@@ -251,17 +297,14 @@ main() {
 
     CPUSET="${TS6_FULLSTACK_CPUSET:-}"
     NICE="${TS6_FULLSTACK_NICE:-}"
-    BOT_CONTAINER_CPUSET="${TS6_BOT_CONTAINER_CPUSET:-}"
+    BOT_CONTAINER_CPUSET="$(normalize_cpuset "${TS6_BOT_CONTAINER_CPUSET:-}")"
     BOT_NICE="${TS6_BOT_NICE:-}"
     BOT_CHRT_SCHED="${TS6_BOT_CHRT_SCHED:-}"
     BOT_CHRT_PRIO="${TS6_BOT_CHRT_PRIO:-}"
     SIDECAR_CPUSET="${TS6_SIDECAR_CPUSET:-}"
     SIDECAR_NICE="${TS6_SIDECAR_NICE:-}"
 
-    if [[ -n "$BOT_CONTAINER_CPUSET" ]] && is_send_only_music_cpuset "$BOT_CONTAINER_CPUSET"; then
-        echo "error: TS6_BOT_CONTAINER_CPUSET=${BOT_CONTAINER_CPUSET} is packing C (music HostConfig on send-only 0-1)." >&2
-        echo "  v1.6.15 Angerfist dig 163/590/117: container-wide 0-1 traps ffmpeg on send cores." >&2
-        echo "  Use unset/0-5 (profile B) or 0-3 after fullstack shrink (profile A). Never 0-1." >&2
+    if ! music_hostconfig_allowed "$BOT_CONTAINER_CPUSET"; then
         exit 1
     fi
 

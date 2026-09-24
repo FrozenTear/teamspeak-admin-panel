@@ -38,10 +38,83 @@ terminated, connection then closed by the server:
 
 import json
 import os
+import shutil
 import socketserver
+import stat
 import sys
+import tempfile
 import threading
 import time
+
+
+def _private_cookie_path(src):
+    """Copy ``src`` to a mode-0600 temp file.
+
+    yt-dlp's ``cookiefile`` / ``--cookies`` rewrites that path when
+    ``YoutubeDL`` closes. Concurrent resolves must not share the operator
+    upload, or the exit write-back truncates it.
+    """
+    fd, path = tempfile.mkstemp(prefix="yt-cookies-", suffix=".txt")
+    os.close(fd)
+    try:
+        shutil.copyfile(src, path)
+        os.chmod(path, 0o600)
+    except Exception:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def _self_check_private_cookies():
+    """Prove two snapshots can be rewritten without touching the upload."""
+    fd, src = tempfile.mkstemp(prefix="yt-cookies-upload-", suffix=".txt")
+    os.close(fd)
+    original = (
+        b"# Netscape HTTP Cookie File\n"
+        b".youtube.com\tTRUE\t/\tTRUE\t0\tSID\tabc\n"
+    )
+    copies = []
+    try:
+        with open(src, "wb") as handle:
+            handle.write(original)
+        copies.append(_private_cookie_path(src))
+        copies.append(_private_cookie_path(src))
+        if len(set(copies)) != 2 or src in copies:
+            raise SystemExit("private cookie paths were not distinct")
+        with open(copies[0], "wb") as handle:
+            handle.write(b"CORRUPT")
+        with open(src, "rb") as handle:
+            if handle.read() != original:
+                raise SystemExit("upload cookie jar was rewritten")
+        with open(copies[1], "rb") as handle:
+            if handle.read() != original:
+                raise SystemExit("second copy did not match the upload")
+        mode = stat.S_IMODE(os.stat(copies[0]).st_mode)
+        if mode & 0o077:
+            raise SystemExit(
+                "private cookie copy is group/world accessible: %o" % mode
+            )
+    finally:
+        for path in copies:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        try:
+            os.unlink(src)
+        except OSError:
+            pass
+    print("OK: private cookie copies", file=sys.stderr)
+
+
+# Run before importing yt_dlp so the cookie check does not need the zipapp.
+# A socket path (the production argv) must not take this branch.
+if __name__ == "__main__" and sys.argv[1:] == ["--self-check-cookies"]:
+    _self_check_private_cookies()
+    raise SystemExit(0)
 
 
 def _load_yt_dlp():
@@ -195,6 +268,25 @@ def _extract_track(info):
 
 
 def resolve(url, cookie_file, send_partial=None):
+    """Resolve ``url``, giving yt-dlp a private cookie snapshot.
+
+    ``YoutubeDL`` rewrites ``cookiefile`` on close. The operator upload is
+    only read; concurrent resolves each get their own temp copy.
+    """
+    private = None
+    try:
+        if cookie_file:
+            private = _private_cookie_path(cookie_file)
+        return _resolve_impl(url, private, send_partial)
+    finally:
+        if private:
+            try:
+                os.unlink(private)
+            except OSError:
+                pass
+
+
+def _resolve_impl(url, cookie_file, send_partial=None):
     """Resolve ``url`` to a direct, ffmpeg-consumable ``bestaudio`` URL.
 
     Mirrors the subprocess fallback's ``yt-dlp -f bestaudio -g``: extraction

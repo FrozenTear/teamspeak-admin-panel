@@ -97,6 +97,8 @@ pipeline.shutdown().await;
 
 CPU affinity (packing B, no fullstack shrink): `voice-rt` pins only the wire-send path to `TS6_BOT_SEND_CPUSET=0-1`. Pipeline, ICY fetch, the yt-dlp bridge, and resolve run on `decode-rt`, pinned to `TS6_BOT_DECODE_CPUSET=2-5`. Music container HostConfig stays unset — never `0-1` (packing C).
 
+`TS6_BOT_NICE` (`-5`) is a one-shot host renice of tids named `voice-rt` after `/health`, not an in-process capability (uid 10001, EPERM, no `CAP_SYS_NICE`). Tokio's blocking pool reuses that name and is created lazily on `spawn_blocking` / `block_in_place`; those threads are pinned to SEND `0-1` and inherit the spawning thread's nice. A music container restart drops the nice until `scripts/apply-fullstack-soft-pin.sh` runs again (Opus #66 L16). Packing B is unchanged. Do not MOVE the bot runtime to Floki.
+
 ## Persistent yt-dlp resolver (PURA-359)
 
 `YtDlp { url }` no longer spawns a fresh `yt-dlp` subprocess on every `!play`.
@@ -207,7 +209,7 @@ YouTube increasingly requires a logged-in session for age-gated content, region-
 1. Generate the cookies file from a browser logged into youtube.com. Recommended: the [cookies.txt](https://addons.mozilla.org/firefox/addon/cookies-txt/) Firefox add-on. Export to `cookies.txt`.
 2. Make the file readable by the manager process (the fullstack image runs as uid `10001` / `ts6:ts6`). Place it under `<DATA_DIR>` so it persists across image rebuilds — e.g. `/var/lib/ts6-manager/yt-cookies.txt`.
 3. Set `YT_COOKIE_FILE=/var/lib/ts6-manager/yt-cookies.txt` in the manager's environment (Quadlet env file or kube `env:` entry).
-4. Restart the manager. Boot summary logs `yt_cookie_file_set=true`. Each yt-dlp invocation passes `--cookies <path>`; absence of the env var means no flag is added.
+4. Restart the manager. Boot summary logs `yt_cookie_file_set=true`. Each yt-dlp invocation passes `--cookies` pointing at a private temp copy of that file (the warm resolver does the same before `YoutubeDL`). The upload itself is not rewritten; yt-dlp's exit write-back lands on the copy. Absence of the env var means no flag is added.
 
 Cookies expire (typical YouTube cookies: weeks to months). A future UI ticket adds an upload + replace surface inside the operator panel; for now, replace the file in place and restart the manager.
 
