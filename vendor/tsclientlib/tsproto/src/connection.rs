@@ -29,10 +29,14 @@ pub trait Socket {
 	/// Non-blocking send. Must not register a waker.
 	///
 	/// The default polls with a no-op waker and maps `Pending` to
-	/// [`io::ErrorKind::WouldBlock`]. A socket that stores the waker passed
-	/// to `poll_send_to` (tokio's `UdpSocket` does, and that waker is the
-	/// reactor registration shared with recv) has to override this so a
-	/// direct flush cannot replace the recv waker.
+	/// [`io::ErrorKind::WouldBlock`]. `poll_send_to` records that waker for
+	/// write readiness. A no-op waker replaces the task that should be woken
+	/// when the socket becomes writable, so a later real `poll_send` is not
+	/// notified. It does not replace the recv waker — tokio keeps the reader
+	/// and writer wakers separate. This default is only safe for sockets that
+	/// ignore the waker (`SimulatedSocket`). `UdpSocket` overrides it with the
+	/// inherent `try_send_to`, a non-blocking syscall that does not touch the
+	/// reactor.
 	fn try_send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
 		let waker = std::task::Waker::noop();
 		let mut cx = Context::from_waker(waker);
@@ -170,9 +174,10 @@ impl Socket for UdpSocket {
 		self.poll_send_to(cx, buf, target)
 	}
 
-	/// Syscall only. `UdpSocket::try_send_to` does not register a waker, so
-	/// a direct flush from the voice task cannot clobber the recv
-	/// registration `poll_recv_from` installed.
+	/// Syscall only. The inherent `UdpSocket::try_send_to` does not register
+	/// a waker, so a direct flush cannot replace the write-readiness waker
+	/// a later `poll_send_to` needs. The recv waker is a separate
+	/// registration and is not what this override is protecting.
 	fn try_send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
 		UdpSocket::try_send_to(self, buf, target)
 	}
