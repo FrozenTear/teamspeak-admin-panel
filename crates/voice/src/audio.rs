@@ -1395,6 +1395,7 @@ impl SendTimingMonitor {
     }
 
     fn log_summary(&self) {
+        let flush_p99 = FLUSH_TIMING.take_p99();
         info!(
             target: "music_bot_latency",
             stage = "audio_send_summary",
@@ -1412,9 +1413,11 @@ impl SendTimingMonitor {
             max_t_send_us = self.window_max_t_send.as_micros() as u64,
             max_t_blockinplace_us = self.window_max_t_blockinplace.as_micros() as u64,
             // Bucket upper bound of the 99th percentile of direct-flush
-            // durations over this ~30 s window. `u64::MAX` is the open
-            // ≥32 ms bucket. Independent of the 1 s `inline_flush` line.
-            flush_p99_us = FLUSH_TIMING.take_p99_us(),
+            // durations over this ~30 s window. The open ≥32 ms bucket is
+            // `flush_p99_us = 32000` with `flush_p99_overflow = true`.
+            // Independent of the 1 s `inline_flush` line.
+            flush_p99_us = flush_p99.us,
+            flush_p99_overflow = flush_p99.overflow,
             "audio send-path timing window — per-window maxes for the \
              PURA-389 A/B/C residual-stall attribution; flush_p99_us is the \
              direct send_to cost over this window",
@@ -1814,8 +1817,13 @@ static FLUSH_LOG_START: OnceLock<Instant> = OnceLock::new();
 /// Log2 duration buckets. Index 0 is `< 2 µs`. Index `k` for `1..=14` is
 /// `[2^k, 2^(k+1))` µs. Index 15 is `≥ 32 ms` and has no upper bound.
 const FLUSH_BUCKET_COUNT: usize = 16;
-/// Floor of the open top bucket, in microseconds (32 ms).
+/// Floor of the open top bucket, in microseconds (2^15). Samples at or
+/// above this land in the top bucket.
 const FLUSH_BUCKET_OVERFLOW_US: u64 = 32_768;
+/// `flush_p99_us` when the 99th percentile is in that open bucket.
+/// 32 ms as a decimal microsecond count, so the log field stays a plain
+/// number. Paired with `flush_p99_overflow = true`.
+const FLUSH_P99_OVERFLOW_US: u64 = 32_000;
 const FLUSH_GE_1MS_US: u64 = 1_000;
 const FLUSH_GE_5MS_US: u64 = 5_000;
 
@@ -1868,14 +1876,21 @@ impl FlushTiming {
     }
 
     /// Bucket-resolution p99 over the samples since the last call, then
-    /// clear the buckets. `0` when the window is empty.
-    fn take_p99_us(&self) -> u64 {
+    /// clear the buckets. `us == 0` and `overflow == false` when the
+    /// window is empty.
+    fn take_p99(&self) -> FlushP99 {
         let mut counts = [0u64; FLUSH_BUCKET_COUNT];
         for (i, bucket) in self.buckets.iter().enumerate() {
             counts[i] = bucket.swap(0, Ordering::Relaxed);
         }
-        flush_p99_upper_us(&counts)
+        flush_p99(&counts)
     }
+}
+
+/// `flush_p99_us` plus whether that percentile landed in the open top bucket.
+struct FlushP99 {
+    us: u64,
+    overflow: bool,
 }
 
 static FLUSH_TIMING: FlushTiming = FlushTiming::new();
@@ -1891,35 +1906,50 @@ fn flush_bucket_index(us: u64) -> usize {
     (63 - us.leading_zeros()) as usize
 }
 
-/// Exclusive upper bound of bucket `index`, in microseconds.
+/// Exclusive upper bound of a finite bucket `index`, in microseconds.
 ///
-/// The top bucket (`≥ 32 ms`) has no finite ceiling and is reported as
-/// [`u64::MAX`].
+/// The open top bucket has no ceiling. [`flush_p99`] reports it as
+/// [`FLUSH_P99_OVERFLOW_US`] with `overflow` set.
 fn flush_bucket_upper_us(index: usize) -> u64 {
-    if index >= FLUSH_BUCKET_COUNT - 1 {
-        return u64::MAX;
-    }
     1u64 << (index + 1)
 }
 
 /// Upper bound of the bucket that holds the 99th percentile.
 ///
 /// Rank is `ceil(0.99 * n)` counting from the low bucket. An empty window
-/// is `0`.
-fn flush_p99_upper_us(counts: &[u64]) -> u64 {
+/// is `us == 0`, `overflow == false`. The open top bucket (`≥ 32 ms`) is
+/// `us == 32000`, `overflow == true`.
+fn flush_p99(counts: &[u64]) -> FlushP99 {
     let total = counts.iter().copied().sum::<u64>();
     if total == 0 {
-        return 0;
+        return FlushP99 {
+            us: 0,
+            overflow: false,
+        };
     }
     let target = (99 * total).div_ceil(100);
     let mut seen = 0u64;
     for (i, count) in counts.iter().copied().enumerate() {
         seen = seen.saturating_add(count);
         if seen >= target {
-            return flush_bucket_upper_us(i);
+            return flush_p99_from_bucket(i);
         }
     }
-    flush_bucket_upper_us(counts.len().saturating_sub(1))
+    flush_p99_from_bucket(counts.len().saturating_sub(1))
+}
+
+fn flush_p99_from_bucket(index: usize) -> FlushP99 {
+    if index >= FLUSH_BUCKET_COUNT - 1 {
+        FlushP99 {
+            us: FLUSH_P99_OVERFLOW_US,
+            overflow: true,
+        }
+    } else {
+        FlushP99 {
+            us: flush_bucket_upper_us(index),
+            overflow: false,
+        }
+    }
 }
 
 fn record_flush_duration(elapsed: Duration) {
@@ -2007,7 +2037,9 @@ pub(crate) fn inline_flush(con: &mut Connection) {
 /// does not include it. The bucket p99 is not on this line — a 1 s window
 /// at 50 frames/s is too small for a nearest-rank p99 to be anything but
 /// the max — it is logged on the ~30 s `audio_send_summary` as
-/// `flush_p99_us`. Drop lines are the same record (`dropped_since_log`),
+/// `flush_p99_us`, with `flush_p99_overflow` set when that percentile is
+/// in the open `≥ 32 ms` bucket (`flush_p99_us` is then `32000`). Drop
+/// lines are the same record (`dropped_since_log`),
 /// never a per-frame log.
 pub(crate) fn maybe_log_inline_flush() {
     if !inline_flush_is_enabled() {
@@ -3458,7 +3490,6 @@ mod tests {
         assert_eq!(flush_bucket_upper_us(14), FLUSH_BUCKET_OVERFLOW_US);
         assert_eq!(flush_bucket_index(FLUSH_BUCKET_OVERFLOW_US), 15);
         assert_eq!(flush_bucket_index(1_000_000), 15);
-        assert_eq!(flush_bucket_upper_us(15), u64::MAX);
 
         let timing = FlushTiming::new();
         timing.record_us(999);
@@ -3489,32 +3520,39 @@ mod tests {
         assert_eq!(second.ge_5ms, 1);
         // 400 fast samples sit in the [8, 16) µs bucket. Rank ceil(0.99*401)
         // is still in that bucket; the spike is the max, not the p99.
-        assert_eq!(
-            timing.take_p99_us(),
-            flush_bucket_upper_us(flush_bucket_index(10))
-        );
+        let p99 = timing.take_p99();
+        assert_eq!(p99.us, flush_bucket_upper_us(flush_bucket_index(10)));
+        assert!(!p99.overflow);
     }
 
     #[test]
     fn flush_p99_is_the_upper_bound_of_the_99th_bucket() {
-        assert_eq!(flush_p99_upper_us(&[0; 16]), 0);
+        let empty = flush_p99(&[0; 16]);
+        assert_eq!(empty.us, 0);
+        assert!(!empty.overflow);
 
         let mut low = [0u64; FLUSH_BUCKET_COUNT];
         low[flush_bucket_index(1_024)] = 100;
-        assert_eq!(flush_p99_upper_us(&low), 2_048);
+        let low_p99 = flush_p99(&low);
+        assert_eq!(low_p99.us, 2_048);
+        assert!(!low_p99.overflow);
 
         // 98 fast, 2 slow. The 99th sample is in the slow bucket.
         let mut mixed = [0u64; FLUSH_BUCKET_COUNT];
         mixed[flush_bucket_index(10)] = 98;
         mixed[flush_bucket_index(10_000)] = 2;
+        let mixed_p99 = flush_p99(&mixed);
         assert_eq!(
-            flush_p99_upper_us(&mixed),
+            mixed_p99.us,
             flush_bucket_upper_us(flush_bucket_index(10_000)),
         );
+        assert!(!mixed_p99.overflow);
 
         let mut overflow = [0u64; FLUSH_BUCKET_COUNT];
         overflow[15] = 100;
-        assert_eq!(flush_p99_upper_us(&overflow), u64::MAX);
+        let overflow_p99 = flush_p99(&overflow);
+        assert_eq!(overflow_p99.us, 32_000);
+        assert!(overflow_p99.overflow);
     }
 
     #[test]
@@ -3530,11 +3568,12 @@ mod tests {
         assert_eq!(cleared.ge_1ms, 0);
         assert_eq!(cleared.ge_5ms, 0);
         // The 1 s snapshot does not drop the spike from the 30 s buckets.
-        assert_eq!(
-            timing.take_p99_us(),
-            flush_bucket_upper_us(flush_bucket_index(10_000)),
-        );
-        assert_eq!(timing.take_p99_us(), 0, "the 30 s window was cleared");
+        let p99 = timing.take_p99();
+        assert_eq!(p99.us, flush_bucket_upper_us(flush_bucket_index(10_000)));
+        assert!(!p99.overflow);
+        let cleared_p99 = timing.take_p99();
+        assert_eq!(cleared_p99.us, 0, "the 30 s window was cleared");
+        assert!(!cleared_p99.overflow);
 
         timing.record_us(50);
         let next = timing.take_second();
