@@ -724,6 +724,11 @@ mod tests {
     /// H3: nice is per-tid. Raising one `voice-rt` thread must not change
     /// the thread-group leader — which is what `renice -p <container pid>`
     /// does, and why send threads stayed at the default.
+    ///
+    /// `comm` is published inside the new thread, and a one-shot
+    /// `/proc/<pid>/task` readdir can miss that tid while other tests
+    /// are spawning threads. The worker waits until its own comm matches
+    /// before publishing `started`. The parent retries the walk.
     #[cfg(target_os = "linux")]
     #[test]
     fn nice_targets_voice_rt_tid_and_not_the_leader() {
@@ -747,6 +752,17 @@ mod tests {
                     })
                     .unwrap_or(0);
                 tid_t.store(tid, std::sync::atomic::Ordering::SeqCst);
+                let comm_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                loop {
+                    let comm =
+                        std::fs::read_to_string("/proc/thread-self/comm").unwrap_or_default();
+                    if comm_matches(&comm, VOICE_RT_THREAD_COMM)
+                        || std::time::Instant::now() >= comm_deadline
+                    {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
                 started_t.store(true, std::sync::atomic::Ordering::SeqCst);
                 while !stop_t.load(std::sync::atomic::Ordering::SeqCst) {
                     std::thread::sleep(std::time::Duration::from_millis(20));
@@ -759,7 +775,12 @@ mod tests {
         let tid = tid_slot.load(std::sync::atomic::Ordering::SeqCst);
         assert_ne!(tid, 0, "voice-rt thread published a tid");
         assert_ne!(tid, leader, "worker tid must differ from the leader");
-        let found = voice_rt_tids(leader).unwrap();
+        let walk_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut found = voice_rt_tids(leader).unwrap();
+        while !found.contains(&tid) && std::time::Instant::now() < walk_deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            found = voice_rt_tids(leader).unwrap();
+        }
         assert!(
             found.contains(&tid),
             "comm walk must find the voice-rt tid {tid}, got {found:?}"

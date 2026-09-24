@@ -79,9 +79,13 @@ rootless-userns rationale.
 
 ### Image source
 
-The Quadlet and Kube manifests pin
-`ghcr.io/frozentear/ts6-manager-fullstack:latest`. Image build, sign,
-and publish procedure: [`docs/ops/images.md`](docs/ops/images.md).
+Kube does not pin `:latest`. `deploy/kube/ts6-manager.yaml` uses
+`@UNRELEASED` on fullstack, music, and sidecar, which fails reference
+parsing. Start and restart that stack only with
+`./scripts/update.sh vX.Y.Z` (it rewrites those images onto the tag
+you pass). Quadlet units are a separate shape; see
+[`deploy/quadlet/README.md`](deploy/quadlet/README.md). Image build,
+sign, and publish: [`docs/ops/images.md`](docs/ops/images.md).
 
 ## Configuration
 

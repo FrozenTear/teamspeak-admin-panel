@@ -122,6 +122,8 @@ if ! music_hostconfig_allowed "0-3" 2>"${TMP}/packing-a.err"; then
 fi
 assert_music_cpuset_refused "0-1" "packing C refused"
 unset TS6_SOFT_PIN_SHRINK_ACK
+# Read by music_hostconfig_allowed in the sourced script.
+# shellcheck disable=SC2034
 CPUSET=""
 
 # main() must refuse before podman. The real packing B env leaves music

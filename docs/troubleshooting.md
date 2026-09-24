@@ -98,12 +98,15 @@ $EDITOR ~/.config/containers/systemd/ts6-manager.env
 systemctl --user daemon-reload
 systemctl --user restart ts6-manager-pod.service
 
-# Kube:
+# Kube. Start and restart only with scripts/update.sh. Do not
+# `podman kube play` the committed manifest: its images are
+# `@UNRELEASED` and fail reference parsing.
 $EDITOR deploy/kube/secrets.yaml         # populate JWT_SECRET
-podman kube down deploy/kube/ts6-manager.yaml
-cat deploy/kube/secrets.yaml deploy/kube/ts6-manager.yaml \
-  > /tmp/ts6-manager.kube.yaml
-podman kube play /tmp/ts6-manager.kube.yaml
+# update.sh re-reads secrets.yaml only when the host secret is absent.
+if podman secret exists ts6-manager-secrets; then
+  podman secret rm ts6-manager-secrets
+fi
+./scripts/update.sh vX.Y.Z
 ```
 
 **Cross-link.** Canonical env list with comments:
@@ -140,7 +143,8 @@ systemctl --user edit ts6-manager-fullstack.service
 # [Container]
 # Image=localhost/ts6-manager-fullstack:dev
 
-# For kube, use the sed-pipe override documented in deploy/kube/README.md.
+# For kube, render a temp manifest with local tags. Do not play the
+# committed file. See deploy/kube/README.md § Override to a local build.
 ```
 
 **Cross-link.** Local-build override path:
