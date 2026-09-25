@@ -173,14 +173,16 @@ impl YtDlpSource {
             let _ = ffmpeg_stdin.shutdown().await;
         });
 
-        Ok(Self {
+        // Held until `Self` exists. Aborting this future mid-spawn (Stop
+        // during fallback) drops the guard, which SIGKILLs yt-dlp and
+        // aborts the bridge. A bare `JoinHandle` drop would detach those
+        // tasks and leave the prefetch running.
+        let inflight = InflightYtDlp {
             yt_dlp: Some(yt_dlp),
             bridge: Some(bridge),
             stderr_task: Some(stderr_task),
-            diagnostics: Vec::new(),
-            inner,
-            cookie_copy,
-        })
+        };
+        Ok(inflight.into_source(inner, cookie_copy))
     }
 
     /// Queue an out-of-band event (e.g. a resolve-time title) for the next
@@ -263,19 +265,64 @@ pub fn classify_yt_dlp_error(raw: &str) -> String {
         .to_string()
 }
 
+/// Children of an in-progress [`YtDlpSource::new`]. Drop kills them so a
+/// cancelled spawn (Stop during fallback, before `Self` is returned) does
+/// not detach the bridge and leave yt-dlp prefetching.
+struct InflightYtDlp {
+    yt_dlp: Option<Child>,
+    bridge: Option<JoinHandle<()>>,
+    stderr_task: Option<JoinHandle<Vec<String>>>,
+}
+
+impl InflightYtDlp {
+    fn into_source(
+        mut self,
+        inner: FfmpegSource,
+        cookie_copy: Option<crate::cookies::CookieJarCopy>,
+    ) -> YtDlpSource {
+        let source = YtDlpSource {
+            yt_dlp: self.yt_dlp.take(),
+            bridge: self.bridge.take(),
+            stderr_task: self.stderr_task.take(),
+            diagnostics: Vec::new(),
+            inner,
+            cookie_copy,
+        };
+        // `self` drops with empty slots — no second kill.
+        source
+    }
+}
+
+impl Drop for InflightYtDlp {
+    fn drop(&mut self) {
+        kill_ytdlp_children(&mut self.yt_dlp, &mut self.bridge, &mut self.stderr_task);
+    }
+}
+
+/// SIGKILL yt-dlp before aborting the bridge. The bridge is the reader of
+/// yt-dlp's stdout; closing that pipe first makes Python raise
+/// `BrokenPipeError` and spam stderr. The signal does not.
+fn kill_ytdlp_children(
+    yt_dlp: &mut Option<Child>,
+    bridge: &mut Option<JoinHandle<()>>,
+    stderr_task: &mut Option<JoinHandle<Vec<String>>>,
+) {
+    if let Some(mut child) = yt_dlp.take()
+        && let Err(e) = child.start_kill()
+    {
+        tracing::debug!(?e, "yt-dlp child kill failed (likely already exited)");
+    }
+    if let Some(handle) = bridge.take() {
+        handle.abort();
+    }
+    if let Some(handle) = stderr_task.take() {
+        handle.abort();
+    }
+}
+
 impl Drop for YtDlpSource {
     fn drop(&mut self) {
-        if let Some(handle) = self.bridge.take() {
-            handle.abort();
-        }
-        if let Some(handle) = self.stderr_task.take() {
-            handle.abort();
-        }
-        if let Some(mut child) = self.yt_dlp.take()
-            && let Err(e) = child.start_kill()
-        {
-            tracing::debug!(?e, "yt-dlp child kill failed (likely already exited)");
-        }
+        kill_ytdlp_children(&mut self.yt_dlp, &mut self.bridge, &mut self.stderr_task);
         // Signalled above. Drop the private jar only after that so
         // `--cookies` was never the operator upload.
         drop(self.cookie_copy.take());
