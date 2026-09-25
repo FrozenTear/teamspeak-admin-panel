@@ -34,7 +34,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::{JoinHandle, block_in_place};
 use tracing::{debug, info, warn};
 use tsclientlib::Connection;
-use tsproto_packets::packets::{AudioData, CodecType, OutAudio};
+use tsproto_packets::packets::{AudioData, CodecType, OutAudio, OutPacket};
 
 use music_bot_audio::source::AudioSourceSpec;
 use music_bot_audio::{
@@ -168,6 +168,28 @@ pub(crate) fn catchup_stall_detail(kind: &str, wire_sent: u64, dropped: u64) -> 
     } else {
         format!("audio_msg={kind}")
     }
+}
+
+/// Detail for one audio-arm tick, when the connected loop should log it.
+///
+/// A tick that sent nothing and dropped frames always returns
+/// `audio_msg=catchup_dropped dropped={n}`, including when the arm body
+/// finished under the 10 ms stall threshold. Every other tick returns a
+/// detail only when `arm_elapsed` is at least `stall_warn`. The log level
+/// and the one-line-per-tick shape stay with the caller; this does not
+/// add a per-frame line.
+pub(crate) fn audio_arm_stall_detail(
+    kind: &str,
+    wire_sent: u64,
+    dropped: u64,
+    arm_elapsed: Duration,
+    stall_warn: Duration,
+) -> Option<String> {
+    let dropped_tick = wire_sent == 0 && dropped > 0;
+    if !dropped_tick && arm_elapsed < stall_warn {
+        return None;
+    }
+    Some(catchup_stall_detail(kind, wire_sent, dropped))
 }
 
 /// Per-bot audio state. The connected loop holds an `Option<ActiveAudio>`;
@@ -1576,7 +1598,37 @@ fn inline_flush_config() -> &'static InlineFlushConfig {
 /// Unset / empty / anything but the usual truthy spellings is off, same
 /// spellings as `VOICE_SPLIT_WIRE_TASK`.
 pub(crate) fn inline_flush_is_enabled() -> bool {
+    #[cfg(test)]
+    match INLINE_FLUSH_TEST_OVERRIDE.load(Ordering::SeqCst) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
     inline_flush_config().enabled
+}
+
+/// Test-only override of [`inline_flush_is_enabled`]. `None` follows the
+/// process env (default off). Compiled out of production builds.
+#[cfg(test)]
+static INLINE_FLUSH_TEST_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(test)]
+pub(crate) fn set_inline_flush_override(enabled: Option<bool>) {
+    let value = match enabled {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    INLINE_FLUSH_TEST_OVERRIDE.store(value, Ordering::SeqCst);
+}
+
+/// Serializes tests that mutate the process-wide flush meters or the
+/// inline-flush override.
+#[cfg(test)]
+pub(crate) fn lock_flush_test_globals() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Pure parse of `VOICE_INLINE_FLUSH`. `None` (unset) is off.
@@ -2126,6 +2178,28 @@ fn warn_flush_once(err: &tsclientlib::Error) {
     }
 }
 
+/// What the send loop needs from a connection in order to enqueue a voice
+/// packet and, when the flag is on, write it before the next `events()`
+/// poll. [`Connection`] is the production impl. Tests supply a scripted
+/// stand-in; the trait is not part of the public API.
+pub(crate) trait OutgoingVoice {
+    // `tsclientlib::Error` is 136 B. Same allowance as [`send_opus_frame`].
+    #[allow(clippy::result_large_err)]
+    fn send_audio(&mut self, packet: OutPacket) -> Result<(), tsclientlib::Error>;
+    #[allow(clippy::result_large_err)]
+    fn try_flush_outgoing(&mut self) -> Result<usize, tsclientlib::Error>;
+}
+
+impl OutgoingVoice for Connection {
+    fn send_audio(&mut self, packet: OutPacket) -> Result<(), tsclientlib::Error> {
+        Connection::send_audio(self, packet)
+    }
+
+    fn try_flush_outgoing(&mut self) -> Result<usize, tsclientlib::Error> {
+        Connection::try_flush_outgoing(self)
+    }
+}
+
 /// Hand queued voice/ack packets to the UDP socket with one non-blocking
 /// `send_to` each. No-op when `VOICE_INLINE_FLUSH` is off. Never waits and
 /// never registers a waker.
@@ -2140,7 +2214,7 @@ fn warn_flush_once(err: &tsclientlib::Error) {
 /// while a later direct `send_to` from this loop writes a newer packet
 /// first. Receivers order voice by packet id, so that overtake is minor.
 /// Packet ids and resend/ack accounting match the normal send path.
-pub(crate) fn inline_flush(con: &mut Connection) {
+pub(crate) fn inline_flush(con: &mut impl OutgoingVoice) {
     if !inline_flush_is_enabled() {
         return;
     }
@@ -2172,7 +2246,8 @@ const FLUSH_SUMMARY_INTERVAL: Duration = Duration::from_secs(30);
 /// small for a nearest-rank p99 to be anything but the max — and it is not
 /// on the per-bot `audio_send_summary` either. Those counters are
 /// process-wide, so the ~30 s `inline_flush_summary` line (`scope=process`)
-/// logs them once: `flush_p99_us` with `flush_p99_overflow` set when that
+/// logs them once: `window_ms` (the wall-clock span those counters cover),
+/// `flush_p99_us` with `flush_p99_overflow` set when that
 /// percentile is in the open `≥ 32 ms` bucket (`flush_p99_us` is then
 /// `32768`). On a single-bot host (how Contabo runs today) the earlier
 /// per-bot readings were valid, because that bot was the whole process.
@@ -2237,6 +2312,9 @@ pub(crate) fn maybe_log_inline_flush() {
 /// exchange already admits a single caller, and this second exchange keeps
 /// the summary to one line even if that changes. The first call only arms
 /// the window so the first line covers a full sample, not the first second.
+/// `window_ms` on that line is the wall-clock span from the arm (or the
+/// previous summary) to this read, so a count on the line can be turned
+/// into a rate.
 fn maybe_log_flush_summary(now_ms: u64) {
     let prev = FLUSH_METERS.last_summary_ms.load(Ordering::Relaxed);
     let interval_ms = u64::try_from(FLUSH_SUMMARY_INTERVAL.as_millis()).unwrap_or(30_000);
@@ -2254,19 +2332,31 @@ fn maybe_log_flush_summary(now_ms: u64) {
     if prev == 0 {
         return;
     }
+    // `prev` is the stamp that opened this window (the arm, or the previous
+    // summary). The counters `take_summary` is about to read accumulated
+    // across that span, so a reader can divide a count by `window_ms`.
+    let window_ms = flush_summary_window_ms(now_ms, prev);
     let summary = FLUSH_TIMING.take_summary();
     info!(
         target: "music_bot_latency",
         stage = "inline_flush_summary",
         scope = "process",
+        window_ms,
         flush_max_us = summary.max_us,
         flush_ge_1ms = summary.ge_1ms,
         flush_ge_5ms = summary.ge_5ms,
         flush_errors = summary.errors,
         flush_p99_us = summary.p99.us,
         flush_p99_overflow = summary.p99.overflow,
-        "process-wide direct-flush timing over ~30 s — one line per process, not per bot. On a single-bot host (how Contabo runs today) the earlier per-bot readings of these counters were valid, because that bot was the whole process. flush_p99_us is the bucket upper bound; the open ≥32 ms bucket is 32768 with flush_p99_overflow true. flush_errors counts failures since the previous process summary",
+        "process-wide direct-flush timing over ~30 s — one line per process, not per bot. window_ms is the wall-clock span these counters cover. On a single-bot host (how Contabo runs today) the earlier per-bot readings of these counters were valid, because that bot was the whole process. flush_p99_us is the bucket upper bound; the open ≥32 ms bucket is 32768 with flush_p99_overflow true. flush_errors counts failures since the previous process summary",
     );
+}
+
+/// Milliseconds between the stamp that opened a process flush window and
+/// the stamp at which its counters are read. Zero when the clock went
+/// backwards.
+fn flush_summary_window_ms(now_ms: u64, opened_ms: u64) -> u64 {
+    now_ms.saturating_sub(opened_ms)
 }
 
 /// Send one 20 ms Opus frame on the wire. Wraps the bytes in the C2S
@@ -2290,7 +2380,7 @@ fn maybe_log_flush_summary(now_ms: u64) {
 // lint isn't worth the API churn for a single in-crate caller.
 #[allow(clippy::result_large_err)]
 pub(crate) fn send_opus_frame(
-    con: &mut Connection,
+    con: &mut impl OutgoingVoice,
     opus: &[u8],
     enqueued_at: Instant,
     monitor: &mut SendTimingMonitor,
@@ -2350,7 +2440,7 @@ pub(crate) fn send_opus_frame(
 /// payload. The TS6 server forwards it to in-channel listeners so their
 /// jitter buffers can flush cleanly. Errors are logged at `warn!` only
 /// — a failed voice-stop never blocks bot shutdown.
-pub(crate) fn send_voice_stop(con: &mut Connection) {
+pub(crate) fn send_voice_stop(con: &mut impl OutgoingVoice) {
     let pkt = OutAudio::new(&AudioData::C2S {
         id: 0,
         codec: CodecType::OpusVoice,
@@ -3921,6 +4011,76 @@ mod tests {
         assert_eq!(catchup_stall_detail("finished", 0, 0), "audio_msg=finished",);
     }
 
+    /// A catch-up tick can drop an overdue slot while the arm body itself
+    /// finishes in under 10 ms. The `catchup_dropped` label is not gated on
+    /// that stall threshold. A short tick that sent a frame still logs
+    /// nothing.
+    #[test]
+    fn sub_10ms_stall_that_drops_frames_labels_catchup_dropped() {
+        let period = OPUS_FRAME_PERIOD;
+        let arm_elapsed = Duration::from_millis(3);
+        let stall_warn = Duration::from_millis(10);
+        assert!(
+            arm_elapsed < stall_warn,
+            "this case is the short stall the 10 ms gate used to hide",
+        );
+
+        let now = Instant::now();
+        let (_tx, mut rx) = mpsc::channel(1);
+        let batch = catchup_batch_with(
+            released_past_due(now, period.saturating_mul(5), 1),
+            &mut rx,
+            true,
+            Some(4),
+            now,
+        );
+        assert_eq!(batch.dropped, 1, "a slot older than 4 periods is dropped");
+        let wire_sent = match &batch.messages {
+            CatchupMessages::Single(AudioMsg::Frame { .. }) => 1,
+            CatchupMessages::Multi(msgs) => msgs
+                .iter()
+                .filter(|msg| matches!(msg, AudioMsg::Frame { .. }))
+                .count() as u64,
+            CatchupMessages::Single(_) => 0,
+        };
+        assert_eq!(wire_sent, 0, "the dropped frame is not handed to send");
+
+        let mut clock = ContentClock::default();
+        let mut monitor = SendTimingMonitor::new();
+        let tick = account_send_tick(&mut clock, &mut monitor, wire_sent, batch.dropped as u64);
+        assert!(!tick.first_audible);
+        assert_eq!(clock.wire_frames, 0);
+        assert_eq!(
+            tick.position, 1,
+            "the drop still moves the content position"
+        );
+        assert_eq!(monitor.dropped_catchup_frames, 1);
+
+        assert_eq!(
+            audio_arm_stall_detail(
+                "frame",
+                wire_sent,
+                batch.dropped as u64,
+                arm_elapsed,
+                stall_warn
+            )
+            .as_deref(),
+            Some("audio_msg=catchup_dropped dropped=1"),
+        );
+        assert!(
+            audio_arm_stall_detail("frame", 1, 0, arm_elapsed, stall_warn).is_none(),
+            "a short tick that sent a frame keeps the 10 ms gate",
+        );
+        assert!(
+            audio_arm_stall_detail("finished", 0, 0, arm_elapsed, stall_warn).is_none(),
+            "a short tick that dropped nothing stays quiet",
+        );
+        assert_eq!(
+            audio_arm_stall_detail("finished", 0, 0, stall_warn, stall_warn).as_deref(),
+            Some("audio_msg=finished"),
+        );
+    }
+
     #[test]
     fn flush_process_summary_keeps_a_spike_the_1s_line_resets() {
         let timing = FlushTiming::new();
@@ -3951,6 +4111,64 @@ mod tests {
         assert_eq!(again.errors, 0);
         assert_eq!(again.p99.us, 0);
         assert!(!again.p99.overflow);
+    }
+
+    #[test]
+    fn inline_flush_summary_logs_a_plausible_window_ms() {
+        let _lock = lock_flush_test_globals();
+        FLUSH_METERS.last_summary_ms.store(0, Ordering::SeqCst);
+
+        let opened_ms = 2_000u64;
+        let now_ms = opened_ms + 30_750;
+        maybe_log_flush_summary(opened_ms);
+        assert_eq!(
+            FLUSH_METERS.last_summary_ms.load(Ordering::SeqCst),
+            opened_ms,
+            "the first call arms the window and does not log",
+        );
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+        let subscriber = SummaryFieldCapture {
+            fields: std::sync::Arc::clone(&captured),
+        };
+        tracing::subscriber::with_default(subscriber, || {
+            maybe_log_flush_summary(now_ms);
+        });
+
+        let fields = captured
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let window = fields.iter().find(|(name, _)| name == "window_ms");
+        let Some((_, raw)) = window else {
+            panic!("inline_flush_summary is missing window_ms; fields={fields:?}");
+        };
+        let window_ms: u64 = raw.parse().expect("window_ms is numeric");
+        assert_eq!(window_ms, flush_summary_window_ms(now_ms, opened_ms));
+        assert_eq!(
+            window_ms, 30_750,
+            "the field is the wall span, not the nominal 30 s"
+        );
+        assert!(
+            (1_000..120_000).contains(&window_ms),
+            "window_ms={window_ms} is a plausible millisecond span",
+        );
+        assert_eq!(
+            fields
+                .iter()
+                .find(|(name, _)| name == "stage")
+                .map(|(_, value)| value.as_str()),
+            Some("inline_flush_summary"),
+        );
+        assert_eq!(
+            fields
+                .iter()
+                .find(|(name, _)| name == "scope")
+                .map(|(_, value)| value.as_str()),
+            Some("process"),
+        );
+
+        FLUSH_METERS.last_summary_ms.store(0, Ordering::SeqCst);
     }
 
     fn pcm_at(index: u64, scheduled_at: Instant) -> PcmFrame {
@@ -4088,5 +4306,74 @@ mod tests {
             catchup_batch_with(released_past_due(now, ages[0], 0), &mut rx, true, None, now);
         assert_eq!(batch.dropped, 0);
         assert_eq!(frame_ids(batch.messages).len(), 25);
+    }
+
+    struct SummaryFieldCapture {
+        fields: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    }
+
+    struct SummaryFieldVisit<'a> {
+        fields: &'a mut Vec<(String, String)>,
+    }
+
+    impl tracing::field::Visit for SummaryFieldVisit<'_> {
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.fields
+                .push((field.name().to_string(), value.to_string()));
+        }
+
+        fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+            self.fields
+                .push((field.name().to_string(), value.to_string()));
+        }
+
+        fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+            self.fields
+                .push((field.name().to_string(), value.to_string()));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.fields
+                .push((field.name().to_string(), value.to_string()));
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.fields
+                .push((field.name().to_string(), format!("{value:?}")));
+        }
+    }
+
+    impl tracing::Subscriber for SummaryFieldCapture {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.target() == "music_bot_latency"
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_non_zero_u64(std::num::NonZeroU64::new(1).unwrap())
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut fields = Vec::new();
+            event.record(&mut SummaryFieldVisit {
+                fields: &mut fields,
+            });
+            if fields
+                .iter()
+                .any(|(name, value)| name == "stage" && value == "inline_flush_summary")
+            {
+                *self
+                    .fields
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = fields;
+            }
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
     }
 }
