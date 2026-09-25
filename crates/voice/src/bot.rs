@@ -1556,11 +1556,13 @@ async fn handle_audio_msg(
     bot_volume: &VolumeHandle,
 ) -> &'static str {
     let Some(msg) = msg else {
-        // Sibling closed without sending Finished — treat as a hard stop.
-        // This shouldn't happen in practice; the sibling always sends
-        // Finished before its task body returns.
-        warn!("audio sibling channel closed without Finished — tearing down");
+        // Sibling closed without `Finished`. Stop / Skip / Disconnect
+        // already dropped `current_audio`; the sibling then returns
+        // without `Finished` so an in-flight fallback is aborted. That
+        // close is expected and must not emit a second `AudioFinished`.
+        // A close while a pipeline is still installed is a hard stop.
         if audio::tear_down(current_audio) {
+            warn!("audio sibling channel closed without Finished — tearing down");
             wire.clear_audio();
             wire.voice_stop_and_flush();
             let _ = events.send(BotEvent::AudioFinished {
