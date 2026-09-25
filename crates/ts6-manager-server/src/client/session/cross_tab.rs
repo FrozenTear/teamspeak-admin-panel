@@ -15,6 +15,11 @@
 //! critical section still runs, and the gate re-reads storage before
 //! refreshing or invalidating.
 //!
+//! Three or more tabs are best-effort. The lock is exclusive, so one
+//! granted tab runs the critical section alone, but a waiter that hits
+//! [`LOCK_WAIT_TIMEOUT_MS`] leaves the queue. That tab may POST a
+//! predecessor token if the holder has not stored a successor yet.
+//!
 //! The Web Locks binding is unstable (`web_sys_unstable_apis`). Wasm builds
 //! in this workspace already pass that cfg (see `.cargo/config.toml`), the
 //! same way the video player reaches `WebTransport`.
@@ -214,6 +219,13 @@ async fn acquire_web_lock(name: &str) -> CrossTabGuard {
     signal.set_onabort(Some(on_abort.as_ref().unchecked_ref()));
     let options = web_sys::LockOptions::new();
     options.set_signal(&signal);
+    // Drop clears `onabort` before the closure is freed. Cancelling
+    // this wait (or returning early) must not leave the signal pointing
+    // at a dropped handler.
+    let _abort_guard = AbortHandlerGuard {
+        signal,
+        _on_abort: on_abort,
+    };
 
     // `request` is not marked `[Throws]` in the binding. The lock name is a
     // non-empty constant, which is the only input the spec rejects.
@@ -228,10 +240,9 @@ async fn acquire_web_lock(name: &str) -> CrossTabGuard {
     callback.forget();
 
     let granted = JsFuture::from(acquired).await;
-    signal.set_onabort(None);
-    drop(on_abort);
     if granted.is_err() {
-        // Timeout (or the request rejected). Fall back to the no-lock
+        // Timeout (or the request rejected). Best-effort for 3+ tabs:
+        // this waiter is no longer queued. Fall back to the no-lock
         // path: re-read storage, then refresh if the blob is unchanged.
         // Do not log out — the session was not rejected.
         crate::client::debug::log(
@@ -262,6 +273,24 @@ fn lock_manager() -> Option<web_sys::LockManager> {
 fn deferred() -> (js_sys::Promise, js_sys::Function) {
     let (promise, resolve, _reject) = deferred_pair();
     (promise, resolve)
+}
+
+/// Clears `onabort` before the closure drops.
+///
+/// The wait future can be cancelled while `locks.request` is still
+/// pending. Dropping the closure while it is the signal's handler
+/// calls into freed state if the abort fires during that drop.
+#[cfg(target_arch = "wasm32")]
+struct AbortHandlerGuard {
+    signal: web_sys::AbortSignal,
+    _on_abort: wasm_bindgen::closure::Closure<dyn FnMut()>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Drop for AbortHandlerGuard {
+    fn drop(&mut self) {
+        self.signal.set_onabort(None);
+    }
 }
 
 /// Resolve and reject handles for a promise created synchronously.

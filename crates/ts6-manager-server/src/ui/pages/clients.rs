@@ -454,6 +454,8 @@ fn ClientsTable(props: ClientsTableProps) -> Element {
                         // `client_is_talker == 0` is the revoked grant, not
                         // a mic or speaker mute (that is `voice` above).
                         let talker_revoked = r.client_is_talker == 0;
+                        let channel = props.channels.iter().find(|c| c.cid == cid);
+                        let talk_hints = super::talk_power::hints_for_client(&r, channel);
                         let on_kick_server = props.on_kick_server;
                         let on_kick_channel = props.on_kick_channel;
                         let on_mute = props.on_mute;
@@ -484,6 +486,14 @@ fn ClientsTable(props: ClientsTableProps) -> Element {
                                                 class: "client-flag",
                                                 title: "Granted talker. Only changes who may speak in a moderated channel. Not a microphone mute.",
                                                 "talker"
+                                            }
+                                        }
+                                        for hint in talk_hints {
+                                            span {
+                                                key: "{hint.label}",
+                                                class: "client-flag",
+                                                title: "{hint.title}",
+                                                "{hint.label}"
                                             }
                                         }
                                     }
