@@ -1,0 +1,17 @@
+# This file is scoped to the music-bot-audio package.
+#
+# Clippy starts at `CLIPPY_CONF_DIR`, then `CARGO_MANIFEST_DIR`, then the
+# current directory, and walks parents until it finds `clippy.toml`. A
+# workspace-root file would also configure the panel server, the voice
+# translator, and the rest of the workspace. `tokio::process::Command::new`
+# is not a reachable path in every one of those crates, so that file would
+# fail `cargo clippy --workspace -- -D warnings` there. The music-bot
+# package (`crates/voice`) carries its own copy for the same reason.
+#
+# The lint stays allow-by-default. This package denies it in
+# `[lints.clippy]` so only these crates forbid the methods below.
+
+disallowed-methods = [
+    { path = "std::process::Command::new", reason = "use music_bot_audio::cpuset::std_music_command so the child does not inherit MUSIC_RUNTIME_TOKEN" },
+    { path = "tokio::process::Command::new", reason = "use music_bot_audio::cpuset::music_command so the child does not inherit MUSIC_RUNTIME_TOKEN" },
+]

@@ -82,7 +82,9 @@ serde_json = { workspace = true }
 # Optional bearer auth on the music control API (`MUSIC_RUNTIME_TOKEN`).
 # SHA-256 makes the subtle compare fixed-length. Both crates are already
 # workspace dependencies. Only the SHA-256 digest is stored in the auth
-# state; child spawns strip `MUSIC_RUNTIME_TOKEN` from the environment.
+# state. Child processes are built with music-bot-audio's token-stripping
+# constructors; this package forbids `Command::new` so a new spawn cannot
+# inherit the bearer.
 sha2 = { workspace = true }
 subtle = { workspace = true }
 # PURA-389a — `clock_gettime(CLOCK_THREAD_CPUTIME_ID)` for per-thread CPU
@@ -103,3 +105,6 @@ http-body-util = "0.1"
 # consumer-encoded Opus frames back to PCM and asserts on output amplitude.
 # Same pin as music-bot-audio's encoder, so this pulls no new libopus.
 audiopus = "0.3.0-rc.0"
+
+[lints.clippy]
+disallowed_methods = "deny"

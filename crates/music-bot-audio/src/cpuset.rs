@@ -50,10 +50,11 @@ pub const SEND_CPUSET_ENV: &str = "TS6_BOT_CPUSET";
 pub const SEND_CPUSET_ENV_PREFERRED: &str = "TS6_BOT_SEND_CPUSET";
 pub const DECODE_CPUSET_ENV: &str = "TS6_BOT_DECODE_CPUSET";
 /// Shared bearer for the music control API. The runtime reads it at
-/// startup and stores only a SHA-256 digest. Every child `Command` in
-/// the music crates must [`strip_music_runtime_token`] so ffmpeg,
-/// yt-dlp (and any Deno it starts), and the warm Python resolver do
-/// not inherit the value. Do not `remove_var` it in the parent.
+/// startup and stores only a SHA-256 digest. Child processes are built
+/// with [`music_command`] or [`std_music_command`], which remove this
+/// variable so ffmpeg, yt-dlp (and any Deno it starts), and the warm
+/// Python resolver do not inherit the value. Do not `remove_var` it in
+/// the parent.
 pub const MUSIC_RUNTIME_TOKEN_ENV: &str = "MUSIC_RUNTIME_TOKEN";
 /// Host and in-process nice for Voice send threads. Negative values
 /// need `CAP_SYS_NICE` inside the container; the host script is the
@@ -171,20 +172,48 @@ pub fn pin_decode_child(child: &tokio::process::Child) {
 
 /// Remove [`MUSIC_RUNTIME_TOKEN_ENV`] from a child environment.
 ///
-/// The parent keeps the variable. `std::env::remove_var` is unsafe once
-/// other tokio threads are running, so spawn sites clear it on the
-/// `Command` only. [`install_decode_pre_exec`] does this for every
-/// decode child; other `Command::new` sites call this directly.
+/// [`music_command`] and [`std_music_command`] call this. The parent
+/// keeps the variable. `std::env::remove_var` is unsafe once other
+/// tokio threads are running, so only the `Command` is cleared.
+/// [`install_decode_pre_exec`] calls this again so a token placed on
+/// the command after construction is still removed before a decode
+/// child starts.
 pub fn strip_music_runtime_token(cmd: &mut std::process::Command) {
     cmd.env_remove(MUSIC_RUNTIME_TOKEN_ENV);
+}
+
+/// Tokio command that does not inherit [`MUSIC_RUNTIME_TOKEN_ENV`].
+///
+/// This is the spawn entry point for `tokio::process::Command` in the
+/// music crates. Clippy `disallowed_methods` forbids `Command::new`
+/// there, with an allow only on the line below. Affinity and nice stay
+/// at the call site; decode children still call
+/// [`install_decode_pre_exec`] before `spawn`.
+pub fn music_command(program: impl AsRef<std::ffi::OsStr>) -> tokio::process::Command {
+    #[allow(clippy::disallowed_methods)]
+    let mut cmd = tokio::process::Command::new(program);
+    strip_music_runtime_token(cmd.as_std_mut());
+    cmd
+}
+
+/// `std::process::Command` that does not inherit [`MUSIC_RUNTIME_TOKEN_ENV`].
+///
+/// Same rule as [`music_command`] for short-lived spawns that are not
+/// decode children (cookie self-check, version probes, `pgrep`).
+pub fn std_music_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    #[allow(clippy::disallowed_methods)]
+    let mut cmd = std::process::Command::new(program);
+    strip_music_runtime_token(&mut cmd);
+    cmd
 }
 
 /// Install a `pre_exec` hook that applies `TS6_BOT_DECODE_CPUSET` with
 /// `sched_setaffinity(0, …)` before `exec`.
 ///
 /// Always strips [`MUSIC_RUNTIME_TOKEN_ENV`], including when the cpuset
-/// is unset. Unset or empty cpuset → no affinity hook. Invalid spec →
-/// warn and no affinity hook. When the hook is installed, a failed
+/// is unset, including a token set on the command after [`music_command`].
+/// Unset or empty cpuset → no affinity hook. Invalid spec → warn and no
+/// affinity hook. When the hook is installed, a failed
 /// `sched_setaffinity` fails the spawn so a decode child is not left
 /// free to run on send cores.
 pub fn install_decode_pre_exec(cmd: &mut tokio::process::Command) {
@@ -517,11 +546,14 @@ mod tests {
     #[tokio::test]
     async fn spawned_child_does_not_inherit_music_runtime_token() {
         let token = "child-must-not-see-this-token";
-        let mut cmd = tokio::process::Command::new("sh");
+        let mut cmd = music_command("sh");
         cmd.arg("-c")
             .arg(format!(
                 "printf '%s' \"${{{MUSIC_RUNTIME_TOKEN_ENV}-UNSET}}\""
             ))
+            // The constructor already removed the variable. Putting it
+            // back here checks that `install_decode_pre_exec` still
+            // clears a token placed on the command before spawn.
             .env(MUSIC_RUNTIME_TOKEN_ENV, token)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
@@ -539,11 +571,14 @@ mod tests {
     #[test]
     fn std_command_child_does_not_inherit_music_runtime_token() {
         let token = "std-child-must-not-see-this-token";
-        let mut cmd = std::process::Command::new("sh");
+        let mut cmd = std_music_command("sh");
         cmd.arg("-c")
             .arg(format!(
                 "printf '%s' \"${{{MUSIC_RUNTIME_TOKEN_ENV}-UNSET}}\""
             ))
+            // The constructor already removed the variable. Putting it
+            // back, then applying the same removal the constructor uses,
+            // proves a present value does not reach the child.
             .env(MUSIC_RUNTIME_TOKEN_ENV, token)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
@@ -553,6 +588,25 @@ mod tests {
         let stdout = String::from_utf8(output.stdout).expect("utf-8 stdout");
         assert_eq!(stdout, "UNSET", "std child inherited the token: {stdout:?}");
         assert!(!stdout.contains(token));
+    }
+
+    #[test]
+    fn music_command_strips_runtime_token() {
+        let std_cmd = std_music_command("sh");
+        assert!(
+            removes_runtime_token(&std_cmd),
+            "std_music_command must env_remove {MUSIC_RUNTIME_TOKEN_ENV}"
+        );
+        let tokio_cmd = music_command("sh");
+        assert!(
+            removes_runtime_token(tokio_cmd.as_std()),
+            "music_command must env_remove {MUSIC_RUNTIME_TOKEN_ENV}"
+        );
+    }
+
+    fn removes_runtime_token(cmd: &std::process::Command) -> bool {
+        cmd.get_envs()
+            .any(|(key, value)| key == MUSIC_RUNTIME_TOKEN_ENV && value.is_none())
     }
 
     #[test]
@@ -699,14 +753,13 @@ mod tests {
         let parent = current_affinity(0);
         assert!(!parent.is_empty(), "parent affinity must be non-empty");
         let cpu = parent[0];
-        let mut cmd = tokio::process::Command::new("sleep");
+        let mut cmd = music_command("sleep");
         cmd.arg("30")
             .kill_on_drop(true)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         install_affinity_pre_exec(&mut cmd, &[cpu]).unwrap();
-        strip_music_runtime_token(cmd.as_std_mut());
         let mut child = cmd.spawn().expect("spawn sleep with decode pre_exec");
         let pid = child.id().expect("child pid");
         let child_aff = current_affinity(pid);

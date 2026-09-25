@@ -21,8 +21,6 @@ use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
-use tokio::process::Command;
-
 /// Per-request socket timeout passed to yt-dlp (`--socket-timeout`).
 ///
 /// PURA-355 caught a watch-page HTTP request stalling ~41 s with no 429
@@ -96,7 +94,7 @@ pub async fn resolve_direct_url(url: &str, cookie_file: Option<&Path>) -> std::i
 /// transient network timeout both surface as [`std::io::ErrorKind::TimedOut`]
 /// so the caller's retry sees a single, uniform "try again" signal.
 async fn run_once(url: &str, cookie_file: Option<&Path>) -> std::io::Result<String> {
-    let mut cmd = Command::new("yt-dlp");
+    let mut cmd = crate::cpuset::music_command("yt-dlp");
     cmd.kill_on_drop(true)
         .arg("--quiet")
         .arg("--no-warnings")
