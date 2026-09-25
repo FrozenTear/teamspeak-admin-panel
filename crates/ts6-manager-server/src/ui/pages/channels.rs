@@ -606,9 +606,13 @@ fn ChannelChildren(props: ChannelChildrenProps) -> Element {
                                 for r in row_clients.iter() {
                                     {
                                         let r = r.clone();
+                                        let needed_talk_power = c.channel_needed_talk_power;
+                                        let forced_silence = c.channel_forced_silence;
                                         rsx! {
                                             ChannelClientBadge {
                                                 client: r,
+                                                needed_talk_power: needed_talk_power,
+                                                forced_silence: forced_silence,
                                                 on_move_user: props.on_move_user,
                                             }
                                         }
@@ -677,6 +681,10 @@ fn ChannelHeader(props: ChannelHeaderProps) -> Element {
         };
     }
     let topic = n.channel_topic.trim();
+    let talk_hints = super::talk_power::channel_talk_hints(
+        n.channel_needed_talk_power,
+        n.channel_forced_silence,
+    );
     rsx! {
         div { class: "channel-row-body",
             div { class: "channel-header",
@@ -703,6 +711,14 @@ fn ChannelHeader(props: ChannelHeaderProps) -> Element {
                         span { class: "tag tag-neutral", "Permanent" }
                     } else if n.channel_flag_semi_permanent != 0 {
                         span { class: "tag tag-neutral", "Semi-permanent" }
+                    }
+                    for hint in talk_hints {
+                        span {
+                            key: "{hint.label}",
+                            class: "{hint.tag_class}",
+                            title: "{hint.title}",
+                            "{hint.label}"
+                        }
                     }
                     span {
                         class: "tag tag-neutral channel-count",
@@ -843,6 +859,8 @@ fn ChannelSpacer(props: ChannelSpacerProps) -> Element {
 #[derive(Props, Clone, PartialEq)]
 struct ChannelClientBadgeProps {
     client: ClientListItem,
+    needed_talk_power: i64,
+    forced_silence: i64,
     on_move_user: Option<EventHandler<ClientListItem>>,
 }
 
@@ -866,6 +884,13 @@ fn ChannelClientBadge(props: ChannelClientBadgeProps) -> Element {
     }
     let on_move_user = props.on_move_user;
     let move_client = r.clone();
+    let talk_hints = super::talk_power::client_talk_hints(
+        r.client_talk_power,
+        Some(props.needed_talk_power),
+        Some(props.forced_silence),
+    );
+    let show_talker =
+        props.needed_talk_power > 0 && super::talk_power::show_talker_chip(r.client_is_talker);
     rsx! {
         li { key: "client-{r.clid}",
             class: "{class}",
@@ -875,6 +900,21 @@ fn ChannelClientBadge(props: ChannelClientBadgeProps) -> Element {
                 span { class: "client-flag", title: "{r.client_away_message}", "away" }
             }
             super::client_voice::VoiceFlagTags { state: voice }
+            if show_talker {
+                span {
+                    class: "client-flag",
+                    title: "Granted talker. Only changes who may speak in a moderated channel. Not a microphone mute.",
+                    "talker"
+                }
+            }
+            for hint in talk_hints {
+                span {
+                    key: "{hint.label}",
+                    class: "client-flag",
+                    title: "{hint.title}",
+                    "{hint.label}"
+                }
+            }
             if let Some(on_move_user) = on_move_user {
                 Button {
                     variant: ButtonVariant::Ghost,
