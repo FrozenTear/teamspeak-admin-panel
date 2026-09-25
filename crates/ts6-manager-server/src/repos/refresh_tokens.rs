@@ -188,6 +188,8 @@ pub async fn set_replaced_by(
 /// successor. `Ok(Some)` means this transaction committed. On the mem
 /// engine that is not a promise that a concurrent transaction aborted;
 /// [`crate::auth::refresh::rotate`] checks the family afterwards.
+/// A predecessor whose `family` is `None` skips that count (no family
+/// id to group). The caller still re-reads its own successor.
 pub async fn commit_rotation(
     db: &Database,
     old_token: &str,

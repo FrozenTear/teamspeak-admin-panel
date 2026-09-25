@@ -40,6 +40,13 @@
 //! not depend on serializable isolation. A later racer that still observes
 //! the fork performs the same revoke, so the family does not stay split.
 //!
+//! Rows whose `family` is `None` skip that count. `list_for_family` keys
+//! on a family id, so a null family has no cohort to count or delete.
+//! [`ensure_single_live_successor`] still re-reads this caller's successor
+//! and returns invalid if that row is gone or already replaced. Two live
+//! rows that both have `family: None` are not collapsed. Logins stamp a
+//! family; `None` is only older rows inserted without one.
+//!
 //! ## Internal — fields are camelCase to match repo wire shapes
 #![allow(non_snake_case)]
 
@@ -214,11 +221,18 @@ pub async fn rotate(db: &Database, supplied: &str, lifetime: Duration) -> Result
 /// the family removes both successors. A racer whose own row was removed by
 /// that revoke fails closed instead of handing the caller a dead bearer
 /// that it already treated as success.
+///
+/// `family == None` skips the count. Those rows were inserted without a
+/// family id, so there is no key to group them and this function does not
+/// delete them as a cohort. The successor re-read below still fail-closes
+/// for this caller's own token.
 async fn ensure_single_live_successor(
     db: &Database,
     family: Option<&str>,
     new_token: &str,
 ) -> Result<(), Error> {
+    // Legacy `family: None` rows skip the live-count on purpose. See the
+    // function docs. Do not treat a missing family as one shared cohort.
     if let Some(family) = family {
         let rows = refresh_tokens::list_for_family(db, family).await?;
         let live = rows.iter().filter(|row| row.replacedBy.is_none()).count();
