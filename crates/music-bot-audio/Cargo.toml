@@ -57,6 +57,9 @@ serde_json = { workspace = true }
 # ffmpeg/yt-dlp. Music HostConfig stays unset — never cpuset 0-1.
 libc = "0.2"
 
+[lints.clippy]
+disallowed_methods = "deny"
+
 [dev-dependencies]
 hound = "3.5"
 # THE-898 — `tokio::time::pause` / `#[tokio::test(start_paused = true)]` for

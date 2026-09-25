@@ -159,7 +159,7 @@ impl FfmpegSource {
             None
         };
         let proxy_url = proxy.as_ref().map(|proxy| proxy.base_url());
-        let mut cmd = Command::new("ffmpeg");
+        let mut cmd = crate::cpuset::music_command("ffmpeg");
         cmd.kill_on_drop(true)
             .arg("-hide_banner")
             .arg("-loglevel")
@@ -245,7 +245,7 @@ impl FfmpegSource {
         channels: u8,
         format_hint: Option<&str>,
     ) -> io::Result<(Self, tokio::process::ChildStdin)> {
-        let mut cmd = Command::new("ffmpeg");
+        let mut cmd = crate::cpuset::music_command("ffmpeg");
         cmd.kill_on_drop(true)
             .arg("-hide_banner")
             .arg("-loglevel")
@@ -542,15 +542,12 @@ mod protocol_whitelist_tests {
         FfmpegSource, REMOTE_PROTOCOL_WHITELIST, apply_ffmpeg_input_args,
         ffmpeg_input_is_remote_http, install_playback_proxy_env,
     };
-    use tokio::process::Command;
-
     fn args_for(input: &str) -> Vec<String> {
         args_for_remote(input, None, None)
     }
 
     fn args_for_remote(input: &str, ca_file: Option<&str>, proxy: Option<&str>) -> Vec<String> {
-        let mut cmd = Command::new("ffmpeg");
-        crate::cpuset::strip_music_runtime_token(cmd.as_std_mut());
+        let mut cmd = crate::cpuset::music_command("ffmpeg");
         apply_ffmpeg_input_args(&mut cmd, input, None, ca_file, proxy);
         cmd.as_std()
             .get_args()
@@ -675,16 +672,14 @@ mod protocol_whitelist_tests {
 
     #[tokio::test]
     async fn ffmpeg_metadata_url_is_refused_by_the_proxy() {
-        let mut probe = std::process::Command::new("ffmpeg");
-        crate::cpuset::strip_music_runtime_token(&mut probe);
+        let mut probe = crate::cpuset::std_music_command("ffmpeg");
         if probe.arg("-version").output().is_err() {
             return;
         }
         let proxy = crate::playback_guard::PlaybackProxy::start()
             .await
             .expect("proxy");
-        let mut cmd = Command::new("ffmpeg");
-        crate::cpuset::strip_music_runtime_token(cmd.as_std_mut());
+        let mut cmd = crate::cpuset::music_command("ffmpeg");
         cmd.kill_on_drop(true)
             .arg("-hide_banner")
             .arg("-loglevel")
