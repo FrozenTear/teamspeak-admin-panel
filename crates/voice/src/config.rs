@@ -62,7 +62,11 @@ impl BotConfig {
         }
     }
 
-    /// PURA-396 — opt into the split wire/control loop (default off).
+    /// PURA-396 — set the legacy force-on flag for the split wire/control
+    /// loop. Unset `VOICE_SPLIT_WIRE_TASK` already selects that loop, so
+    /// passing `false` does not opt out. An explicit `0`, `false`, `no`, or
+    /// `off` selects the single loop and beats a stored `true`. This field
+    /// can only force the split on.
     pub fn with_voice_split_wire_task(mut self, on: bool) -> Self {
         self.voice_split_wire_task = on;
         self

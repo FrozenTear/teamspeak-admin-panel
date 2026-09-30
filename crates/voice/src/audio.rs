@@ -1942,8 +1942,10 @@ fn inline_flush_config() -> &'static InlineFlushConfig {
 }
 
 /// Whether the send loop should flush after `send_audio` and cap catch-up.
-/// Unset / empty / anything but the usual truthy spellings is off, same
-/// spellings as `VOICE_SPLIT_WIRE_TASK`.
+/// For this flag, unset, empty, or anything but the usual truthy spellings
+/// is off. That is not how `VOICE_SPLIT_WIRE_TASK` works: unset selects the
+/// split loop, and an explicit `0`, `false`, `no`, or `off` is the kill
+/// switch back to the single loop.
 pub(crate) fn inline_flush_is_enabled() -> bool {
     #[cfg(test)]
     match INLINE_FLUSH_TEST_OVERRIDE.load(Ordering::SeqCst) {
