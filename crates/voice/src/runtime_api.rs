@@ -56,6 +56,23 @@ pub struct SettingsRequest {
     pub yt_api_key: Option<Option<String>>,
 }
 
+/// Issue #93 — body of `GET` / `POST /v1/voice/send-lead`: how far ahead of
+/// its slot the audio sibling releases each frame, in ms. `0` is off. A new
+/// value applies from the next track; above 500 it is clamped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendLead {
+    pub ms: u64,
+}
+
+/// Issue #93 — body of `GET` / `POST /v1/voice/encode-headroom`: gain in dB
+/// applied right before the Opus encoder, after the operator's volume. The
+/// default is `-6` (room for Opus decode overshoot); `0` turns it off. A new value
+/// applies from the next track; it is clamped to `-24..=0`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct EncodeHeadroom {
+    pub db: f32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BugReportContextResponse {
     pub music_bot_latency: String,

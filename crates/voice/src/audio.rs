@@ -29,7 +29,7 @@
 //! (≈ 5 s on fast sources) drains.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -464,6 +464,9 @@ fn build_active(
         pause_rx,
         msg_tx,
         sibling_catchup_cap(),
+        send_lead(),
+        encode_headroom_db(),
+        None,
     );
     ActiveAudio {
         source_label,
@@ -904,10 +907,22 @@ struct PacerMonitor {
     /// Previous steal sample, for the per-window delta. `None` only off
     /// Linux or before the first successful read.
     last_steal: Option<StealSample>,
+    /// Issue #93 — send-ahead lead for this play. Zero is off.
+    lead: Duration,
+    /// Issue #93 — window frames released at least [`LEAD_REANCHOR_MIN`]
+    /// past their listener slot, after time spent in an operator pause is
+    /// subtracted: likely listener holes, if the client keeps the lead.
+    window_reanchors: u32,
+    /// Issue #93 — worst re-anchor this window.
+    window_reanchor_max: Duration,
+    /// Issue #93 — summed re-anchors this window.
+    window_reanchor_sum: Duration,
+    /// Test probe for lead observations. Production leaves this `None`.
+    reanchor_probe: Option<Arc<ReanchorProbe>>,
 }
 
 impl PacerMonitor {
-    fn new() -> Self {
+    fn new(lead: Duration) -> Self {
         Self {
             total_frames: 0,
             window_frames: 0,
@@ -917,6 +932,41 @@ impl PacerMonitor {
             window_max_oversleep: Duration::ZERO,
             window_sum_oversleep: Duration::ZERO,
             last_steal: read_steal_sample(),
+            lead,
+            window_reanchors: 0,
+            window_reanchor_max: Duration::ZERO,
+            window_reanchor_sum: Duration::ZERO,
+            reanchor_probe: None,
+        }
+    }
+
+    /// Issue #93 — record how far past its listener slot frame `index` left.
+    /// Call before [`Self::observe`] for the same frame, so the re-anchor
+    /// lands in that frame's window.
+    fn observe_reanchor(&mut self, index: u64, behind: Duration) {
+        if let Some(probe) = &self.reanchor_probe {
+            probe.seen.fetch_add(1, Ordering::Relaxed);
+            if behind >= LEAD_REANCHOR_MIN {
+                probe.counted.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        if behind < LEAD_REANCHOR_MIN {
+            return;
+        }
+        self.window_reanchors += 1;
+        self.window_reanchor_max = self.window_reanchor_max.max(behind);
+        self.window_reanchor_sum += behind;
+        if behind >= OPUS_FRAME_PERIOD {
+            warn!(
+                target: "music_bot_latency",
+                stage = "lead_reanchor",
+                frame_index = index,
+                behind_ms = behind.as_millis() as u64,
+                send_lead_ms = self.lead.as_millis() as u64,
+                "frame left past its listener slot — the send-ahead lead ran out, \
+                 so the listener's buffer likely ran dry; re-anchored, refilling \
+                 up to the lead (issue #93)",
+            );
         }
     }
 
@@ -976,6 +1026,10 @@ impl PacerMonitor {
             mean_pacer_oversleep_us = mean_oversleep_us,
             host_steal_ms,
             proc_runqueue_wait_ms,
+            send_lead_ms = self.lead.as_millis() as u64,
+            lead_reanchors = self.window_reanchors,
+            lead_reanchor_max_ms = self.window_reanchor_max.as_millis() as u64,
+            lead_reanchor_total_ms = self.window_reanchor_sum.as_millis() as u64,
             "pacer-wakeup timing window — 20 ms tick oversleep + host vCPU \
              steal; oversleep with low host_steal_ms ⇒ tokio worker-queue \
              contention (2a), oversleep tracking host_steal_ms ⇒ host vCPU \
@@ -995,6 +1049,9 @@ impl PacerMonitor {
         self.window_overslept_frames = 0;
         self.window_max_oversleep = Duration::ZERO;
         self.window_sum_oversleep = Duration::ZERO;
+        self.window_reanchors = 0;
+        self.window_reanchor_max = Duration::ZERO;
+        self.window_reanchor_sum = Duration::ZERO;
     }
 
     /// Flush a final partial-window `pacer_wakeup` summary when the play
@@ -1039,6 +1096,211 @@ fn sibling_catchup_cap() -> Option<usize> {
     if cfg.enabled { cfg.max_catchup } else { None }
 }
 
+/// Issue #93 — upper bound for the send-ahead lead. A larger value is
+/// clamped, never rejected.
+const MAX_SEND_LEAD: Duration = Duration::from_millis(500);
+
+/// Issue #93 — a re-anchor this far past the listener slot counts as a
+/// likely listener hole in the `pacer_wakeup` window. Below it is timer
+/// noise on the first frame of a play.
+const LEAD_REANCHOR_MIN: Duration = Duration::from_millis(2);
+
+/// Issue #93 — counts lead observations inside one sibling. `seen` is every
+/// observation; `counted` is those at or above [`LEAD_REANCHOR_MIN`]. The
+/// pause test installs one; production does not.
+struct ReanchorProbe {
+    seen: AtomicU32,
+    counted: AtomicU32,
+}
+
+/// Issue #93 — the send-ahead lead in ms. Seeded once from
+/// `VOICE_SEND_LEAD_MS`; `POST /v1/voice/send-lead` changes it at runtime.
+/// Read when a play starts, so a change applies from the next track.
+fn send_lead_ms_cell() -> &'static AtomicU64 {
+    static CELL: OnceLock<AtomicU64> = OnceLock::new();
+    CELL.get_or_init(|| {
+        let lead = parse_send_lead_ms(std::env::var("VOICE_SEND_LEAD_MS").ok().as_deref());
+        if !lead.is_zero() {
+            info!(
+                send_lead_ms = lead.as_millis() as u64,
+                "VOICE_SEND_LEAD_MS — audio frames are released ahead of their slot (issue #93)",
+            );
+        }
+        AtomicU64::new(lead.as_millis() as u64)
+    })
+}
+
+/// Send-ahead lead for the next play. Zero is off: pre-#93 pacing.
+pub(crate) fn send_lead() -> Duration {
+    Duration::from_millis(send_lead_ms_cell().load(Ordering::Relaxed))
+}
+
+/// Set the send-ahead lead for later plays, clamped to [`MAX_SEND_LEAD`].
+/// Returns the lead now in force.
+pub(crate) fn set_send_lead_ms(ms: u64) -> Duration {
+    let lead = Duration::from_millis(ms).min(MAX_SEND_LEAD);
+    send_lead_ms_cell().store(lead.as_millis() as u64, Ordering::Relaxed);
+    info!(
+        send_lead_ms = lead.as_millis() as u64,
+        "send-ahead lead set; applies from the next track (issue #93)",
+    );
+    lead
+}
+
+/// Pure parse of `VOICE_SEND_LEAD_MS`. Unset, empty, `0`, a negative or an
+/// unparsable value is off. Above [`MAX_SEND_LEAD`] is clamped.
+fn parse_send_lead_ms(value: Option<&str>) -> Duration {
+    value
+        .map(str::trim)
+        .and_then(|s| s.parse::<u64>().ok())
+        .map_or(Duration::ZERO, |ms| {
+            Duration::from_millis(ms).min(MAX_SEND_LEAD)
+        })
+}
+
+/// Issue #93 — deepest encode headroom; a larger cut is clamped.
+const MIN_ENCODE_HEADROOM_DB: f32 = -24.0;
+
+/// Issue #93 — encode headroom when `VOICE_ENCODE_HEADROOM_DB` is unset.
+/// −6 dB removed all decoder overshoot on the hottest material measured:
+/// hardstyle mastered at −8.8 dBFS RMS decodes to a −3.5 dBFS peak, against
+/// +2.7 dBFS and overshoot in 54% of 100 ms blocks at 0 dB.
+const DEFAULT_ENCODE_HEADROOM_DB: f32 = -6.0;
+
+/// Issue #93 — encode headroom in dB (0 or negative), stored as `f32` bits.
+///
+/// Mastered music sits at 0 dBFS, and Opus decoding overshoots full scale:
+/// Bubble Pop at unity gain, 64 kbit/s mono, decodes to +6.1 dBFS peaks with
+/// overshoot in 63% of 100 ms blocks. A client that cannot carry audio above
+/// 0 dBFS (int16 decode, a phone at normal volume) hard-clips those peaks,
+/// which is heard as crackle on loud, bass-heavy passages. −6 dB before the
+/// encoder removed all of it in that test, and on hardstyle too.
+///
+/// Defaults to [`DEFAULT_ENCODE_HEADROOM_DB`]; `VOICE_ENCODE_HEADROOM_DB=0`
+/// turns it off. Seeded once from `VOICE_ENCODE_HEADROOM_DB`; `POST
+/// /v1/voice/encode-headroom` changes it at runtime. Read when a play
+/// starts, so a change applies from the next track.
+fn encode_headroom_cell() -> &'static AtomicU32 {
+    static CELL: OnceLock<AtomicU32> = OnceLock::new();
+    CELL.get_or_init(|| {
+        let db =
+            parse_encode_headroom_db(std::env::var("VOICE_ENCODE_HEADROOM_DB").ok().as_deref());
+        info!(
+            encode_headroom_db = db,
+            "encode headroom before the Opus encoder (issue #93); \
+             VOICE_ENCODE_HEADROOM_DB=0 turns it off",
+        );
+        AtomicU32::new(db.to_bits())
+    })
+}
+
+/// Encode headroom for the next play, in dB. Zero is off: unchanged levels.
+pub(crate) fn encode_headroom_db() -> f32 {
+    f32::from_bits(encode_headroom_cell().load(Ordering::Relaxed))
+}
+
+/// Set the encode headroom for later plays, clamped to
+/// [`MIN_ENCODE_HEADROOM_DB`]`..=0`. Returns the value now in force.
+pub(crate) fn set_encode_headroom_db(db: f32) -> f32 {
+    let db = clamp_encode_headroom_db(db);
+    encode_headroom_cell().store(db.to_bits(), Ordering::Relaxed);
+    info!(
+        encode_headroom_db = db,
+        "encode headroom set; applies from the next track (issue #93)",
+    );
+    db
+}
+
+/// Pure parse of `VOICE_ENCODE_HEADROOM_DB`. Unset, empty, unparsable or
+/// non-finite is [`DEFAULT_ENCODE_HEADROOM_DB`]; `0` turns the headroom off.
+/// Positive values (a boost) are clamped to 0, below
+/// [`MIN_ENCODE_HEADROOM_DB`] is clamped.
+fn parse_encode_headroom_db(value: Option<&str>) -> f32 {
+    value
+        .map(str::trim)
+        .and_then(|s| s.parse::<f32>().ok())
+        .filter(|db| db.is_finite())
+        .map_or(DEFAULT_ENCODE_HEADROOM_DB, clamp_encode_headroom_db)
+}
+
+fn clamp_encode_headroom_db(db: f32) -> f32 {
+    if db.is_finite() {
+        db.clamp(MIN_ENCODE_HEADROOM_DB, 0.0)
+    } else {
+        DEFAULT_ENCODE_HEADROOM_DB
+    }
+}
+
+/// Linear factor for a headroom in dB.
+fn headroom_factor(db: f32) -> f32 {
+    10f32.powf(db / 20.0)
+}
+
+/// Scale one PCM frame by the encode headroom. A factor of 1 or more is a
+/// no-op, so a zero headroom keeps the frame bit-exact.
+fn apply_headroom(pcm: &mut [i16], factor: f32) {
+    if factor >= 1.0 {
+        return;
+    }
+    for sample in pcm.iter_mut() {
+        *sample = (f32::from(*sample) * factor).round() as i16;
+    }
+}
+
+/// Issue #93 — send-ahead pacing for the audio sibling.
+///
+/// The Contabo host pauses the whole VM for 50–260 ms at a time, and the
+/// guest sees no steal for it. No thread in this process can send during
+/// such a pause, so what a listener hears depends on how much audio their
+/// TeamSpeak client already holds when it starts. With a lead, each frame
+/// is released `lead` before the listener needs it, so the client's jitter
+/// buffer holds that much audio.
+///
+/// The listener timeline starts when the first frame is released and
+/// advances one frame period per frame; it does not follow the pipeline's
+/// `scheduled_at`. A frame released after its listener slot means the
+/// client ran dry: at the start, after a stall longer than the lead, or
+/// after a pause. The timeline is then re-anchored to that release, so only
+/// the next `lead / 20 ms` frames go out at once to refill the client. The
+/// backlog is never dumped: a burst is what the TeamSpeak jitter buffer
+/// plays as choppy (PURA-314, THE-982). Enabling the lead on live radio
+/// accumulates `(stall − lead)` of delay, and nothing shrinks it.
+struct LeadPacer {
+    lead: Duration,
+    /// Listener play time of the next frame. `None` before the first frame.
+    next_slot: Option<Instant>,
+}
+
+impl LeadPacer {
+    /// `None` when `lead` is zero, which keeps the pre-#93 schedule.
+    fn new(lead: Duration) -> Option<Self> {
+        (!lead.is_zero()).then_some(Self {
+            lead,
+            next_slot: None,
+        })
+    }
+
+    /// Listener slot of the frame popped at `recv_at`.
+    fn slot(&self, recv_at: Instant) -> Instant {
+        self.next_slot.unwrap_or(recv_at)
+    }
+
+    /// When the frame for `slot` should leave.
+    fn release_at(&self, slot: Instant) -> Instant {
+        slot.checked_sub(self.lead).unwrap_or(slot)
+    }
+
+    /// Record that the frame for `slot` left at `now`. Returns the slot to
+    /// stamp on the frame and how far past its slot it left (zero while the
+    /// client still had audio).
+    fn released(&mut self, slot: Instant, now: Instant) -> (Instant, Duration) {
+        let behind = now.saturating_duration_since(slot);
+        let slot = if behind.is_zero() { slot } else { now };
+        self.next_slot = Some(slot + OPUS_FRAME_PERIOD);
+        (slot, behind)
+    }
+}
+
 // The cap is a test seam on top of the existing channel arguments.
 #[allow(clippy::too_many_arguments)]
 fn spawn_sibling(
@@ -1050,6 +1312,9 @@ fn spawn_sibling(
     mut pause_rx: watch::Receiver<bool>,
     tx: mpsc::Sender<AudioMsg>,
     catchup_cap: Option<usize>,
+    send_lead: Duration,
+    encode_headroom_db: f32,
+    reanchor_probe: Option<Arc<ReanchorProbe>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         // Keep `pipeline` alive for the lifetime of the sibling — its
@@ -1061,6 +1326,17 @@ fn spawn_sibling(
         // (AR-3) click-free ramp.
         let mut gain = GainStage::new(volume);
 
+        // Issue #93 — fixed headroom, the last step before the encoder, so
+        // the margin holds whatever the operator's volume is.
+        let headroom = headroom_factor(encode_headroom_db);
+        info!(
+            target: "music_bot_latency",
+            stage = "sibling_config",
+            send_lead_ms = send_lead.as_millis() as u64,
+            encode_headroom_db,
+            "audio sibling settings for this play (issue #93)",
+        );
+
         // PURA-342 — frame-buffer underrun watchdog. Lives for the whole
         // play: it tags the opening `STARTUP_WATCH_FRAMES` as the `startup`
         // regime and everything after as `midsong`, so an occasional
@@ -1070,7 +1346,12 @@ fn spawn_sibling(
         // PURA-408b — pacer-wakeup oversleep tracker. Sees how far past its
         // `scheduled_at` slot the paced `sleep_until` below actually woke —
         // the attribution `frame_underrun` and `dequeue_gap` both miss.
-        let mut pacer = PacerMonitor::new();
+        let mut pacer = PacerMonitor::new(send_lead);
+        pacer.reanchor_probe = reanchor_probe;
+
+        // Issue #93 — send-ahead pacing. `None` (zero lead) keeps the
+        // pipeline slot + pause shift below exactly as before.
+        let mut lead_pacer = LeadPacer::new(send_lead);
 
         // THE-982 (AR-1) — total time spent parked on pause across the whole
         // play. The pipeline pacer's `scheduled_at` anchor never moves (it is
@@ -1174,7 +1455,12 @@ fn spawn_sibling(
                         // THE-982 — every slot is paced against the
                         // pause-shifted schedule; the raw `scheduled_at`
                         // stops being meaningful once playback has parked.
-                        let mut slot = f.scheduled_at + paused_total;
+                        // Issue #93 — with a lead the slot is the listener
+                        // timeline instead (see [`LeadPacer`]).
+                        let mut slot = match &lead_pacer {
+                            Some(lp) => lp.slot(recv_at),
+                            None => f.scheduled_at + paused_total,
+                        };
                         let lateness = recv_at.saturating_duration_since(slot);
                         monitor.observe(f.index, buffered, lateness);
                         // Wall-clock pacing. The pipeline decodes far faster
@@ -1199,6 +1485,15 @@ fn spawn_sibling(
                         // pause arm first so a pause that is already
                         // observable when the slot expires still holds the
                         // frame rather than letting it slip out.
+                        //
+                        // Issue #93 — with a lead the sleep ends `lead`
+                        // before the listener slot. A pause does not move
+                        // the listener slot: after a long one the release is
+                        // overdue and the re-anchor below refills the client.
+                        let mut release_at = lead_pacer
+                            .as_ref()
+                            .map_or(slot, |lp| lp.release_at(slot));
+                        let mut paused_this_frame = Duration::ZERO;
                         loop {
                             tokio::select! {
                                 biased;
@@ -1208,15 +1503,36 @@ fn spawn_sibling(
                                         return;
                                     }
                                     match park_while_paused(&mut pause_rx).await {
-                                        Some(parked) => paused_total += parked,
+                                        Some(parked) => {
+                                            paused_total += parked;
+                                            // The listener slot stays put
+                                            // across a pause, so the first
+                                            // frame after one is about
+                                            // `pause − lead` late. That is
+                                            // the pause, not a stall.
+                                            paused_this_frame += parked;
+                                        }
                                         None => return,
                                     }
-                                    slot = f.scheduled_at + paused_total;
+                                    if lead_pacer.is_none() {
+                                        slot = f.scheduled_at + paused_total;
+                                        release_at = slot;
+                                    }
                                 }
                                 _ = tokio::time::sleep_until(
-                                    tokio::time::Instant::from_std(slot),
+                                    tokio::time::Instant::from_std(release_at),
                                 ) => break,
                             }
+                        }
+                        let woke_at = std::time::Instant::now();
+                        // Issue #93 — a release past the listener slot means
+                        // the client ran dry: re-anchor the listener timeline
+                        // there, which bounds the refill to the lead.
+                        if let Some(lp) = lead_pacer.as_mut() {
+                            let (anchored, behind) = lp.released(slot, woke_at);
+                            slot = anchored;
+                            let stall = behind.saturating_sub(paused_this_frame);
+                            pacer.observe_reanchor(f.index, stall);
                         }
                         // PURA-408b — the paced `sleep_until` is meant to
                         // return exactly at the shifted slot; sample how far
@@ -1224,8 +1540,9 @@ fn spawn_sibling(
                         // tells the monitor whether this frame genuinely
                         // slept or its slot had already passed. Sampled
                         // before the encode below so oversleep measures the
-                        // timer, not the ~100 µs encode.
-                        pacer.observe(slot, recv_at, std::time::Instant::now());
+                        // timer, not the ~100 µs encode. With a lead the
+                        // timer's target is the release, not the slot.
+                        pacer.observe(release_at, recv_at, woke_at);
                         // Drop before gain + encode. A real catch-up trickles
                         // one overdue frame at a time; the slot is already
                         // more than N periods in the past, so encoding it
@@ -1271,6 +1588,7 @@ fn spawn_sibling(
                         // policy the worker applied pre-THE-986.
                         let mut samples = f.samples;
                         gain.apply(&mut samples, f.channels);
+                        apply_headroom(&mut samples, headroom);
                         let bytes = match encoder.encode_frame(&samples) {
                             Ok(b) => b,
                             Err(e) => {
@@ -1624,8 +1942,10 @@ fn inline_flush_config() -> &'static InlineFlushConfig {
 }
 
 /// Whether the send loop should flush after `send_audio` and cap catch-up.
-/// Unset / empty / anything but the usual truthy spellings is off, same
-/// spellings as `VOICE_SPLIT_WIRE_TASK`.
+/// For this flag, unset, empty, or anything but the usual truthy spellings
+/// is off. That is not how `VOICE_SPLIT_WIRE_TASK` works: unset selects the
+/// split loop, and an explicit `0`, `false`, `no`, or `off` is the kill
+/// switch back to the single loop.
 pub(crate) fn inline_flush_is_enabled() -> bool {
     #[cfg(test)]
     match INLINE_FLUSH_TEST_OVERRIDE.load(Ordering::SeqCst) {
@@ -2934,6 +3254,9 @@ mod tests {
             pause_rx,
             msg_tx,
             None,
+            Duration::ZERO,
+            0.0,
+            None,
         );
 
         let mut frame_count = 0usize;
@@ -3002,6 +3325,9 @@ mod tests {
             events_rx,
             pause_rx,
             msg_tx,
+            None,
+            Duration::ZERO,
+            0.0,
             None,
         );
 
@@ -3185,6 +3511,9 @@ mod tests {
             pause_rx,
             msg_tx,
             None,
+            Duration::ZERO,
+            0.0,
+            None,
         );
 
         let mut frames_seen = 0usize;
@@ -3252,6 +3581,9 @@ mod tests {
             events_rx,
             pause_rx,
             msg_tx,
+            None,
+            Duration::ZERO,
+            0.0,
             None,
         );
 
@@ -3398,7 +3730,7 @@ mod tests {
     /// its oversleep; the per-window max/count track it.
     #[test]
     fn pacer_monitor_records_oversleep() {
-        let mut p = PacerMonitor::new();
+        let mut p = PacerMonitor::new(Duration::ZERO);
         let base = Instant::now();
         // Slot 1 s out; popped now (well before it), woke 5 ms late.
         let scheduled = base + Duration::from_secs(1);
@@ -3414,7 +3746,7 @@ mod tests {
     /// from the oversleep stats.
     #[test]
     fn pacer_monitor_excludes_already_late_frames() {
-        let mut p = PacerMonitor::new();
+        let mut p = PacerMonitor::new(Duration::ZERO);
         let base = Instant::now();
         // The slot is 1 s behind the pop instant.
         let scheduled = base;
@@ -3430,7 +3762,7 @@ mod tests {
     /// max/mean but does not count toward `overslept_frames`.
     #[test]
     fn pacer_monitor_ignores_sub_threshold_jitter() {
-        let mut p = PacerMonitor::new();
+        let mut p = PacerMonitor::new(Duration::ZERO);
         let base = Instant::now();
         let scheduled = base + Duration::from_secs(1);
         p.observe(scheduled, base, scheduled + Duration::from_millis(1));
@@ -3443,7 +3775,7 @@ mod tests {
     /// frames and clears the per-window state; `total_frames` survives.
     #[test]
     fn pacer_monitor_summary_resets_window() {
-        let mut p = PacerMonitor::new();
+        let mut p = PacerMonitor::new(Duration::ZERO);
         let base = Instant::now();
         let scheduled = base + Duration::from_secs(1);
         for _ in 0..PACER_SUMMARY_INTERVAL {
@@ -4364,6 +4696,9 @@ mod tests {
             pause_rx,
             msg_tx,
             cap,
+            Duration::ZERO,
+            0.0,
+            None,
         );
         let mut out = Vec::new();
         while let Some(msg) = msg_rx.recv().await {
@@ -4461,6 +4796,431 @@ mod tests {
             catchup_batch_with(released_past_due(now, ages[0], 0), &mut rx, true, None, now);
         assert_eq!(batch.dropped, 0);
         assert_eq!(frame_ids(batch.messages).len(), 25);
+    }
+
+    #[test]
+    fn send_lead_parse_is_off_unless_positive_and_is_clamped() {
+        assert_eq!(parse_send_lead_ms(None), Duration::ZERO);
+        assert_eq!(parse_send_lead_ms(Some("")), Duration::ZERO);
+        assert_eq!(parse_send_lead_ms(Some("0")), Duration::ZERO);
+        assert_eq!(parse_send_lead_ms(Some("-40")), Duration::ZERO);
+        assert_eq!(parse_send_lead_ms(Some("80ms")), Duration::ZERO);
+        assert_eq!(parse_send_lead_ms(Some(" 80 ")), Duration::from_millis(80));
+        assert_eq!(parse_send_lead_ms(Some("9999")), MAX_SEND_LEAD);
+    }
+
+    #[test]
+    fn lead_pacer_is_off_at_zero() {
+        assert!(LeadPacer::new(Duration::ZERO).is_none());
+    }
+
+    /// Drive a [`LeadPacer`] the way the sibling does: wait for each release
+    /// (never before `now`), then record it. Returns the instant of the last
+    /// release.
+    fn release_frames(lp: &mut LeadPacer, mut now: Instant, frames: usize) -> Instant {
+        for _ in 0..frames {
+            let slot = lp.slot(now);
+            now = now.max(lp.release_at(slot));
+            lp.released(slot, now);
+        }
+        now
+    }
+
+    /// Issue #93 — the first `lead / 20 ms + 1` frames of a play are due at
+    /// once (the client is primed with the lead), then one per period.
+    #[test]
+    fn lead_pacer_primes_once_then_paces() {
+        let mut lp = LeadPacer::new(Duration::from_millis(80)).expect("lead on");
+        let t0 = Instant::now();
+        let mut immediate = 0;
+        let mut now = t0;
+        for _ in 0..20 {
+            let slot = lp.slot(now);
+            let release = lp.release_at(slot);
+            if release <= t0 {
+                immediate += 1;
+            }
+            now = now.max(release);
+            let (_, behind) = lp.released(slot, now);
+            assert_eq!(behind, Duration::ZERO, "an undisturbed play never runs dry");
+        }
+        assert_eq!(immediate, 5, "an 80 ms lead primes 4 frames plus the first");
+        assert_eq!(
+            now,
+            t0 + Duration::from_millis(300),
+            "frame 19 leaves at 19 × 20 − 80 ms"
+        );
+    }
+
+    /// Issue #93 — a stall longer than the lead re-anchors the listener
+    /// timeline, so the refill after it is the lead (4 frames at 80 ms), not
+    /// the whole deficit (12 frames for a 250 ms stall). A deficit dump is
+    /// what PURA-314 / THE-982 found the TeamSpeak jitter buffer plays as
+    /// choppy.
+    #[test]
+    fn lead_pacer_refills_only_up_to_the_lead_after_a_stall() {
+        let mut lp = LeadPacer::new(Duration::from_millis(80)).expect("lead on");
+        let now = release_frames(&mut lp, Instant::now(), 20);
+
+        // The VM stalls 250 ms while the sibling waits for the next release.
+        let slot = lp.slot(now);
+        let woke = lp.release_at(slot) + Duration::from_millis(250);
+        let (anchored, behind) = lp.released(slot, woke);
+        assert_eq!(
+            behind,
+            Duration::from_millis(170),
+            "250 ms stall − 80 ms lead"
+        );
+        assert_eq!(anchored, woke, "the late frame becomes the new anchor");
+
+        let mut refill = 0;
+        loop {
+            let slot = lp.slot(woke);
+            if lp.release_at(slot) > woke {
+                break;
+            }
+            let (_, behind) = lp.released(slot, woke);
+            assert_eq!(behind, Duration::ZERO);
+            refill += 1;
+        }
+        assert_eq!(
+            refill, 4,
+            "the refill is the 80 ms lead, not the 12-frame deficit"
+        );
+    }
+
+    /// Issue #93 — a stall shorter than the lead is absorbed: no re-anchor,
+    /// and the frames that came due during it go out to restore the lead.
+    #[test]
+    fn lead_pacer_absorbs_a_stall_shorter_than_the_lead() {
+        let mut lp = LeadPacer::new(Duration::from_millis(80)).expect("lead on");
+        let now = release_frames(&mut lp, Instant::now(), 20);
+        let slot = lp.slot(now);
+        let woke = lp.release_at(slot) + Duration::from_millis(60);
+        let (anchored, behind) = lp.released(slot, woke);
+        assert_eq!(behind, Duration::ZERO, "a 60 ms stall inside an 80 ms lead");
+        assert_eq!(anchored, slot, "the listener timeline does not move");
+    }
+
+    /// Run the sibling on hand-fed frames with a send lead and return the
+    /// arrival instant of every forwarded frame. With `pause = Some((n, d))`
+    /// the sibling is paused once, for `d`, after `n` frames have arrived
+    /// with a paced gap; frames that arrive while paused are returned
+    /// separately, as offsets from the pause.
+    async fn arrivals_with_lead(
+        frames: Vec<PcmFrame>,
+        lead: Duration,
+        pause: Option<(usize, Duration)>,
+        reanchor_probe: Option<Arc<ReanchorProbe>>,
+    ) -> (Vec<Instant>, Vec<Duration>) {
+        let mut pipeline = AudioPipeline::spawn(
+            AudioSourceSpec::SyntheticTone {
+                hz: 440.0,
+                amplitude: 0.0,
+                duration_ms: Some(40),
+            },
+            PipelineConfig::default(),
+        )
+        .await
+        .expect("spawn synthetic pipeline");
+        let _discard = pipeline.take_frames();
+        let events_rx = pipeline.events();
+        let (frames_tx, frames_rx) = mpsc::channel(128);
+        for frame in frames {
+            frames_tx.send(frame).await.expect("frame channel open");
+        }
+        drop(frames_tx);
+        let (pause_tx, pause_rx) = watch::channel(false);
+        let (msg_tx, mut msg_rx) = mpsc::channel(128);
+        let sibling = spawn_sibling(
+            pipeline,
+            test_encoder(),
+            VolumeHandle::default(),
+            frames_rx,
+            events_rx,
+            pause_rx,
+            msg_tx,
+            None,
+            lead,
+            0.0,
+            reanchor_probe,
+        );
+
+        let mut arrivals: Vec<Instant> = Vec::new();
+        let mut during_pause = Vec::new();
+        let mut pause_plan = pause;
+        let mut paused_at: Option<(Instant, Duration)> = None;
+        loop {
+            let msg = if let Some((at, window)) = paused_at {
+                match tokio::time::timeout(window.saturating_sub(at.elapsed()), msg_rx.recv()).await
+                {
+                    Ok(msg) => msg,
+                    Err(_) => {
+                        pause_tx.send(false).expect("sibling holds pause_rx");
+                        paused_at = None;
+                        continue;
+                    }
+                }
+            } else {
+                msg_rx.recv().await
+            };
+            match msg {
+                Some(AudioMsg::Frame { .. }) => {
+                    let now = Instant::now();
+                    if let Some((at, _)) = paused_at {
+                        during_pause.push(now.duration_since(at));
+                        continue;
+                    }
+                    let paced = arrivals
+                        .last()
+                        .is_some_and(|last| now.duration_since(*last) >= Duration::from_millis(15));
+                    arrivals.push(now);
+                    if let Some((after, window)) = pause_plan
+                        && arrivals.len() >= after
+                        && paced
+                    {
+                        pause_plan = None;
+                        pause_tx.send(true).expect("sibling holds pause_rx");
+                        paused_at = Some((Instant::now(), window));
+                    }
+                }
+                Some(AudioMsg::Finished) | None => break,
+                Some(AudioMsg::PipelineEvent(_) | AudioMsg::CatchupDropped(_)) => {}
+            }
+        }
+        sibling.await.expect("sibling joins");
+        (arrivals, during_pause)
+    }
+
+    /// Issue #93 — with an 80 ms lead the sibling sends 5 frames at once
+    /// when the play starts, then one per 20 ms.
+    #[tokio::test]
+    async fn sibling_with_lead_primes_then_paces() {
+        let anchor = Instant::now();
+        let frames = (0..25)
+            .map(|i| pcm_at(i, anchor + OPUS_FRAME_PERIOD * i as u32))
+            .collect();
+        let (arrivals, _) = arrivals_with_lead(frames, Duration::from_millis(80), None, None).await;
+        assert_eq!(arrivals.len(), 25);
+        let first = arrivals[0];
+        let primed = arrivals
+            .iter()
+            .filter(|at| at.duration_since(first) < Duration::from_millis(10))
+            .count();
+        assert!(
+            (5..=8).contains(&primed),
+            "expected an 80 ms lead to prime ~5 frames at once, got {primed}",
+        );
+        // The other 20 frames are paced: ~400 ms, not a burst.
+        let span = arrivals[24].duration_since(first);
+        assert!(
+            span >= Duration::from_millis(250),
+            "25 frames with an 80 ms lead spanned {span:?} — expected ~400 ms of pacing",
+        );
+    }
+
+    /// Issue #93 — with a lead, a pause still holds every frame, and resume
+    /// refills only the lead (4 frames at 60 ms) before pacing again — no
+    /// catch-up dump of the frames that came due during the pause. The
+    /// pause itself is not a stall: `lead_reanchors` stays at zero.
+    #[tokio::test]
+    async fn sibling_with_lead_refills_only_the_lead_after_a_pause() {
+        let anchor = Instant::now();
+        let frames = (0..60)
+            .map(|i| pcm_at(i, anchor + OPUS_FRAME_PERIOD * i as u32))
+            .collect();
+        let probe = Arc::new(ReanchorProbe {
+            seen: AtomicU32::new(0),
+            counted: AtomicU32::new(0),
+        });
+        let (arrivals, during_pause) = arrivals_with_lead(
+            frames,
+            Duration::from_millis(60),
+            Some((10, Duration::from_millis(400))),
+            Some(Arc::clone(&probe)),
+        )
+        .await;
+        assert!(
+            probe.seen.load(Ordering::Relaxed) > 0,
+            "the sibling never reported a lead observation",
+        );
+        assert_eq!(
+            probe.counted.load(Ordering::Relaxed),
+            0,
+            "a pure operator pause must not count as a lead stall",
+        );
+        assert!(
+            during_pause
+                .iter()
+                .all(|at| *at < Duration::from_millis(10)),
+            "frames left during the pause: {during_pause:?}",
+        );
+        // The resume is the first gap of at least 300 ms.
+        let resume = arrivals
+            .windows(2)
+            .position(|w| w[1].duration_since(w[0]) >= Duration::from_millis(300))
+            .expect("the pause shows as a gap")
+            + 1;
+        let first = arrivals[resume];
+        let refill = arrivals[resume..]
+            .iter()
+            .filter(|at| at.duration_since(first) < Duration::from_millis(10))
+            .count();
+        assert!(
+            (3..=6).contains(&refill),
+            "expected ~4 frames to refill a 60 ms lead after resume, got {refill}",
+        );
+        let mut gaps: Vec<Duration> = arrivals[resume + refill..]
+            .windows(2)
+            .map(|w| w[1].duration_since(w[0]))
+            .collect();
+        gaps.sort();
+        let median = gaps[gaps.len() / 2];
+        assert!(
+            median >= Duration::from_millis(10),
+            "median post-refill gap {median:?} — expected 20 ms pacing",
+        );
+    }
+
+    #[test]
+    fn encode_headroom_defaults_to_minus_six_and_zero_turns_it_off() {
+        assert_eq!(DEFAULT_ENCODE_HEADROOM_DB, -6.0);
+        assert_eq!(parse_encode_headroom_db(None), DEFAULT_ENCODE_HEADROOM_DB);
+        assert_eq!(
+            parse_encode_headroom_db(Some("")),
+            DEFAULT_ENCODE_HEADROOM_DB
+        );
+        assert_eq!(
+            parse_encode_headroom_db(Some("abc")),
+            DEFAULT_ENCODE_HEADROOM_DB
+        );
+        assert_eq!(
+            parse_encode_headroom_db(Some("NaN")),
+            DEFAULT_ENCODE_HEADROOM_DB
+        );
+        assert_eq!(
+            parse_encode_headroom_db(Some("0")),
+            0.0,
+            "explicit 0 is off"
+        );
+        assert_eq!(parse_encode_headroom_db(Some("3")), 0.0, "no boost");
+        assert_eq!(parse_encode_headroom_db(Some(" -3 ")), -3.0);
+        assert_eq!(
+            parse_encode_headroom_db(Some("-40")),
+            MIN_ENCODE_HEADROOM_DB
+        );
+    }
+
+    #[test]
+    fn apply_headroom_is_bit_exact_at_zero_and_scales_below() {
+        let frame: Vec<i16> = vec![i16::MAX, i16::MIN, 1000, -1000, 0];
+        let mut same = frame.clone();
+        apply_headroom(&mut same, headroom_factor(0.0));
+        assert_eq!(same, frame, "0 dB must not touch the frame");
+
+        let mut cut = frame.clone();
+        apply_headroom(&mut cut, headroom_factor(-6.0));
+        // 10^(-6/20) = 0.5012
+        assert_eq!(cut, vec![16422, -16423, 501, -501, 0]);
+    }
+
+    /// Run hand-fed frames through the sibling (gain, headroom, Opus encode)
+    /// and return the encoded packets.
+    async fn encode_through_sibling(frames: Vec<PcmFrame>, headroom_db: f32) -> Vec<Bytes> {
+        let mut pipeline = AudioPipeline::spawn(
+            AudioSourceSpec::SyntheticTone {
+                hz: 440.0,
+                amplitude: 0.0,
+                duration_ms: Some(40),
+            },
+            PipelineConfig::default(),
+        )
+        .await
+        .expect("spawn synthetic pipeline");
+        let _discard = pipeline.take_frames();
+        let events_rx = pipeline.events();
+        let (frames_tx, frames_rx) = mpsc::channel(64);
+        for frame in frames {
+            frames_tx.send(frame).await.expect("frame channel open");
+        }
+        drop(frames_tx);
+        let (_pause_tx, pause_rx) = watch::channel(false);
+        let (msg_tx, mut msg_rx) = mpsc::channel(64);
+        let sibling = spawn_sibling(
+            pipeline,
+            test_encoder(),
+            VolumeHandle::default(),
+            frames_rx,
+            events_rx,
+            pause_rx,
+            msg_tx,
+            None,
+            Duration::ZERO,
+            headroom_db,
+            None,
+        );
+        let mut out = Vec::new();
+        while let Some(msg) = msg_rx.recv().await {
+            match msg {
+                AudioMsg::Frame { bytes, .. } => out.push(bytes),
+                AudioMsg::Finished => break,
+                AudioMsg::PipelineEvent(_) | AudioMsg::CatchupDropped(_) => {}
+            }
+        }
+        sibling.await.expect("sibling joins");
+        out
+    }
+
+    /// Issue #93 — the headroom is applied end to end: a full-scale tone
+    /// encoded at -6 dB decodes at about half the level of the same tone at
+    /// 0 dB. Decoded level is what a TeamSpeak client plays.
+    #[tokio::test]
+    async fn encode_headroom_lowers_the_decoded_level() {
+        let tone = |i: u64| {
+            let n = music_bot_audio::SAMPLES_PER_FRAME_MONO;
+            let samples = (0..n)
+                .map(|k| {
+                    let t = (i as usize * n + k) as f32 / 48_000.0;
+                    (f32::sin(2.0 * std::f32::consts::PI * 110.0 * t) * i16::MAX as f32) as i16
+                })
+                .collect();
+            PcmFrame {
+                samples,
+                index: i,
+                scheduled_at: Instant::now(),
+                channels: 1,
+            }
+        };
+        let rms = |packets: &[Bytes]| -> f64 {
+            let mut decoder = audiopus::coder::Decoder::new(
+                audiopus::SampleRate::Hz48000,
+                audiopus::Channels::Mono,
+            )
+            .expect("decoder");
+            let (mut sum, mut n) = (0.0f64, 0usize);
+            // Skip the first frames while the codec settles.
+            for packet in packets.iter().skip(5) {
+                let mut pcm = vec![0i16; music_bot_audio::SAMPLES_PER_FRAME_MONO];
+                let p = audiopus::packet::Packet::try_from(&packet[..]).expect("packet");
+                let signals = audiopus::MutSignals::try_from(&mut pcm[..]).expect("signals");
+                let got = decoder.decode(Some(p), signals, false).expect("decode");
+                sum += pcm[..got]
+                    .iter()
+                    .map(|s| f64::from(*s).powi(2))
+                    .sum::<f64>();
+                n += got;
+            }
+            (sum / n.max(1) as f64).sqrt()
+        };
+        let unity = encode_through_sibling((0..25).map(tone).collect(), 0.0).await;
+        let cut = encode_through_sibling((0..25).map(tone).collect(), -6.0).await;
+        assert_eq!(unity.len(), 25);
+        assert_eq!(cut.len(), 25);
+        let ratio = rms(&cut) / rms(&unity);
+        assert!(
+            (0.44..=0.56).contains(&ratio),
+            "-6 dB headroom should halve the decoded level, got ratio {ratio:.3}",
+        );
     }
 
     struct SummaryFieldCapture {

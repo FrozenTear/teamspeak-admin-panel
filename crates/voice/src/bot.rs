@@ -91,11 +91,10 @@ pub(crate) async fn run_bot(
     let mut hold_disconnected = false;
 
     // PURA-396 — pick the connected-loop implementation once, up front. The
-    // config flag is `OR`-ed with the `VOICE_SPLIT_WIRE_TASK` env var so a
-    // contabo-dev A/B is a pod env flip with no DB write. Default is the
-    // single-loop path; `true` selects the PURA-389 §2a/2b wire/control
-    // split.
-    let split_wire = config.voice_split_wire_task || env_split_wire_task();
+    // PURA-389 §2a/2b wire/control split is the default (issue #93); an
+    // explicit falsy `VOICE_SPLIT_WIRE_TASK` is the kill switch back to the
+    // single loop. The legacy config flag can still force the split on.
+    let split_wire = select_split_wire(env_split_wire_task(), config.voice_split_wire_task);
     info!(
         split_wire,
         "PURA-396 — connected-loop mode selected (split wire/control task = {split_wire})",
@@ -788,24 +787,35 @@ async fn run_connected_loop(
 // task owns it outright and the control task reaches the wire only through
 // the `WireCmd` channel.
 //
-// Gated behind `BotConfig::voice_split_wire_task` (default off) — the
-// single-loop path above is the untouched rollback.
+// On by default since issue #93 (it has run on the Contabo host since
+// PURA-396). `VOICE_SPLIT_WIRE_TASK=0` selects the single-loop path above,
+// which stays as the rollback.
 // ===========================================================================
 
-/// PURA-396 — is the `VOICE_SPLIT_WIRE_TASK` env override set truthy? Lets a
-/// contabo-dev A/B flip the split loop on per pod without a DB write.
-fn env_split_wire_task() -> bool {
-    split_flag_truthy(std::env::var("VOICE_SPLIT_WIRE_TASK").ok().as_deref())
+/// Issue #93 — the split wire/control loop is the default connected loop.
+const DEFAULT_SPLIT_WIRE_TASK: bool = true;
+
+/// Issue #93 — the connected-loop choice. An explicit env override wins;
+/// otherwise the split loop, which the legacy config flag can only force on.
+fn select_split_wire(env: Option<bool>, config_flag: bool) -> bool {
+    env.unwrap_or(DEFAULT_SPLIT_WIRE_TASK || config_flag)
 }
 
-/// PURA-396 — parse a truthy env-flag value: trimmed, case-insensitive on the
+/// PURA-396 — the `VOICE_SPLIT_WIRE_TASK` override, if set. `None` (unset or
+/// unrecognised) means [`DEFAULT_SPLIT_WIRE_TASK`].
+fn env_split_wire_task() -> Option<bool> {
+    split_flag_override(std::env::var("VOICE_SPLIT_WIRE_TASK").ok().as_deref())
+}
+
+/// PURA-396 — parse the env override: trimmed, case-insensitive on the
 /// common spellings. Pure so it is unit-testable without touching the
 /// process environment.
-fn split_flag_truthy(value: Option<&str>) -> bool {
-    matches!(
-        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
-        Some("1") | Some("true") | Some("yes") | Some("on"),
-    )
+fn split_flag_override(value: Option<&str>) -> Option<bool> {
+    match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("1" | "true" | "yes" | "on") => Some(true),
+        Some("0" | "false" | "no" | "off") => Some(false),
+        _ => None,
+    }
 }
 
 /// PURA-396 — a command for the wire task: an operation that needs
@@ -1220,6 +1230,16 @@ async fn run_wire_loop<C: VoiceLoopConn>(
             },
             cmd = wire_cmd_rx.recv() => match cmd {
                 Some(WireCmd::InstallAudio { rx, started_at, seek_base_secs, epoch }) => {
+                    // A fresh play builds a new send-ahead pacer and bursts
+                    // another lead. If a receiver is still installed, the
+                    // listener's jitter buffer still holds the previous one.
+                    // The end-of-voice packet resets that buffer, the same
+                    // way Stop / SkipNext / Seek do. Lead 0 has no pacer
+                    // and no burst; this packet is the reset, not a lead.
+                    if play.is_some() {
+                        audio::send_voice_stop(&mut con);
+                        audio::inline_flush(&mut con);
+                    }
                     play = Some(WirePlay {
                         rx,
                         clock: audio::ContentClock::default(),
@@ -1812,6 +1832,15 @@ async fn handle_audio_command(
             // UI-uploaded cookie takes effect without a manager restart.
             let cookie = yt_cookie.read().unwrap().clone();
             info!(?source, "AudioCommand::Play — spawning pipeline");
+            // Match SkipNext when a play is already live. Dropping the
+            // pipeline alone leaves the wire receiver (and the listener's
+            // jitter buffer) in place, so the replacement's fresh pacer
+            // stacks a second send-ahead lead on top of the first. Lead 0
+            // still builds no pacer and sends no burst.
+            if audio::tear_down(current_audio) {
+                wire.clear_audio();
+                wire.voice_stop_and_flush();
+            }
             if let Err(err) =
                 audio::start_pipeline(current_audio, &source, cookie, bot_volume).await
             {
@@ -2830,18 +2859,28 @@ mod tests {
         assert_flush_on(&on);
     }
 
-    /// PURA-396 — the `VOICE_SPLIT_WIRE_TASK` env override is parsed
-    /// trimmed and case-insensitive on the common truthy spellings;
-    /// anything else (incl. absent) is off.
+    /// Issue #93 — the split loop is on by default. The
+    /// `VOICE_SPLIT_WIRE_TASK` override is parsed trimmed and
+    /// case-insensitive; an explicit falsy value is the kill switch, and
+    /// anything unset or unrecognised falls back to the default.
     #[test]
-    fn split_flag_truthy_accepts_the_common_spellings() {
+    fn split_wire_task_is_on_by_default_and_falsy_env_turns_it_off() {
+        assert!(select_split_wire(None, false), "unset env: the split loop");
+        assert!(
+            !select_split_wire(Some(false), true),
+            "a falsy env is the kill switch"
+        );
+        assert!(select_split_wire(Some(true), false));
         for v in ["1", "true", "TRUE", " yes ", "On", "tRuE"] {
-            assert!(split_flag_truthy(Some(v)), "{v:?} should be truthy");
+            assert_eq!(split_flag_override(Some(v)), Some(true), "{v:?}");
         }
-        for v in ["0", "false", "", "no", "off", "2"] {
-            assert!(!split_flag_truthy(Some(v)), "{v:?} should be falsy");
+        for v in ["0", "false", "FALSE", " no ", "Off"] {
+            assert_eq!(split_flag_override(Some(v)), Some(false), "{v:?}");
         }
-        assert!(!split_flag_truthy(None), "an unset var is off");
+        for v in ["", "2", "maybe"] {
+            assert_eq!(split_flag_override(Some(v)), None, "{v:?}");
+        }
+        assert_eq!(split_flag_override(None), None, "unset uses the default");
     }
 
     /// PURA-396 — the acceptance criterion: a single FIFO `mpsc<WireCmd>`
@@ -3081,6 +3120,68 @@ mod tests {
             "a second call with nothing pending is epoch-stable"
         );
         assert!(rx.try_recv().is_err(), "and ships no further WireCmd");
+    }
+
+    /// Issue #93 — a direct Play over a live pipeline matches SkipNext:
+    /// clear the wire receiver, then the end-of-voice packet, before the
+    /// replacement is spawned. The first play has nothing to flush. Lead 0
+    /// (the default) still builds no pacer; this is the jitter-buffer reset.
+    #[tokio::test]
+    async fn direct_play_over_active_audio_flushes_before_replacement() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<WireCmd>();
+        let store: Arc<dyn MusicBotStore> = Arc::new(InMemoryMusicBotStore::new());
+        let (events, _events_rx) = broadcast::channel(8);
+        let yt_cookie: Arc<RwLock<Option<PathBuf>>> = Arc::new(RwLock::new(None));
+        let volume = VolumeHandle::default();
+        let mut current_audio: Option<ActiveAudio> = None;
+        let source = AudioSource::Url("synthetic://?hz=440&duration_ms=200&amplitude=0".into());
+
+        {
+            let mut wire = WireSink::Split(&tx);
+            handle_audio_command(
+                &mut wire,
+                AudioCommand::Play {
+                    source: source.clone(),
+                },
+                &mut current_audio,
+                BotId(7),
+                &store,
+                &events,
+                &yt_cookie,
+                &volume,
+            )
+            .await;
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "the first play has no previous receiver to clear",
+        );
+        assert!(current_audio.is_some(), "the first play spawned a pipeline");
+
+        {
+            let mut wire = WireSink::Split(&tx);
+            handle_audio_command(
+                &mut wire,
+                AudioCommand::Play { source },
+                &mut current_audio,
+                BotId(7),
+                &store,
+                &events,
+                &yt_cookie,
+                &volume,
+            )
+            .await;
+        }
+        assert!(
+            matches!(rx.try_recv(), Ok(WireCmd::ClearAudio)),
+            "replacement drops the previous wire receiver first",
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(WireCmd::VoiceStop)),
+            "replacement sends the end-of-voice packet",
+        );
+        assert!(rx.try_recv().is_err(), "no further wire commands");
+        assert!(current_audio.is_some(), "the replacement pipeline is live");
     }
 
     /// A bot that can never finish a handshake must still leave when
@@ -3586,6 +3687,73 @@ mod tests {
             "send loop did not reach the post-send events poll: {snapshot:?}"
         );
         snapshot
+    }
+
+    /// Issue #93 — installing audio while a receiver is already live sends
+    /// the end-of-voice packet. The first install has nothing to reset, so
+    /// a second install is exactly one voice-stop, not two.
+    #[tokio::test]
+    async fn install_audio_over_active_play_sends_one_voice_stop() {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let conn = ScriptedConn {
+            queue: std::collections::VecDeque::new(),
+            log: Arc::clone(&log),
+        };
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (evt_tx, _evt_rx) = mpsc::unbounded_channel();
+        let (events, _events_rx) = broadcast::channel(8);
+        let task = tokio::spawn(run_wire_loop(conn, cmd_rx, evt_tx, events));
+        let now = std::time::Instant::now();
+        let (first_tx, first_rx) = mpsc::channel(1);
+        let (second_tx, second_rx) = mpsc::channel(1);
+        cmd_tx
+            .send(WireCmd::InstallAudio {
+                rx: first_rx,
+                started_at: now,
+                seek_base_secs: 0,
+                epoch: 1,
+            })
+            .expect("command channel open");
+        cmd_tx
+            .send(WireCmd::InstallAudio {
+                rx: second_rx,
+                started_at: now,
+                seek_base_secs: 0,
+                epoch: 2,
+            })
+            .expect("command channel open");
+
+        let enqueued = || {
+            log.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .filter(|step| matches!(step, WireStep::Enqueued))
+                .count()
+        };
+        let mut stops = enqueued();
+        for _ in 0..200 {
+            if stops >= 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+            stops = enqueued();
+        }
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        stops = enqueued();
+        let snapshot = log
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        drop(first_tx);
+        drop(second_tx);
+        drop(cmd_tx);
+        task.await.expect("wire loop exits");
+        assert_eq!(
+            stops, 1,
+            "replacing an installed play sends one end-of-voice packet: {snapshot:?}"
+        );
     }
 
     fn wire_log_ready(log: &[WireStep], flush_on: bool) -> bool {

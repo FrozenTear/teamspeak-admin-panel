@@ -32,15 +32,16 @@ pub struct BotConfig {
     /// late-subscriber tolerance, more memory. Default 64 events is
     /// plenty for the WS-5 / WS-6 surfaces.
     pub event_buffer: usize,
-    /// PURA-396 — run the connected loop as a split **wire task** (sole
-    /// `&mut Connection` owner, bounded per-iteration cost) + **control
-    /// task** (chat / queue / pipeline lifecycle). Default `false` keeps
-    /// the single-loop path; `true` is the PURA-389 §2a/2b refactor.
+    /// PURA-396 — force the connected loop to run as a split **wire task**
+    /// (sole `&mut Connection` owner, bounded per-iteration cost) +
+    /// **control task** (chat / queue / pipeline lifecycle).
     ///
-    /// `#[serde(default)]` so configs persisted before this field (the
-    /// PURA-357 `music_bot_runtime` rows) still deserialize. The effective
-    /// value is `OR`-ed with the `VOICE_SPLIT_WIRE_TASK` env var at actor
-    /// start, so a contabo-dev A/B is a pod env flip with no DB write.
+    /// Legacy: since issue #93 the split loop is the default for every bot,
+    /// so `false` here no longer selects the single loop. The switch is the
+    /// `VOICE_SPLIT_WIRE_TASK` env var: unset means the split loop, and an
+    /// explicit falsy value (`0` / `false` / `no` / `off`) selects the single
+    /// loop. `#[serde(default)]` so configs persisted before this field (the
+    /// PURA-357 `music_bot_runtime` rows) still deserialize.
     #[serde(default)]
     pub voice_split_wire_task: bool,
 }
@@ -61,7 +62,11 @@ impl BotConfig {
         }
     }
 
-    /// PURA-396 — opt into the split wire/control loop (default off).
+    /// PURA-396 — set the legacy force-on flag for the split wire/control
+    /// loop. Unset `VOICE_SPLIT_WIRE_TASK` already selects that loop, so
+    /// passing `false` does not opt out. An explicit `0`, `false`, `no`, or
+    /// `off` selects the single loop and beats a stored `true`. This field
+    /// can only force the split on.
     pub fn with_voice_split_wire_task(mut self, on: bool) -> Self {
         self.voice_split_wire_task = on;
         self
@@ -104,14 +109,16 @@ impl std::fmt::Display for BotId {
 mod tests {
     use super::*;
 
-    /// PURA-396 — the split wire/control loop is opt-in: `false` by
-    /// default, flipped by the builder.
+    /// PURA-396 — the legacy force-on config field is `false` by default and
+    /// flipped by the builder. Since issue #93 the split loop is the default
+    /// regardless (see `bot.rs`, `DEFAULT_SPLIT_WIRE_TASK`); this field only
+    /// matters as a force-on and must keep deserializing.
     #[test]
-    fn voice_split_wire_task_defaults_off() {
+    fn voice_split_wire_task_config_field_defaults_false() {
         let cfg = BotConfig::new("bot", "/tmp/bot.identity");
         assert!(
             !cfg.voice_split_wire_task,
-            "default must be the single-loop path"
+            "the legacy config field defaults to false"
         );
         assert!(
             BotConfig::new("bot", "/tmp/bot.identity")
