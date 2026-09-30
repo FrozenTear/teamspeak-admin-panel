@@ -215,7 +215,32 @@ fn merge_from_panel_label(mut labels: Vec<String>) -> Vec<String> {
 }
 
 impl Config {
+    /// Read the process environment. `MUSIC_RUNTIME_TOKEN` goes through
+    /// [`crate::music_runtime::MusicRuntimeToken::from_env`] (`var_os`
+    /// into [`crate::music_runtime::MusicRuntimeToken::from_os_value`]).
+    /// A non-UTF-8 value is refused before the rest of the environment
+    /// is read.
     pub fn load() -> Result<Self> {
+        let music_runtime_token = crate::music_runtime::MusicRuntimeToken::from_env()?;
+        Self::finish_load(music_runtime_token)
+    }
+
+    /// Same token refusal as [`Self::load`], with the bytes supplied by
+    /// the caller so a test does not mutate the process environment.
+    /// A non-UTF-8 value returns before [`Self::finish_load`], so the
+    /// error does not depend on `JWT_SECRET`.
+    #[cfg(test)]
+    fn load_with_music_runtime_token(
+        music_runtime_token_raw: Option<&std::ffi::OsStr>,
+    ) -> Result<Self> {
+        let music_runtime_token =
+            crate::music_runtime::MusicRuntimeToken::from_os_value(music_runtime_token_raw)?;
+        Self::finish_load(music_runtime_token)
+    }
+
+    fn finish_load(
+        music_runtime_token: Option<crate::music_runtime::MusicRuntimeToken>,
+    ) -> Result<Self> {
         let node_env = NodeEnv::from_env_string(env::var("NODE_ENV").ok().as_deref());
 
         let raw_jwt_secret = env::var("JWT_SECRET").ok();
@@ -250,7 +275,6 @@ impl Config {
         let sidecar_url = optional_env("SIDECAR_URL");
         let sidecar_binary_path = optional_env("SIDECAR_BINARY_PATH").map(PathBuf::from);
         let music_runtime_url = optional_env("MUSIC_RUNTIME_URL");
-        let music_runtime_token = crate::music_runtime::MusicRuntimeToken::from_env()?;
         let moq_public_url = optional_env("MOQ_PUBLIC_URL");
         let yt_cookie_file = optional_env("YT_COOKIE_FILE").map(PathBuf::from);
         let youtube_api_key = optional_env("YOUTUBE_API_KEY");
@@ -594,6 +618,24 @@ mod tests {
             }
             .is_configured()
         );
+    }
+
+    /// `Config::load` refuses a non-UTF-8 `MUSIC_RUNTIME_TOKEN` without
+    /// printing the bytes. The process environment is not mutated: parallel
+    /// tests share it, so this calls the same function `load` uses.
+    #[cfg(unix)]
+    #[test]
+    fn load_refuses_non_utf8_music_runtime_token() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let raw = std::ffi::OsStr::from_bytes(b"not-utf8-\xff-token");
+        let err = Config::load_with_music_runtime_token(Some(raw))
+            .expect_err("startup must refuse a non-utf8 token");
+        let msg = err.to_string();
+        assert!(msg.contains("Refusing to start"), "{msg}");
+        assert!(msg.to_lowercase().contains("utf-8"), "{msg}");
+        assert!(!msg.contains("not-utf8"), "{msg}");
+        assert!(!format!("{err:?}").contains("not-utf8"), "{err:?}");
     }
 
     #[test]

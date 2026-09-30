@@ -255,15 +255,19 @@ For all three shapes the external smoke is the same: `curl -fsS http://127.0.0.1
 | Shape | Start | Stop | Restart |
 | --- | --- | --- | --- |
 | Quadlet | `systemctl --user start ts6-manager-pod.service` | `systemctl --user stop ts6-manager-pod.service` | `systemctl --user restart ts6-manager-pod.service` |
-| Kube | `./scripts/update.sh vX.Y.Z` | `podman kube down deploy/kube/ts6-manager.yaml` (never `--force`) | `./scripts/update.sh vX.Y.Z` |
+| Kube | `./scripts/update.sh vX.Y.Z` | rewritten manifest, never the committed file and never `--force` ([Bring down](../deploy/kube/README.md#bring-down)) | `./scripts/update.sh vX.Y.Z` |
 | Compose | `podman-compose up -d fullstack` | `podman-compose down` | `podman-compose restart fullstack` |
 
 Kube start and restart are only `./scripts/update.sh vX.Y.Z`. Do not
 `podman kube play` the committed manifest: fullstack, music, and
 sidecar are `@UNRELEASED`, which fails reference parsing before any pull.
-`kube down` removes the pod and containers but leaves the named
+`kube down` of a rewritten manifest (not the committed
+`@UNRELEASED` file; see [Bring down](../deploy/kube/README.md#bring-down))
+removes the pod and containers but leaves the named
 volumes (`ts6-data`, `ts6-db`, `ts6-music`) intact, so data survives a
-restart. `ts6-data` backs the manager state root and is what keeps a
+restart. Podman 4.4–5.6 only reads the pod name during down, so the
+committed file happens to work there; the documented stop is still
+the rewritten copy. `ts6-data` backs the manager state root and is what keeps a
 yt-dlp cookie uploaded via Settings from being wiped on redeploy
 ([PURA-314](https://github.com/FrozenTear/teamspeak-admin-panel/issues)).
 

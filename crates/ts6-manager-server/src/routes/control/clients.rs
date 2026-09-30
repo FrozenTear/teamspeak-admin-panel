@@ -236,9 +236,11 @@ pub async fn mute(
 }
 
 /// Restore the `client_is_talker` talker flag — the TS6 server-side unmute
-/// primitive (PURA-292/PURA-299). TS6 rejects `client_is_talker=1` with `1538`
-/// when the target is not in a moderated channel; in that case the client can
-/// already speak, so we treat `1538` as success.
+/// primitive (PURA-292/PURA-299). TS6 rejects `client_is_talker=1` with
+/// `1538` (invalid parameter: the channel is not moderated, the query
+/// lacks permission, or the flag does not apply). That reply is an
+/// upstream error, mapped like every other TeamSpeak error on mute:
+/// the §7.0.2 envelope, not 204, and no `ts:client:unmuted` publish.
 pub async fn unmute(
     State(state): State<AppState>,
     RequireServerAccess { user, .. }: RequireServerAccess,
@@ -249,20 +251,7 @@ pub async fn unmute(
     let started = Instant::now();
     let action = "client.unmute";
     let details = format!("clid={clid} client_is_talker=1");
-    let result = match client.client_set_talker(sid, clid, true).await {
-        Ok(()) => Ok(()),
-        Err(ref e) if e.upstream_code() == 1538 => {
-            // Target not in a moderated channel — client can already speak.
-            tracing::info!(
-                sid,
-                clid,
-                "unmute: TS6 1538 — target not in a moderated channel, talker flag moot"
-            );
-            Ok(())
-        }
-        Err(e) => Err(e),
-    };
-    match result {
+    match client.client_set_talker(sid, clid, true).await {
         Ok(()) => {
             emit_success(
                 &state,

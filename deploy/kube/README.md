@@ -32,8 +32,11 @@ The script is cwd-agnostic. It rewrites fullstack, music, and sidecar
 checkout still has the committed `@UNRELEASED` placeholder or a legacy
 `:vX.Y.Z` pin — `podman pull`s those GHCR images (required — the
 manifest uses `imagePullPolicy: IfNotPresent`), `podman kube down`s
-the rewritten temp manifest **without** `--force` (same pod name;
-the committed file's image refs do not parse), plays that file (pod-only
+the rewritten temp manifest **without** `--force` (same pod name
+`ts6-manager`. The committed file is `@UNRELEASED`. Podman 4.4–5.6
+only reads the pod name during down, and the script still downs the
+rewritten copy so a later podman that checks image refs cannot abort
+teardown), plays that file (pod-only
 if `podman secret exists ts6-manager-secrets`, otherwise concatenates
 `deploy/kube/secrets.yaml`), curls fullstack
 `http://127.0.0.1:3001/health` **and** music
@@ -115,14 +118,32 @@ podman logs ts6-manager-fullstack
 
 ## Bring down
 
-```bash
-podman kube down deploy/kube/ts6-manager.yaml
-```
-
 `kube down` stops and removes the pod + containers, but leaves the
 PVC-backed named volumes (`ts6-data`, `ts6-db`, `ts6-music`) intact so
 data survives. `--force` is the opt-in flag for wiping volumes — do not
 pass it during normal redeploys.
+
+Down reads a YAML file and keys off the pod name. `scripts/update.sh`
+refuses the committed manifest and downs a rewritten copy: same pod
+name `ts6-manager`, image refs that parse. The committed file's
+`@UNRELEASED` images are not a valid reference. Podman 4.4.4, 5.6.0,
+and current main only read `metadata.name` during down, so
+`podman kube down deploy/kube/ts6-manager.yaml` happens to succeed on
+those versions. A podman that checks image refs would fail that file
+before teardown. Manual stop uses a rewritten copy, the same rule as
+`update.sh` and the [local-build recipe](#override-to-a-local-build-pre-publish-smoke):
+
+```bash
+sed -E \
+  -e 's#(image:[[:space:]]+ghcr\.io/frozentear/ts6-manager-fullstack)[:@][^[:space:]]+#\1:down#' \
+  -e 's#(image:[[:space:]]+ghcr\.io/frozentear/ts6-manager-music)[:@][^[:space:]]+#\1:down#' \
+  -e 's#(image:[[:space:]]+ghcr\.io/frozentear/ts6-manager-sidecar)[:@][^[:space:]]+#\1:down#' \
+  -e 's#(image:[[:space:]]+[^[:space:]]*ts6-manager-[A-Za-z0-9._-]+)[:@][^[:space:]]+#\1:down#' \
+  deploy/kube/ts6-manager.yaml > /tmp/ts6-manager.kube.down.yaml
+podman kube down /tmp/ts6-manager.kube.down.yaml
+```
+
+`:down` is only there so the file parses. Down does not pull that tag.
 
 > Note: podman's `kube down` output **always** prints a literal
 > `Volumes removed:` header, even when no volumes were removed. Read
@@ -174,6 +195,16 @@ sed -E \
   -e 's#(image:[[:space:]]+)ghcr\.io/frozentear/ts6-manager-sidecar[:@][^[:space:]]+#\1localhost/ts6-manager-sidecar:dev#' \
   -e 's#imagePullPolicy: IfNotPresent#imagePullPolicy: Never#' \
   deploy/kube/ts6-manager.yaml > /tmp/ts6-manager.kube.override.yaml
+
+# Down this rendered file, not deploy/kube/ts6-manager.yaml. The
+# committed images are @UNRELEASED. update.sh refuses that file, and
+# Bring down uses a rewritten copy for the same reason. Podman 4.4–5.6
+# only reads metadata.name, so the committed file happens to parse
+# there; this recipe still downs the rendered file. A second smoke
+# otherwise leaves the pod in place and the next play conflicts.
+if podman pod exists ts6-manager; then
+  podman kube down /tmp/ts6-manager.kube.override.yaml
+fi
 
 # Same secret rule as update.sh: concat only when the host secret is absent.
 if podman secret exists ts6-manager-secrets; then
@@ -312,5 +343,5 @@ This matches the Quadlet `ts6-manager.pod` topology in
 - `./scripts/update.sh vX.Y.Z` is the only start/restart and succeeds on a Podman ≥ 4.4 host when that tag is published for fullstack, music, and sidecar.
 - `podman kube play` of the committed manifest fails reference parsing (`@UNRELEASED` on fullstack, music, and sidecar).
 - `curl http://localhost:3001/health` returns 200.
-- `podman kube down deploy/kube/ts6-manager.yaml` cleans up the pod.
+- `podman kube down` of the rewritten manifest (see [Bring down](#bring-down)) cleans up the pod. Do not down the committed file.
 - Data on PVCs `ts6-data`, `ts6-db` and `ts6-music` survives `kube down` and is reachable after the next `./scripts/update.sh` — including a yt-dlp cookie uploaded via Settings.

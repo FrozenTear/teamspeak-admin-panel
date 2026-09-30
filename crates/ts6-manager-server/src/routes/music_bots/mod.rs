@@ -107,6 +107,9 @@ pub(super) fn music_runtime_auth() -> Response {
         .into_response()
 }
 
+/// A runtime HTTP 401 is 502 `music_runtime_auth`. That 401 also sets
+/// the shared latch in the music runtime, which pauses every other
+/// bot's event stream until a later authenticated 2xx clears it.
 pub(super) fn map_music_runtime_error(err: crate::music_runtime::MusicRuntimeError) -> Response {
     use crate::music_runtime::MusicRuntimeError;
     match err {

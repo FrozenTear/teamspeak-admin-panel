@@ -21,7 +21,7 @@ use music_bot::{
     MusicBotStore, NewLibraryEntry, NewTrack, PlaylistName, SendError, StoreError, StoreResult,
     Track, TrackId,
 };
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, Notify, broadcast};
 use tracing::{info, warn};
 
 /// Environment variable holding the shared bearer for the music control
@@ -56,6 +56,8 @@ impl MusicRuntimeToken {
     /// refusal come from [`music_bot::runtime_http::ControlAuth`], so a
     /// stray space cannot disagree with the music process. A present
     /// non-UTF-8 value is that error and does not mean "no auth".
+    /// [`crate::config::Config::load`] reads the same variable with
+    /// `var_os` and passes it to [`Self::from_os_value`].
     pub fn from_env() -> Result<Option<Self>, music_bot::runtime_http::ControlAuthError> {
         match std::env::var_os(MUSIC_RUNTIME_TOKEN_ENV) {
             None => Ok(None),
@@ -250,6 +252,32 @@ impl MusicBotFront {
     ) -> Self {
         Self {
             inner: FrontInner::Remote(RemoteMusicRuntime::new(base_url, token)),
+        }
+    }
+
+    /// Latch tests. The 401 backoff is zero so the pump-stopped signal
+    /// is not a wall-clock sleep. Production [`Self::remote_with_token`]
+    /// keeps the one-second backoff.
+    #[cfg(test)]
+    fn remote_for_latch_tests(
+        base_url: impl Into<String>,
+        token: Option<MusicRuntimeToken>,
+    ) -> Self {
+        let mut runtime = RemoteMusicRuntime::new(base_url, token);
+        runtime.auth_backoff = Duration::ZERO;
+        Self {
+            inner: FrontInner::Remote(runtime),
+        }
+    }
+
+    #[cfg(test)]
+    fn auth_notifies(&self) -> (Arc<Notify>, Arc<Notify>) {
+        match &self.inner {
+            FrontInner::Remote(runtime) => (
+                Arc::clone(&runtime.auth_latched),
+                Arc::clone(&runtime.auth_pump_stopped),
+            ),
+            FrontInner::Local(_) => panic!("auth latch is remote-only"),
         }
     }
 
@@ -565,13 +593,26 @@ struct RemoteMusicRuntime {
     /// `None` when `MUSIC_RUNTIME_TOKEN` is unset. Not logged.
     token: Option<MusicRuntimeToken>,
     pumps: Arc<Mutex<HashMap<BotId, broadcast::Sender<BotEvent>>>>,
-    /// Set when the runtime answers 401. `subscribe` then refuses to
-    /// open another stream, so a browser `EventSource` retry cannot
-    /// hammer the control API. Cleared after a successful authenticated
-    /// response (including a successful SSE connect) so a corrected
-    /// token recovers without restarting fullstack. A 401 itself waits
-    /// out the reconnect backoff and does not loop.
+    /// One latch for every bot on this runtime, not one per bot.
+    /// Any music-runtime HTTP 401 (list, command, store, settings, or
+    /// one bot's event stream) sets it. Panel routes map that 401 to
+    /// 502 `music_runtime_auth`. While it is set, `subscribe` refuses
+    /// every bot, and every other bot's event pump stops at its next
+    /// loop check instead of reconnecting. A later 2xx clears it for
+    /// all of them together. A 401 itself waits out
+    /// [`Self::auth_backoff`] and does not loop, so a browser
+    /// `EventSource` retry cannot hammer the control API.
     sse_auth_failed: Arc<AtomicBool>,
+    /// Wakes a waiter when [`Self::sse_auth_failed`] becomes true.
+    /// Nothing in production waits on it.
+    auth_latched: Arc<Notify>,
+    /// Wakes a waiter when an event pump stops because of that latch
+    /// and is not restarted.
+    auth_pump_stopped: Arc<Notify>,
+    /// Delay after a 401 before the event pump stops. Production is
+    /// one second. Latch tests set this to zero so the stop signal is
+    /// not tied to a wall-clock sleep.
+    auth_backoff: Duration,
 }
 
 impl RemoteMusicRuntime {
@@ -596,6 +637,9 @@ impl RemoteMusicRuntime {
             token,
             pumps: Arc::new(Mutex::new(HashMap::new())),
             sse_auth_failed: Arc::new(AtomicBool::new(false)),
+            auth_latched: Arc::new(Notify::new()),
+            auth_pump_stopped: Arc::new(Notify::new()),
+            auth_backoff: Duration::from_secs(1),
         }
     }
 
@@ -622,9 +666,11 @@ impl RemoteMusicRuntime {
     /// until a later authenticated call succeeds.
     fn log_unauthorized(&self, op: &'static str) {
         self.sse_auth_failed.store(true, Ordering::SeqCst);
+        // Shared across bots: this 401 pauses every event stream.
+        self.auth_latched.notify_waiters();
         warn!(
             op,
-            "music runtime returned 401; panel routes answer 502 music_runtime_auth"
+            "music runtime returned 401; panel routes answer 502 music_runtime_auth; other bots' event streams pause on the shared latch"
         );
     }
 
@@ -757,6 +803,7 @@ impl RemoteMusicRuntime {
         id: BotId,
     ) -> Result<Option<broadcast::Receiver<BotEvent>>, MusicRuntimeError> {
         if self.sse_auth_failed.load(Ordering::SeqCst) {
+            // Shared latch: a 401 for any bot pauses this subscribe too.
             return Err(MusicRuntimeError::unauthorized());
         }
         let bots = self.list().await?;
@@ -779,6 +826,9 @@ impl RemoteMusicRuntime {
             tx: tx.clone(),
             pumps: Arc::clone(&self.pumps),
             sse_auth_failed: Arc::clone(&self.sse_auth_failed),
+            auth_latched: Arc::clone(&self.auth_latched),
+            auth_pump_stopped: Arc::clone(&self.auth_pump_stopped),
+            auth_backoff: self.auth_backoff,
         });
         pumps.insert(id, tx);
         Ok(Some(rx))
@@ -911,6 +961,9 @@ struct EventPump {
     tx: broadcast::Sender<BotEvent>,
     pumps: Arc<Mutex<HashMap<BotId, broadcast::Sender<BotEvent>>>>,
     sse_auth_failed: Arc<AtomicBool>,
+    auth_latched: Arc<Notify>,
+    auth_pump_stopped: Arc<Notify>,
+    auth_backoff: Duration,
 }
 
 fn start_event_pump(pump: EventPump) {
@@ -929,6 +982,12 @@ fn start_event_pump(pump: EventPump) {
         // set. A later 2xx clears it.
         if matches!(end, PumpEnd::Auth) || existing.receiver_count() == 0 {
             map.remove(&pump.id);
+            if matches!(end, PumpEnd::Auth) {
+                // The shared latch already paused every other bot. This
+                // signal is only so a test can observe the stop without
+                // sleeping through the backoff.
+                pump.auth_pump_stopped.notify_waiters();
+            }
             return;
         }
         let restart = EventPump {
@@ -939,6 +998,9 @@ fn start_event_pump(pump: EventPump) {
             tx: existing.clone(),
             pumps: Arc::clone(&pump.pumps),
             sse_auth_failed: Arc::clone(&pump.sse_auth_failed),
+            auth_latched: Arc::clone(&pump.auth_latched),
+            auth_pump_stopped: Arc::clone(&pump.auth_pump_stopped),
+            auth_backoff: pump.auth_backoff,
         };
         drop(map);
         start_event_pump(restart);
@@ -981,6 +1043,8 @@ async fn pump_events(pump: &EventPump) -> PumpEnd {
     let url = format!("{}/v1/bots/{}/events", pump.base, pump.id.0);
     loop {
         if pump.sse_auth_failed.load(Ordering::SeqCst) {
+            // A 401 on any runtime call (mapped to 502 music_runtime_auth)
+            // set the shared latch. This bot's stream pauses with the others.
             return PumpEnd::Auth;
         }
         if pump.tx.receiver_count() == 0 {
@@ -1025,14 +1089,18 @@ async fn pump_events(pump: &EventPump) -> PumpEnd {
             }
             Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED => {
                 pump.sse_auth_failed.store(true, Ordering::SeqCst);
+                // One latch for every bot. Panel routes map this 401 to
+                // 502 music_runtime_auth, and the other pumps see the
+                // flag at the top of their loop.
+                pump.auth_latched.notify_waiters();
                 warn!(
                     bot = %pump.id,
-                    "music runtime returned 401 on the event stream; backing off and not reconnecting"
+                    "music runtime returned 401 on the event stream; backing off and not reconnecting; other bots' event streams pause on the shared latch"
                 );
-                // Same 1s backoff as a transient SSE error, then stop.
+                // Same backoff as a transient SSE error, then stop.
                 // The next subscribe stays closed until a 2xx clears
                 // the latch, so this does not become a retry storm.
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::time::sleep(pump.auth_backoff).await;
                 return PumpEnd::Auth;
             }
             Ok(resp) => {
@@ -1043,6 +1111,8 @@ async fn pump_events(pump: &EventPump) -> PumpEnd {
             }
         }
         if pump.sse_auth_failed.load(Ordering::SeqCst) {
+            // Shared latch, including a 401 that landed on another bot
+            // while this pump was in the transient-error backoff.
             return PumpEnd::Auth;
         }
         if pump.tx.receiver_count() == 0 {
@@ -1352,6 +1422,36 @@ mod tests {
     #[derive(Clone)]
     struct HitLog {
         hits: Arc<Mutex<Vec<Hit>>>,
+        /// Wakes a waiter after a hit is recorded. Tests enable it
+        /// before the call so they do not sleep for the request.
+        hit: Arc<Notify>,
+    }
+
+    impl HitLog {
+        fn new() -> Self {
+            Self {
+                hits: Arc::new(Mutex::new(Vec::new())),
+                hit: Arc::new(Notify::new()),
+            }
+        }
+
+        async fn wait_until(&self, pred: impl Fn(&[Hit]) -> bool) {
+            loop {
+                let notified = self.hit.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if pred(&self.hits.lock().await.clone()) {
+                    return;
+                }
+                notified.await;
+            }
+        }
+
+        fn event_count(hits: &[Hit]) -> usize {
+            hits.iter()
+                .filter(|hit| hit.path.ends_with("/events"))
+                .count()
+        }
     }
 
     #[derive(Debug, Clone)]
@@ -1367,15 +1467,16 @@ mod tests {
         /// `GET /v1/bots` stays open so subscribe can start the pump.
         /// The event stream answers 401.
         EventsUnauthorized,
+        /// `GET /v1/bots` answers 401. Event streams stay open so a
+        /// test can see that the shared latch never opens one.
+        ListUnauthorized,
         /// When the flag is true, `/events` answers 401. A test clears
         /// it to simulate the runtime accepting the bearer again.
         EventsGate(Arc<AtomicBool>),
     }
 
     async fn serve_mock(mode: MockMode) -> (String, HitLog) {
-        let log = HitLog {
-            hits: Arc::new(Mutex::new(Vec::new())),
-        };
+        let log = HitLog::new();
         let state = (log.clone(), mode);
         let app = Router::new()
             .route("/health", get(|| async { "ok" }))
@@ -1460,16 +1561,22 @@ mod tests {
             .map(str::to_string);
         let method = req.method().to_string();
         let path = req.uri().path().to_string();
+        let deny_list =
+            path == "/v1/bots" && method == "GET" && matches!(mode, MockMode::ListUnauthorized);
         log.hits.lock().await.push(Hit {
             method,
             path: path.clone(),
             authorization,
         });
+        log.hit.notify_waiters();
+        if deny_list {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
         let deny_events = path.ends_with("/events")
             && match &mode {
                 MockMode::EventsUnauthorized => true,
                 MockMode::EventsGate(deny) => deny.load(Ordering::SeqCst),
-                MockMode::Allow => false,
+                MockMode::Allow | MockMode::ListUnauthorized => false,
             };
         if deny_events {
             return StatusCode::UNAUTHORIZED.into_response();
@@ -1481,7 +1588,7 @@ mod tests {
         MusicRuntimeToken::parse("panel-runtime-token-test").unwrap()
     }
 
-    async fn exercise_remote_calls(front: &MusicBotFront) {
+    async fn exercise_remote_calls(front: &MusicBotFront, log: &HitLog) {
         assert!(front.wait_until_healthy(3).await);
         front.list().await.expect("list");
         let cfg = BotConfig::new(
@@ -1516,7 +1623,7 @@ mod tests {
             .await
             .expect("subscribe list")
             .expect("bot exists");
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        log.wait_until(|hits| HitLog::event_count(hits) >= 1).await;
         drop(rx);
     }
 
@@ -1541,7 +1648,7 @@ mod tests {
     async fn bearer_header_is_sent_on_every_runtime_call_when_token_is_set() {
         let (url, log) = serve_mock(MockMode::Allow).await;
         let front = MusicBotFront::remote_with_token(url, Some(bearer_token()));
-        exercise_remote_calls(&front).await;
+        exercise_remote_calls(&front, &log).await;
         let hits = log.hits.lock().await.clone();
         assert_paths_covered(&hits);
         for hit in &hits {
@@ -1560,7 +1667,7 @@ mod tests {
     async fn unset_token_sends_no_authorization_header() {
         let (url, log) = serve_mock(MockMode::Allow).await;
         let front = MusicBotFront::remote(url);
-        exercise_remote_calls(&front).await;
+        exercise_remote_calls(&front, &log).await;
         let hits = log.hits.lock().await.clone();
         assert_paths_covered(&hits);
         for hit in &hits {
@@ -1574,23 +1681,39 @@ mod tests {
         }
     }
 
+    /// Arm `notify` before the call that sets it. `notify_waiters` does
+    /// not store a permit, so a waiter registered afterwards misses it.
+    fn arm_notify(notify: &Notify) -> tokio::sync::futures::Notified<'_> {
+        let wait = notify.notified();
+        // enable is on the pinned future; callers pin the return value.
+        wait
+    }
+
     #[tokio::test]
     async fn event_stream_does_not_reconnect_after_401() {
         let (url, log) = serve_mock(MockMode::EventsUnauthorized).await;
-        let front = MusicBotFront::remote_with_token(url, Some(bearer_token()));
+        let front = MusicBotFront::remote_for_latch_tests(url, Some(bearer_token()));
+        let (latched, stopped) = front.auth_notifies();
+        let latched_wait = arm_notify(&latched);
+        let stopped_wait = arm_notify(&stopped);
+        tokio::pin!(latched_wait);
+        tokio::pin!(stopped_wait);
+        latched_wait.as_mut().enable();
+        stopped_wait.as_mut().enable();
+
         let rx = front
             .subscribe(BotId(1))
             .await
             .expect("list is open")
             .expect("bot exists");
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let again = front.subscribe(BotId(1)).await;
+        latched_wait.await;
+        let other = front.subscribe(BotId(2)).await;
         assert!(
-            again.expect_err("auth latch").is_auth(),
-            "a second subscribe must not open another event stream"
+            other.expect_err("shared latch pauses every bot").is_auth(),
+            "a 401 on one event stream must pause the other bots"
         );
+        stopped_wait.await;
         drop(rx);
-        tokio::time::sleep(Duration::from_secs(2)).await;
         let hits = log.hits.lock().await.clone();
         let events: Vec<_> = hits
             .iter()
@@ -1605,47 +1728,61 @@ mod tests {
             events[0].authorization.as_deref(),
             Some("Bearer panel-runtime-token-test")
         );
+        assert!(
+            events.iter().all(|hit| hit.path.ends_with("/1/events")),
+            "the paused bot must not open its own stream: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn any_runtime_401_pauses_every_bots_event_stream() {
+        let (url, log) = serve_mock(MockMode::ListUnauthorized).await;
+        let front = MusicBotFront::remote_with_token(url, Some(bearer_token()));
+        let err = front.list().await.expect_err("list 401");
+        assert!(err.is_auth());
+        let paused = front.subscribe(BotId(2)).await;
+        assert!(
+            paused
+                .expect_err("list 401 pauses every bot's event stream")
+                .is_auth()
+        );
+        let hits = log.hits.lock().await.clone();
+        assert_eq!(
+            HitLog::event_count(&hits),
+            0,
+            "a latched 401 must not open an event stream: {hits:?}"
+        );
     }
 
     #[tokio::test]
     async fn auth_latch_clears_after_successful_runtime_response() {
         let deny_events = Arc::new(AtomicBool::new(true));
         let (url, log) = serve_mock(MockMode::EventsGate(Arc::clone(&deny_events))).await;
-        let front = MusicBotFront::remote_with_token(url, Some(bearer_token()));
+        let front = MusicBotFront::remote_for_latch_tests(url, Some(bearer_token()));
+        let (latched, stopped) = front.auth_notifies();
+        let latched_wait = arm_notify(&latched);
+        let stopped_wait = arm_notify(&stopped);
+        tokio::pin!(latched_wait);
+        tokio::pin!(stopped_wait);
+        latched_wait.as_mut().enable();
+        stopped_wait.as_mut().enable();
+
         let rx = front
             .subscribe(BotId(1))
             .await
             .expect("list is open")
             .expect("bot exists");
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        latched_wait.await;
         assert!(
             front
-                .subscribe(BotId(1))
+                .subscribe(BotId(2))
                 .await
-                .expect_err("401 latches the event stream")
+                .expect_err("401 latches every bot's event stream")
                 .is_auth()
         );
-        let events_while_latched = log
-            .hits
-            .lock()
-            .await
-            .iter()
-            .filter(|hit| hit.path.ends_with("/events"))
-            .count();
-        assert_eq!(
-            events_while_latched, 1,
-            "a latched 401 must not open another event stream"
-        );
-        // The pump backs off once, then stops. It must not reconnect.
-        tokio::time::sleep(Duration::from_millis(1200)).await;
-        let events_after_backoff = log
-            .hits
-            .lock()
-            .await
-            .iter()
-            .filter(|hit| hit.path.ends_with("/events"))
-            .count();
-        assert_eq!(events_after_backoff, 1, "401 backoff must not retry");
+        stopped_wait.await;
+        let events_after_stop = HitLog::event_count(&log.hits.lock().await.clone());
+        assert_eq!(events_after_stop, 1, "401 backoff must not retry");
         drop(rx);
 
         deny_events.store(false, Ordering::SeqCst);
@@ -1655,19 +1792,13 @@ mod tests {
             .await
             .expect("latch cleared")
             .expect("bot exists");
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        log.wait_until(|hits| HitLog::event_count(hits) >= 2).await;
         front
             .subscribe(BotId(1))
             .await
             .expect("successful event stream keeps the latch clear")
             .expect("bot exists");
-        let events_after_recovery = log
-            .hits
-            .lock()
-            .await
-            .iter()
-            .filter(|hit| hit.path.ends_with("/events"))
-            .count();
+        let events_after_recovery = HitLog::event_count(&log.hits.lock().await.clone());
         assert!(
             events_after_recovery >= 2,
             "recovery must open the event stream again, saw {events_after_recovery}"
@@ -1734,9 +1865,7 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(LogCapture(Arc::clone(&logs)));
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        let log = HitLog {
-            hits: Arc::new(Mutex::new(Vec::new())),
-        };
+        let log = HitLog::new();
         let app = Router::new().route("/v1/bots", get(|| async { StatusCode::UNAUTHORIZED }));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1777,7 +1906,7 @@ mod tests {
         }
         let (url, log) = serve_mock(MockMode::Allow).await;
         let front = MusicBotFront::remote_with_token(url, MusicRuntimeToken::parse(" \t "));
-        exercise_remote_calls(&front).await;
+        exercise_remote_calls(&front, &log).await;
         let hits = log.hits.lock().await.clone();
         assert_paths_covered(&hits);
         for hit in &hits {
@@ -1892,9 +2021,9 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        // `from_env` is `var_os` plus `from_os_value`. Startup calls that
-        // wrapper; the refusal itself is the pure parser above, so this
-        // test does not mutate the process environment.
+        // `Config::load` is `var_os` into `from_os_value` (same as
+        // `from_env`). The `Config::load` refusal test lives next to
+        // `load`. This one does not mutate the process environment.
         let missing = MusicRuntimeToken::from_os_value(None).unwrap();
         assert!(missing.is_none());
     }

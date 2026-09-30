@@ -1236,6 +1236,54 @@ async fn unmute_resets_talker_flag() {
     assert_eq!(last.get("client_is_talker").map(|s| s.as_str()), Some("1"));
 }
 
+/// TeamSpeak `1538` on `client_is_talker=1` is an upstream error. The
+/// route must not answer 204 and must not publish `ts:client:unmuted`.
+#[tokio::test]
+async fn unmute_team_speak_1538_is_not_no_content_and_does_not_publish() {
+    let (port, mock) = boot_mock_webquery("API-KEY").await;
+    *mock.behavior.force_upstream_error.lock().unwrap() = Some((1538, "invalid parameter".into()));
+    let state = fresh_state().await;
+    let server = seed_server(&state, port, "API-KEY").await;
+    let (_admin, atoken) = seed_user_with_token(&state, "alice", "admin").await;
+
+    let admin_principal = crate::ws::auth::Principal::User(crate::ws::auth::UserPrincipal {
+        user_id: 1,
+        username: "alice".into(),
+        role: "admin".into(),
+        is_admin: true,
+        is_at_least_moderator: true,
+        access_exp: i64::MAX,
+    });
+    let topic = crate::ws::topic::Topic::new(server.id, crate::ws::topic::TopicKind::Clients);
+    let mut sub = state
+        .ws_hub
+        .subscribe(&state.db, &admin_principal, topic, None)
+        .await
+        .unwrap();
+
+    let resp = app(state)
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/servers/{}/vs/1/clients/14/unmute", server.id))
+                .header("authorization", auth_header(&atoken))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    let v = read_body_value(resp).await;
+    assert_eq!(v["error"], "TeamSpeak API Error");
+    assert_eq!(v["code"], 1538);
+    assert_eq!(v["details"], "invalid parameter");
+    assert!(
+        sub.receiver.try_recv().is_err(),
+        "1538 must not publish ts:client:unmuted"
+    );
+}
+
 #[tokio::test]
 async fn ban_create_returns_banid_and_lists_round_trip() {
     let (port, _mock) = boot_mock_webquery("API-KEY").await;

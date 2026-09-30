@@ -103,6 +103,14 @@ systemctl --user restart ts6-manager-pod.service
 # `@UNRELEASED` and fail reference parsing.
 $EDITOR deploy/kube/secrets.yaml         # populate JWT_SECRET
 # update.sh re-reads secrets.yaml only when the host secret is absent.
+# `podman secret rm` fails while the pod still mounts the secret
+# (podman: the secret is in use). That is a hard error, not a warning
+# you can ignore. Down the pod first, using a rewritten manifest —
+# not deploy/kube/ts6-manager.yaml. See deploy/kube/README.md § Bring down.
+# rm deletes the host secret. The next update.sh recreates it from the
+# secrets.yaml you just edited. If that file is missing, update.sh
+# refuses to start. Do not rm the secret until the file is filled in.
+# After the Bring down `podman kube down` of the rewritten copy:
 if podman secret exists ts6-manager-secrets; then
   podman secret rm ts6-manager-secrets
 fi

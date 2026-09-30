@@ -10,9 +10,11 @@
 #
 # The script rewrites a temp copy so every ts6-manager-* image is on
 # that tag (the committed placeholder, or a legacy `:vX.Y.Z` still on
-# a live checkout), pulls, then plays. Stop with:
-#
-#   podman kube down deploy/kube/ts6-manager.yaml
+# a live checkout), pulls, then plays. Stop with a rewritten copy of
+# this file, not this file itself. `@UNRELEASED` is an invalid image
+# reference. Podman 4.4–5.6 only reads metadata.name during down, so
+# down of this file happens to work there; a podman that checks image
+# refs would fail before teardown. See deploy/kube/README.md § Bring down.
 #
 # Never `podman kube down --force` (wipes ts6-data / ts6-db / ts6-music).
 # See deploy/kube/README.md. Topology mirrors podman-compose.yml + the

@@ -765,10 +765,11 @@ impl WebQueryClient {
     /// (`channel_needed_talk_power > 0`).
     ///
     /// TS6 accepts `client_is_talker=0` in any channel, but rejects `=1`
-    /// with `1538` when the target is not in a moderated channel — callers
-    /// that "unmute" must tolerate that code (the client can already speak
-    /// there). `&[(&str, &str)]` keeps this on the audited `clientedit`
-    /// path shared with [`Self::clientedit_raw`].
+    /// with `1538` when the target is not in a moderated channel (also
+    /// insufficient permissions and other invalid-parameter cases).
+    /// `POST .../unmute` maps that code like any other upstream error.
+    /// `&[(&str, &str)]` keeps this on the audited `clientedit` path
+    /// shared with [`Self::clientedit_raw`].
     pub async fn client_set_talker(
         &self,
         sid: i64,
