@@ -1143,6 +1143,12 @@ fn parse_send_lead_ms(value: Option<&str>) -> Duration {
 /// Issue #93 — deepest encode headroom; a larger cut is clamped.
 const MIN_ENCODE_HEADROOM_DB: f32 = -24.0;
 
+/// Issue #93 — encode headroom when `VOICE_ENCODE_HEADROOM_DB` is unset.
+/// −6 dB removed all decoder overshoot on the hottest material measured:
+/// hardstyle mastered at −8.8 dBFS RMS decodes to a −3.5 dBFS peak, against
+/// +2.7 dBFS and overshoot in 54% of 100 ms blocks at 0 dB.
+const DEFAULT_ENCODE_HEADROOM_DB: f32 = -6.0;
+
 /// Issue #93 — encode headroom in dB (0 or negative), stored as `f32` bits.
 ///
 /// Mastered music sits at 0 dBFS, and Opus decoding overshoots full scale:
@@ -1150,23 +1156,22 @@ const MIN_ENCODE_HEADROOM_DB: f32 = -24.0;
 /// overshoot in 63% of 100 ms blocks. A client that cannot carry audio above
 /// 0 dBFS (int16 decode, a phone at normal volume) hard-clips those peaks,
 /// which is heard as crackle on loud, bass-heavy passages. −6 dB before the
-/// encoder removed all of it in that test.
+/// encoder removed all of it in that test, and on hardstyle too.
 ///
-/// Seeded once from `VOICE_ENCODE_HEADROOM_DB`; `POST
+/// Defaults to [`DEFAULT_ENCODE_HEADROOM_DB`]; `VOICE_ENCODE_HEADROOM_DB=0`
+/// turns it off. Seeded once from `VOICE_ENCODE_HEADROOM_DB`; `POST
 /// /v1/voice/encode-headroom` changes it at runtime. Read when a play
 /// starts, so a change applies from the next track.
 fn encode_headroom_cell() -> &'static AtomicU32 {
     static CELL: OnceLock<AtomicU32> = OnceLock::new();
     CELL.get_or_init(|| {
-        let db = parse_encode_headroom_db(
-            std::env::var("VOICE_ENCODE_HEADROOM_DB").ok().as_deref(),
+        let db =
+            parse_encode_headroom_db(std::env::var("VOICE_ENCODE_HEADROOM_DB").ok().as_deref());
+        info!(
+            encode_headroom_db = db,
+            "encode headroom before the Opus encoder (issue #93); \
+             VOICE_ENCODE_HEADROOM_DB=0 turns it off",
         );
-        if db < 0.0 {
-            info!(
-                encode_headroom_db = db,
-                "VOICE_ENCODE_HEADROOM_DB — audio is attenuated before the Opus encoder (issue #93)",
-            );
-        }
         AtomicU32::new(db.to_bits())
     })
 }
@@ -1188,21 +1193,23 @@ pub(crate) fn set_encode_headroom_db(db: f32) -> f32 {
     db
 }
 
-/// Pure parse of `VOICE_ENCODE_HEADROOM_DB`. Unset, empty or unparsable is
-/// off. Positive values (a boost) are clamped to 0, below
+/// Pure parse of `VOICE_ENCODE_HEADROOM_DB`. Unset, empty, unparsable or
+/// non-finite is [`DEFAULT_ENCODE_HEADROOM_DB`]; `0` turns the headroom off.
+/// Positive values (a boost) are clamped to 0, below
 /// [`MIN_ENCODE_HEADROOM_DB`] is clamped.
 fn parse_encode_headroom_db(value: Option<&str>) -> f32 {
     value
         .map(str::trim)
         .and_then(|s| s.parse::<f32>().ok())
-        .map_or(0.0, clamp_encode_headroom_db)
+        .filter(|db| db.is_finite())
+        .map_or(DEFAULT_ENCODE_HEADROOM_DB, clamp_encode_headroom_db)
 }
 
 fn clamp_encode_headroom_db(db: f32) -> f32 {
     if db.is_finite() {
         db.clamp(MIN_ENCODE_HEADROOM_DB, 0.0)
     } else {
-        0.0
+        DEFAULT_ENCODE_HEADROOM_DB
     }
 }
 
@@ -5021,13 +5028,28 @@ mod tests {
     }
 
     #[test]
-    fn encode_headroom_parse_is_off_unless_negative_and_is_clamped() {
-        assert_eq!(parse_encode_headroom_db(None), 0.0);
-        assert_eq!(parse_encode_headroom_db(Some("")), 0.0);
-        assert_eq!(parse_encode_headroom_db(Some("abc")), 0.0);
-        assert_eq!(parse_encode_headroom_db(Some("NaN")), 0.0);
+    fn encode_headroom_defaults_to_minus_six_and_zero_turns_it_off() {
+        assert_eq!(DEFAULT_ENCODE_HEADROOM_DB, -6.0);
+        assert_eq!(parse_encode_headroom_db(None), DEFAULT_ENCODE_HEADROOM_DB);
+        assert_eq!(
+            parse_encode_headroom_db(Some("")),
+            DEFAULT_ENCODE_HEADROOM_DB
+        );
+        assert_eq!(
+            parse_encode_headroom_db(Some("abc")),
+            DEFAULT_ENCODE_HEADROOM_DB
+        );
+        assert_eq!(
+            parse_encode_headroom_db(Some("NaN")),
+            DEFAULT_ENCODE_HEADROOM_DB
+        );
+        assert_eq!(
+            parse_encode_headroom_db(Some("0")),
+            0.0,
+            "explicit 0 is off"
+        );
         assert_eq!(parse_encode_headroom_db(Some("3")), 0.0, "no boost");
-        assert_eq!(parse_encode_headroom_db(Some(" -6 ")), -6.0);
+        assert_eq!(parse_encode_headroom_db(Some(" -3 ")), -3.0);
         assert_eq!(
             parse_encode_headroom_db(Some("-40")),
             MIN_ENCODE_HEADROOM_DB

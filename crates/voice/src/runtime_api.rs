@@ -65,8 +65,8 @@ pub struct SendLead {
 }
 
 /// Issue #93 — body of `GET` / `POST /v1/voice/encode-headroom`: gain in dB
-/// applied right before the Opus encoder, after the operator's volume. `0`
-/// is off; negative values leave room for Opus decode overshoot. A new value
+/// applied right before the Opus encoder, after the operator's volume. The
+/// default is `-6` (room for Opus decode overshoot); `0` turns it off. A new value
 /// applies from the next track; it is clamped to `-24..=0`.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct EncodeHeadroom {
