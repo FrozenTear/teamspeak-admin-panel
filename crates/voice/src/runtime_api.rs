@@ -56,6 +56,14 @@ pub struct SettingsRequest {
     pub yt_api_key: Option<Option<String>>,
 }
 
+/// Issue #93 — body of `GET` / `POST /v1/voice/send-lead`: how far ahead of
+/// its slot the audio sibling releases each frame, in ms. `0` is off. A new
+/// value applies from the next track; above 500 it is clamped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendLead {
+    pub ms: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BugReportContextResponse {
     pub music_bot_latency: String,

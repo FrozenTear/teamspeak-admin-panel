@@ -39,8 +39,8 @@ pub use music_bot_audio::cpuset::MUSIC_RUNTIME_TOKEN_ENV;
 
 use crate::config::BotId;
 use crate::runtime_api::{
-    BugReportContextResponse, HealthResponse, ListResponse, MutateOp, SendRequest, SettingsRequest,
-    SpawnRequest, SpawnResponse, StoreOp, WireError, store_err_to_wire,
+    BugReportContextResponse, HealthResponse, ListResponse, MutateOp, SendLead, SendRequest,
+    SettingsRequest, SpawnRequest, SpawnResponse, StoreOp, WireError, store_err_to_wire,
 };
 use crate::store::{LibraryEntryId, PlaylistName, StoreError, TrackId};
 use crate::supervisor::BotSupervisor;
@@ -299,6 +299,10 @@ pub fn router_with_auth(state: RuntimeState, auth: ControlAuth) -> Router {
         .route("/v1/bots/{id}/command", post(send_command))
         .route("/v1/bots/{id}/events", get(events_sse))
         .route("/v1/settings", post(update_settings))
+        .route(
+            "/v1/voice/send-lead",
+            get(get_send_lead).post(set_send_lead),
+        )
         .route("/v1/bug-report-context", get(bug_report_context))
         .route("/v1/mutate", post(mutate))
         .route("/v1/store", post(store_op));
@@ -463,6 +467,22 @@ async fn update_settings(
         *state.yt_api_key.write().unwrap_or_else(|e| e.into_inner()) = key;
     }
     StatusCode::NO_CONTENT
+}
+
+/// Issue #93 — current send-ahead lead.
+async fn get_send_lead() -> Json<SendLead> {
+    Json(SendLead {
+        ms: crate::audio::send_lead().as_millis() as u64,
+    })
+}
+
+/// Issue #93 — set the send-ahead lead for later tracks. Answers with the
+/// value now in force, which is clamped.
+async fn set_send_lead(Json(req): Json<SendLead>) -> Json<SendLead> {
+    let lead = crate::audio::set_send_lead_ms(req.ms);
+    Json(SendLead {
+        ms: lead.as_millis() as u64,
+    })
 }
 
 async fn bug_report_context() -> Json<BugReportContextResponse> {
@@ -845,6 +865,41 @@ mod tests {
         let list: ListResponse = json(resp).await;
         assert_eq!(list.bots.len(), 1);
         assert_eq!(list.bots[0].name, "unit");
+    }
+
+    /// Issue #93 — the send-lead route reads and writes the process-wide
+    /// lead. The write re-sets the value it just read, so a play spawned by
+    /// another test in this process never sees a lead it did not ask for.
+    #[tokio::test]
+    async fn send_lead_route_reads_and_sets() {
+        let app = router(RuntimeState::new());
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/voice/send-lead")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let current: SendLead = json(resp).await;
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/voice/send-lead")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&current).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let set: SendLead = json(resp).await;
+        assert_eq!(set, current);
     }
 
     fn addr(text: &str) -> SocketAddr {
