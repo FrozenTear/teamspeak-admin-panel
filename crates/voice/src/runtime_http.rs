@@ -39,8 +39,9 @@ pub use music_bot_audio::cpuset::MUSIC_RUNTIME_TOKEN_ENV;
 
 use crate::config::BotId;
 use crate::runtime_api::{
-    BugReportContextResponse, HealthResponse, ListResponse, MutateOp, SendLead, SendRequest,
-    SettingsRequest, SpawnRequest, SpawnResponse, StoreOp, WireError, store_err_to_wire,
+    BugReportContextResponse, EncodeHeadroom, HealthResponse, ListResponse, MutateOp, SendLead,
+    SendRequest, SettingsRequest, SpawnRequest, SpawnResponse, StoreOp, WireError,
+    store_err_to_wire,
 };
 use crate::store::{LibraryEntryId, PlaylistName, StoreError, TrackId};
 use crate::supervisor::BotSupervisor;
@@ -303,6 +304,10 @@ pub fn router_with_auth(state: RuntimeState, auth: ControlAuth) -> Router {
             "/v1/voice/send-lead",
             get(get_send_lead).post(set_send_lead),
         )
+        .route(
+            "/v1/voice/encode-headroom",
+            get(get_encode_headroom).post(set_encode_headroom),
+        )
         .route("/v1/bug-report-context", get(bug_report_context))
         .route("/v1/mutate", post(mutate))
         .route("/v1/store", post(store_op));
@@ -482,6 +487,21 @@ async fn set_send_lead(Json(req): Json<SendLead>) -> Json<SendLead> {
     let lead = crate::audio::set_send_lead_ms(req.ms);
     Json(SendLead {
         ms: lead.as_millis() as u64,
+    })
+}
+
+/// Issue #93 — current encode headroom.
+async fn get_encode_headroom() -> Json<EncodeHeadroom> {
+    Json(EncodeHeadroom {
+        db: crate::audio::encode_headroom_db(),
+    })
+}
+
+/// Issue #93 — set the encode headroom for later tracks. Answers with the
+/// value now in force, which is clamped.
+async fn set_encode_headroom(Json(req): Json<EncodeHeadroom>) -> Json<EncodeHeadroom> {
+    Json(EncodeHeadroom {
+        db: crate::audio::set_encode_headroom_db(req.db),
     })
 }
 
@@ -899,6 +919,41 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let set: SendLead = json(resp).await;
+        assert_eq!(set, current);
+    }
+
+    /// Issue #93 — the encode-headroom route reads and writes the
+    /// process-wide headroom. The write re-sets the value it just read, so a
+    /// play spawned by another test never sees a headroom it did not ask for.
+    #[tokio::test]
+    async fn encode_headroom_route_reads_and_sets() {
+        let app = router(RuntimeState::new());
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/voice/encode-headroom")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let current: EncodeHeadroom = json(resp).await;
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/voice/encode-headroom")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&current).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let set: EncodeHeadroom = json(resp).await;
         assert_eq!(set, current);
     }
 

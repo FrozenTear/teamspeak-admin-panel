@@ -29,7 +29,7 @@
 //! (≈ 5 s on fast sources) drains.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -465,6 +465,7 @@ fn build_active(
         msg_tx,
         sibling_catchup_cap(),
         send_lead(),
+        encode_headroom_db(),
     );
     ActiveAudio {
         source_label,
@@ -1139,6 +1140,88 @@ fn parse_send_lead_ms(value: Option<&str>) -> Duration {
         })
 }
 
+/// Issue #93 — deepest encode headroom; a larger cut is clamped.
+const MIN_ENCODE_HEADROOM_DB: f32 = -24.0;
+
+/// Issue #93 — encode headroom in dB (0 or negative), stored as `f32` bits.
+///
+/// Mastered music sits at 0 dBFS, and Opus decoding overshoots full scale:
+/// Bubble Pop at unity gain, 64 kbit/s mono, decodes to +6.1 dBFS peaks with
+/// overshoot in 63% of 100 ms blocks. A client that cannot carry audio above
+/// 0 dBFS (int16 decode, a phone at normal volume) hard-clips those peaks,
+/// which is heard as crackle on loud, bass-heavy passages. −6 dB before the
+/// encoder removed all of it in that test.
+///
+/// Seeded once from `VOICE_ENCODE_HEADROOM_DB`; `POST
+/// /v1/voice/encode-headroom` changes it at runtime. Read when a play
+/// starts, so a change applies from the next track.
+fn encode_headroom_cell() -> &'static AtomicU32 {
+    static CELL: OnceLock<AtomicU32> = OnceLock::new();
+    CELL.get_or_init(|| {
+        let db = parse_encode_headroom_db(
+            std::env::var("VOICE_ENCODE_HEADROOM_DB").ok().as_deref(),
+        );
+        if db < 0.0 {
+            info!(
+                encode_headroom_db = db,
+                "VOICE_ENCODE_HEADROOM_DB — audio is attenuated before the Opus encoder (issue #93)",
+            );
+        }
+        AtomicU32::new(db.to_bits())
+    })
+}
+
+/// Encode headroom for the next play, in dB. Zero is off: unchanged levels.
+pub(crate) fn encode_headroom_db() -> f32 {
+    f32::from_bits(encode_headroom_cell().load(Ordering::Relaxed))
+}
+
+/// Set the encode headroom for later plays, clamped to
+/// [`MIN_ENCODE_HEADROOM_DB`]`..=0`. Returns the value now in force.
+pub(crate) fn set_encode_headroom_db(db: f32) -> f32 {
+    let db = clamp_encode_headroom_db(db);
+    encode_headroom_cell().store(db.to_bits(), Ordering::Relaxed);
+    info!(
+        encode_headroom_db = db,
+        "encode headroom set; applies from the next track (issue #93)",
+    );
+    db
+}
+
+/// Pure parse of `VOICE_ENCODE_HEADROOM_DB`. Unset, empty or unparsable is
+/// off. Positive values (a boost) are clamped to 0, below
+/// [`MIN_ENCODE_HEADROOM_DB`] is clamped.
+fn parse_encode_headroom_db(value: Option<&str>) -> f32 {
+    value
+        .map(str::trim)
+        .and_then(|s| s.parse::<f32>().ok())
+        .map_or(0.0, clamp_encode_headroom_db)
+}
+
+fn clamp_encode_headroom_db(db: f32) -> f32 {
+    if db.is_finite() {
+        db.clamp(MIN_ENCODE_HEADROOM_DB, 0.0)
+    } else {
+        0.0
+    }
+}
+
+/// Linear factor for a headroom in dB.
+fn headroom_factor(db: f32) -> f32 {
+    10f32.powf(db / 20.0)
+}
+
+/// Scale one PCM frame by the encode headroom. A factor of 1 or more is a
+/// no-op, so a zero headroom keeps the frame bit-exact.
+fn apply_headroom(pcm: &mut [i16], factor: f32) {
+    if factor >= 1.0 {
+        return;
+    }
+    for sample in pcm.iter_mut() {
+        *sample = (f32::from(*sample) * factor).round() as i16;
+    }
+}
+
 /// Issue #93 — send-ahead pacing for the audio sibling.
 ///
 /// The Contabo host pauses the whole VM for 50–260 ms at a time, and the
@@ -1204,6 +1287,7 @@ fn spawn_sibling(
     tx: mpsc::Sender<AudioMsg>,
     catchup_cap: Option<usize>,
     send_lead: Duration,
+    encode_headroom_db: f32,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         // Keep `pipeline` alive for the lifetime of the sibling — its
@@ -1214,6 +1298,17 @@ fn spawn_sibling(
         // once per dequeued frame and applies flat gain or the THE-983
         // (AR-3) click-free ramp.
         let mut gain = GainStage::new(volume);
+
+        // Issue #93 — fixed headroom, the last step before the encoder, so
+        // the margin holds whatever the operator's volume is.
+        let headroom = headroom_factor(encode_headroom_db);
+        info!(
+            target: "music_bot_latency",
+            stage = "sibling_config",
+            send_lead_ms = send_lead.as_millis() as u64,
+            encode_headroom_db,
+            "audio sibling settings for this play (issue #93)",
+        );
 
         // PURA-342 — frame-buffer underrun watchdog. Lives for the whole
         // play: it tags the opening `STARTUP_WATCH_FRAMES` as the `startup`
@@ -1455,6 +1550,7 @@ fn spawn_sibling(
                         // policy the worker applied pre-THE-986.
                         let mut samples = f.samples;
                         gain.apply(&mut samples, f.channels);
+                        apply_headroom(&mut samples, headroom);
                         let bytes = match encoder.encode_frame(&samples) {
                             Ok(b) => b,
                             Err(e) => {
@@ -3119,6 +3215,7 @@ mod tests {
             msg_tx,
             None,
             Duration::ZERO,
+            0.0,
         );
 
         let mut frame_count = 0usize;
@@ -3189,6 +3286,7 @@ mod tests {
             msg_tx,
             None,
             Duration::ZERO,
+            0.0,
         );
 
         // Let a few frames flow, then pause ≥2 s mid-play. The 600 ms tone
@@ -3372,6 +3470,7 @@ mod tests {
             msg_tx,
             None,
             Duration::ZERO,
+            0.0,
         );
 
         let mut frames_seen = 0usize;
@@ -3441,6 +3540,7 @@ mod tests {
             msg_tx,
             None,
             Duration::ZERO,
+            0.0,
         );
 
         // Decode each Opus frame back to PCM — decoded amplitude is what a
@@ -4553,6 +4653,7 @@ mod tests {
             msg_tx,
             cap,
             Duration::ZERO,
+            0.0,
         );
         let mut out = Vec::new();
         while let Some(msg) = msg_rx.recv().await {
@@ -4795,6 +4896,7 @@ mod tests {
             msg_tx,
             None,
             lead,
+            0.0,
         );
 
         let mut arrivals: Vec<Instant> = Vec::new();
@@ -4915,6 +5017,131 @@ mod tests {
         assert!(
             median >= Duration::from_millis(10),
             "median post-refill gap {median:?} — expected 20 ms pacing",
+        );
+    }
+
+    #[test]
+    fn encode_headroom_parse_is_off_unless_negative_and_is_clamped() {
+        assert_eq!(parse_encode_headroom_db(None), 0.0);
+        assert_eq!(parse_encode_headroom_db(Some("")), 0.0);
+        assert_eq!(parse_encode_headroom_db(Some("abc")), 0.0);
+        assert_eq!(parse_encode_headroom_db(Some("NaN")), 0.0);
+        assert_eq!(parse_encode_headroom_db(Some("3")), 0.0, "no boost");
+        assert_eq!(parse_encode_headroom_db(Some(" -6 ")), -6.0);
+        assert_eq!(
+            parse_encode_headroom_db(Some("-40")),
+            MIN_ENCODE_HEADROOM_DB
+        );
+    }
+
+    #[test]
+    fn apply_headroom_is_bit_exact_at_zero_and_scales_below() {
+        let frame: Vec<i16> = vec![i16::MAX, i16::MIN, 1000, -1000, 0];
+        let mut same = frame.clone();
+        apply_headroom(&mut same, headroom_factor(0.0));
+        assert_eq!(same, frame, "0 dB must not touch the frame");
+
+        let mut cut = frame.clone();
+        apply_headroom(&mut cut, headroom_factor(-6.0));
+        // 10^(-6/20) = 0.5012
+        assert_eq!(cut, vec![16422, -16423, 501, -501, 0]);
+    }
+
+    /// Run hand-fed frames through the sibling (gain, headroom, Opus encode)
+    /// and return the encoded packets.
+    async fn encode_through_sibling(frames: Vec<PcmFrame>, headroom_db: f32) -> Vec<Bytes> {
+        let mut pipeline = AudioPipeline::spawn(
+            AudioSourceSpec::SyntheticTone {
+                hz: 440.0,
+                amplitude: 0.0,
+                duration_ms: Some(40),
+            },
+            PipelineConfig::default(),
+        )
+        .await
+        .expect("spawn synthetic pipeline");
+        let _discard = pipeline.take_frames();
+        let events_rx = pipeline.events();
+        let (frames_tx, frames_rx) = mpsc::channel(64);
+        for frame in frames {
+            frames_tx.send(frame).await.expect("frame channel open");
+        }
+        drop(frames_tx);
+        let (_pause_tx, pause_rx) = watch::channel(false);
+        let (msg_tx, mut msg_rx) = mpsc::channel(64);
+        let sibling = spawn_sibling(
+            pipeline,
+            test_encoder(),
+            VolumeHandle::default(),
+            frames_rx,
+            events_rx,
+            pause_rx,
+            msg_tx,
+            None,
+            Duration::ZERO,
+            headroom_db,
+        );
+        let mut out = Vec::new();
+        while let Some(msg) = msg_rx.recv().await {
+            match msg {
+                AudioMsg::Frame { bytes, .. } => out.push(bytes),
+                AudioMsg::Finished => break,
+                AudioMsg::PipelineEvent(_) | AudioMsg::CatchupDropped(_) => {}
+            }
+        }
+        sibling.await.expect("sibling joins");
+        out
+    }
+
+    /// Issue #93 — the headroom is applied end to end: a full-scale tone
+    /// encoded at -6 dB decodes at about half the level of the same tone at
+    /// 0 dB. Decoded level is what a TeamSpeak client plays.
+    #[tokio::test]
+    async fn encode_headroom_lowers_the_decoded_level() {
+        let tone = |i: u64| {
+            let n = music_bot_audio::SAMPLES_PER_FRAME_MONO;
+            let samples = (0..n)
+                .map(|k| {
+                    let t = (i as usize * n + k) as f32 / 48_000.0;
+                    (f32::sin(2.0 * std::f32::consts::PI * 110.0 * t) * i16::MAX as f32) as i16
+                })
+                .collect();
+            PcmFrame {
+                samples,
+                index: i,
+                scheduled_at: Instant::now(),
+                channels: 1,
+            }
+        };
+        let rms = |packets: &[Bytes]| -> f64 {
+            let mut decoder = audiopus::coder::Decoder::new(
+                audiopus::SampleRate::Hz48000,
+                audiopus::Channels::Mono,
+            )
+            .expect("decoder");
+            let (mut sum, mut n) = (0.0f64, 0usize);
+            // Skip the first frames while the codec settles.
+            for packet in packets.iter().skip(5) {
+                let mut pcm = vec![0i16; music_bot_audio::SAMPLES_PER_FRAME_MONO];
+                let p = audiopus::packet::Packet::try_from(&packet[..]).expect("packet");
+                let signals = audiopus::MutSignals::try_from(&mut pcm[..]).expect("signals");
+                let got = decoder.decode(Some(p), signals, false).expect("decode");
+                sum += pcm[..got]
+                    .iter()
+                    .map(|s| f64::from(*s).powi(2))
+                    .sum::<f64>();
+                n += got;
+            }
+            (sum / n.max(1) as f64).sqrt()
+        };
+        let unity = encode_through_sibling((0..25).map(tone).collect(), 0.0).await;
+        let cut = encode_through_sibling((0..25).map(tone).collect(), -6.0).await;
+        assert_eq!(unity.len(), 25);
+        assert_eq!(cut.len(), 25);
+        let ratio = rms(&cut) / rms(&unity);
+        assert!(
+            (0.44..=0.56).contains(&ratio),
+            "-6 dB headroom should halve the decoded level, got ratio {ratio:.3}",
         );
     }
 
