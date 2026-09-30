@@ -16,8 +16,12 @@
 //! 3. Pause/Resume flip a `tokio::sync::watch` the sibling honours by
 //!    parking on `pause_rx.changed()` — that back-pressures the pipeline
 //!    naturally (the worker's `read_samples` stalls on a full channel).
-//! 4. Dropping [`ActiveAudio`] aborts both the sibling and the pipeline
-//!    worker — clean teardown on `Stop` / `SkipNext` / `Play(replace)`.
+//! 4. Dropping [`ActiveAudio`] (Stop, Skip, Play-replace, Disconnect,
+//!    Shutdown) makes the sibling return at once. That drops the
+//!    [`AudioPipeline`], which aborts the worker — including a warm
+//!    resolve or yt-dlp fallback that has not produced a frame yet.
+//!    yt-dlp / ffmpeg then die on the source `Drop` / `kill_on_drop`
+//!    paths, before prebuffer and before the wire.
 //!
 //! THE-986 — the pipeline emits *PCM*; the sibling applies the operator's
 //! gain and encodes Opus at dequeue, so a `!vol` move is audible within
@@ -231,14 +235,16 @@ pub(crate) struct ActiveAudio {
     /// sources that need no resolve (library / synthetic) and for a
     /// [`seek_to`] respawn (the input is already resolved).
     _resolve: Option<JoinHandle<()>>,
-    /// The paced sibling task. **Not** aborted on [`Drop`]; it self-cleans
-    /// when the [`ActiveAudio`]'s `audio_rx` is dropped above as part of
-    /// this struct, which closes the sibling's `msg_tx` and lets it return
-    /// normally — flushing the PURA-342 / PURA-408b end-of-play summaries
-    /// on the way out. Aborting it would cut those summaries off. The
-    /// sibling owns the [`AudioPipeline`], whose own `Drop` aborts the
-    /// worker task, so this single handle is enough to keep the audio
-    /// stack alive for the duration of one track.
+    /// The paced sibling task. **Not** `JoinHandle::abort`ed here: a clean
+    /// end-of-track flushes the PURA-342 / PURA-408b summaries and sends
+    /// `Finished` before this struct is dropped, and aborting the task
+    /// would cut that tail off. The sibling instead returns as soon as
+    /// this struct's pause sender is dropped or its frame consumer is
+    /// gone — see [`spawn_sibling`]. That return drops the
+    /// [`AudioPipeline`] the sibling owns, and the pipeline `Drop`
+    /// aborts the worker. v1.6.24 — without that wake, a closed pause
+    /// watch stays permanently ready, the sibling spins in `select`, and
+    /// an in-flight yt-dlp fallback keeps prefetching until prebuffer.
     _sibling: JoinHandle<()>,
 }
 
@@ -1071,9 +1077,18 @@ fn spawn_sibling(
         let mut events_open = true;
 
         loop {
+            // v1.6.24 — Stop / Skip / Disconnect / Shutdown drop the frame
+            // consumer (single-loop) or will drop it on ClearAudio (split).
+            // Return before any further prepare so the pipeline guard
+            // below aborts the worker. A consumer that is still open stays
+            // pending in `closed()` and does not change pacing.
+            if tx.is_closed() {
+                return;
+            }
             // THE-985 (C-2) — bounded event drain. The biased select below
-            // polls the frame arm first; on a fast source it is always
-            // ready, so pipeline events (warnings, ICY `NowPlaying`) starve
+            // takes a ready frame before the event arm; on a fast source
+            // the frame arm is always ready, so pipeline events (warnings,
+            // ICY `NowPlaying`) starve
             // behind a full frame channel until the broadcast overflows and
             // drops them as `Lagged`. Draining up to [`EVENT_DRAIN_MAX`]
             // queued events here surfaces them within ~one frame period;
@@ -1105,6 +1120,24 @@ fn spawn_sibling(
             }
             tokio::select! {
                 biased;
+                // Teardown before a queued frame. Once the pause sender is
+                // dropped, `changed()` stays ready forever; treating that
+                // as "loop" spins this task and holds the pipeline until
+                // the worker finishes prebuffer (v1.6.23: Stop mid yt-dlp
+                // fallback kept prefetching, then Python BrokenPipeError
+                // when the pipe finally closed). Returning here drops
+                // `_pipeline_guard`, which aborts the worker and kills
+                // yt-dlp / ffmpeg through their existing Drop paths.
+                // The split path drops the pause sender in `tear_down`
+                // even while the wire task still holds `audio_rx`; that
+                // arm is what wakes us before ClearAudio. `tx.closed()`
+                // covers the single-loop receiver drop on the same turn.
+                _ = tx.closed() => return,
+                changed = pause_rx.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
                 frame = frames_rx.recv() => match frame {
                     Some(f) => {
                         // PURA-342 — sample the underrun watchdog *before*
@@ -1270,10 +1303,6 @@ fn spawn_sibling(
                     // forever and hot-spin the select loop.
                     Err(broadcast::error::RecvError::Closed) => events_open = false,
                 },
-                _ = pause_rx.changed() => {
-                    // Loop back; the outer `while *pause_rx.borrow()`
-                    // gate will park us again if we are now paused.
-                }
             }
         }
         // PURA-342 — playback drained cleanly; flush the watchdog summaries
@@ -2652,6 +2681,132 @@ mod tests {
         assert!(
             resolve_abort.is_finished(),
             "Drop must abort the _resolve JoinHandle (THE-896 regression)",
+        );
+    }
+
+    /// v1.6.24 — Stop (drop [`ActiveAudio`]) during an in-flight fallback.
+    ///
+    /// The source blocks in `read_samples` after spawning a long `sleep`,
+    /// the stand-in for yt-dlp still prefetching. Dropping the play must
+    /// abort the worker and kill that child before the block ends, and
+    /// must not wait out the sleep. No PCM is produced, so nothing can
+    /// reach prebuffer or the wire.
+    #[tokio::test]
+    async fn stop_during_inflight_fallback_kills_child() {
+        use std::sync::atomic::{AtomicBool, AtomicU32};
+
+        use async_trait::async_trait;
+        use music_bot_audio::source::PcmSource;
+
+        struct BlockingFallback {
+            child: Option<tokio::process::Child>,
+            entered: Arc<AtomicBool>,
+            dropped: Arc<AtomicBool>,
+            pid: Arc<AtomicU32>,
+        }
+
+        impl Drop for BlockingFallback {
+            fn drop(&mut self) {
+                if let Some(mut child) = self.child.take() {
+                    let _ = child.start_kill();
+                }
+                self.dropped.store(true, Ordering::SeqCst);
+            }
+        }
+
+        #[async_trait]
+        impl PcmSource for BlockingFallback {
+            async fn read_samples(&mut self, _buf: &mut [i16]) -> std::io::Result<usize> {
+                if self.child.is_none() {
+                    let mut cmd = music_bot_audio::cpuset::music_command("sleep");
+                    cmd.arg("120")
+                        .kill_on_drop(true)
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null());
+                    let child = cmd.spawn().expect("spawn fallback stand-in");
+                    let pid = child.id().expect("stand-in pid");
+                    self.pid.store(pid, Ordering::SeqCst);
+                    self.child = Some(child);
+                    self.entered.store(true, Ordering::SeqCst);
+                }
+                // Long prefetch. Stop must cancel this await.
+                loop {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                }
+            }
+        }
+
+        fn still_running(pid: u32) -> bool {
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                return false;
+            };
+            let Some((_, rest)) = stat.rsplit_once(')') else {
+                return true;
+            };
+            matches!(
+                rest.trim_start().chars().next(),
+                Some('R' | 'S' | 'D' | 'T')
+            )
+        }
+
+        let entered = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let pid = Arc::new(AtomicU32::new(0));
+        let source = BlockingFallback {
+            child: None,
+            entered: Arc::clone(&entered),
+            dropped: Arc::clone(&dropped),
+            pid: Arc::clone(&pid),
+        };
+        let cfg = PipelineConfig {
+            // Production prebuffer. The stand-in never fills it; Stop must
+            // not wait for a watermark that will not arrive.
+            prebuffer_frames: 150,
+            frame_buffer: 250,
+            ..PipelineConfig::default()
+        };
+        let pipeline = AudioPipeline::spawn_with_source(Box::new(source), cfg).expect("spawn");
+        let active = build_active(
+            pipeline,
+            test_encoder(),
+            VolumeHandle::default(),
+            "https://www.youtube.com/watch?v=bubble-pop".to_string(),
+            Instant::now(),
+            0,
+            Arc::new(Mutex::new(None)),
+            None,
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !entered.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "fallback stand-in never started",);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let child_pid = pid.load(Ordering::SeqCst);
+        assert_ne!(child_pid, 0, "stand-in published a pid");
+        assert!(
+            still_running(child_pid),
+            "stand-in should be alive before Stop",
+        );
+
+        let stopped = Instant::now();
+        drop(active);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !dropped.load(Ordering::SeqCst) || still_running(child_pid) {
+            assert!(
+                Instant::now() < deadline,
+                "Stop left the in-flight fallback alive (dropped={}, running={})",
+                dropped.load(Ordering::SeqCst),
+                still_running(child_pid),
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            stopped.elapsed() < Duration::from_secs(1),
+            "abort took {:?}; in-flight fallback must die promptly",
+            stopped.elapsed(),
         );
     }
 

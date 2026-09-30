@@ -32,7 +32,9 @@ use tracing::warn;
 /// Environment variable that holds the shared bearer token.
 ///
 /// Read at startup. Never a file, a database, or a response field.
-/// Defined once in the audio crate so every child spawn can strip it.
+/// Defined once in the audio crate. [`music_bot_audio::cpuset::music_command`]
+/// and [`music_bot_audio::cpuset::std_music_command`] remove it from child
+/// environments; this module does not spawn processes.
 pub use music_bot_audio::cpuset::MUSIC_RUNTIME_TOKEN_ENV;
 
 use crate::config::BotId;
@@ -68,9 +70,11 @@ impl Default for RuntimeState {
 
 /// How the control API authenticates callers.
 ///
-/// Only the SHA-256 digest is stored in this auth state. The raw token
-/// is dropped after parse. `Debug` redacts the digest. Child spawns
-/// strip [`MUSIC_RUNTIME_TOKEN_ENV`] so the value is not inherited.
+/// Only the SHA-256 digest is stored. The raw token is dropped after
+/// parse. `Debug` redacts the digest. [`ControlAuth`] does not spawn
+/// processes and does not strip child environments — that is
+/// [`music_bot_audio::cpuset::music_command`] /
+/// [`music_bot_audio::cpuset::std_music_command`].
 #[derive(Clone, Copy)]
 pub enum ControlAuth {
     /// No bearer check. Valid only when the listener is loopback.

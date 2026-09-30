@@ -590,6 +590,36 @@ mod tests {
         assert!(!stdout.contains(token));
     }
 
+    /// `std_music_command` is not a decode child: no `pre_exec` pin.
+    /// The child must inherit the caller's CPU affinity. A decode cpuset
+    /// hooked onto this constructor would fail the equality. The
+    /// constructor's own `env_remove` is asserted here with no second
+    /// `strip_music_runtime_token` call.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn std_music_command_child_inherits_parent_cpuset() {
+        let parent = current_affinity(0);
+        assert!(!parent.is_empty(), "parent affinity must be non-empty");
+        let mut cmd = std_music_command("sleep");
+        assert!(
+            removes_runtime_token(&cmd),
+            "std_music_command must env_remove {MUSIC_RUNTIME_TOKEN_ENV} in the constructor"
+        );
+        cmd.arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child = cmd.spawn().expect("spawn sleep");
+        let pid = child.id();
+        let child_aff = current_affinity(pid);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(
+            child_aff, parent,
+            "std_music_command must inherit the parent cpuset, not a decode pin"
+        );
+    }
+
     #[test]
     fn music_command_strips_runtime_token() {
         let std_cmd = std_music_command("sh");

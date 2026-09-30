@@ -534,6 +534,15 @@ def _gate_for_prewarm(send_partial):
 
 class Handler(socketserver.StreamRequestHandler):
     def handle(self):
+        # Stop drops the client socket while a resolve is in flight. The
+        # write then raises BrokenPipeError; a traceback here is log spam
+        # on a shared helper that must keep serving other bots.
+        try:
+            self._handle_line()
+        except BrokenPipeError:
+            return
+
+    def _handle_line(self):
         line = self.rfile.readline()
         if not line:
             return
