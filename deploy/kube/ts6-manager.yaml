@@ -224,6 +224,12 @@ spec:
           value: "2-5"
         - name: TS6_BOT_NICE
           value: "-5"
+        # PURA-396 — wire task owns the 20 ms send; chat/queue/yt-dlp stay
+        # on the control task. Read once at bot start. Music container only.
+        # The split loop is also the code default since issue #93; this line
+        # keeps it explicit. "0" selects the single-loop rollback path.
+        - name: VOICE_SPLIT_WIRE_TASK
+          value: "1"
       volumeMounts:
         - name: ts6-data
           mountPath: /var/lib/ts6-manager

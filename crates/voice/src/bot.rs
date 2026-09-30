@@ -91,11 +91,10 @@ pub(crate) async fn run_bot(
     let mut hold_disconnected = false;
 
     // PURA-396 — pick the connected-loop implementation once, up front. The
-    // config flag is `OR`-ed with the `VOICE_SPLIT_WIRE_TASK` env var so a
-    // contabo-dev A/B is a pod env flip with no DB write. Default is the
-    // single-loop path; `true` selects the PURA-389 §2a/2b wire/control
-    // split.
-    let split_wire = config.voice_split_wire_task || env_split_wire_task();
+    // PURA-389 §2a/2b wire/control split is the default (issue #93); an
+    // explicit falsy `VOICE_SPLIT_WIRE_TASK` is the kill switch back to the
+    // single loop. The legacy config flag can still force the split on.
+    let split_wire = select_split_wire(env_split_wire_task(), config.voice_split_wire_task);
     info!(
         split_wire,
         "PURA-396 — connected-loop mode selected (split wire/control task = {split_wire})",
@@ -788,24 +787,35 @@ async fn run_connected_loop(
 // task owns it outright and the control task reaches the wire only through
 // the `WireCmd` channel.
 //
-// Gated behind `BotConfig::voice_split_wire_task` (default off) — the
-// single-loop path above is the untouched rollback.
+// On by default since issue #93 (it has run on the Contabo host since
+// PURA-396). `VOICE_SPLIT_WIRE_TASK=0` selects the single-loop path above,
+// which stays as the rollback.
 // ===========================================================================
 
-/// PURA-396 — is the `VOICE_SPLIT_WIRE_TASK` env override set truthy? Lets a
-/// contabo-dev A/B flip the split loop on per pod without a DB write.
-fn env_split_wire_task() -> bool {
-    split_flag_truthy(std::env::var("VOICE_SPLIT_WIRE_TASK").ok().as_deref())
+/// Issue #93 — the split wire/control loop is the default connected loop.
+const DEFAULT_SPLIT_WIRE_TASK: bool = true;
+
+/// Issue #93 — the connected-loop choice. An explicit env override wins;
+/// otherwise the split loop, which the legacy config flag can only force on.
+fn select_split_wire(env: Option<bool>, config_flag: bool) -> bool {
+    env.unwrap_or(DEFAULT_SPLIT_WIRE_TASK || config_flag)
 }
 
-/// PURA-396 — parse a truthy env-flag value: trimmed, case-insensitive on the
+/// PURA-396 — the `VOICE_SPLIT_WIRE_TASK` override, if set. `None` (unset or
+/// unrecognised) means [`DEFAULT_SPLIT_WIRE_TASK`].
+fn env_split_wire_task() -> Option<bool> {
+    split_flag_override(std::env::var("VOICE_SPLIT_WIRE_TASK").ok().as_deref())
+}
+
+/// PURA-396 — parse the env override: trimmed, case-insensitive on the
 /// common spellings. Pure so it is unit-testable without touching the
 /// process environment.
-fn split_flag_truthy(value: Option<&str>) -> bool {
-    matches!(
-        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
-        Some("1") | Some("true") | Some("yes") | Some("on"),
-    )
+fn split_flag_override(value: Option<&str>) -> Option<bool> {
+    match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("1" | "true" | "yes" | "on") => Some(true),
+        Some("0" | "false" | "no" | "off") => Some(false),
+        _ => None,
+    }
 }
 
 /// PURA-396 — a command for the wire task: an operation that needs
@@ -2849,18 +2859,28 @@ mod tests {
         assert_flush_on(&on);
     }
 
-    /// PURA-396 — the `VOICE_SPLIT_WIRE_TASK` env override is parsed
-    /// trimmed and case-insensitive on the common truthy spellings;
-    /// anything else (incl. absent) is off.
+    /// Issue #93 — the split loop is on by default. The
+    /// `VOICE_SPLIT_WIRE_TASK` override is parsed trimmed and
+    /// case-insensitive; an explicit falsy value is the kill switch, and
+    /// anything unset or unrecognised falls back to the default.
     #[test]
-    fn split_flag_truthy_accepts_the_common_spellings() {
+    fn split_wire_task_is_on_by_default_and_falsy_env_turns_it_off() {
+        assert!(select_split_wire(None, false), "unset env: the split loop");
+        assert!(
+            !select_split_wire(Some(false), true),
+            "a falsy env is the kill switch"
+        );
+        assert!(select_split_wire(Some(true), false));
         for v in ["1", "true", "TRUE", " yes ", "On", "tRuE"] {
-            assert!(split_flag_truthy(Some(v)), "{v:?} should be truthy");
+            assert_eq!(split_flag_override(Some(v)), Some(true), "{v:?}");
         }
-        for v in ["0", "false", "", "no", "off", "2"] {
-            assert!(!split_flag_truthy(Some(v)), "{v:?} should be falsy");
+        for v in ["0", "false", "FALSE", " no ", "Off"] {
+            assert_eq!(split_flag_override(Some(v)), Some(false), "{v:?}");
         }
-        assert!(!split_flag_truthy(None), "an unset var is off");
+        for v in ["", "2", "maybe"] {
+            assert_eq!(split_flag_override(Some(v)), None, "{v:?}");
+        }
+        assert_eq!(split_flag_override(None), None, "unset uses the default");
     }
 
     /// PURA-396 — the acceptance criterion: a single FIFO `mpsc<WireCmd>`
