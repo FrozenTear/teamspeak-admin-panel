@@ -909,8 +909,8 @@ struct PacerMonitor {
     /// Issue #93 — send-ahead lead for this play. Zero is off.
     lead: Duration,
     /// Issue #93 — window frames released at least [`LEAD_REANCHOR_MIN`]
-    /// past their listener slot: likely listener holes, if the client keeps
-    /// the lead.
+    /// past their listener slot, after time spent in an operator pause is
+    /// subtracted: likely listener holes, if the client keeps the lead.
     window_reanchors: u32,
     /// Issue #93 — worst re-anchor this window.
     window_reanchor_max: Duration,
@@ -940,6 +940,8 @@ impl PacerMonitor {
     /// Call before [`Self::observe`] for the same frame, so the re-anchor
     /// lands in that frame's window.
     fn observe_reanchor(&mut self, index: u64, behind: Duration) {
+        #[cfg(test)]
+        note_reanchor_probe(behind >= LEAD_REANCHOR_MIN);
         if behind < LEAD_REANCHOR_MIN {
             return;
         }
@@ -1095,6 +1097,30 @@ const MAX_SEND_LEAD: Duration = Duration::from_millis(500);
 /// noise on the first frame of a play.
 const LEAD_REANCHOR_MIN: Duration = Duration::from_millis(2);
 
+/// Issue #93 — counts lead observations for the pause test. `seen` proves
+/// the sibling inherited the probe; `counted` is stalls at or above
+/// [`LEAD_REANCHOR_MIN`]. Absent outside that test.
+#[cfg(test)]
+struct ReanchorProbe {
+    seen: AtomicU32,
+    counted: AtomicU32,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static LEAD_REANCHOR_PROBE: Arc<ReanchorProbe>;
+}
+
+#[cfg(test)]
+fn note_reanchor_probe(counted: bool) {
+    let _ = LEAD_REANCHOR_PROBE.try_with(|probe| {
+        probe.seen.fetch_add(1, Ordering::Relaxed);
+        if counted {
+            probe.counted.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+}
+
 /// Issue #93 — the send-ahead lead in ms. Seeded once from
 /// `VOICE_SEND_LEAD_MS`; `POST /v1/voice/send-lead` changes it at runtime.
 /// Read when a play starts, so a change applies from the next track.
@@ -1245,7 +1271,8 @@ fn apply_headroom(pcm: &mut [i16], factor: f32) {
 /// after a pause. The timeline is then re-anchored to that release, so only
 /// the next `lead / 20 ms` frames go out at once to refill the client. The
 /// backlog is never dumped: a burst is what the TeamSpeak jitter buffer
-/// plays as choppy (PURA-314, THE-982).
+/// plays as choppy (PURA-314, THE-982). Enabling the lead on live radio
+/// accumulates `(stall − lead)` of delay, and nothing shrinks it.
 struct LeadPacer {
     lead: Duration,
     /// Listener play time of the next frame. `None` before the first frame.
@@ -1472,6 +1499,7 @@ fn spawn_sibling(
                         let mut release_at = lead_pacer
                             .as_ref()
                             .map_or(slot, |lp| lp.release_at(slot));
+                        let mut paused_this_frame = Duration::ZERO;
                         loop {
                             tokio::select! {
                                 biased;
@@ -1481,7 +1509,15 @@ fn spawn_sibling(
                                         return;
                                     }
                                     match park_while_paused(&mut pause_rx).await {
-                                        Some(parked) => paused_total += parked,
+                                        Some(parked) => {
+                                            paused_total += parked;
+                                            // The listener slot stays put
+                                            // across a pause, so the first
+                                            // frame after one is about
+                                            // `pause − lead` late. That is
+                                            // the pause, not a stall.
+                                            paused_this_frame += parked;
+                                        }
                                         None => return,
                                     }
                                     if lead_pacer.is_none() {
@@ -1501,7 +1537,8 @@ fn spawn_sibling(
                         if let Some(lp) = lead_pacer.as_mut() {
                             let (anchored, behind) = lp.released(slot, woke_at);
                             slot = anchored;
-                            pacer.observe_reanchor(f.index, behind);
+                            let stall = behind.saturating_sub(paused_this_frame);
+                            pacer.observe_reanchor(f.index, stall);
                         }
                         // PURA-408b — the paced `sleep_until` is meant to
                         // return exactly at the shifted slot; sample how far
@@ -4981,19 +5018,37 @@ mod tests {
 
     /// Issue #93 — with a lead, a pause still holds every frame, and resume
     /// refills only the lead (4 frames at 60 ms) before pacing again — no
-    /// catch-up dump of the frames that came due during the pause.
+    /// catch-up dump of the frames that came due during the pause. The
+    /// pause itself is not a stall: `lead_reanchors` stays at zero.
     #[tokio::test]
     async fn sibling_with_lead_refills_only_the_lead_after_a_pause() {
         let anchor = Instant::now();
         let frames = (0..60)
             .map(|i| pcm_at(i, anchor + OPUS_FRAME_PERIOD * i as u32))
             .collect();
-        let (arrivals, during_pause) = arrivals_with_lead(
-            frames,
-            Duration::from_millis(60),
-            Some((10, Duration::from_millis(400))),
-        )
-        .await;
+        let probe = Arc::new(ReanchorProbe {
+            seen: AtomicU32::new(0),
+            counted: AtomicU32::new(0),
+        });
+        let (arrivals, during_pause) = LEAD_REANCHOR_PROBE
+            .scope(
+                Arc::clone(&probe),
+                arrivals_with_lead(
+                    frames,
+                    Duration::from_millis(60),
+                    Some((10, Duration::from_millis(400))),
+                ),
+            )
+            .await;
+        assert!(
+            probe.seen.load(Ordering::Relaxed) > 0,
+            "the sibling never reported a lead observation",
+        );
+        assert_eq!(
+            probe.counted.load(Ordering::Relaxed),
+            0,
+            "a pure operator pause must not count as a lead stall",
+        );
         assert!(
             during_pause
                 .iter()

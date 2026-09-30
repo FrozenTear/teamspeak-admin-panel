@@ -1220,6 +1220,16 @@ async fn run_wire_loop<C: VoiceLoopConn>(
             },
             cmd = wire_cmd_rx.recv() => match cmd {
                 Some(WireCmd::InstallAudio { rx, started_at, seek_base_secs, epoch }) => {
+                    // A fresh play builds a new send-ahead pacer and bursts
+                    // another lead. If a receiver is still installed, the
+                    // listener's jitter buffer still holds the previous one.
+                    // The end-of-voice packet resets that buffer, the same
+                    // way Stop / SkipNext / Seek do. Lead 0 has no pacer
+                    // and no burst; this packet is the reset, not a lead.
+                    if play.is_some() {
+                        audio::send_voice_stop(&mut con);
+                        audio::inline_flush(&mut con);
+                    }
                     play = Some(WirePlay {
                         rx,
                         clock: audio::ContentClock::default(),
@@ -1812,6 +1822,15 @@ async fn handle_audio_command(
             // UI-uploaded cookie takes effect without a manager restart.
             let cookie = yt_cookie.read().unwrap().clone();
             info!(?source, "AudioCommand::Play — spawning pipeline");
+            // Match SkipNext when a play is already live. Dropping the
+            // pipeline alone leaves the wire receiver (and the listener's
+            // jitter buffer) in place, so the replacement's fresh pacer
+            // stacks a second send-ahead lead on top of the first. Lead 0
+            // still builds no pacer and sends no burst.
+            if audio::tear_down(current_audio) {
+                wire.clear_audio();
+                wire.voice_stop_and_flush();
+            }
             if let Err(err) =
                 audio::start_pipeline(current_audio, &source, cookie, bot_volume).await
             {
@@ -3083,6 +3102,68 @@ mod tests {
         assert!(rx.try_recv().is_err(), "and ships no further WireCmd");
     }
 
+    /// Issue #93 — a direct Play over a live pipeline matches SkipNext:
+    /// clear the wire receiver, then the end-of-voice packet, before the
+    /// replacement is spawned. The first play has nothing to flush. Lead 0
+    /// (the default) still builds no pacer; this is the jitter-buffer reset.
+    #[tokio::test]
+    async fn direct_play_over_active_audio_flushes_before_replacement() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<WireCmd>();
+        let store: Arc<dyn MusicBotStore> = Arc::new(InMemoryMusicBotStore::new());
+        let (events, _events_rx) = broadcast::channel(8);
+        let yt_cookie: Arc<RwLock<Option<PathBuf>>> = Arc::new(RwLock::new(None));
+        let volume = VolumeHandle::default();
+        let mut current_audio: Option<ActiveAudio> = None;
+        let source = AudioSource::Url("synthetic://?hz=440&duration_ms=200&amplitude=0".into());
+
+        {
+            let mut wire = WireSink::Split(&tx);
+            handle_audio_command(
+                &mut wire,
+                AudioCommand::Play {
+                    source: source.clone(),
+                },
+                &mut current_audio,
+                BotId(7),
+                &store,
+                &events,
+                &yt_cookie,
+                &volume,
+            )
+            .await;
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "the first play has no previous receiver to clear",
+        );
+        assert!(current_audio.is_some(), "the first play spawned a pipeline");
+
+        {
+            let mut wire = WireSink::Split(&tx);
+            handle_audio_command(
+                &mut wire,
+                AudioCommand::Play { source },
+                &mut current_audio,
+                BotId(7),
+                &store,
+                &events,
+                &yt_cookie,
+                &volume,
+            )
+            .await;
+        }
+        assert!(
+            matches!(rx.try_recv(), Ok(WireCmd::ClearAudio)),
+            "replacement drops the previous wire receiver first",
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(WireCmd::VoiceStop)),
+            "replacement sends the end-of-voice packet",
+        );
+        assert!(rx.try_recv().is_err(), "no further wire commands");
+        assert!(current_audio.is_some(), "the replacement pipeline is live");
+    }
+
     /// A bot that can never finish a handshake must still leave when
     /// `Shutdown` arrives during the connect/retry loop.
     ///
@@ -3586,6 +3667,73 @@ mod tests {
             "send loop did not reach the post-send events poll: {snapshot:?}"
         );
         snapshot
+    }
+
+    /// Issue #93 — installing audio while a receiver is already live sends
+    /// the end-of-voice packet. The first install has nothing to reset, so
+    /// a second install is exactly one voice-stop, not two.
+    #[tokio::test]
+    async fn install_audio_over_active_play_sends_one_voice_stop() {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let conn = ScriptedConn {
+            queue: std::collections::VecDeque::new(),
+            log: Arc::clone(&log),
+        };
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (evt_tx, _evt_rx) = mpsc::unbounded_channel();
+        let (events, _events_rx) = broadcast::channel(8);
+        let task = tokio::spawn(run_wire_loop(conn, cmd_rx, evt_tx, events));
+        let now = std::time::Instant::now();
+        let (first_tx, first_rx) = mpsc::channel(1);
+        let (second_tx, second_rx) = mpsc::channel(1);
+        cmd_tx
+            .send(WireCmd::InstallAudio {
+                rx: first_rx,
+                started_at: now,
+                seek_base_secs: 0,
+                epoch: 1,
+            })
+            .expect("command channel open");
+        cmd_tx
+            .send(WireCmd::InstallAudio {
+                rx: second_rx,
+                started_at: now,
+                seek_base_secs: 0,
+                epoch: 2,
+            })
+            .expect("command channel open");
+
+        let enqueued = || {
+            log.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .filter(|step| matches!(step, WireStep::Enqueued))
+                .count()
+        };
+        let mut stops = 0;
+        for _ in 0..200 {
+            stops = enqueued();
+            if stops >= 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        stops = enqueued();
+        let snapshot = log
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        drop(first_tx);
+        drop(second_tx);
+        drop(cmd_tx);
+        task.await.expect("wire loop exits");
+        assert_eq!(
+            stops, 1,
+            "replacing an installed play sends one end-of-voice packet: {snapshot:?}"
+        );
     }
 
     fn wire_log_ready(log: &[WireStep], flush_on: bool) -> bool {

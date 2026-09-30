@@ -887,74 +887,125 @@ mod tests {
         assert_eq!(list.bots[0].name, "unit");
     }
 
-    /// Issue #93 — the send-lead route reads and writes the process-wide
-    /// lead. The write re-sets the value it just read, so a play spawned by
-    /// another test in this process never sees a lead it did not ask for.
-    #[tokio::test]
-    async fn send_lead_route_reads_and_sets() {
-        let app = router(RuntimeState::new());
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/v1/voice/send-lead")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let current: SendLead = json(resp).await;
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/voice/send-lead")
-                    .header("content-type", "application/json")
-                    .body(Body::from(serde_json::to_vec(&current).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let set: SendLead = json(resp).await;
-        assert_eq!(set, current);
+    /// Serializes tests that write the process-wide send-lead and encode
+    /// headroom, so one test cannot restore a value another test changed.
+    fn voice_setting_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Issue #93 — the encode-headroom route reads and writes the
-    /// process-wide headroom. The write re-sets the value it just read, so a
-    /// play spawned by another test never sees a headroom it did not ask for.
-    #[tokio::test]
-    async fn encode_headroom_route_reads_and_sets() {
-        let app = router(RuntimeState::new());
+    struct RestoreSendLead(u64);
+    impl Drop for RestoreSendLead {
+        fn drop(&mut self) {
+            crate::audio::set_send_lead_ms(self.0);
+        }
+    }
+
+    struct RestoreHeadroom(f32);
+    impl Drop for RestoreHeadroom {
+        fn drop(&mut self) {
+            crate::audio::set_encode_headroom_db(self.0);
+        }
+    }
+
+    async fn voice_get<T: serde::de::DeserializeOwned>(app: &axum::Router, uri: &str) -> T {
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "GET {uri}");
+        json(resp).await
+    }
+
+    async fn voice_post<T: serde::de::DeserializeOwned>(
+        app: &axum::Router,
+        uri: &str,
+        body: &str,
+    ) -> T {
         let resp = app
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/v1/voice/encode-headroom")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let current: EncodeHeadroom = json(resp).await;
-
-        let resp = app
-            .oneshot(
-                Request::builder()
                     .method("POST")
-                    .uri("/v1/voice/encode-headroom")
+                    .uri(uri)
                     .header("content-type", "application/json")
-                    .body(Body::from(serde_json::to_vec(&current).unwrap()))
+                    .body(Body::from(body.to_string()))
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let set: EncodeHeadroom = json(resp).await;
-        assert_eq!(set, current);
+        assert_eq!(resp.status(), StatusCode::OK, "POST {uri} {body}");
+        json(resp).await
+    }
+
+    /// Issue #93 — posting a different lead sticks, values above 500 ms are
+    /// clamped, and the process-wide lead is put back so other tests keep
+    /// the default (0, no pacer).
+    #[tokio::test]
+    async fn send_lead_route_sets_clamps_and_restores() {
+        let _lock = voice_setting_lock();
+        let app = router(RuntimeState::new());
+        let original: SendLead = voice_get(&app, "/v1/voice/send-lead").await;
+        let _restore = RestoreSendLead(original.ms);
+
+        let posted = if original.ms == 80 { 40 } else { 80 };
+        let set: SendLead = voice_post(
+            &app,
+            "/v1/voice/send-lead",
+            &format!(r#"{{"ms":{posted}}}"#),
+        )
+        .await;
+        assert_eq!(set.ms, posted, "POST must apply its body");
+        let read: SendLead = voice_get(&app, "/v1/voice/send-lead").await;
+        assert_eq!(read.ms, posted, "the posted lead must stick");
+
+        let clamped: SendLead = voice_post(&app, "/v1/voice/send-lead", r#"{"ms":9999}"#).await;
+        assert_eq!(clamped.ms, 500, "above 500 ms is clamped");
+        let read: SendLead = voice_get(&app, "/v1/voice/send-lead").await;
+        assert_eq!(read.ms, 500);
+    }
+
+    /// Issue #93 — posting a different headroom sticks. Values above 0 and
+    /// below −24 are clamped. An integer JSON body (`{"db": -6}`) is
+    /// accepted. The process-wide headroom is restored afterwards.
+    #[tokio::test]
+    async fn encode_headroom_route_sets_clamps_and_restores() {
+        let _lock = voice_setting_lock();
+        let app = router(RuntimeState::new());
+        let original: EncodeHeadroom = voice_get(&app, "/v1/voice/encode-headroom").await;
+        let _restore = RestoreHeadroom(original.db);
+
+        let posted = if original.db == -12.0 { -3.0 } else { -12.0 };
+        let set: EncodeHeadroom = voice_post(
+            &app,
+            "/v1/voice/encode-headroom",
+            &format!(r#"{{"db":{posted}}}"#),
+        )
+        .await;
+        assert_eq!(set.db, posted, "POST must apply its body");
+        let read: EncodeHeadroom = voice_get(&app, "/v1/voice/encode-headroom").await;
+        assert_eq!(read.db, posted, "the posted headroom must stick");
+
+        let above: EncodeHeadroom =
+            voice_post(&app, "/v1/voice/encode-headroom", r#"{"db":3}"#).await;
+        assert_eq!(above.db, 0.0, "above 0 dB is clamped to 0");
+        let read: EncodeHeadroom = voice_get(&app, "/v1/voice/encode-headroom").await;
+        assert_eq!(read.db, 0.0);
+
+        let below: EncodeHeadroom =
+            voice_post(&app, "/v1/voice/encode-headroom", r#"{"db":-40}"#).await;
+        assert_eq!(below.db, -24.0, "below -24 dB is clamped");
+        let read: EncodeHeadroom = voice_get(&app, "/v1/voice/encode-headroom").await;
+        assert_eq!(read.db, -24.0);
+
+        // Integer, not `-6.0`: a handler that ignored the body, or a
+        // deserializer that required a JSON float, would fail this.
+        let integer: EncodeHeadroom =
+            voice_post(&app, "/v1/voice/encode-headroom", r#"{"db": -6}"#).await;
+        assert_eq!(integer.db, -6.0);
+        let read: EncodeHeadroom = voice_get(&app, "/v1/voice/encode-headroom").await;
+        assert_eq!(read.db, -6.0);
     }
 
     fn addr(text: &str) -> SocketAddr {
@@ -1013,6 +1064,10 @@ mod tests {
             Some(r#"{"op":"playlist_list","bot":1}"#),
         ),
         ("POST", "/v1/store", Some(r#"{"op":"queue_peek","bot":1}"#)),
+        ("GET", "/v1/voice/send-lead", None),
+        ("POST", "/v1/voice/send-lead", Some(r#"{"ms":0}"#)),
+        ("GET", "/v1/voice/encode-headroom", None),
+        ("POST", "/v1/voice/encode-headroom", Some(r#"{"db":-6}"#)),
     ];
 
     #[tokio::test]
@@ -1143,6 +1198,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+
+        {
+            // Echo the value just read so this auth check does not leave a
+            // non-default lead or headroom for other tests.
+            let _lock = voice_setting_lock();
+            let resp = app
+                .clone()
+                .oneshot(authed("GET", "/v1/voice/send-lead", Some(token), None))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let lead: SendLead = json(resp).await;
+            let resp = app
+                .clone()
+                .oneshot(authed(
+                    "POST",
+                    "/v1/voice/send-lead",
+                    Some(token),
+                    Some(&serde_json::to_string(&lead).unwrap()),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let echoed: SendLead = json(resp).await;
+            assert_eq!(echoed, lead);
+
+            let resp = app
+                .clone()
+                .oneshot(authed(
+                    "GET",
+                    "/v1/voice/encode-headroom",
+                    Some(token),
+                    None,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let headroom: EncodeHeadroom = json(resp).await;
+            let resp = app
+                .clone()
+                .oneshot(authed(
+                    "POST",
+                    "/v1/voice/encode-headroom",
+                    Some(token),
+                    Some(&serde_json::to_string(&headroom).unwrap()),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let echoed: EncodeHeadroom = json(resp).await;
+            assert_eq!(echoed, headroom);
+        }
 
         let resp = app
             .clone()
