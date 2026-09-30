@@ -3710,13 +3710,13 @@ mod tests {
                 .filter(|step| matches!(step, WireStep::Enqueued))
                 .count()
         };
-        let mut stops = 0;
+        let mut stops = enqueued();
         for _ in 0..200 {
-            stops = enqueued();
             if stops >= 1 {
                 break;
             }
             tokio::task::yield_now().await;
+            stops = enqueued();
         }
         for _ in 0..20 {
             tokio::task::yield_now().await;

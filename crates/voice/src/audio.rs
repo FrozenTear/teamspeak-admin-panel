@@ -466,6 +466,7 @@ fn build_active(
         sibling_catchup_cap(),
         send_lead(),
         encode_headroom_db(),
+        None,
     );
     ActiveAudio {
         source_label,
@@ -916,6 +917,8 @@ struct PacerMonitor {
     window_reanchor_max: Duration,
     /// Issue #93 — summed re-anchors this window.
     window_reanchor_sum: Duration,
+    /// Test probe for lead observations. Production leaves this `None`.
+    reanchor_probe: Option<Arc<ReanchorProbe>>,
 }
 
 impl PacerMonitor {
@@ -933,6 +936,7 @@ impl PacerMonitor {
             window_reanchors: 0,
             window_reanchor_max: Duration::ZERO,
             window_reanchor_sum: Duration::ZERO,
+            reanchor_probe: None,
         }
     }
 
@@ -940,8 +944,12 @@ impl PacerMonitor {
     /// Call before [`Self::observe`] for the same frame, so the re-anchor
     /// lands in that frame's window.
     fn observe_reanchor(&mut self, index: u64, behind: Duration) {
-        #[cfg(test)]
-        note_reanchor_probe(behind >= LEAD_REANCHOR_MIN);
+        if let Some(probe) = &self.reanchor_probe {
+            probe.seen.fetch_add(1, Ordering::Relaxed);
+            if behind >= LEAD_REANCHOR_MIN {
+                probe.counted.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         if behind < LEAD_REANCHOR_MIN {
             return;
         }
@@ -1097,28 +1105,12 @@ const MAX_SEND_LEAD: Duration = Duration::from_millis(500);
 /// noise on the first frame of a play.
 const LEAD_REANCHOR_MIN: Duration = Duration::from_millis(2);
 
-/// Issue #93 — counts lead observations for the pause test. `seen` proves
-/// the sibling inherited the probe; `counted` is stalls at or above
-/// [`LEAD_REANCHOR_MIN`]. Absent outside that test.
-#[cfg(test)]
+/// Issue #93 — counts lead observations inside one sibling. `seen` is every
+/// observation; `counted` is those at or above [`LEAD_REANCHOR_MIN`]. The
+/// pause test installs one; production does not.
 struct ReanchorProbe {
     seen: AtomicU32,
     counted: AtomicU32,
-}
-
-#[cfg(test)]
-tokio::task_local! {
-    static LEAD_REANCHOR_PROBE: Arc<ReanchorProbe>;
-}
-
-#[cfg(test)]
-fn note_reanchor_probe(counted: bool) {
-    let _ = LEAD_REANCHOR_PROBE.try_with(|probe| {
-        probe.seen.fetch_add(1, Ordering::Relaxed);
-        if counted {
-            probe.counted.fetch_add(1, Ordering::Relaxed);
-        }
-    });
 }
 
 /// Issue #93 — the send-ahead lead in ms. Seeded once from
@@ -1322,6 +1314,7 @@ fn spawn_sibling(
     catchup_cap: Option<usize>,
     send_lead: Duration,
     encode_headroom_db: f32,
+    reanchor_probe: Option<Arc<ReanchorProbe>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         // Keep `pipeline` alive for the lifetime of the sibling — its
@@ -1354,6 +1347,7 @@ fn spawn_sibling(
         // `scheduled_at` slot the paced `sleep_until` below actually woke —
         // the attribution `frame_underrun` and `dequeue_gap` both miss.
         let mut pacer = PacerMonitor::new(send_lead);
+        pacer.reanchor_probe = reanchor_probe;
 
         // Issue #93 — send-ahead pacing. `None` (zero lead) keeps the
         // pipeline slot + pause shift below exactly as before.
@@ -3260,6 +3254,7 @@ mod tests {
             None,
             Duration::ZERO,
             0.0,
+            None,
         );
 
         let mut frame_count = 0usize;
@@ -3331,6 +3326,7 @@ mod tests {
             None,
             Duration::ZERO,
             0.0,
+            None,
         );
 
         // Let a few frames flow, then pause ≥2 s mid-play. The 600 ms tone
@@ -3515,6 +3511,7 @@ mod tests {
             None,
             Duration::ZERO,
             0.0,
+            None,
         );
 
         let mut frames_seen = 0usize;
@@ -3585,6 +3582,7 @@ mod tests {
             None,
             Duration::ZERO,
             0.0,
+            None,
         );
 
         // Decode each Opus frame back to PCM — decoded amplitude is what a
@@ -4698,6 +4696,7 @@ mod tests {
             cap,
             Duration::ZERO,
             0.0,
+            None,
         );
         let mut out = Vec::new();
         while let Some(msg) = msg_rx.recv().await {
@@ -4910,6 +4909,7 @@ mod tests {
         frames: Vec<PcmFrame>,
         lead: Duration,
         pause: Option<(usize, Duration)>,
+        reanchor_probe: Option<Arc<ReanchorProbe>>,
     ) -> (Vec<Instant>, Vec<Duration>) {
         let mut pipeline = AudioPipeline::spawn(
             AudioSourceSpec::SyntheticTone {
@@ -4941,6 +4941,7 @@ mod tests {
             None,
             lead,
             0.0,
+            reanchor_probe,
         );
 
         let mut arrivals: Vec<Instant> = Vec::new();
@@ -4997,7 +4998,7 @@ mod tests {
         let frames = (0..25)
             .map(|i| pcm_at(i, anchor + OPUS_FRAME_PERIOD * i as u32))
             .collect();
-        let (arrivals, _) = arrivals_with_lead(frames, Duration::from_millis(80), None).await;
+        let (arrivals, _) = arrivals_with_lead(frames, Duration::from_millis(80), None, None).await;
         assert_eq!(arrivals.len(), 25);
         let first = arrivals[0];
         let primed = arrivals
@@ -5030,16 +5031,13 @@ mod tests {
             seen: AtomicU32::new(0),
             counted: AtomicU32::new(0),
         });
-        let (arrivals, during_pause) = LEAD_REANCHOR_PROBE
-            .scope(
-                Arc::clone(&probe),
-                arrivals_with_lead(
-                    frames,
-                    Duration::from_millis(60),
-                    Some((10, Duration::from_millis(400))),
-                ),
-            )
-            .await;
+        let (arrivals, during_pause) = arrivals_with_lead(
+            frames,
+            Duration::from_millis(60),
+            Some((10, Duration::from_millis(400))),
+            Some(Arc::clone(&probe)),
+        )
+        .await;
         assert!(
             probe.seen.load(Ordering::Relaxed) > 0,
             "the sibling never reported a lead observation",
@@ -5157,6 +5155,7 @@ mod tests {
             None,
             Duration::ZERO,
             headroom_db,
+            None,
         );
         let mut out = Vec::new();
         while let Some(msg) = msg_rx.recv().await {

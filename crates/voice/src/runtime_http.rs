@@ -889,9 +889,9 @@ mod tests {
 
     /// Serializes tests that write the process-wide send-lead and encode
     /// headroom, so one test cannot restore a value another test changed.
-    fn voice_setting_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    fn voice_setting_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
     }
 
     struct RestoreSendLead(u64);
@@ -944,7 +944,7 @@ mod tests {
     /// the default (0, no pacer).
     #[tokio::test]
     async fn send_lead_route_sets_clamps_and_restores() {
-        let _lock = voice_setting_lock();
+        let _lock = voice_setting_lock().lock().await;
         let app = router(RuntimeState::new());
         let original: SendLead = voice_get(&app, "/v1/voice/send-lead").await;
         let _restore = RestoreSendLead(original.ms);
@@ -971,7 +971,7 @@ mod tests {
     /// accepted. The process-wide headroom is restored afterwards.
     #[tokio::test]
     async fn encode_headroom_route_sets_clamps_and_restores() {
-        let _lock = voice_setting_lock();
+        let _lock = voice_setting_lock().lock().await;
         let app = router(RuntimeState::new());
         let original: EncodeHeadroom = voice_get(&app, "/v1/voice/encode-headroom").await;
         let _restore = RestoreHeadroom(original.db);
@@ -1202,7 +1202,7 @@ mod tests {
         {
             // Echo the value just read so this auth check does not leave a
             // non-default lead or headroom for other tests.
-            let _lock = voice_setting_lock();
+            let _lock = voice_setting_lock().lock().await;
             let resp = app
                 .clone()
                 .oneshot(authed("GET", "/v1/voice/send-lead", Some(token), None))
