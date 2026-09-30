@@ -24,8 +24,8 @@ use crate::ui::components::toast::{ToastVariant, use_toaster};
 use crate::ui::components::{Banner, BannerVariant, Button, ButtonSize, ButtonType, ButtonVariant};
 use crate::ui::pages::music_bots::shared::{
     audio_source_host, bot_in_channel, effective_playback_state, format_duration, format_error,
-    parse_audio_source, source_glyph, state_badge_class, state_label, track_display_title,
-    track_title_is_placeholder,
+    orphaned_badge_class, parse_audio_source, source_glyph, state_badge_class, state_label,
+    track_display_title, track_title_is_placeholder,
 };
 use crate::ui::routes::Route;
 
@@ -257,6 +257,13 @@ pub fn BotDetailPage(bot_id: u64) -> Element {
                     p { class: "page-lede",
                         span { class: state_badge_class(shown_state.unwrap_or(d.state)),
                             "{state_label(shown_state.unwrap_or(d.state))}"
+                        }
+                        if d.orphaned {
+                            span {
+                                class: orphaned_badge_class(),
+                                title: "This bot's server address matches no enabled connection.",
+                                "Orphaned"
+                            }
                         }
                         " · {d.server_addr}"
                         if in_a_channel {

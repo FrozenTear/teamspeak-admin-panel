@@ -244,13 +244,19 @@ where
     Req: Serialize,
     Resp: DeserializeOwned,
 {
-    let resp = send(base, method, path, bearer, body, timeout_ms).await?;
-    let status = resp.status();
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| AuthError::Transport(e.to_string()))?;
-    if status >= 200 && status < 300 {
+    let fetched = send(base, method, path, bearer, body, timeout_ms).await?;
+    let status = fetched.resp.status();
+    // The refresh deadline stays armed through the body read. Dropping
+    // it when headers arrive lets a stalled `text()` sit inside the
+    // cross-tab lock with no abort.
+    let text = match fetched.resp.text().await {
+        Ok(text) => {
+            drop(fetched.timeout);
+            text
+        }
+        Err(e) => return Err(fetch_transport_error(&e, &fetched.timeout)),
+    };
+    if (200..300).contains(&status) {
         serde_json::from_str(&text).map_err(|e| AuthError::Deserialise(e.to_string()))
     } else {
         Err(map_error_status(status, &text))
@@ -281,12 +287,19 @@ async fn request_no_content<Req: Serialize>(
     bearer: Option<&str>,
     body: Option<&Req>,
 ) -> Result<(), AuthError> {
-    let resp = send(base, method, path, bearer, body, None).await?;
-    let status = resp.status();
+    let fetched = send(base, method, path, bearer, body, None).await?;
+    let status = fetched.resp.status();
     if status == 204 || (200..300).contains(&status) {
+        drop(fetched.timeout);
         Ok(())
     } else {
-        let text = resp.text().await.unwrap_or_default();
+        let text = match fetched.resp.text().await {
+            Ok(text) => {
+                drop(fetched.timeout);
+                text
+            }
+            Err(e) => return Err(fetch_transport_error(&e, &fetched.timeout)),
+        };
         Err(map_error_status(status, &text))
     }
 }
@@ -310,7 +323,7 @@ async fn send<Req: Serialize>(
     bearer: Option<&str>,
     body: Option<&Req>,
     timeout_ms: Option<u32>,
-) -> Result<gloo_net::http::Response, AuthError> {
+) -> Result<TimedResponse, AuthError> {
     use gloo_net::http::Request;
     let url = format!("{}{}", base.trim_end_matches('/'), path);
     let mut builder = match method {
@@ -324,12 +337,12 @@ async fn send<Req: Serialize>(
         builder = builder.header("authorization", &format!("Bearer {token}"));
     }
     // Only the refresh POST passes a timeout. An AbortController aborts
-    // the fetch; that error is transport, never a 401.
+    // the fetch; that error is transport, never a 401. Callers hold
+    // `timeout` until `resp.text()` finishes.
     let timeout = timeout_ms.and_then(arm_refresh_timeout);
     if let Some(timeout) = &timeout {
         builder = builder.abort_signal(Some(&timeout.signal));
     }
-    let signal = timeout.as_ref().map(|timeout| timeout.signal.clone());
     let request = if let Some(b) = body {
         builder
             .header("content-type", "application/json")
@@ -340,12 +353,31 @@ async fn send<Req: Serialize>(
             .build()
             .map_err(|e| AuthError::Transport(e.to_string()))?
     };
-    let result = request.send().await;
-    drop(timeout);
-    result.map_err(|e| match &signal {
-        Some(signal) if signal.aborted() => refresh_aborted_error(&e.to_string()),
-        _ => AuthError::Transport(e.to_string()),
-    })
+    match request.send().await {
+        Ok(resp) => Ok(TimedResponse { resp, timeout }),
+        Err(e) => Err(fetch_transport_error(&e, &timeout)),
+    }
+}
+
+/// Response plus the refresh deadline, if this call armed one.
+///
+/// The timeout is not dropped when headers arrive. [`request_json`]
+/// holds it across `resp.text()`.
+#[cfg(target_arch = "wasm32")]
+struct TimedResponse {
+    resp: gloo_net::http::Response,
+    timeout: Option<RefreshFetchTimeout>,
+}
+
+#[cfg(target_arch = "wasm32")]
+fn fetch_transport_error(
+    err: &impl std::fmt::Display,
+    timeout: &Option<RefreshFetchTimeout>,
+) -> AuthError {
+    match timeout {
+        Some(timeout) if timeout.signal.aborted() => refresh_aborted_error(&err.to_string()),
+        _ => AuthError::Transport(err.to_string()),
+    }
 }
 
 /// Abort the refresh `fetch` after `timeout_ms`. Drop clears the timer so

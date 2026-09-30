@@ -116,6 +116,30 @@ jobs:
         # Default features cover unit + non-network integration tests.
         run: cargo test --workspace --locked
 
+  # Panel SPA (`--features web`) is the wasm32 build dx-CLI ships.
+  # Native `cargo test` does not compile that target, so a hung
+  # `resp.text()` or a Web Locks binding break would otherwise land
+  # only in a browser bundle.
+  wasm-check:
+    name: wasm32 client check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+          shared-key: wasm32
+
+      - name: cargo check (panel web)
+        run: cargo check -p ts6-manager-server --target wasm32-unknown-unknown --no-default-features --features web --locked
+
   # PURA-170 (OD3 ratified on PURA-169): boot the public
   # `teamspeaksystems/teamspeak6-server` image and run the env-gated
   # WebQuery integration test

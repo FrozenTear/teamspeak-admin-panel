@@ -28,6 +28,7 @@ mod server_info;
 mod servers_index;
 mod settings;
 mod setup;
+mod talk_power;
 mod video_sources;
 mod widgets;
 

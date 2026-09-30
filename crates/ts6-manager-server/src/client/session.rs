@@ -35,6 +35,11 @@
 //!    the at-most-one-successor fix is a separate API change — this gate
 //!    is what stops the second POST.
 //!
+//! Cross-tab exclusion is best-effort once three or more tabs are open.
+//! Web Locks grants the critical section to one tab; a waiter that hits
+//! the lock timeout leaves the queue and may POST a predecessor refresh
+//! token if the holder has not stored a successor yet.
+//!
 //! The refresh transport is injected via [`RefreshFn`] so unit tests can
 //! exercise the locking + replay logic without touching the network.
 //!
@@ -372,10 +377,13 @@ impl RefreshGate {
                     ]),
                 );
                 self.update_pair_with_log(pair.access_token.clone(), pair.refresh_token.clone());
-                let snap = SessionSnapshot {
-                    access: pair.access_token,
-                    refresh: pair.refresh_token,
-                    user: after_lock.user,
+                // Peer logout can land before this write. `update_pair`
+                // drops the rotation when memory is already anonymous.
+                // Re-read before replay so a data call does not present
+                // tokens that logout discarded.
+                let Some(snap) = self.snapshot() else {
+                    auth_debug::log("gate.refresh_ok_dropped_on_logout", serde_json::Value::Null);
+                    return LockedRefresh::Stop(AuthError::SessionAnonymous);
                 };
                 // PURA-225 — same defense-in-depth as the parallel-rotator
                 // branch: if the replay (with a brand-new access token)
@@ -383,7 +391,8 @@ impl RefreshGate {
                 // so AppShell bounces instead of looping `data 401 →
                 // refresh → replay 401 → propagate Unauthorized → stuck
                 // banner` on every render. That invalidate happens in
-                // `replay_snapshot`, after these guards have dropped.
+                // `replay_snapshot`, after these guards have dropped, and
+                // only when storage still holds this refresh token.
                 LockedRefresh::Replay {
                     snap,
                     reason: "post_refresh_replay_401",
@@ -402,11 +411,13 @@ impl RefreshGate {
                 // the right banner. A timeout is [`AuthError::Transport`],
                 // not a 401, so it takes this keep-alive path.
                 //
-                // A client-side refresh timeout does not cancel the
-                // rotation on the server. Do not POST again inside this
-                // hold — return and drop both locks. The next attempt
-                // re-reads storage before any new refresh, and adopts a
-                // pair another tab already stored.
+                // A client-side refresh timeout does not cancel a
+                // rotation the server may already have committed, and
+                // this arm does not re-read storage. A peer-stored
+                // successor (R1) is not adopted here. Memory still holds
+                // the refresh token we sent (R0), so a later attempt in
+                // this tab can POST R0 again. Do not POST again inside
+                // this hold — return and drop both locks.
                 //
                 // A 401 is not automatically fatal across tabs: a peer may
                 // have won the rotation and written a successor while our
@@ -456,9 +467,10 @@ impl RefreshGate {
         }
     }
 
-    /// Replay `f` with `snap`. A 401 on the replay invalidates: the access
-    /// token we just adopted or minted was rejected, so the session cannot
-    /// be recovered by another refresh.
+    /// Replay `f` with `snap`. A 401 invalidates only when storage still
+    /// holds the refresh token we replayed with. A peer that stored a
+    /// different pair (or logged out) during the replay is adopted
+    /// instead, so this tab does not `remove` that successor.
     async fn replay_snapshot<F, Fut, T>(
         &self,
         f: &mut F,
@@ -469,15 +481,25 @@ impl RefreshGate {
         F: FnMut(SessionSnapshot) -> Fut,
         Fut: Future<Output = Result<T, AuthError>>,
     {
+        let replayed_refresh = snap.refresh.clone();
         let result = f(snap).await;
         if let Err(err) = &result
             && err.is_unauthorized()
         {
-            auth_debug::log(
-                "gate.replay_401_invalidate",
-                auth_debug::fields(&[("body", err.to_string().into())]),
-            );
-            self.invalidate_with_log(invalidate_reason);
+            let stored = self.session.load_persisted();
+            if persisted_holds_refresh(&stored, &replayed_refresh) {
+                auth_debug::log(
+                    "gate.replay_401_invalidate",
+                    auth_debug::fields(&[("body", err.to_string().into())]),
+                );
+                self.invalidate_with_log(invalidate_reason);
+            } else {
+                auth_debug::log(
+                    "gate.replay_401_storage_moved",
+                    auth_debug::fields(&[("body", err.to_string().into())]),
+                );
+                self.session.adopt_memory(stored);
+            }
         }
         result
     }
@@ -626,6 +648,8 @@ pub mod testing {
 mod tests {
     use super::*;
     use crate::client::storage::{MemoryStore, Storage};
+    use crate::client::store::save_state;
+    use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     use super::testing::InMemorySession;
@@ -677,6 +701,32 @@ mod tests {
             let n = self.count.fetch_add(1, Ordering::SeqCst) + 1;
             let result = (self.responder)(n);
             Box::pin(async move { result })
+        }
+    }
+
+    /// Records the refresh token each POST sends. The first call writes a
+    /// peer successor into storage so a timeout test can show that arm
+    /// does not adopt it.
+    struct RecordingRefresh {
+        sent: Arc<StdMutex<Vec<String>>>,
+        storage: Arc<dyn Storage + Send + Sync>,
+    }
+
+    impl RefreshFn for RecordingRefresh {
+        fn refresh(
+            &self,
+            token: String,
+        ) -> futures::future::BoxFuture<'static, Result<TokenPairResponse, AuthError>> {
+            let n = {
+                let mut sent = self.sent.lock().unwrap();
+                sent.push(token);
+                sent.len()
+            };
+            if n == 1 {
+                save_state(&*self.storage, &authed("peer-access", "R1"));
+            }
+            let err = crate::client::auth::refresh_aborted_error("AbortError");
+            Box::pin(async move { Err(err) })
         }
     }
 
@@ -1557,12 +1607,119 @@ mod tests {
         );
     }
 
-    /// A timed-out refresh does not cancel the server rotation, so this
-    /// hold must not POST again. The lock drops with the error. A later
-    /// attempt re-reads storage first and adopts a pair another tab stored,
-    /// instead of sending the predecessor token.
+    /// A timed-out refresh posts once inside this hold, then returns.
+    /// That arm does not adopt a peer-stored successor: memory stays on
+    /// the token that was sent (R0) even if storage now holds R1. When
+    /// storage is still R0, a later attempt can POST R0 again.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn timed_out_refresh_does_not_post_again_in_the_same_hold() {
+        use ts6_manager_shared::auth::auth_error_strings as msg;
+
+        let storage = arc_storage(MemoryStore::new());
+        let session: Arc<dyn SessionHandle> = Arc::new(InMemorySession::new(
+            authed("old-access", "R0"),
+            storage.clone(),
+        ));
+        let sent = Arc::new(StdMutex::new(Vec::new()));
+        let gate = RefreshGate::new(
+            session.clone(),
+            Arc::new(RecordingRefresh {
+                sent: sent.clone(),
+                storage: storage.clone(),
+            }),
+        );
+
+        let err = gate
+            .run(|_| async { Err::<u32, _>(AuthError::Unauthorized(msg::INVALID_TOKEN.into())) })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AuthError::Transport(_)), "got {err:?}");
+        assert!(!err.is_unauthorized());
+        assert_eq!(sent.lock().unwrap().as_slice(), ["R0"]);
+        match session.read() {
+            AuthState::Authenticated { refresh, .. } => {
+                assert_eq!(refresh, "R0", "timeout must not adopt peer-stored R1");
+            }
+            AuthState::Anonymous => panic!("a timed-out refresh must not log out"),
+        }
+        let stored = session.load_persisted();
+        assert_eq!(
+            stored.refresh_token(),
+            Some("R1"),
+            "the peer write is in storage, and this arm ignored it"
+        );
+
+        // The realistic miss: this tab timed out and nobody stored a
+        // successor. Put the blob back to R0. The next attempt can
+        // POST that predecessor again.
+        save_state(&*storage, &authed("old-access", "R0"));
+        let err = gate
+            .run(|_| async { Err::<u32, _>(AuthError::Unauthorized(msg::INVALID_TOKEN.into())) })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AuthError::Transport(_)), "got {err:?}");
+        assert_eq!(
+            sent.lock().unwrap().as_slice(),
+            ["R0", "R0"],
+            "a later attempt can POST R0 again"
+        );
+        assert!(session.read().is_authenticated());
+    }
+
+    /// Refresh succeeded in the stub, but a peer logout had already
+    /// cleared memory. `update_pair` must not resurrect the session,
+    /// and the data call must not be replayed with the new pair.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn refresh_ok_after_peer_logout_does_not_replay() {
+        use ts6_manager_shared::auth::auth_error_strings as msg;
+
+        let storage = arc_storage(MemoryStore::new());
+        let session: Arc<dyn SessionHandle> = Arc::new(InMemorySession::new(
+            authed("old-access", "old-refresh"),
+            storage.clone(),
+        ));
+        let session_for_refresh = session.clone();
+        let stub = StubRefresh::new(move |_| {
+            session_for_refresh.invalidate();
+            Ok(TokenPairResponse {
+                access_token: "fresh-access".into(),
+                refresh_token: "fresh-refresh".into(),
+            })
+        });
+        let gate = RefreshGate::new(session.clone(), stub.clone());
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_for_run = calls.clone();
+        let err = gate
+            .run(move |snap| {
+                let calls = calls_for_run.clone();
+                async move {
+                    let n = calls.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(n, 0, "peer logout must not replay the data call");
+                    assert_eq!(snap.access, "old-access");
+                    Err::<u32, _>(AuthError::Unauthorized(msg::INVALID_TOKEN.into()))
+                }
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AuthError::SessionAnonymous), "got {err:?}");
+        assert_eq!(stub.calls(), 1);
+        assert!(
+            !session.read().is_authenticated(),
+            "dropped rotation must not resurrect the session"
+        );
+        assert!(
+            storage
+                .get(crate::client::store::SESSION_STORAGE_KEY)
+                .is_none(),
+            "fresh tokens must not be written after logout"
+        );
+    }
+
+    /// A 401 on the replay invalidates only while storage still holds
+    /// the refresh token that was replayed. A peer successor written
+    /// during the replay is adopted, not deleted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn replay_401_adopts_peer_successor_instead_of_invalidating() {
         use crate::client::store::save_state;
         use ts6_manager_shared::auth::auth_error_strings as msg;
 
@@ -1571,45 +1728,29 @@ mod tests {
             authed("old-access", "old-refresh"),
             storage.clone(),
         ));
-        let stub = StubRefresh::new(|n| {
-            assert_eq!(
-                n, 1,
-                "timed-out refresh must not POST again inside the same critical section"
-            );
-            Err(crate::client::auth::refresh_aborted_error("AbortError"))
+        let stub = StubRefresh::new(|_| {
+            Ok(TokenPairResponse {
+                access_token: "fresh-access".into(),
+                refresh_token: "fresh-refresh".into(),
+            })
         });
-        let gate = RefreshGate::new(session.clone(), stub.clone());
-
+        let gate = RefreshGate::new(session.clone(), stub);
+        let storage_for_replay = storage.clone();
         let err = gate
-            .run(|_| async { Err::<u32, _>(AuthError::Unauthorized(msg::INVALID_TOKEN.into())) })
-            .await
-            .unwrap_err();
-        assert!(matches!(err, AuthError::Transport(_)), "got {err:?}");
-        assert!(!err.is_unauthorized());
-        assert_eq!(stub.calls(), 1);
-        assert!(session.read().is_authenticated());
-
-        // The hold has ended. Another tab finished the rotation and wrote
-        // the successor. The next attempt must adopt it and not POST.
-        save_state(&*storage, &authed("peer-access", "peer-refresh"));
-        let out = gate
-            .run(|snap| async move {
-                if snap.access == "old-access" {
+            .run(move |snap| {
+                let storage = storage_for_replay.clone();
+                async move {
+                    if snap.access == "old-access" {
+                        return Err::<u32, _>(AuthError::Unauthorized(msg::INVALID_TOKEN.into()));
+                    }
+                    assert_eq!(snap.refresh, "fresh-refresh");
+                    save_state(&*storage, &authed("peer-access", "peer-refresh"));
                     Err(AuthError::Unauthorized(msg::INVALID_TOKEN.into()))
-                } else {
-                    assert_eq!(snap.access, "peer-access");
-                    assert_eq!(snap.refresh, "peer-refresh");
-                    Ok::<u32, AuthError>(11)
                 }
             })
             .await
-            .unwrap();
-        assert_eq!(out, 11);
-        assert_eq!(
-            stub.calls(),
-            1,
-            "later attempt adopts the stored pair and does not refresh"
-        );
+            .unwrap_err();
+        assert!(err.is_unauthorized(), "got {err:?}");
         match session.read() {
             AuthState::Authenticated {
                 access, refresh, ..
@@ -1617,8 +1758,12 @@ mod tests {
                 assert_eq!(access, "peer-access");
                 assert_eq!(refresh, "peer-refresh");
             }
-            AuthState::Anonymous => panic!("adopting after a timeout must not log out"),
+            AuthState::Anonymous => {
+                panic!("replay 401 must not wipe a peer-stored successor")
+            }
         }
+        let stored = session.load_persisted();
+        assert_eq!(stored.refresh_token(), Some("peer-refresh"));
     }
 
     /// PURA-225 regression — when the data endpoint returns a 401 whose

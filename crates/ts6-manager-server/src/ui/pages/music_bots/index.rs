@@ -2,8 +2,9 @@
 //!
 //! Lists every bot the supervisor knows about, with state badges and the
 //! lifecycle actions an operator needs in one click: spawn a new bot,
-//! connect / disconnect, and delete (clean shutdown). The detail page
-//! (one click into a row) covers per-bot queue management.
+//! connect / disconnect, and delete (clean shutdown). An orphaned bot
+//! shows an Orphaned badge and labels that same delete control Stop.
+//! The detail page (one click into a row) covers per-bot queue management.
 
 use dioxus::prelude::*;
 use ts6_manager_shared::music_bots as wire;
@@ -15,7 +16,8 @@ use crate::client::store::AuthState;
 use crate::ui::components::toast::{ToastVariant, use_toaster};
 use crate::ui::components::{Banner, BannerVariant, Button, ButtonSize, ButtonType, ButtonVariant};
 use crate::ui::pages::music_bots::shared::{
-    format_error, state_badge_class, state_label, track_display_title,
+    delete_control_label, format_error, orphaned_badge_class, state_badge_class, state_label,
+    track_display_title,
 };
 use crate::ui::routes::Route;
 
@@ -103,23 +105,25 @@ pub fn BotsIndexPage() -> Element {
     let on_delete = {
         let gate = gate.clone();
         let mut bump = bump;
-        move |bot: wire::BotId| {
+        move |(bot, orphaned): (wire::BotId, bool)| {
             let gate = gate.clone();
+            let ok_title = if orphaned {
+                format!("Stopped bot {}", bot.0)
+            } else {
+                format!("Deleted bot {}", bot.0)
+            };
+            let err_title = if orphaned {
+                "Stop failed"
+            } else {
+                "Delete failed"
+            };
             spawn(async move {
                 match mb::delete_bot(gate, bot).await {
                     Ok(()) => {
-                        toaster.push(
-                            ToastVariant::Success,
-                            format!("Deleted bot {}", bot.0),
-                            None,
-                        );
+                        toaster.push(ToastVariant::Success, ok_title, None);
                         bump();
                     }
-                    Err(e) => toaster.push(
-                        ToastVariant::Danger,
-                        "Delete failed",
-                        Some(format_error(&e)),
-                    ),
+                    Err(e) => toaster.push(ToastVariant::Danger, err_title, Some(format_error(&e))),
                 }
             });
         }
@@ -182,7 +186,7 @@ pub fn BotsIndexPage() -> Element {
                     }),
                     on_delete: EventHandler::new({
                         let on_delete = on_delete.clone();
-                        move |id: wire::BotId| on_delete(id)
+                        move |action: (wire::BotId, bool)| on_delete(action)
                     }),
                 }
             }
@@ -214,7 +218,7 @@ struct BotsTableProps {
     rows: Vec<wire::MusicBotSummary>,
     on_connect: EventHandler<wire::BotId>,
     on_disconnect: EventHandler<wire::BotId>,
-    on_delete: EventHandler<wire::BotId>,
+    on_delete: EventHandler<(wire::BotId, bool)>,
 }
 
 #[component]
@@ -240,6 +244,8 @@ fn BotsTable(props: BotsTableProps) -> Element {
                         let on_connect = props.on_connect;
                         let on_disconnect = props.on_disconnect;
                         let on_delete = props.on_delete;
+                        let orphaned = b.orphaned;
+                        let delete_label = delete_control_label(orphaned);
                         let online = matches!(state, wire::BotState::Connected | wire::BotState::InChannel | wire::BotState::Playing);
                         let now_playing = b
                             .now_playing
@@ -260,6 +266,13 @@ fn BotsTable(props: BotsTableProps) -> Element {
                                 td {
                                     span { class: state_badge_class(state),
                                         "{state_label(state)}"
+                                    }
+                                    if orphaned {
+                                        span {
+                                            class: orphaned_badge_class(),
+                                            title: "This bot's server address matches no enabled connection.",
+                                            "Orphaned"
+                                        }
                                     }
                                     // PURA-270 — a failed track leaves no
                                     // `Failed` wire state, so the row badge
@@ -301,8 +314,13 @@ fn BotsTable(props: BotsTableProps) -> Element {
                                     Button {
                                         variant: ButtonVariant::Danger,
                                         size: ButtonSize::Small,
-                                        onclick: move |_| on_delete.call(id),
-                                        "Delete"
+                                        title: if orphaned {
+                                            Some("Stop this orphaned bot".into())
+                                        } else {
+                                            None
+                                        },
+                                        onclick: move |_| on_delete.call((id, orphaned)),
+                                        "{delete_label}"
                                     }
                                 }
                             }

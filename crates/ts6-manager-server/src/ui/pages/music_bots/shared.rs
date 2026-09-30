@@ -157,10 +157,44 @@ pub fn parse_audio_source(raw: &str) -> Option<wire::AudioSource> {
     })
 }
 
+/// Class used for the "Orphaned" chip beside a bot state badge.
+/// Same `bot-badge` family as [`state_badge_class`] and the Failed chip.
+pub fn orphaned_badge_class() -> &'static str {
+    "bot-badge bot-badge--pending"
+}
+
+/// Label for the existing delete control. Orphaned rows say Stop; the
+/// request is still `DELETE` and uses the same permission gate.
+pub fn delete_control_label(orphaned: bool) -> &'static str {
+    if orphaned { "Stop" } else { "Delete" }
+}
+
+/// Operator copy when a music action's 502 body mentions
+/// `music_runtime_auth`. Other errors keep the generic formatting.
+const MUSIC_RUNTIME_AUTH_MESSAGE: &str =
+    "The music control token is missing or mismatched on the server.";
+
+fn is_music_runtime_auth(err: &ApiError) -> bool {
+    match err {
+        ApiError::BadGateway { error, details, .. } => {
+            mentions_music_runtime_auth(error)
+                || details.as_deref().is_some_and(mentions_music_runtime_auth)
+        }
+        _ => false,
+    }
+}
+
+fn mentions_music_runtime_auth(body: &str) -> bool {
+    body.contains("music_runtime_auth")
+}
+
 /// Convert an [`ApiError`] into the operator-facing message banners +
 /// toasts use. Mirrors the helper in `clients.rs` so the music-bot
 /// pages render errors with the same vocabulary as the rest of the SPA.
 pub fn format_error(err: &ApiError) -> String {
+    if is_music_runtime_auth(err) {
+        return MUSIC_RUNTIME_AUTH_MESSAGE.to_string();
+    }
     match err {
         ApiError::BadGateway {
             error,
@@ -355,6 +389,59 @@ mod tests {
         track.title = "https://other.example/watch?v=1".into();
         assert_eq!(track_display_title(&track), "soundcloud.com");
         assert!(track_title_is_placeholder(&track));
+    }
+
+    #[test]
+    fn orphaned_badge_uses_the_bot_badge_family() {
+        assert!(orphaned_badge_class().starts_with("bot-badge"));
+        assert_ne!(
+            orphaned_badge_class(),
+            state_badge_class(wire::BotState::Playing)
+        );
+    }
+
+    #[test]
+    fn delete_control_says_stop_only_for_orphaned_rows() {
+        assert_eq!(delete_control_label(true), "Stop");
+        assert_eq!(delete_control_label(false), "Delete");
+    }
+
+    #[test]
+    fn music_runtime_auth_502_explains_the_control_token() {
+        let err = ApiError::BadGateway {
+            error: "music_runtime_auth".into(),
+            code: None,
+            details: None,
+        };
+        assert_eq!(format_error(&err), MUSIC_RUNTIME_AUTH_MESSAGE);
+        let mentioned = ApiError::BadGateway {
+            error: "Bad Gateway".into(),
+            code: None,
+            details: Some("upstream said music_runtime_auth".into()),
+        };
+        assert_eq!(format_error(&mentioned), MUSIC_RUNTIME_AUTH_MESSAGE);
+    }
+
+    #[test]
+    fn other_errors_keep_their_existing_text() {
+        let gateway = ApiError::BadGateway {
+            error: "TeamSpeak API Error".into(),
+            code: Some(1538),
+            details: Some("invalid parameter".into()),
+        };
+        assert_eq!(
+            format_error(&gateway),
+            "TeamSpeak API Error: invalid parameter (code 1538)"
+        );
+        let server = ApiError::Server {
+            status: 500,
+            message: "music_runtime_auth".into(),
+        };
+        assert_eq!(format_error(&server), "500: music_runtime_auth");
+        assert_eq!(
+            format_error(&ApiError::Unauthorized("nope".into())),
+            "Session expired. Sign in again."
+        );
     }
 
     #[test]
