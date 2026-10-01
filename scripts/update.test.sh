@@ -98,3 +98,76 @@ if ! grep -q "rewritten manifest" "${TMP}/down.err"; then
 fi
 
 echo "OK: kube image tag rewrite (placeholder and legacy tag)"
+
+# Live music is on Floki. The default action must not play the Contabo
+# music container, and the turn-back switch has to be obvious.
+unset TS6_CONTABO_MUSIC
+[[ "$(contabo_music_action)" == "skip" ]] || fail "default music action is not skip"
+for raw in skip SKIP 0 off OFF false no " skip "; do
+    TS6_CONTABO_MUSIC="$raw"
+    [[ "$(contabo_music_action)" == "skip" ]] || fail "TS6_CONTABO_MUSIC=${raw} did not skip"
+done
+for raw in play PLAY 1 on true yes; do
+    TS6_CONTABO_MUSIC="$raw"
+    [[ "$(contabo_music_action)" == "play" ]] || fail "TS6_CONTABO_MUSIC=${raw} did not play"
+done
+if TS6_CONTABO_MUSIC=banana contabo_music_action >/dev/null 2>"${TMP}/bad-music.err"; then
+    fail "accepted TS6_CONTABO_MUSIC=banana"
+fi
+grep -q "skip or play" "${TMP}/bad-music.err" || fail "bad music action did not say how to set it"
+unset TS6_CONTABO_MUSIC
+
+banner="$(print_contabo_music_banner skip v9.9.9)"
+grep -q "TS6_CONTABO_MUSIC=skip" <<<"$banner" || fail "skip banner hid the mode"
+grep -q "TS6_CONTABO_MUSIC=play" <<<"$banner" || fail "skip banner hid the turn-back switch"
+grep -q "bot-1.identity" <<<"$banner" || fail "skip banner omitted the cloned identity"
+grep -q "127.0.0.1:3002" <<<"$banner" || fail "skip banner omitted the loopback port"
+play_banner="$(print_contabo_music_banner play v9.9.9)"
+grep -q "TS6_CONTABO_MUSIC=play" <<<"$play_banner" || fail "play banner hid the mode"
+grep -q "ts6-manager-music-floki" <<<"$play_banner" || fail "play banner omitted the Floki container"
+
+explain_contabo_music_running ts6-manager-music > "${TMP}/running.txt"
+grep -q "will not restart the API" "${TMP}/running.txt" || fail "a running Contabo music container would still restart the API"
+grep -q "bot-1.identity" "${TMP}/running.txt" || fail "running-container failure omitted the cloned identity"
+grep -q "Floki hop" "${TMP}/running.txt" || fail "running-container failure omitted the hop"
+
+explain_music_hop_down > "${TMP}/hop.txt"
+grep -q "will not restart the API" "${TMP}/hop.txt" || fail "hop failure would still restart the API"
+grep -q "ts6-music-tunnel.service" "${TMP}/hop.txt" || fail "hop failure omitted the tunnel unit"
+grep -q "music page is 404" "${TMP}/hop.txt" || fail "hop failure omitted the rehydrate symptom"
+grep -q "bot-1.identity" "${TMP}/hop.txt" || fail "hop failure omitted the cloned identity"
+grep -q "Do not publish :3002 or :7080" "${TMP}/hop.txt" || fail "hop failure omitted the publish ban"
+grep -q "MUSIC_RUNTIME_URL" "${TMP}/hop.txt" || fail "hop failure omitted the runtime URL"
+
+prepare_contabo_play_manifest "${TMP}/out.yaml" "${TMP}/skip.yaml" skip || fail "skip play manifest"
+if grep -q 'ghcr.io/frozentear/ts6-manager-music' "${TMP}/skip.yaml"; then
+    fail "skip manifest still has the music image"
+fi
+if grep -Eq '^    - name: music[[:space:]]*$' "${TMP}/skip.yaml"; then
+    fail "skip manifest still has the music container"
+fi
+if grep -q 'containerPort: 3002' "${TMP}/skip.yaml"; then
+    fail "skip manifest still has containerPort 3002"
+fi
+grep -q 'image: ghcr.io/frozentear/ts6-manager-fullstack:v9.9.9-guard' "${TMP}/skip.yaml" || fail "skip dropped fullstack"
+grep -q 'image: ghcr.io/frozentear/ts6-manager-sidecar:v9.9.9-guard' "${TMP}/skip.yaml" || fail "skip dropped sidecar"
+grep -q 'image: ghcr.io/frozentear/ts6-manager-future:v9.9.9-guard' "${TMP}/skip.yaml" || fail "skip dropped a non-music container"
+grep -q 'value: "http://127.0.0.1:3002"' "${TMP}/skip.yaml" || fail "skip retargeted MUSIC_RUNTIME_URL"
+grep -q '127.0.0.1:7080' "${TMP}/skip.yaml" || fail "skip changed sidecar listen"
+grep -q 'name: ts6-music' "${TMP}/skip.yaml" || fail "skip dropped the ts6-music volume"
+if grep -Eq '^[[:space:]]+hostPort:' "${TMP}/skip.yaml"; then
+    fail "skip manifest publishes a hostPort"
+fi
+
+prepare_contabo_play_manifest "${TMP}/out.yaml" "${TMP}/play.yaml" play || fail "play manifest"
+grep -q 'image: ghcr.io/frozentear/ts6-manager-music:v9.9.9-guard' "${TMP}/play.yaml" || fail "play mode dropped the music image"
+grep -Eq '^    - name: music[[:space:]]*$' "${TMP}/play.yaml" || fail "play mode dropped the music container"
+grep -q 'value: "http://127.0.0.1:3002"' "${TMP}/play.yaml" || fail "play mode retargeted MUSIC_RUNTIME_URL"
+
+# kube down still reads the rewritten manifest that names the music
+# container, so a pod that still has it is removed. Play is the stripped file.
+down="$(kube_down_manifest "$MANIFEST" "${TMP}/out.yaml")"
+[[ "$down" == "${TMP}/out.yaml" ]] || fail "down target changed"
+grep -q 'ts6-manager-music' "$down" || fail "down manifest no longer names the music container"
+
+echo "OK: Contabo music container stays skipped unless TS6_CONTABO_MUSIC=play"

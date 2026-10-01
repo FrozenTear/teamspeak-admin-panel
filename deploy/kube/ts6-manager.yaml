@@ -8,6 +8,11 @@
 #
 #   ./scripts/update.sh vX.Y.Z
 #
+# Live music is Docker on Floki (ts6-manager-music-floki), not this
+# pod. update.sh skips the music container unless TS6_CONTABO_MUSIC=play.
+# Starting it binds 127.0.0.1:3002 and clones bot-1.identity.
+# MUSIC_RUNTIME_URL stays http://127.0.0.1:3002. See deploy/contabo/README.md.
+#
 # The script rewrites a temp copy so every ts6-manager-* image is on
 # that tag (the committed placeholder, or a legacy `:vX.Y.Z` still on
 # a live checkout), pulls, then plays. Stop with a rewritten copy of
@@ -144,8 +149,9 @@ spec:
           value: "/var/lib/ts6-manager/data"
         - name: SIDECAR_URL
           value: "http://127.0.0.1:7080"
-        # Contabo Music+Voice split: fullstack keeps Panel/API/Surreal
-        # and proxies bot lifecycle to the sibling music unit. Unset on
+        # Panel/API stay here and call the music process on loopback.
+        # Live music is the Floki container, reached through the SSH
+        # hop on 127.0.0.1:3002. Do not retarget this URL. Unset on
         # hosts that still run the in-process supervisor (dev / Quadlet).
         - name: MUSIC_RUNTIME_URL
           value: "http://127.0.0.1:3002"
@@ -176,8 +182,11 @@ spec:
         periodSeconds: 30
         timeoutSeconds: 5
         failureThreshold: 3
-    # Contabo-only Music+Voice unit. Owns decode → Opus → TS6 wire send
-    # (the only send loop). hostNetwork inherited from the pod —
+    # Music container kept so TS6_CONTABO_MUSIC=play can start it.
+    # Default update.sh skips this item. The live process is
+    # ts6-manager-music-floki on Floki. Starting this container binds
+    # 127.0.0.1:3002 and the TeamSpeak server sees a second
+    # bot-1.identity. hostNetwork inherited from the pod —
     # containerPort 3002 IS the host port. Do not use kube httpGet:
     # Podman 5.6 turns that into in-container curl and this image has
     # none (sidecar pattern: exec binary --healthcheck-url).

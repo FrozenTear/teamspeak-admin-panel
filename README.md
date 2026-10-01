@@ -27,7 +27,7 @@ Podman deploy.
 | --- | --- | --- | --- |
 | Fullstack admin panel | [`crates/ts6-manager-server`](crates/ts6-manager-server) | `ts6-manager-fullstack` | Dioxus 0.7 fullstack server (Axum API + WASM UI) — server management, accounts, music bot, audit. |
 | Media sidecar | [`crates/ts6-media-sidecar`](crates/ts6-media-sidecar) | `ts6-manager-sidecar` | MoQ-over-WebTransport video/audio relay. Sibling workspace. |
-| Music unit | [`crates/voice`](crates/voice) (`ts6-manager-music`) | `ts6-manager-music` | Contabo Music+Voice send loop (decode → Opus → TS6). |
+| Music unit | [`crates/voice`](crates/voice) (`ts6-manager-music`) | `ts6-manager-music` | Music+Voice send loop (decode → Opus → TS6). Production process is Docker on Floki; the Contabo container stays stopped. |
 | Voice prototype | [`crates/ts6-voice-prototype`](crates/ts6-voice-prototype) | — | "Two clients can talk" reference: Opus over the TS6 wire protocol. |
 | Voice translator | [`crates/ts6-voice-translator`](crates/ts6-voice-translator) | — | TS6 ↔ WebRTC voice bridge. |
 | Music bot audio | [`crates/music-bot-audio`](crates/music-bot-audio) | — | Library helpers for the in-panel music bot. |
@@ -37,6 +37,36 @@ Podman deploy.
 The data plane is rooted in open standards: TeamSpeak 6's published
 wire protocol, Opus, MoQ-over-QUIC, WebTransport, SRTP. No bespoke
 voice stack.
+
+## Where music runs
+
+Production music is Docker on Floki (`185.146.234.42`), container
+`ts6-manager-music-floki`, image `v1.6.24`, host network, listen
+`127.0.0.1:3002`, restart `unless-stopped`. It was not recreated
+after it started at `2026-09-30T20:21:44Z`. Identities and
+`yt-cookies.txt` live in `/home/scuffedspeak/ts6-floki-test/data`.
+Panel bot 7 (DJ-Bot) is `bot-1.identity`.
+
+The panel and API stay on Contabo and still call
+`http://127.0.0.1:3002` with no bearer. That address is an SSH
+reverse tunnel Floki opens to the Contabo user `ts6dev`, bound only
+to `127.0.0.1:3002`. Do not publish `:3002` or `:7080`, and do not
+retarget the URL. `ts6-music-tunnel.service` on Floki is installed
+and enabled; it is inactive while a one-off `ssh -f` holds the port.
+On a Floki reboot that unit should start the hop. The music process
+comes back from its restart policy. The client is pushed only when
+the Contabo API starts, so the hop has to be listening first or
+rehydrate fails and the music page is 404.
+
+Contabo's `ts6-manager-music` is stopped (exited 137). Its volume
+still has the same `bot-1.identity`. Starting it takes port 3002 and
+the TeamSpeak server sees a second copy of that client.
+`./scripts/update.sh` skips that container unless
+`TS6_CONTABO_MUSIC=play`. Sidecar stays on Contabo. Soft pin packing
+B stays. Do not restart TeamSpeak on either host.
+
+Procedure and the cut order: [`deploy/contabo/README.md`](deploy/contabo/README.md)
+and [`docs/runbook.md`](docs/runbook.md) § 3.4.
 
 ## Install
 
@@ -81,9 +111,11 @@ rootless-userns rationale.
 
 Kube does not pin `:latest`. `deploy/kube/ts6-manager.yaml` uses
 `@UNRELEASED` on fullstack, music, and sidecar, which fails reference
-parsing. Start and restart that stack only with
+parsing. Start and restart the Contabo stack only with
 `./scripts/update.sh vX.Y.Z` (it rewrites those images onto the tag
-you pass). Quadlet units are a separate shape; see
+you pass). The default `TS6_CONTABO_MUSIC=skip` does not start the
+Contabo music container while the Floki copy is the live one. Quadlet
+units are a separate shape; see
 [`deploy/quadlet/README.md`](deploy/quadlet/README.md). Image build,
 sign, and publish: [`docs/ops/images.md`](docs/ops/images.md).
 

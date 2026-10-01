@@ -1,16 +1,53 @@
-# Contabo Music+Voice split (draft)
+# Contabo production and the Floki music process
 
-**DRAFT — do not merge, do not tag, do not apply on Contabo** until
-unanimous critical +1 from Voice / Music / API / Panel / Sidecar /
-Release **and** CoS/FrozenTear. Floki MOVE is forbidden. Live Contabo
-soft pin stays fullstack `2-5` / `-5` until merge + tag + `update.sh`.
+Live music is Docker on Floki (`185.146.234.42`), not the Contabo pod.
+This is the layout verified on 2026-09-30. Older notes that say music
+runs on Contabo, or that moving music to Floki is refused, are stale.
 
-Contabo production is started and restarted only with
-`./scripts/update.sh vX.Y.Z` (rootful Podman, not Quadlet). That script
+| | |
+|---|---|
+| Container | `ts6-manager-music-floki` |
+| Image | `v1.6.24`. Not recreated after start `2026-09-30T20:21:44Z`. |
+| Runtime | Docker, host network, listen `127.0.0.1:3002`, restart `unless-stopped`. |
+| Data | `/home/scuffedspeak/ts6-floki-test/data` — identities and `yt-cookies.txt`. Panel bot 7 (DJ-Bot) is `bot-1.identity`. |
+| Contabo copy | `ts6-manager-music` is stopped (exited 137). The volume still has the same `bot-1.identity`. Starting it takes `127.0.0.1:3002` and the TeamSpeak server sees a second copy of that client. |
+
+The panel and API stay on Contabo. `MUSIC_RUNTIME_URL` stays
+`http://127.0.0.1:3002`. There is no bearer on that hop, so it stays
+on Contabo's loopback. Do not publish `:3002` or `:7080`. Do not
+retarget the URL.
+
+The hop is an SSH reverse tunnel that Floki opens to the Contabo user
+`ts6dev`, binding only `127.0.0.1:3002`. `ts6-music-tunnel.service` is
+installed and enabled. It is inactive while a one-off `ssh -f` holds
+the port. On a Floki reboot that unit should start the hop. The music
+process comes back because of the restart policy. The client is pushed
+only when the Contabo API starts. **Cut order: hop up, then API.** If
+the hop is down when the API comes back, rehydrate fails and the music
+page is 404.
+
+Contabo is started and restarted only with `./scripts/update.sh vX.Y.Z`
+(rootful Podman, not Quadlet). The default `TS6_CONTABO_MUSIC=skip`
+does not start `ts6-manager-music`. The script prints that mode and
+the turn-back command. If `ts6-manager-music` is already running, the
+script stops before it restarts the API: that process is holding
+`127.0.0.1:3002`, so the health check would not be the Floki hop.
+Stop it only after the tunnel can bind the port, then re-run. When
+the container is stopped, the script checks
+`http://127.0.0.1:3002/health` before it restarts the API, and it does
+not pull or play the music image while skipping. `TS6_CONTABO_MUSIC=play` starts the Contabo music
+container again — stop `ts6-manager-music-floki` first. The script
 rewrites `deploy/kube/ts6-manager.yaml` and plays the temp copy. Do not
 `podman kube play` the committed manifest — fullstack, music, and
 sidecar are `@UNRELEASED`, which fails reference parsing before any pull. Never
 `podman kube down --force`.
+
+Sidecar stays on Contabo. Soft pin packing B stays (fullstack `2-5` /
+`-5`, music HostConfig unset). Do not restart TeamSpeak on either host.
+
+Issue #93 stays open. The same `v1.6.24` image and the same track had
+93 late frames on Contabo and 0 on Floki. That is a host finding, not
+a code fix. Do not close #93 and do not change the audio path to chase it.
 
 ## Topology
 
@@ -19,7 +56,7 @@ Same pod `ts6-manager` (`hostNetwork: true`):
 | Container | Image | Role | Pin (packing B, Robert) |
 |-----------|-------|------|-------------------------|
 | `fullstack` | `ts6-manager-fullstack` | Panel / API / Surreal / Scuffed site | **stays `2-5` / nice `-5`** (no shrink) |
-| `music` | `ts6-manager-music` | Only decode → Opus → TS6 send loop | SEND `0-1` in-process; HostConfig **unset**; DECODE **`2-5`** (share Axum) |
+| `music` | `ts6-manager-music` | Manifest still describes the send loop. **Not started** while `TS6_CONTABO_MUSIC=skip` (the default). The live process is `ts6-manager-music-floki`. | SEND `0-1` in-process; HostConfig **unset**; DECODE **`2-5`** (share Axum) |
 | `sidecar` | `ts6-manager-sidecar` | MoQ | Unpinned |
 
 `ts6-music` PVC is mounted on fullstack **and** music — do not orphan it.
@@ -67,7 +104,7 @@ A music container restart drops the nice until
 `apply-fullstack-soft-pin.sh` runs again. In-process `setpriority`
 of `-5` is EPERM as uid 10001 — do not add `CAP_SYS_NICE`. `chrt`
 FIFO/RR is opt-in env, default off. Music HostConfig stays unset.
-Packing B stays. Floki MOVE NO.
+Packing B stays. The live music process stays the Floki container. Do not start `ts6-manager-music` on Contabo while that copy is up.
 
 ## Control plane
 
@@ -95,8 +132,8 @@ kube `httpGet` (Podman 5.6 → in-container curl; this image has none).
 ## Panel HTTPS (host Caddy + Let’s Encrypt)
 
 **DRAFT — do not apply on Contabo** until unanimous seat critical +1s
-**and** CoS/FrozenTear **and** Robert. Soft pin stays packing B
-(fullstack `2-5` / `-5`). Floki MOVE NO. This section is Caddy / DNS
+**and** CoS/FrozenTear **and** the DNS owner. Soft pin stays packing B
+(fullstack `2-5` / `-5`). The live music process stays on Floki. This section is Caddy / DNS
 / docs only — it does not change `soft-pin.env` or packing B.
 
 Contabo already runs Caddy v2.11.4 at `/etc/caddy/Caddyfile`

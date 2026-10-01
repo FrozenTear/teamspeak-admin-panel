@@ -26,6 +26,11 @@
 # script runs again. Do not add CAP_SYS_NICE. Packing B values stay.
 # Sidecar stays unpinned unless TS6_SIDECAR_* are set.
 #
+# TS6_CONTABO_MUSIC=skip (what scripts/update.sh exports by default)
+# does not renice ts6-manager-music. That container is not the live
+# music process. TS6_CONTABO_MUSIC=play renices it as before.
+# Unset keeps the historical behaviour (pin the bot container).
+#
 # podman update failure is fatal when a cpuset was requested.
 
 set -euo pipefail
@@ -86,7 +91,23 @@ music_hostconfig_allowed() {
     return 0
 }
 
-# Profile A shrinks live 2-5. Refuse unless Robert ACK is set.
+# contabo_music_pin_mode
+# Print "skip" or "play". update.sh exports the canonical value.
+# Unset means play: a direct run of this script still pins the bot
+# container when the operator has not asked to skip it.
+contabo_music_pin_mode() {
+    case "${TS6_CONTABO_MUSIC:-play}" in
+        skip|play) printf '%s\n' "${TS6_CONTABO_MUSIC:-play}" ;;
+        *)
+            echo "error: TS6_CONTABO_MUSIC must be skip or play (got: ${TS6_CONTABO_MUSIC})." >&2
+            echo "  scripts/update.sh sets this. skip leaves the Contabo music container alone." >&2
+            echo "  play renices ts6-manager-music. Turn the container back on with TS6_CONTABO_MUSIC=play ./scripts/update.sh vX.Y.Z" >&2
+            return 1
+            ;;
+    esac
+}
+
+# Profile A shrinks live 2-5. Refuse unless the shrink ACK is set.
 is_fullstack_shrink_from_live() {
     local spec
     spec="$(normalize_cpuset "$1")"
@@ -263,6 +284,9 @@ apply_chrt() {
 }
 
 apply_soft_pin() {
+local music_mode
+music_mode="$(contabo_music_pin_mode)" || return 1
+
 apply_cpuset "$CONTAINER" "$CPUSET"
 apply_nice "$CONTAINER" "$NICE"
 
@@ -274,16 +298,25 @@ fi
 if [[ -n "${TS6_BOT_DECODE_CPUSET:-}" ]]; then
     echo "==> TS6_BOT_DECODE_CPUSET=${TS6_BOT_DECODE_CPUSET} is in-process decode pre_exec (kube env); this script does not inject it"
 fi
-apply_cpuset "$BOT_CONTAINER" "$BOT_CONTAINER_CPUSET"
-apply_nice "$BOT_CONTAINER" "$BOT_NICE"
-apply_chrt "$BOT_CONTAINER" "$BOT_CHRT_SCHED" "$BOT_CHRT_PRIO"
+local bot_pin="applied"
+if [[ "$music_mode" == "skip" ]]; then
+    bot_pin="skipped"
+    echo "==> TS6_CONTABO_MUSIC=skip: not applying HostConfig, nice, or chrt to ${BOT_CONTAINER}."
+    echo "    That container is not the live music process. Live music is ts6-manager-music-floki on Floki."
+    echo "    Turn the Contabo container back on with: TS6_CONTABO_MUSIC=play ./scripts/update.sh vX.Y.Z"
+else
+    apply_cpuset "$BOT_CONTAINER" "$BOT_CONTAINER_CPUSET"
+    apply_nice "$BOT_CONTAINER" "$BOT_NICE"
+    apply_chrt "$BOT_CONTAINER" "$BOT_CHRT_SCHED" "$BOT_CHRT_PRIO"
+fi
 
 apply_cpuset "$SIDECAR_CONTAINER" "$SIDECAR_CPUSET"
 apply_nice "$SIDECAR_CONTAINER" "$SIDECAR_NICE"
 
 echo "OK: soft pin applied (fullstack cpuset=${CPUSET:-unset} nice=${NICE:-unset}" \
     "bot-container cpuset=${BOT_CONTAINER_CPUSET:-unset} bot nice=${BOT_NICE:-unset}" \
-    "bot chrt=${BOT_CHRT_SCHED:-off} sidecar cpuset=${SIDECAR_CPUSET:-unset} nice=${SIDECAR_NICE:-unset})"
+    "bot pin=${bot_pin} bot chrt=${BOT_CHRT_SCHED:-off}" \
+    "sidecar cpuset=${SIDECAR_CPUSET:-unset} nice=${SIDECAR_NICE:-unset})"
 }
 
 main() {
@@ -305,6 +338,10 @@ main() {
     SIDECAR_NICE="${TS6_SIDECAR_NICE:-}"
 
     if ! music_hostconfig_allowed "$BOT_CONTAINER_CPUSET"; then
+        exit 1
+    fi
+
+    if ! contabo_music_pin_mode >/dev/null; then
         exit 1
     fi
 

@@ -256,7 +256,8 @@ build helper.
 8. **Create GitHub Release `vX.Y.Z`** with the binary archives,
    sha256 files, and `.sig` files attached. `.github/workflows/release.yml`
    writes the body: What's changed (commits since the previous tag),
-   the Contabo kube upgrade (`./scripts/update.sh vX.Y.Z`), image
+   the Contabo kube upgrade (`./scripts/update.sh vX.Y.Z`, which skips
+   the Contabo music container unless `TS6_CONTABO_MUSIC=play`), image
    refs, and the cosign verify block.
 9. **Hand off to WS-Gate.** Comment on the WS-Gate tracking issue with
    the published refs and signatures so the rootless-deploy validation

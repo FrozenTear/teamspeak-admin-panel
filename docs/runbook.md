@@ -72,10 +72,17 @@ a raw 401 as its own session expiring). The browser-facing route
 answers `502` with `{"error":"music_runtime_auth"}`. The event-stream
 client does not reconnect in a loop after `401`. Do not log the token.
 If the variable is unset and `--listen` is not a loopback address, the
-music process refuses to start. Kube manifests are unchanged: the
-Contabo pod still binds `127.0.0.1:3002` and does not set the variable.
+music process refuses to start. Kube manifests do not set the
+variable. `MUSIC_RUNTIME_URL` stays `http://127.0.0.1:3002`. On
+Contabo that socket is the SSH reverse tunnel to Floki's music
+container (`ts6-manager-music-floki` on `127.0.0.1:3002`), not a
+published port and not the stopped `ts6-manager-music` container.
+See [`deploy/contabo/README.md`](../deploy/contabo/README.md).
 
-When the music runtime runs on a separate host from the panel, bind
+A listener that is not loopback is a different layout (shared bearer
+over WireGuard). The live hop is the Floki reverse tunnel above.
+When the music runtime runs on a separate host from the panel and
+the listener is not loopback, bind
 `--listen` to the WireGuard address, firewall `:3002` so only the
 tunnel can reach it, and set the same `MUSIC_RUNTIME_TOKEN` in both
 containers. The value is a bearer token on plain HTTP, so it must
@@ -100,7 +107,7 @@ sidecar adds two more.
 | Port | Component | Protocol | Required? | Notes |
 | --- | --- | --- | --- | --- |
 | `3001` | Fullstack admin panel | TCP | Yes | Web UI + API. Bind a reverse proxy in front for TLS. |
-| `3002` | Music unit control | TCP | Contabo kube | Loopback `MUSIC_RUNTIME_URL`. Exec probe, not httpGet. |
+| `3002` | Music unit control | TCP | Contabo loopback via the Floki SSH hop | `MUSIC_RUNTIME_URL` stays `http://127.0.0.1:3002`. Do not publish. The Contabo music container is not started. |
 | `7080` | MoQ sidecar HTTP control | TCP | Only if running the sidecar | Loopback-only inside the pod by default. Unpinned. |
 | `4443` | MoQ sidecar WebTransport | UDP | Only if exposing public video | Browsers reject WebTransport on cleartext origins; terminate TLS. |
 
@@ -152,7 +159,7 @@ The panel path is the same shape: `panel.scuffedcrew.no` →
 via `hostNetwork`).
 
 **Not applied.** Append only after unanimous seat +1s, CoS/FrozenTear,
-and Robert. Soft pin stays packing B. Floki MOVE NO. Never SSH-apply
+and the DNS owner. Soft pin stays packing B. Live music stays on Floki. Never SSH-apply
 from a draft PR.
 
 1. **DNS (Robert, prerequisite):** A
@@ -185,9 +192,11 @@ live, public access is the panel hostname — not raw `:3001`. See
 | Kube | `podman logs -f ts6-manager-fullstack` (or `podman pod logs -f ts6-manager`) |
 | Compose | `podman-compose logs -f fullstack` |
 
-Sidecar / music-bot / voice-translator logs follow the same pattern with
-the matching unit / container name (`ts6-manager-sidecar.service`,
-`ts6-fixture`, `voice-translator`, etc.).
+Sidecar logs on Contabo follow the same pattern (`ts6-manager-sidecar`).
+The live music process is Docker on Floki: `docker logs -f ts6-manager-music-floki`.
+`podman logs ts6-manager-music` on Contabo is the stopped container.
+Voice-translator logs use the matching unit name (`voice-translator`,
+`ts6-fixture`, and so on).
 
 ### 2.2 What each component logs
 
@@ -255,7 +264,7 @@ For all three shapes the external smoke is the same: `curl -fsS http://127.0.0.1
 | Shape | Start | Stop | Restart |
 | --- | --- | --- | --- |
 | Quadlet | `systemctl --user start ts6-manager-pod.service` | `systemctl --user stop ts6-manager-pod.service` | `systemctl --user restart ts6-manager-pod.service` |
-| Kube | `./scripts/update.sh vX.Y.Z` | rewritten manifest, never the committed file and never `--force` ([Bring down](../deploy/kube/README.md#bring-down)) | `./scripts/update.sh vX.Y.Z` |
+| Kube | `./scripts/update.sh vX.Y.Z` (does not start the Contabo music container unless `TS6_CONTABO_MUSIC=play`) | rewritten manifest, never the committed file and never `--force` ([Bring down](../deploy/kube/README.md#bring-down)) | `./scripts/update.sh vX.Y.Z` |
 | Compose | `podman-compose up -d fullstack` | `podman-compose down` | `podman-compose restart fullstack` |
 
 Kube start and restart are only `./scripts/update.sh vX.Y.Z`. Do not
@@ -350,27 +359,54 @@ means the script pulls the target tags before play or old layers stick.
 ./scripts/update.sh vX.Y.Z
 ```
 
-From any cwd against a repo checkout. The script pulls fullstack +
-music + sidecar, rewrites a temp manifest so music and sidecar cannot lag,
-`podman kube down`s **without** `--force`, plays (pod-only if
-`ts6-manager-secrets` already exists; otherwise concatenates
-`deploy/kube/secrets.yaml`), curls fullstack `:3001/health` and music
-`:3002/health`, then re-applies Contabo's soft CPU pin
-(`deploy/contabo/soft-pin.env` via
-`scripts/apply-fullstack-soft-pin.sh`). Packing **B** (Robert):
-fullstack stays `2-5` / `-5` (no shrink). Bot
+From any cwd against a repo checkout. The script rewrites a temp
+manifest so sidecar cannot lag the fullstack tag. **It does not start
+the Contabo music container** unless `TS6_CONTABO_MUSIC=play`. The
+default `TS6_CONTABO_MUSIC=skip` is printed at the start of the run,
+with the command that turns it back on. Skip mode does not pull the
+music image. If `ts6-manager-music` is already running, the script
+stops before `podman kube down` (that process would be what answers
+on `127.0.0.1:3002`). When it is stopped, skip mode requires
+`http://127.0.0.1:3002/health` (the Floki SSH hop) to answer
+**before** `podman kube down`, then plays fullstack and sidecar only. `podman kube down` is **without** `--force`. Play is
+pod-only if `ts6-manager-secrets` already exists; otherwise the script
+concatenates `deploy/kube/secrets.yaml`. It curls fullstack
+`:3001/health`, re-checks the hop, and re-applies Contabo's soft CPU
+pin (`deploy/contabo/soft-pin.env` via
+`scripts/apply-fullstack-soft-pin.sh`). While skipping, that pin does
+not renice `ts6-manager-music` and does not change the Floki process.
+
+`TS6_CONTABO_MUSIC=play` is the turn-back. Stop
+`ts6-manager-music-floki` first. Contabo's volume still has the same
+`bot-1.identity`. Two running copies mean the TeamSpeak server sees
+the client twice, and the Contabo container takes `127.0.0.1:3002`
+from the hop.
+
+Packing **B** stays: fullstack `2-5` / `-5` (no shrink). Bot
 `TS6_BOT_CPUSET=0-1` is an in-process wire-send pin on `voice-rt`
 (option 1) — never a container-wide `0-1` cpuset (packing C; Angerfist
 163/590/117). kube `TS6_BOT_DECODE_CPUSET=2-5` pins `decode-rt`
 (pipeline/fetch/bridge/resolve) and parks ffmpeg/yt-dlp off send
-cores before exec (share Axum). Host renice also targets `voice-rt`
-tids. Sidecar stays unpinned. Music HostConfig stays unset. The music
-kube container has no `envFrom` secrets;
-fullstack `sync_settings` pushes the yt-dlp cookie / API key after
-`/health` as long as those paths stay under the shared `ts6-data`
-volume. Never `podman kube down --force`. Do not MOVE the bot
-runtime to Floki. Verify signatures first if you want — see § 5 and
+cores before exec (share Axum). Those env values are on the music
+container in the manifest; the live process is the Floki container,
+which was not recreated for this layout. Host renice of `voice-rt`
+runs only when `TS6_CONTABO_MUSIC=play`. Sidecar stays unpinned.
+Music HostConfig stays unset. The music kube container has no
+`envFrom` secrets. Live identities and `yt-cookies.txt` are in
+`/home/scuffedspeak/ts6-floki-test/data` on Floki. Panel bot 7
+(DJ-Bot) is `bot-1.identity` there and on the stopped Contabo volume.
+Never `podman kube down --force`. Do not publish `:3002` or `:7080`.
+Do not retarget `MUSIC_RUNTIME_URL`. Do not restart TeamSpeak on
+either host. Verify signatures first if you want — see § 5 and
 [`docs/ops/images.md` § 3](ops/images.md#3-signing).
+
+**Cut order.** On a Floki reboot the music container comes back from
+`unless-stopped`. `ts6-music-tunnel.service` (installed and enabled;
+inactive while a one-off `ssh -f` holds the port) should bind
+Contabo `127.0.0.1:3002` to Floki's `127.0.0.1:3002` as user
+`ts6dev`. Then the Contabo API may start. `update.sh` enforces that
+order when it skips the Contabo music container. If the API starts
+first, rehydrate fails and the music page is 404.
 
 There is no hand-rolled `sed` / `podman kube play` start or restart.
 Playing the committed manifest fails reference parsing (`@UNRELEASED`).
@@ -384,7 +420,9 @@ in-process `setpriority` of that negative nice is EPERM as uid 10001
 threads at nice 0 until that script runs again — `update.sh` is the
 path that calls it. Do not add `CAP_SYS_NICE`. Do not change packing B
 (`fullstack` `2-5` / `-5`, music HostConfig unset, SEND `0-1`, DECODE
-`2-5`). Do not MOVE the bot runtime to Floki.
+`2-5`). The live music process is `ts6-manager-music-floki`. While
+`TS6_CONTABO_MUSIC=skip`, this renice does not run against a Contabo
+music container and does not change the Floki process.
 
 Tokio's blocking pool uses the same thread name `voice-rt` and the
 same start hook, so those threads are pinned to SEND `0-1` too. The

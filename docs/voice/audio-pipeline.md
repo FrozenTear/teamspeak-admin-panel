@@ -97,7 +97,7 @@ pipeline.shutdown().await;
 
 CPU affinity (packing B, no fullstack shrink): `voice-rt` pins only the wire-send path to `TS6_BOT_SEND_CPUSET=0-1`. Pipeline, ICY fetch, the yt-dlp bridge, and resolve run on `decode-rt`, pinned to `TS6_BOT_DECODE_CPUSET=2-5`. Music container HostConfig stays unset — never `0-1` (packing C).
 
-`TS6_BOT_NICE` (`-5`) is a one-shot host renice of tids named `voice-rt` after `/health`, not an in-process capability (uid 10001, EPERM, no `CAP_SYS_NICE`). Tokio's blocking pool reuses that name and is created lazily on `spawn_blocking` / `block_in_place`; those threads are pinned to SEND `0-1` and inherit the spawning thread's nice. A music container restart drops the nice until `scripts/apply-fullstack-soft-pin.sh` runs again (Opus #66 L16). Packing B is unchanged. Do not MOVE the bot runtime to Floki.
+`TS6_BOT_NICE` (`-5`) is a one-shot host renice of tids named `voice-rt` after `/health`, not an in-process capability (uid 10001, EPERM, no `CAP_SYS_NICE`). Tokio's blocking pool reuses that name and is created lazily on `spawn_blocking` / `block_in_place`; those threads are pinned to SEND `0-1` and inherit the spawning thread's nice. A music container restart drops the nice until `scripts/apply-fullstack-soft-pin.sh` runs again (Opus #66 L16). Packing B is unchanged. The live music process is Docker on Floki (`ts6-manager-music-floki`). While `TS6_CONTABO_MUSIC=skip`, that script does not renice a Contabo music container and does not change the Floki process.
 
 ## Persistent yt-dlp resolver (PURA-359)
 
@@ -112,8 +112,10 @@ Measured on contabo-dev: ~6.5 s cold subprocess vs ~3.8 s warm — **−~2.7 s**
 
 - The manager warms the resolver at boot (`music_bot::warm_resolver()`)
   so the `import yt_dlp` cost is paid before the first `!play`. Contabo
-  kube sets `MUSIC_RUNTIME_URL`; fullstack skips the warm and the music
-  unit warms instead (`ts6-manager-music`). The supervisor task runs
+  kube sets `MUSIC_RUNTIME_URL` to `http://127.0.0.1:3002` (the Floki
+  hop; do not retarget it). Fullstack skips the warm and the music
+  process warms instead. The live process is `ts6-manager-music-floki`.
+  The supervisor task runs
   on `decode-rt`, and a pre_exec `sched_setaffinity` parks that
   process on `TS6_BOT_DECODE_CPUSET=2-5` before exec
   (`pin_decode_child` is a leader backup; packing B; share Axum,
