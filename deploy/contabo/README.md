@@ -1,16 +1,69 @@
-# Contabo Music+Voice split (draft)
+# Panel host and the remote music process
 
-**DRAFT — do not merge, do not tag, do not apply on Contabo** until
-unanimous critical +1 from Voice / Music / API / Panel / Sidecar /
-Release **and** CoS/FrozenTear. Floki MOVE is forbidden. Live Contabo
-soft pin stays fullstack `2-5` / `-5` until merge + tag + `update.sh`.
+The panel and API run on the host where `./scripts/update.sh` runs.
+Music runs on a different host. Older notes that put the live music
+process on the panel host, or that refuse moving it, are stale.
 
-Contabo production is started and restarted only with
-`./scripts/update.sh vX.Y.Z` (rootful Podman, not Quadlet). That script
-rewrites `deploy/kube/ts6-manager.yaml` and plays the temp copy. Do not
+`MUSIC_RUNTIME_URL` stays `http://127.0.0.1:3002`. There is no bearer
+on that hop, so it stays on the panel host's loopback. Do not publish
+`:3002` or `:7080`. Do not retarget the URL.
+
+The hop is a reverse tunnel the music host opens, binding only
+`127.0.0.1:3002` on the panel host. `ts6-music-tunnel.service` on the
+music host is installed and enabled. It is inactive while a one-off
+`ssh -f` holds the port. On a reboot of the music host that unit
+should start the hop. The music process comes back because of the
+restart policy. The client is pushed only when the panel API starts.
+**Cut order: hop up, then API.** If the API boots while
+`127.0.0.1:3002` is not answering, the saved row is never pushed and
+the music page is 404. That 404 is the empty supervisor. A hop that
+dies after the client is already connected is a 5xx from the API.
+The TeamSpeak client stays in the channel, and the panel cannot drive
+it until the hop is back.
+
+The panel host is started and restarted only with
+`./scripts/update.sh vX.Y.Z` (rootful Podman, not Quadlet).
+`TS6_LOCAL_MUSIC` decides whether that script starts the music
+container on the host where it runs. The default `skip` does not
+start it. The script prints that mode and the turn-back command. If
+the local music container is already running, the script stops before
+it restarts the API: that process is holding `127.0.0.1:3002`, so the
+health check would not be the remote hop. Stop it only after the
+tunnel can bind the port, then re-run. When the container is stopped,
+the script checks `http://127.0.0.1:3002/health` before it restarts
+the API, and it does not pull or play the music image while skipping.
+`TS6_LOCAL_MUSIC=play` starts the local music container again — stop
+the remote music process first. The script rewrites
+`deploy/kube/ts6-manager.yaml` and plays the temp copy. Do not
 `podman kube play` the committed manifest — fullstack, music, and
 sidecar are `@UNRELEASED`, which fails reference parsing before any pull. Never
 `podman kube down --force`.
+
+Sidecar stays on the panel host. Packing B (send CPUs 0-1, decode 2-5,
+nice -5; fullstack HostConfig `2-5` / `-5`; music HostConfig unset)
+is the pin on the panel host. The remote music process had no cpuset
+and no nice. Its send thread was on both of that host's cores. Do not
+restart TeamSpeak on either host.
+
+Issue #93 stays open as the panel-host finding. The same image and
+the same track had 93 late frames on the panel host and 0 on the
+remote music host. That remote track is not packing B, and it is not
+an unpinned loop. Do not close #93 and do not change the audio path
+to chase it. An empty `yt-cookies.txt` on the music host fails the
+resolve and puts nothing on the wire.
+
+## Present example
+
+Verified 2026-09-30. Panel on Contabo, music on Floki. This is the
+current pair, not the name of `TS6_LOCAL_MUSIC`.
+
+| | |
+|---|---|
+| Music container | `ts6-manager-music-floki` on `185.146.234.42` |
+| Image | `v1.6.24`. Not recreated after start `2026-09-30T20:21:44Z`. Docker, host network, listen `127.0.0.1:3002`, restart `unless-stopped`. |
+| Data | `/home/scuffedspeak/ts6-floki-test/data` — identities and `yt-cookies.txt`. Panel bot 7 (DJ-Bot) is `bot-1.identity`. |
+| Local copy | Contabo `ts6-manager-music` is stopped (exited 137). The volume still has the same `bot-1.identity`. |
+| Hop | Floki opens the tunnel to Contabo user `ts6dev`, binding only `127.0.0.1:3002`. |
 
 ## Topology
 
@@ -19,7 +72,7 @@ Same pod `ts6-manager` (`hostNetwork: true`):
 | Container | Image | Role | Pin (packing B, Robert) |
 |-----------|-------|------|-------------------------|
 | `fullstack` | `ts6-manager-fullstack` | Panel / API / Surreal / Scuffed site | **stays `2-5` / nice `-5`** (no shrink) |
-| `music` | `ts6-manager-music` | Only decode → Opus → TS6 send loop | SEND `0-1` in-process; HostConfig **unset**; DECODE **`2-5`** (share Axum) |
+| `music` | `ts6-manager-music` | Manifest still describes the send loop. **Not started** while `TS6_LOCAL_MUSIC=skip` (the default). The live process is the remote container in the present example. | SEND `0-1` in-process; HostConfig **unset**; DECODE **`2-5`** (share Axum) |
 | `sidecar` | `ts6-manager-sidecar` | MoQ | Unpinned |
 
 `ts6-music` PVC is mounted on fullstack **and** music — do not orphan it.
@@ -67,7 +120,7 @@ A music container restart drops the nice until
 `apply-fullstack-soft-pin.sh` runs again. In-process `setpriority`
 of `-5` is EPERM as uid 10001 — do not add `CAP_SYS_NICE`. `chrt`
 FIFO/RR is opt-in env, default off. Music HostConfig stays unset.
-Packing B stays. Floki MOVE NO.
+Packing B stays the pin on the panel host. The live music process stays the remote container. Do not start the local music container while that copy is up.
 
 ## Control plane
 
@@ -94,19 +147,19 @@ kube `httpGet` (Podman 5.6 → in-container curl; this image has none).
 
 ## Panel HTTPS (host Caddy + Let’s Encrypt)
 
-**DRAFT — do not apply on Contabo** until unanimous seat critical +1s
-**and** CoS/FrozenTear **and** Robert. Soft pin stays packing B
-(fullstack `2-5` / `-5`). Floki MOVE NO. This section is Caddy / DNS
+**DRAFT — do not apply on the panel host** until unanimous seat critical +1s
+**and** CoS/FrozenTear **and** the DNS owner. Soft pin stays packing B
+(fullstack `2-5` / `-5`). The live music process stays on the remote host. This section is Caddy / DNS
 / docs only — it does not change `soft-pin.env` or packing B.
 
-Contabo already runs Caddy v2.11.4 at `/etc/caddy/Caddyfile`
+The panel host already runs Caddy v2.11.4 at `/etc/caddy/Caddyfile`
 (`scuffedcrew.no` → `:3100`, `news.scuffedcrew.no` → `:8888`,
 `ow.scuffedcrew.no` → `:3000`). Panel uses the same host Caddy:
 
 `panel.scuffedcrew.no` → `reverse_proxy 127.0.0.1:3001`
 
 Fullstack is `0.0.0.0:3001` today (`hostNetwork`). Once live, public
-access is the hostname, not raw `:3001`. Contabo kube fullstack env
+access is the hostname, not raw `:3001`. The kube fullstack env
 (`deploy/kube/ts6-manager.yaml`) sets
 `FRONTEND_URL=https://panel.scuffedcrew.no`, `TRUSTED_PROXY_HOPS=1`,
 and `TRUSTED_PROXY_CIDRS=127.0.0.1/32` (host Caddy on loopback; an

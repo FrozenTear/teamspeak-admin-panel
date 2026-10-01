@@ -27,7 +27,7 @@ Podman deploy.
 | --- | --- | --- | --- |
 | Fullstack admin panel | [`crates/ts6-manager-server`](crates/ts6-manager-server) | `ts6-manager-fullstack` | Dioxus 0.7 fullstack server (Axum API + WASM UI) — server management, accounts, music bot, audit. |
 | Media sidecar | [`crates/ts6-media-sidecar`](crates/ts6-media-sidecar) | `ts6-manager-sidecar` | MoQ-over-WebTransport video/audio relay. Sibling workspace. |
-| Music unit | [`crates/voice`](crates/voice) (`ts6-manager-music`) | `ts6-manager-music` | Contabo Music+Voice send loop (decode → Opus → TS6). |
+| Music unit | [`crates/voice`](crates/voice) (`ts6-manager-music`) | `ts6-manager-music` | Music+Voice send loop (decode → Opus → TS6). The live process is on a different host from the panel. The local music container stays stopped. |
 | Voice prototype | [`crates/ts6-voice-prototype`](crates/ts6-voice-prototype) | — | "Two clients can talk" reference: Opus over the TS6 wire protocol. |
 | Voice translator | [`crates/ts6-voice-translator`](crates/ts6-voice-translator) | — | TS6 ↔ WebRTC voice bridge. |
 | Music bot audio | [`crates/music-bot-audio`](crates/music-bot-audio) | — | Library helpers for the in-panel music bot. |
@@ -37,6 +37,45 @@ Podman deploy.
 The data plane is rooted in open standards: TeamSpeak 6's published
 wire protocol, Opus, MoQ-over-QUIC, WebTransport, SRTP. No bespoke
 voice stack.
+
+## Where music runs
+
+The panel and API run on one host. Music runs on another. The panel
+still calls `http://127.0.0.1:3002` with no bearer. That address is a
+reverse tunnel the music host opens, bound only to `127.0.0.1:3002`
+on the panel host. Do not publish `:3002` or `:7080`, and do not
+retarget the URL.
+
+`TS6_LOCAL_MUSIC` decides whether `./scripts/update.sh` starts the
+music container on the host where the script runs. The default is
+`skip`, because music is already running on the other host. Starting
+the local container takes `127.0.0.1:3002` and the TeamSpeak server
+sees a second copy of the same client identity.
+`TS6_LOCAL_MUSIC=play` starts that local container again, and only
+after the remote music process is stopped. The script prints the mode
+and the turn-back command.
+
+The music process comes back from its restart policy. The client is
+pushed only when the panel API starts, so the hop has to be listening
+first. If the API boots while `127.0.0.1:3002` is not answering, the
+saved row is never pushed and the music page is 404. That 404 is the
+empty supervisor. A hop that dies after the client is already
+connected is a 5xx from the API. The TeamSpeak client stays in the
+channel, and the panel cannot drive it until the hop is back.
+
+Identities and `yt-cookies.txt` live on the music host. An empty
+cookie file fails the resolve and puts nothing on the wire.
+
+Packing B (send CPUs 0-1, decode 2-5, nice -5) is the pin on the
+panel host. The remote music process had no cpuset and no nice. Its
+send thread was on both of that host's cores. The track with 0 late
+frames is not that pin, and it is not an unpinned loop. Issue #93
+stays open as that panel-host finding. Sidecar stays on the panel
+host. Do not restart TeamSpeak on either host.
+
+The present hosts are written once in
+[`deploy/contabo/README.md`](deploy/contabo/README.md). Cut order:
+that file and [`docs/runbook.md`](docs/runbook.md) § 3.4.
 
 ## Install
 
@@ -83,7 +122,9 @@ Kube does not pin `:latest`. `deploy/kube/ts6-manager.yaml` uses
 `@UNRELEASED` on fullstack, music, and sidecar, which fails reference
 parsing. Start and restart that stack only with
 `./scripts/update.sh vX.Y.Z` (it rewrites those images onto the tag
-you pass). Quadlet units are a separate shape; see
+you pass). The default `TS6_LOCAL_MUSIC=skip` does not start the
+local music container while music is running on another host. Quadlet
+units are a separate shape; see
 [`deploy/quadlet/README.md`](deploy/quadlet/README.md). Image build,
 sign, and publish: [`docs/ops/images.md`](docs/ops/images.md).
 

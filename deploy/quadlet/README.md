@@ -3,14 +3,17 @@
 This directory holds the [Quadlet](https://docs.podman.io/en/latest/markdown/podman-systemd.unit.5.html)
 unit files that bring the manager up as a rootless `systemd --user`
 service. Quadlet is the recommended single-host shape per impl-plan §9.
-Contabo production is started and restarted only with `scripts/update.sh`,
-not Quadlet — see [`deploy/kube/README.md`](../kube/README.md). Contabo's
-Music+Voice split (third container `music` / `ts6-manager-music`) and
-soft CPU pin (`scripts/apply-fullstack-soft-pin.sh` after kube play,
-`deploy/contabo/soft-pin.env`) are **kube-only**. Do not treat Quadlet
-as the Contabo cutover path. Do not expect Quadlet `CPUAffinity=` to
-be the Contabo pin. Sidecar stays unpinned. Floki MOVE is not this
-workstream.
+The panel host is started and restarted only with `scripts/update.sh`,
+not Quadlet — see [`deploy/kube/README.md`](../kube/README.md). The kube
+manifest still has a `music` container (`ts6-manager-music`); `update.sh`
+does not start it while the live process is on the music host
+(`TS6_LOCAL_MUSIC=skip`). The soft CPU pin
+(`scripts/apply-fullstack-soft-pin.sh` after kube play,
+`deploy/contabo/soft-pin.env`) is **kube-only** and packing B stays.
+Do not treat Quadlet as the panel-host cutover path. Do not expect Quadlet
+`CPUAffinity=` to be that pin. Sidecar stays unpinned. Live music
+is the remote Docker container described in [`deploy/contabo/README.md`](../contabo/README.md),
+not a Quadlet unit.
 
 For multi-host / Kubernetes-bound deploys, use the
 `podman kube play` YAML emitted under `deploy/kube/` (sibling

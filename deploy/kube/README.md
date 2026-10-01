@@ -6,8 +6,8 @@ The script rewrites a temp copy of the manifest and plays that. Do not
 `ts6-manager-sidecar` are `@UNRELEASED`, which fails reference parsing
 (`invalid reference format`) before any pull. The same YAML shape is
 portable to a real Kubernetes cluster — the supported runtime here is
-Podman on a host ≥ 4.4. Contabo
-production is a git checkout plus `scripts/update.sh`, not Quadlet.
+Podman on a host ≥ 4.4. The panel host
+is a git checkout plus `scripts/update.sh`, not Quadlet.
 For semantically-equivalent systemd-managed deploys, see
 `deploy/quadlet/` (sibling workstream).
 
@@ -20,7 +20,7 @@ For semantically-equivalent systemd-managed deploys, see
 
 ## Upgrade (existing host)
 
-On a host that already has the pod and volumes (Contabo: a checkout
+On a host that already has the pod and volumes (a checkout
 under a path like `/root/github/teamspeak-admin-panel`):
 
 ```bash
@@ -30,25 +30,51 @@ under a path like `/root/github/teamspeak-admin-panel`):
 The script is cwd-agnostic. It rewrites fullstack, music, and sidecar
 (and any other `ts6-manager-*` image) onto that tag — whether the
 checkout still has the committed `@UNRELEASED` placeholder or a legacy
-`:vX.Y.Z` pin — `podman pull`s those GHCR images (required — the
-manifest uses `imagePullPolicy: IfNotPresent`), `podman kube down`s
-the rewritten temp manifest **without** `--force` (same pod name
-`ts6-manager`. The committed file is `@UNRELEASED`. Podman 4.4–5.6
-only reads the pod name during down, and the script still downs the
-rewritten copy so a later podman that checks image refs cannot abort
-teardown), plays that file (pod-only
-if `podman secret exists ts6-manager-secrets`, otherwise concatenates
-`deploy/kube/secrets.yaml`), curls fullstack
-`http://127.0.0.1:3001/health` **and** music
-`http://127.0.0.1:3002/health`, then re-applies the Contabo soft CPU
-pin (see [Contabo soft CPU pin](#contabo-soft-cpu-pin)).
+`:vX.Y.Z` pin. **Default `TS6_LOCAL_MUSIC=skip` does not pull or
+play the local music container.** Music is running on another host.
+Starting the local container binds `127.0.0.1:3002` and the TeamSpeak
+server sees a second copy of the same client identity. The script
+prints the mode. `TS6_LOCAL_MUSIC=play ./scripts/update.sh vX.Y.Z`
+starts the local container again, and only after the remote music
+process is stopped.
+
+While skipping, the script checks `http://127.0.0.1:3002/health`
+**before** `podman kube down`. That port is the reverse tunnel from
+the music host, not a local music container. If it is down, the script
+stops and does not restart the API. Cut order is hop, then API. If
+the API boots while the hop is silent, the saved row is never pushed
+and the music page is 404 (empty supervisor). A hop that dies after
+the client is already connected is a 5xx from the API. The TeamSpeak
+client stays in the channel, and the panel cannot drive it until the
+hop is back. The manifest's `MUSIC_RUNTIME_URL` stays
+`http://127.0.0.1:3002`.
+
+It `podman pull`s the images it will play (`imagePullPolicy: IfNotPresent`),
+`podman kube down`s the rewritten temp manifest **without** `--force`
+(same pod name `ts6-manager`; the down file still names the music
+container so a pod that has one is removed, and the play file does
+not). The committed file is `@UNRELEASED`. Podman 4.4–5.6 only reads
+the pod name during down, and the script still downs the rewritten
+copy so a later podman that checks image refs cannot abort teardown.
+It plays the temp file (pod-only if `podman secret exists
+ts6-manager-secrets`, otherwise concatenates `deploy/kube/secrets.yaml`),
+curls fullstack `http://127.0.0.1:3001/health`, re-checks the music
+hop when skipping (or the local music container when
+`TS6_LOCAL_MUSIC=play`), then re-applies the soft CPU pin
+(see [Soft CPU pin](#soft-cpu-pin)). Packing B (send
+CPUs 0-1, decode 2-5, nice -5) is the pin on this host. The skip does
+not renice the local music container, and it does not change the
+remote process. That process had no cpuset and no nice. Its send
+thread was on both of that host's cores. The track with 0 late frames
+there is not packing B, and it is not an unpinned loop. Issue #93
+stays open as the panel-host finding.
 
 Never `podman kube down --force` — that wipes `ts6-data` / `ts6-db` /
 `ts6-music`. Confirm volumes survived with
 `podman volume ls --filter name=^ts6-`. There is no hand-rolled
 `sed` / `kube play` upgrade.
 
-## Contabo soft CPU pin
+## Soft CPU pin
 
 `podman kube play` does not persist HostConfig `CpusetCpus` or process
 nice. After both health checks succeed, `update.sh` runs
@@ -90,12 +116,15 @@ drops the nice until `apply-fullstack-soft-pin.sh` runs again.
 `TS6_BOT_CHRT_SCHED` FIFO/RR
 is opt-in, default off (no kube privileged / `CAP_SYS_NICE` default).
 In-process `setpriority` as uid 10001 is EPERM. Do not add
-`CAP_SYS_NICE`. Packing B stays. Do not MOVE the bot runtime to Floki.
-Disable pins by
+`CAP_SYS_NICE`. Packing B stays the pin on this host. The remote
+music process had no cpuset and no nice. Its send thread was on both
+of that host's cores. `TS6_LOCAL_MUSIC=skip` (the `update.sh` default)
+does not apply bot HostConfig, nice, or chrt, and does not change
+that process. The track with 0 late frames on the remote host is not
+packing B, and it is not an unpinned loop. Disable pins by
 emptying the vars, removing `soft-pin.env`, or pointing
-`TS6_SOFT_PIN_ENV` at a host-local override (Floki / other hosts —
-do not MOVE the bot runtime to Floki). A requested container cpuset
-that `podman update` cannot apply fails the upgrade so Contabo does
+`TS6_SOFT_PIN_ENV` at a host-local override. A requested container cpuset
+that `podman update` cannot apply fails the upgrade so the panel host does
 not silently lose the pin.
 
 ## Start / restart
@@ -179,7 +208,7 @@ requested tag first (`IfNotPresent`).
 
 ### Override to a local build (pre-publish smoke)
 
-Not a Contabo start or restart. That path stays `./scripts/update.sh vX.Y.Z`.
+Not a panel-host start or restart. That path stays `./scripts/update.sh vX.Y.Z`.
 Build the three images, render a temp manifest with local tags, and play
 only that file. The substitution matches `:` or `@`, so it covers both
 `@UNRELEASED` and a legacy `:vX.Y.Z` pin.
@@ -196,6 +225,9 @@ sed -E \
   -e 's#imagePullPolicy: IfNotPresent#imagePullPolicy: Never#' \
   deploy/kube/ts6-manager.yaml > /tmp/ts6-manager.kube.override.yaml
 
+# Do not run this override on the panel host while the remote music
+# process is the live client. The play below starts the local music
+# container, which binds 127.0.0.1:3002 and clones the client identity.
 # Down this rendered file, not deploy/kube/ts6-manager.yaml. The
 # committed images are @UNRELEASED. update.sh refuses that file, and
 # Bring down uses a rewritten copy for the same reason. Podman 4.4–5.6
@@ -236,7 +268,7 @@ documented production layout.
 | Container port | Host port | Notes |
 |----------------|-----------|-------|
 | 3001 | 3001 | HTTP, served by the Dioxus fullstack server |
-| 3002 | loopback only | Music unit control (`--listen 127.0.0.1:3002`, `MUSIC_RUNTIME_URL`). Not a public listener; do not put it on Caddy. Optional `MUSIC_RUNTIME_TOKEN` bearer; see below. |
+| 3002 | loopback only | Music control. On the panel host this is the remote hop, not a published port. `MUSIC_RUNTIME_URL` stays `http://127.0.0.1:3002` with no bearer. Do not put it on Caddy. The manifest's music container listens here only when `TS6_LOCAL_MUSIC=play`. |
 | 7080 | loopback only | MoQ sidecar HTTP control (`--http-listen 127.0.0.1:7080`). Not a public listener; do not put it on Caddy. |
 | 4443 | 4443 (UDP) | MoQ sidecar WebTransport |
 
@@ -267,9 +299,17 @@ loopback, so `:3002` cannot be published on a non-loopback address
 without authentication. `/health` stays unauthenticated so the exec
 probe is unchanged.
 
-When the music runtime runs on a separate host from the panel, bind
-`--listen` to the WireGuard address, firewall `:3002` to the tunnel
-only, and set the same `MUSIC_RUNTIME_TOKEN` in both containers. The
+The remote music process listens on `127.0.0.1:3002` with no bearer.
+That host opens a reverse tunnel so the panel host's `127.0.0.1:3002`
+reaches it. The present pair is in
+[`deploy/contabo/README.md`](../contabo/README.md).
+Do not publish `:3002`, do not set `MUSIC_RUNTIME_TOKEN` for this hop,
+and do not change `MUSIC_RUNTIME_URL`. Details and the cut order are
+in [`deploy/contabo/README.md`](../contabo/README.md).
+
+A different layout, with the music listener off loopback, binds
+`--listen` to the WireGuard address, firewalls `:3002` to the tunnel
+only, and sets the same `MUSIC_RUNTIME_TOKEN` in both containers. The
 token is a bearer secret on plain HTTP, so it must travel only over
 the WireGuard link, never over the public internet. A wildcard bind
 (`0.0.0.0` or `::`) is refused while the token is set.
@@ -277,13 +317,13 @@ the WireGuard link, never over the public internet. A wildcard bind
 refusal and is discouraged: the process logs a warning, and the
 operator must still firewall `:3002` to the private tunnel.
 
-Contabo public HTTPS (draft, **not applied**): once
+Panel-host public HTTPS (draft, **not applied**): once
 `panel.scuffedcrew.no` is live on the existing host Caddy, public
 access is that hostname — not raw `:3001`. Music `:3002` and sidecar
 `:7080` stay loopback-only (`MUSIC_RUNTIME_URL` remains
 `http://127.0.0.1:3002`). Snippet + DNS gate:
 [`deploy/contabo/Caddyfile.panel.snippet`](../contabo/Caddyfile.panel.snippet).
-Soft pin / packing B / Floki MOVE NO are unchanged.
+Packing B (send CPUs 0-1, decode 2-5, nice -5) stays the pin on the panel host. The remote music process had no cpuset and no nice. Its send thread was on both of that host's cores. `update.sh` skips the local music container unless `TS6_LOCAL_MUSIC=play`.
 
 ## Network mode
 
@@ -328,8 +368,8 @@ Pod ts6-manager
 │    ├── PVC ts6-data  → /var/lib/ts6-manager       (state root / uploads)
 │    ├── PVC ts6-db    → /var/lib/ts6-manager/db    (SurrealKV)
 │    └── PVC ts6-music → /var/lib/ts6-manager/music
-├── container music      (port 3002, uid 10001 — shared volume owner)
-│    ├── PVC ts6-data  → /var/lib/ts6-manager       (identities + cookies; no Surreal open)
+├── container music      (in the manifest; update.sh does not start it unless TS6_LOCAL_MUSIC=play)
+│    ├── PVC ts6-data  → /var/lib/ts6-manager       (local copy of identities; live files are on the music host)
 │    └── PVC ts6-music → /var/lib/ts6-manager/music (do not orphan this PVC)
 └── container sidecar    (7080/tcp, 4443/udp, uid 10002)  # stays unpinned
 ```
@@ -340,7 +380,7 @@ This matches the Quadlet `ts6-manager.pod` topology in
 
 ## Definition of done check
 
-- `./scripts/update.sh vX.Y.Z` is the only start/restart and succeeds on a Podman ≥ 4.4 host when that tag is published for fullstack, music, and sidecar.
+- `./scripts/update.sh vX.Y.Z` is the only panel-host start/restart. The default skip does not start the local music container. Fullstack and sidecar tags must be published. `TS6_LOCAL_MUSIC=play` also needs the music tag, and it must not run while the remote process is the live client.
 - `podman kube play` of the committed manifest fails reference parsing (`@UNRELEASED` on fullstack, music, and sidecar).
 - `curl http://localhost:3001/health` returns 200.
 - `podman kube down` of the rewritten manifest (see [Bring down](#bring-down)) cleans up the pod. Do not down the committed file.

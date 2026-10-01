@@ -179,7 +179,7 @@ build-arg; `Containerfile.fullstack` now re-declares that ARG in the
 **builder** stage and sets `ENV TS6_RELEASE=${IMAGE_VERSION}` before
 `dx bundle`. Untagged local images stamp `dev`. `dx serve` / `cargo test`
 (no deploy env) fall back to `v` + crate semver (`0.0.1`). Do not bump
-`Cargo.toml` to match image tags — Contabo cuts are image tags.
+`Cargo.toml` to match image tags — panel-host cuts are image tags.
 
 ## 3. Signing
 
@@ -256,7 +256,8 @@ build helper.
 8. **Create GitHub Release `vX.Y.Z`** with the binary archives,
    sha256 files, and `.sig` files attached. `.github/workflows/release.yml`
    writes the body: What's changed (commits since the previous tag),
-   the Contabo kube upgrade (`./scripts/update.sh vX.Y.Z`), image
+   the panel-host kube upgrade (`./scripts/update.sh vX.Y.Z`, which skips
+   the local music container unless `TS6_LOCAL_MUSIC=play`), image
    refs, and the cosign verify block.
 9. **Hand off to WS-Gate.** Comment on the WS-Gate tracking issue with
    the published refs and signatures so the rootless-deploy validation

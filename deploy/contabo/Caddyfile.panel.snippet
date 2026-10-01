@@ -1,7 +1,8 @@
-# DRAFT — do not merge, do not apply on Contabo until unanimous
+# DRAFT — do not merge, do not apply on the panel host until unanimous
 # Voice / Music / API / Panel / Sidecar / Release critical +1s
-# AND CoS/FrozenTear AND Robert. Floki MOVE NO. Soft pin unchanged
-# (packing B: fullstack 2-5 / -5). Never SSH-apply from this draft.
+# AND CoS/FrozenTear AND the DNS owner. Soft pin unchanged
+# (packing B: fullstack 2-5 / -5). Live music stays on the remote host.
+# Never SSH-apply from this draft.
 #
 # Host already runs Caddy v2.11.4 with /etc/caddy/Caddyfile:
 #   scuffedcrew.no       → 127.0.0.1:3100
@@ -21,7 +22,7 @@
 #   reverse_proxy 127.0.0.1:3001   (fullstack, hostNetwork;
 #   listener is 0.0.0.0:3001 today — public path is the hostname)
 # NEVER proxy :3002 (music) or :7080 (sidecar) on public Caddy.
-# MUSIC_RUNTIME_URL stays http://127.0.0.1:3002 (Contabo-internal).
+# MUSIC_RUNTIME_URL stays http://127.0.0.1:3002 (panel-host loopback).
 #
 # Do not add HSTS here. API owns the HSTS gate (no HSTS on
 # cleartext :3001). Panel owns the http:// absolute-URL audit.
