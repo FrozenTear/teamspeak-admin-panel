@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Re-apply Contabo soft CPU pin + nice after podman kube play.
+# Re-apply the soft CPU pin + nice after podman kube play.
 # Kube YAML does not persist HostConfig cpuset or process nice.
 #
 # Usage (from any cwd, against a repo checkout):
@@ -26,9 +26,11 @@
 # script runs again. Do not add CAP_SYS_NICE. Packing B values stay.
 # Sidecar stays unpinned unless TS6_SIDECAR_* are set.
 #
-# TS6_CONTABO_MUSIC=skip (what scripts/update.sh exports by default)
-# does not renice ts6-manager-music. That container is not the live
-# music process. TS6_CONTABO_MUSIC=play renices it as before.
+# TS6_LOCAL_MUSIC=skip (what scripts/update.sh exports by default)
+# does not renice the local music container. Music is on another host.
+# TS6_LOCAL_MUSIC=play renices the local container as before.
+# Packing B is the pin on this host. The remote process had no cpuset
+# and no nice. Do not describe that remote track as this pin.
 # Unset keeps the historical behaviour (pin the bot container).
 #
 # podman update failure is fatal when a cpuset was requested.
@@ -91,17 +93,18 @@ music_hostconfig_allowed() {
     return 0
 }
 
-# contabo_music_pin_mode
+# local_music_pin_mode
 # Print "skip" or "play". update.sh exports the canonical value.
 # Unset means play: a direct run of this script still pins the bot
 # container when the operator has not asked to skip it.
-contabo_music_pin_mode() {
-    case "${TS6_CONTABO_MUSIC:-play}" in
-        skip|play) printf '%s\n' "${TS6_CONTABO_MUSIC:-play}" ;;
+local_music_pin_mode() {
+    case "${TS6_LOCAL_MUSIC:-play}" in
+        skip|play) printf '%s\n' "${TS6_LOCAL_MUSIC:-play}" ;;
         *)
-            echo "error: TS6_CONTABO_MUSIC must be skip or play (got: ${TS6_CONTABO_MUSIC})." >&2
-            echo "  scripts/update.sh sets this. skip leaves the Contabo music container alone." >&2
-            echo "  play renices ts6-manager-music. Turn the container back on with TS6_CONTABO_MUSIC=play ./scripts/update.sh vX.Y.Z" >&2
+            echo "error: TS6_LOCAL_MUSIC must be skip or play (got: ${TS6_LOCAL_MUSIC})." >&2
+            echo "  scripts/update.sh sets this. skip leaves the local music container alone." >&2
+            echo "  play renices the local music container. Turn it back on with TS6_LOCAL_MUSIC=play ./scripts/update.sh vX.Y.Z" >&2
+            echo "  Stop the remote music process first." >&2
             return 1
             ;;
     esac
@@ -285,7 +288,7 @@ apply_chrt() {
 
 apply_soft_pin() {
 local music_mode
-music_mode="$(contabo_music_pin_mode)" || return 1
+music_mode="$(local_music_pin_mode)" || return 1
 
 apply_cpuset "$CONTAINER" "$CPUSET"
 apply_nice "$CONTAINER" "$NICE"
@@ -301,9 +304,11 @@ fi
 local bot_pin="applied"
 if [[ "$music_mode" == "skip" ]]; then
     bot_pin="skipped"
-    echo "==> TS6_CONTABO_MUSIC=skip: not applying HostConfig, nice, or chrt to ${BOT_CONTAINER}."
-    echo "    That container is not the live music process. Live music is ts6-manager-music-floki on Floki."
-    echo "    Turn the Contabo container back on with: TS6_CONTABO_MUSIC=play ./scripts/update.sh vX.Y.Z"
+    echo "==> TS6_LOCAL_MUSIC=skip: not applying HostConfig, nice, or chrt to ${BOT_CONTAINER}."
+    echo "    That container is not the live music process. Music is running on a different host."
+    echo "    Packing B (send 0-1, decode 2-5, nice -5) is the pin on this host. The remote process had no cpuset and no nice."
+    echo "    Turn the local container back on with: TS6_LOCAL_MUSIC=play ./scripts/update.sh vX.Y.Z"
+    echo "    Stop the remote music process first."
 else
     apply_cpuset "$BOT_CONTAINER" "$BOT_CONTAINER_CPUSET"
     apply_nice "$BOT_CONTAINER" "$BOT_NICE"
@@ -341,7 +346,7 @@ main() {
         exit 1
     fi
 
-    if ! contabo_music_pin_mode >/dev/null; then
+    if ! local_music_pin_mode >/dev/null; then
         exit 1
     fi
 

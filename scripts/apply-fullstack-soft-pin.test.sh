@@ -143,10 +143,10 @@ unset TS6_BOT_CONTAINER_CPUSET
 
 echo "OK: packing B refuses any music HostConfig cpuset"
 
-# Default update.sh mode skips the Contabo music container. The pin
+# Default update.sh mode skips the local music container. The pin
 # must not inspect that container, and a direct run with the variable
 # unset still renices it.
-export TS6_CONTABO_MUSIC=skip
+export TS6_LOCAL_MUSIC=skip
 export TS6_BOT_CPUSET=0-1
 export TS6_BOT_SEND_CPUSET=0-1
 CPUSET=""
@@ -171,21 +171,21 @@ if ! apply_soft_pin >"${TMP}/skip-pin.out" 2>"${TMP}/skip-pin.err"; then
     cat "${TMP}/skip-pin.err" >&2
     exit 1
 fi
-grep -q "TS6_CONTABO_MUSIC=skip" "${TMP}/skip-pin.out"
+grep -q "TS6_LOCAL_MUSIC=skip" "${TMP}/skip-pin.out"
 grep -q "bot pin=skipped" "${TMP}/skip-pin.out"
 if grep -q "container_pid should not run" "${TMP}/skip-pin.err" "${TMP}/skip-pin.out"; then
     echo "skip mode inspected the music container" >&2
     exit 1
 fi
 
-export TS6_CONTABO_MUSIC=banana
+export TS6_LOCAL_MUSIC=banana
 if apply_soft_pin >"${TMP}/bad-pin.out" 2>"${TMP}/bad-pin.err"; then
-    echo "soft pin accepted TS6_CONTABO_MUSIC=banana" >&2
+    echo "soft pin accepted TS6_LOCAL_MUSIC=banana" >&2
     exit 1
 fi
 grep -q "skip or play" "${TMP}/bad-pin.err"
 
-unset TS6_CONTABO_MUSIC
+unset TS6_LOCAL_MUSIC
 container_pid() {
     echo "$PID"
 }
@@ -193,4 +193,4 @@ container_pid() {
 apply_nice ts6-manager-music -5
 grep -qx -- '-n -5 -p 4242' "$LOG"
 
-echo "OK: TS6_CONTABO_MUSIC=skip does not pin the Contabo music container"
+echo "OK: TS6_LOCAL_MUSIC=skip does not pin the local music container"

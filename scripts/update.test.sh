@@ -99,47 +99,51 @@ fi
 
 echo "OK: kube image tag rewrite (placeholder and legacy tag)"
 
-# Live music is on Floki. The default action must not play the Contabo
-# music container, and the turn-back switch has to be obvious.
-unset TS6_CONTABO_MUSIC
-[[ "$(contabo_music_action)" == "skip" ]] || fail "default music action is not skip"
+# Live music is on another host. The default action must not play the
+# local music container, and the turn-back switch has to be obvious.
+unset TS6_LOCAL_MUSIC
+[[ "$(local_music_action)" == "skip" ]] || fail "default music action is not skip"
 for raw in skip SKIP 0 off OFF false no " skip "; do
-    TS6_CONTABO_MUSIC="$raw"
-    [[ "$(contabo_music_action)" == "skip" ]] || fail "TS6_CONTABO_MUSIC=${raw} did not skip"
+    TS6_LOCAL_MUSIC="$raw"
+    [[ "$(local_music_action)" == "skip" ]] || fail "TS6_LOCAL_MUSIC=${raw} did not skip"
 done
 for raw in play PLAY 1 on true yes; do
-    TS6_CONTABO_MUSIC="$raw"
-    [[ "$(contabo_music_action)" == "play" ]] || fail "TS6_CONTABO_MUSIC=${raw} did not play"
+    TS6_LOCAL_MUSIC="$raw"
+    [[ "$(local_music_action)" == "play" ]] || fail "TS6_LOCAL_MUSIC=${raw} did not play"
 done
-if TS6_CONTABO_MUSIC=banana contabo_music_action >/dev/null 2>"${TMP}/bad-music.err"; then
-    fail "accepted TS6_CONTABO_MUSIC=banana"
+if TS6_LOCAL_MUSIC=banana local_music_action >/dev/null 2>"${TMP}/bad-music.err"; then
+    fail "accepted TS6_LOCAL_MUSIC=banana"
 fi
 grep -q "skip or play" "${TMP}/bad-music.err" || fail "bad music action did not say how to set it"
-unset TS6_CONTABO_MUSIC
+unset TS6_LOCAL_MUSIC
 
-banner="$(print_contabo_music_banner skip v9.9.9)"
-grep -q "TS6_CONTABO_MUSIC=skip" <<<"$banner" || fail "skip banner hid the mode"
-grep -q "TS6_CONTABO_MUSIC=play" <<<"$banner" || fail "skip banner hid the turn-back switch"
-grep -q "bot-1.identity" <<<"$banner" || fail "skip banner omitted the cloned identity"
+banner="$(print_local_music_banner skip v9.9.9)"
+grep -q "TS6_LOCAL_MUSIC=skip" <<<"$banner" || fail "skip banner hid the mode"
+grep -q "TS6_LOCAL_MUSIC=play" <<<"$banner" || fail "skip banner hid the turn-back switch"
+grep -q "client identity" <<<"$banner" || fail "skip banner omitted the cloned identity"
+grep -q "remote music process" <<<"$banner" || fail "skip banner omitted the remote process"
 grep -q "127.0.0.1:3002" <<<"$banner" || fail "skip banner omitted the loopback port"
-play_banner="$(print_contabo_music_banner play v9.9.9)"
-grep -q "TS6_CONTABO_MUSIC=play" <<<"$play_banner" || fail "play banner hid the mode"
-grep -q "ts6-manager-music-floki" <<<"$play_banner" || fail "play banner omitted the Floki container"
+play_banner="$(print_local_music_banner play v9.9.9)"
+grep -q "TS6_LOCAL_MUSIC=play" <<<"$play_banner" || fail "play banner hid the mode"
+grep -q "remote music process" <<<"$play_banner" || fail "play banner omitted the remote process"
 
-explain_contabo_music_running ts6-manager-music > "${TMP}/running.txt"
-grep -q "will not restart the API" "${TMP}/running.txt" || fail "a running Contabo music container would still restart the API"
-grep -q "bot-1.identity" "${TMP}/running.txt" || fail "running-container failure omitted the cloned identity"
-grep -q "Floki hop" "${TMP}/running.txt" || fail "running-container failure omitted the hop"
+explain_local_music_running ts6-manager-music > "${TMP}/running.txt"
+grep -q "will not restart the API" "${TMP}/running.txt" || fail "a running local music container would still restart the API"
+grep -q "client identity" "${TMP}/running.txt" || fail "running-container failure omitted the cloned identity"
+grep -q "remote hop" "${TMP}/running.txt" || fail "running-container failure omitted the hop"
 
 explain_music_hop_down > "${TMP}/hop.txt"
 grep -q "will not restart the API" "${TMP}/hop.txt" || fail "hop failure would still restart the API"
 grep -q "ts6-music-tunnel.service" "${TMP}/hop.txt" || fail "hop failure omitted the tunnel unit"
-grep -q "music page is 404" "${TMP}/hop.txt" || fail "hop failure omitted the rehydrate symptom"
-grep -q "bot-1.identity" "${TMP}/hop.txt" || fail "hop failure omitted the cloned identity"
+grep -q "music page is 404" "${TMP}/hop.txt" || fail "hop failure omitted the empty-supervisor 404"
+grep -q "empty supervisor" "${TMP}/hop.txt" || fail "hop failure did not name the empty supervisor"
+grep -q "5xx" "${TMP}/hop.txt" || fail "hop failure described a later hop death as the 404"
+grep -q "stays in the channel" "${TMP}/hop.txt" || fail "hop failure omitted the client that stays connected"
+grep -q "client identity" "${TMP}/hop.txt" || fail "hop failure omitted the cloned identity"
 grep -q "Do not publish :3002 or :7080" "${TMP}/hop.txt" || fail "hop failure omitted the publish ban"
 grep -q "MUSIC_RUNTIME_URL" "${TMP}/hop.txt" || fail "hop failure omitted the runtime URL"
 
-prepare_contabo_play_manifest "${TMP}/out.yaml" "${TMP}/skip.yaml" skip || fail "skip play manifest"
+prepare_local_play_manifest "${TMP}/out.yaml" "${TMP}/skip.yaml" skip || fail "skip play manifest"
 if grep -q 'ghcr.io/frozentear/ts6-manager-music' "${TMP}/skip.yaml"; then
     fail "skip manifest still has the music image"
 fi
@@ -159,7 +163,7 @@ if grep -Eq '^[[:space:]]+hostPort:' "${TMP}/skip.yaml"; then
     fail "skip manifest publishes a hostPort"
 fi
 
-prepare_contabo_play_manifest "${TMP}/out.yaml" "${TMP}/play.yaml" play || fail "play manifest"
+prepare_local_play_manifest "${TMP}/out.yaml" "${TMP}/play.yaml" play || fail "play manifest"
 grep -q 'image: ghcr.io/frozentear/ts6-manager-music:v9.9.9-guard' "${TMP}/play.yaml" || fail "play mode dropped the music image"
 grep -Eq '^    - name: music[[:space:]]*$' "${TMP}/play.yaml" || fail "play mode dropped the music container"
 grep -q 'value: "http://127.0.0.1:3002"' "${TMP}/play.yaml" || fail "play mode retargeted MUSIC_RUNTIME_URL"
@@ -170,4 +174,4 @@ down="$(kube_down_manifest "$MANIFEST" "${TMP}/out.yaml")"
 [[ "$down" == "${TMP}/out.yaml" ]] || fail "down target changed"
 grep -q 'ts6-manager-music' "$down" || fail "down manifest no longer names the music container"
 
-echo "OK: Contabo music container stays skipped unless TS6_CONTABO_MUSIC=play"
+echo "OK: local music container stays skipped unless TS6_LOCAL_MUSIC=play"

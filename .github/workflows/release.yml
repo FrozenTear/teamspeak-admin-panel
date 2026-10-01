@@ -321,7 +321,7 @@ jobs:
               echo "No previous \`v*\` tag found to diff against (first cut, or tags were not fetched)."
             fi
             echo
-            echo "## Contabo / kube upgrade"
+            echo "## Panel-host kube upgrade"
             echo
             echo "On the existing host checkout (never \`podman kube down --force\`):"
             echo
@@ -329,7 +329,7 @@ jobs:
             echo "./scripts/update.sh ${TAG}"
             echo '```'
             echo
-            echo "Pulls the fullstack and sidecar GHCR images and plays those two containers. The Contabo music container stays stopped (\`TS6_CONTABO_MUSIC=skip\`, the default) while music runs on Floki. \`TS6_CONTABO_MUSIC=play\` starts it again, after the Floki container is stopped. Does not wipe \`ts6-data\` / \`ts6-db\` / \`ts6-music\`. See \`deploy/kube/README.md\` and \`docs/runbook.md\` § 3.4."
+            echo "Pulls the fullstack and sidecar GHCR images and plays those two containers. The local music container stays stopped (\`TS6_LOCAL_MUSIC=skip\`, the default) while music runs on another host. \`TS6_LOCAL_MUSIC=play\` starts the local container again, after the remote music process is stopped. Does not wipe \`ts6-data\` / \`ts6-db\` / \`ts6-music\`. See \`deploy/kube/README.md\` and \`docs/runbook.md\` § 3.4."
             echo
             echo "### Images (manifest lists, linux/amd64 + linux/arm64)"
             echo

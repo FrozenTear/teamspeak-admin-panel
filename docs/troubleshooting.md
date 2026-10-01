@@ -35,7 +35,7 @@ right command per shape).
 - [Dashboard says "control transport error" after a fresh deploy](#dashboard-says-control-transport-error-after-a-fresh-deploy)
 - [Headless browser probes deadlock against the SPA](#headless-browser-probes-deadlock-against-the-spa)
 - [Kick "About" section does not render the widget snapshot image](#kick-about-section-does-not-render-the-widget-snapshot-image)
-- [Music page is 404 after the API comes back](#music-page-is-404-after-the-api-comes-back)
+- [Music page is 404, or a 5xx after the hop drops](#music-page-is-404-or-a-5xx-after-the-hop-drops)
 
 ---
 
@@ -669,42 +669,53 @@ owns the share-modal copy correction.
 
 ---
 
-## Music page is 404 after the API comes back
+## Music page is 404, or a 5xx after the hop drops
 
-**What the operator sees.** The panel is up (`http://127.0.0.1:3001/health`
-answers) and the music page is 404. `curl -fsS http://127.0.0.1:3002/health`
-on Contabo fails, or it failed at the moment the API started.
+**What the operator sees.** Two different failures share the same hop.
+
+- **404, empty supervisor.** The panel is up and the music page is 404.
+  The API booted while `127.0.0.1:3002` was not answering, so the saved
+  row was never pushed.
+- **5xx, hop died after connect.** The client is already in the channel.
+  The API answers 5xx when the panel tries to drive it. The TeamSpeak
+  client stays in the channel. The panel cannot drive it until the hop
+  is back. That is not the 404.
 
 **Why it happens.** The panel still calls `http://127.0.0.1:3002` with
-no bearer. That socket is the SSH reverse tunnel from Floki, not the
-Contabo music container. The music process (`ts6-manager-music-floki`)
-comes back on its own (`restart unless-stopped`). The client is pushed
-only when the Contabo API starts. If `127.0.0.1:3002` is not listening
-yet, rehydrate fails and the music page is 404.
+no bearer. That socket is the reverse tunnel from the music host, not
+the local music container. The music process comes back on its own
+(`restart unless-stopped`). The client is pushed only when the panel
+API starts. If that start happens while the hop is down, the supervisor
+stays empty and the music page is 404.
 
-`ts6-music-tunnel.service` on Floki is installed and enabled. It is
-inactive while a one-off `ssh -f` holds the port. After a Floki reboot
-the one-off is gone and that unit should bind the hop (Floki to the
-Contabo user `ts6dev`, Contabo `127.0.0.1:3002` only).
+`ts6-music-tunnel.service` on the music host is installed and enabled.
+It is inactive while a one-off `ssh -f` holds the port. After a reboot
+of the music host the one-off is gone and that unit should bind the hop
+(music host to the panel host, panel `127.0.0.1:3002` only). The
+present hosts are written once in
+[`deploy/contabo/README.md`](../deploy/contabo/README.md).
 
 **What to do.**
 
-1. On Floki, confirm `ts6-manager-music-floki` is running and listening
-   on `127.0.0.1:3002`. Identities and `yt-cookies.txt` are in
-   `/home/scuffedspeak/ts6-floki-test/data`. Panel bot 7 (DJ-Bot) is
-   `bot-1.identity`.
-2. Confirm the hop is up: from Contabo,
-   `curl -fsS http://127.0.0.1:3002/health`. If the host just rebooted,
-   start `ts6-music-tunnel.service` on Floki and check again.
-3. Only then restart the Contabo API (`./scripts/update.sh vX.Y.Z`,
-   which refuses to go on when the hop is down). Do not retarget
+1. On the music host, confirm the music container is running and
+   listening on `127.0.0.1:3002`. Identities and `yt-cookies.txt` are
+   in that host's data directory. An empty cookie file fails the
+   resolve and puts nothing on the wire.
+2. Confirm the hop is up: from the panel host,
+   `curl -fsS http://127.0.0.1:3002/health`. If the music host just
+   rebooted, start `ts6-music-tunnel.service` there and check again.
+3. For the 404, bring the hop up and then start the panel API
+   (`./scripts/update.sh vX.Y.Z`, which refuses to go on when the hop
+   is down) so the saved row is pushed. For the 5xx, restore the hop.
+   The client is already in the channel. The panel can drive it once
+   `127.0.0.1:3002` answers again. Do not retarget
    `MUSIC_RUNTIME_URL`. Do not publish `:3002` or `:7080`.
 
-Do not start `ts6-manager-music` on Contabo to fill the port. It is
-stopped (exited 137) and its volume still has the same
-`bot-1.identity`. Starting it takes `127.0.0.1:3002` and the TeamSpeak
-server sees a second copy of that client. `TS6_CONTABO_MUSIC=play` is
-the turn-back, and only after the Floki container is stopped.
+Do not start the local music container to fill the port. Its volume
+still has the same client identity. Starting it takes `127.0.0.1:3002`
+and the TeamSpeak server sees a second copy of that client.
+`TS6_LOCAL_MUSIC=play` is the turn-back, and only after the remote
+music process is stopped.
 
 **Cross-link.** [`deploy/contabo/README.md`](../deploy/contabo/README.md)
 and [`docs/runbook.md` § 3.4](runbook.md#34-image-upgrade).

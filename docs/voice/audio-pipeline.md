@@ -97,7 +97,7 @@ pipeline.shutdown().await;
 
 CPU affinity (packing B, no fullstack shrink): `voice-rt` pins only the wire-send path to `TS6_BOT_SEND_CPUSET=0-1`. Pipeline, ICY fetch, the yt-dlp bridge, and resolve run on `decode-rt`, pinned to `TS6_BOT_DECODE_CPUSET=2-5`. Music container HostConfig stays unset — never `0-1` (packing C).
 
-`TS6_BOT_NICE` (`-5`) is a one-shot host renice of tids named `voice-rt` after `/health`, not an in-process capability (uid 10001, EPERM, no `CAP_SYS_NICE`). Tokio's blocking pool reuses that name and is created lazily on `spawn_blocking` / `block_in_place`; those threads are pinned to SEND `0-1` and inherit the spawning thread's nice. A music container restart drops the nice until `scripts/apply-fullstack-soft-pin.sh` runs again (Opus #66 L16). Packing B is unchanged. The live music process is Docker on Floki (`ts6-manager-music-floki`). While `TS6_CONTABO_MUSIC=skip`, that script does not renice a Contabo music container and does not change the Floki process.
+`TS6_BOT_NICE` (`-5`) is a one-shot host renice of tids named `voice-rt` after `/health`, not an in-process capability (uid 10001, EPERM, no `CAP_SYS_NICE`). Tokio's blocking pool reuses that name and is created lazily on `spawn_blocking` / `block_in_place`; those threads are pinned to SEND `0-1` and inherit the spawning thread's nice. A music container restart drops the nice until `scripts/apply-fullstack-soft-pin.sh` runs again (Opus #66 L16). Packing B (send CPUs 0-1, decode 2-5, nice -5) is the pin on the panel host. The remote music process had no cpuset and no nice. Its send thread was on both of that host's cores. While `TS6_LOCAL_MUSIC=skip`, that script does not renice the local music container and does not change the remote process. The track with 0 late frames on the remote host is not that pin, and it is not an unpinned loop. Issue #93 stays open as the panel-host finding.
 
 ## Persistent yt-dlp resolver (PURA-359)
 
@@ -108,18 +108,21 @@ track. `crates/music-bot-audio/src/resolver.rs` instead runs a long-lived
 Python process (`yt_resolver.py`, embedded via `include_str!`) that imports
 `yt_dlp` once at boot and resolves tracks over a unix-domain socket; the warm
 process returns the direct `bestaudio` URL and `ffmpeg` consumes it directly.
-Measured on contabo-dev: ~6.5 s cold subprocess vs ~3.8 s warm — **−~2.7 s**.
+Measured on the panel host: ~6.5 s cold subprocess vs ~3.8 s warm — **−~2.7 s**.
 
 - The manager warms the resolver at boot (`music_bot::warm_resolver()`)
-  so the `import yt_dlp` cost is paid before the first `!play`. Contabo
-  kube sets `MUSIC_RUNTIME_URL` to `http://127.0.0.1:3002` (the Floki
-  hop; do not retarget it). Fullstack skips the warm and the music
-  process warms instead. The live process is `ts6-manager-music-floki`.
-  The supervisor task runs
-  on `decode-rt`, and a pre_exec `sched_setaffinity` parks that
-  process on `TS6_BOT_DECODE_CPUSET=2-5` before exec
-  (`pin_decode_child` is a leader backup; packing B; share Axum,
-  never send `0-1`).
+  so the `import yt_dlp` cost is paid before the first `!play`. Kube
+  sets `MUSIC_RUNTIME_URL` to `http://127.0.0.1:3002` (the remote hop;
+  do not retarget it). Fullstack skips the warm and the music
+  process warms instead. On the local music container the supervisor
+  task runs on `decode-rt`, and a pre_exec `sched_setaffinity` parks
+  that process on `TS6_BOT_DECODE_CPUSET=2-5` before exec
+  (`pin_decode_child` is a leader backup; packing B, send CPUs 0-1,
+  decode 2-5, nice -5; share Axum, never send `0-1`). That pin is the
+  panel host's. The remote process had no cpuset and no nice. Its send
+  thread was on both of that host's cores. The track with 0 late frames
+  on the remote host is not that pin, and it is not an unpinned loop.
+  Issue #93 stays open as the panel-host finding.
 - A background supervisor restarts the process on exit; after repeated fast
   crashes it gives up and leaves the subprocess fallback in effect.
 - **Every failure path falls back to the `yt-dlp` subprocess** — service down,
