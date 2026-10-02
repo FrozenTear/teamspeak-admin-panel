@@ -23,19 +23,17 @@ pub struct MusicSummonCap {
 const PROJECTION: &str = "serverAddr, cap";
 
 /// The stored number for `server_addr`, or `None` when that server has
-/// no row.
+/// no row. Addresses that dial the same socket share one row.
 pub async fn get(db: &Database, server_addr: &str) -> Result<Option<u32>> {
-    let sql = format!(
-        "SELECT {PROJECTION} FROM music_summon_cap WHERE serverAddr = $serverAddr LIMIT 1;"
-    );
-    let mut resp = db
-        .query(sql)
-        .bind(("serverAddr", server_addr.to_string()))
-        .await
-        .context("music_summon_cap get query failed")?
-        .check()?;
-    let rows: Vec<MusicSummonCap> = resp.take(0)?;
-    match rows.into_iter().next() {
+    let want = music_bot::canon_server_addr(server_addr);
+    if want.is_empty() {
+        return Ok(None);
+    }
+    let rows = list(db).await?;
+    match rows
+        .into_iter()
+        .find(|row| music_bot::canon_server_addr(&row.serverAddr) == want)
+    {
         None => Ok(None),
         Some(row) => Ok(Some(cap_as_u32(row.cap)?)),
     }
@@ -52,21 +50,28 @@ pub async fn list(db: &Database) -> Result<Vec<MusicSummonCap>> {
     Ok(resp.take(0)?)
 }
 
-/// Insert or replace the one row for `server_addr`.
+/// Insert or replace the one row for `server_addr`. The stored address
+/// is the canonical socket, so a second spelling does not create a row.
 pub async fn upsert(db: &Database, server_addr: &str, cap: u32) -> Result<()> {
+    let canon = music_bot::canon_server_addr(server_addr);
     let cap = i64::from(cap);
-    if get(db, server_addr).await?.is_some() {
-        let sql = "UPDATE music_summon_cap SET cap = $cap WHERE serverAddr = $serverAddr;";
+    let rows = list(db).await?;
+    if let Some(existing) = rows
+        .into_iter()
+        .find(|row| music_bot::canon_server_addr(&row.serverAddr) == canon)
+    {
+        let sql = "UPDATE music_summon_cap SET cap = $cap, serverAddr = $canon WHERE serverAddr = $serverAddr;";
         db.query(sql)
             .bind(("cap", cap))
-            .bind(("serverAddr", server_addr.to_string()))
+            .bind(("canon", canon))
+            .bind(("serverAddr", existing.serverAddr))
             .await
             .context("music_summon_cap update query failed")?
             .check()?;
     } else {
         let sql = "CREATE music_summon_cap CONTENT { serverAddr: $serverAddr, cap: $cap };";
         db.query(sql)
-            .bind(("serverAddr", server_addr.to_string()))
+            .bind(("serverAddr", canon))
             .bind(("cap", cap))
             .await
             .context("music_summon_cap create query failed")?
@@ -106,5 +111,19 @@ mod tests {
         assert_eq!(rows[0].serverAddr, "127.0.0.1:9987");
         assert_eq!(rows[0].cap, 4);
         assert_eq!(rows[1].cap, 0);
+    }
+
+    #[tokio::test]
+    async fn spellings_of_one_socket_are_one_row() {
+        let db = connect_in_memory().await.expect("connect");
+        crate::db::migrations::run(&db).await.expect("migrations");
+        upsert(&db, "Voice.Example", 2).await.expect("insert");
+        upsert(&db, "voice.example:9987", 3).await.expect("replace");
+        assert_eq!(get(&db, "VOICE.example").await.expect("get"), Some(3));
+        assert_eq!(list(&db).await.expect("list").len(), 1);
+        upsert(&db, "voice.example:9988", 1)
+            .await
+            .expect("other port");
+        assert_eq!(list(&db).await.expect("list").len(), 2);
     }
 }

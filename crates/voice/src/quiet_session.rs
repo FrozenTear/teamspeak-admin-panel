@@ -34,7 +34,14 @@ pub(crate) async fn run(
 ) -> Result<()> {
     let server = launch.server.clone();
     let slot = launch.slot;
+    let generation = launch.generation;
     let mut stop = launch.stop;
+    let _guard = SessionEnd {
+        director: director.clone(),
+        server: server.clone(),
+        slot,
+        generation,
+    };
     if *stop.borrow() {
         return Ok(());
     }
@@ -57,23 +64,32 @@ pub(crate) async fn run(
     if !connected {
         anyhow::bail!("quiet client handshake did not finish");
     }
-    let own = wait_own(&mut con).await?;
+    let mut own = wait_own(&mut con).await?;
+    if !landed_in_tech_support(&mut con).await? {
+        anyhow::bail!("quiet client did not land in {TECH_SUPPORT_CHANNEL}");
+    }
     subscribe_all(&mut con).context("subscribe channels")?;
-    if let Some((at, clients)) = snapshot(&con) {
-        director.mark_ready(&server, slot, at, &clients);
+    if let Some((at, clients)) = snapshot(&con)
+        && !director.mark_ready_gen(&server, slot, generation, at, &clients)
+    {
+        anyhow::bail!("quiet slot was replaced before it became ready");
     }
 
     let mut current: Option<ActiveAudio> = None;
     let mut frames: Option<mpsc::Receiver<AudioMsg>> = None;
     let mut monitor = SendTimingMonitor::new();
     let volume = VolumeHandle::default();
+    let mut playback = false;
+    let mut resubscribe = false;
+    let mut resubscribe_tries: u8 = 0;
+    let mut trust_on_next_book = false;
 
     loop {
         if *stop.borrow() {
             break;
         }
         if let Some(active) = current.as_ref() {
-            active.set_paused(!director.playback_open(&server, slot));
+            active.set_paused(!playback);
         }
         tokio::select! {
             biased;
@@ -84,13 +100,47 @@ pub(crate) async fn run(
             }
             ev = async { con.events().next().await } => {
                 match ev {
+                    Some(Ok(StreamItem::DisconnectedTemporarily(reason))) => {
+                        warn!(%server, slot, ?reason, "quiet client reconnecting");
+                        resubscribe = true;
+                        resubscribe_tries = 0;
+                    }
+                    Some(Ok(_item)) if resubscribe => {
+                        resubscribe_tries = resubscribe_tries.saturating_add(1);
+                        if resubscribe_tries > 5 {
+                            anyhow::bail!("quiet client did not resubscribe after reconnect");
+                        }
+                        if let Some(id) = own_id(&con) {
+                            own = id;
+                            if subscribe_all(&mut con).is_ok() {
+                                if let Some((at, _)) = snapshot(&con) {
+                                    director.mark_reconnected(&server, slot, generation, at);
+                                }
+                                resubscribe = false;
+                                trust_on_next_book = true;
+                            }
+                        }
+                    }
                     Some(Ok(item)) => {
-                        let instr = instructions_for(&director, &server, slot, own, &con, &item);
+                        if trust_on_next_book && matches!(item, StreamItem::BookEvents(_)) {
+                            director.note_list_trusted(&server, slot, generation);
+                            trust_on_next_book = false;
+                        }
+                        let instr = instructions_for(
+                            &director,
+                            &server,
+                            slot,
+                            generation,
+                            own,
+                            &con,
+                            &item,
+                        );
                         apply(
                             &director,
                             &live,
                             &server,
                             slot,
+                            generation,
                             &mut con,
                             &mut current,
                             &mut frames,
@@ -98,6 +148,7 @@ pub(crate) async fn run(
                             instr,
                         )
                         .await;
+                        playback = director.playback_open_gen(&server, slot, generation);
                     }
                     Some(Err(err)) => {
                         warn!(%server, slot, error = %err, "quiet client stream error");
@@ -109,7 +160,7 @@ pub(crate) async fn run(
             msg = recv_frame(&mut frames) => {
                 match msg {
                     Some(AudioMsg::Frame { bytes, enqueued_at, .. }) => {
-                        if director.offer_frame(&server, slot)
+                        if director.offer_frame_gen(&server, slot, generation)
                             && let Err(err) = audio::send_opus_frame(
                                 &mut con,
                                 &bytes,
@@ -119,12 +170,14 @@ pub(crate) async fn run(
                             )
                         {
                             warn!(%server, slot, error = %err, "quiet client send_audio failed");
-                            let instr = director.on_playback_finished(&server, slot);
+                            let instr =
+                                director.on_playback_finished_gen(&server, slot, generation);
                             apply(
                                 &director,
                                 &live,
                                 &server,
                                 slot,
+                                generation,
                                 &mut con,
                                 &mut current,
                                 &mut frames,
@@ -132,16 +185,18 @@ pub(crate) async fn run(
                                 instr,
                             )
                             .await;
+                            playback = director.playback_open_gen(&server, slot, generation);
                         }
                     }
                     Some(AudioMsg::Finished) | None => {
                         frames = None;
-                        let instr = director.on_playback_finished(&server, slot);
+                        let instr = director.on_playback_finished_gen(&server, slot, generation);
                         apply(
                             &director,
                             &live,
                             &server,
                             slot,
+                            generation,
                             &mut con,
                             &mut current,
                             &mut frames,
@@ -149,6 +204,7 @@ pub(crate) async fn run(
                             instr,
                         )
                         .await;
+                        playback = director.playback_open_gen(&server, slot, generation);
                     }
                     Some(AudioMsg::CatchupDropped(_)) | Some(AudioMsg::PipelineEvent(_)) => {}
                 }
@@ -177,30 +233,42 @@ fn instructions_for(
     director: &SummonDirector,
     server: &str,
     slot: u32,
+    generation: u64,
     own: ClientId,
     con: &Connection,
     item: &StreamItem,
 ) -> Vec<QuietInstruction> {
+    // Voice packets are not book events. Snapshotting the client list
+    // here would take the director lock on every incoming frame.
+    let StreamItem::BookEvents(events) = item else {
+        return Vec::new();
+    };
     let Some((at, clients)) = snapshot(con) else {
         return Vec::new();
     };
-    let mut out = director.on_book(server, slot, at, &clients);
-    let StreamItem::BookEvents(events) = item else {
-        return out;
-    };
+    let mut out = director.on_book_gen(server, slot, generation, at, &clients);
     for event in events {
         let BookEvent::Message {
-            target: MessageTarget::Channel,
+            target,
             invoker,
             message,
         } = event
         else {
             continue;
         };
+        // Channel text only arrives for the channel this connection is
+        // in. Server text, a private message, and a poke arrive while
+        // the client is sitting in another channel. All four are commands.
+        match target {
+            MessageTarget::Server
+            | MessageTarget::Channel
+            | MessageTarget::Client(_)
+            | MessageTarget::Poke(_) => {}
+        }
         if invoker.id == own {
             continue;
         }
-        out.extend(director.on_chat(server, slot, invoker.id.0, message, &clients));
+        out.extend(director.on_chat_gen(server, slot, generation, invoker.id.0, message, &clients));
     }
     out
 }
@@ -211,6 +279,7 @@ async fn apply(
     live: &LiveQuiet,
     server: &str,
     slot: u32,
+    generation: u64,
     con: &mut Connection,
     current: &mut Option<ActiveAudio>,
     frames: &mut Option<mpsc::Receiver<AudioMsg>>,
@@ -237,7 +306,7 @@ async fn apply(
             }
         }
         if let Some(arg) = instr.play
-            && director.playback_open(server, slot)
+            && director.playback_open_gen(server, slot, generation)
         {
             let cookie = live
                 .yt_cookie
@@ -257,7 +326,7 @@ async fn apply(
                     warn!(%server, slot, error = %err, "quiet client cold resolve failed");
                     *frames = None;
                     audio::tear_down(current);
-                    let back = director.on_playback_finished(server, slot);
+                    let back = director.on_playback_finished_gen(server, slot, generation);
                     for back in back {
                         if back.stop_audio {
                             audio::send_voice_stop(con);
@@ -337,4 +406,61 @@ fn own_id(con: &Connection) -> Option<ClientId> {
     let book = con.get_state().ok()?;
     book.clients.get(&book.own_client)?;
     Some(book.own_client)
+}
+
+struct SessionEnd {
+    director: SummonDirector,
+    server: String,
+    slot: u32,
+    generation: u64,
+}
+
+impl Drop for SessionEnd {
+    fn drop(&mut self) {
+        self.director
+            .session_ended(&self.server, self.slot, self.generation);
+    }
+}
+
+/// True only when this connection is in the channel named Tech Support.
+/// A missing or rejected channel leaves the client in the default
+/// channel; that is not a place to sit or to play.
+async fn landed_in_tech_support(con: &mut Connection) -> Result<bool> {
+    let deadline = tokio::time::sleep(Duration::from_secs(2));
+    tokio::pin!(deadline);
+    loop {
+        if let Some(name) = own_channel_name(con) {
+            return Ok(name == TECH_SUPPORT_CHANNEL);
+        }
+        tokio::select! {
+            biased;
+            _ = &mut deadline => return Ok(false),
+            ev = async { con.events().next().await } => match ev {
+                Some(Ok(_)) => continue,
+                Some(Err(err)) => return Err(anyhow::anyhow!("stream error: {err}")),
+                None => anyhow::bail!("stream ended before the channel name arrived"),
+            }
+        }
+    }
+}
+
+fn own_channel_name(con: &Connection) -> Option<String> {
+    let book = con.get_state().ok()?;
+    let own = book.clients.get(&book.own_client)?;
+    let channel = book.channels.get(&own.channel)?;
+    Some(channel.name.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn voice_packets_are_not_book_work() {
+        let item = StreamItem::IdentityLevelIncreased;
+        assert!(!matches!(item, StreamItem::BookEvents(_)));
+        let item =
+            StreamItem::DisconnectedTemporarily(tsclientlib::TemporaryDisconnectReason::Serverstop);
+        assert!(!matches!(item, StreamItem::BookEvents(_)));
+    }
 }

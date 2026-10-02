@@ -316,7 +316,12 @@ impl BotSupervisor {
     pub async fn shutdown_bot(&self, id: BotId) -> Result<(), SendError> {
         let handle = self.bots.lock().await.remove(&id);
         match handle {
-            Some(h) => h.shutdown().await,
+            Some(h) => {
+                let server = h.config.server_addr.clone();
+                let result = h.shutdown().await;
+                self.summon.forget_saved(&server, id.0);
+                result
+            }
             None => Err(SendError::ActorGone),
         }
     }

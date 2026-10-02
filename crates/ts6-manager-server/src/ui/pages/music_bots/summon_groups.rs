@@ -1,8 +1,8 @@
-//! Group saved music-bot rows by the exact server address they dial.
+//! Group saved music-bot rows by the socket they dial.
 //!
-//! One summon cap belongs to that address. A server with no stored cap
-//! contributes `None`, which the page renders as an empty field. A cap
-//! whose address has no saved bot is left out.
+//! One summon cap belongs to that socket. A server with no stored cap
+//! contributes `None`, which the page renders as an empty field. A stored
+//! cap with no saved bots is still shown, so the page can set it to 0.
 
 use ts6_manager_shared::music_bots as wire;
 
@@ -19,21 +19,30 @@ pub fn group_summon_caps(
 ) -> Vec<SummonServerGroup> {
     let mut groups: Vec<SummonServerGroup> = Vec::new();
     for bot in bots {
-        if let Some(group) = groups
-            .iter_mut()
-            .find(|group| group.server_addr == bot.server_addr)
-        {
+        let key = music_bot::canon_server_addr(&bot.server_addr);
+        if let Some(group) = groups.iter_mut().find(|group| group.server_addr == key) {
             group.bots.push(bot.clone());
             continue;
         }
         let cap = caps
             .iter()
-            .find(|cap| cap.server_addr == bot.server_addr)
+            .find(|cap| music_bot::canon_server_addr(&cap.server_addr) == key)
             .map(|cap| cap.cap);
         groups.push(SummonServerGroup {
-            server_addr: bot.server_addr.clone(),
+            server_addr: key,
             cap,
             bots: vec![bot.clone()],
+        });
+    }
+    for cap in caps {
+        let key = music_bot::canon_server_addr(&cap.server_addr);
+        if key.is_empty() || groups.iter().any(|group| group.server_addr == key) {
+            continue;
+        }
+        groups.push(SummonServerGroup {
+            server_addr: key,
+            cap: Some(cap.cap),
+            bots: Vec::new(),
         });
     }
     groups
@@ -77,7 +86,7 @@ mod tests {
     }
 
     #[test]
-    fn a_cap_with_no_bot_is_omitted_and_another_server_is_not_borrowed() {
+    fn a_stored_cap_with_no_bot_stays_visible_and_is_not_borrowed() {
         let bots = vec![bot(1, "10.0.0.1:9987")];
         let caps = vec![
             wire::SummonCap {
@@ -90,17 +99,46 @@ mod tests {
             },
         ];
         let groups = group_summon_caps(&bots, &caps);
-        assert_eq!(groups.len(), 1);
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0].server_addr, "10.0.0.1:9987");
         assert_eq!(groups[0].cap, None);
         assert_eq!(groups[0].bots.len(), 1);
+        assert!(groups.iter().any(|group| {
+            group.server_addr == "10.0.0.2:9987" && group.cap == Some(4) && group.bots.is_empty()
+        }));
+        assert!(groups.iter().any(|group| {
+            group.server_addr == "10.0.0.1:9988" && group.cap == Some(2) && group.bots.is_empty()
+        }));
     }
 
     #[test]
-    fn no_bots_shows_no_group() {
+    fn spellings_of_one_socket_share_one_number() {
+        let bots = vec![bot(1, "Voice.Example"), bot(2, "voice.example:9987")];
+        let caps = vec![wire::SummonCap {
+            server_addr: "voice.example:9987".into(),
+            cap: 2,
+        }];
+        let groups = group_summon_caps(&bots, &caps);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].server_addr, "voice.example:9987");
+        assert_eq!(groups[0].cap, Some(2));
+        assert_eq!(groups[0].bots.len(), 2);
+    }
+
+    #[test]
+    fn no_bots_and_no_caps_shows_no_group() {
+        assert!(group_summon_caps(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn a_stored_cap_with_no_bots_is_a_group() {
         let caps = vec![wire::SummonCap {
             server_addr: "127.0.0.1:9987".into(),
             cap: 2,
         }];
-        assert!(group_summon_caps(&[], &caps).is_empty());
+        let groups = group_summon_caps(&[], &caps);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].cap, Some(2));
+        assert!(groups[0].bots.is_empty());
     }
 }

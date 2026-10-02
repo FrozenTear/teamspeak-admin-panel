@@ -38,7 +38,7 @@ pub use store::{
     InMemoryMusicBotStore, LibraryEntry, LibraryEntryId, MusicBotStore, NewLibraryEntry, NewTrack,
     PlaylistName, SNAPSHOT_VERSION, StoreError, StoreResult, Track, TrackId,
 };
-pub use summon::{MAX_SUMMON_CAP, SummonDirector, TECH_SUPPORT_CHANNEL};
+pub use summon::{MAX_SUMMON_CAP, SummonDirector, TECH_SUPPORT_CHANNEL, canon_server_addr};
 pub use supervisor::{BotHandle, BotInfo, BotSupervisor, SendError, spawn_bot};
 
 /// Voice `context` bag for `POST /api/bug-reports` (PR #28).

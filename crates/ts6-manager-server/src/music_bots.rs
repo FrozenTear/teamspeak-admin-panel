@@ -38,6 +38,9 @@ pub struct MusicBotService {
     pub identity_dir: Arc<PathBuf>,
     pub liveness: Arc<LivenessTracker>,
     pub requests: Arc<RequestLog>,
+    /// One in-flight cap save per server address. Two saves must not
+    /// both observe an empty row and then undo each other.
+    summon_saves: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl MusicBotService {
@@ -54,6 +57,7 @@ impl MusicBotService {
             identity_dir: Arc::new(identity_dir),
             liveness,
             requests,
+            summon_saves: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -75,7 +79,23 @@ impl MusicBotService {
             identity_dir: Arc::new(identity_dir),
             liveness: Arc::new(LivenessTracker::default()),
             requests: Arc::new(RequestLog::default()),
+            summon_saves: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Hold the per-server cap-save lock until the guard is dropped.
+    pub async fn lock_summon_save(&self, server: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let key = music_bot::canon_server_addr(server);
+        let mutex = {
+            let mut map = self
+                .summon_saves
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            map.entry(key)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        mutex.lock_owned().await
     }
 
     /// Test helper — fresh in-memory supervisor + a per-process temp

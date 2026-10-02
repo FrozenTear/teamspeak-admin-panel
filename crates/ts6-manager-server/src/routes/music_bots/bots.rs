@@ -477,7 +477,7 @@ async fn match_addr(state: &AppState, server_addr: &str) -> Result<AddrMatch, Re
 /// nothing about a bot they cannot read — including one whose address
 /// matches no enabled server. A database failure is returned so the
 /// handler can answer 500.
-async fn bot_visibility(
+pub(super) async fn bot_visibility(
     state: &AppState,
     user: &crate::auth::extractors::AuthUser,
     server_addr: &str,

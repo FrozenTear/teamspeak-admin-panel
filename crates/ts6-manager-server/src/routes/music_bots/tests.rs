@@ -2905,3 +2905,131 @@ async fn a_failed_first_store_clears_the_number_the_process_accepted() {
         Some(None)
     );
 }
+
+#[tokio::test]
+async fn caps_the_caller_cannot_see_are_omitted() {
+    let state = fresh_state().await;
+    let server_id = server_connections::list(&state.db).await.unwrap()[0].id;
+    let admin_id = seed_user_role(&state, "admin-caps", "admin").await;
+    let admin_token = mint_token_role(&state, admin_id, "admin-caps", "admin");
+    let mod_id = seed_user_role(&state, "mod-caps", "moderator").await;
+    let mod_token = mint_token_role(&state, mod_id, "mod-caps", "moderator");
+    crate::repos::server_user_grants::insert(&state.db, mod_id, server_id)
+        .await
+        .unwrap();
+    let stranger_id = seed_user_role(&state, "stranger-caps", "moderator").await;
+    let stranger_token = mint_token_role(&state, stranger_id, "stranger-caps", "moderator");
+    crate::repos::music_summon_cap::upsert(&state.db, "127.0.0.1:9987", 1)
+        .await
+        .unwrap();
+    crate::repos::music_summon_cap::upsert(&state.db, "10.255.255.1:9987", 4)
+        .await
+        .unwrap();
+    let app = app(state);
+
+    let admin_caps = get_summon_caps(&app, &admin_token).await;
+    assert_eq!(admin_caps.caps.len(), 2);
+    let mod_caps = get_summon_caps(&app, &mod_token).await;
+    assert_eq!(mod_caps.caps.len(), 1);
+    assert_eq!(mod_caps.caps[0].server_addr, "127.0.0.1:9987");
+    let stranger_caps = get_summon_caps(&app, &stranger_token).await;
+    assert!(
+        stranger_caps.caps.is_empty(),
+        "a moderator with no grant must not see summon caps"
+    );
+}
+
+#[tokio::test]
+async fn deleting_the_last_saved_bot_stops_quiet_clients_and_the_cap_stays_settable() {
+    let (app, token, state) = make_test_app().await;
+    let created = create_test_bot(&app, &token).await;
+    assert_eq!(
+        put_summon_cap(&app, &token, "127.0.0.1:9987", 1)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        state
+            .music_bots
+            .supervisor
+            .local_quiet_count("127.0.0.1:9987"),
+        Some(1)
+    );
+
+    let deleted = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri(format!("/api/music-bots/{}", created.id.0))
+                .header("authorization", auth_header(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        state
+            .music_bots
+            .supervisor
+            .local_quiet_count("127.0.0.1:9987"),
+        Some(0)
+    );
+    assert_eq!(
+        get_summon_caps(&app, &token).await.caps,
+        vec![wire::SummonCap {
+            server_addr: "127.0.0.1:9987".into(),
+            cap: 1,
+        }]
+    );
+
+    assert_eq!(
+        put_summon_cap(&app, &token, "127.0.0.1:9987", 0)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        state
+            .music_bots
+            .supervisor
+            .local_summon_cap("127.0.0.1:9987"),
+        Some(Some(0))
+    );
+    assert_eq!(
+        state
+            .music_bots
+            .supervisor
+            .local_quiet_count("127.0.0.1:9987"),
+        Some(0)
+    );
+}
+
+#[tokio::test]
+async fn two_saves_at_once_leave_the_process_on_the_stored_number() {
+    let (app, token, state) = make_test_app().await;
+    let _bot = create_test_bot(&app, &token).await;
+    let (first, second) = tokio::join!(
+        put_summon_cap(&app, &token, "127.0.0.1:9987", 2),
+        put_summon_cap(&app, &token, "127.0.0.1", 1),
+    );
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(second.status(), StatusCode::OK);
+    let stored = get_summon_caps(&app, &token).await;
+    assert_eq!(stored.caps.len(), 1);
+    let cap = stored.caps[0].cap;
+    assert!(cap == 1 || cap == 2);
+    assert_eq!(
+        state.music_bots.supervisor.local_summon_cap("127.0.0.1"),
+        Some(Some(cap))
+    );
+    assert_eq!(
+        state
+            .music_bots
+            .supervisor
+            .local_quiet_count("127.0.0.1:9987"),
+        Some(cap as usize)
+    );
+}
