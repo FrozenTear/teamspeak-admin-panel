@@ -3411,3 +3411,112 @@ async fn a_failed_process_read_does_not_return_the_forward_error() {
         Some(4)
     );
 }
+
+#[tokio::test]
+async fn a_dropped_handler_reads_until_the_process_read_succeeds() {
+    let (app, token, state) = make_test_app().await;
+    let _bot = create_test_bot(&app, &token).await;
+    let server = "127.0.0.1:9996";
+    assert_eq!(
+        put_summon_cap(&app, &token, server, 1).await.status(),
+        StatusCode::OK
+    );
+    state
+        .music_bots
+        .supervisor
+        .set_summon_cap(server, 4)
+        .await
+        .unwrap();
+    super::summon::arm_process_read_failures(server, 4);
+    let (pause, release) = super::summon::align_pause(server);
+    drop(super::summon::hold_unconfirmed_cap(&state, server, 4).await);
+    pause
+        .await
+        .expect("a dropped save keeps reading under the save lock");
+    assert!(
+        state
+            .music_bots
+            .summon_save_mutex(server)
+            .try_lock()
+            .is_err(),
+        "align keeps the save lock while process reads fail"
+    );
+    assert_eq!(
+        state.music_bots.supervisor.local_summon_cap(server),
+        Some(Some(4)),
+        "a dropped save does not roll the process back while reads fail"
+    );
+    assert_eq!(
+        crate::repos::music_summon_cap::get(&state.db, server)
+            .await
+            .unwrap(),
+        Some(1),
+        "the stored row stays until a process read succeeds"
+    );
+    release
+        .send(())
+        .expect("align is still waiting on the failed process read");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if state
+            .music_bots
+            .summon_save_mutex(server)
+            .try_lock()
+            .is_ok()
+        {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("align did not finish after the process read succeeded");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    super::summon::clear_cap_save_fault(server);
+    assert_eq!(
+        state.music_bots.supervisor.local_summon_cap(server),
+        Some(Some(4))
+    );
+    assert_eq!(
+        crate::repos::music_summon_cap::get(&state.db, server)
+            .await
+            .unwrap(),
+        Some(4)
+    );
+}
+
+#[tokio::test]
+async fn a_dropped_handler_leaves_the_store_when_the_process_is_still_on_the_old_number() {
+    let (app, token, state) = make_test_app().await;
+    let _bot = create_test_bot(&app, &token).await;
+    let server = "127.0.0.1:9997";
+    assert_eq!(
+        put_summon_cap(&app, &token, server, 1).await.status(),
+        StatusCode::OK
+    );
+    drop(super::summon::hold_unconfirmed_cap(&state, server, 4).await);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if state
+            .music_bots
+            .summon_save_mutex(server)
+            .try_lock()
+            .is_ok()
+        {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("align did not finish after reading the old number");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        state.music_bots.supervisor.local_summon_cap(server),
+        Some(Some(1))
+    );
+    assert_eq!(
+        crate::repos::music_summon_cap::get(&state.db, server)
+            .await
+            .unwrap(),
+        Some(1)
+    );
+}

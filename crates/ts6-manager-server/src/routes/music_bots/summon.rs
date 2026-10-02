@@ -79,6 +79,7 @@ async fn set(
         db: state.db.clone(),
         server: server_addr.clone(),
         forwarded: None,
+        pending: Some(req.cap),
         settled: false,
         mutex: Some(mutex),
         guard: Some(guard),
@@ -93,16 +94,19 @@ async fn set(
         );
         if process_already_accepted(&unsettled.front, &server_addr, req.cap).await {
             unsettled.forwarded = Some(req.cap);
-            store_accepted(&unsettled, req.cap).await;
+            unsettled.pending = None;
+            store_accepted(&unsettled.db, &unsettled.server, req.cap).await;
             unsettled.settled = true;
             return Ok(Json(wire::SummonCap {
                 server_addr,
                 cap: req.cap,
             }));
         }
+        unsettled.pending = None;
         unsettled.settled = true;
         return Err(map_music_runtime_error(err));
     }
+    unsettled.pending = None;
     unsettled.forwarded = Some(req.cap);
 
     if let Err(err) = store_cap(&state.db, &server_addr, req.cap).await {
@@ -141,6 +145,7 @@ async fn align_held(unsettled: &mut UnsettledCap) -> AlignOutcome {
         unsettled.db.clone(),
         unsettled.server.clone(),
         unsettled.forwarded,
+        unsettled.pending,
         mutex,
         guard,
     )
@@ -185,6 +190,11 @@ async fn forward_cap(
 /// the old number, so it is retried until a read succeeds. `true` when
 /// that read shows `requested`. Any other successful read is `false`.
 async fn process_already_accepted(front: &MusicBotFront, server: &str, requested: u32) -> bool {
+    read_process_until_success(front, server).await == Some(requested)
+}
+
+/// The cap the process holds, once a read succeeds. Failed reads wait.
+async fn read_process_until_success(front: &MusicBotFront, server: &str) -> Option<u32> {
     let mut wait = Duration::from_millis(20);
     loop {
         #[cfg(test)]
@@ -198,8 +208,7 @@ async fn process_already_accepted(front: &MusicBotFront, server: &str, requested
             continue;
         }
         match front.read_summon_cap(server).await {
-            Ok(Some(cap)) if cap == requested => return true,
-            Ok(_) => return false,
+            Ok(cap) => return cap,
             Err(err) => {
                 warn!(
                     server = %server,
@@ -216,26 +225,26 @@ async fn process_already_accepted(front: &MusicBotFront, server: &str, requested
 /// Write `cap` while the save lock is still held. Returns only when the
 /// store shows that number. The process is already on it, so this does
 /// not put the process back on the old number.
-async fn store_accepted(unsettled: &UnsettledCap, cap: u32) {
+async fn store_accepted(db: &Database, server: &str, cap: u32) {
     let mut wait = Duration::from_millis(50);
     loop {
-        match store_cap(&unsettled.db, &unsettled.server, cap).await {
+        match store_cap(db, server, cap).await {
             Ok(()) => return,
             Err(err) => {
                 error!(
-                    server = %unsettled.server,
+                    server = %server,
                     cap,
                     error = %err,
                     "summon cap the process accepted was not stored"
                 );
             }
         }
-        match read_cap_retry(&unsettled.db, &unsettled.server).await {
+        match read_cap_retry(db, server).await {
             Ok(Some(stored)) if stored == cap => return,
             Ok(_) => {}
             Err(err) => {
                 error!(
-                    server = %unsettled.server,
+                    server = %server,
                     error = %err,
                     "summon cap re-read failed; the captured number is not restored"
                 );
@@ -272,15 +281,20 @@ async fn restore_with_retry(
     Err(last.expect("restore retried"))
 }
 
-/// If this save is dropped after the forward and before it settles,
-/// put the process and the store on the same number. The restore runs
-/// while the per-server lock is still held.
+/// If this save is dropped before it settles, keep the per-server lock
+/// and put the process and the store on the same number. Dropping the
+/// handler is not a reject: `pending` is the number this save may already
+/// have handed to the process.
 pub(super) struct UnsettledCap {
     front: MusicBotFront,
     db: std::sync::Arc<Database>,
     server: String,
-    /// Set only after the music process accepted this save's number.
+    /// Set only after a forward returned success, or a process read
+    /// showed this number. The catch-up write uses it.
     forwarded: Option<u32>,
+    /// The number still being confirmed. Set before the forward, and
+    /// cleared once a process read succeeds. A drop keeps it.
+    pending: Option<u32>,
     settled: bool,
     mutex: Option<std::sync::Arc<tokio::sync::Mutex<()>>>,
     guard: Option<tokio::sync::OwnedMutexGuard<()>>,
@@ -299,17 +313,18 @@ impl Drop for UnsettledCap {
         let db = self.db.clone();
         let server = std::mem::take(&mut self.server);
         let forwarded = self.forwarded;
+        let pending = self.pending;
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                align_cap(front, db, server, forwarded, mutex, guard).await;
+                align_cap(front, db, server, forwarded, pending, mutex, guard).await;
             });
         }
     }
 }
 
-/// The process and the store after align. `Restored` means the process
-/// was put on the stored number. `CaughtUp` means that restore failed and
-/// the forwarded number was written, so both sides are that number.
+/// The process and the store after align. `Restored` means both sides
+/// already showed the stored number, or the process was put back on it.
+/// `CaughtUp` means the store was written to the number the process holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum AlignOutcome {
     Restored(Option<u32>),
@@ -325,6 +340,7 @@ async fn align_cap(
     db: std::sync::Arc<Database>,
     server: String,
     forwarded: Option<u32>,
+    pending: Option<u32>,
     mutex: std::sync::Arc<tokio::sync::Mutex<()>>,
     guard: Option<tokio::sync::OwnedMutexGuard<()>>,
 ) -> AlignOutcome {
@@ -332,6 +348,9 @@ async fn align_cap(
         Some(held) => held,
         None => mutex.lock_owned().await,
     };
+    if let Some(live) = pending {
+        return confirm_pending(&front, &db, &server, live).await;
+    }
     let mut wait = Duration::from_millis(50);
     let mut unaccepted = 0u32;
     loop {
@@ -393,6 +412,44 @@ async fn align_cap(
     }
 }
 
+/// A dropped save still has `live` in flight. Read the process until a
+/// read succeeds. The new number is written. Any other number leaves the
+/// stored row unchanged. This does not return while the two differ, and
+/// it does not stop after a run of failed reads.
+async fn confirm_pending(
+    front: &MusicBotFront,
+    db: &Database,
+    server: &str,
+    live: u32,
+) -> AlignOutcome {
+    let mut wait = Duration::from_millis(50);
+    loop {
+        let seen = read_process_until_success(front, server).await;
+        if seen == Some(live) {
+            store_accepted(db, server, live).await;
+            return AlignOutcome::CaughtUp(live);
+        }
+        match read_cap_retry(db, server).await {
+            Ok(stored) if stored == seen => return AlignOutcome::Restored(stored),
+            Ok(_) => {
+                warn!(
+                    server = %server,
+                    "summon cap process and store differ; reading again under the save lock"
+                );
+            }
+            Err(err) => {
+                error!(
+                    server = %server,
+                    error = %err,
+                    "summon cap re-read failed; the captured number is not restored"
+                );
+            }
+        }
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(Duration::from_millis(200));
+    }
+}
+
 async fn store_cap(db: &Database, server: &str, cap: u32) -> Result<(), anyhow::Error> {
     #[cfg(test)]
     if save_fault::fail_upsert(server) {
@@ -435,6 +492,7 @@ pub(super) async fn hold_forwarded_cap(state: &AppState, server: &str, cap: u32)
         db: state.db.clone(),
         server: server.to_string(),
         forwarded: Some(cap),
+        pending: None,
         settled: false,
         mutex: Some(mutex),
         guard: Some(guard),
@@ -457,10 +515,30 @@ pub(super) async fn align_cap_for_test(
         state.db.clone(),
         server.to_string(),
         forwarded,
+        None,
         mutex,
         Some(guard),
     )
     .await
+}
+
+/// A save dropped before a process read succeeds. `cap` is the number
+/// the forward may already have handed over. The process is not changed
+/// here. Dropping the returned guard confirms it by reading.
+#[cfg(test)]
+pub(super) async fn hold_unconfirmed_cap(state: &AppState, server: &str, cap: u32) -> UnsettledCap {
+    let mutex = state.music_bots.summon_save_mutex(server);
+    let guard = mutex.clone().lock_owned().await;
+    UnsettledCap {
+        front: state.music_bots.supervisor.clone(),
+        db: state.db.clone(),
+        server: server.to_string(),
+        forwarded: None,
+        pending: Some(cap),
+        settled: false,
+        mutex: Some(mutex),
+        guard: Some(guard),
+    }
 }
 
 /// Cap to carry on a saved-bot push. A lookup error is `None`: the push
