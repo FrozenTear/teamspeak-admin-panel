@@ -1,11 +1,13 @@
 # Phase 6 readiness audit (WS-0)
 
-- **Status:** Drafted by CTO under [PURA-156](/PURA/issues/PURA-156).
-- **Date:** 2026-05-14.
+- **Status:** Drafted by CTO under [PURA-156](/PURA/issues/PURA-156). R6 / [PURA-150](/PURA/issues/PURA-150) rows refreshed 2026-09-04 after [PURA-172](/PURA/issues/PURA-172) and the SSRF audit behind GitHub [PR #8](https://github.com/FrozenTear/teamspeak-admin-panel/pull/8).
+- **Date:** 2026-05-14 (original WS-0 audit). R6 refresh: 2026-09-04.
 - **Scope of gate:** v1.0 release. Phase 6 epic — [PURA-155](/PURA/issues/PURA-155).
 - **Base commit surveyed:** `885f3f3` (PURA-154 music-bot-audio wire), `main`. The wake payload for [PURA-156](/PURA/issues/PURA-156) named `46e7e3c` as the "last green commit on `main`"; that commit was actually the WS-3 IP-pin revert ([PURA-149](/PURA/issues/PURA-149)). Phase 5 was merged in `c56f84c` ([PURA-152](/PURA/issues/PURA-152)) and the Phase 4 carry-over [PURA-154](/PURA/issues/PURA-154) landed on top in `885f3f3`. Audit is taken against `885f3f3` because that is where Chapter 1 verification 5 (music bot streams audible audio) first becomes potentially live.
 
 This document is the gate output for WS-0. It is documentation + inventory only — no new code is in scope under this audit. Child workstreams (WS-OPS-\*, WS-Security, WS-Perf, WS-Runbook, WS-Gate) are filed on [PURA-155](/PURA/issues/PURA-155) after this audit lands so they reflect *actual* state, not the wake-payload sketch.
+
+> **Scope update (2026-09-04):** [PURA-172](/PURA/issues/PURA-172) shipped the Host-preserving IP-pin loopback proxy in `crates/ts6-media-sidecar/src/http_pin.rs`. Plaintext HTTP `POST /source` initial GET is closed when `resolved_ip` is present. The original audit described that pin as [PURA-150](/PURA/issues/PURA-150) `backlog`; that description now belongs to shipped PURA-172. PURA-150 is re-scoped to R6 residuals: F2 (FFmpeg follows 3xx on HTTPS / unpinned HTTP — the pin proxy refuses redirects; FFmpeg does not), F3 (HLS/DASH secondary absolute segment URLs bypass the pin; only the first `-i` is proxied), F4 (HTTP with `resolved_ip = None` / spec §9.3 NXDOMAIN skips the pin — a product call, not a silent fail-closed). Separate in-flight PR [#8](https://github.com/FrozenTear/teamspeak-admin-panel/pull/8) blocks IPv6 unspecified `::` and trailing-dot metadata hosts in `ts6-ssrf`; that fix is not duplicated here.
 
 ---
 
@@ -44,7 +46,7 @@ The seven verifications are quoted from `study-documents/ts6-manager-spec.md` §
 |---|---|---|---|
 | **Signaling / TS6 manager** | REST surface (auth, servers, channels, clients, server-groups, channel-groups, permissions, bans, tokens, complaints, messages, server-logs, files, instance-settings, virtual-servers), WS hub with metrics ([PURA-82](/PURA/issues/PURA-82)), SSH event bridge ([PURA-80](/PURA/issues/PURA-80)), WebQuery client. | None functionally; release packaging only. | `crates/ts6-manager-server/src/{auth,routes,sshbridge,webquery,ws}/`. |
 | **Voice path (Opus, SRT, sidecar)** | TS6 voice handshake against `teamspeak6-server:6.0.0-beta9` fixture (Phase 4 epic); Opus encode pipeline (`crates/music-bot-audio/src/encoder.rs`, `pacer.rs`); music-bot → `bot.send_audio` wire ([PURA-154](/PURA/issues/PURA-154)); LiveKit↔TS6 translator binary at `crates/ts6-voice-translator/`. | No audible-in-real-client smoke since the [PURA-154](/PURA/issues/PURA-154) wire; voice latency budget (`docs/voice/0001-latency-budget.md`) is targets, not measurements. Note: "SRT" in the wake checklist is a mis-spec — the voice path uses Opus over RTP into the TS6 handshake, not SRT. Audited as Opus + RTP. |
-| **WS-3 outbound HTTP pin status** | `crates/ts6-ssrf` (IP normalization, blocklist, async DNS resolver); sidecar `GaiResolver` (`crates/ts6-media-sidecar/src/ssrf_resolver.rs`); URL→host validation runs *before* FFmpeg spawn ([PURA-141](/PURA/issues/PURA-141)); URL→IP-literal rewrite was correctly reverted in [PURA-149](/PURA/issues/PURA-149) (TLS SNI / virtual-hosted CDNs would break). | **R6 still open.** FFmpeg itself performs the outbound DNS at fetch time, so the resolved IP we validated and the IP FFmpeg actually connects to can diverge (DNS rebinding window). [PURA-150](/PURA/issues/PURA-150) is the planned Rust-side reqwest proxy that preserves `Host:` while pinning the socket address. Currently `backlog`. |
+| **WS-3 outbound HTTP pin status** | `crates/ts6-ssrf` (IP normalization, blocklist, async DNS resolver); sidecar `GaiResolver` (`crates/ts6-media-sidecar/src/ssrf_resolver.rs`); URL→host validation runs *before* FFmpeg spawn ([PURA-141](/PURA/issues/PURA-141)); URL→IP-literal rewrite was correctly reverted in [PURA-149](/PURA/issues/PURA-149) (TLS SNI / virtual-hosted CDNs would break). **v1 pin shipped** ([PURA-172](/PURA/issues/PURA-172)): Host-preserving IP-pin loopback proxy in `crates/ts6-media-sidecar/src/http_pin.rs` — plaintext HTTP `POST /source` initial GET is closed when `resolved_ip` is present (`resolve_to_addrs` pins the socket, `Host:` is preserved, 3xx → 502, token burned on `POST /source/stop`). HTTPS initial fetch is unchanged (TLS SAN / `-tls_verify 1`). | **R6 residual is [PURA-150](/PURA/issues/PURA-150), not the pin itself.** F2: FFmpeg follows 3xx on HTTPS / unpinned HTTP (the pin proxy refuses redirects; FFmpeg does not). F3: HLS/DASH secondary absolute segment URLs bypass the pin (only the first `-i` is proxied). F4: HTTP with `resolved_ip = None` (spec §9.3 NXDOMAIN) skips the pin — product call, not a silent fail-closed. In-flight PR [#8](https://github.com/FrozenTear/teamspeak-admin-panel/pull/8) blocks IPv6 unspecified `::` and trailing-dot metadata hosts in `ts6-ssrf`; do not duplicate that fix here. |
 | **Rootless podman story** | `Containerfile.fullstack` builds and runs; `podman-compose.yml` boots end-to-end with **named volumes** workaround ([PURA-67](/PURA/issues/PURA-67) deviation), confirmed in `study-documents/ts6-manager-impl-plan.md` §9 callout; `docs/ts6-fixture.md` documents the required `--network=host` for the upstream TS6 fixture. | **OPS deliverables almost entirely missing.** No `deploy/quadlet/*.container`, no `deploy/quadlet/ts6-manager.pod`, no `deploy/kube/ts6-manager.yaml`, no `Containerfile.sidecar` (sidecar still built from source via cargo), no `bin/` for pre-built sidecar binaries, no CI image push to GHCR, no `LICENSE` file (OD7 unenforced), no `.github/workflows/` (OD2 unenforced). The "self-host in <10 minutes from public images" wedge is unsupported today. |
 | **Auth — refresh-token reuse detection (R5)** | Full spec §6.5 + §6.6 behaviour in `crates/ts6-manager-server/src/auth/refresh.rs`: family ids, predecessor-preserved reuse check, family-wide revocation on reuse, cross-user isolation. Unit tests cover the canonical reuse, cross-family non-revocation, and revoked-family rejection paths. | No fuzz / property-test harness on token format, family id collisions, or concurrent rotation. Treat as **R5 = covered for the spec contract**; recommend a short fuzz pass in WS-Security as defence-in-depth, not a blocker. |
 | **SurrealDB error boundaries (R8 / D8)** | D8 deviation captured in `crates/ts6-manager-server/src/db/mod.rs` and `config.rs:10`; the spec's SQLite-full / `SQLITE_FULL` / sqlx boundaries are remapped onto SurrealKV embedded backend. Migrations runner is in place ([PURA-133](/PURA/issues/PURA-133)). | **No explicit three-state mapping in code.** Impl-plan calls for **write-failure / transaction-conflict / capacity-pressure** boundaries with error-injection tests against SurrealDB error variants. Today the DB layer returns `anyhow::Result` and bubbles SurrealDB errors raw; no boundary detection in repos. This is the dominant R8 carry-over for v1.0. |
@@ -84,9 +86,9 @@ The seven verifications are quoted from `study-documents/ts6-manager-spec.md` §
 | R3 | iOS / Safari lacks WebTransport | Documented exclusion; Helium 148 (Chromium) is the supported viewer | Same | Unchanged. |
 | R4 | Dioxus flow-canvas | FE-EDITOR shipped through Phase 3 | Same; no regression observed | Unchanged. |
 | R5 | Refresh-token reuse-detection bug | Implementation + unit tests landed Phase 1 | Same; no fuzz harness | **R5 = covered, with a fuzz-pass nice-to-have.** Recommend dropping to R5-low. |
-| R6 | SSRF blocklist gaps (DNS rebinding, IPv6 link-local, octal private) | `ts6-ssrf` crate + sidecar resolver shipped Phase 5 | **Still open at the FFmpeg fetch boundary** — [PURA-150](/PURA/issues/PURA-150) Rust-side reqwest pin is `backlog` | **R6 = still high.** Recommend bumping to **escalate to CEO** if WS-Security can't land [PURA-150](/PURA/issues/PURA-150) before the gate; this is the most operator-visible attack surface in v1.0. |
+| R6 | SSRF blocklist gaps (DNS rebinding, IPv6 link-local, octal private) | `ts6-ssrf` crate + sidecar resolver shipped Phase 5 | **v1 pin shipped** ([PURA-172](/PURA/issues/PURA-172) Host-preserving IP-pin loopback proxy). Remaining residual is [PURA-150](/PURA/issues/PURA-150): F2 (FFmpeg follows 3xx on HTTPS / unpinned HTTP), F3 (HLS/DASH secondary absolute URLs bypass the pin), F4 (§9.3 NXDOMAIN skips the pin — product call, not fail-closed). IPv6 unspecified `::` + trailing-dot metadata hosts are in-flight on PR [#8](https://github.com/FrozenTear/teamspeak-admin-panel/pull/8). | **R6 = reduced.** Initial-GET rebinding window is closed for pinned plaintext HTTP. Residual is PURA-150 (redirects / secondary fetches / §9.3), not "land the pin proxy". No longer escalate-to-CEO on the pin itself. |
 | R7 | ServerQuery escaper bug | Escape table + unit tests landed Phase 1 | Same; no fuzz / roundtrip property test | R7 partially covered. Recommend a one-day fuzz pass under WS-Security. |
-| R8 | SurrealDB storage-full / boundary surface | D8 deviation ratified; SurrealKV embedded backend | **Three boundaries (write-failure / transaction-conflict / capacity-pressure) not mapped in code; no error-injection tests** | **R8 = unchanged from end of Phase 1.** This is the second-most-load-bearing security gap behind R6. Recommend dedicated workstream slice. |
+| R8 | SurrealDB storage-full / boundary surface | D8 deviation ratified; SurrealKV embedded backend | **Three boundaries (write-failure / transaction-conflict / capacity-pressure) not mapped in code; no error-injection tests** | **R8 = unchanged from end of Phase 1.** With the v1 R6 pin shipped, this is now the most load-bearing unmapped-in-code security gap. Recommend dedicated workstream slice. |
 | R9 | Synthetic SSH events drift | Phase 2 epic close-out | Same; no new spec deltas | Unchanged. |
 | R10 | Dioxus WS scalability ceiling | Raw axum WS hub used per impl-plan; not hit | Same | Unchanged. |
 
@@ -95,13 +97,13 @@ The seven verifications are quoted from `study-documents/ts6-manager-spec.md` §
 - **R11 — OPS deliverable cliff.** The Phase 6 `deploy/quadlet/`, `deploy/kube/`, `Containerfile.sidecar`, `bin/`, CI workflow, and `LICENSE` are all unstarted. Likelihood: certain. Impact: high (no path to "self-host in <10 minutes from public images"). Owner: WS-OPS-\* under IC.
 - **R12 — Gate-run-against-release-image not exercised.** All Chapter 1 verifications have been run against the dev fixture, never against a release-tagged OCI image on a fresh host. Likelihood: certain. Impact: medium (likely surfaces hidden assumptions on `MUSIC_DIR`, `YT_COOKIE_FILE`, `ENCRYPTION_KEY` fallback, asset-bundle paths). Owner: WS-Gate.
 
-**Escalate to CEO:** R6 (SSRF DNS-rebinding window via FFmpeg fetch) is the highest residual security risk for v1.0. Recommend the CEO/board confirm we **do not ship v1.0** without [PURA-150](/PURA/issues/PURA-150) closed.
+**Escalate to CEO:** The v1 pin ([PURA-172](/PURA/issues/PURA-172)) has landed — the original "do not ship v1.0 without the reqwest pin" ask is closed. Remaining R6 residual is [PURA-150](/PURA/issues/PURA-150) (F2 redirects / F3 secondary fetches / F4 §9.3). That is residual surface, not an unbuilt scaffold; treat as follow-up, not a new escalate-to-CEO on the pin itself. R8 (SurrealDB three-boundary mapping) remains the highest unmapped-in-code security gap.
 
 ---
 
 ## 5. Recommended sequencing
 
-The impl-plan's [PURA-155](/PURA/issues/PURA-155) sequencing diagram routes everything through "IC onboards → WS-OPS-\* (parallel) | WS-Security (parallel) | WS-Perf | WS-Runbook | WS-Gate". The audit surfaces a different critical path: **R6 + R8 are the security blockers that must close before the gate, not in parallel with it**, and **OPS-Images / CI-LICENSE are themselves blockers for the gate** because there is no release artefact to gate against until then. The revised order is:
+The impl-plan's [PURA-155](/PURA/issues/PURA-155) sequencing diagram routes everything through "IC onboards → WS-OPS-\* (parallel) | WS-Security (parallel) | WS-Perf | WS-Runbook | WS-Gate". The original audit surfaced a different critical path: **R6 + R8 as security blockers that must close before the gate, not in parallel with it**, plus **OPS-Images / CI-LICENSE as blockers for the gate** because there is no release artefact to gate against until then. **Refresh (2026-09-04):** the v1 R6 pin shipped as [PURA-172](/PURA/issues/PURA-172); remaining R6 residual is [PURA-150](/PURA/issues/PURA-150) (redirects / secondary fetches / §9.3) and no longer means "land the pin". **R8 remains the security blocker that must close before the gate.** The revised order is:
 
 ```
 [WS-0 audit] ────> [WS-Hire] ──> IC onboards
@@ -117,9 +119,6 @@ The impl-plan's [PURA-155](/PURA/issues/PURA-155) sequencing diagram routes ever
         │  WS-OPS-Kube     ┘                                      │
         │            │                                            │
         │            ▼                                            │
-        │  WS-Security-R6 (PURA-150 Rust-side reqwest pin)        │
-        │            │                                            │
-        │            ▼                                            │
         │  WS-Security-R8 (SurrealDB three-boundary mapping       │
         │                  + error-injection tests)               │
         │            │                                            │
@@ -132,6 +131,8 @@ The impl-plan's [PURA-155](/PURA/issues/PURA-155) sequencing diagram routes ever
         ┌─────────────────────────────────────────────────────────┐
         │ Parallel tracks (gate-supporting, not gate-blocking)    │
         │ ─────────────────────────────────                       │
+        │  WS-Security-R6 residual (PURA-150: redirects /         │
+        │     secondary fetches / §9.3; v1 pin = PURA-172)        │
         │  WS-Security-R7 (ServerQuery escaper fuzz)              │
         │  WS-Security-R5 (refresh-token fuzz; nice-to-have)      │
         │  WS-Perf (sidecar latency + sustained-load smoke)       │
@@ -145,17 +146,17 @@ The impl-plan's [PURA-155](/PURA/issues/PURA-155) sequencing diagram routes ever
 
 **Why this differs from impl-plan §5 / [PURA-155](/PURA/issues/PURA-155) sequencing:**
 
-1. The original sequencing parallelises WS-OPS-\* with WS-Security with WS-Perf. The audit shows R6 has no scaffold yet ([PURA-150](/PURA/issues/PURA-150) backlog) and R8 has *no* boundary mapping in code — these are not "polish" items. They must close before the gate.
+1. The original sequencing parallelises WS-OPS-\* with WS-Security with WS-Perf. The original audit showed R6 had no scaffold yet ([PURA-150](/PURA/issues/PURA-150) was then the pin, `backlog`) and R8 has *no* boundary mapping in code — these were not "polish" items. **v1 pin shipped** as [PURA-172](/PURA/issues/PURA-172); remaining R6 residual is [PURA-150](/PURA/issues/PURA-150) (redirects / secondary fetches / §9.3). R8 is still unmapped in code and still must close before the gate. The pin-build itself no longer blocks the gate.
 2. WS-Gate cannot start without a release-tagged OCI image to deploy. WS-OPS-CI-LICENSE → WS-OPS-Quadlet/Kube → WS-OPS-Sidecar-Image is therefore a hard prerequisite of WS-Gate.
 3. WS-Perf and WS-Runbook do not block the gate; they support it. Run in parallel.
-4. WS-Security-R7 (ServerQuery escaper fuzz) and WS-Security-R5 (refresh-token fuzz) are defence-in-depth on already-covered risks. Run in parallel; do not block the gate.
+4. WS-Security-R7 (ServerQuery escaper fuzz) and WS-Security-R5 (refresh-token fuzz) are defence-in-depth on already-covered risks. WS-Security-R6 residual ([PURA-150](/PURA/issues/PURA-150)) is the same class after the v1 pin shipped — residual surface, not an unbuilt scaffold. Run in parallel; do not block the gate on "land the pin".
 
 **Estimate vs. impl-plan §5 "3–4 weeks":**
 
 - WS-Hire: 3–5 days to draft role spec, route hire approval, onboard.
 - WS-OPS-CI-LICENSE: 1–2 days (mechanical, the IC's onboarding PR).
 - WS-OPS-Quadlet/Kube/Sidecar-Image: 3–5 days (mechanical but needs a real rootless host).
-- WS-Security-R6 ([PURA-150](/PURA/issues/PURA-150)): 3–5 days (Rust-side reqwest proxy that preserves `Host:` while pinning the socket address — non-trivial because `reqwest` does not expose a connect-to-IP-but-send-this-`Host` knob directly; either patch `hyper` resolver or build a custom `Connector`).
+- WS-Security-R6 ([PURA-150](/PURA/issues/PURA-150)): residual only — F2 (per-hop re-validation so FFmpeg 3xx on HTTPS / unpinned HTTP cannot walk off the pin), F3 (HLS/DASH secondary absolute segment URLs; only the first `-i` is proxied), F4 (§9.3 NXDOMAIN pin-skip is a product call, not fail-closed). The v1 Host-preserving pin itself shipped as [PURA-172](/PURA/issues/PURA-172); the original 3–5 day "build a custom Connector" estimate applied to that pin and is closed.
 - WS-Security-R8: 2–3 days (boundary detection on `surrealdb::Error` variants + error-injection tests).
 - WS-Gate: 1–2 days, contingent on a real rootless Podman host (CEO's `scuffedcrew.no` candidate — see [PURA-8](/PURA/issues/PURA-8) OD3) or a fresh CI runner.
 
@@ -172,13 +173,13 @@ These are the child issues WS-0 expects to file on [PURA-155](/PURA/issues/PURA-
 3. **WS-OPS-Quadlet** — `deploy/quadlet/*.container` + `deploy/quadlet/ts6-manager.pod`, rootless smoke test.
 4. **WS-OPS-Kube** — `deploy/kube/ts6-manager.yaml`, `podman kube play` smoke.
 5. **WS-OPS-Sidecar-Bin-Release** — pre-built sidecar binaries as release artefacts, `SIDECAR_BINARY_PATH` documented.
-6. **WS-Security-R6** — close [PURA-150](/PURA/issues/PURA-150) (Rust-side reqwest proxy with Host-preserving IP pin). **Block WS-Gate on this.**
+6. **WS-Security-R6 residual** — close [PURA-150](/PURA/issues/PURA-150) residuals: F2 (FFmpeg follows 3xx on HTTPS / unpinned HTTP; the pin proxy refuses redirects), F3 (HLS/DASH secondary absolute URLs bypass the pin), F4 (HTTP `resolved_ip = None` / §9.3 NXDOMAIN skips the pin — product call). The v1 Host-preserving pin shipped as [PURA-172](/PURA/issues/PURA-172) and no longer blocks WS-Gate.
 7. **WS-Security-R8** — SurrealDB three-boundary mapping (write-failure / transaction-conflict / capacity-pressure) + error-injection tests.
 8. **WS-Security-R7** — ServerQuery escaper fuzz harness + roundtrip property test (parallel, non-blocking).
 9. **WS-Security-R5-defense** — refresh-token reuse-detection fuzz pass (parallel, non-blocking, nice-to-have).
 10. **WS-Perf** — sidecar latency + sustained-load smoke against fixture, parameter sweep for `SYNC_PLAYOUT_BUFFER_MS` / `AUDIO_DELAY_MS`.
 11. **WS-Runbook** — `docs/runbook/` (operator install in <10 min, troubleshooting, common failures from [PURA-67](/PURA/issues/PURA-67) / [PURA-93](/PURA/issues/PURA-93) / [PURA-75](/PURA/issues/PURA-75) post-mortems).
-12. **WS-Gate** — run the **six remaining Chapter 1 verifications** (V1, V2, V3, V4, V5, V7) against a fresh rootless Podman deploy of the v1.0 OCI image, on a real host. Tag v1.0 on green. Blocked by WS-OPS-\* and WS-Security-R6 + R8. V6 (flow trigger) is **cut from the v1.0 gate** per [PURA-195](/PURA/issues/PURA-195); flow engine ships in v1.1.
+12. **WS-Gate** — run the **six remaining Chapter 1 verifications** (V1, V2, V3, V4, V5, V7) against a fresh rootless Podman deploy of the v1.0 OCI image, on a real host. Tag v1.0 on green. Blocked by WS-OPS-\* and WS-Security-R8. v1 R6 pin ([PURA-172](/PURA/issues/PURA-172)) shipped; residual R6 ([PURA-150](/PURA/issues/PURA-150)) is redirects / secondary fetches / §9.3, not "land the pin". V6 (flow trigger) is **cut from the v1.0 gate** per [PURA-195](/PURA/issues/PURA-195); flow engine ships in v1.1.
 13. **Close-out** of [PURA-81](/PURA/issues/PURA-81) and [PURA-8](/PURA/issues/PURA-8) under WS-Runbook + WS-OPS-CI-LICENSE respectively.
 
 ---
