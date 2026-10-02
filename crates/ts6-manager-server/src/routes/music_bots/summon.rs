@@ -181,15 +181,25 @@ async fn forward_cap(
     result
 }
 
-/// Read the process under the caller's save lock. `true` when one of
-/// those reads shows `requested`, which means the forward was accepted
-/// even though it returned an error.
+/// Read the process under the caller's save lock. A failed read is not
+/// the old number, so it is retried until a read succeeds. `true` when
+/// that read shows `requested`. Any other successful read is `false`.
 async fn process_already_accepted(front: &MusicBotFront, server: &str, requested: u32) -> bool {
     let mut wait = Duration::from_millis(20);
-    for attempt in 0..UNACCEPTED_ALIGN_TRIES {
+    loop {
+        #[cfg(test)]
+        if save_fault::fail_process_read(server) {
+            warn!(server = %server, "summon cap process read failed");
+            if let Some(release) = save_fault::note_pause(server) {
+                let _ = release.await;
+            }
+            tokio::time::sleep(wait).await;
+            wait = (wait * 2).min(Duration::from_millis(200));
+            continue;
+        }
         match front.read_summon_cap(server).await {
             Ok(Some(cap)) if cap == requested => return true,
-            Ok(_) => {}
+            Ok(_) => return false,
             Err(err) => {
                 warn!(
                     server = %server,
@@ -198,12 +208,9 @@ async fn process_already_accepted(front: &MusicBotFront, server: &str, requested
                 );
             }
         }
-        if attempt + 1 < UNACCEPTED_ALIGN_TRIES {
-            tokio::time::sleep(wait).await;
-            wait = (wait * 2).min(Duration::from_millis(200));
-        }
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(Duration::from_millis(200));
     }
-    false
 }
 
 /// Write `cap` while the save lock is still held. Returns only when the
@@ -309,9 +316,8 @@ pub(super) enum AlignOutcome {
     CaughtUp(u32),
 }
 
-/// Process reads after a forward error. The lock is held the whole time.
-/// A read that shows the new number stops early. Three reads that do not
-/// are the process still on the old number, or a read that never landed.
+/// Restores to attempt when a dropped save never recorded an accepted
+/// number. The lock is held the whole time.
 const UNACCEPTED_ALIGN_TRIES: u32 = 3;
 
 async fn align_cap(
@@ -509,6 +515,12 @@ pub(super) fn arm_forward_error_before_accept(server: &str) {
     save_fault::arm_forward_error_before_accept(server);
 }
 
+/// The next `reads` process reads for `server` fail. Later reads run.
+#[cfg(test)]
+pub(super) fn arm_process_read_failures(server: &str, reads: u32) {
+    save_fault::arm_process_read_failures(server, reads);
+}
+
 #[cfg(test)]
 mod save_fault {
     use std::collections::HashMap;
@@ -519,6 +531,7 @@ mod save_fault {
         restores_left: u32,
         forward_error_after_accept: bool,
         forward_error_before_accept: bool,
+        process_reads_left: u32,
         paused: Option<tokio::sync::oneshot::Sender<()>>,
         release: Option<tokio::sync::oneshot::Receiver<()>>,
     }
@@ -530,6 +543,7 @@ mod save_fault {
                 restores_left: 0,
                 forward_error_after_accept: false,
                 forward_error_before_accept: false,
+                process_reads_left: 0,
                 paused: None,
                 release: None,
             }
@@ -614,6 +628,27 @@ mod save_fault {
         map.entry(key)
             .or_insert_with(Fault::empty)
             .forward_error_after_accept = true;
+    }
+
+    pub(super) fn arm_process_read_failures(server: &str, reads: u32) {
+        let key = music_bot::canon_server_addr(server);
+        let mut map = table().lock().unwrap_or_else(|err| err.into_inner());
+        map.entry(key)
+            .or_insert_with(Fault::empty)
+            .process_reads_left = reads;
+    }
+
+    pub(super) fn fail_process_read(server: &str) -> bool {
+        let key = music_bot::canon_server_addr(server);
+        let mut map = table().lock().unwrap_or_else(|err| err.into_inner());
+        let Some(fault) = map.get_mut(&key) else {
+            return false;
+        };
+        if fault.process_reads_left == 0 {
+            return false;
+        }
+        fault.process_reads_left -= 1;
+        true
     }
 
     pub(super) fn arm_forward_error_before_accept(server: &str) {

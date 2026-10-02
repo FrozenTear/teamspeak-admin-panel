@@ -2435,7 +2435,7 @@ async fn get_summon_caps(app: &Router, token: &str) -> wire::SummonCapList {
 }
 
 #[tokio::test]
-async fn summon_cap_is_empty_until_stored_and_a_failed_forward_keeps_the_old_number() {
+async fn summon_cap_is_empty_until_stored() {
     let (app, token, state) = make_test_app().await;
     let listed = get_summon_caps(&app, &token).await;
     assert!(
@@ -2472,30 +2472,6 @@ async fn summon_cap_is_empty_until_stored_and_a_failed_forward_keeps_the_old_num
     assert_eq!(too_big.status(), StatusCode::BAD_REQUEST);
     let empty = put_summon_cap(&app, &token, "   ", 3).await;
     assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
-
-    let mut broken = state.clone();
-    broken.music_bots = MusicBotService::remote(
-        std::env::temp_dir().join("ts6-test-summon-cap-forward-down"),
-        "http://127.0.0.1:1",
-        None,
-    );
-    let failed = put_summon_cap(
-        &Router::new().merge(super::router()).with_state(broken),
-        &token,
-        "127.0.0.1:9987",
-        4,
-    )
-    .await;
-    assert_eq!(failed.status(), StatusCode::BAD_GATEWAY);
-    let listed = get_summon_caps(&app, &token).await;
-    assert_eq!(
-        listed
-            .caps
-            .iter()
-            .find(|cap| cap.server_addr == "127.0.0.1:9987")
-            .map(|cap| cap.cap),
-        Some(1)
-    );
     assert_eq!(
         crate::repos::music_summon_cap::get(&state.db, "127.0.0.1:9987")
             .await
@@ -3372,5 +3348,66 @@ async fn a_forward_error_leaves_the_store_when_the_process_is_still_on_the_old_n
             .await
             .unwrap(),
         Some(1)
+    );
+}
+
+#[tokio::test]
+async fn a_failed_process_read_does_not_return_the_forward_error() {
+    let (app, token, state) = make_test_app().await;
+    let _bot = create_test_bot(&app, &token).await;
+    let server = "127.0.0.1:9995";
+    assert_eq!(
+        put_summon_cap(&app, &token, server, 1).await.status(),
+        StatusCode::OK
+    );
+    super::summon::arm_forward_error_after_accept(server);
+    super::summon::arm_process_read_failures(server, 1);
+    let (pause, release) = super::summon::align_pause(server);
+    let app2 = app.clone();
+    let token2 = token.clone();
+    let put =
+        tokio::spawn(async move { put_summon_cap(&app2, &token2, "127.0.0.1:9995", 4).await });
+    pause
+        .await
+        .expect("a failed process read waits under the save lock");
+    assert!(
+        state
+            .music_bots
+            .summon_save_mutex(server)
+            .try_lock()
+            .is_err(),
+        "the save lock stays held while the process read is retried"
+    );
+    assert!(
+        !put.is_finished(),
+        "a failed process read must not return the forward error"
+    );
+    assert_eq!(
+        state.music_bots.supervisor.local_summon_cap(server),
+        Some(Some(4))
+    );
+    assert_eq!(
+        crate::repos::music_summon_cap::get(&state.db, server)
+            .await
+            .unwrap(),
+        Some(1),
+        "the stored row stays on the previous save while the read is failing"
+    );
+    release.send(()).expect("the process read is still waiting");
+    let saved = put.await.unwrap();
+    super::summon::clear_cap_save_fault(server);
+    assert_eq!(saved.status(), StatusCode::OK);
+    let body: wire::SummonCap = read_json(saved).await;
+    assert_eq!(body.server_addr, server);
+    assert_eq!(body.cap, 4);
+    assert_eq!(
+        state.music_bots.supervisor.local_summon_cap(server),
+        Some(Some(4))
+    );
+    assert_eq!(
+        crate::repos::music_summon_cap::get(&state.db, server)
+            .await
+            .unwrap(),
+        Some(4)
     );
 }
