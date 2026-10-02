@@ -46,6 +46,18 @@ pub struct SummonCapBody {
     pub cap: Option<u32>,
 }
 
+/// Body of `POST /v1/summon-heard`. A channel line the panel already
+/// received. `server_host` is the server connection's host, not a voice
+/// port. `invoker_id` is the TeamSpeak client id on that notify. This is
+/// not a request to look the caller up.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SummonHeardBody {
+    pub server_host: String,
+    pub invoker_id: u16,
+    pub text: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpawnResponse {
     pub id: BotId,

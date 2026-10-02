@@ -368,6 +368,7 @@ mod server_entry {
                 hub: state.ws_hub.clone(),
                 control: state.control.clone(),
                 flow_engine: _flow_engine.handle(),
+                music: state.music_bots.supervisor.clone(),
             });
 
         // PURA-144 (WS-6) — sidecar `/stats` poller + per-server

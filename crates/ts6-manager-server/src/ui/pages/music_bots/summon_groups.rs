@@ -48,6 +48,18 @@ pub fn group_summon_caps(
     groups
 }
 
+/// The empty "No music bots yet" banner. A stored cap with no bots is
+/// a field, so that banner waits until caps have loaded and there are
+/// none. While caps are still loading the page does not flash the banner.
+pub fn show_empty_bot_list(bot_count: usize, cap_count: usize, caps_known: bool) -> bool {
+    bot_count == 0 && caps_known && cap_count == 0
+}
+
+/// Text put back into the summon-cap field when a save fails.
+pub fn summon_cap_field_after_failed_save(stored: Option<u32>) -> String {
+    stored.map(|cap| cap.to_string()).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,6 +140,21 @@ mod tests {
     #[test]
     fn no_bots_and_no_caps_shows_no_group() {
         assert!(group_summon_caps(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn an_empty_bot_list_hides_the_banner_when_a_cap_is_stored() {
+        assert!(!show_empty_bot_list(0, 1, true));
+        assert!(show_empty_bot_list(0, 0, true));
+        assert!(!show_empty_bot_list(0, 0, false));
+        assert!(!show_empty_bot_list(2, 0, true));
+    }
+
+    #[test]
+    fn a_failed_save_puts_the_stored_number_back() {
+        assert_eq!(summon_cap_field_after_failed_save(Some(0)), "0");
+        assert_eq!(summon_cap_field_after_failed_save(Some(4)), "4");
+        assert_eq!(summon_cap_field_after_failed_save(None), "");
     }
 
     #[test]

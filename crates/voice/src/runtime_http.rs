@@ -40,8 +40,8 @@ pub use music_bot_audio::cpuset::MUSIC_RUNTIME_TOKEN_ENV;
 use crate::config::BotId;
 use crate::runtime_api::{
     BugReportContextResponse, EncodeHeadroom, HealthResponse, ListResponse, MutateOp, SendLead,
-    SendRequest, SettingsRequest, SpawnRequest, SpawnResponse, StoreOp, SummonCapBody, WireError,
-    store_err_to_wire,
+    SendRequest, SettingsRequest, SpawnRequest, SpawnResponse, StoreOp, SummonCapBody,
+    SummonHeardBody, WireError, store_err_to_wire,
 };
 use crate::store::{LibraryEntryId, PlaylistName, StoreError, TrackId};
 use crate::supervisor::BotSupervisor;
@@ -297,6 +297,7 @@ pub fn router_with_auth(state: RuntimeState, auth: ControlAuth) -> Router {
     let mut app = Router::new()
         .route("/v1/bots", get(list_bots).post(spawn_bot))
         .route("/v1/summon-cap", put(put_summon_cap))
+        .route("/v1/summon-heard", post(post_summon_heard))
         .route("/v1/bots/{id}", delete(shutdown_bot))
         .route("/v1/bots/{id}/command", post(send_command))
         .route("/v1/bots/{id}/events", get(events_sse))
@@ -428,6 +429,22 @@ async fn put_summon_cap(
         None => state.supervisor.restore_summon_cap(&req.server_addr, None),
     };
     result.map_err(|err| status_err(StatusCode::BAD_REQUEST, &err))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// A channel summon the panel's server-query subscription already has.
+/// The quiet client's own client list is the channel source. No lookup.
+async fn post_summon_heard(
+    State(state): State<RuntimeState>,
+    Json(req): Json<SummonHeardBody>,
+) -> Result<StatusCode, Response> {
+    if req.server_host.trim().is_empty() {
+        return Err(status_err(StatusCode::BAD_REQUEST, "server host is empty"));
+    }
+    state
+        .supervisor
+        .summon()
+        .hear_for_host(&req.server_host, req.invoker_id, &req.text);
     Ok(StatusCode::NO_CONTENT)
 }
 

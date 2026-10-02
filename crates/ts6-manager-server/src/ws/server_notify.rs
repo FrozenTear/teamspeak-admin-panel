@@ -77,6 +77,9 @@ pub struct EventSourceDeps {
     /// Flow-engine handle — the worker bridges join/chat/move notify
     /// frames into the automod trigger surface (PURA-300).
     pub flow_engine: crate::flow::FlowEngineHandle,
+    /// Music process. A channel summon already on this notify is
+    /// forwarded there. This worker does not look up the caller.
+    pub music: crate::music_runtime::MusicBotFront,
 }
 
 /// Drop-guard returned by [`spawn`]. Holding it keeps the watch sender
@@ -205,6 +208,7 @@ async fn run_worker(
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let config_id = connection.id;
+    let host = connection.host.clone();
 
     let backend = match deps
         .control
@@ -303,6 +307,7 @@ async fn run_worker(
                     Ok(frame) => {
                         publish_notify(&deps.hub, config_id, &frame).await;
                         bridge_to_flow_engine(&deps.flow_engine, &mut clid_uid, &frame).await;
+                        forward_channel_summon(&deps.music, &host, &frame);
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         // Slow consumer. Each lagged item is one missed
@@ -528,6 +533,51 @@ fn parse_bridge_event(frame: &NotifyFrame) -> Option<BridgeEvent> {
     }
 }
 
+/// A channel `!play` or `!radio` the server-query subscription already
+/// delivered. `None` for any other target, or for a line that is not a song.
+/// The notify has no channel id. The quiet client's client list is the
+/// channel source, so this does not look the caller up.
+fn channel_summon(frame: &NotifyFrame) -> Option<(u16, String)> {
+    if frame.event != "notifytextmessage" {
+        return None;
+    }
+    let rec = frame.records.first()?;
+    if rec.get("targetmode").map(String::as_str) != Some("2") {
+        return None;
+    }
+    let text = rec.get("msg")?.clone();
+    let song = matches!(
+        music_bot::parse_chat_command(&text),
+        Ok(music_bot::ParsedCommand::Play { .. } | music_bot::ParsedCommand::Radio { .. })
+    );
+    if !song {
+        return None;
+    }
+    let invoker_id = rec.get("invokerid")?.parse().ok()?;
+    Some((invoker_id, text))
+}
+
+fn forward_channel_summon(
+    front: &crate::music_runtime::MusicBotFront,
+    host: &str,
+    frame: &NotifyFrame,
+) {
+    let Some((invoker_id, text)) = channel_summon(frame) else {
+        return;
+    };
+    let front = front.clone();
+    let host = host.to_string();
+    tokio::spawn(async move {
+        if let Err(err) = front.hear_summon(&host, invoker_id, &text).await {
+            tracing::warn!(
+                target: "ws::server_notify",
+                error = %err,
+                "channel summon was not forwarded"
+            );
+        }
+    });
+}
+
 /// Bridge a parsed notify frame into the flow engine's automod trigger
 /// surface. Runs alongside [`publish_notify`] — WS-topic republishing is
 /// unaffected; this is a parallel fan-out so `Ts6ClientJoined` /
@@ -714,6 +764,53 @@ mod tests {
                 nickname: "Alice".into(),
                 clid: Some("42".into()),
             })
+        );
+    }
+
+    #[test]
+    fn a_channel_summon_is_the_invoker_and_the_line() {
+        let frame = notify(
+            "notifytextmessage",
+            &[
+                ("targetmode", "2"),
+                ("msg", "!play https://cdn.example/one.mp3"),
+                ("invokerid", "10"),
+                ("invokername", "Ada"),
+            ],
+        );
+        assert_eq!(
+            channel_summon(&frame),
+            Some((10, "!play https://cdn.example/one.mp3".into()))
+        );
+        assert_eq!(
+            channel_summon(&notify(
+                "notifytextmessage",
+                &[
+                    ("targetmode", "3"),
+                    ("msg", "!play https://cdn.example/one.mp3"),
+                    ("invokerid", "10"),
+                ],
+            )),
+            None,
+            "server text is not the channel path"
+        );
+        assert_eq!(
+            channel_summon(&notify(
+                "notifytextmessage",
+                &[("targetmode", "2"), ("msg", "!stop"), ("invokerid", "10")],
+            )),
+            None
+        );
+        assert_eq!(
+            channel_summon(&notify(
+                "notifytextmessage",
+                &[
+                    ("targetmode", "2"),
+                    ("msg", "!radio station"),
+                    ("invokerid", "4"),
+                ],
+            )),
+            Some((4, "!radio station".into()))
         );
     }
 

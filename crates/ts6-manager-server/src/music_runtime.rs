@@ -14,7 +14,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use music_bot::runtime_api::{
     BugReportContextResponse, ListResponse, MutateOp, SendRequest, SettingsRequest, SpawnRequest,
-    SpawnResponse, StoreOp, SummonCapBody, WireError, store_err_from_wire,
+    SpawnResponse, StoreOp, SummonCapBody, SummonHeardBody, WireError, store_err_from_wire,
 };
 use music_bot::{
     BotCommand, BotConfig, BotEvent, BotId, BotInfo, BotSupervisor, LibraryEntry, LibraryEntryId,
@@ -409,6 +409,23 @@ impl MusicBotFront {
                 .accept_summon_cap(server_addr, cap)
                 .map_err(MusicRuntimeError::Unavailable),
             FrontInner::Remote(r) => r.set_summon_cap(server_addr, cap).await,
+        }
+    }
+
+    /// A channel line the panel already received. Forwarded to every
+    /// pool on that host. Not a client lookup.
+    pub async fn hear_summon(
+        &self,
+        server_host: &str,
+        invoker_id: u16,
+        text: &str,
+    ) -> Result<(), MusicRuntimeError> {
+        match &self.inner {
+            FrontInner::Local(s) => {
+                s.summon().hear_for_host(server_host, invoker_id, text);
+                Ok(())
+            }
+            FrontInner::Remote(r) => r.hear_summon(server_host, invoker_id, text).await,
         }
     }
 
@@ -929,6 +946,33 @@ impl RemoteMusicRuntime {
         self.reject_unauthorized("summon cap", resp.status())?;
         if !resp.status().is_success() {
             return Err(runtime_err(format!("summon cap: {}", resp.status())));
+        }
+        self.clear_auth_latch();
+        Ok(())
+    }
+
+    async fn hear_summon(
+        &self,
+        server_host: &str,
+        invoker_id: u16,
+        text: &str,
+    ) -> Result<(), MusicRuntimeError> {
+        let resp = self
+            .authorize(
+                self.http
+                    .post(format!("{}/v1/summon-heard", self.base))
+                    .json(&SummonHeardBody {
+                        server_host: server_host.to_string(),
+                        invoker_id,
+                        text: text.to_string(),
+                    }),
+            )?
+            .send()
+            .await
+            .map_err(|e| runtime_err(format!("summon heard: {e}")))?;
+        self.reject_unauthorized("summon heard", resp.status())?;
+        if !resp.status().is_success() {
+            return Err(runtime_err(format!("summon heard: {}", resp.status())));
         }
         self.clear_auth_latch();
         Ok(())

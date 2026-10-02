@@ -3033,3 +3033,172 @@ async fn two_saves_at_once_leave_the_process_on_the_stored_number() {
         Some(cap as usize)
     );
 }
+
+#[tokio::test]
+async fn a_dropped_save_stays_on_the_number_the_other_save_stores() {
+    let (app, token, state) = make_test_app().await;
+    let _bot = create_test_bot(&app, &token).await;
+    assert_eq!(
+        put_summon_cap(&app, &token, "127.0.0.1:9987", 1)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let guard = super::summon::hold_forwarded_cap(&state, "127.0.0.1:9987", 4).await;
+    assert_eq!(
+        state
+            .music_bots
+            .supervisor
+            .local_summon_cap("127.0.0.1:9987"),
+        Some(Some(4))
+    );
+    let app2 = app.clone();
+    let token2 = token.clone();
+    let put = tokio::spawn(async move { put_summon_cap(&app2, &token2, "127.0.0.1", 2).await });
+    drop(guard);
+    assert_eq!(put.await.unwrap().status(), StatusCode::OK);
+    let stored = get_summon_caps(&app, &token).await;
+    assert_eq!(stored.caps.len(), 1);
+    assert_eq!(stored.caps[0].cap, 2);
+    assert_eq!(
+        state.music_bots.supervisor.local_summon_cap("127.0.0.1"),
+        Some(Some(2))
+    );
+    assert_eq!(
+        state
+            .music_bots
+            .supervisor
+            .local_quiet_count("127.0.0.1:9987"),
+        Some(2)
+    );
+}
+
+#[tokio::test]
+async fn a_failed_first_save_does_not_clear_the_other_saves_number() {
+    let (app, token, state) = make_test_app().await;
+    let _bot = create_test_bot(&app, &token).await;
+    let guard = super::summon::hold_forwarded_cap(&state, "127.0.0.1:9987", 2).await;
+    let app2 = app.clone();
+    let token2 = token.clone();
+    let put =
+        tokio::spawn(async move { put_summon_cap(&app2, &token2, "127.0.0.1:9987", 1).await });
+    drop(guard);
+    assert_eq!(put.await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        get_summon_caps(&app, &token).await.caps,
+        vec![wire::SummonCap {
+            server_addr: "127.0.0.1:9987".into(),
+            cap: 1,
+        }]
+    );
+    assert_eq!(
+        state
+            .music_bots
+            .supervisor
+            .local_summon_cap("127.0.0.1:9987"),
+        Some(Some(1))
+    );
+    assert_eq!(
+        state
+            .music_bots
+            .supervisor
+            .local_quiet_count("127.0.0.1:9987"),
+        Some(1)
+    );
+}
+
+#[tokio::test]
+async fn a_lost_forward_puts_the_process_back_on_the_stored_number() {
+    let (app, token, state) = make_test_app().await;
+    let _bot = create_test_bot(&app, &token).await;
+    assert_eq!(
+        put_summon_cap(&app, &token, "127.0.0.1:9987", 1)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    state
+        .music_bots
+        .supervisor
+        .set_summon_cap("127.0.0.1:9987", 4)
+        .await
+        .unwrap();
+    super::summon::align_cap_for_test(
+        &state,
+        state.music_bots.supervisor.clone(),
+        "127.0.0.1:9987",
+        None,
+    )
+    .await;
+    assert_eq!(
+        state
+            .music_bots
+            .supervisor
+            .local_summon_cap("127.0.0.1:9987"),
+        Some(Some(1))
+    );
+    assert_eq!(
+        get_summon_caps(&app, &token).await.caps,
+        vec![wire::SummonCap {
+            server_addr: "127.0.0.1:9987".into(),
+            cap: 1,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn a_second_save_is_not_rolled_back_to_a_number_read_earlier() {
+    let (app, token, state) = make_test_app().await;
+    let _bot = create_test_bot(&app, &token).await;
+    assert_eq!(
+        put_summon_cap(&app, &token, "127.0.0.1:9987", 2)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    state
+        .music_bots
+        .supervisor
+        .set_summon_cap("127.0.0.1:9987", 4)
+        .await
+        .unwrap();
+    super::summon::align_cap_for_test(
+        &state,
+        state.music_bots.supervisor.clone(),
+        "127.0.0.1:9987",
+        Some(4),
+    )
+    .await;
+    assert_eq!(
+        state
+            .music_bots
+            .supervisor
+            .local_summon_cap("127.0.0.1:9987"),
+        Some(Some(2))
+    );
+    assert_eq!(
+        get_summon_caps(&app, &token).await.caps,
+        vec![wire::SummonCap {
+            server_addr: "127.0.0.1:9987".into(),
+            cap: 2,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn five_failed_restores_store_the_number_the_process_accepted() {
+    let (app, token, state) = make_test_app().await;
+    let _bot = create_test_bot(&app, &token).await;
+    crate::repos::music_summon_cap::upsert(&state.db, "127.0.0.1:9987", 1)
+        .await
+        .unwrap();
+    let front = crate::music_runtime::MusicBotFront::remote("http://127.0.0.1:9");
+    super::summon::align_cap_for_test(&state, front, "127.0.0.1:9987", Some(4)).await;
+    assert_eq!(
+        get_summon_caps(&app, &token).await.caps,
+        vec![wire::SummonCap {
+            server_addr: "127.0.0.1:9987".into(),
+            cap: 4,
+        }]
+    );
+}

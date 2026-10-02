@@ -83,19 +83,17 @@ impl MusicBotService {
         }
     }
 
-    /// Hold the per-server cap-save lock until the guard is dropped.
-    pub async fn lock_summon_save(&self, server: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    /// The per-server cap-save lock. Callers that restore after a drop
+    /// keep this `Arc` so they can lock again after a wait.
+    pub fn summon_save_mutex(&self, server: &str) -> Arc<tokio::sync::Mutex<()>> {
         let key = music_bot::canon_server_addr(server);
-        let mutex = {
-            let mut map = self
-                .summon_saves
-                .lock()
-                .unwrap_or_else(|err| err.into_inner());
-            map.entry(key)
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                .clone()
-        };
-        mutex.lock_owned().await
+        let mut map = self
+            .summon_saves
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        map.entry(key)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// Test helper — fresh in-memory supervisor + a per-process temp

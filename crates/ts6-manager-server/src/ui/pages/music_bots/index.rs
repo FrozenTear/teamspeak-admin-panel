@@ -194,7 +194,18 @@ pub fn BotsIndexPage() -> Element {
                 div { class: "card", aria_busy: "true",
                     p { class: "muted", "Loading bots…" }
                 }
-            } else if rows.read().is_empty() {
+            } else if rows.read().is_empty()
+                && !*caps_known.read()
+                && caps_error.read().is_none()
+            {
+                div { class: "card", aria_busy: "true",
+                    p { class: "muted", "Loading bots…" }
+                }
+            } else if summon_groups::show_empty_bot_list(
+                rows.read().len(),
+                caps.read().len(),
+                *caps_known.read() || caps_error.read().is_some(),
+            ) {
                 div { class: "empty",
                     div { class: "icon", "♪" }
                     h3 { "No music bots yet" }
@@ -401,7 +412,7 @@ struct SummonCapEditorProps {
 }
 
 fn stored_cap_text(stored: Option<u32>) -> String {
-    stored.map(|cap| cap.to_string()).unwrap_or_default()
+    summon_groups::summon_cap_field_after_failed_save(stored)
 }
 
 #[component]

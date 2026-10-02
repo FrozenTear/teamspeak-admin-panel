@@ -24,8 +24,8 @@ use music_bot_audio::VolumeHandle;
 
 use crate::audio::{self, ActiveAudio, AudioMsg, SendTimingMonitor};
 use crate::summon::{
-    DeliveryHow, ListedClient, LiveQuiet, QuietInstruction, SlotLaunch, SummonArrival,
-    SummonDirector, TECH_SUPPORT_CHANNEL, cold_audio_source, mint_quiet_identity,
+    ListedClient, LiveQuiet, QuietInstruction, SlotLaunch, SummonDirector, TECH_SUPPORT_CHANNEL,
+    cold_audio_source, mint_quiet_identity,
 };
 
 pub(crate) async fn run(
@@ -37,6 +37,7 @@ pub(crate) async fn run(
     let slot = launch.slot;
     let generation = launch.generation;
     let mut stop = launch.stop;
+    let mut pulse = launch.pulse;
     let _guard = SessionEnd {
         director: director.clone(),
         server: server.clone(),
@@ -80,7 +81,21 @@ pub(crate) async fn run(
     let mut frames: Option<mpsc::Receiver<AudioMsg>> = None;
     let mut monitor = SendTimingMonitor::new();
     let volume = VolumeHandle::default();
-    let mut playback = false;
+    let heard = director.pull_heard_gen(&server, slot, generation);
+    apply(
+        &director,
+        &live,
+        &server,
+        slot,
+        generation,
+        &mut con,
+        &mut current,
+        &mut frames,
+        &volume,
+        heard,
+    )
+    .await;
+    let mut playback = director.playback_open_gen(&server, slot, generation);
     let mut resubscribe = false;
     let mut resubscribe_tries: u8 = 0;
     let mut trust_on_next_book = false;
@@ -98,6 +113,26 @@ pub(crate) async fn run(
                 if changed.is_err() || *stop.borrow() {
                     break;
                 }
+            }
+            changed = pulse.changed() => {
+                if changed.is_err() {
+                    continue;
+                }
+                let instr = director.drain_pending_gen(&server, slot, generation);
+                apply(
+                    &director,
+                    &live,
+                    &server,
+                    slot,
+                    generation,
+                    &mut con,
+                    &mut current,
+                    &mut frames,
+                    &volume,
+                    instr,
+                )
+                .await;
+                playback = director.playback_open_gen(&server, slot, generation);
             }
             ev = async { con.events().next().await } => {
                 match ev {
@@ -127,7 +162,7 @@ pub(crate) async fn run(
                             director.note_list_trusted(&server, slot, generation);
                             trust_on_next_book = false;
                         }
-                        let instr = instructions_for(
+                        let mut instr = instructions_for(
                             &director,
                             &server,
                             slot,
@@ -136,6 +171,7 @@ pub(crate) async fn run(
                             &con,
                             &item,
                         );
+                        instr.extend(director.drain_pending_gen(&server, slot, generation));
                         apply(
                             &director,
                             &live,
@@ -265,9 +301,12 @@ fn instructions_for(
                 if invoker.id == own {
                     continue;
                 }
-                let sender_here = clients
+                let sender_channel = clients
                     .iter()
-                    .any(|client| client.id == invoker.id.0 && client.channel_id == at);
+                    .find(|client| client.id == invoker.id.0)
+                    .map(|client| client.channel_id);
+                let sender_here =
+                    sender_channel.is_some_and(|channel| channel_text_is_local(channel, at));
                 if sender_here {
                     out.extend(director.on_chat_gen(
                         server,
@@ -385,27 +424,9 @@ async fn apply(
     }
 }
 
-/// Server text, a private message, or a poke. Never channel text.
-fn crossing_target(arrival: &SummonArrival) -> MessageTarget {
-    match arrival.how {
-        DeliveryHow::Server => MessageTarget::Server,
-        DeliveryHow::Private => MessageTarget::Client(ClientId(arrival.target)),
-        DeliveryHow::Poke => MessageTarget::Poke(ClientId(arrival.target)),
-    }
-}
-
-pub(crate) fn send_crossing(con: &mut Connection, arrival: &SummonArrival) -> Result<()> {
-    let target = crossing_target(arrival);
-    debug_assert!(
-        !matches!(target, MessageTarget::Channel),
-        "a crossing summon is not channel text"
-    );
-    let cmd = {
-        let book = con.get_state().context("connection has no book yet")?;
-        book.send_message(target, &arrival.text)
-    };
-    cmd.send(con).context("crossing summon")?;
-    Ok(())
+/// Channel text is delivered only inside the sender's channel.
+fn channel_text_is_local(sender_channel: u64, here: u64) -> bool {
+    sender_channel == here
 }
 
 fn subscribe_all(con: &mut Connection) -> Result<()> {
@@ -517,6 +538,23 @@ fn own_channel_name(con: &Connection) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::summon::{DeliveryHow, SummonArrival};
+    use tsclientlib::{ClientId, MessageTarget};
+
+    /// Server text, a private message, or a poke. Never channel text.
+    fn crossing_target(arrival: &SummonArrival) -> MessageTarget {
+        match arrival.how {
+            DeliveryHow::Server => MessageTarget::Server,
+            DeliveryHow::Private => MessageTarget::Client(ClientId(arrival.target)),
+            DeliveryHow::Poke => MessageTarget::Poke(ClientId(arrival.target)),
+        }
+    }
+
+    #[test]
+    fn channel_text_does_not_cross_into_tech_support() {
+        assert!(channel_text_is_local(5, 5));
+        assert!(!channel_text_is_local(5, 42));
+    }
 
     #[test]
     fn crossing_delivery_is_not_channel_text() {

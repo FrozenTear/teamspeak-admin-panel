@@ -131,6 +131,10 @@ struct QuietSlot {
     frames_sent: u64,
     frames_blocked: u64,
     stop: watch::Sender<bool>,
+    /// Moves this session still has to apply. A pulse wakes it; a book
+    /// drains the same queue if the pulse was missed.
+    pending: Vec<QuietInstruction>,
+    pulse: watch::Sender<()>,
 }
 
 enum Phase {
@@ -214,24 +218,18 @@ fn live_director() -> Option<SummonDirector> {
 
 static LIVE_DIRECTOR: Mutex<Option<SummonDirector>> = Mutex::new(None);
 
-/// A saved bot heard a summon in its channel. Channel text does not
-/// reach Tech Support. The return value, when present, is server text,
-/// a private message, or a poke for that bot to send. The quiet client
-/// moves when that message arrives on its own connection.
-pub(crate) fn relay_heard_channel_line(
-    server: &str,
-    caller: u16,
-    line: &str,
-) -> Option<SummonArrival> {
-    let director = live_director()?;
-    director.stage_channel_summon(server, caller, line);
-    director.take_outbound(server)
-}
-
-/// A crossing message that became sendable after the line was heard,
-/// once the sender showed up on a quiet client's list.
-pub(crate) fn poll_outbound(server: &str) -> Option<SummonArrival> {
-    live_director()?.take_outbound(server)
+/// A saved bot heard a song line in its own channel. When this server's
+/// pool claims the line, the sitting quiet client takes it and the saved
+/// bot must not start the song. Cap 0 does not claim: the saved bot plays.
+pub(crate) fn saved_bot_yields_summon(server: &str, caller: u16, line: &str) -> bool {
+    let Some(director) = live_director() else {
+        return false;
+    };
+    if !director.claims_summon_line(server, line) {
+        return false;
+    }
+    director.hear_channel_line(server, caller, line);
+    true
 }
 
 /// Per-server pool of quiet clients.
@@ -247,6 +245,7 @@ pub(crate) struct SlotLaunch {
     pub(crate) generation: u64,
     pub(crate) identity_path: PathBuf,
     pub(crate) stop: watch::Receiver<bool>,
+    pub(crate) pulse: watch::Receiver<()>,
 }
 
 impl SummonDirector {
@@ -288,8 +287,9 @@ impl SummonDirector {
     }
 
     /// Put this server back to a cap the database still has. `None` means
-    /// nothing is stored: the number is cleared and quiet clients started
-    /// for the rejected number are stopped.
+    /// nothing is stored: the number is cleared and a quiet client that
+    /// is still sitting is stopped. A client that is already playing
+    /// stays until that song ends.
     pub fn restore_cap(&self, server: &str, cap: Option<u32>) -> Result<(), String> {
         {
             let mut state = self.lock();
@@ -514,6 +514,84 @@ impl SummonDirector {
         self.lock().stage_channel_summon(server, caller, line);
     }
 
+    /// True when a song line belongs to the quiet pool: the server is
+    /// armed and the stored cap is above zero. Cap 0 leaves the line
+    /// with the saved bot.
+    pub fn claims_summon_line(&self, server: &str, line: &str) -> bool {
+        song_arg(line).is_some()
+            && self
+                .lock()
+                .pool(server)
+                .is_some_and(|pool| pool.armed && pool.cap.unwrap_or(0) > 0)
+    }
+
+    /// A channel summon already received, with the caller's client id.
+    /// The sitting quiet client moves on its own connection when that
+    /// id is on its client list. This does not look the caller up, and
+    /// it does not play.
+    pub fn hear_channel_line(
+        &self,
+        server: &str,
+        caller: u16,
+        line: &str,
+    ) -> Vec<QuietInstruction> {
+        self.lock().hear_channel_line(server, caller, line)
+    }
+
+    /// Every armed pool on `host`, including an explicit non-default
+    /// voice port. The notify carries the server connection's host and
+    /// no voice port.
+    pub fn hear_for_host(&self, host: &str, caller: u16, line: &str) {
+        let servers: Vec<String> = {
+            let state = self.lock();
+            state
+                .servers
+                .keys()
+                .filter(|addr| host_of_canon(addr, host))
+                .cloned()
+                .collect()
+        };
+        for server in servers {
+            self.hear_channel_line(&server, caller, line);
+        }
+    }
+
+    /// Instructions a hear queued for this session. Empty when another
+    /// drain already took them.
+    pub fn drain_pending_gen(
+        &self,
+        server: &str,
+        slot: u32,
+        generation: u64,
+    ) -> Vec<QuietInstruction> {
+        let mut state = self.lock();
+        if !state.owns(server, slot, generation) {
+            return Vec::new();
+        }
+        state.take_pending(server, slot)
+    }
+
+    /// Take a staged line now that this session's client list is trusted,
+    /// then anything a hear queued before the session was waiting.
+    pub fn pull_heard_gen(
+        &self,
+        server: &str,
+        slot: u32,
+        generation: u64,
+    ) -> Vec<QuietInstruction> {
+        let mut state = self.lock();
+        if !state.owns(server, slot, generation) {
+            return Vec::new();
+        }
+        let clients = state
+            .pool(server)
+            .map(|pool| pool.clients.clone())
+            .unwrap_or_default();
+        let mut out = state.take_staged(server, slot, &clients);
+        out.extend(state.take_pending(server, slot));
+        out
+    }
+
     pub fn prepare_delivery_gen(
         &self,
         server: &str,
@@ -566,24 +644,6 @@ impl SummonDirector {
             .pool(server)
             .and_then(|pool| pool.staged.as_ref())
             .is_some_and(|staged| staged.line == text)
-    }
-
-    pub(crate) fn take_outbound(&self, server: &str) -> Option<SummonArrival> {
-        let mut state = self.lock();
-        let clients = state
-            .pool(server)
-            .map(|pool| pool.clients.clone())
-            .unwrap_or_default();
-        let slot = state.pool(server).and_then(|pool| {
-            pool.slots
-                .iter()
-                .find(|slot| slot.is_sitting())
-                .map(|slot| slot.slot)
-        })?;
-        state
-            .prepare_delivery(server, slot, &clients)
-            .into_iter()
-            .find_map(|instr| instr.deliver)
     }
 
     pub fn release_delivery_gen(&self, server: &str, slot: u32, generation: u64) {
@@ -927,9 +987,17 @@ impl SummonState {
         pool.relaunches_due = 0;
         pool.relaunch_not_before = None;
         pool.staged = None;
-        let removed = std::mem::take(&mut pool.slots);
-        for slot in removed {
-            let _ = slot.stop.send(true);
+        let sitting: Vec<usize> = pool
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.is_sitting())
+            .map(|(index, _)| index)
+            .rev()
+            .collect();
+        for index in sitting {
+            let removed = pool.slots.remove(index);
+            let _ = removed.stop.send(true);
         }
         Ok(())
     }
@@ -942,6 +1010,7 @@ impl SummonState {
         let identity_path = self.allocate_identity(server, slot_no, saved);
         let connection_id = self.next_connection.fetch_add(1, Ordering::Relaxed);
         let (stop, _) = watch::channel(false);
+        let (pulse, _) = watch::channel(());
         let pool = self.pool_entry(server);
         pool.slots.push(QuietSlot {
             slot: slot_no,
@@ -958,6 +1027,8 @@ impl SummonState {
             frames_sent: 0,
             frames_blocked: 0,
             stop,
+            pending: Vec::new(),
+            pulse,
         });
     }
 
@@ -999,6 +1070,7 @@ impl SummonState {
                     generation: slot.generation,
                     identity_path: slot.identity_path.clone(),
                     stop: slot.stop.subscribe(),
+                    pulse: slot.pulse.subscribe(),
                 });
             }
         }
@@ -1140,7 +1212,7 @@ impl SummonState {
             ..
         } = &slot.phase
         else {
-            return self.complete_heard(server, slot_id, clients);
+            return self.sitting_book(server, slot_id, clients);
         };
         let caller = *caller;
         let channel = *channel;
@@ -1298,6 +1370,145 @@ impl SummonState {
             armed_slot: None,
             heard: false,
         });
+    }
+
+    fn hear_channel_line(
+        &mut self,
+        server: &str,
+        caller: u16,
+        line: &str,
+    ) -> Vec<QuietInstruction> {
+        let Some(arg) = song_arg(line) else {
+            return Vec::new();
+        };
+        let claims = self
+            .pool(server)
+            .is_some_and(|pool| pool.armed && pool.cap.unwrap_or(0) > 0);
+        if !claims {
+            return Vec::new();
+        }
+        let already = self.pool(server).is_some_and(|pool| {
+            pool.slots.iter().any(|slot| {
+                matches!(
+                    &slot.phase,
+                    Phase::Out {
+                        caller: current,
+                        request,
+                        ..
+                    } if *current == caller && request == &arg
+                )
+            })
+        });
+        if already {
+            return Vec::new();
+        }
+        self.stage_channel_summon(server, caller, line);
+        let clients = self
+            .pool(server)
+            .map(|pool| pool.clients.clone())
+            .unwrap_or_default();
+        let slot_id = self.pool(server).and_then(|pool| {
+            pool.slots
+                .iter()
+                .find(|slot| slot.is_sitting() && slot.list_trusted && slot.subscribed)
+                .map(|slot| slot.slot)
+        });
+        let Some(slot_id) = slot_id else {
+            let busy = self.pool(server).is_some_and(|pool| {
+                !pool.slots.is_empty() && pool.slots.iter().all(|slot| !slot.is_sitting())
+            });
+            if busy && let Some(pool) = self.pool_mut(server) {
+                pool.staged = None;
+            }
+            return Vec::new();
+        };
+        let instr = self.take_staged(server, slot_id, &clients);
+        self.enqueue_moves(server, slot_id, &instr);
+        instr
+    }
+
+    /// Move on the staged line when this sitting client can see the
+    /// caller. A missing caller stays staged. Tech Support and an
+    /// occupied channel drop the line. Nothing here plays.
+    fn take_staged(
+        &mut self,
+        server: &str,
+        slot_id: u32,
+        clients: &[ListedClient],
+    ) -> Vec<QuietInstruction> {
+        let staged = self.pool(server).and_then(|pool| {
+            pool.staged
+                .as_ref()
+                .map(|staged| (staged.caller, staged.line.clone()))
+        });
+        let Some((caller, line)) = staged else {
+            return Vec::new();
+        };
+        let ready = self
+            .slot(server, slot_id)
+            .is_some_and(|slot| slot.is_sitting() && slot.list_trusted && slot.subscribed);
+        if !ready {
+            return Vec::new();
+        }
+        if let Some(fate) = self.delivery_block(server, slot_id, caller, &line, clients) {
+            return self.settle_staged(server, fate);
+        }
+        if let Some(pool) = self.pool_mut(server) {
+            pool.staged = None;
+        }
+        let Some(arg) = song_arg(&line) else {
+            return Vec::new();
+        };
+        let channel = clients
+            .iter()
+            .find(|client| client.id == caller)
+            .map(|client| client.channel_id)
+            .expect("delivery_block accepted the caller");
+        self.assign(server, slot_id, caller, channel, arg)
+    }
+
+    fn sitting_book(
+        &mut self,
+        server: &str,
+        slot_id: u32,
+        clients: &[ListedClient],
+    ) -> Vec<QuietInstruction> {
+        let heard = self.complete_heard(server, slot_id, clients);
+        if heard
+            .iter()
+            .any(|instr| instr.move_to.is_some() || instr.play.is_some())
+        {
+            return heard;
+        }
+        let taken = self.take_staged(server, slot_id, clients);
+        if taken
+            .iter()
+            .any(|instr| instr.move_to.is_some() || instr.play.is_some())
+        {
+            return taken;
+        }
+        if !heard.is_empty() { heard } else { taken }
+    }
+
+    fn enqueue_moves(&mut self, server: &str, slot_id: u32, instr: &[QuietInstruction]) {
+        let queued: Vec<QuietInstruction> = instr
+            .iter()
+            .filter(|instr| instr.move_to.is_some() || instr.play.is_some() || instr.stop_audio)
+            .cloned()
+            .collect();
+        if queued.is_empty() {
+            return;
+        }
+        if let Some(slot) = self.slot_mut(server, slot_id) {
+            slot.pending.extend(queued);
+            let _ = slot.pulse.send(());
+        }
+    }
+
+    fn take_pending(&mut self, server: &str, slot_id: u32) -> Vec<QuietInstruction> {
+        self.slot_mut(server, slot_id)
+            .map(|slot| std::mem::take(&mut slot.pending))
+            .unwrap_or_default()
     }
 
     fn prepare_delivery(
@@ -1634,6 +1845,14 @@ impl SummonState {
             }
         }
     }
+}
+
+fn host_of_canon(canon: &str, host: &str) -> bool {
+    let host = host.trim().trim_matches(['[', ']']);
+    let Some((name, port)) = canon.rsplit_once(':') else {
+        return false;
+    };
+    port.parse::<u16>().is_ok() && name.eq_ignore_ascii_case(host)
 }
 
 fn relaunch_delay(attempt: u32) -> Duration {
@@ -2689,6 +2908,155 @@ mod tests {
         assert_eq!(director.quiet_count(SERVER), 0);
         director.accept_cap(SERVER, 0).unwrap();
         assert_eq!(director.cap(SERVER), Some(0));
+        assert_eq!(director.quiet_count(SERVER), 0);
+    }
+
+    #[test]
+    fn a_channel_summon_reaches_tech_support_with_no_bot_in_that_channel() {
+        let director = boot(1);
+        let slot = director.slot_ids(SERVER)[0];
+        let clients = [person(1, HOME), person(10, 5)];
+        director.mark_ready(SERVER, slot, HOME, 1, &clients);
+        let moved = director.hear_channel_line(SERVER, 10, "!play https://cdn.example/one.mp3");
+        assert_eq!(moved[0].move_to, Some(5));
+        assert!(moved[0].play.is_none());
+        assert!(moved[0].deliver.is_none());
+        assert!(!moved[0].stop_audio);
+        assert!(!director.playback_open(SERVER, slot));
+        assert_eq!(director.server_lookups(), 0);
+        let waiting = director.on_book(SERVER, slot, HOME, &clients);
+        assert!(
+            waiting
+                .iter()
+                .all(|instr| instr.play.is_none() && !instr.stop_audio)
+        );
+        let landed = director.on_book(SERVER, slot, 5, &clients);
+        assert_eq!(
+            landed[0].play.as_deref(),
+            Some("https://cdn.example/one.mp3")
+        );
+        assert!(director.playback_open(SERVER, slot));
+        let again = director.hear_channel_line(SERVER, 10, "!play https://cdn.example/one.mp3");
+        assert!(again.is_empty());
+        assert!(director.playback_open(SERVER, slot));
+        assert_eq!(
+            director.assigned_request(SERVER, slot).as_deref(),
+            Some("https://cdn.example/one.mp3")
+        );
+    }
+
+    #[test]
+    fn a_heard_summon_from_tech_support_does_not_play_there() {
+        let director = boot(1);
+        let slot = director.slot_ids(SERVER)[0];
+        director.mark_ready(SERVER, slot, HOME, 1, &[person(1, HOME), person(10, HOME)]);
+        let heard = director.hear_channel_line(SERVER, 10, "!play https://cdn.example/one.mp3");
+        assert!(heard.is_empty());
+        assert!(!director.playback_open(SERVER, slot));
+        assert!(director.assigned_request(SERVER, slot).is_none());
+        assert_eq!(director.server_lookups(), 0);
+    }
+
+    #[test]
+    fn a_heard_summon_from_an_unknown_sender_is_kept() {
+        let director = boot(1);
+        let slot = director.slot_ids(SERVER)[0];
+        director.mark_ready(SERVER, slot, HOME, 1, &[person(1, HOME)]);
+        let kept = director.hear_channel_line(SERVER, 99, "!play https://cdn.example/hidden.mp3");
+        assert!(
+            kept.iter()
+                .all(|instr| instr.move_to.is_none() && instr.play.is_none())
+        );
+        assert!(!director.playback_open(SERVER, slot));
+        assert_eq!(director.server_lookups(), 0);
+        let appeared = director.on_book(SERVER, slot, HOME, &[person(1, HOME), person(99, 5)]);
+        assert_eq!(appeared[0].move_to, Some(5));
+        assert!(appeared[0].play.is_none());
+        assert!(!director.playback_open(SERVER, slot));
+    }
+
+    #[test]
+    fn a_claimed_line_does_not_belong_to_the_saved_bot() {
+        let director = boot(1);
+        let slot = director.slot_ids(SERVER)[0];
+        director.mark_ready(SERVER, slot, HOME, 1, &[person(1, HOME), person(10, 5)]);
+        assert!(director.claims_summon_line(SERVER, "!play https://cdn.example/one.mp3"));
+        assert!(director.claims_summon_line(SERVER, "!radio https://cdn.example/station"));
+        assert!(!director.claims_summon_line(SERVER, "!stop"));
+        let moved = director.hear_channel_line(SERVER, 10, "!radio https://cdn.example/station");
+        assert_eq!(moved[0].move_to, Some(5));
+        assert!(moved[0].play.is_none());
+        director.accept_cap(SERVER, 0).unwrap();
+        assert!(!director.claims_summon_line(SERVER, "!play https://cdn.example/two.mp3"));
+        let left = director.hear_channel_line(SERVER, 11, "!play https://cdn.example/two.mp3");
+        assert!(left.is_empty());
+    }
+
+    #[test]
+    fn a_host_notify_reaches_every_pool_on_that_host() {
+        let director = boot(1);
+        director.note_push(
+            "voice.example:9988",
+            8,
+            Some(1),
+            Path::new("/data/music-bot-identities/bot-8.identity"),
+        );
+        let other = director.slot_ids("voice.example:9988")[0];
+        director.mark_ready(
+            "voice.example:9988",
+            other,
+            HOME,
+            2,
+            &[person(2, HOME), person(10, 9)],
+        );
+        let home = director.slot_ids(SERVER)[0];
+        director.mark_ready(SERVER, home, HOME, 1, &[person(1, HOME), person(10, 5)]);
+        director.hear_for_host("Voice.Example", 10, "!play https://cdn.example/one.mp3");
+        assert_eq!(
+            director.assigned_request(SERVER, home).as_deref(),
+            Some("https://cdn.example/one.mp3")
+        );
+        assert_eq!(
+            director
+                .assigned_request("voice.example:9988", other)
+                .as_deref(),
+            Some("https://cdn.example/one.mp3")
+        );
+        assert!(!director.playback_open(SERVER, home));
+        assert!(!director.playback_open("voice.example:9988", other));
+        director.note_push(
+            "other.example:9987",
+            9,
+            Some(1),
+            Path::new("/data/music-bot-identities/bot-9.identity"),
+        );
+        let elsewhere = director.slot_ids(OTHER)[0];
+        director.mark_ready(OTHER, elsewhere, HOME, 3, &[person(3, HOME), person(10, 5)]);
+        director.hear_for_host("voice.example", 10, "!play https://cdn.example/two.mp3");
+        assert!(director.assigned_request(OTHER, elsewhere).is_none());
+    }
+
+    #[test]
+    fn clearing_the_cap_leaves_a_playing_client_connected() {
+        let director = boot(2);
+        let slots = director.slot_ids(SERVER);
+        director.on_chat(
+            SERVER,
+            slots[0],
+            10,
+            "!play https://cdn.example/one.mp3",
+            &[person(10, 5)],
+        );
+        director.on_book(SERVER, slots[0], 5, &[person(10, 5)]);
+        assert!(director.playback_open(SERVER, slots[0]));
+        director.restore_cap(SERVER, None).unwrap();
+        assert_eq!(director.cap(SERVER), None);
+        assert!(!director.armed(SERVER));
+        assert!(director.playback_open(SERVER, slots[0]));
+        assert_eq!(director.quiet_count(SERVER), 1);
+        assert_eq!(director.slot_ids(SERVER), vec![slots[0]]);
+        let done = director.on_playback_finished(SERVER, slots[0]);
+        assert!(done[0].stop_audio);
         assert_eq!(director.quiet_count(SERVER), 0);
     }
 
