@@ -525,9 +525,70 @@ pub struct SummonCapList {
     pub caps: Vec<SummonCap>,
 }
 
+/// TeamSpeak's voice port when an address omits one. `host` and
+/// `host:9987` are the same dial target.
+const DEFAULT_VOICE_PORT: u16 = 9987;
+
+/// One pool key for addresses that dial the same socket.
+///
+/// Host case does not matter. A missing port is the default voice port.
+/// An explicit different port stays a different pool. The music page and
+/// the music process both use this so a spelling difference does not
+/// invent a second cap.
+pub fn canon_server_addr(addr: &str) -> String {
+    let trimmed = addr.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let (host, port) = split_host_port(trimmed);
+    let host = host.trim().trim_matches(['[', ']']).to_ascii_lowercase();
+    format!("{host}:{}", port.unwrap_or(DEFAULT_VOICE_PORT))
+}
+
+fn split_host_port(addr: &str) -> (String, Option<u16>) {
+    if let Some(rest) = addr.strip_prefix('[') {
+        if let Some((host, port)) = rest.rsplit_once("]:") {
+            return (host.to_string(), parse_port(port));
+        }
+        if let Some(host) = rest.strip_suffix(']') {
+            return (host.to_string(), None);
+        }
+    }
+    if let Some((host, port)) = addr.rsplit_once(':')
+        && !host.is_empty()
+        && !host.contains(':')
+        && let Some(port) = parse_port(port)
+    {
+        return (host.to_string(), Some(port));
+    }
+    (addr.to_string(), None)
+}
+
+fn parse_port(text: &str) -> Option<u16> {
+    let port = text.parse::<u16>().ok()?;
+    if port == 0 { None } else { Some(port) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canon_server_addr_ignores_case_and_the_default_port() {
+        assert_eq!(canon_server_addr("Voice.Example"), "voice.example:9987");
+        assert_eq!(canon_server_addr("voice.example"), "voice.example:9987");
+        assert_eq!(
+            canon_server_addr(" voice.example:9987 "),
+            "voice.example:9987"
+        );
+        assert_eq!(
+            canon_server_addr("voice.example:9988"),
+            "voice.example:9988"
+        );
+        assert_eq!(canon_server_addr(""), "");
+        assert_eq!(canon_server_addr("[::1]"), "::1:9987");
+        assert_eq!(canon_server_addr("[::1]:9988"), "::1:9988");
+    }
 
     #[test]
     fn audio_source_round_trips_with_kind_discriminator() {

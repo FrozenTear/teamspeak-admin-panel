@@ -30,50 +30,12 @@ pub const TECH_SUPPORT_CHANNEL: &str = "Tech Support";
 /// so it is not stored. This is not a default.
 pub const MAX_SUMMON_CAP: u32 = 64;
 
-/// TeamSpeak's voice port when an address omits one. `host` and
-/// `host:9987` are the same dial target.
-const DEFAULT_VOICE_PORT: u16 = 9987;
-
 /// Moves toward the caller's channel before the summon is sent home.
 const MAX_MOVE_ATTEMPTS: u8 = 3;
 
-/// One pool key for addresses that dial the same socket.
-///
-/// Host case does not matter. A missing port is the default voice port.
-/// An explicit different port stays a different pool.
-pub fn canon_server_addr(addr: &str) -> String {
-    let trimmed = addr.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    let (host, port) = split_host_port(trimmed);
-    let host = host.trim().trim_matches(['[', ']']).to_ascii_lowercase();
-    format!("{host}:{}", port.unwrap_or(DEFAULT_VOICE_PORT))
-}
-
-fn split_host_port(addr: &str) -> (String, Option<u16>) {
-    if let Some(rest) = addr.strip_prefix('[') {
-        if let Some((host, port)) = rest.rsplit_once("]:") {
-            return (host.to_string(), parse_port(port));
-        }
-        if let Some(host) = rest.strip_suffix(']') {
-            return (host.to_string(), None);
-        }
-    }
-    if let Some((host, port)) = addr.rsplit_once(':')
-        && !host.is_empty()
-        && !host.contains(':')
-        && let Some(port) = parse_port(port)
-    {
-        return (host.to_string(), Some(port));
-    }
-    (addr.to_string(), None)
-}
-
-fn parse_port(text: &str) -> Option<u16> {
-    let port = text.parse::<u16>().ok()?;
-    if port == 0 { None } else { Some(port) }
-}
+/// Same key the music page uses. Defined in the shared crate so the
+/// wasm client does not link this crate.
+pub use ts6_manager_shared::music_bots::canon_server_addr;
 
 /// One person already on a quiet client's own client list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

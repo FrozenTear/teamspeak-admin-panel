@@ -19,14 +19,14 @@ pub fn group_summon_caps(
 ) -> Vec<SummonServerGroup> {
     let mut groups: Vec<SummonServerGroup> = Vec::new();
     for bot in bots {
-        let key = music_bot::canon_server_addr(&bot.server_addr);
+        let key = wire::canon_server_addr(&bot.server_addr);
         if let Some(group) = groups.iter_mut().find(|group| group.server_addr == key) {
             group.bots.push(bot.clone());
             continue;
         }
         let cap = caps
             .iter()
-            .find(|cap| music_bot::canon_server_addr(&cap.server_addr) == key)
+            .find(|cap| wire::canon_server_addr(&cap.server_addr) == key)
             .map(|cap| cap.cap);
         groups.push(SummonServerGroup {
             server_addr: key,
@@ -35,7 +35,7 @@ pub fn group_summon_caps(
         });
     }
     for cap in caps {
-        let key = music_bot::canon_server_addr(&cap.server_addr);
+        let key = wire::canon_server_addr(&cap.server_addr);
         if key.is_empty() || groups.iter().any(|group| group.server_addr == key) {
             continue;
         }
