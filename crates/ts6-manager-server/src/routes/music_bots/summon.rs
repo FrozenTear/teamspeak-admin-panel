@@ -111,7 +111,9 @@ async fn set(
         );
         let outcome = align_held(&mut unsettled).await;
         unsettled.settled = true;
-        return number_that_stuck(server_addr, req.cap, outcome);
+        let cap = number_that_stuck(req.cap, outcome)
+            .map_err(|()| internal("summon cap was not stored"))?;
+        return Ok(Json(wire::SummonCap { server_addr, cap }));
     }
 
     unsettled.settled = true;
@@ -142,23 +144,14 @@ async fn align_held(unsettled: &mut UnsettledCap) -> AlignOutcome {
     .await
 }
 
-/// What the page should show after a store write failed and align ran.
-/// A catch-up that landed, or a store that already held this save's
-/// number, is that number. Anything else is the not-stored error, and
-/// the page puts the previous number back.
-fn number_that_stuck(
-    server_addr: String,
-    requested: u32,
-    outcome: AlignOutcome,
-) -> Result<Json<wire::SummonCap>, Response> {
-    let stuck = match outcome {
-        AlignOutcome::CaughtUp(cap) => Some(cap),
-        AlignOutcome::Restored(Some(cap)) if cap == requested => Some(cap),
-        AlignOutcome::Restored(_) => None,
-    };
-    match stuck {
-        Some(cap) => Ok(Json(wire::SummonCap { server_addr, cap })),
-        None => Err(internal("summon cap was not stored")),
+/// The number the page should show after a store write failed and align
+/// ran. A catch-up that landed, or a store that already held this save's
+/// number, is that number. Anything else leaves the previous number up.
+fn number_that_stuck(requested: u32, outcome: AlignOutcome) -> Result<u32, ()> {
+    match outcome {
+        AlignOutcome::CaughtUp(cap) => Ok(cap),
+        AlignOutcome::Restored(Some(cap)) if cap == requested => Ok(cap),
+        AlignOutcome::Restored(_) => Err(()),
     }
 }
 
@@ -232,6 +225,11 @@ pub(super) enum AlignOutcome {
     CaughtUp(u32),
 }
 
+/// Restores to attempt when the process never accepted this save.
+/// There is no forwarded number to catch the store up to, so this does
+/// not retry forever. The lock is held the whole time.
+const UNACCEPTED_ALIGN_TRIES: u32 = 3;
+
 async fn align_cap(
     front: MusicBotFront,
     db: std::sync::Arc<Database>,
@@ -245,6 +243,7 @@ async fn align_cap(
         None => mutex.lock_owned().await,
     };
     let mut wait = Duration::from_millis(50);
+    let mut unaccepted = 0u32;
     loop {
         match read_cap_retry(&db, &server).await {
             Ok(stored) => {
@@ -268,6 +267,11 @@ async fn align_cap(
                             );
                         }
                     }
+                } else {
+                    unaccepted += 1;
+                    if unaccepted >= UNACCEPTED_ALIGN_TRIES {
+                        return AlignOutcome::Restored(stored);
+                    }
                 }
             }
             Err(err) => {
@@ -276,12 +280,20 @@ async fn align_cap(
                     error = %err,
                     "summon cap re-read failed; the captured number is not restored"
                 );
+                if forwarded.is_none() {
+                    unaccepted += 1;
+                    if unaccepted >= UNACCEPTED_ALIGN_TRIES {
+                        return AlignOutcome::Restored(None);
+                    }
+                }
             }
         }
-        warn!(
-            server = %server,
-            "summon cap process and store differ; retrying under the save lock"
-        );
+        if forwarded.is_some() {
+            warn!(
+                server = %server,
+                "summon cap process and store differ; retrying under the save lock"
+            );
+        }
         #[cfg(test)]
         if let Some(release) = save_fault::note_pause(&server) {
             let _ = release.await;
@@ -359,6 +371,22 @@ pub(super) async fn align_cap_for_test(
         Some(guard),
     )
     .await
+}
+
+/// Cap to carry on a saved-bot push. A lookup error is `None`: the push
+/// must not invent a number and must not fail bot create.
+pub(super) async fn cap_for_push(state: &AppState, server_addr: &str) -> Option<u32> {
+    match crate::repos::music_summon_cap::get(&state.db, server_addr).await {
+        Ok(cap) => cap,
+        Err(err) => {
+            warn!(
+                server = %server_addr,
+                error = %err,
+                "summon cap lookup failed; this push will not arm summon"
+            );
+            None
+        }
+    }
 }
 
 /// Fail the next `upserts` store writes and the next `restores` restore
@@ -468,9 +496,7 @@ mod save_fault {
     pub(super) fn note_pause(server: &str) -> Option<tokio::sync::oneshot::Receiver<()>> {
         let key = music_bot::canon_server_addr(server);
         let mut map = table().lock().unwrap_or_else(|err| err.into_inner());
-        let Some(fault) = map.get_mut(&key) else {
-            return None;
-        };
+        let fault = map.get_mut(&key)?;
         if let Some(tx) = fault.paused.take() {
             let _ = tx.send(());
         }
@@ -483,21 +509,5 @@ mod save_fault {
             .lock()
             .unwrap_or_else(|err| err.into_inner())
             .remove(&key);
-    }
-}
-
-/// Cap to carry on a saved-bot push. A lookup error is `None`: the push
-/// must not invent a number and must not fail bot create.
-pub(super) async fn cap_for_push(state: &AppState, server_addr: &str) -> Option<u32> {
-    match crate::repos::music_summon_cap::get(&state.db, server_addr).await {
-        Ok(cap) => cap,
-        Err(err) => {
-            warn!(
-                server = %server_addr,
-                error = %err,
-                "summon cap lookup failed; this push will not arm summon"
-            );
-            None
-        }
     }
 }
