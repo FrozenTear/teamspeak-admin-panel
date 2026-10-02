@@ -208,6 +208,12 @@ impl BotSupervisor {
         self.summon.accept_cap(server, cap)
     }
 
+    /// Put the process back on the cap the database still has. `None`
+    /// clears the number and the quiet clients the rejected accept started.
+    pub fn restore_summon_cap(&self, server: &str, cap: Option<u32>) -> Result<(), String> {
+        self.summon.restore_cap(server, cap)
+    }
+
     /// Open real TeamSpeak sessions for quiet clients. Saved-bot connect
     /// and disconnect do not call this.
     pub fn enable_quiet_sessions(

@@ -56,6 +56,13 @@ async fn set(
     }
     let _server = require_server_write(&state, &user, &req.server_addr).await?;
 
+    let previous = crate::repos::music_summon_cap::get(&state.db, &req.server_addr)
+        .await
+        .map_err(|err| {
+            error!(server = %req.server_addr, error = %err, "summon cap lookup failed");
+            internal("summon cap lookup failed")
+        })?;
+
     state
         .music_bots
         .supervisor
@@ -70,11 +77,21 @@ async fn set(
             server = %req.server_addr,
             cap = req.cap,
             error = %err,
-            "summon cap accepted by the music process but not stored"
+            "summon cap was not stored; restoring the previous number"
         );
-        return Err(internal(
-            "summon cap was accepted by the music process but was not stored",
-        ));
+        if let Err(rollback) = state
+            .music_bots
+            .supervisor
+            .restore_summon_cap(&req.server_addr, previous)
+            .await
+        {
+            error!(
+                server = %req.server_addr,
+                error = %rollback,
+                "summon cap rollback failed"
+            );
+        }
+        return Err(internal("summon cap was not stored"));
     }
 
     Ok(Json(wire::SummonCap {

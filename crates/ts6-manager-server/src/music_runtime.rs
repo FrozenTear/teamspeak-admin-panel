@@ -412,6 +412,43 @@ impl MusicBotFront {
         }
     }
 
+    /// Put the music process back on `cap` after a database write failed.
+    /// `None` clears the number the process just accepted.
+    pub async fn restore_summon_cap(
+        &self,
+        server_addr: &str,
+        cap: Option<u32>,
+    ) -> Result<(), MusicRuntimeError> {
+        match cap {
+            Some(cap) => self.set_summon_cap(server_addr, cap).await,
+            None => match &self.inner {
+                FrontInner::Local(s) => s
+                    .restore_summon_cap(server_addr, None)
+                    .map_err(MusicRuntimeError::Unavailable),
+                FrontInner::Remote(r) => r.clear_summon_cap(server_addr).await,
+            },
+        }
+    }
+
+    /// Stored process cap for tests. Outer `None` means this front is remote.
+    /// Inner `None` means the process has no number for that server.
+    #[cfg(test)]
+    pub fn local_summon_cap(&self, server_addr: &str) -> Option<Option<u32>> {
+        match &self.inner {
+            FrontInner::Local(s) => Some(s.summon().cap(server_addr)),
+            FrontInner::Remote(_) => None,
+        }
+    }
+
+    /// Whether summon is armed on the local process.
+    #[cfg(test)]
+    pub fn local_summon_armed(&self, server_addr: &str) -> Option<bool> {
+        match &self.inner {
+            FrontInner::Local(s) => Some(s.summon().armed(server_addr)),
+            FrontInner::Remote(_) => None,
+        }
+    }
+
     /// Quiet-client count for tests and the local process. `None` when
     /// this front is only an HTTP client.
     #[cfg(test)]
@@ -883,7 +920,26 @@ impl RemoteMusicRuntime {
             .authorize(self.http.put(format!("{}/v1/summon-cap", self.base)).json(
                 &SummonCapBody {
                     server_addr: server_addr.to_string(),
-                    cap,
+                    cap: Some(cap),
+                },
+            ))?
+            .send()
+            .await
+            .map_err(|e| runtime_err(format!("summon cap: {e}")))?;
+        self.reject_unauthorized("summon cap", resp.status())?;
+        if !resp.status().is_success() {
+            return Err(runtime_err(format!("summon cap: {}", resp.status())));
+        }
+        self.clear_auth_latch();
+        Ok(())
+    }
+
+    async fn clear_summon_cap(&self, server_addr: &str) -> Result<(), MusicRuntimeError> {
+        let resp = self
+            .authorize(self.http.put(format!("{}/v1/summon-cap", self.base)).json(
+                &SummonCapBody {
+                    server_addr: server_addr.to_string(),
+                    cap: None,
                 },
             ))?
             .send()

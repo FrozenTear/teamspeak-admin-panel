@@ -423,10 +423,11 @@ async fn put_summon_cap(
     State(state): State<RuntimeState>,
     Json(req): Json<SummonCapBody>,
 ) -> Result<StatusCode, Response> {
-    state
-        .supervisor
-        .accept_summon_cap(&req.server_addr, req.cap)
-        .map_err(|err| status_err(StatusCode::BAD_REQUEST, &err))?;
+    let result = match req.cap {
+        Some(cap) => state.supervisor.accept_summon_cap(&req.server_addr, cap),
+        None => state.supervisor.restore_summon_cap(&req.server_addr, None),
+    };
+    result.map_err(|err| status_err(StatusCode::BAD_REQUEST, &err))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1658,7 +1659,7 @@ mod tests {
             "/v1/summon-cap",
             &SummonCapBody {
                 server_addr: server.into(),
-                cap: 3,
+                cap: Some(3),
             },
         )
         .await;
@@ -1684,7 +1685,7 @@ mod tests {
             "/v1/summon-cap",
             &SummonCapBody {
                 server_addr: server.into(),
-                cap: 2,
+                cap: Some(2),
             },
         )
         .await;
@@ -1700,7 +1701,7 @@ mod tests {
                 "/v1/summon-cap",
                 &SummonCapBody {
                     server_addr: server.into(),
-                    cap,
+                    cap: Some(cap),
                 },
             )
             .await;
@@ -1720,5 +1721,63 @@ mod tests {
             .unwrap();
         let listed: ListResponse = json(listed).await;
         assert_eq!(listed.bots.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn summon_cap_null_clears_an_accepted_number() {
+        let state = RuntimeState::new();
+        let supervisor = Arc::clone(&state.supervisor);
+        let app = router(state);
+        let server = "10.4.0.1:9987";
+
+        let spawned = send_json(
+            &app,
+            "POST",
+            "/v1/bots",
+            &summon_spawn("known", server, None),
+        )
+        .await;
+        assert_eq!(spawned.status(), StatusCode::OK);
+
+        let accepted = send_json(
+            &app,
+            "PUT",
+            "/v1/summon-cap",
+            &SummonCapBody {
+                server_addr: server.into(),
+                cap: Some(2),
+            },
+        )
+        .await;
+        assert_eq!(accepted.status(), StatusCode::NO_CONTENT);
+        assert_eq!(supervisor.summon().quiet_count(server), 2);
+        assert!(supervisor.summon().armed(server));
+
+        let cleared = send_json(
+            &app,
+            "PUT",
+            "/v1/summon-cap",
+            &SummonCapBody {
+                server_addr: server.into(),
+                cap: None,
+            },
+        )
+        .await;
+        assert_eq!(cleared.status(), StatusCode::NO_CONTENT);
+        assert_eq!(supervisor.summon().cap(server), None);
+        assert!(!supervisor.summon().armed(server));
+        assert_eq!(supervisor.summon().quiet_count(server), 0);
+
+        let later = send_json(
+            &app,
+            "POST",
+            "/v1/bots",
+            &summon_spawn("later", server, None),
+        )
+        .await;
+        assert_eq!(later.status(), StatusCode::OK);
+        assert!(!supervisor.summon().armed(server));
+        assert_eq!(supervisor.summon().quiet_count(server), 0);
+        assert_eq!(supervisor.summon().cap(server), None);
     }
 }

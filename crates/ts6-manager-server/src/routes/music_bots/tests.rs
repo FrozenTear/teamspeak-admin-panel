@@ -2774,3 +2774,134 @@ async fn a_later_bot_push_carries_only_that_servers_stored_cap() {
         }]
     );
 }
+
+#[tokio::test]
+async fn a_failed_store_rolls_the_music_process_back_to_the_stored_cap() {
+    let (app, token, state) = make_test_app().await;
+    let _bot = create_test_bot(&app, &token).await;
+    assert_eq!(
+        put_summon_cap(&app, &token, "127.0.0.1:9987", 1)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        state
+            .music_bots
+            .supervisor
+            .local_quiet_count("127.0.0.1:9987"),
+        Some(1)
+    );
+
+    state
+        .db
+        .query("DEFINE FIELD OVERWRITE cap ON music_summon_cap TYPE int ASSERT $value = 1;")
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+    let failed = put_summon_cap(&app, &token, "127.0.0.1:9987", 4).await;
+    assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        state
+            .music_bots
+            .supervisor
+            .local_summon_cap("127.0.0.1:9987"),
+        Some(Some(1)),
+        "the process is back on the stored number without another push or a restart"
+    );
+    assert_eq!(
+        state
+            .music_bots
+            .supervisor
+            .local_quiet_count("127.0.0.1:9987"),
+        Some(1)
+    );
+    assert_eq!(
+        state
+            .music_bots
+            .supervisor
+            .local_summon_armed("127.0.0.1:9987"),
+        Some(true)
+    );
+    assert_eq!(
+        get_summon_caps(&app, &token).await.caps,
+        vec![wire::SummonCap {
+            server_addr: "127.0.0.1:9987".into(),
+            cap: 1,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn a_failed_first_store_clears_the_number_the_process_accepted() {
+    let (app, token, state) = make_test_app().await;
+    let _bot = create_test_bot(&app, &token).await;
+    assert_eq!(
+        state
+            .music_bots
+            .supervisor
+            .local_summon_armed("127.0.0.1:9987"),
+        Some(false)
+    );
+
+    state
+        .db
+        .query(
+            "DEFINE FIELD OVERWRITE serverAddr ON music_summon_cap TYPE string ASSERT $value = 'blocked';",
+        )
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+    let failed = put_summon_cap(&app, &token, "127.0.0.1:9987", 2).await;
+    assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        state
+            .music_bots
+            .supervisor
+            .local_summon_cap("127.0.0.1:9987"),
+        Some(None)
+    );
+    assert_eq!(
+        state
+            .music_bots
+            .supervisor
+            .local_summon_armed("127.0.0.1:9987"),
+        Some(false)
+    );
+    assert_eq!(
+        state
+            .music_bots
+            .supervisor
+            .local_quiet_count("127.0.0.1:9987"),
+        Some(0)
+    );
+    assert!(get_summon_caps(&app, &token).await.caps.is_empty());
+
+    let _later = create_test_bot(&app, &token).await;
+    assert_eq!(
+        state
+            .music_bots
+            .supervisor
+            .local_summon_armed("127.0.0.1:9987"),
+        Some(false),
+        "a later push that carries no number does not arm the cleared cap"
+    );
+    assert_eq!(
+        state
+            .music_bots
+            .supervisor
+            .local_quiet_count("127.0.0.1:9987"),
+        Some(0)
+    );
+    assert_eq!(
+        state
+            .music_bots
+            .supervisor
+            .local_summon_cap("127.0.0.1:9987"),
+        Some(None)
+    );
+}

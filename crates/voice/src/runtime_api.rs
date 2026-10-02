@@ -38,11 +38,12 @@ pub struct SpawnRequest {
 }
 
 /// Body of `PUT /v1/summon-cap`. One number for one server address.
+/// `cap: null` clears a number the database did not keep.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SummonCapBody {
     pub server_addr: String,
-    pub cap: u32,
+    pub cap: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

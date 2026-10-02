@@ -183,6 +183,21 @@ impl SummonDirector {
         Ok(())
     }
 
+    /// Put this server back to a cap the database still has. `None` means
+    /// nothing is stored: the number is cleared and quiet clients started
+    /// for the rejected number are stopped.
+    pub fn restore_cap(&self, server: &str, cap: Option<u32>) -> Result<(), String> {
+        {
+            let mut state = self.lock();
+            match cap {
+                Some(cap) => state.accept_cap(server, cap)?,
+                None => state.clear_cap(server)?,
+            }
+        }
+        self.launch_pending();
+        Ok(())
+    }
+
     /// The session has subscribed on its own connection and knows the
     /// tech-support channel it landed in.
     pub fn mark_ready(&self, server: &str, slot: u32, home: u64, clients: &[ListedClient]) {
@@ -284,6 +299,17 @@ impl SummonDirector {
 
     pub fn cap(&self, server: &str) -> Option<u32> {
         self.lock().servers.get(server).and_then(|pool| pool.cap)
+    }
+
+    /// Song the quiet client is already committed to, if it is out.
+    #[cfg(test)]
+    pub fn assigned_request(&self, server: &str, slot: u32) -> Option<String> {
+        self.lock()
+            .slot(server, slot)
+            .and_then(|slot| match &slot.phase {
+                Phase::Out { request, .. } => Some(request.clone()),
+                Phase::Sitting => None,
+            })
     }
 
     pub fn armed(&self, server: &str) -> bool {
@@ -492,6 +518,22 @@ impl SummonState {
         Ok(())
     }
 
+    fn clear_cap(&mut self, server: &str) -> Result<(), String> {
+        if server.is_empty() {
+            return Err("server address is empty".into());
+        }
+        let Some(pool) = self.servers.get_mut(server) else {
+            return Ok(());
+        };
+        pool.cap = None;
+        pool.armed = false;
+        let removed = std::mem::take(&mut pool.slots);
+        for slot in removed {
+            let _ = slot.stop.send(true);
+        }
+        Ok(())
+    }
+
     fn push_slot(&mut self, server: &str, saved: &[PathBuf]) {
         let slot_no = self
             .servers
@@ -598,11 +640,11 @@ impl SummonState {
             .find(|client| client.id == sender_id)
             .map(|client| client.channel_id)
             .expect("sender was on the list");
-        if let Some(occupant) = self.occupant(server, channel) {
-            if occupant != slot_id {
-                return Vec::new();
-            }
-            return self.keep_on_occupant(server, slot_id, arg);
+        // A channel that already has a quiet client is finished with this
+        // request. No new song, no move, no extra client. The occupant
+        // keeps the pipeline it already has.
+        if self.occupant(server, channel).is_some() {
+            return Vec::new();
         }
         let sitting = self
             .slot(server, slot_id)
@@ -642,37 +684,6 @@ impl SummonState {
         }
         let mut instr = QuietInstruction::bare(slot_id);
         instr.move_to = Some(channel);
-        instr.kept_request = Some(arg);
-        vec![instr]
-    }
-
-    fn keep_on_occupant(
-        &mut self,
-        server: &str,
-        slot_id: u32,
-        arg: String,
-    ) -> Vec<QuietInstruction> {
-        let Some(slot) = self.slot_mut(server, slot_id) else {
-            return Vec::new();
-        };
-        let Phase::Out {
-            request,
-            arrived,
-            playing,
-            ..
-        } = &mut slot.phase
-        else {
-            return Vec::new();
-        };
-        *request = arg.clone();
-        if *arrived {
-            *playing = true;
-            let mut instr = QuietInstruction::bare(slot_id);
-            instr.play = Some(arg);
-            instr.kept_request = instr.play.clone();
-            return vec![instr];
-        }
-        let mut instr = QuietInstruction::bare(slot_id);
         instr.kept_request = Some(arg);
         vec![instr]
     }
@@ -726,6 +737,14 @@ impl SummonState {
             None => self.finish(server, slot_id),
             Some(client) if client.channel_id != channel => {
                 let new_channel = client.channel_id;
+                if self
+                    .occupant(server, new_channel)
+                    .is_some_and(|other| other != slot_id)
+                {
+                    // The caller left, and the destination already has a
+                    // quiet client. Do not follow into it.
+                    return self.finish(server, slot_id);
+                }
                 let Some(slot) = self.slot_mut(server, slot_id) else {
                     return Vec::new();
                 };
@@ -1138,6 +1157,22 @@ mod tests {
         assert!(!director.offer_frame(SERVER, slots[0]));
         assert_eq!(director.frames_sent(SERVER, slots[0]), 0);
 
+        let while_moving = director.on_chat(
+            SERVER,
+            slots[0],
+            11,
+            "!play https://cdn.example/two.mp3",
+            &[person(11, 5), person(10, 5)],
+        );
+        assert!(
+            while_moving.is_empty(),
+            "a second summon before arrival does not replace the pending song"
+        );
+        assert_eq!(
+            director.assigned_request(SERVER, slots[0]).as_deref(),
+            Some("https://cdn.example/one.mp3")
+        );
+
         let arrived = director.on_book(SERVER, slots[0], 5, &[person(10, 5), person(1, 5)]);
         assert_eq!(
             arrived[0].play.as_deref(),
@@ -1158,19 +1193,43 @@ mod tests {
             "the other client does not join the same channel"
         );
         let kept = director.connection_id(SERVER, slots[0]);
+        let paths = director.identity_paths(SERVER);
+        let sent = director.frames_sent(SERVER, slots[0]);
+        let blocked = director.frames_blocked(SERVER, slots[0]);
+        let book = director.on_book(SERVER, slots[0], 5, &[person(11, 5), person(10, 5)]);
         let again = director.on_chat(
             SERVER,
             slots[0],
             11,
             "!play https://cdn.example/two.mp3",
-            &[person(11, 5)],
+            &[person(11, 5), person(10, 5)],
+        );
+        assert!(
+            book.is_empty() && again.is_empty(),
+            "a second summon does nothing: no end-of-voice, no new song, no move"
+        );
+        assert!(
+            again
+                .iter()
+                .chain(book.iter())
+                .all(|instr| instr.play.is_none() && !instr.stop_audio && instr.move_to.is_none())
         );
         assert_eq!(
-            again[0].play.as_deref(),
-            Some("https://cdn.example/two.mp3")
+            director.frames_blocked(SERVER, slots[0]),
+            blocked,
+            "the second summon does not drop or reject the frames already in flight"
         );
-        assert!(again[0].move_to.is_none());
+        assert_eq!(
+            director.assigned_request(SERVER, slots[0]).as_deref(),
+            Some("https://cdn.example/one.mp3"),
+            "the client keeps the song it was playing"
+        );
+        assert!(director.playback_open(SERVER, slots[0]));
+        assert!(director.offer_frame(SERVER, slots[0]));
+        assert_eq!(director.frames_sent(SERVER, slots[0]), sent + 1);
         assert_eq!(director.connection_id(SERVER, slots[0]), kept);
+        assert_eq!(director.identity_paths(SERVER), paths);
+        assert_eq!(director.quiet_count(SERVER), 2);
 
         let second = director.on_chat(
             SERVER,
@@ -1274,6 +1333,95 @@ mod tests {
         assert!(!director.playback_open(SERVER, slot));
         assert_eq!(director.saved_ids(SERVER), vec![7]);
         assert_eq!(director.connection_id(SERVER, slot), connection);
+    }
+
+    #[test]
+    fn follow_does_not_enter_a_channel_that_already_has_a_quiet_client() {
+        let director = boot(2);
+        let slots = director.slot_ids(SERVER);
+        director.on_chat(
+            SERVER,
+            slots[0],
+            10,
+            "!play https://cdn.example/one.mp3",
+            &[person(10, 5)],
+        );
+        director.on_book(SERVER, slots[0], 5, &[person(10, 5)]);
+        director.on_chat(
+            SERVER,
+            slots[1],
+            12,
+            "!play https://cdn.example/two.mp3",
+            &[person(12, 8)],
+        );
+        director.on_book(SERVER, slots[1], 8, &[person(12, 8)]);
+        let sent = director.frames_sent(SERVER, slots[0]);
+        let occupant = director.connection_id(SERVER, slots[0]);
+
+        let follow = director.on_book(SERVER, slots[1], 8, &[person(12, 5), person(10, 5)]);
+        assert!(
+            follow.iter().all(|instr| instr.move_to != Some(5)),
+            "the follower does not move into the occupied channel"
+        );
+        assert!(follow.iter().all(|instr| instr.play.is_none()));
+        assert_eq!(follow[0].move_to, Some(HOME));
+        assert!(follow[0].stop_audio);
+        assert!(director.playback_open(SERVER, slots[0]));
+        assert_eq!(
+            director.assigned_request(SERVER, slots[0]).as_deref(),
+            Some("https://cdn.example/one.mp3")
+        );
+        assert!(director.offer_frame(SERVER, slots[0]));
+        assert_eq!(director.frames_sent(SERVER, slots[0]), sent + 1);
+        assert_eq!(director.connection_id(SERVER, slots[0]), occupant);
+        assert!(director.assigned_request(SERVER, slots[1]).is_none());
+        assert_eq!(director.quiet_count(SERVER), 2);
+        assert_eq!(director.identity_paths(SERVER).len(), 2);
+    }
+
+    #[test]
+    fn restore_puts_the_process_back_without_waiting_for_another_push() {
+        let grown = boot(2);
+        assert_eq!(grown.quiet_count(SERVER), 2);
+        grown.accept_cap(SERVER, 4).unwrap();
+        assert_eq!(grown.cap(SERVER), Some(4));
+        assert_eq!(grown.quiet_count(SERVER), 4);
+        grown.restore_cap(SERVER, Some(2)).unwrap();
+        assert_eq!(grown.cap(SERVER), Some(2));
+        assert_eq!(grown.quiet_count(SERVER), 2);
+        grown.note_push(
+            SERVER,
+            8,
+            None,
+            Path::new("/data/music-bot-identities/bot-8.identity"),
+        );
+        assert_eq!(grown.cap(SERVER), Some(2));
+        assert_eq!(grown.quiet_count(SERVER), 2);
+
+        let bare = director();
+        bare.note_push(
+            SERVER,
+            7,
+            None,
+            Path::new("/data/music-bot-identities/bot-7.identity"),
+        );
+        assert!(!bare.armed(SERVER));
+        bare.accept_cap(SERVER, 3).unwrap();
+        assert!(bare.armed(SERVER));
+        assert_eq!(bare.quiet_count(SERVER), 3);
+        bare.restore_cap(SERVER, None).unwrap();
+        assert_eq!(bare.cap(SERVER), None);
+        assert!(!bare.armed(SERVER));
+        assert_eq!(bare.quiet_count(SERVER), 0);
+        bare.note_push(
+            SERVER,
+            9,
+            None,
+            Path::new("/data/music-bot-identities/bot-9.identity"),
+        );
+        assert!(!bare.armed(SERVER));
+        assert_eq!(bare.cap(SERVER), None);
+        assert_eq!(bare.quiet_count(SERVER), 0);
     }
 
     #[test]
