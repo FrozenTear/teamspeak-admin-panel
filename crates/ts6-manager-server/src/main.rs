@@ -212,6 +212,11 @@ mod server_entry {
             // itself from its own `MUSIC_DIR`.
             music_bot::install_music_dir(state.music_dir.clone());
             music_bot::warm_resolver();
+            state.music_bots.supervisor.enable_local_quiet_sessions(
+                state.data_dir.join("quiet-identities"),
+                state.yt_cookie.clone(),
+                state.yt_api_key.clone(),
+            );
         } else {
             if !state.music_bots.supervisor.wait_until_healthy(30).await {
                 tracing::warn!(
@@ -248,11 +253,35 @@ mod server_entry {
         // startup, and an `auto_connect=false` bot is restored idle.
         // When MUSIC_RUNTIME_URL is set, spawn_with_id is an HTTP hop
         // to the music unit (the only send loop).
+        let summon_caps = match crate::repos::music_summon_cap::list(&database).await {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "summon cap lookup failed; rehydrated bots will not arm summon"
+                );
+                Vec::new()
+            }
+        };
         match crate::repos::music_bot_runtime::list(&database).await {
             Ok(rows) => {
                 let count = rows.len();
                 for row in rows {
                     let id = music_bot::BotId(row.id as u64);
+                    let summon_cap = summon_caps
+                        .iter()
+                        .find(|cap| cap.serverAddr == row.serverAddr)
+                        .and_then(|cap| match u32::try_from(cap.cap) {
+                            Ok(n) => Some(n),
+                            Err(_) => {
+                                tracing::warn!(
+                                    server = %cap.serverAddr,
+                                    stored = cap.cap,
+                                    "stored summon cap is not a u32; this push will not arm summon"
+                                );
+                                None
+                            }
+                        });
                     let config = music_bot::BotConfig::new(
                         row.name,
                         std::path::PathBuf::from(row.identityPath),
@@ -262,11 +291,12 @@ mod server_entry {
                     match state
                         .music_bots
                         .supervisor
-                        .spawn_with_id(
+                        .spawn_with_id_and_summon(
                             id,
                             config,
                             state.yt_cookie.clone(),
                             state.yt_api_key.clone(),
+                            summon_cap,
                         )
                         .await
                     {

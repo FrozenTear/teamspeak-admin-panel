@@ -509,6 +509,22 @@ pub enum BotEventWire {
     },
 }
 
+/// One server's summon cap. The key is the bot `serverAddr` string.
+/// Absent from [`SummonCapList`] when nothing is stored for that server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SummonCap {
+    pub server_addr: String,
+    pub cap: u32,
+}
+
+/// `GET /api/music-summon-caps`. Only stored rows. No default entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SummonCapList {
+    pub caps: Vec<SummonCap>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -22,6 +22,7 @@ mod library;
 mod playlists;
 mod radio_stations;
 mod shared;
+mod summon_groups;
 
 pub use detail::BotDetailPage;
 pub use index::BotsIndexPage;

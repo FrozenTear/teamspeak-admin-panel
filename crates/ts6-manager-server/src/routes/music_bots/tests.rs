@@ -2393,3 +2393,384 @@ async fn runtime_auth_mapping_uses_http_status_not_message_text() {
     let command_other_body = body_string(command_other).await;
     assert_ne!(command_other_body, r#"{"error":"music_runtime_auth"}"#);
 }
+
+async fn put_summon_cap(
+    app: &Router,
+    token: &str,
+    server: &str,
+    cap: u32,
+) -> axum::http::Response<Body> {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/api/music-summon-caps")
+                .header("authorization", auth_header(token))
+                .header("content-type", "application/json")
+                .body(json_body(&wire::SummonCap {
+                    server_addr: server.into(),
+                    cap,
+                }))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+async fn get_summon_caps(app: &Router, token: &str) -> wire::SummonCapList {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/music-summon-caps")
+                .header("authorization", auth_header(token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    read_json(resp).await
+}
+
+#[tokio::test]
+async fn summon_cap_is_empty_until_stored_and_a_failed_forward_keeps_the_old_number() {
+    let (app, token, state) = make_test_app().await;
+    let listed = get_summon_caps(&app, &token).await;
+    assert!(
+        listed.caps.is_empty(),
+        "nothing stored must not invent a cap"
+    );
+
+    let created = put_summon_cap(&app, &token, "127.0.0.1:9987", 1).await;
+    assert_eq!(
+        state
+            .music_bots
+            .supervisor
+            .local_quiet_count("127.0.0.1:9987"),
+        Some(0),
+        "a stored cap starts no quiet client until a saved bot is known"
+    );
+    assert_eq!(created.status(), StatusCode::OK);
+    let stored: wire::SummonCap = read_json(created).await;
+    assert_eq!(stored.cap, 1);
+
+    let other = put_summon_cap(&app, &token, "127.0.0.1:9988", 4).await;
+    assert_eq!(other.status(), StatusCode::OK);
+    let zero = put_summon_cap(&app, &token, "127.0.0.1:9988", 0).await;
+    assert_eq!(zero.status(), StatusCode::OK);
+
+    let listed = get_summon_caps(&app, &token).await;
+    assert_eq!(listed.caps.len(), 2);
+    assert_eq!(listed.caps[0].server_addr, "127.0.0.1:9987");
+    assert_eq!(listed.caps[0].cap, 1);
+    assert_eq!(listed.caps[1].server_addr, "127.0.0.1:9988");
+    assert_eq!(listed.caps[1].cap, 0);
+
+    let too_big = put_summon_cap(&app, &token, "127.0.0.1:9987", 65).await;
+    assert_eq!(too_big.status(), StatusCode::BAD_REQUEST);
+    let empty = put_summon_cap(&app, &token, "   ", 3).await;
+    assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
+
+    let mut broken = state.clone();
+    broken.music_bots = MusicBotService::remote(
+        std::env::temp_dir().join("ts6-test-summon-cap-forward-down"),
+        "http://127.0.0.1:1",
+        None,
+    );
+    let failed = put_summon_cap(
+        &Router::new().merge(super::router()).with_state(broken),
+        &token,
+        "127.0.0.1:9987",
+        4,
+    )
+    .await;
+    assert_eq!(failed.status(), StatusCode::BAD_GATEWAY);
+    let listed = get_summon_caps(&app, &token).await;
+    assert_eq!(
+        listed
+            .caps
+            .iter()
+            .find(|cap| cap.server_addr == "127.0.0.1:9987")
+            .map(|cap| cap.cap),
+        Some(1)
+    );
+    assert_eq!(
+        crate::repos::music_summon_cap::get(&state.db, "127.0.0.1:9987")
+            .await
+            .unwrap(),
+        Some(1)
+    );
+}
+
+#[tokio::test]
+async fn saved_bots_share_one_pool_and_do_not_write_the_cap() {
+    let (app, token, state) = make_test_app().await;
+    let first = create_test_bot(&app, &token).await;
+    assert!(get_summon_caps(&app, &token).await.caps.is_empty());
+    assert_eq!(
+        state
+            .music_bots
+            .supervisor
+            .local_quiet_count("127.0.0.1:9987"),
+        Some(0)
+    );
+
+    let saved = put_summon_cap(&app, &token, "127.0.0.1:9987", 1).await;
+    assert_eq!(saved.status(), StatusCode::OK);
+    assert_eq!(
+        state
+            .music_bots
+            .supervisor
+            .local_quiet_count("127.0.0.1:9987"),
+        Some(1),
+        "a known saved bot is enough to arm the cap"
+    );
+
+    let second_body = wire::CreateBotRequest {
+        name: "Second".into(),
+        server_addr: "127.0.0.1:9987".into(),
+        identity_path: None,
+        auto_connect: Some(false),
+    };
+    let second = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/music-bots")
+                .header("authorization", auth_header(&token))
+                .header("content-type", "application/json")
+                .body(json_body(&second_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::CREATED);
+
+    let other_body = wire::CreateBotRequest {
+        name: "Other".into(),
+        server_addr: "127.0.0.1:9988".into(),
+        identity_path: None,
+        auto_connect: Some(false),
+    };
+    let other = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/music-bots")
+                .header("authorization", auth_header(&token))
+                .header("content-type", "application/json")
+                .body(json_body(&other_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(other.status(), StatusCode::CREATED);
+
+    assert_eq!(
+        state
+            .music_bots
+            .supervisor
+            .local_quiet_count("127.0.0.1:9987"),
+        Some(1)
+    );
+    assert_eq!(
+        state
+            .music_bots
+            .supervisor
+            .local_quiet_count("127.0.0.1:9988"),
+        Some(0)
+    );
+    let caps = get_summon_caps(&app, &token).await;
+    assert_eq!(caps.caps.len(), 1);
+    assert_eq!(caps.caps[0].cap, 1);
+
+    let listed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/music-bots")
+                .header("authorization", auth_header(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bots: Vec<wire::MusicBotSummary> = read_json(listed).await;
+    assert_eq!(bots.len(), 3);
+    assert!(bots.iter().any(|bot| bot.id == first.id));
+
+    let rows = crate::repos::music_bot_runtime::list(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|row| !row.identityPath.contains("quiet-")));
+
+    let fresh = crate::music_runtime::MusicBotFront::local(std::sync::Arc::new(
+        music_bot::BotSupervisor::new(),
+    ));
+    for row in &rows {
+        let cap = crate::repos::music_summon_cap::get(&state.db, &row.serverAddr)
+            .await
+            .unwrap();
+        fresh
+            .spawn_with_id_and_summon(
+                music_bot::BotId(row.id as u64),
+                music_bot::BotConfig::new(
+                    row.name.clone(),
+                    std::path::PathBuf::from(&row.identityPath),
+                )
+                .with_server_addr(row.serverAddr.clone())
+                .with_auto_connect(false),
+                state.yt_cookie.clone(),
+                state.yt_api_key.clone(),
+                cap,
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(fresh.list().await.unwrap().len(), 3);
+    assert_eq!(fresh.local_quiet_count("127.0.0.1:9987"), Some(1));
+    assert_eq!(fresh.local_quiet_count("127.0.0.1:9988"), Some(0));
+}
+
+#[tokio::test]
+async fn connect_disconnect_and_dropping_a_quiet_client_leave_the_saved_bot() {
+    let (app, token, state) = make_test_app().await;
+    let created = create_test_bot(&app, &token).await;
+    assert_eq!(
+        put_summon_cap(&app, &token, "127.0.0.1:9987", 1)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        state
+            .music_bots
+            .supervisor
+            .local_quiet_count("127.0.0.1:9987"),
+        Some(1)
+    );
+
+    let connect = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/music-bots/{}/connect", created.id.0))
+                .header("authorization", auth_header(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(connect.status(), StatusCode::ACCEPTED);
+    let disconnect = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/music-bots/{}/disconnect", created.id.0))
+                .header("authorization", auth_header(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(disconnect.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        state
+            .music_bots
+            .supervisor
+            .local_quiet_count("127.0.0.1:9987"),
+        Some(1)
+    );
+
+    let slots = state
+        .music_bots
+        .supervisor
+        .local_slot_ids("127.0.0.1:9987")
+        .unwrap();
+    assert_eq!(slots.len(), 1);
+    assert!(
+        state
+            .music_bots
+            .supervisor
+            .local_drop_quiet("127.0.0.1:9987", slots[0])
+            .unwrap()
+    );
+    assert_eq!(
+        state
+            .music_bots
+            .supervisor
+            .local_quiet_count("127.0.0.1:9987"),
+        Some(0)
+    );
+
+    let detail = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/music-bots/{}", created.id.0))
+                .header("authorization", auth_header(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail.status(), StatusCode::OK);
+    let detail: wire::MusicBotDetail = read_json(detail).await;
+    assert_eq!(detail.id, created.id);
+    assert_eq!(
+        crate::repos::music_bot_runtime::list(&state.db)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_later_bot_push_carries_only_that_servers_stored_cap() {
+    let (app, token, state) = make_test_app().await;
+    assert_eq!(
+        put_summon_cap(&app, &token, "127.0.0.1:9987", 2)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        state
+            .music_bots
+            .supervisor
+            .local_quiet_count("127.0.0.1:9987"),
+        Some(0)
+    );
+    let _created = create_test_bot(&app, &token).await;
+    assert_eq!(
+        state
+            .music_bots
+            .supervisor
+            .local_quiet_count("127.0.0.1:9987"),
+        Some(2)
+    );
+    let _second = create_test_bot(&app, &token).await;
+    assert_eq!(
+        state
+            .music_bots
+            .supervisor
+            .local_quiet_count("127.0.0.1:9987"),
+        Some(2)
+    );
+    assert_eq!(
+        get_summon_caps(&app, &token).await.caps,
+        vec![wire::SummonCap {
+            server_addr: "127.0.0.1:9987".into(),
+            cap: 2,
+        }]
+    );
+}

@@ -159,8 +159,14 @@ async fn create(
     config = config.with_server_addr(req.server_addr.clone());
     config = config.with_auto_connect(auto_connect);
 
+    let summon_cap = super::summon::cap_for_push(&state, &req.server_addr).await;
     let id = supervisor
-        .spawn(config, state.yt_cookie.clone(), state.yt_api_key.clone())
+        .spawn_with_summon_cap(
+            config,
+            state.yt_cookie.clone(),
+            state.yt_api_key.clone(),
+            summon_cap,
+        )
         .await
         .map_err(map_music_runtime_error)?;
     state.music_bots.watch(id).await;
@@ -427,7 +433,7 @@ async fn server_for_addr(
         .ok_or_else(|| validation("serverAddr does not match a configured server"))
 }
 
-async fn require_server_write(
+pub(super) async fn require_server_write(
     state: &AppState,
     user: &crate::auth::extractors::AuthUser,
     server_addr: &str,

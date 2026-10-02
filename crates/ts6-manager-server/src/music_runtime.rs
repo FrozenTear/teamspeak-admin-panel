@@ -14,7 +14,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use music_bot::runtime_api::{
     BugReportContextResponse, ListResponse, MutateOp, SendRequest, SettingsRequest, SpawnRequest,
-    SpawnResponse, StoreOp, WireError, store_err_from_wire,
+    SpawnResponse, StoreOp, SummonCapBody, WireError, store_err_from_wire,
 };
 use music_bot::{
     BotCommand, BotConfig, BotEvent, BotId, BotInfo, BotSupervisor, LibraryEntry, LibraryEntryId,
@@ -296,6 +296,9 @@ impl MusicBotFront {
         }
     }
 
+    /// Spawn without carrying a summon cap. Create and rehydrate use the
+    /// carrying methods. This remains for a push that must not arm summon.
+    #[allow(dead_code)]
     pub async fn spawn(
         &self,
         config: BotConfig,
@@ -304,10 +307,19 @@ impl MusicBotFront {
     ) -> Result<BotId, MusicRuntimeError> {
         match &self.inner {
             FrontInner::Local(s) => Ok(s.spawn(config, yt_cookie, yt_api_key).await),
-            FrontInner::Remote(r) => r.spawn(SpawnRequest { config, id: None }).await,
+            FrontInner::Remote(r) => {
+                r.spawn(SpawnRequest {
+                    config,
+                    id: None,
+                    summon_cap: None,
+                })
+                .await
+            }
         }
     }
 
+    /// Re-spawn a known id without carrying a summon cap.
+    #[allow(dead_code)]
     pub async fn spawn_with_id(
         &self,
         id: BotId,
@@ -321,9 +333,122 @@ impl MusicBotFront {
                 r.spawn(SpawnRequest {
                     config,
                     id: Some(id.0),
+                    summon_cap: None,
                 })
                 .await
             }
+        }
+    }
+
+    /// Spawn a saved bot and, when `summon_cap` is `Some`, carry that
+    /// server's number on the push. `None` does not arm summon.
+    pub async fn spawn_with_summon_cap(
+        &self,
+        config: BotConfig,
+        yt_cookie: Arc<RwLock<Option<PathBuf>>>,
+        yt_api_key: Arc<RwLock<Option<String>>>,
+        summon_cap: Option<u32>,
+    ) -> Result<BotId, MusicRuntimeError> {
+        let server = config.server_addr.clone();
+        let identity = config.identity_path.clone();
+        match &self.inner {
+            FrontInner::Local(s) => {
+                let id = s.spawn(config, yt_cookie, yt_api_key).await;
+                s.note_summon_push(&server, id.0, summon_cap, &identity);
+                Ok(id)
+            }
+            FrontInner::Remote(r) => {
+                r.spawn(SpawnRequest {
+                    config,
+                    id: None,
+                    summon_cap,
+                })
+                .await
+            }
+        }
+    }
+
+    /// Rehydrate a saved bot and carry the server's summon cap when one
+    /// is stored.
+    pub async fn spawn_with_id_and_summon(
+        &self,
+        id: BotId,
+        config: BotConfig,
+        yt_cookie: Arc<RwLock<Option<PathBuf>>>,
+        yt_api_key: Arc<RwLock<Option<String>>>,
+        summon_cap: Option<u32>,
+    ) -> Result<BotId, MusicRuntimeError> {
+        let server = config.server_addr.clone();
+        let identity = config.identity_path.clone();
+        match &self.inner {
+            FrontInner::Local(s) => {
+                let id = s.spawn_with_id(id, config, yt_cookie, yt_api_key).await;
+                s.note_summon_push(&server, id.0, summon_cap, &identity);
+                Ok(id)
+            }
+            FrontInner::Remote(r) => {
+                r.spawn(SpawnRequest {
+                    config,
+                    id: Some(id.0),
+                    summon_cap,
+                })
+                .await
+            }
+        }
+    }
+
+    /// Forward a cap to the music process. Local acceptance is the
+    /// in-process director. Remote acceptance is `PUT /v1/summon-cap`.
+    pub async fn set_summon_cap(
+        &self,
+        server_addr: &str,
+        cap: u32,
+    ) -> Result<(), MusicRuntimeError> {
+        match &self.inner {
+            FrontInner::Local(s) => s
+                .accept_summon_cap(server_addr, cap)
+                .map_err(MusicRuntimeError::Unavailable),
+            FrontInner::Remote(r) => r.set_summon_cap(server_addr, cap).await,
+        }
+    }
+
+    /// Quiet-client count for tests and the local process. `None` when
+    /// this front is only an HTTP client.
+    #[cfg(test)]
+    pub fn local_quiet_count(&self, server_addr: &str) -> Option<usize> {
+        match &self.inner {
+            FrontInner::Local(s) => Some(s.summon().quiet_count(server_addr)),
+            FrontInner::Remote(_) => None,
+        }
+    }
+
+    /// Slot ids of the in-process quiet clients. `None` on a remote front.
+    #[cfg(test)]
+    pub fn local_slot_ids(&self, server_addr: &str) -> Option<Vec<u32>> {
+        match &self.inner {
+            FrontInner::Local(s) => Some(s.summon().slot_ids(server_addr)),
+            FrontInner::Remote(_) => None,
+        }
+    }
+
+    /// Drop one in-process quiet client. Saved bots stay. `None` on a
+    /// remote front.
+    #[cfg(test)]
+    pub fn local_drop_quiet(&self, server_addr: &str, slot: u32) -> Option<bool> {
+        match &self.inner {
+            FrontInner::Local(s) => Some(s.summon().drop_quiet(server_addr, slot)),
+            FrontInner::Remote(_) => None,
+        }
+    }
+
+    pub fn enable_local_quiet_sessions(
+        &self,
+        identity_dir: PathBuf,
+        yt_cookie: Arc<RwLock<Option<PathBuf>>>,
+        yt_api_key: Arc<RwLock<Option<String>>>,
+    ) {
+        if let FrontInner::Local(s) = &self.inner {
+            s.enable_quiet_sessions(identity_dir, yt_cookie, yt_api_key);
         }
     }
 
@@ -751,6 +876,25 @@ impl RemoteMusicRuntime {
             .await
             .map_err(|e| runtime_err(format!("spawn: {e}")))?;
         Ok(body.id)
+    }
+
+    async fn set_summon_cap(&self, server_addr: &str, cap: u32) -> Result<(), MusicRuntimeError> {
+        let resp = self
+            .authorize(self.http.put(format!("{}/v1/summon-cap", self.base)).json(
+                &SummonCapBody {
+                    server_addr: server_addr.to_string(),
+                    cap,
+                },
+            ))?
+            .send()
+            .await
+            .map_err(|e| runtime_err(format!("summon cap: {e}")))?;
+        self.reject_unauthorized("summon cap", resp.status())?;
+        if !resp.status().is_success() {
+            return Err(runtime_err(format!("summon cap: {}", resp.status())));
+        }
+        self.clear_auth_latch();
+        Ok(())
     }
 
     async fn send(&self, id: BotId, command: BotCommand) -> Result<(), FrontSendError> {
@@ -2026,5 +2170,78 @@ mod tests {
         // `load`. This one does not mutate the process environment.
         let missing = MusicRuntimeToken::from_os_value(None).unwrap();
         assert!(missing.is_none());
+    }
+
+    #[tokio::test]
+    async fn remote_front_forwards_summon_cap_and_a_carrying_spawn() {
+        let state = music_bot::runtime_http::RuntimeState::new();
+        let supervisor = Arc::clone(&state.supervisor);
+        let app = music_bot::runtime_http::router(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let front = MusicBotFront::remote(format!("http://{addr}"));
+        let server = "10.4.0.1:9987";
+        let other = "10.4.0.2:9987";
+
+        front.set_summon_cap(server, 2).await.expect("put cap");
+        assert_eq!(supervisor.summon().cap(server), Some(2));
+        assert_eq!(supervisor.summon().quiet_count(server), 0);
+
+        let cookie = Arc::new(RwLock::new(None));
+        let key = Arc::new(RwLock::new(None));
+        front
+            .spawn_with_summon_cap(
+                BotConfig::new(
+                    "remote-a",
+                    std::env::temp_dir().join("remote-summon-a.identity"),
+                )
+                .with_server_addr(server)
+                .with_auto_connect(false),
+                Arc::clone(&cookie),
+                Arc::clone(&key),
+                Some(2),
+            )
+            .await
+            .expect("spawn with cap");
+        assert_eq!(supervisor.summon().quiet_count(server), 2);
+        assert_eq!(front.list().await.unwrap().len(), 1);
+
+        front
+            .spawn_with_summon_cap(
+                BotConfig::new(
+                    "remote-b",
+                    std::env::temp_dir().join("remote-summon-b.identity"),
+                )
+                .with_server_addr(server)
+                .with_auto_connect(false),
+                Arc::clone(&cookie),
+                Arc::clone(&key),
+                Some(9),
+            )
+            .await
+            .expect("second spawn");
+        assert_eq!(supervisor.summon().quiet_count(server), 2);
+        assert_eq!(supervisor.summon().cap(server), Some(2));
+
+        front
+            .spawn_with_summon_cap(
+                BotConfig::new(
+                    "remote-c",
+                    std::env::temp_dir().join("remote-summon-c.identity"),
+                )
+                .with_server_addr(other)
+                .with_auto_connect(false),
+                cookie,
+                key,
+                None,
+            )
+            .await
+            .expect("other server");
+        assert_eq!(supervisor.summon().quiet_count(other), 0);
+        assert_eq!(supervisor.summon().cap(other), None);
+        assert_eq!(front.list().await.unwrap().len(), 3);
     }
 }

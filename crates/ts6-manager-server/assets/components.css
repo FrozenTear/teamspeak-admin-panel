@@ -891,6 +891,18 @@ a:hover {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.data-table tr.summon-cap-row td {
+  background: var(--bg-surface-sunken);
+}
+.summon-cap-editor {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+.summon-cap-editor .input {
+  width: 5rem;
+}
 button.client-uid-copy {
   display: inline-block;
   padding: 0;
