@@ -3321,3 +3321,56 @@ async fn a_catch_up_write_returns_the_number_that_stuck() {
         .expect("the catch-up number is stored");
     assert_eq!(row.cap, 4);
 }
+
+#[tokio::test]
+async fn a_forward_error_after_accept_returns_the_number_the_process_holds() {
+    let (app, token, state) = make_test_app().await;
+    let _bot = create_test_bot(&app, &token).await;
+    let server = "127.0.0.1:9993";
+    assert_eq!(
+        put_summon_cap(&app, &token, server, 1).await.status(),
+        StatusCode::OK
+    );
+    super::summon::arm_forward_error_after_accept(server);
+    let saved = put_summon_cap(&app, &token, server, 4).await;
+    super::summon::clear_cap_save_fault(server);
+    assert_eq!(saved.status(), StatusCode::OK);
+    let body: wire::SummonCap = read_json(saved).await;
+    assert_eq!(body.server_addr, server);
+    assert_eq!(body.cap, 4);
+    assert_eq!(
+        state.music_bots.supervisor.local_summon_cap(server),
+        Some(Some(4))
+    );
+    assert_eq!(
+        crate::repos::music_summon_cap::get(&state.db, server)
+            .await
+            .unwrap(),
+        Some(4)
+    );
+}
+
+#[tokio::test]
+async fn a_forward_error_leaves_the_store_when_the_process_is_still_on_the_old_number() {
+    let (app, token, state) = make_test_app().await;
+    let _bot = create_test_bot(&app, &token).await;
+    let server = "127.0.0.1:9994";
+    assert_eq!(
+        put_summon_cap(&app, &token, server, 1).await.status(),
+        StatusCode::OK
+    );
+    super::summon::arm_forward_error_before_accept(server);
+    let failed = put_summon_cap(&app, &token, server, 4).await;
+    super::summon::clear_cap_save_fault(server);
+    assert_eq!(failed.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        state.music_bots.supervisor.local_summon_cap(server),
+        Some(Some(1))
+    );
+    assert_eq!(
+        crate::repos::music_summon_cap::get(&state.db, server)
+            .await
+            .unwrap(),
+        Some(1)
+    );
+}

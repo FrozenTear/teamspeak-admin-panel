@@ -84,19 +84,22 @@ async fn set(
         guard: Some(guard),
     };
 
-    if let Err(err) = state
-        .music_bots
-        .supervisor
-        .set_summon_cap(&server_addr, req.cap)
-        .await
-    {
+    if let Err(err) = forward_cap(&state.music_bots.supervisor, &server_addr, req.cap).await {
         error!(
             server = %server_addr,
             cap = req.cap,
             error = %err,
-            "summon cap forward failed; restoring the stored number"
+            "summon cap forward failed; reading the number the process holds"
         );
-        align_held(&mut unsettled).await;
+        if process_already_accepted(&unsettled.front, &server_addr, req.cap).await {
+            unsettled.forwarded = Some(req.cap);
+            store_accepted(&unsettled, req.cap).await;
+            unsettled.settled = true;
+            return Ok(Json(wire::SummonCap {
+                server_addr,
+                cap: req.cap,
+            }));
+        }
         unsettled.settled = true;
         return Err(map_music_runtime_error(err));
     }
@@ -152,6 +155,87 @@ fn number_that_stuck(requested: u32, outcome: AlignOutcome) -> Result<u32, ()> {
         AlignOutcome::CaughtUp(cap) => Ok(cap),
         AlignOutcome::Restored(Some(cap)) if cap == requested => Ok(cap),
         AlignOutcome::Restored(_) => Err(()),
+    }
+}
+
+/// Send the cap to the music process. An `Err` does not by itself mean
+/// the process rejected the number: the process may already hold it.
+async fn forward_cap(
+    front: &MusicBotFront,
+    server: &str,
+    cap: u32,
+) -> Result<(), crate::music_runtime::MusicRuntimeError> {
+    #[cfg(test)]
+    if save_fault::take_forward_error_before_accept(server) {
+        return Err(crate::music_runtime::MusicRuntimeError::Unavailable(
+            "summon cap forward failed before the process changed".into(),
+        ));
+    }
+    let result = front.set_summon_cap(server, cap).await;
+    #[cfg(test)]
+    if result.is_ok() && save_fault::take_forward_error_after_accept(server) {
+        return Err(crate::music_runtime::MusicRuntimeError::Unavailable(
+            "summon cap forward failed after the process accepted the number".into(),
+        ));
+    }
+    result
+}
+
+/// Read the process under the caller's save lock. `true` when one of
+/// those reads shows `requested`, which means the forward was accepted
+/// even though it returned an error.
+async fn process_already_accepted(front: &MusicBotFront, server: &str, requested: u32) -> bool {
+    let mut wait = Duration::from_millis(20);
+    for attempt in 0..UNACCEPTED_ALIGN_TRIES {
+        match front.read_summon_cap(server).await {
+            Ok(Some(cap)) if cap == requested => return true,
+            Ok(_) => {}
+            Err(err) => {
+                warn!(
+                    server = %server,
+                    error = %err,
+                    "summon cap process read failed"
+                );
+            }
+        }
+        if attempt + 1 < UNACCEPTED_ALIGN_TRIES {
+            tokio::time::sleep(wait).await;
+            wait = (wait * 2).min(Duration::from_millis(200));
+        }
+    }
+    false
+}
+
+/// Write `cap` while the save lock is still held. Returns only when the
+/// store shows that number. The process is already on it, so this does
+/// not put the process back on the old number.
+async fn store_accepted(unsettled: &UnsettledCap, cap: u32) {
+    let mut wait = Duration::from_millis(50);
+    loop {
+        match store_cap(&unsettled.db, &unsettled.server, cap).await {
+            Ok(()) => return,
+            Err(err) => {
+                error!(
+                    server = %unsettled.server,
+                    cap,
+                    error = %err,
+                    "summon cap the process accepted was not stored"
+                );
+            }
+        }
+        match read_cap_retry(&unsettled.db, &unsettled.server).await {
+            Ok(Some(stored)) if stored == cap => return,
+            Ok(_) => {}
+            Err(err) => {
+                error!(
+                    server = %unsettled.server,
+                    error = %err,
+                    "summon cap re-read failed; the captured number is not restored"
+                );
+            }
+        }
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(Duration::from_millis(200));
     }
 }
 
@@ -225,9 +309,9 @@ pub(super) enum AlignOutcome {
     CaughtUp(u32),
 }
 
-/// Restores to attempt when the process never accepted this save.
-/// There is no forwarded number to catch the store up to, so this does
-/// not retry forever. The lock is held the whole time.
+/// Process reads after a forward error. The lock is held the whole time.
+/// A read that shows the new number stops early. Three reads that do not
+/// are the process still on the old number, or a read that never landed.
 const UNACCEPTED_ALIGN_TRIES: u32 = 3;
 
 async fn align_cap(
@@ -413,6 +497,18 @@ pub(super) fn clear_cap_save_fault(server: &str) {
     save_fault::clear(server);
 }
 
+/// The next forward for `server` applies on the process, then returns an error.
+#[cfg(test)]
+pub(super) fn arm_forward_error_after_accept(server: &str) {
+    save_fault::arm_forward_error_after_accept(server);
+}
+
+/// The next forward for `server` returns an error and does not change the process.
+#[cfg(test)]
+pub(super) fn arm_forward_error_before_accept(server: &str) {
+    save_fault::arm_forward_error_before_accept(server);
+}
+
 #[cfg(test)]
 mod save_fault {
     use std::collections::HashMap;
@@ -421,8 +517,23 @@ mod save_fault {
     struct Fault {
         upserts_left: u32,
         restores_left: u32,
+        forward_error_after_accept: bool,
+        forward_error_before_accept: bool,
         paused: Option<tokio::sync::oneshot::Sender<()>>,
         release: Option<tokio::sync::oneshot::Receiver<()>>,
+    }
+
+    impl Fault {
+        fn empty() -> Self {
+            Self {
+                upserts_left: 0,
+                restores_left: 0,
+                forward_error_after_accept: false,
+                forward_error_before_accept: false,
+                paused: None,
+                release: None,
+            }
+        }
     }
 
     fn table() -> &'static Mutex<HashMap<String, Fault>> {
@@ -440,8 +551,7 @@ mod save_fault {
                 Fault {
                     upserts_left: upserts,
                     restores_left: restores,
-                    paused: None,
-                    release: None,
+                    ..Fault::empty()
                 },
             );
     }
@@ -456,12 +566,7 @@ mod save_fault {
         let (paused_tx, paused_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let mut map = table().lock().unwrap_or_else(|err| err.into_inner());
-        let fault = map.entry(key).or_insert_with(|| Fault {
-            upserts_left: 0,
-            restores_left: 0,
-            paused: None,
-            release: None,
-        });
+        let fault = map.entry(key).or_insert_with(Fault::empty);
         fault.paused = Some(paused_tx);
         fault.release = Some(release_rx);
         (paused_rx, release_tx)
@@ -501,6 +606,44 @@ mod save_fault {
             let _ = tx.send(());
         }
         fault.release.take()
+    }
+
+    pub(super) fn arm_forward_error_after_accept(server: &str) {
+        let key = music_bot::canon_server_addr(server);
+        let mut map = table().lock().unwrap_or_else(|err| err.into_inner());
+        map.entry(key)
+            .or_insert_with(Fault::empty)
+            .forward_error_after_accept = true;
+    }
+
+    pub(super) fn arm_forward_error_before_accept(server: &str) {
+        let key = music_bot::canon_server_addr(server);
+        let mut map = table().lock().unwrap_or_else(|err| err.into_inner());
+        map.entry(key)
+            .or_insert_with(Fault::empty)
+            .forward_error_before_accept = true;
+    }
+
+    pub(super) fn take_forward_error_after_accept(server: &str) -> bool {
+        take_flag(server, |fault| {
+            let armed = fault.forward_error_after_accept;
+            fault.forward_error_after_accept = false;
+            armed
+        })
+    }
+
+    pub(super) fn take_forward_error_before_accept(server: &str) -> bool {
+        take_flag(server, |fault| {
+            let armed = fault.forward_error_before_accept;
+            fault.forward_error_before_accept = false;
+            armed
+        })
+    }
+
+    fn take_flag(server: &str, flag: impl FnOnce(&mut Fault) -> bool) -> bool {
+        let key = music_bot::canon_server_addr(server);
+        let mut map = table().lock().unwrap_or_else(|err| err.into_inner());
+        map.get_mut(&key).is_some_and(flag)
     }
 
     pub(super) fn clear(server: &str) {

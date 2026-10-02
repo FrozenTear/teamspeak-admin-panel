@@ -397,6 +397,19 @@ impl MusicBotFront {
         }
     }
 
+    /// The cap the music process currently holds. `Ok(None)` is a process
+    /// with no number for that server. An error is a failed read, not a
+    /// rejected number.
+    pub async fn read_summon_cap(
+        &self,
+        server_addr: &str,
+    ) -> Result<Option<u32>, MusicRuntimeError> {
+        match &self.inner {
+            FrontInner::Local(s) => Ok(s.summon().cap(server_addr)),
+            FrontInner::Remote(r) => r.read_summon_cap(server_addr).await,
+        }
+    }
+
     /// Forward a cap to the music process. Local acceptance is the
     /// in-process director. Remote acceptance is `PUT /v1/summon-cap`.
     pub async fn set_summon_cap(
@@ -930,6 +943,28 @@ impl RemoteMusicRuntime {
             .await
             .map_err(|e| runtime_err(format!("spawn: {e}")))?;
         Ok(body.id)
+    }
+
+    async fn read_summon_cap(&self, server_addr: &str) -> Result<Option<u32>, MusicRuntimeError> {
+        let resp = self
+            .authorize(
+                self.http
+                    .get(format!("{}/v1/summon-cap", self.base))
+                    .query(&[("serverAddr", server_addr)]),
+            )?
+            .send()
+            .await
+            .map_err(|e| runtime_err(format!("summon cap read: {e}")))?;
+        self.reject_unauthorized("summon cap read", resp.status())?;
+        if !resp.status().is_success() {
+            return Err(runtime_err(format!("summon cap read: {}", resp.status())));
+        }
+        self.clear_auth_latch();
+        let body: SummonCapBody = resp
+            .json()
+            .await
+            .map_err(|e| runtime_err(format!("summon cap read: {e}")))?;
+        Ok(body.cap)
     }
 
     async fn set_summon_cap(&self, server_addr: &str, cap: u32) -> Result<(), MusicRuntimeError> {
@@ -2288,6 +2323,14 @@ mod tests {
 
         front.set_summon_cap(server, 2).await.expect("put cap");
         assert_eq!(supervisor.summon().cap(server), Some(2));
+        assert_eq!(
+            front.read_summon_cap(server).await.expect("read cap"),
+            Some(2)
+        );
+        assert_eq!(
+            front.read_summon_cap(other).await.expect("read other"),
+            None
+        );
         assert_eq!(supervisor.summon().quiet_count(server), 0);
 
         let cookie = Arc::new(RwLock::new(None));

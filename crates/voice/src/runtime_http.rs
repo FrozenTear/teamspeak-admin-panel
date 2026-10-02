@@ -17,12 +17,12 @@ use std::time::Duration;
 
 use axum::Json;
 use axum::Router;
-use axum::extract::{Path, Request, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::routing::{delete, get, post, put};
+use axum::routing::{delete, get, post};
 use futures::stream::{Stream, StreamExt};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -296,7 +296,7 @@ pub fn router(state: RuntimeState) -> Router {
 pub fn router_with_auth(state: RuntimeState, auth: ControlAuth) -> Router {
     let mut app = Router::new()
         .route("/v1/bots", get(list_bots).post(spawn_bot))
-        .route("/v1/summon-cap", put(put_summon_cap))
+        .route("/v1/summon-cap", get(get_summon_cap).put(put_summon_cap))
         .route("/v1/summon-heard", post(post_summon_heard))
         .route("/v1/bots/{id}", delete(shutdown_bot))
         .route("/v1/bots/{id}/command", post(send_command))
@@ -418,6 +418,23 @@ async fn spawn_bot(
         .supervisor
         .note_summon_push(&server_addr, id.0, summon_cap, &identity);
     Ok(Json(SpawnResponse { id }))
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SummonCapQuery {
+    server_addr: String,
+}
+
+/// The cap the music process currently holds. A missing row is `cap: null`.
+/// This is not a client lookup.
+async fn get_summon_cap(
+    State(state): State<RuntimeState>,
+    Query(query): Query<SummonCapQuery>,
+) -> Json<SummonCapBody> {
+    let server_addr = crate::canon_server_addr(&query.server_addr);
+    let cap = state.supervisor.summon().cap(&server_addr);
+    Json(SummonCapBody { server_addr, cap })
 }
 
 async fn put_summon_cap(
