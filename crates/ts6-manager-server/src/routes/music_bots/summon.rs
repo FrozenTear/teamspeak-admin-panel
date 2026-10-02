@@ -102,17 +102,16 @@ async fn set(
     }
     unsettled.forwarded = Some(req.cap);
 
-    if let Err(err) = crate::repos::music_summon_cap::upsert(&state.db, &server_addr, req.cap).await
-    {
+    if let Err(err) = store_cap(&state.db, &server_addr, req.cap).await {
         error!(
             server = %server_addr,
             cap = req.cap,
             error = %err,
             "summon cap was not stored; restoring the stored number"
         );
-        align_held(&mut unsettled).await;
+        let outcome = align_held(&mut unsettled).await;
         unsettled.settled = true;
-        return Err(internal("summon cap was not stored"));
+        return number_that_stuck(server_addr, req.cap, outcome);
     }
 
     unsettled.settled = true;
@@ -124,12 +123,12 @@ async fn set(
 
 /// Re-read the stored cap and put the process on that number, while
 /// `guard` is held. A failed read is retried. It is not replaced with a
-/// number captured before this call. After five failed restores of a
-/// number the page does not show, store the forwarded number so the page
-/// matches the process.
-async fn align_held(unsettled: &mut UnsettledCap) {
+/// number captured before this call. When the process cannot be put back,
+/// store the forwarded number so the page matches the process. The lock
+/// stays held until those two numbers are the same.
+async fn align_held(unsettled: &mut UnsettledCap) -> AlignOutcome {
     let Some(mutex) = unsettled.mutex.clone() else {
-        return;
+        return AlignOutcome::Restored(None);
     };
     let guard = unsettled.guard.take();
     align_cap(
@@ -140,7 +139,27 @@ async fn align_held(unsettled: &mut UnsettledCap) {
         mutex,
         guard,
     )
-    .await;
+    .await
+}
+
+/// What the page should show after a store write failed and align ran.
+/// A catch-up that landed, or a store that already held this save's
+/// number, is that number. Anything else is the not-stored error, and
+/// the page puts the previous number back.
+fn number_that_stuck(
+    server_addr: String,
+    requested: u32,
+    outcome: AlignOutcome,
+) -> Result<Json<wire::SummonCap>, Response> {
+    let stuck = match outcome {
+        AlignOutcome::CaughtUp(cap) => Some(cap),
+        AlignOutcome::Restored(Some(cap)) if cap == requested => Some(cap),
+        AlignOutcome::Restored(_) => None,
+    };
+    match stuck {
+        Some(cap) => Ok(Json(wire::SummonCap { server_addr, cap })),
+        None => Err(internal("summon cap was not stored")),
+    }
 }
 
 async fn restore_with_retry(
@@ -148,6 +167,12 @@ async fn restore_with_retry(
     server: &str,
     cap: Option<u32>,
 ) -> Result<(), crate::music_runtime::MusicRuntimeError> {
+    #[cfg(test)]
+    if save_fault::fail_restore(server) {
+        return Err(crate::music_runtime::MusicRuntimeError::Unavailable(
+            "summon cap restore failed before the process changed".into(),
+        ));
+    }
     let mut wait = Duration::from_millis(20);
     let mut last = None;
     for _ in 0..5 {
@@ -198,7 +223,14 @@ impl Drop for UnsettledCap {
     }
 }
 
-const ALIGN_CYCLES: u32 = 3;
+/// The process and the store after align. `Restored` means the process
+/// was put on the stored number. `CaughtUp` means that restore failed and
+/// the forwarded number was written, so both sides are that number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AlignOutcome {
+    Restored(Option<u32>),
+    CaughtUp(u32),
+}
 
 async fn align_cap(
     front: MusicBotFront,
@@ -206,23 +238,28 @@ async fn align_cap(
     server: String,
     forwarded: Option<u32>,
     mutex: std::sync::Arc<tokio::sync::Mutex<()>>,
-    mut guard: Option<tokio::sync::OwnedMutexGuard<()>>,
-) {
-    for cycle in 0..ALIGN_CYCLES {
-        if guard.is_none() {
-            guard = Some(mutex.clone().lock_owned().await);
-        }
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+) -> AlignOutcome {
+    let _guard = match guard {
+        Some(held) => held,
+        None => mutex.lock_owned().await,
+    };
+    let mut wait = Duration::from_millis(50);
+    loop {
         match read_cap_retry(&db, &server).await {
             Ok(stored) => {
                 if restore_with_retry(&front, &server, stored).await.is_ok() {
-                    return;
+                    return AlignOutcome::Restored(stored);
                 }
                 if let Some(live) = forwarded {
+                    // The process is still on `live`: the restore did not
+                    // land, and this lock keeps another save from changing
+                    // it. A store that already shows `live` is the same number.
                     if Some(live) == stored {
-                        return;
+                        return AlignOutcome::Restored(stored);
                     }
-                    match crate::repos::music_summon_cap::upsert(&db, &server, live).await {
-                        Ok(()) => return,
+                    match store_cap(&db, &server, live).await {
+                        Ok(()) => return AlignOutcome::CaughtUp(live),
                         Err(err) => {
                             error!(
                                 server = %server,
@@ -241,12 +278,25 @@ async fn align_cap(
                 );
             }
         }
-        drop(guard.take());
-        if cycle + 1 < ALIGN_CYCLES {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+        warn!(
+            server = %server,
+            "summon cap process and store differ; retrying under the save lock"
+        );
+        #[cfg(test)]
+        if let Some(release) = save_fault::note_pause(&server) {
+            let _ = release.await;
         }
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(Duration::from_millis(200));
     }
-    error!(server = %server, "summon cap process and store were not aligned");
+}
+
+async fn store_cap(db: &Database, server: &str, cap: u32) -> Result<(), anyhow::Error> {
+    #[cfg(test)]
+    if save_fault::fail_upsert(server) {
+        anyhow::bail!("summon cap store failed before the row was written");
+    }
+    crate::repos::music_summon_cap::upsert(db, server, cap).await
 }
 
 async fn read_cap_retry(db: &Database, server: &str) -> Result<Option<u32>, anyhow::Error> {
@@ -297,7 +347,7 @@ pub(super) async fn align_cap_for_test(
     front: MusicBotFront,
     server: &str,
     forwarded: Option<u32>,
-) {
+) -> AlignOutcome {
     let mutex = state.music_bots.summon_save_mutex(server);
     let guard = mutex.clone().lock_owned().await;
     align_cap(
@@ -308,7 +358,132 @@ pub(super) async fn align_cap_for_test(
         mutex,
         Some(guard),
     )
-    .await;
+    .await
+}
+
+/// Fail the next `upserts` store writes and the next `restores` restore
+/// attempts for `server`. Other servers are left alone.
+#[cfg(test)]
+pub(super) fn arm_cap_save_fault(server: &str, upserts: u32, restores: u32) {
+    save_fault::arm(server, upserts, restores);
+}
+
+/// The first value fires when align is about to wait while still holding
+/// the lock. Sending on the second value lets that wait finish.
+#[cfg(test)]
+pub(super) fn align_pause(
+    server: &str,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    save_fault::listen(server)
+}
+
+#[cfg(test)]
+pub(super) fn clear_cap_save_fault(server: &str) {
+    save_fault::clear(server);
+}
+
+#[cfg(test)]
+mod save_fault {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    struct Fault {
+        upserts_left: u32,
+        restores_left: u32,
+        paused: Option<tokio::sync::oneshot::Sender<()>>,
+        release: Option<tokio::sync::oneshot::Receiver<()>>,
+    }
+
+    fn table() -> &'static Mutex<HashMap<String, Fault>> {
+        static TABLE: OnceLock<Mutex<HashMap<String, Fault>>> = OnceLock::new();
+        TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(super) fn arm(server: &str, upserts: u32, restores: u32) {
+        let key = music_bot::canon_server_addr(server);
+        table()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .insert(
+                key,
+                Fault {
+                    upserts_left: upserts,
+                    restores_left: restores,
+                    paused: None,
+                    release: None,
+                },
+            );
+    }
+
+    pub(super) fn listen(
+        server: &str,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let key = music_bot::canon_server_addr(server);
+        let (paused_tx, paused_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut map = table().lock().unwrap_or_else(|err| err.into_inner());
+        let fault = map.entry(key).or_insert_with(|| Fault {
+            upserts_left: 0,
+            restores_left: 0,
+            paused: None,
+            release: None,
+        });
+        fault.paused = Some(paused_tx);
+        fault.release = Some(release_rx);
+        (paused_rx, release_tx)
+    }
+
+    pub(super) fn fail_upsert(server: &str) -> bool {
+        let key = music_bot::canon_server_addr(server);
+        let mut map = table().lock().unwrap_or_else(|err| err.into_inner());
+        let Some(fault) = map.get_mut(&key) else {
+            return false;
+        };
+        if fault.upserts_left == 0 {
+            return false;
+        }
+        fault.upserts_left -= 1;
+        true
+    }
+
+    pub(super) fn fail_restore(server: &str) -> bool {
+        let key = music_bot::canon_server_addr(server);
+        let mut map = table().lock().unwrap_or_else(|err| err.into_inner());
+        let Some(fault) = map.get_mut(&key) else {
+            return false;
+        };
+        if fault.restores_left == 0 {
+            return false;
+        }
+        fault.restores_left -= 1;
+        true
+    }
+
+    pub(super) fn note_pause(server: &str) -> Option<tokio::sync::oneshot::Receiver<()>> {
+        let key = music_bot::canon_server_addr(server);
+        let mut map = table().lock().unwrap_or_else(|err| err.into_inner());
+        let Some(fault) = map.get_mut(&key) else {
+            return None;
+        };
+        if let Some(tx) = fault.paused.take() {
+            let _ = tx.send(());
+        }
+        fault.release.take()
+    }
+
+    pub(super) fn clear(server: &str) {
+        let key = music_bot::canon_server_addr(server);
+        table()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .remove(&key);
+    }
 }
 
 /// Cap to carry on a saved-bot push. A lookup error is `None`: the push

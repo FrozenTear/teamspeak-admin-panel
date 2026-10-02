@@ -538,22 +538,15 @@ impl SummonDirector {
         self.lock().hear_channel_line(server, caller, line)
     }
 
-    /// Every armed pool on `host`, including an explicit non-default
-    /// voice port. The notify carries the server connection's host and
-    /// no voice port.
+    /// A server-query notify carries a host and no voice port. A missing
+    /// port is the default voice port, so this reaches only that pool.
+    /// An explicit different port is a separate pool and is left alone.
     pub fn hear_for_host(&self, host: &str, caller: u16, line: &str) {
-        let servers: Vec<String> = {
-            let state = self.lock();
-            state
-                .servers
-                .keys()
-                .filter(|addr| host_of_canon(addr, host))
-                .cloned()
-                .collect()
-        };
-        for server in servers {
-            self.hear_channel_line(&server, caller, line);
+        let server = canon_server_addr(host);
+        if server.is_empty() {
+            return;
         }
+        self.hear_channel_line(&server, caller, line);
     }
 
     /// Instructions a hear queued for this session. Empty when another
@@ -1847,14 +1840,6 @@ impl SummonState {
     }
 }
 
-fn host_of_canon(canon: &str, host: &str) -> bool {
-    let host = host.trim().trim_matches(['[', ']']);
-    let Some((name, port)) = canon.rsplit_once(':') else {
-        return false;
-    };
-    port.parse::<u16>().is_ok() && name.eq_ignore_ascii_case(host)
-}
-
 fn relaunch_delay(attempt: u32) -> Duration {
     let shift = u32::min(attempt, 5);
     Duration::from_secs(1_u64 << shift).min(Duration::from_secs(30))
@@ -2993,7 +2978,7 @@ mod tests {
     }
 
     #[test]
-    fn a_host_notify_reaches_every_pool_on_that_host() {
+    fn a_host_notify_matches_only_the_default_port_pool() {
         let director = boot(1);
         director.note_push(
             "voice.example:9988",
@@ -3001,29 +2986,45 @@ mod tests {
             Some(1),
             Path::new("/data/music-bot-identities/bot-8.identity"),
         );
-        let other = director.slot_ids("voice.example:9988")[0];
+        let other_port = director.slot_ids("voice.example:9988")[0];
         director.mark_ready(
             "voice.example:9988",
-            other,
+            other_port,
             HOME,
             2,
             &[person(2, HOME), person(10, 9)],
         );
         let home = director.slot_ids(SERVER)[0];
-        director.mark_ready(SERVER, home, HOME, 1, &[person(1, HOME), person(10, 5)]);
+        let clients = [person(1, HOME), person(10, 5)];
+        director.mark_ready(SERVER, home, HOME, 1, &clients);
         director.hear_for_host("Voice.Example", 10, "!play https://cdn.example/one.mp3");
         assert_eq!(
             director.assigned_request(SERVER, home).as_deref(),
             Some("https://cdn.example/one.mp3")
         );
-        assert_eq!(
+        assert!(
             director
-                .assigned_request("voice.example:9988", other)
-                .as_deref(),
-            Some("https://cdn.example/one.mp3")
+                .assigned_request("voice.example:9988", other_port)
+                .is_none(),
+            "a host with no port must not move the quiet client on another port"
         );
         assert!(!director.playback_open(SERVER, home));
-        assert!(!director.playback_open("voice.example:9988", other));
+        assert!(!director.playback_open("voice.example:9988", other_port));
+        assert_eq!(director.server_lookups(), 0);
+        let waiting = director.on_book(SERVER, home, HOME, &clients);
+        assert!(
+            waiting
+                .iter()
+                .all(|instr| instr.play.is_none() && !instr.stop_audio)
+        );
+        assert!(!director.playback_open(SERVER, home));
+        let landed = director.on_book(SERVER, home, 5, &clients);
+        assert_eq!(
+            landed[0].play.as_deref(),
+            Some("https://cdn.example/one.mp3")
+        );
+        assert!(director.playback_open(SERVER, home));
+        assert!(!director.playback_open("voice.example:9988", other_port));
         director.note_push(
             "other.example:9987",
             9,
@@ -3034,6 +3035,11 @@ mod tests {
         director.mark_ready(OTHER, elsewhere, HOME, 3, &[person(3, HOME), person(10, 5)]);
         director.hear_for_host("voice.example", 10, "!play https://cdn.example/two.mp3");
         assert!(director.assigned_request(OTHER, elsewhere).is_none());
+        assert!(
+            director
+                .assigned_request("voice.example:9988", other_port)
+                .is_none()
+        );
     }
 
     #[test]

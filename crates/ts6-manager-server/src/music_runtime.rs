@@ -412,8 +412,8 @@ impl MusicBotFront {
         }
     }
 
-    /// A channel line the panel already received. Forwarded to every
-    /// pool on that host. Not a client lookup.
+    /// A channel line the panel already received. The host has no voice
+    /// port, so this matches the default-port pool only. Not a client lookup.
     pub async fn hear_summon(
         &self,
         server_host: &str,
