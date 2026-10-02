@@ -260,7 +260,10 @@ impl SummonDirector {
     }
 
     /// Remember a saved bot. `cap` is the number carried on this push.
-    /// `None` does not arm this server and does not read any other server.
+    /// It applies only when this server has no number yet. A number the
+    /// process already accepted is kept, and an unarmed pool arms with
+    /// that number. `None` does not invent a number and does not read
+    /// any other server.
     pub fn note_push(&self, server: &str, bot_id: u64, cap: Option<u32>, saved_identity: &Path) {
         {
             let mut state = self.lock();
@@ -930,13 +933,21 @@ impl SummonState {
             {
                 pool.saved_identities.push(saved_identity.to_path_buf());
             }
-            match cap {
-                Some(cap) if !pool.armed => {
-                    pool.cap = Some(cap);
-                    pool.armed = true;
-                    Some(cap)
-                }
-                _ => None,
+            // An armed pool already has its number. A later push must
+            // not replace it.
+            if pool.armed {
+                None
+            } else if let Some(held) = pool.cap {
+                // The process already accepted `held`. Arm with that
+                // number. The value on this push is not a newer save.
+                pool.armed = true;
+                Some(held)
+            } else if let Some(cap) = cap {
+                pool.cap = Some(cap);
+                pool.armed = true;
+                Some(cap)
+            } else {
+                None
             }
         };
         let Some(cap) = arm_at else {
@@ -2078,13 +2089,33 @@ mod tests {
         assert_eq!(director.cap(SERVER), Some(4));
         assert_eq!(director.quiet_count(SERVER), 0);
         assert!(!director.armed(SERVER));
+    }
+
+    #[test]
+    fn a_push_keeps_the_cap_the_process_already_accepted() {
+        let director = director();
+        director.accept_cap(SERVER, 4).unwrap();
+        assert!(!director.armed(SERVER));
+        director.note_push(SERVER, 1, Some(1), Path::new("/saved/bot-1.identity"));
+        assert_eq!(director.cap(SERVER), Some(4));
+        assert!(director.armed(SERVER));
+        assert_eq!(director.quiet_count(SERVER), 4);
+        assert_eq!(director.saved_ids(SERVER), vec![1]);
+        director.note_push(SERVER, 2, Some(9), Path::new("/saved/bot-2.identity"));
+        assert_eq!(director.cap(SERVER), Some(4));
+        assert_eq!(director.quiet_count(SERVER), 4);
+    }
+
+    #[test]
+    fn a_push_without_a_number_arms_the_cap_the_process_already_holds() {
+        let director = director();
+        director.accept_cap(SERVER, 4).unwrap();
         director.note_push(SERVER, 1, None, Path::new("/saved/bot-4.identity"));
-        assert_eq!(
-            director.quiet_count(SERVER),
-            0,
-            "a push without the number does not arm"
-        );
-        director.note_push(SERVER, 2, Some(4), Path::new("/saved/bot-5.identity"));
+        assert_eq!(director.cap(SERVER), Some(4));
+        assert!(director.armed(SERVER));
+        assert_eq!(director.quiet_count(SERVER), 4);
+        director.note_push(SERVER, 2, None, Path::new("/saved/bot-5.identity"));
+        assert_eq!(director.cap(SERVER), Some(4));
         assert_eq!(director.quiet_count(SERVER), 4);
     }
 
@@ -2958,8 +2989,9 @@ mod tests {
         assert!(!director.armed(SERVER));
         assert!(director.assigned_request(SERVER, slot).is_none());
         director.note_push(SERVER, 9, None, Path::new("/saved/bot-9.identity"));
-        assert!(!director.armed(SERVER));
-        assert_eq!(director.quiet_count(SERVER), 0);
+        assert_eq!(director.cap(SERVER), Some(1));
+        assert!(director.armed(SERVER));
+        assert_eq!(director.quiet_count(SERVER), 1);
         director.accept_cap(SERVER, 0).unwrap();
         assert_eq!(director.cap(SERVER), Some(0));
         assert_eq!(director.quiet_count(SERVER), 0);

@@ -3776,3 +3776,97 @@ async fn a_forward_error_restores_a_third_number_before_it_returns() {
         Some(1)
     );
 }
+
+async fn create_bot_on(app: &Router, token: &str, server: &str) -> axum::http::Response<Body> {
+    let body = wire::CreateBotRequest {
+        name: "DJ-Bot".into(),
+        server_addr: server.to_string(),
+        identity_path: None,
+        auto_connect: Some(false),
+    };
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/music-bots")
+                .header("authorization", auth_header(token))
+                .header("content-type", "application/json")
+                .body(json_body(&body))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_bot_create_does_not_overwrite_a_cap_the_process_already_accepted() {
+    let (app, token, state) = make_test_app().await;
+    let server = "127.0.0.1:9971";
+    assert_eq!(
+        put_summon_cap(&app, &token, server, 1).await.status(),
+        StatusCode::OK
+    );
+    state
+        .music_bots
+        .supervisor
+        .set_summon_cap(server, 4)
+        .await
+        .unwrap();
+    assert_eq!(
+        state.music_bots.supervisor.local_quiet_count(server),
+        Some(0)
+    );
+    let created = create_bot_on(&app, &token, server).await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    assert_eq!(
+        state.music_bots.supervisor.local_summon_cap(server),
+        Some(Some(4)),
+        "the push carried the stored 1 and must not replace the accepted 4"
+    );
+    assert_eq!(
+        state.music_bots.supervisor.local_summon_armed(server),
+        Some(true)
+    );
+    assert_eq!(
+        state.music_bots.supervisor.local_quiet_count(server),
+        Some(4)
+    );
+    assert_eq!(
+        crate::repos::music_summon_cap::get(&state.db, server)
+            .await
+            .unwrap(),
+        Some(1)
+    );
+}
+
+#[tokio::test]
+async fn a_bot_create_without_a_stored_cap_arms_the_number_the_process_holds() {
+    let (app, token, state) = make_test_app().await;
+    let server = "127.0.0.1:9972";
+    state
+        .music_bots
+        .supervisor
+        .set_summon_cap(server, 4)
+        .await
+        .unwrap();
+    let created = create_bot_on(&app, &token, server).await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    assert_eq!(
+        state.music_bots.supervisor.local_summon_cap(server),
+        Some(Some(4))
+    );
+    assert_eq!(
+        state.music_bots.supervisor.local_summon_armed(server),
+        Some(true)
+    );
+    assert_eq!(
+        state.music_bots.supervisor.local_quiet_count(server),
+        Some(4)
+    );
+    assert_eq!(
+        crate::repos::music_summon_cap::get(&state.db, server)
+            .await
+            .unwrap(),
+        None
+    );
+}
