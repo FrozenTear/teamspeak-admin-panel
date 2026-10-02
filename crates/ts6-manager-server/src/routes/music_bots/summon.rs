@@ -628,6 +628,17 @@ pub(super) async fn cap_for_push(state: &AppState, server_addr: &str) -> Option<
     }
 }
 
+/// After a saved-bot push, write the number the process holds.
+/// The caller keeps the per-server save lock. A process with no number
+/// leaves the store unchanged. This does not return while a held number
+/// is still missing from the store.
+pub(super) async fn store_held_cap(state: &AppState, server: &str) {
+    let Some(cap) = read_process_until_success(&state.music_bots.supervisor, server).await else {
+        return;
+    };
+    store_accepted(&state.db, server, cap).await;
+}
+
 /// Fail the next `upserts` store writes and the next `restores` restore
 /// attempts for `server`. Other servers are left alone.
 #[cfg(test)]

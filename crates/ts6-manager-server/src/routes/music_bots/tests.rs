@@ -3818,10 +3818,19 @@ async fn a_bot_create_does_not_overwrite_a_cap_the_process_already_accepted() {
     );
     let created = create_bot_on(&app, &token, server).await;
     assert_eq!(created.status(), StatusCode::CREATED);
+    let process = state.music_bots.supervisor.local_summon_cap(server);
+    let stored = crate::repos::music_summon_cap::get(&state.db, server)
+        .await
+        .unwrap();
     assert_eq!(
-        state.music_bots.supervisor.local_summon_cap(server),
+        process,
         Some(Some(4)),
         "the push carried the stored 1 and must not replace the accepted 4"
+    );
+    assert_eq!(
+        stored,
+        process.flatten(),
+        "the store must keep the number the process kept"
     );
     assert_eq!(
         state.music_bots.supervisor.local_summon_armed(server),
@@ -3830,12 +3839,6 @@ async fn a_bot_create_does_not_overwrite_a_cap_the_process_already_accepted() {
     assert_eq!(
         state.music_bots.supervisor.local_quiet_count(server),
         Some(4)
-    );
-    assert_eq!(
-        crate::repos::music_summon_cap::get(&state.db, server)
-            .await
-            .unwrap(),
-        Some(1)
     );
 }
 
@@ -3851,9 +3854,15 @@ async fn a_bot_create_without_a_stored_cap_arms_the_number_the_process_holds() {
         .unwrap();
     let created = create_bot_on(&app, &token, server).await;
     assert_eq!(created.status(), StatusCode::CREATED);
+    let process = state.music_bots.supervisor.local_summon_cap(server);
+    let stored = crate::repos::music_summon_cap::get(&state.db, server)
+        .await
+        .unwrap();
+    assert_eq!(process, Some(Some(4)));
     assert_eq!(
-        state.music_bots.supervisor.local_summon_cap(server),
-        Some(Some(4))
+        stored,
+        process.flatten(),
+        "the store must hold the number the process already held"
     );
     assert_eq!(
         state.music_bots.supervisor.local_summon_armed(server),
@@ -3862,11 +3871,5 @@ async fn a_bot_create_without_a_stored_cap_arms_the_number_the_process_holds() {
     assert_eq!(
         state.music_bots.supervisor.local_quiet_count(server),
         Some(4)
-    );
-    assert_eq!(
-        crate::repos::music_summon_cap::get(&state.db, server)
-            .await
-            .unwrap(),
-        None
     );
 }

@@ -159,16 +159,28 @@ async fn create(
     config = config.with_server_addr(req.server_addr.clone());
     config = config.with_auto_connect(auto_connect);
 
-    let summon_cap = super::summon::cap_for_push(&state, &req.server_addr).await;
-    let id = supervisor
-        .spawn_with_summon_cap(
-            config,
-            state.yt_cookie.clone(),
-            state.yt_api_key.clone(),
-            summon_cap,
-        )
-        .await
-        .map_err(map_music_runtime_error)?;
+    // The save lock covers the stored-cap read and the push, so a save
+    // in flight cannot change the row between them. If the process
+    // already holds a number, that number is stored before this returns.
+    let id = {
+        let _guard = state
+            .music_bots
+            .summon_save_mutex(&req.server_addr)
+            .lock_owned()
+            .await;
+        let summon_cap = super::summon::cap_for_push(&state, &req.server_addr).await;
+        let id = supervisor
+            .spawn_with_summon_cap(
+                config,
+                state.yt_cookie.clone(),
+                state.yt_api_key.clone(),
+                summon_cap,
+            )
+            .await
+            .map_err(map_music_runtime_error)?;
+        super::summon::store_held_cap(&state, &req.server_addr).await;
+        id
+    };
     state.music_bots.watch(id).await;
 
     // PURA-357 — persist the bot's runtime config so it survives a
