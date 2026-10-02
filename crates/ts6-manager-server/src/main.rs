@@ -268,20 +268,7 @@ mod server_entry {
                 let count = rows.len();
                 for row in rows {
                     let id = music_bot::BotId(row.id as u64);
-                    let summon_cap = summon_caps
-                        .iter()
-                        .find(|cap| cap.serverAddr == row.serverAddr)
-                        .and_then(|cap| match u32::try_from(cap.cap) {
-                            Ok(n) => Some(n),
-                            Err(_) => {
-                                tracing::warn!(
-                                    server = %cap.serverAddr,
-                                    stored = cap.cap,
-                                    "stored summon cap is not a u32; this push will not arm summon"
-                                );
-                                None
-                            }
-                        });
+                    let summon_cap = summon_cap_for_bot(&summon_caps, &row.serverAddr);
                     let config = music_bot::BotConfig::new(
                         row.name,
                         std::path::PathBuf::from(row.identityPath),
@@ -601,6 +588,54 @@ mod server_entry {
         )
         .await?;
         Ok(())
+    }
+
+    /// The cap row is stored under the canonical address. A bot row keeps
+    /// the address as it was typed. Rehydrate matches those by the socket,
+    /// not by the exact string.
+    fn summon_cap_for_bot(
+        caps: &[crate::repos::music_summon_cap::MusicSummonCap],
+        server_addr: &str,
+    ) -> Option<u32> {
+        let want = music_bot::canon_server_addr(server_addr);
+        if want.is_empty() {
+            return None;
+        }
+        let cap = caps
+            .iter()
+            .find(|cap| music_bot::canon_server_addr(&cap.serverAddr) == want)?;
+        match u32::try_from(cap.cap) {
+            Ok(n) => Some(n),
+            Err(_) => {
+                tracing::warn!(
+                    server = %cap.serverAddr,
+                    stored = cap.cap,
+                    "stored summon cap is not a u32; this push will not arm summon"
+                );
+                None
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::summon_cap_for_bot;
+        use crate::repos::music_summon_cap::MusicSummonCap;
+
+        fn row(server_addr: &str, cap: i64) -> MusicSummonCap {
+            MusicSummonCap {
+                serverAddr: server_addr.to_string(),
+                cap,
+            }
+        }
+
+        #[test]
+        fn rehydrate_matches_the_canonical_server_address() {
+            let caps = vec![row("ts.example:9987", 3)];
+            assert_eq!(summon_cap_for_bot(&caps, "TS.Example:9987"), Some(3));
+            assert_eq!(summon_cap_for_bot(&caps, "ts.example"), Some(3));
+            assert_eq!(summon_cap_for_bot(&caps, "ts.example:9988"), None);
+        }
     }
 }
 

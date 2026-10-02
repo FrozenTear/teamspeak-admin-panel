@@ -16,8 +16,8 @@ use tokio::sync::mpsc;
 use tracing::warn;
 use tsclientlib::prelude::*;
 use tsclientlib::{
-    ChannelId as TsChannelId, ClientId, Connection, DisconnectOptions, MessageTarget, Reason,
-    StreamItem, events::Event as BookEvent,
+    ChannelId as TsChannelId, ClientId, Connection, DisconnectOptions, MessageHandle,
+    MessageTarget, Reason, StreamItem, events::Event as BookEvent,
 };
 
 use music_bot_audio::VolumeHandle;
@@ -38,11 +38,12 @@ pub(crate) async fn run(
     let generation = launch.generation;
     let mut stop = launch.stop;
     let mut pulse = launch.pulse;
-    let _guard = SessionEnd {
+    let mut session_end = SessionEnd {
         director: director.clone(),
         server: server.clone(),
         slot,
         generation,
+        replace: true,
     };
     if *stop.borrow() {
         return Ok(());
@@ -68,6 +69,7 @@ pub(crate) async fn run(
     }
     let mut own = wait_own(&mut con).await?;
     if !landed_in_tech_support(&mut con).await? {
+        session_end.replace = false;
         anyhow::bail!("quiet client did not land in {TECH_SUPPORT_CHANNEL}");
     }
     subscribe_all(&mut con).context("subscribe channels")?;
@@ -82,7 +84,7 @@ pub(crate) async fn run(
     let mut monitor = SendTimingMonitor::new();
     let volume = VolumeHandle::default();
     let heard = director.pull_heard_gen(&server, slot, generation);
-    apply(
+    let mut pending_move = apply(
         &director,
         &live,
         &server,
@@ -119,7 +121,7 @@ pub(crate) async fn run(
                     continue;
                 }
                 let instr = director.drain_pending_gen(&server, slot, generation);
-                apply(
+                if let Some(handle) = apply(
                     &director,
                     &live,
                     &server,
@@ -131,7 +133,10 @@ pub(crate) async fn run(
                     &volume,
                     instr,
                 )
-                .await;
+                .await
+                {
+                    pending_move = Some(handle);
+                }
                 playback = director.playback_open_gen(&server, slot, generation);
             }
             ev = async { con.events().next().await } => {
@@ -162,6 +167,32 @@ pub(crate) async fn run(
                             director.note_list_trusted(&server, slot, generation);
                             trust_on_next_book = false;
                         }
+                        if classify_move_reply(pending_move, &item) == MoveReply::Refused {
+                            pending_move = None;
+                            let refused =
+                                director.on_move_refused_gen(&server, slot, generation);
+                            if let Some(handle) = apply(
+                                &director,
+                                &live,
+                                &server,
+                                slot,
+                                generation,
+                                &mut con,
+                                &mut current,
+                                &mut frames,
+                                &volume,
+                                refused,
+                            )
+                            .await
+                            {
+                                pending_move = Some(handle);
+                            }
+                            playback = director.playback_open_gen(&server, slot, generation);
+                            continue;
+                        }
+                        if classify_move_reply(pending_move, &item) == MoveReply::Accepted {
+                            pending_move = None;
+                        }
                         let mut instr = instructions_for(
                             &director,
                             &server,
@@ -172,7 +203,7 @@ pub(crate) async fn run(
                             &item,
                         );
                         instr.extend(director.drain_pending_gen(&server, slot, generation));
-                        apply(
+                        if let Some(handle) = apply(
                             &director,
                             &live,
                             &server,
@@ -184,7 +215,10 @@ pub(crate) async fn run(
                             &volume,
                             instr,
                         )
-                        .await;
+                        .await
+                        {
+                            pending_move = Some(handle);
+                        }
                         playback = director.playback_open_gen(&server, slot, generation);
                     }
                     Some(Err(err)) => {
@@ -209,7 +243,7 @@ pub(crate) async fn run(
                             warn!(%server, slot, error = %err, "quiet client send_audio failed");
                             let instr =
                                 director.on_playback_finished_gen(&server, slot, generation);
-                            apply(
+                            if let Some(handle) = apply(
                                 &director,
                                 &live,
                                 &server,
@@ -221,14 +255,17 @@ pub(crate) async fn run(
                                 &volume,
                                 instr,
                             )
-                            .await;
+                            .await
+                            {
+                                pending_move = Some(handle);
+                            }
                             playback = director.playback_open_gen(&server, slot, generation);
                         }
                     }
                     Some(AudioMsg::Finished) | None => {
                         frames = None;
                         let instr = director.on_playback_finished_gen(&server, slot, generation);
-                        apply(
+                        if let Some(handle) = apply(
                             &director,
                             &live,
                             &server,
@@ -240,7 +277,10 @@ pub(crate) async fn run(
                             &volume,
                             instr,
                         )
-                        .await;
+                        .await
+                        {
+                            pending_move = Some(handle);
+                        }
                         playback = director.playback_open_gen(&server, slot, generation);
                     }
                     Some(AudioMsg::CatchupDropped(_)) | Some(AudioMsg::PipelineEvent(_)) => {}
@@ -356,8 +396,9 @@ async fn apply(
     frames: &mut Option<mpsc::Receiver<AudioMsg>>,
     volume: &VolumeHandle,
     instrs: Vec<QuietInstruction>,
-) {
+) -> Option<MessageHandle> {
     let mut queue: VecDeque<QuietInstruction> = instrs.into();
+    let mut sent = None;
     while let Some(instr) = queue.pop_front() {
         // A reply from the channel this client is sitting in would not
         // reach the caller. The director leaves `reply` empty; do not
@@ -373,14 +414,17 @@ async fn apply(
             if let Some(active) = current.as_ref() {
                 active.set_paused(true);
             }
-            if let Err(err) = move_to(con, channel) {
-                warn!(%server, slot, error = %err, "quiet client move failed");
-                for follow in director
-                    .on_move_failed_gen(server, slot, generation)
-                    .into_iter()
-                    .rev()
-                {
-                    queue.push_front(follow);
+            match move_to(con, channel) {
+                Ok(handle) => sent = Some(handle),
+                Err(err) => {
+                    warn!(%server, slot, error = %err, "quiet client move failed");
+                    for follow in director
+                        .on_move_failed_gen(server, slot, generation)
+                        .into_iter()
+                        .rev()
+                    {
+                        queue.push_front(follow);
+                    }
                 }
             }
         }
@@ -410,8 +454,10 @@ async fn apply(
                         if back.stop_audio {
                             audio::send_voice_stop(con);
                         }
-                        if let Some(channel) = back.move_to {
-                            let _ = move_to(con, channel);
+                        if let Some(channel) = back.move_to
+                            && let Ok(handle) = move_to(con, channel)
+                        {
+                            sent = Some(handle);
                         }
                     }
                 }
@@ -422,6 +468,7 @@ async fn apply(
             audio::tear_down(current);
         }
     }
+    sent
 }
 
 /// Channel text is delivered only inside the sender's channel.
@@ -439,7 +486,7 @@ fn subscribe_all(con: &mut Connection) -> Result<()> {
     Ok(())
 }
 
-fn move_to(con: &mut Connection, channel: u64) -> Result<()> {
+fn move_to(con: &mut Connection, channel: u64) -> Result<MessageHandle> {
     let cmd = {
         let book = con.get_state().context("connection has no book yet")?;
         let own = book
@@ -448,8 +495,23 @@ fn move_to(con: &mut Connection, channel: u64) -> Result<()> {
             .context("own client missing")?;
         own.client_move(TsChannelId(channel))
     };
-    cmd.send(con).context("clientmove")?;
-    Ok(())
+    cmd.send_with_result(con).context("clientmove")
+}
+
+/// What a `clientmove` result means for the handle this session is waiting on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MoveReply {
+    Refused,
+    Accepted,
+    Other,
+}
+
+fn classify_move_reply(pending: Option<MessageHandle>, item: &StreamItem) -> MoveReply {
+    match (pending, item) {
+        (Some(want), StreamItem::MessageResult(got, Err(_))) if want == *got => MoveReply::Refused,
+        (Some(want), StreamItem::MessageResult(got, Ok(()))) if want == *got => MoveReply::Accepted,
+        _ => MoveReply::Other,
+    }
 }
 
 fn snapshot(con: &Connection) -> Option<(u64, Vec<ListedClient>)> {
@@ -497,12 +559,20 @@ struct SessionEnd {
     server: String,
     slot: u32,
     generation: u64,
+    /// False when Tech Support is missing. That end does not schedule
+    /// another identity and another join of the default channel.
+    replace: bool,
 }
 
 impl Drop for SessionEnd {
     fn drop(&mut self) {
-        self.director
-            .session_ended(&self.server, self.slot, self.generation);
+        if self.replace {
+            self.director
+                .session_ended(&self.server, self.slot, self.generation);
+        } else {
+            self.director
+                .session_ended_no_relaunch(&self.server, self.slot, self.generation);
+        }
     }
 }
 
@@ -539,7 +609,7 @@ fn own_channel_name(con: &Connection) -> Option<String> {
 mod tests {
     use super::*;
     use crate::summon::{DeliveryHow, SummonArrival};
-    use tsclientlib::{ClientId, MessageTarget};
+    use tsclientlib::{ClientId, CommandError, MessageHandle, MessageTarget, StreamItem, TsError};
 
     /// Server text, a private message, or a poke. Never channel text.
     fn crossing_target(arrival: &SummonArrival) -> MessageTarget {
@@ -548,6 +618,31 @@ mod tests {
             DeliveryHow::Private => MessageTarget::Client(ClientId(arrival.target)),
             DeliveryHow::Poke => MessageTarget::Poke(ClientId(arrival.target)),
         }
+    }
+
+    #[test]
+    fn a_refused_clientmove_is_the_pending_handle() {
+        let handle = MessageHandle(7);
+        let refused = StreamItem::MessageResult(
+            handle,
+            Err(CommandError {
+                error: TsError::ChannelMaxclientsReached,
+                missing_permission: None,
+            }),
+        );
+        assert_eq!(
+            classify_move_reply(Some(handle), &refused),
+            MoveReply::Refused
+        );
+        assert_eq!(
+            classify_move_reply(Some(MessageHandle(8)), &refused),
+            MoveReply::Other
+        );
+        let accepted = StreamItem::MessageResult(handle, Ok(()));
+        assert_eq!(
+            classify_move_reply(Some(handle), &accepted),
+            MoveReply::Accepted
+        );
     }
 
     #[test]

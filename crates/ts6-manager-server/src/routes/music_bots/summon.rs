@@ -81,6 +81,7 @@ async fn set(
         forwarded: None,
         pending: Some(req.cap),
         settled: false,
+        handed_off: false,
         mutex: Some(mutex),
         guard: Some(guard),
     };
@@ -92,19 +93,20 @@ async fn set(
             error = %err,
             "summon cap forward failed; reading the number the process holds"
         );
-        if process_already_accepted(&unsettled.front, &server_addr, req.cap).await {
-            unsettled.forwarded = Some(req.cap);
-            unsettled.pending = None;
-            store_accepted(&unsettled.db, &unsettled.server, req.cap).await;
-            unsettled.settled = true;
-            return Ok(Json(wire::SummonCap {
-                server_addr,
-                cap: req.cap,
-            }));
-        }
+        // A failed forward is not a reject. Read until a read succeeds.
+        // The new number is stored. The stored number leaves the row.
+        // A third number, including no cap, is restored onto the stored
+        // row and read again before this returns.
+        let outcome = confirm_pending(&unsettled.front, &unsettled.db, &server_addr, req.cap).await;
         unsettled.pending = None;
         unsettled.settled = true;
-        return Err(map_music_runtime_error(err));
+        return match outcome {
+            AlignOutcome::CaughtUp(cap) => {
+                unsettled.forwarded = Some(cap);
+                Ok(Json(wire::SummonCap { server_addr, cap }))
+            }
+            AlignOutcome::Restored(_) => Err(map_music_runtime_error(err)),
+        };
     }
     unsettled.pending = None;
     unsettled.forwarded = Some(req.cap);
@@ -130,26 +132,31 @@ async fn set(
     }))
 }
 
-/// Re-read the stored cap and put the process on that number, while
-/// `guard` is held. A failed read is retried. It is not replaced with a
-/// number captured before this call. When the process cannot be put back,
-/// store the forwarded number so the page matches the process. The lock
-/// stays held until those two numbers are the same.
+/// Re-read the stored cap and put the process on that number. The align
+/// task owns the guard, so dropping this handler does not release the
+/// lock before that task finishes. A failed restore is not proof the
+/// process still holds the forwarded number: that path reads until a
+/// read succeeds.
 async fn align_held(unsettled: &mut UnsettledCap) -> AlignOutcome {
     let Some(mutex) = unsettled.mutex.clone() else {
         return AlignOutcome::Restored(None);
     };
+    // Set before the guard moves. Drop then leaves this task in charge
+    // of the lock instead of starting a second align.
+    unsettled.handed_off = true;
     let guard = unsettled.guard.take();
-    align_cap(
-        unsettled.front.clone(),
-        unsettled.db.clone(),
-        unsettled.server.clone(),
-        unsettled.forwarded,
-        unsettled.pending,
-        mutex,
-        guard,
-    )
-    .await
+    let front = unsettled.front.clone();
+    let db = unsettled.db.clone();
+    let server = unsettled.server.clone();
+    let forwarded = unsettled.forwarded;
+    let pending = unsettled.pending;
+    let handle = tokio::spawn(async move {
+        align_cap(front, db, server, forwarded, pending, mutex, guard).await
+    });
+    match handle.await {
+        Ok(outcome) => outcome,
+        Err(_) => AlignOutcome::Restored(None),
+    }
 }
 
 /// The number the page should show after a store write failed and align
@@ -184,13 +191,6 @@ async fn forward_cap(
         ));
     }
     result
-}
-
-/// Read the process under the caller's save lock. A failed read is not
-/// the old number, so it is retried until a read succeeds. `true` when
-/// that read shows `requested`. Any other successful read is `false`.
-async fn process_already_accepted(front: &MusicBotFront, server: &str, requested: u32) -> bool {
-    read_process_until_success(front, server).await == Some(requested)
 }
 
 /// The cap the process holds, once a read succeeds. Failed reads wait.
@@ -270,7 +270,17 @@ async fn restore_with_retry(
     let mut last = None;
     for _ in 0..5 {
         match front.restore_summon_cap(server, cap).await {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                // An error after the restore was applied is not proof
+                // the process is still on the number from before.
+                #[cfg(test)]
+                if save_fault::take_restore_error_after_apply(server) {
+                    return Err(crate::music_runtime::MusicRuntimeError::Unavailable(
+                        "summon cap restore failed after the process changed".into(),
+                    ));
+                }
+                return Ok(());
+            }
             Err(err) => {
                 last = Some(err);
                 tokio::time::sleep(wait).await;
@@ -296,13 +306,15 @@ pub(super) struct UnsettledCap {
     /// cleared once a process read succeeds. A drop keeps it.
     pending: Option<u32>,
     settled: bool,
+    /// An align task already owns the guard. Drop must not start another.
+    handed_off: bool,
     mutex: Option<std::sync::Arc<tokio::sync::Mutex<()>>>,
     guard: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 impl Drop for UnsettledCap {
     fn drop(&mut self) {
-        if self.settled {
+        if self.settled || self.handed_off {
             return;
         }
         let Some(mutex) = self.mutex.take() else {
@@ -316,7 +328,21 @@ impl Drop for UnsettledCap {
         let pending = self.pending;
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                align_cap(front, db, server, forwarded, pending, mutex, guard).await;
+                let guard = match guard {
+                    Some(held) => held,
+                    None => mutex.clone().lock_owned().await,
+                };
+                // A drop after the process is known to hold the new
+                // number stores that number. It does not put the old
+                // number back.
+                if pending.is_none()
+                    && let Some(live) = forwarded
+                {
+                    let _guard = guard;
+                    store_accepted(&db, &server, live).await;
+                    return;
+                }
+                align_cap(front, db, server, forwarded, pending, mutex, Some(guard)).await;
             });
         }
     }
@@ -351,6 +377,9 @@ async fn align_cap(
     if let Some(live) = pending {
         return confirm_pending(&front, &db, &server, live).await;
     }
+    if let Some(live) = forwarded {
+        return align_accepted(&front, &db, &server, live).await;
+    }
     let mut wait = Duration::from_millis(50);
     let mut unaccepted = 0u32;
     loop {
@@ -359,28 +388,9 @@ async fn align_cap(
                 if restore_with_retry(&front, &server, stored).await.is_ok() {
                     return AlignOutcome::Restored(stored);
                 }
-                if let Some(live) = forwarded {
-                    // The process is still on `live`: the restore did not
-                    // land, and this lock keeps another save from changing
-                    // it. A store that already shows `live` is the same number.
-                    if Some(live) == stored {
-                        return AlignOutcome::Restored(stored);
-                    }
-                    match store_cap(&db, &server, live).await {
-                        Ok(()) => return AlignOutcome::CaughtUp(live),
-                        Err(err) => {
-                            error!(
-                                server = %server,
-                                error = %err,
-                                "summon cap page was not aligned to the process"
-                            );
-                        }
-                    }
-                } else {
-                    unaccepted += 1;
-                    if unaccepted >= UNACCEPTED_ALIGN_TRIES {
-                        return AlignOutcome::Restored(stored);
-                    }
+                unaccepted += 1;
+                if unaccepted >= UNACCEPTED_ALIGN_TRIES {
+                    return AlignOutcome::Restored(stored);
                 }
             }
             Err(err) => {
@@ -389,19 +399,11 @@ async fn align_cap(
                     error = %err,
                     "summon cap re-read failed; the captured number is not restored"
                 );
-                if forwarded.is_none() {
-                    unaccepted += 1;
-                    if unaccepted >= UNACCEPTED_ALIGN_TRIES {
-                        return AlignOutcome::Restored(None);
-                    }
+                unaccepted += 1;
+                if unaccepted >= UNACCEPTED_ALIGN_TRIES {
+                    return AlignOutcome::Restored(None);
                 }
             }
-        }
-        if forwarded.is_some() {
-            warn!(
-                server = %server,
-                "summon cap process and store differ; retrying under the save lock"
-            );
         }
         #[cfg(test)]
         if let Some(release) = save_fault::note_pause(&server) {
@@ -412,10 +414,64 @@ async fn align_cap(
     }
 }
 
-/// A dropped save still has `live` in flight. Read the process until a
-/// read succeeds. The new number is written. Any other number leaves the
-/// stored row unchanged. This does not return while the two differ, and
-/// it does not stop after a run of failed reads.
+/// The process accepted `live` and the store write failed. Restore the
+/// stored row. When that restore reports an error, read the process and
+/// act on what the read shows. Do not finish while the two differ, and
+/// do not store `live` unless a read shows it.
+async fn align_accepted(
+    front: &MusicBotFront,
+    db: &Database,
+    server: &str,
+    live: u32,
+) -> AlignOutcome {
+    let mut wait = Duration::from_millis(50);
+    loop {
+        let stored = match read_cap_retry(db, server).await {
+            Ok(stored) => stored,
+            Err(err) => {
+                error!(
+                    server = %server,
+                    error = %err,
+                    "summon cap re-read failed; the captured number is not restored"
+                );
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(Duration::from_millis(200));
+                continue;
+            }
+        };
+        if Some(live) == stored {
+            return AlignOutcome::Restored(stored);
+        }
+        if restore_with_retry(front, server, stored).await.is_ok() {
+            return AlignOutcome::Restored(stored);
+        }
+        // The restore's error is not the number the process holds.
+        #[cfg(test)]
+        if let Some(release) = save_fault::note_pause(server) {
+            let _ = release.await;
+        }
+        let seen = read_process_until_success(front, server).await;
+        if seen == stored {
+            return AlignOutcome::Restored(stored);
+        }
+        if seen == Some(live) {
+            store_accepted(db, server, live).await;
+            return AlignOutcome::CaughtUp(live);
+        }
+        warn!(
+            server = %server,
+            "summon cap process and store differ; restoring again under the save lock"
+        );
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(Duration::from_millis(200));
+    }
+}
+
+/// Read the process until a read succeeds. `live` is stored when the
+/// read shows it. The stored row is left unchanged when the read shows
+/// that row. Any other number, including no cap, is restored onto the
+/// stored row and then read again. This does not finish while the two
+/// differ.
 async fn confirm_pending(
     front: &MusicBotFront,
     db: &Database,
@@ -429,22 +485,35 @@ async fn confirm_pending(
             store_accepted(db, server, live).await;
             return AlignOutcome::CaughtUp(live);
         }
-        match read_cap_retry(db, server).await {
-            Ok(stored) if stored == seen => return AlignOutcome::Restored(stored),
-            Ok(_) => {
-                warn!(
-                    server = %server,
-                    "summon cap process and store differ; reading again under the save lock"
-                );
-            }
+        let stored = match read_cap_retry(db, server).await {
+            Ok(stored) => stored,
             Err(err) => {
                 error!(
                     server = %server,
                     error = %err,
                     "summon cap re-read failed; the captured number is not restored"
                 );
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(Duration::from_millis(200));
+                continue;
             }
+        };
+        if stored == seen {
+            return AlignOutcome::Restored(stored);
         }
+        let _ = restore_with_retry(front, server, stored).await;
+        let again = read_process_until_success(front, server).await;
+        if again == stored {
+            return AlignOutcome::Restored(stored);
+        }
+        if again == Some(live) {
+            store_accepted(db, server, live).await;
+            return AlignOutcome::CaughtUp(live);
+        }
+        warn!(
+            server = %server,
+            "summon cap process and store differ; restoring the stored number under the save lock"
+        );
         tokio::time::sleep(wait).await;
         wait = (wait * 2).min(Duration::from_millis(200));
     }
@@ -475,8 +544,8 @@ async fn read_cap_retry(db: &Database, server: &str) -> Result<Option<u32>, anyh
 }
 
 /// A save that forwarded `cap` and then stopped before the store write.
-/// Dropping the guard aligns the process to the stored number under the
-/// lock. Tests use this for a handler that does not return.
+/// Dropping the guard stores `cap`. It does not put the old number back.
+/// Tests use this for a handler that does not return.
 #[cfg(test)]
 pub(super) async fn hold_forwarded_cap(state: &AppState, server: &str, cap: u32) -> UnsettledCap {
     let mutex = state.music_bots.summon_save_mutex(server);
@@ -494,6 +563,7 @@ pub(super) async fn hold_forwarded_cap(state: &AppState, server: &str, cap: u32)
         forwarded: Some(cap),
         pending: None,
         settled: false,
+        handed_off: false,
         mutex: Some(mutex),
         guard: Some(guard),
     }
@@ -536,6 +606,7 @@ pub(super) async fn hold_unconfirmed_cap(state: &AppState, server: &str, cap: u3
         forwarded: None,
         pending: Some(cap),
         settled: false,
+        handed_off: false,
         mutex: Some(mutex),
         guard: Some(guard),
     }
@@ -599,6 +670,12 @@ pub(super) fn arm_process_read_failures(server: &str, reads: u32) {
     save_fault::arm_process_read_failures(server, reads);
 }
 
+/// The next restore that the process applies still reports an error.
+#[cfg(test)]
+pub(super) fn arm_restore_error_after_apply(server: &str) {
+    save_fault::arm_restore_error_after_apply(server);
+}
+
 #[cfg(test)]
 mod save_fault {
     use std::collections::HashMap;
@@ -610,6 +687,7 @@ mod save_fault {
         forward_error_after_accept: bool,
         forward_error_before_accept: bool,
         process_reads_left: u32,
+        restore_error_after_apply: bool,
         paused: Option<tokio::sync::oneshot::Sender<()>>,
         release: Option<tokio::sync::oneshot::Receiver<()>>,
     }
@@ -622,6 +700,7 @@ mod save_fault {
                 forward_error_after_accept: false,
                 forward_error_before_accept: false,
                 process_reads_left: 0,
+                restore_error_after_apply: false,
                 paused: None,
                 release: None,
             }
@@ -706,6 +785,22 @@ mod save_fault {
         map.entry(key)
             .or_insert_with(Fault::empty)
             .forward_error_after_accept = true;
+    }
+
+    pub(super) fn arm_restore_error_after_apply(server: &str) {
+        let key = music_bot::canon_server_addr(server);
+        let mut map = table().lock().unwrap_or_else(|err| err.into_inner());
+        map.entry(key)
+            .or_insert_with(Fault::empty)
+            .restore_error_after_apply = true;
+    }
+
+    pub(super) fn take_restore_error_after_apply(server: &str) -> bool {
+        take_flag(server, |fault| {
+            let armed = fault.restore_error_after_apply;
+            fault.restore_error_after_apply = false;
+            armed
+        })
     }
 
     pub(super) fn arm_process_read_failures(server: &str, reads: u32) {

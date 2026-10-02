@@ -3162,20 +3162,77 @@ async fn a_second_save_is_not_rolled_back_to_a_number_read_earlier() {
 }
 
 #[tokio::test]
-async fn five_failed_restores_store_the_number_the_process_accepted() {
+async fn a_failed_restore_stores_only_the_number_a_later_read_shows() {
     let (app, token, state) = make_test_app().await;
     let _bot = create_test_bot(&app, &token).await;
-    crate::repos::music_summon_cap::upsert(&state.db, "127.0.0.1:9987", 1)
+    let server = "127.0.0.1:9983";
+    assert_eq!(
+        put_summon_cap(&app, &token, server, 1).await.status(),
+        StatusCode::OK
+    );
+    state
+        .music_bots
+        .supervisor
+        .set_summon_cap(server, 4)
         .await
         .unwrap();
-    let front = crate::music_runtime::MusicBotFront::remote("http://127.0.0.1:9");
-    super::summon::align_cap_for_test(&state, front, "127.0.0.1:9987", Some(4)).await;
+    super::summon::arm_cap_save_fault(server, 0, 1);
+    let outcome = super::summon::align_cap_for_test(
+        &state,
+        state.music_bots.supervisor.clone(),
+        server,
+        Some(4),
+    )
+    .await;
+    super::summon::clear_cap_save_fault(server);
+    assert_eq!(outcome, super::summon::AlignOutcome::CaughtUp(4));
     assert_eq!(
-        get_summon_caps(&app, &token).await.caps,
-        vec![wire::SummonCap {
-            server_addr: "127.0.0.1:9987".into(),
-            cap: 4,
-        }]
+        state.music_bots.supervisor.local_summon_cap(server),
+        Some(Some(4))
+    );
+    assert_eq!(
+        crate::repos::music_summon_cap::get(&state.db, server)
+            .await
+            .unwrap(),
+        Some(4)
+    );
+}
+
+#[tokio::test]
+async fn a_restore_error_after_apply_does_not_store_the_new_number() {
+    let (app, token, state) = make_test_app().await;
+    let _bot = create_test_bot(&app, &token).await;
+    let server = "127.0.0.1:9984";
+    assert_eq!(
+        put_summon_cap(&app, &token, server, 1).await.status(),
+        StatusCode::OK
+    );
+    state
+        .music_bots
+        .supervisor
+        .set_summon_cap(server, 4)
+        .await
+        .unwrap();
+    super::summon::arm_restore_error_after_apply(server);
+    let outcome = super::summon::align_cap_for_test(
+        &state,
+        state.music_bots.supervisor.clone(),
+        server,
+        Some(4),
+    )
+    .await;
+    super::summon::clear_cap_save_fault(server);
+    assert_eq!(outcome, super::summon::AlignOutcome::Restored(Some(1)));
+    assert_eq!(
+        state.music_bots.supervisor.local_summon_cap(server),
+        Some(Some(1)),
+        "the restore landed, so the process is not left on 4"
+    );
+    assert_eq!(
+        crate::repos::music_summon_cap::get(&state.db, server)
+            .await
+            .unwrap(),
+        Some(1)
     );
 }
 
@@ -3248,8 +3305,8 @@ async fn a_later_save_cannot_store_while_align_holds_the_lock() {
         .expect("align is still waiting on the save lock");
     assert_eq!(
         align.await.unwrap(),
-        super::summon::AlignOutcome::Restored(Some(1)),
-        "align puts the process back on the stored number instead of writing over a later save"
+        super::summon::AlignOutcome::CaughtUp(4),
+        "a failed restore is followed by a read, and that read showed 4"
     );
     let saved = put.await.unwrap();
     assert_eq!(saved.status(), StatusCode::OK);
@@ -3509,6 +3566,205 @@ async fn a_dropped_handler_leaves_the_store_when_the_process_is_still_on_the_old
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    assert_eq!(
+        state.music_bots.supervisor.local_summon_cap(server),
+        Some(Some(1))
+    );
+    assert_eq!(
+        crate::repos::music_summon_cap::get(&state.db, server)
+            .await
+            .unwrap(),
+        Some(1)
+    );
+}
+
+#[tokio::test]
+async fn a_restore_that_lands_and_then_errors_does_not_return_the_new_number() {
+    let (app, token, state) = make_test_app().await;
+    let _bot = create_test_bot(&app, &token).await;
+    let server = "127.0.0.1:9985";
+    assert_eq!(
+        put_summon_cap(&app, &token, server, 1).await.status(),
+        StatusCode::OK
+    );
+    super::summon::arm_cap_save_fault(server, 1, 0);
+    super::summon::arm_restore_error_after_apply(server);
+    let saved = put_summon_cap(&app, &token, server, 4).await;
+    super::summon::clear_cap_save_fault(server);
+    assert_eq!(saved.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        state.music_bots.supervisor.local_summon_cap(server),
+        Some(Some(1))
+    );
+    assert_eq!(
+        crate::repos::music_summon_cap::get(&state.db, server)
+            .await
+            .unwrap(),
+        Some(1)
+    );
+}
+
+#[tokio::test]
+async fn a_drop_after_a_forward_stores_the_new_number() {
+    let (app, token, state) = make_test_app().await;
+    let _bot = create_test_bot(&app, &token).await;
+    let server = "127.0.0.1:9990";
+    assert_eq!(
+        put_summon_cap(&app, &token, server, 1).await.status(),
+        StatusCode::OK
+    );
+    let pending = super::summon::hold_forwarded_cap(&state, server, 4).await;
+    drop(pending);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if state
+            .music_bots
+            .summon_save_mutex(server)
+            .try_lock()
+            .is_ok()
+        {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("the dropped forward did not store its number");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        state.music_bots.supervisor.local_summon_cap(server),
+        Some(Some(4))
+    );
+    assert_eq!(
+        crate::repos::music_summon_cap::get(&state.db, server)
+            .await
+            .unwrap(),
+        Some(4)
+    );
+}
+
+#[tokio::test]
+async fn a_drop_during_align_does_not_let_the_failed_save_overwrite_the_later_one() {
+    let (app, token, state) = make_test_app().await;
+    let _bot = create_test_bot(&app, &token).await;
+    let server = "127.0.0.1:9998";
+    assert_eq!(
+        put_summon_cap(&app, &token, server, 1).await.status(),
+        StatusCode::OK
+    );
+    super::summon::arm_cap_save_fault(server, 1, 1);
+    let (pause, release) = super::summon::align_pause(server);
+    let app2 = app.clone();
+    let token2 = token.clone();
+    let put =
+        tokio::spawn(async move { put_summon_cap(&app2, &token2, "127.0.0.1:9998", 4).await });
+    pause
+        .await
+        .expect("align waits under the save lock after the restore fails");
+    let app3 = app.clone();
+    let token3 = token.clone();
+    let later =
+        tokio::spawn(async move { put_summon_cap(&app3, &token3, "127.0.0.1:9998", 2).await });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(
+        !later.is_finished(),
+        "a later save waits while align holds the lock"
+    );
+    put.abort();
+    let _ = put.await;
+    assert!(
+        state
+            .music_bots
+            .summon_save_mutex(server)
+            .try_lock()
+            .is_err(),
+        "dropping the handler leaves the align task holding the save lock"
+    );
+    assert!(
+        !later.is_finished(),
+        "a later save must not store while the dropped align still holds the lock"
+    );
+    release
+        .send(())
+        .expect("align is still waiting on the failed restore");
+    let saved = later.await.unwrap();
+    super::summon::clear_cap_save_fault(server);
+    assert_eq!(saved.status(), StatusCode::OK);
+    let body: wire::SummonCap = read_json(saved).await;
+    assert_eq!(body.cap, 2);
+    assert_eq!(
+        state.music_bots.supervisor.local_summon_cap(server),
+        Some(Some(2))
+    );
+    assert_eq!(
+        crate::repos::music_summon_cap::get(&state.db, server)
+            .await
+            .unwrap(),
+        Some(2)
+    );
+}
+
+#[tokio::test]
+async fn a_dropped_save_restores_a_third_number_onto_the_stored_row() {
+    let (app, token, state) = make_test_app().await;
+    let _bot = create_test_bot(&app, &token).await;
+    let server = "127.0.0.1:9989";
+    assert_eq!(
+        put_summon_cap(&app, &token, server, 1).await.status(),
+        StatusCode::OK
+    );
+    state
+        .music_bots
+        .supervisor
+        .set_summon_cap(server, 7)
+        .await
+        .unwrap();
+    drop(super::summon::hold_unconfirmed_cap(&state, server, 4).await);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if state
+            .music_bots
+            .summon_save_mutex(server)
+            .try_lock()
+            .is_ok()
+        {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("align looped on a third number instead of restoring the stored row");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        state.music_bots.supervisor.local_summon_cap(server),
+        Some(Some(1))
+    );
+    assert_eq!(
+        crate::repos::music_summon_cap::get(&state.db, server)
+            .await
+            .unwrap(),
+        Some(1)
+    );
+}
+
+#[tokio::test]
+async fn a_forward_error_restores_a_third_number_before_it_returns() {
+    let (app, token, state) = make_test_app().await;
+    let _bot = create_test_bot(&app, &token).await;
+    let server = "127.0.0.1:9986";
+    assert_eq!(
+        put_summon_cap(&app, &token, server, 1).await.status(),
+        StatusCode::OK
+    );
+    state
+        .music_bots
+        .supervisor
+        .set_summon_cap(server, 7)
+        .await
+        .unwrap();
+    super::summon::arm_forward_error_before_accept(server);
+    let failed = put_summon_cap(&app, &token, server, 4).await;
+    super::summon::clear_cap_save_fault(server);
+    assert_eq!(failed.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(
         state.music_bots.supervisor.local_summon_cap(server),
         Some(Some(1))
