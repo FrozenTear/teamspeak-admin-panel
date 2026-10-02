@@ -251,6 +251,7 @@ pub(crate) async fn run_bot(
                                     &mut rx,
                                     &events,
                                     bot_id,
+                                    config.server_addr.as_str(),
                                     &store,
                                     Arc::clone(&yt_cookie),
                                     Arc::clone(&yt_api_key),
@@ -267,6 +268,7 @@ pub(crate) async fn run_bot(
                                     &mut rx,
                                     &events,
                                     bot_id,
+                                    config.server_addr.as_str(),
                                     &store,
                                     Arc::clone(&yt_cookie),
                                     Arc::clone(&yt_api_key),
@@ -587,6 +589,7 @@ async fn run_connected_loop(
     rx: &mut mpsc::Receiver<BotCommand>,
     events: &broadcast::Sender<BotEvent>,
     bot_id: BotId,
+    server: &str,
     store: &Arc<dyn MusicBotStore>,
     yt_cookie: Arc<RwLock<Option<PathBuf>>>,
     yt_api_key: Arc<RwLock<Option<String>>>,
@@ -668,6 +671,9 @@ async fn run_connected_loop(
                     // event vector when chat is actually present.
                     let chat_msgs = extract_channel_chat(&item, con);
                     let chat_lines = chat_msgs.len();
+                    if let Some(arrival) = crate::summon::poll_outbound(server) {
+                        WireSink::Direct(&mut *con).cross_send(arrival);
+                    }
                     if let Some(channel) = handle_stream_item(item, con)
                         && Some(channel) != *current_channel {
                             *current_channel = Some(channel);
@@ -682,6 +688,7 @@ async fn run_connected_loop(
                             &mut WireSink::Direct(&mut *con),
                             &mut current_audio,
                             bot_id,
+                            server,
                             store,
                             events,
                             &yt_cookie,
@@ -841,6 +848,8 @@ enum WireCmd {
     ChannelMove(ChannelId),
     /// A channel-chat reply line.
     ChatReply(String),
+    /// Server text, a private message, or a poke. Not channel text.
+    CrossSend(crate::summon::SummonArrival),
     /// Clean-disconnect the connection and exit the wire task.
     Disconnect { shutdown: bool },
 }
@@ -920,6 +929,20 @@ impl WireSink<'_> {
             WireSink::Split(tx) => {
                 let _ = tx.send(WireCmd::ChannelMove(target));
                 Ok(())
+            }
+        }
+    }
+
+    /// Server text, a private message, or a poke for a sitting quiet client.
+    fn cross_send(&mut self, arrival: crate::summon::SummonArrival) {
+        match self {
+            WireSink::Direct(con) => {
+                if let Err(err) = crate::quiet_session::send_crossing(con, &arrival) {
+                    warn!(error = %err, "crossing summon send failed");
+                }
+            }
+            WireSink::Split(tx) => {
+                let _ = tx.send(WireCmd::CrossSend(arrival));
             }
         }
     }
@@ -1086,6 +1109,8 @@ trait VoiceLoopConn: audio::OutgoingVoice {
 
     fn chat_reply(&mut self, line: &str);
 
+    fn cross_send(&mut self, arrival: crate::summon::SummonArrival);
+
     async fn shutdown(&mut self, reason: &str);
 
     fn extract_chat(&self, item: &StreamItem) -> Vec<ChatLine>;
@@ -1104,6 +1129,12 @@ impl VoiceLoopConn for Connection {
 
     fn chat_reply(&mut self, line: &str) {
         chat::send_reply(self, line);
+    }
+
+    fn cross_send(&mut self, arrival: crate::summon::SummonArrival) {
+        if let Err(err) = crate::quiet_session::send_crossing(self, &arrival) {
+            warn!(error = %err, "crossing summon send failed");
+        }
     }
 
     async fn shutdown(&mut self, reason: &str) {
@@ -1264,6 +1295,7 @@ async fn run_wire_loop<C: VoiceLoopConn>(
                     }
                 }
                 Some(WireCmd::ChatReply(line)) => con.chat_reply(&line),
+                Some(WireCmd::CrossSend(arrival)) => con.cross_send(arrival),
                 Some(WireCmd::Disconnect { shutdown }) => {
                     con.shutdown(if shutdown { "shutdown" } else { "disconnect" })
                         .await;
@@ -1351,6 +1383,7 @@ async fn run_split_connected_loop(
     rx: &mut mpsc::Receiver<BotCommand>,
     events: &broadcast::Sender<BotEvent>,
     bot_id: BotId,
+    server: &str,
     store: &Arc<dyn MusicBotStore>,
     yt_cookie: Arc<RwLock<Option<PathBuf>>>,
     yt_api_key: Arc<RwLock<Option<String>>>,
@@ -1370,6 +1403,9 @@ async fn run_split_connected_loop(
     let exit = loop {
         // Install any pipeline the previous iteration spawned.
         install_pending_audio(&mut current_audio, &mut audio_epoch, &wire_cmd_tx);
+        if let Some(arrival) = crate::summon::poll_outbound(server) {
+            let _ = wire_cmd_tx.send(WireCmd::CrossSend(arrival));
+        }
 
         tokio::select! {
             wevt = wire_evt_rx.recv() => match wevt {
@@ -1386,6 +1422,7 @@ async fn run_split_connected_loop(
                             &mut WireSink::Split(&wire_cmd_tx),
                             &mut current_audio,
                             bot_id,
+                            server,
                             store,
                             events,
                             &yt_cookie,
@@ -2475,6 +2512,7 @@ pub(crate) fn arc_for_tests<T>(t: T) -> Arc<T> {
 /// with the invoker's name for debug-logging context.
 struct ChatLine {
     invoker: String,
+    invoker_id: u16,
     text: String,
 }
 
@@ -2508,6 +2546,7 @@ fn extract_channel_chat(item: &StreamItem, con: &Connection) -> Vec<ChatLine> {
             }
             out.push(ChatLine {
                 invoker: invoker.name.clone(),
+                invoker_id: invoker.id.0,
                 text: message.clone(),
             });
         }
@@ -2528,6 +2567,7 @@ async fn dispatch_chat_line(
     wire: &mut WireSink<'_>,
     current_audio: &mut Option<ActiveAudio>,
     bot_id: BotId,
+    server: &str,
     store: &Arc<dyn MusicBotStore>,
     events: &broadcast::Sender<BotEvent>,
     yt_cookie: &Arc<RwLock<Option<PathBuf>>>,
@@ -2544,6 +2584,18 @@ async fn dispatch_chat_line(
             // the command-dispatch latency the issue calls out as
             // previously unmeasured.
             info!(target: "music_bot_latency", invoker = %msg.invoker, command = ?parsed, "chat command received");
+            // Channel text stays in this channel. A sitting quiet client
+            // is in Tech Support, so hand a summon to it here. The wire
+            // task does not take the director lock; this runs on the
+            // control task (and on the single loop, with the other chat work).
+            if matches!(
+                parsed,
+                chat::ParsedCommand::Play { .. } | chat::ParsedCommand::Radio { .. }
+            ) && let Some(arrival) =
+                crate::summon::relay_heard_channel_line(server, msg.invoker_id, &msg.text)
+            {
+                wire.cross_send(arrival);
+            }
             // PURA-396 — `chat::handle_command` is `Connection`-free; the
             // reply rides the `WireSink` (a direct `send_reply`, or a
             // `WireCmd::ChatReply` to the wire task in the split path).
@@ -3620,6 +3672,8 @@ mod tests {
         }
 
         fn chat_reply(&mut self, _line: &str) {}
+
+        fn cross_send(&mut self, _arrival: crate::summon::SummonArrival) {}
 
         async fn shutdown(&mut self, _reason: &str) {}
 

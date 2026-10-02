@@ -7,6 +7,7 @@
 //! `send_audio` only while the director says the client is in the
 //! caller's channel with a song open.
 
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -23,8 +24,8 @@ use music_bot_audio::VolumeHandle;
 
 use crate::audio::{self, ActiveAudio, AudioMsg, SendTimingMonitor};
 use crate::summon::{
-    ListedClient, LiveQuiet, QuietInstruction, SlotLaunch, SummonDirector, TECH_SUPPORT_CHANNEL,
-    cold_audio_source, mint_quiet_identity,
+    DeliveryHow, ListedClient, LiveQuiet, QuietInstruction, SlotLaunch, SummonArrival,
+    SummonDirector, TECH_SUPPORT_CHANNEL, cold_audio_source, mint_quiet_identity,
 };
 
 pub(crate) async fn run(
@@ -70,7 +71,7 @@ pub(crate) async fn run(
     }
     subscribe_all(&mut con).context("subscribe channels")?;
     if let Some((at, clients)) = snapshot(&con)
-        && !director.mark_ready_gen(&server, slot, generation, at, &clients)
+        && !director.mark_ready_gen(&server, slot, generation, at, own.0, &clients)
     {
         anyhow::bail!("quiet slot was replaced before it became ready");
     }
@@ -256,19 +257,50 @@ fn instructions_for(
         else {
             continue;
         };
-        // Channel text only arrives for the channel this connection is
-        // in. Server text, a private message, and a poke arrive while
-        // the client is sitting in another channel. All four are commands.
         match target {
-            MessageTarget::Server
-            | MessageTarget::Channel
-            | MessageTarget::Client(_)
-            | MessageTarget::Poke(_) => {}
+            // Channel text is delivered only inside the sender's channel.
+            // It is a command when this connection is already there. It
+            // is not how a summon typed somewhere else reaches Tech Support.
+            MessageTarget::Channel => {
+                if invoker.id == own {
+                    continue;
+                }
+                let sender_here = clients
+                    .iter()
+                    .any(|client| client.id == invoker.id.0 && client.channel_id == at);
+                if sender_here {
+                    out.extend(director.on_chat_gen(
+                        server,
+                        slot,
+                        generation,
+                        invoker.id.0,
+                        message,
+                        &clients,
+                    ));
+                }
+            }
+            // Server text, a private message, or a poke can arrive here
+            // while this client sits in Tech Support. The move happens
+            // when that text is the staged summon, not before.
+            MessageTarget::Server | MessageTarget::Client(_) | MessageTarget::Poke(_) => {
+                if let Some(moved) =
+                    director.ack_delivery_gen(server, slot, generation, message, &clients)
+                {
+                    out.extend(moved);
+                } else if director.holds_staged_text(server, message) || invoker.id == own {
+                    // The saved bot's copy of a summon, or our own echo.
+                } else {
+                    out.extend(director.on_chat_gen(
+                        server,
+                        slot,
+                        generation,
+                        invoker.id.0,
+                        message,
+                        &clients,
+                    ));
+                }
+            }
         }
-        if invoker.id == own {
-            continue;
-        }
-        out.extend(director.on_chat_gen(server, slot, generation, invoker.id.0, message, &clients));
     }
     out
 }
@@ -286,7 +318,8 @@ async fn apply(
     volume: &VolumeHandle,
     instrs: Vec<QuietInstruction>,
 ) {
-    for instr in instrs {
+    let mut queue: VecDeque<QuietInstruction> = instrs.into();
+    while let Some(instr) = queue.pop_front() {
         // A reply from the channel this client is sitting in would not
         // reach the caller. The director leaves `reply` empty; do not
         // invent one.
@@ -303,6 +336,13 @@ async fn apply(
             }
             if let Err(err) = move_to(con, channel) {
                 warn!(%server, slot, error = %err, "quiet client move failed");
+                for follow in director
+                    .on_move_failed_gen(server, slot, generation)
+                    .into_iter()
+                    .rev()
+                {
+                    queue.push_front(follow);
+                }
             }
         }
         if let Some(arg) = instr.play
@@ -343,6 +383,29 @@ async fn apply(
             audio::tear_down(current);
         }
     }
+}
+
+/// Server text, a private message, or a poke. Never channel text.
+fn crossing_target(arrival: &SummonArrival) -> MessageTarget {
+    match arrival.how {
+        DeliveryHow::Server => MessageTarget::Server,
+        DeliveryHow::Private => MessageTarget::Client(ClientId(arrival.target)),
+        DeliveryHow::Poke => MessageTarget::Poke(ClientId(arrival.target)),
+    }
+}
+
+pub(crate) fn send_crossing(con: &mut Connection, arrival: &SummonArrival) -> Result<()> {
+    let target = crossing_target(arrival);
+    debug_assert!(
+        !matches!(target, MessageTarget::Channel),
+        "a crossing summon is not channel text"
+    );
+    let cmd = {
+        let book = con.get_state().context("connection has no book yet")?;
+        book.send_message(target, &arrival.text)
+    };
+    cmd.send(con).context("crossing summon")?;
+    Ok(())
 }
 
 fn subscribe_all(con: &mut Connection) -> Result<()> {
@@ -454,6 +517,43 @@ fn own_channel_name(con: &Connection) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crossing_delivery_is_not_channel_text() {
+        let text = "!play https://cdn.example/one.mp3".to_string();
+        for how in [DeliveryHow::Server, DeliveryHow::Private, DeliveryHow::Poke] {
+            let target = crossing_target(&SummonArrival {
+                how,
+                target: 1,
+                text: text.clone(),
+            });
+            assert!(!matches!(target, MessageTarget::Channel));
+        }
+        assert!(matches!(
+            crossing_target(&SummonArrival {
+                how: DeliveryHow::Private,
+                target: 1,
+                text: text.clone(),
+            }),
+            MessageTarget::Client(ClientId(1))
+        ));
+        assert!(matches!(
+            crossing_target(&SummonArrival {
+                how: DeliveryHow::Poke,
+                target: 1,
+                text: text.clone(),
+            }),
+            MessageTarget::Poke(ClientId(1))
+        ));
+        assert!(matches!(
+            crossing_target(&SummonArrival {
+                how: DeliveryHow::Server,
+                target: 0,
+                text,
+            }),
+            MessageTarget::Server
+        ));
+    }
 
     #[test]
     fn voice_packets_are_not_book_work() {

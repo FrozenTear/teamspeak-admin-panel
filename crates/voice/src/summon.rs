@@ -44,6 +44,27 @@ pub struct ListedClient {
     pub channel_id: u64,
 }
 
+/// How a summon typed in another channel is handed to a quiet client.
+///
+/// Channel text stays in the sender's channel. These three are what can
+/// arrive while the client sits somewhere else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryHow {
+    Server,
+    Private,
+    Poke,
+}
+
+/// One crossing message the quiet client's own connection sends.
+/// The move happens when that message is committed, not when channel
+/// text is seen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummonArrival {
+    pub how: DeliveryHow,
+    pub target: u16,
+    pub text: String,
+}
+
 /// What one quiet client should do on its own voice connection.
 ///
 /// `reply` stays `None`. A line typed into the channel the client is
@@ -60,6 +81,8 @@ pub struct QuietInstruction {
     /// those are not recorded.
     pub kept_request: Option<String>,
     pub silence: bool,
+    /// Server text, a private message, or a poke. Never channel text.
+    pub deliver: Option<SummonArrival>,
 }
 
 impl QuietInstruction {
@@ -73,6 +96,7 @@ impl QuietInstruction {
             reply: None,
             kept_request: None,
             silence: false,
+            deliver: None,
         }
     }
 }
@@ -98,6 +122,8 @@ struct QuietSlot {
     home: Option<u64>,
     at: Option<u64>,
     subscribed: bool,
+    /// This connection's TeamSpeak client id, once the session is ready.
+    self_id: Option<u16>,
     /// False while a reconnect has not finished rebuilding the client list.
     list_trusted: bool,
     launched: bool,
@@ -136,10 +162,33 @@ struct ServerPool {
     relaunches_due: u32,
     relaunch_attempt: u32,
     relaunch_not_before: Option<Instant>,
+    /// Last client list a quiet client on this server reported.
+    clients: Vec<ListedClient>,
+    /// A summon heard in some channel, waiting to be delivered to a
+    /// sitting quiet client by server text, a private message, or a poke.
+    staged: Option<StagedSummon>,
     /// Always empty. Refusals are not recorded.
     refused: Vec<u16>,
     /// Always empty. There is no wait queue.
     waiters: Vec<u16>,
+}
+
+struct StagedSummon {
+    caller: u16,
+    line: String,
+    /// Slot the crossing message is addressed to.
+    armed_slot: Option<u32>,
+    /// The crossing message was received. A missing sender stays here
+    /// until a later book lists them.
+    heard: bool,
+}
+
+/// What to do with a staged summon that is not sent.
+enum StagedFate {
+    /// Sender is not on the client list. Leave the line staged.
+    Keep(Vec<QuietInstruction>),
+    /// Tech Support, an occupied channel, or not a song. Forget the line.
+    Drop(Vec<QuietInstruction>),
 }
 
 struct SummonState {
@@ -151,6 +200,38 @@ struct SummonState {
     servers: BTreeMap<String, ServerPool>,
     /// Always zero. A missing sender is not resolved with a server lookup.
     server_lookups: u32,
+}
+
+/// The process's live director, so a saved bot that hears channel text
+/// can hand the line to a sitting quiet client. Tests use their own
+/// director and do not install this.
+fn live_director() -> Option<SummonDirector> {
+    LIVE_DIRECTOR
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .clone()
+}
+
+static LIVE_DIRECTOR: Mutex<Option<SummonDirector>> = Mutex::new(None);
+
+/// A saved bot heard a summon in its channel. Channel text does not
+/// reach Tech Support. The return value, when present, is server text,
+/// a private message, or a poke for that bot to send. The quiet client
+/// moves when that message arrives on its own connection.
+pub(crate) fn relay_heard_channel_line(
+    server: &str,
+    caller: u16,
+    line: &str,
+) -> Option<SummonArrival> {
+    let director = live_director()?;
+    director.stage_channel_summon(server, caller, line);
+    director.take_outbound(server)
+}
+
+/// A crossing message that became sendable after the line was heard,
+/// once the sender showed up on a quiet client's list.
+pub(crate) fn poll_outbound(server: &str) -> Option<SummonArrival> {
+    live_director()?.take_outbound(server)
 }
 
 /// Per-server pool of quiet clients.
@@ -223,7 +304,14 @@ impl SummonDirector {
 
     /// The session has subscribed on its own connection and knows the
     /// tech-support channel it landed in.
-    pub fn mark_ready(&self, server: &str, slot: u32, home: u64, clients: &[ListedClient]) {
+    pub fn mark_ready(
+        &self,
+        server: &str,
+        slot: u32,
+        home: u64,
+        own: u16,
+        clients: &[ListedClient],
+    ) {
         let mut state = self.lock();
         {
             let Some(slot) = state.slot_mut(server, slot) else {
@@ -231,13 +319,14 @@ impl SummonDirector {
             };
             slot.home = Some(home);
             slot.at = Some(home);
+            slot.self_id = Some(own);
             slot.subscribed = true;
             slot.list_trusted = true;
         }
         if let Some(pool) = state.pool_mut(server) {
             pool.relaunch_attempt = 0;
+            pool.clients = clients.to_vec();
         }
-        let _ = clients;
     }
 
     /// Same as [`Self::mark_ready`], ignored when `generation` is stale.
@@ -247,12 +336,13 @@ impl SummonDirector {
         slot: u32,
         generation: u64,
         home: u64,
+        own: u16,
         clients: &[ListedClient],
     ) -> bool {
         if !self.lock().owns(server, slot, generation) {
             return false;
         }
-        self.mark_ready(server, slot, home, clients);
+        self.mark_ready(server, slot, home, own, clients);
         true
     }
 
@@ -418,6 +508,112 @@ impl SummonDirector {
         state.on_book(server, slot, own_channel, clients)
     }
 
+    /// A summon typed in some channel. Stored until a sitting quiet
+    /// client sends it onward. Does not move and does not play.
+    pub fn stage_channel_summon(&self, server: &str, caller: u16, line: &str) {
+        self.lock().stage_channel_summon(server, caller, line);
+    }
+
+    pub fn prepare_delivery_gen(
+        &self,
+        server: &str,
+        slot: u32,
+        generation: u64,
+        clients: &[ListedClient],
+    ) -> Vec<QuietInstruction> {
+        let mut state = self.lock();
+        if !state.owns(server, slot, generation) {
+            return Vec::new();
+        }
+        state.prepare_delivery(server, slot, clients)
+    }
+
+    pub fn commit_delivery_gen(
+        &self,
+        server: &str,
+        slot: u32,
+        generation: u64,
+        clients: &[ListedClient],
+    ) -> Vec<QuietInstruction> {
+        let mut state = self.lock();
+        if !state.owns(server, slot, generation) {
+            return Vec::new();
+        }
+        state.commit_delivery(server, slot, clients)
+    }
+
+    /// The crossing message arrived on this connection. Moves only when
+    /// the text is the staged summon. Anything else returns `None`.
+    pub fn ack_delivery_gen(
+        &self,
+        server: &str,
+        slot: u32,
+        generation: u64,
+        text: &str,
+        clients: &[ListedClient],
+    ) -> Option<Vec<QuietInstruction>> {
+        let mut state = self.lock();
+        if !state.owns(server, slot, generation) {
+            return None;
+        }
+        state.ack_delivery(server, slot, text, clients)
+    }
+
+    /// True while this exact line is still the staged summon, so another
+    /// quiet client does not treat the saved bot as the caller.
+    pub fn holds_staged_text(&self, server: &str, text: &str) -> bool {
+        self.lock()
+            .pool(server)
+            .and_then(|pool| pool.staged.as_ref())
+            .is_some_and(|staged| staged.line == text)
+    }
+
+    pub(crate) fn take_outbound(&self, server: &str) -> Option<SummonArrival> {
+        let mut state = self.lock();
+        let clients = state
+            .pool(server)
+            .map(|pool| pool.clients.clone())
+            .unwrap_or_default();
+        let slot = state.pool(server).and_then(|pool| {
+            pool.slots
+                .iter()
+                .find(|slot| slot.is_sitting())
+                .map(|slot| slot.slot)
+        })?;
+        state
+            .prepare_delivery(server, slot, &clients)
+            .into_iter()
+            .find_map(|instr| instr.deliver)
+    }
+
+    pub fn release_delivery_gen(&self, server: &str, slot: u32, generation: u64) {
+        let mut state = self.lock();
+        if !state.owns(server, slot, generation) {
+            return;
+        }
+        state.release_delivery(server, slot);
+    }
+
+    /// The move command failed, or the client landed in the wrong channel.
+    /// Resend up to three times, then end the summon and go home.
+    pub fn on_move_failed(&self, server: &str, slot: u32) -> Vec<QuietInstruction> {
+        let mut state = self.lock();
+        state.fail_move(server, slot)
+    }
+
+    pub fn on_move_failed_gen(
+        &self,
+        server: &str,
+        slot: u32,
+        generation: u64,
+    ) -> Vec<QuietInstruction> {
+        let mut state = self.lock();
+        if !state.owns(server, slot, generation) {
+            return Vec::new();
+        }
+        state.fail_move(server, slot)
+    }
+
     pub fn on_playback_finished(&self, server: &str, slot: u32) -> Vec<QuietInstruction> {
         let mut state = self.lock();
         state.finish(server, slot)
@@ -470,6 +666,7 @@ impl SummonDirector {
             yt_cookie,
             yt_api_key,
         });
+        *LIVE_DIRECTOR.lock().unwrap_or_else(|err| err.into_inner()) = Some(self.clone());
         self.launch_pending();
     }
 
@@ -729,6 +926,7 @@ impl SummonState {
         pool.armed = false;
         pool.relaunches_due = 0;
         pool.relaunch_not_before = None;
+        pool.staged = None;
         let removed = std::mem::take(&mut pool.slots);
         for slot in removed {
             let _ = slot.stop.send(true);
@@ -753,6 +951,7 @@ impl SummonState {
             home: None,
             at: None,
             subscribed: false,
+            self_id: None,
             list_trusted: false,
             launched: false,
             phase: Phase::Sitting,
@@ -878,7 +1077,9 @@ impl SummonState {
             request: arg.clone(),
             arrived: here,
             playing: here,
-            move_attempts: if here { 0 } else { 1 },
+            // Zero resends so far. The first move is the one this
+            // instruction already carries. Book updates do not count.
+            move_attempts: 0,
         };
         if here {
             let mut instr = QuietInstruction::bare(slot_id);
@@ -918,31 +1119,34 @@ impl SummonState {
         own_channel: u64,
         clients: &[ListedClient],
     ) -> Vec<QuietInstruction> {
+        if let Some(pool) = self.pool_mut(server) {
+            pool.clients = clients.to_vec();
+        }
         let Some(slot) = self.slot_mut(server, slot_id) else {
             return Vec::new();
         };
+        let previous_at = slot.at;
         slot.at = Some(own_channel);
         if !slot.list_trusted {
             return Vec::new();
         }
+        let home = slot.home;
         let Phase::Out {
             caller,
             channel,
             request,
             arrived,
             playing,
-            move_attempts,
+            ..
         } = &slot.phase
         else {
-            return Vec::new();
+            return self.complete_heard(server, slot_id, clients);
         };
         let caller = *caller;
         let channel = *channel;
         let request = request.clone();
         let arrived = *arrived;
         let playing = *playing;
-        let move_attempts = *move_attempts;
-        let home = slot.home;
         match clients.iter().find(|client| client.id == caller) {
             None => self.finish(server, slot_id),
             Some(client) if client.channel_id != channel => {
@@ -972,7 +1176,7 @@ impl SummonState {
                 {
                     *channel = new_channel;
                     *arrived = already_there;
-                    *move_attempts = if already_there { 0 } else { 1 };
+                    *move_attempts = 0;
                     if already_there {
                         *playing = true;
                     }
@@ -987,17 +1191,14 @@ impl SummonState {
                 vec![instr]
             }
             Some(_) if own_channel != channel => {
-                if move_attempts >= MAX_MOVE_ATTEMPTS {
-                    return self.finish(server, slot_id);
+                // Still where we were: the move is in flight. A book
+                // update that is not a failed landing does not resend
+                // and does not send the client home.
+                let failed_landing = previous_at.is_some() && previous_at != Some(own_channel);
+                if !failed_landing {
+                    return Vec::new();
                 }
-                if let Some(slot) = self.slot_mut(server, slot_id)
-                    && let Phase::Out { move_attempts, .. } = &mut slot.phase
-                {
-                    *move_attempts = move_attempts.saturating_add(1);
-                }
-                let mut instr = QuietInstruction::bare(slot_id);
-                instr.move_to = Some(channel);
-                vec![instr]
+                self.fail_move(server, slot_id)
             }
             Some(_) if own_channel == channel && !arrived => {
                 let was_playing = playing;
@@ -1081,6 +1282,256 @@ impl SummonState {
         })
     }
 
+    fn stage_channel_summon(&mut self, server: &str, caller: u16, line: &str) {
+        if song_arg(line).is_none() {
+            return;
+        }
+        let Some(pool) = self.pool_mut(server) else {
+            return;
+        };
+        if !pool.armed || pool.staged.is_some() {
+            return;
+        }
+        pool.staged = Some(StagedSummon {
+            caller,
+            line: line.to_string(),
+            armed_slot: None,
+            heard: false,
+        });
+    }
+
+    fn prepare_delivery(
+        &mut self,
+        server: &str,
+        slot_id: u32,
+        clients: &[ListedClient],
+    ) -> Vec<QuietInstruction> {
+        let sitting = self
+            .pool(server)
+            .is_some_and(|pool| pool.slots.iter().any(QuietSlot::is_sitting));
+        let staged = self
+            .pool(server)
+            .and_then(|pool| pool.staged.as_ref())
+            .map(|staged| (staged.caller, staged.line.clone(), staged.armed_slot));
+        let Some((caller, line, armed)) = staged else {
+            return Vec::new();
+        };
+        if armed.is_some() {
+            return Vec::new();
+        }
+        if !sitting {
+            if let Some(pool) = self.pool_mut(server) {
+                pool.staged = None;
+            }
+            let mut instr = QuietInstruction::bare(slot_id);
+            instr.silence = true;
+            return vec![instr];
+        }
+        let me_sitting = self
+            .slot(server, slot_id)
+            .is_some_and(QuietSlot::is_sitting);
+        if !me_sitting {
+            return Vec::new();
+        }
+        if let Some(fate) = self.delivery_block(server, slot_id, caller, &line, clients) {
+            return self.settle_staged(server, fate);
+        }
+        let self_id = self.slot(server, slot_id).and_then(|slot| slot.self_id);
+        if let Some(pool) = self.pool_mut(server)
+            && let Some(staged) = pool.staged.as_mut()
+        {
+            staged.armed_slot = Some(slot_id);
+        }
+        let mut instr = QuietInstruction::bare(slot_id);
+        instr.deliver = Some(match self_id {
+            Some(target) => SummonArrival {
+                how: DeliveryHow::Private,
+                target,
+                text: line,
+            },
+            None => SummonArrival {
+                how: DeliveryHow::Server,
+                target: 0,
+                text: line,
+            },
+        });
+        vec![instr]
+    }
+
+    /// Why this staged summon must not be delivered. `None` means send it.
+    ///
+    /// A sender missing from the client list is kept. Tech Support and a
+    /// channel that already has a quiet client are dropped.
+    fn delivery_block(
+        &self,
+        server: &str,
+        slot_id: u32,
+        caller: u16,
+        line: &str,
+        clients: &[ListedClient],
+    ) -> Option<StagedFate> {
+        let Some(arg) = song_arg(line) else {
+            return Some(StagedFate::Drop(Vec::new()));
+        };
+        let Some(channel) = clients
+            .iter()
+            .find(|client| client.id == caller)
+            .map(|client| client.channel_id)
+        else {
+            let mut instr = QuietInstruction::bare(slot_id);
+            instr.kept_request = Some(arg);
+            return Some(StagedFate::Keep(vec![instr]));
+        };
+        let home = self.slot(server, slot_id).and_then(|slot| slot.home);
+        if home == Some(channel) || self.occupant(server, channel).is_some() {
+            return Some(StagedFate::Drop(Vec::new()));
+        }
+        None
+    }
+
+    fn settle_staged(&mut self, server: &str, fate: StagedFate) -> Vec<QuietInstruction> {
+        match fate {
+            StagedFate::Drop(instr) => {
+                if let Some(pool) = self.pool_mut(server) {
+                    pool.staged = None;
+                }
+                instr
+            }
+            StagedFate::Keep(instr) => {
+                if let Some(pool) = self.pool_mut(server)
+                    && let Some(staged) = pool.staged.as_mut()
+                {
+                    staged.armed_slot = None;
+                }
+                instr
+            }
+        }
+    }
+
+    fn commit_delivery(
+        &mut self,
+        server: &str,
+        slot_id: u32,
+        clients: &[ListedClient],
+    ) -> Vec<QuietInstruction> {
+        let staged = self.pool(server).and_then(|pool| {
+            pool.staged.as_ref().and_then(|staged| {
+                (staged.armed_slot == Some(slot_id)).then(|| (staged.caller, staged.line.clone()))
+            })
+        });
+        let Some((caller, line)) = staged else {
+            return Vec::new();
+        };
+        if let Some(fate) = self.delivery_block(server, slot_id, caller, &line, clients) {
+            return self.settle_staged(server, fate);
+        }
+        if let Some(pool) = self.pool_mut(server) {
+            pool.staged = None;
+        }
+        let Some(arg) = song_arg(&line) else {
+            return Vec::new();
+        };
+        let channel = clients
+            .iter()
+            .find(|client| client.id == caller)
+            .map(|client| client.channel_id)
+            .expect("delivery_block accepted the caller");
+        self.assign(server, slot_id, caller, channel, arg)
+    }
+
+    fn ack_delivery(
+        &mut self,
+        server: &str,
+        slot_id: u32,
+        text: &str,
+        clients: &[ListedClient],
+    ) -> Option<Vec<QuietInstruction>> {
+        let matches = self.pool(server).is_some_and(|pool| {
+            pool.staged
+                .as_ref()
+                .is_some_and(|staged| staged.line == text && staged.armed_slot == Some(slot_id))
+        });
+        if !matches {
+            return None;
+        }
+        if let Some(pool) = self.pool_mut(server)
+            && let Some(staged) = pool.staged.as_mut()
+        {
+            staged.heard = true;
+        }
+        Some(self.commit_delivery(server, slot_id, clients))
+    }
+
+    /// A crossing message already arrived, and the sender was missing.
+    /// Move once a later book lists them. A book that is not that
+    /// arrival does not send the client anywhere.
+    fn complete_heard(
+        &mut self,
+        server: &str,
+        slot_id: u32,
+        clients: &[ListedClient],
+    ) -> Vec<QuietInstruction> {
+        let pending = self.pool(server).and_then(|pool| {
+            let staged = pool.staged.as_ref()?;
+            (staged.heard && staged.armed_slot.is_none()).then(|| staged.line.clone())
+        });
+        let Some(line) = pending else {
+            return Vec::new();
+        };
+        if !self
+            .slot(server, slot_id)
+            .is_some_and(QuietSlot::is_sitting)
+        {
+            return Vec::new();
+        }
+        if let Some(pool) = self.pool_mut(server)
+            && let Some(staged) = pool.staged.as_mut()
+        {
+            staged.armed_slot = Some(slot_id);
+        }
+        self.ack_delivery(server, slot_id, &line, clients)
+            .unwrap_or_default()
+    }
+
+    fn release_delivery(&mut self, server: &str, slot_id: u32) {
+        let Some(pool) = self.pool_mut(server) else {
+            return;
+        };
+        let Some(staged) = pool.staged.as_mut() else {
+            return;
+        };
+        if staged.armed_slot == Some(slot_id) {
+            staged.armed_slot = None;
+        }
+    }
+
+    fn fail_move(&mut self, server: &str, slot_id: u32) -> Vec<QuietInstruction> {
+        let Some(slot) = self.slot(server, slot_id) else {
+            return Vec::new();
+        };
+        let Phase::Out {
+            channel,
+            move_attempts,
+            ..
+        } = &slot.phase
+        else {
+            return Vec::new();
+        };
+        let channel = *channel;
+        let move_attempts = *move_attempts;
+        if move_attempts >= MAX_MOVE_ATTEMPTS {
+            return self.finish(server, slot_id);
+        }
+        if let Some(slot) = self.slot_mut(server, slot_id)
+            && let Phase::Out { move_attempts, .. } = &mut slot.phase
+        {
+            *move_attempts = move_attempts.saturating_add(1);
+        }
+        let mut instr = QuietInstruction::bare(slot_id);
+        instr.move_to = Some(channel);
+        vec![instr]
+    }
+
     fn slot(&self, server: &str, slot_id: u32) -> Option<&QuietSlot> {
         self.pool(server)?
             .slots
@@ -1107,12 +1558,21 @@ impl SummonState {
             return None;
         }
         pool.relaunches_due = pool.relaunches_due.saturating_add(1);
-        if pool.relaunch_not_before.is_some() {
+        let now = Instant::now();
+        // A timer still in the future covers this death too. A timer
+        // that already fired is not pending; leaving it set is what
+        // stuck the pool short of the cap.
+        if pool.relaunch_not_before.is_some_and(|due| due > now) {
+            return None;
+        }
+        let cap = pool.cap.unwrap_or(0) as usize;
+        if pool.slots.len() >= cap {
+            pool.relaunch_not_before = None;
             return None;
         }
         let delay = relaunch_delay(pool.relaunch_attempt);
         pool.relaunch_attempt = pool.relaunch_attempt.saturating_add(1);
-        pool.relaunch_not_before = Some(Instant::now() + delay);
+        pool.relaunch_not_before = Some(now + delay);
         Some(delay)
     }
 
@@ -1127,6 +1587,7 @@ impl SummonState {
         pool.armed = false;
         pool.relaunches_due = 0;
         pool.relaunch_not_before = None;
+        pool.staged = None;
         let removed = std::mem::take(&mut pool.slots);
         for slot in removed {
             let _ = slot.stop.send(true);
@@ -1153,13 +1614,19 @@ impl SummonState {
                 let cap = pool.cap.unwrap_or(0) as usize;
                 let room = cap.saturating_sub(pool.slots.len());
                 if room == 0 {
+                    // The fired timer found a full pool. Drop it so the
+                    // next death can schedule. Do not stop the clients
+                    // that are still here.
+                    pool.relaunches_due = 0;
+                    pool.relaunch_not_before = None;
                     continue;
                 }
                 let spawn_n = (pool.relaunches_due as usize).min(room);
                 pool.relaunches_due -= spawn_n as u32;
-                if pool.relaunches_due == 0 {
-                    pool.relaunch_not_before = None;
+                if pool.relaunches_due == 0 || pool.slots.len() + spawn_n >= cap {
+                    pool.relaunches_due = 0;
                 }
+                pool.relaunch_not_before = None;
                 spawn_n
             };
             for _ in 0..spawn_n {
@@ -1285,7 +1752,7 @@ mod tests {
             Path::new("/data/music-bot-identities/bot-7.identity"),
         );
         for slot in director.slot_ids(SERVER) {
-            director.mark_ready(SERVER, slot, HOME, &[]);
+            director.mark_ready(SERVER, slot, HOME, 1, &[]);
         }
         director
     }
@@ -1847,6 +2314,41 @@ mod tests {
     fn a_move_that_does_not_land_is_retried_then_sent_home() {
         let director = boot(1);
         let slot = director.slot_ids(SERVER)[0];
+        let started = director.on_chat(
+            SERVER,
+            slot,
+            10,
+            "!play https://cdn.example/one.mp3",
+            &[person(10, 5)],
+        );
+        assert_eq!(started[0].move_to, Some(5));
+        for _ in 0..8 {
+            let book = director.on_book(SERVER, slot, HOME, &[person(10, 5)]);
+            assert!(
+                book.is_empty(),
+                "a book update while the move is in flight is not a failed landing"
+            );
+        }
+        assert_eq!(
+            director.assigned_request(SERVER, slot).as_deref(),
+            Some("https://cdn.example/one.mp3")
+        );
+        for _ in 0..MAX_MOVE_ATTEMPTS {
+            let retry = director.on_move_failed(SERVER, slot);
+            assert_eq!(retry[0].move_to, Some(5));
+            assert!(!retry[0].stop_audio);
+        }
+        let gave_up = director.on_move_failed(SERVER, slot);
+        assert!(gave_up[0].stop_audio);
+        assert!(gave_up[0].move_to.is_none(), "already home, so no move");
+        assert!(director.assigned_request(SERVER, slot).is_none());
+        assert!(!director.playback_open(SERVER, slot));
+    }
+
+    #[test]
+    fn changing_destination_resets_the_move_count() {
+        let director = boot(1);
+        let slot = director.slot_ids(SERVER)[0];
         director.on_chat(
             SERVER,
             slot,
@@ -1854,23 +2356,245 @@ mod tests {
             "!play https://cdn.example/one.mp3",
             &[person(10, 5)],
         );
-        let mut moved = 0;
-        let mut gave_up = false;
-        for _ in 0..MAX_MOVE_ATTEMPTS {
-            let book = director.on_book(SERVER, slot, HOME, &[person(10, 5)]);
-            if book.iter().any(|instr| instr.move_to == Some(5)) {
-                moved += 1;
-            }
-            if book.iter().any(|instr| instr.stop_audio) {
-                gave_up = true;
-                assert!(book[0].move_to.is_none(), "already home, so no move");
-                break;
-            }
+        director.on_move_failed(SERVER, slot);
+        director.on_move_failed(SERVER, slot);
+        let away = director.on_book(SERVER, slot, HOME, &[person(10, 6)]);
+        assert_eq!(away[0].move_to, Some(6));
+        assert!(!away[0].stop_audio);
+        for _ in 0..4 {
+            assert!(
+                director
+                    .on_book(SERVER, slot, HOME, &[person(10, 6)])
+                    .is_empty()
+            );
         }
-        assert!(moved >= 1);
-        assert!(gave_up);
-        assert!(director.assigned_request(SERVER, slot).is_none());
+        for _ in 0..MAX_MOVE_ATTEMPTS {
+            let retry = director.on_move_failed(SERVER, slot);
+            assert_eq!(retry[0].move_to, Some(6));
+            assert!(!retry[0].stop_audio);
+        }
+        let home = director.on_move_failed(SERVER, slot);
+        assert!(home[0].stop_audio);
         assert!(!director.playback_open(SERVER, slot));
+    }
+
+    #[test]
+    fn a_channel_summon_arrives_by_a_crossing_message_then_moves() {
+        let director = boot(1);
+        let slot = director.slot_ids(SERVER)[0];
+        let generation = director.generation(SERVER, slot).unwrap();
+        let clients = [person(1, HOME), person(10, 5)];
+        director.stage_channel_summon(SERVER, 10, "!play https://cdn.example/one.mp3");
+        let prepared = director.prepare_delivery_gen(SERVER, slot, generation, &clients);
+        assert!(prepared[0].move_to.is_none());
+        assert!(prepared[0].play.is_none());
+        assert!(!prepared[0].stop_audio);
+        let arrival = prepared[0].deliver.as_ref().expect("crossing delivery");
+        assert!(matches!(
+            arrival.how,
+            DeliveryHow::Server | DeliveryHow::Private | DeliveryHow::Poke
+        ));
+        assert_eq!(arrival.text, "!play https://cdn.example/one.mp3");
+        assert_eq!(arrival.target, 1);
+        assert!(!director.playback_open(SERVER, slot));
+        assert!(
+            director
+                .ack_delivery_gen(SERVER, slot, generation, "not the summon", &clients)
+                .is_none()
+        );
+        assert!(!director.playback_open(SERVER, slot));
+        let moved = director
+            .ack_delivery_gen(
+                SERVER,
+                slot,
+                generation,
+                "!play https://cdn.example/one.mp3",
+                &clients,
+            )
+            .expect("the crossing message arrived");
+        assert_eq!(moved[0].move_to, Some(5));
+        assert!(moved[0].play.is_none());
+        assert!(moved[0].deliver.is_none());
+        assert!(!director.playback_open(SERVER, slot));
+        let waiting = director.on_book(SERVER, slot, HOME, &clients);
+        assert!(
+            waiting
+                .iter()
+                .all(|instr| instr.play.is_none() && !instr.stop_audio)
+        );
+        let landed = director.on_book(SERVER, slot, 5, &clients);
+        assert_eq!(
+            landed[0].play.as_deref(),
+            Some("https://cdn.example/one.mp3")
+        );
+        assert!(director.playback_open(SERVER, slot));
+        let still = director.on_book(SERVER, slot, 5, &clients);
+        assert!(
+            still
+                .iter()
+                .all(|instr| instr.move_to.is_none() && !instr.stop_audio)
+        );
+        assert!(director.playback_open(SERVER, slot));
+    }
+
+    #[test]
+    fn a_landing_in_another_channel_counts_as_one_failed_move() {
+        let director = boot(1);
+        let slot = director.slot_ids(SERVER)[0];
+        director.on_chat(
+            SERVER,
+            slot,
+            10,
+            "!play https://cdn.example/one.mp3",
+            &[person(10, 5)],
+        );
+        assert!(
+            director
+                .on_book(SERVER, slot, HOME, &[person(10, 5)])
+                .is_empty()
+        );
+        let wrong = director.on_book(SERVER, slot, 9, &[person(10, 5)]);
+        assert_eq!(wrong[0].move_to, Some(5));
+        assert!(!wrong[0].stop_audio);
+        assert!(!director.playback_open(SERVER, slot));
+        assert!(director.assigned_request(SERVER, slot).is_some());
+    }
+
+    #[test]
+    fn a_channel_summon_from_an_unknown_sender_is_kept() {
+        let director = boot(1);
+        let slot = director.slot_ids(SERVER)[0];
+        let generation = director.generation(SERVER, slot).unwrap();
+        director.stage_channel_summon(SERVER, 99, "!play https://cdn.example/hidden.mp3");
+        let prepared = director.prepare_delivery_gen(SERVER, slot, generation, &[person(1, HOME)]);
+        assert_eq!(
+            prepared[0].kept_request.as_deref(),
+            Some("https://cdn.example/hidden.mp3")
+        );
+        assert!(prepared[0].deliver.is_none());
+        assert!(prepared[0].move_to.is_none());
+        assert!(prepared[0].play.is_none());
+        assert_eq!(director.server_lookups(), 0);
+        assert!(!director.playback_open(SERVER, slot));
+        let still = director.prepare_delivery_gen(SERVER, slot, generation, &[person(1, HOME)]);
+        assert_eq!(
+            still[0].kept_request.as_deref(),
+            Some("https://cdn.example/hidden.mp3")
+        );
+        assert!(still[0].move_to.is_none());
+        assert!(still[0].play.is_none());
+        let known = director.prepare_delivery_gen(
+            SERVER,
+            slot,
+            generation,
+            &[person(1, HOME), person(99, 5)],
+        );
+        let arrival = known[0]
+            .deliver
+            .as_ref()
+            .expect("kept until the sender appears");
+        assert!(matches!(
+            arrival.how,
+            DeliveryHow::Server | DeliveryHow::Private | DeliveryHow::Poke
+        ));
+        assert!(known[0].move_to.is_none());
+        assert!(known[0].play.is_none());
+        assert!(!director.playback_open(SERVER, slot));
+        let arrived = director
+            .ack_delivery_gen(
+                SERVER,
+                slot,
+                generation,
+                "!play https://cdn.example/hidden.mp3",
+                &[person(1, HOME), person(99, 5)],
+            )
+            .expect("arrival after the sender is listed");
+        assert_eq!(arrived[0].move_to, Some(5));
+        assert!(arrived[0].play.is_none());
+        assert!(!director.playback_open(SERVER, slot));
+    }
+
+    #[test]
+    fn a_staged_summon_from_tech_support_does_not_play_there() {
+        let director = boot(1);
+        let slot = director.slot_ids(SERVER)[0];
+        let generation = director.generation(SERVER, slot).unwrap();
+        director.stage_channel_summon(SERVER, 10, "!play https://cdn.example/one.mp3");
+        let prepared = director.prepare_delivery_gen(
+            SERVER,
+            slot,
+            generation,
+            &[person(1, HOME), person(10, HOME)],
+        );
+        assert!(prepared.is_empty());
+        assert!(!director.playback_open(SERVER, slot));
+        assert!(director.assigned_request(SERVER, slot).is_none());
+    }
+
+    #[test]
+    fn a_dead_session_does_not_stop_a_client_that_is_still_playing() {
+        let director = boot(2);
+        let slots = director.slot_ids(SERVER);
+        director.on_chat(
+            SERVER,
+            slots[0],
+            10,
+            "!play https://cdn.example/one.mp3",
+            &[person(10, 5)],
+        );
+        director.on_book(SERVER, slots[0], 5, &[person(10, 5)]);
+        assert!(director.playback_open(SERVER, slots[0]));
+        let idle = slots[1];
+        let generation = director.generation(SERVER, idle).unwrap();
+        director.session_ended(SERVER, idle, generation);
+        assert!(director.playback_open(SERVER, slots[0]));
+        assert_eq!(director.saved_ids(SERVER), vec![7]);
+        assert_eq!(director.quiet_count(SERVER), 1);
+        let due = director.relaunch_not_before(SERVER).unwrap();
+        director.promote_due(due);
+        assert_eq!(director.quiet_count(SERVER), 2);
+        assert!(director.playback_open(SERVER, slots[0]));
+        assert_eq!(director.saved_ids(SERVER), vec![7]);
+    }
+
+    #[test]
+    fn a_fired_timer_on_a_full_pool_does_not_stick_the_next_death() {
+        let director = boot(1);
+        let slot = director.slot_ids(SERVER)[0];
+        let generation = director.generation(SERVER, slot).unwrap();
+        director.session_ended(SERVER, slot, generation);
+        assert_eq!(director.quiet_count(SERVER), 0);
+        let due = director.relaunch_not_before(SERVER).unwrap();
+        director.accept_cap(SERVER, 1).unwrap();
+        assert_eq!(director.quiet_count(SERVER), 1);
+        let filled = director.slot_ids(SERVER)[0];
+        director.mark_ready(SERVER, filled, HOME, 1, &[]);
+        director.on_chat(
+            SERVER,
+            filled,
+            10,
+            "!play https://cdn.example/one.mp3",
+            &[person(10, 5)],
+        );
+        director.on_book(SERVER, filled, 5, &[person(10, 5)]);
+        assert!(director.playback_open(SERVER, filled));
+        director.promote_due(due);
+        assert!(director.playback_open(SERVER, filled));
+        assert_eq!(director.quiet_count(SERVER), 1);
+        assert!(director.relaunch_not_before(SERVER).is_none());
+        assert_eq!(director.saved_ids(SERVER), vec![7]);
+        let generation = director.generation(SERVER, filled).unwrap();
+        director.session_ended(SERVER, filled, generation);
+        assert_eq!(director.quiet_count(SERVER), 0);
+        assert!(!director.playback_open(SERVER, filled));
+        let due = director
+            .relaunch_not_before(SERVER)
+            .expect("a replacement is scheduled");
+        director.promote_due(due - Duration::from_millis(1));
+        assert_eq!(director.quiet_count(SERVER), 0);
+        director.promote_due(due);
+        assert_eq!(director.quiet_count(SERVER), 1);
+        assert_eq!(director.saved_ids(SERVER), vec![7]);
     }
 
     #[test]
