@@ -1702,6 +1702,8 @@ mod tests {
         assert_eq!(supervisor.summon().quiet_count(server), 0);
         assert!(!supervisor.summon().armed(server));
 
+        // A push that carries no number keeps the cap this PUT already
+        // stored and arms the pool with that number.
         let bare = send_json(
             &app,
             "POST",
@@ -1710,8 +1712,9 @@ mod tests {
         )
         .await;
         assert_eq!(bare.status(), StatusCode::OK);
-        assert!(!supervisor.summon().armed(server));
-        assert_eq!(supervisor.summon().quiet_count(server), 0);
+        assert!(supervisor.summon().armed(server));
+        assert_eq!(supervisor.summon().cap(server), Some(3));
+        assert_eq!(supervisor.summon().quiet_count(server), 3);
 
         let accepted = send_json(
             &app,
