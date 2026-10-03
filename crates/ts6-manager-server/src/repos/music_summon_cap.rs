@@ -1,8 +1,10 @@
-//! One summon cap per TeamSpeak server address.
+//! One summon cap and one summon home channel per TeamSpeak server
+//! address.
 //!
 //! The key is the bot `serverAddr` string (`host:port`). It is not a bot
-//! id and not a slot. A missing row means nothing is stored — callers
-//! must not invent a number.
+//! id and not a slot. A missing row, or a row without a cap, means no
+//! number is stored, and callers must not invent one. A row without a
+//! home means no home channel is picked, and callers must not pick one.
 
 #![allow(non_snake_case)]
 
@@ -12,31 +14,46 @@ use surrealdb::types::SurrealValue;
 
 use crate::db::Database;
 
-/// One stored cap. `cap` is the number the music process has accepted.
+/// One server's stored summon settings. `cap` is the number the music
+/// process has accepted. `homeChannel` is the channel its summon clients
+/// wait in.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SurrealValue)]
 #[surreal(crate = "surrealdb::types")]
 pub struct MusicSummonCap {
     pub serverAddr: String,
-    pub cap: i64,
+    pub cap: Option<i64>,
+    pub homeChannel: Option<i64>,
 }
 
-const PROJECTION: &str = "serverAddr, cap";
+const PROJECTION: &str = "serverAddr, cap, homeChannel";
 
 /// The stored number for `server_addr`, or `None` when that server has
-/// no row. Addresses that dial the same socket share one row.
+/// no row or no number. Addresses that dial the same socket share one row.
 pub async fn get(db: &Database, server_addr: &str) -> Result<Option<u32>> {
+    match find(db, server_addr).await?.and_then(|row| row.cap) {
+        None => Ok(None),
+        Some(cap) => Ok(Some(cap_as_u32(cap)?)),
+    }
+}
+
+/// The stored home channel for `server_addr`, or `None` when none is
+/// picked.
+pub async fn get_home(db: &Database, server_addr: &str) -> Result<Option<u64>> {
+    match find(db, server_addr).await?.and_then(|row| row.homeChannel) {
+        None => Ok(None),
+        Some(home) => Ok(Some(home_as_u64(home)?)),
+    }
+}
+
+async fn find(db: &Database, server_addr: &str) -> Result<Option<MusicSummonCap>> {
     let want = music_bot::canon_server_addr(server_addr);
     if want.is_empty() {
         return Ok(None);
     }
     let rows = list(db).await?;
-    match rows
+    Ok(rows
         .into_iter()
-        .find(|row| music_bot::canon_server_addr(&row.serverAddr) == want)
-    {
-        None => Ok(None),
-        Some(row) => Ok(Some(cap_as_u32(row.cap)?)),
-    }
+        .find(|row| music_bot::canon_server_addr(&row.serverAddr) == want))
 }
 
 /// Every stored cap. Servers with no row are absent.
@@ -80,8 +97,51 @@ pub async fn upsert(db: &Database, server_addr: &str, cap: u32) -> Result<()> {
     Ok(())
 }
 
+/// Insert or replace the home channel for `server_addr`. `None` clears
+/// it. The cap on the same row is left as it is; a new row has no cap.
+pub async fn upsert_home(db: &Database, server_addr: &str, home: Option<u64>) -> Result<()> {
+    let canon = music_bot::canon_server_addr(server_addr);
+    let home = home
+        .map(|home| {
+            i64::try_from(home)
+                .map_err(|_| anyhow::anyhow!("summon home channel {home} is outside i64"))
+        })
+        .transpose()?;
+    let rows = list(db).await?;
+    if let Some(existing) = rows
+        .into_iter()
+        .find(|row| music_bot::canon_server_addr(&row.serverAddr) == canon)
+    {
+        let sql = "UPDATE music_summon_cap SET homeChannel = $home, serverAddr = $canon WHERE serverAddr = $serverAddr;";
+        db.query(sql)
+            .bind(("home", home))
+            .bind(("canon", canon))
+            .bind(("serverAddr", existing.serverAddr))
+            .await
+            .context("music_summon_cap home update query failed")?
+            .check()?;
+    } else if home.is_some() {
+        let sql =
+            "CREATE music_summon_cap CONTENT { serverAddr: $serverAddr, homeChannel: $home };";
+        db.query(sql)
+            .bind(("serverAddr", canon))
+            .bind(("home", home))
+            .await
+            .context("music_summon_cap home create query failed")?
+            .check()?;
+    }
+    Ok(())
+}
+
 fn cap_as_u32(cap: i64) -> Result<u32> {
     u32::try_from(cap).map_err(|_| anyhow::anyhow!("stored summon cap {cap} is outside u32"))
+}
+
+fn home_as_u64(home: i64) -> Result<u64> {
+    u64::try_from(home)
+        .ok()
+        .filter(|home| *home > 0)
+        .ok_or_else(|| anyhow::anyhow!("stored summon home channel {home} is not a channel id"))
 }
 
 #[cfg(test)]
@@ -109,8 +169,60 @@ mod tests {
         let rows = list(&db).await.expect("list");
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].serverAddr, "127.0.0.1:9987");
-        assert_eq!(rows[0].cap, 4);
-        assert_eq!(rows[1].cap, 0);
+        assert_eq!(rows[0].cap, Some(4));
+        assert_eq!(rows[1].cap, Some(0));
+    }
+
+    #[tokio::test]
+    async fn the_home_shares_the_cap_row_and_is_not_invented() {
+        let db = connect_in_memory().await.expect("connect");
+        crate::db::migrations::run(&db).await.expect("migrations");
+
+        assert_eq!(get_home(&db, "127.0.0.1:9987").await.expect("get"), None);
+        // Clearing a home that was never picked writes nothing.
+        upsert_home(&db, "127.0.0.1:9987", None)
+            .await
+            .expect("clear nothing");
+        assert!(list(&db).await.expect("list").is_empty());
+
+        // A home before any cap: one row, still no number.
+        upsert_home(&db, "127.0.0.1:9987", Some(12))
+            .await
+            .expect("home");
+        assert_eq!(get_home(&db, "127.0.0.1").await.expect("get"), Some(12));
+        assert_eq!(get(&db, "127.0.0.1:9987").await.expect("cap"), None);
+
+        // The cap lands on the same row and keeps the home.
+        upsert(&db, "127.0.0.1:9987", 2).await.expect("cap");
+        assert_eq!(get(&db, "127.0.0.1:9987").await.expect("cap"), Some(2));
+        assert_eq!(
+            get_home(&db, "127.0.0.1:9987").await.expect("get"),
+            Some(12)
+        );
+        let rows = list(&db).await.expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].homeChannel, Some(12));
+
+        // A new home keeps the cap. Clearing it keeps the cap too.
+        upsert_home(&db, "127.0.0.1:9987", Some(30))
+            .await
+            .expect("move");
+        assert_eq!(
+            get_home(&db, "127.0.0.1:9987").await.expect("get"),
+            Some(30)
+        );
+        upsert_home(&db, "127.0.0.1:9987", None)
+            .await
+            .expect("clear");
+        assert_eq!(get_home(&db, "127.0.0.1:9987").await.expect("get"), None);
+        assert_eq!(get(&db, "127.0.0.1:9987").await.expect("cap"), Some(2));
+
+        assert_eq!(get_home(&db, "127.0.0.1:9988").await.expect("get"), None);
+        assert!(
+            upsert_home(&db, "127.0.0.1:9988", Some(u64::MAX))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

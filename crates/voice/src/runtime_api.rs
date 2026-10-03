@@ -35,6 +35,10 @@ pub struct SpawnRequest {
     /// server's number.
     #[serde(default)]
     pub summon_cap: Option<u32>,
+    /// Home channel for `config.server_addr` when the API has one stored.
+    /// Omitted or null leaves the home the process holds.
+    #[serde(default)]
+    pub summon_home: Option<u64>,
 }
 
 /// Body of `PUT /v1/summon-cap`. One number for one server address.
@@ -44,6 +48,16 @@ pub struct SpawnRequest {
 pub struct SummonCapBody {
     pub server_addr: String,
     pub cap: Option<u32>,
+}
+
+/// Body of `GET`/`PUT /v1/summon-home`. The channel summon clients on one
+/// server wait in when they are not playing for anyone. `channelId: null`
+/// means none is picked: a client that is done disconnects.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SummonHomeBody {
+    pub server_addr: String,
+    pub channel_id: Option<u64>,
 }
 
 /// Body of `POST /v1/summon-heard`. A channel or server-chat line the

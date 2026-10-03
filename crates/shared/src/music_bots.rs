@@ -523,6 +523,40 @@ pub struct SummonCap {
 #[serde(rename_all = "camelCase")]
 pub struct SummonCapList {
     pub caps: Vec<SummonCap>,
+    /// Picked home channels. A server with none picked is absent.
+    #[serde(default)]
+    pub homes: Vec<SummonHome>,
+}
+
+/// One server's summon home channel: where its summon clients wait when
+/// they are not playing for anyone. Stored on the same row as the cap.
+/// `PUT /api/music-summon-homes` with `channelId: null` clears it; a
+/// summon client that is done then disconnects instead of waiting.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SummonHome {
+    pub server_addr: String,
+    pub channel_id: Option<u64>,
+}
+
+/// A channel the music page offers as a summon home.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SummonHomeChannel {
+    pub channel_id: u64,
+    /// The channel's name after its parents' names, joined with " / ".
+    pub path: String,
+    /// The server's default channel, where every new client lands.
+    pub is_default: bool,
+}
+
+/// `GET /api/music-summon-homes/channels?serverAddr=…`, in channel-tree
+/// order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SummonHomeChannelList {
+    pub server_addr: String,
+    pub channels: Vec<SummonHomeChannel>,
 }
 
 /// TeamSpeak's voice port when an address omits one. `host` and

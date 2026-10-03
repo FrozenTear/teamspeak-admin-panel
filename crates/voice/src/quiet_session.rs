@@ -7,14 +7,19 @@
 //! channel on this same connection (`Server::set_subscribed(true)`, which
 //! tsclientlib sends as `channelsubscribeall`), finds the caller on its
 //! own client list, and `clientmove`s there. It plays only once it is in
-//! the caller's channel, and it disconnects when the song ends.
+//! the caller's channel.
+//!
+//! When it is not playing for anyone it goes to the home channel picked
+//! on the music page and waits there on the same connection. The next
+//! summon takes it from there. With no home picked it disconnects
+//! instead, so it never waits in a public channel.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 use tsclientlib::prelude::*;
 use tsclientlib::{
@@ -27,7 +32,7 @@ use music_bot_audio::VolumeHandle;
 use crate::audio::{self, ActiveAudio, AudioMsg, SendTimingMonitor};
 use crate::chat::{ParsedCommand, parse as parse_chat};
 use crate::summon::{
-    Heard, ListedClient, LiveQuiet, Seat, SessionCmd, SlotLaunch, SummonDirector,
+    Heard, Homeward, ListedClient, LiveQuiet, Seat, SessionCmd, SlotLaunch, SummonDirector,
     cold_audio_source, discard_quiet_identity, is_summon_line, mint_quiet_identity,
 };
 
@@ -42,10 +47,11 @@ const CALLER_WAIT: Duration = Duration::from_secs(3);
 const MOVE_WAIT: Duration = Duration::from_secs(5);
 const DISCONNECT_DRAIN: Duration = Duration::from_secs(1);
 
-/// Why a summon client left.
+/// Why a summon client stopped playing for someone, or why it left.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Outcome {
     Stopped,
+    StopCommand,
     CallerNotFound,
     Occupied,
     SavedBotChannel,
@@ -56,12 +62,26 @@ pub(crate) enum Outcome {
     MovedAway,
     ConnectionLost,
     SendFailed(String),
+    NoHome,
+    OverLimit,
+    HomeRefused(String),
+}
+
+impl Outcome {
+    /// The client disconnects instead of going home.
+    fn ends_session(&self) -> bool {
+        matches!(
+            self,
+            Outcome::Stopped | Outcome::ConnectionLost | Outcome::SendFailed(_)
+        )
+    }
 }
 
 impl std::fmt::Display for Outcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Outcome::Stopped => write!(f, "stopped"),
+            Outcome::StopCommand => write!(f, "!stop in its channel"),
             Outcome::CallerNotFound => write!(f, "the caller was not on its client list"),
             Outcome::Occupied => write!(f, "another summon client plays in that channel"),
             Outcome::SavedBotChannel => write!(f, "a saved bot sits in that channel"),
@@ -72,6 +92,11 @@ impl std::fmt::Display for Outcome {
             Outcome::MovedAway => write!(f, "it was moved out of the channel"),
             Outcome::ConnectionLost => write!(f, "the connection dropped"),
             Outcome::SendFailed(err) => write!(f, "send_audio failed: {err}"),
+            Outcome::NoHome => write!(f, "no home channel is picked"),
+            Outcome::OverLimit => write!(f, "the server is over its limit of summon clients"),
+            Outcome::HomeRefused(err) => {
+                write!(f, "the server refused the move to the home channel: {err}")
+            }
         }
     }
 }
@@ -129,116 +154,235 @@ pub(crate) async fn run(
         return Err(err.context("summon client handshake"));
     }
     let own = wait_own(&mut con).await?;
+    director.note_own_client(&server, summon, own.0);
     subscribe_all(&mut con).context("subscribe channels")?;
 
-    let Some(channel) = wait_for_caller(&mut con, caller).await? else {
-        leave(&mut con).await;
-        return Ok(Outcome::CallerNotFound);
+    let mut session = Session {
+        director: &director,
+        server: &server,
+        summon,
+        own,
+        live: &live,
+        con: &mut con,
+        stop: &mut stop,
+        cmds: &mut cmds,
     };
-    let saved = saved_bot_uids(&director.saved_identities(&server)).await;
-    let saved_here = uid_in_channel(&con, channel, &saved);
-    let request = match director.seat(&server, summon, channel, saved_here) {
-        Seat::Go { request } => request,
-        Seat::Occupied => {
-            leave(&mut con).await;
-            return Ok(Outcome::Occupied);
+    let outcome = session.run(caller).await;
+    leave(&mut con).await;
+    outcome
+}
+
+/// A connected summon client.
+struct Session<'a> {
+    director: &'a SummonDirector,
+    server: &'a str,
+    summon: u64,
+    own: ClientId,
+    live: &'a LiveQuiet,
+    con: &'a mut Connection,
+    stop: &'a mut watch::Receiver<bool>,
+    cmds: &'a mut mpsc::UnboundedReceiver<SessionCmd>,
+}
+
+/// What ended a wait in the home channel.
+enum Waited {
+    /// The director picked this client for a summon.
+    Serve(u16),
+    /// The home channel changed.
+    Rehome,
+    Leave(Outcome),
+}
+
+/// Where a trip to the home channel ended.
+enum Trip {
+    Arrived(u64),
+    Leave(Outcome),
+}
+
+impl Session<'_> {
+    /// Serve `caller`, then wait at home for the next summon, until a
+    /// reason to disconnect comes up. Returns that reason.
+    async fn run(&mut self, caller: u16) -> Result<Outcome> {
+        let (server, summon) = (self.server, self.summon);
+        let mut next = Some(caller);
+        loop {
+            if let Some(caller) = next.take() {
+                let outcome = self.serve(caller).await?;
+                if outcome.ends_session() {
+                    return Ok(outcome);
+                }
+                info!(%server, summon, caller, %outcome, "summon request ended");
+            }
+            let home = match self.go_home().await? {
+                Trip::Arrived(home) => home,
+                Trip::Leave(outcome) => return Ok(outcome),
+            };
+            info!(%server, summon, home, "summon client is waiting in the home channel");
+            match self.wait_at_home(home).await {
+                Waited::Serve(caller) => next = Some(caller),
+                Waited::Rehome => {}
+                Waited::Leave(outcome) => return Ok(outcome),
+            }
         }
-        Seat::SavedBot => {
-            leave(&mut con).await;
-            return Ok(Outcome::SavedBotChannel);
-        }
-        Seat::Gone => {
-            leave(&mut con).await;
-            return Ok(Outcome::Stopped);
-        }
-    };
-    if own_channel(&con) != Some(channel) {
-        let handle = move_to(&mut con, channel)?;
-        if let Moved::Refused(err) = wait_moved(&mut con, handle, channel).await? {
-            leave(&mut con).await;
-            return Ok(Outcome::MoveRefused(err));
-        }
-    }
-    info!(%server, summon, caller, channel, "summon client is in the caller's channel");
-    if let Some((_, clients)) = snapshot(&con) {
-        director.note_clients(&server, summon, &clients);
     }
 
-    let mut current: Option<ActiveAudio> = None;
-    let mut frames: Option<mpsc::Receiver<AudioMsg>> = None;
-    let mut monitor = SendTimingMonitor::new();
-    let volume = VolumeHandle::default();
-    if let Err(err) = play(
-        &live,
-        &request,
-        &mut con,
-        &mut current,
-        &mut frames,
-        &volume,
-    )
-    .await
-    {
-        leave(&mut con).await;
-        return Ok(Outcome::ResolveFailed(err));
+    /// Find `caller`, go to their channel, and play until the song ends
+    /// or the channel stops it. Says why it stopped playing.
+    async fn serve(&mut self, caller: u16) -> Result<Outcome> {
+        let (director, server, summon, own) = (self.director, self.server, self.summon, self.own);
+        let (live, con, stop, cmds) = (self.live, &mut *self.con, &mut *self.stop, &mut *self.cmds);
+        let Some(channel) = wait_for_caller(con, caller).await? else {
+            return Ok(Outcome::CallerNotFound);
+        };
+        let saved = saved_bot_uids(&director.saved_identities(server)).await;
+        let saved_here = uid_in_channel(con, channel, &saved);
+        let request = match director.seat(server, summon, channel, saved_here) {
+            Seat::Go { request } => request,
+            Seat::Occupied => return Ok(Outcome::Occupied),
+            Seat::SavedBot => return Ok(Outcome::SavedBotChannel),
+            Seat::Gone => return Ok(Outcome::Stopped),
+        };
+        if own_channel(con) != Some(channel) {
+            let handle = move_to(con, channel)?;
+            if let Moved::Refused(err) = wait_moved(con, handle, channel).await? {
+                return Ok(Outcome::MoveRefused(err));
+            }
+        }
+        info!(%server, summon, caller, channel, "summon client is in the caller's channel");
+        if let Some((_, clients)) = snapshot(con) {
+            director.note_clients(server, summon, &clients);
+        }
+
+        let mut current: Option<ActiveAudio> = None;
+        let mut frames: Option<mpsc::Receiver<AudioMsg>> = None;
+        let mut monitor = SendTimingMonitor::new();
+        let volume = VolumeHandle::default();
+        if let Err(err) = play(live, &request, con, &mut current, &mut frames, &volume).await {
+            return Ok(Outcome::ResolveFailed(err));
+        }
+
+        let outcome = loop {
+            tokio::select! {
+                biased;
+                changed = stop.changed() => {
+                    if changed.is_err() || *stop.borrow() {
+                        break Outcome::Stopped;
+                    }
+                }
+                cmd = cmds.recv() => match cmd {
+                    Some(SessionCmd::Play(arg)) => {
+                        if let Err(err) =
+                            play(live, &arg, con, &mut current, &mut frames, &volume).await
+                        {
+                            break Outcome::ResolveFailed(err);
+                        }
+                    }
+                    // Sent only to a client that waits at home.
+                    Some(SessionCmd::Serve(_) | SessionCmd::Home) => {}
+                    Some(SessionCmd::Stop) | None => break Outcome::Stopped,
+                },
+                ev = async { con.events().next().await } => match ev {
+                    Some(Ok(item)) => {
+                        match react(director, server, summon, own, channel, con, &item) {
+                            React::Stay => {}
+                            React::Play(arg) => {
+                                if let Err(err) =
+                                    play(live, &arg, con, &mut current, &mut frames, &volume)
+                                        .await
+                                {
+                                    break Outcome::ResolveFailed(err);
+                                }
+                            }
+                            React::Done(outcome) => break outcome,
+                        }
+                    }
+                    Some(Err(err)) => {
+                        warn!(%server, summon, error = %err, "summon client stream error");
+                        break Outcome::ConnectionLost;
+                    }
+                    None => break Outcome::ConnectionLost,
+                },
+                msg = recv_frame(&mut frames) => match msg {
+                    Some(AudioMsg::Frame { bytes, enqueued_at, .. }) => {
+                        if let Err(err) =
+                            audio::send_opus_frame(con, &bytes, enqueued_at, &mut monitor, false)
+                        {
+                            break Outcome::SendFailed(err.to_string());
+                        }
+                    }
+                    Some(AudioMsg::Finished) | None => break Outcome::SongEnded,
+                    Some(AudioMsg::CatchupDropped(_)) | Some(AudioMsg::PipelineEvent(_)) => {}
+                },
+            }
+        };
+
+        audio::tear_down(&mut current);
+        audio::send_voice_stop(con);
+        Ok(outcome)
     }
 
-    let outcome = loop {
-        tokio::select! {
-            biased;
-            changed = stop.changed() => {
-                if changed.is_err() || *stop.borrow() {
-                    break Outcome::Stopped;
+    /// Go to the home channel. A client with nowhere to wait leaves.
+    async fn go_home(&mut self) -> Result<Trip> {
+        let (director, server, summon) = (self.director, self.server, self.summon);
+        let con = &mut *self.con;
+        let mut verdict = director.release(server, summon);
+        loop {
+            let home = match verdict {
+                Homeward::Home(home) => home,
+                Homeward::NoHome => return Ok(Trip::Leave(Outcome::NoHome)),
+                Homeward::OverLimit => return Ok(Trip::Leave(Outcome::OverLimit)),
+                Homeward::Gone => return Ok(Trip::Leave(Outcome::Stopped)),
+            };
+            if own_channel(con) != Some(home) {
+                let handle = move_to(con, home)?;
+                if let Moved::Refused(err) = wait_moved(con, handle, home).await? {
+                    return Ok(Trip::Leave(Outcome::HomeRefused(err)));
                 }
             }
-            cmd = cmds.recv() => match cmd {
-                Some(SessionCmd::Play(arg)) => {
-                    if let Err(err) =
-                        play(&live, &arg, &mut con, &mut current, &mut frames, &volume).await
-                    {
-                        break Outcome::ResolveFailed(err);
-                    }
-                }
-                Some(SessionCmd::Stop) | None => break Outcome::Stopped,
-            },
-            ev = async { con.events().next().await } => match ev {
-                Some(Ok(item)) => {
-                    match react(&director, &server, summon, own, channel, &con, &item) {
-                        React::Stay => {}
-                        React::Play(arg) => {
-                            if let Err(err) =
-                                play(&live, &arg, &mut con, &mut current, &mut frames, &volume)
-                                    .await
-                            {
-                                break Outcome::ResolveFailed(err);
-                            }
-                        }
-                        React::Leave(outcome) => break outcome,
-                    }
-                }
-                Some(Err(err)) => {
-                    warn!(%server, summon, error = %err, "summon client stream error");
-                    break Outcome::ConnectionLost;
-                }
-                None => break Outcome::ConnectionLost,
-            },
-            msg = recv_frame(&mut frames) => match msg {
-                Some(AudioMsg::Frame { bytes, enqueued_at, .. }) => {
-                    if let Err(err) =
-                        audio::send_opus_frame(&mut con, &bytes, enqueued_at, &mut monitor, false)
-                    {
-                        break Outcome::SendFailed(err.to_string());
-                    }
-                }
-                Some(AudioMsg::Finished) | None => break Outcome::SongEnded,
-                Some(AudioMsg::CatchupDropped(_)) | Some(AudioMsg::PipelineEvent(_)) => {}
-            },
+            verdict = director.settle(server, summon, home);
+            if verdict == Homeward::Home(home) {
+                return Ok(Trip::Arrived(home));
+            }
         }
-    };
+    }
 
-    audio::tear_down(&mut current);
-    audio::send_voice_stop(&mut con);
-    leave(&mut con).await;
-    Ok(outcome)
+    /// Wait in `home` until a summon picks this client, the home
+    /// changes, or a reason to disconnect comes up.
+    async fn wait_at_home(&mut self, home: u64) -> Waited {
+        let (director, server, summon, own) = (self.director, self.server, self.summon, self.own);
+        let (con, stop, cmds) = (&mut *self.con, &mut *self.stop, &mut *self.cmds);
+        loop {
+            tokio::select! {
+                biased;
+                changed = stop.changed() => {
+                    if changed.is_err() || *stop.borrow() {
+                        return Waited::Leave(Outcome::Stopped);
+                    }
+                }
+                cmd = cmds.recv() => match cmd {
+                    Some(SessionCmd::Serve(caller)) => return Waited::Serve(caller),
+                    Some(SessionCmd::Home) => return Waited::Rehome,
+                    // A song for the channel it played in before.
+                    Some(SessionCmd::Play(_)) => {}
+                    Some(SessionCmd::Stop) | None => return Waited::Leave(Outcome::Stopped),
+                },
+                ev = async { con.events().next().await } => match ev {
+                    Some(Ok(item)) => {
+                        if let Some(outcome) =
+                            react_at_home(director, server, summon, own, home, con, &item)
+                        {
+                            return Waited::Leave(outcome);
+                        }
+                    }
+                    Some(Err(err)) => {
+                        warn!(%server, summon, error = %err, "summon client stream error");
+                        return Waited::Leave(Outcome::ConnectionLost);
+                    }
+                    None => return Waited::Leave(Outcome::ConnectionLost),
+                },
+            }
+        }
+    }
 }
 
 /// Drive the event stream until the server sends the first book. A
@@ -331,7 +475,8 @@ async fn recv_frame(frames: &mut Option<mpsc::Receiver<AudioMsg>>) -> Option<Aud
 enum React {
     Stay,
     Play(String),
-    Leave(Outcome),
+    /// It stops playing for the caller, for this reason.
+    Done(Outcome),
 }
 
 fn react(
@@ -364,7 +509,7 @@ fn react(
                 }
                 match line_for(*target, message) {
                     Line::Song(arg) => next = React::Play(arg),
-                    Line::Stop => return React::Leave(Outcome::Stopped),
+                    Line::Stop => return React::Done(Outcome::StopCommand),
                     Line::Crossing => {
                         director.hear(server, invoker.id.0, message, Heard::Crossing);
                     }
@@ -372,15 +517,65 @@ fn react(
                 }
             }
             if at != channel {
-                return React::Leave(Outcome::MovedAway);
+                return React::Done(Outcome::MovedAway);
             }
-            if !someone_else_in(&clients, channel, own.0) {
-                return React::Leave(Outcome::ChannelEmpty);
+            // Other summon clients waiting in this channel are not
+            // listeners.
+            let mut ours = director.summon_clients(server);
+            ours.push(own.0);
+            if !someone_else_in(&clients, channel, &ours) {
+                return React::Done(Outcome::ChannelEmpty);
             }
             next
         }
-        StreamItem::DisconnectedTemporarily(_) => React::Leave(Outcome::ConnectionLost),
+        StreamItem::DisconnectedTemporarily(_) => React::Done(Outcome::ConnectionLost),
         _ => React::Stay,
+    }
+}
+
+/// What one stream item means for a client waiting in the home channel.
+/// `Some` is why it leaves.
+fn react_at_home(
+    director: &SummonDirector,
+    server: &str,
+    summon: u64,
+    own: ClientId,
+    home: u64,
+    con: &Connection,
+    item: &StreamItem,
+) -> Option<Outcome> {
+    match item {
+        StreamItem::BookEvents(events) => {
+            let (at, clients) = snapshot(con)?;
+            director.note_clients(server, summon, &clients);
+            for event in events {
+                let BookEvent::Message {
+                    target,
+                    invoker,
+                    message,
+                } = event
+                else {
+                    continue;
+                };
+                if invoker.id == own || !is_summon_line(message) {
+                    continue;
+                }
+                match target {
+                    // Someone in the home channel. A saved bot or a summon
+                    // client playing there answers that chat itself.
+                    MessageTarget::Channel => {
+                        director.hear_home_chat(server, invoker.id.0, message);
+                    }
+                    MessageTarget::Server | MessageTarget::Client(_) | MessageTarget::Poke(_) => {
+                        director.hear(server, invoker.id.0, message, Heard::Crossing);
+                    }
+                }
+            }
+            // Moved or kicked out of the home channel by someone else.
+            (at != home).then_some(Outcome::MovedAway)
+        }
+        StreamItem::DisconnectedTemporarily(_) => Some(Outcome::ConnectionLost),
+        _ => None,
     }
 }
 
@@ -415,10 +610,12 @@ fn line_for(target: MessageTarget, message: &str) -> Line {
     }
 }
 
-fn someone_else_in(clients: &[ListedClient], channel: u64, own: u16) -> bool {
+/// True when someone other than `ours`, this server's summon clients,
+/// is in `channel`.
+fn someone_else_in(clients: &[ListedClient], channel: u64, ours: &[u16]) -> bool {
     clients
         .iter()
-        .any(|client| client.channel_id == channel && client.id != own)
+        .any(|client| client.channel_id == channel && !ours.contains(&client.id))
 }
 
 fn subscribe_all(con: &mut Connection) -> Result<()> {
@@ -712,8 +909,30 @@ mod tests {
                 channel_id: 9,
             },
         ];
-        assert!(!someone_else_in(&clients, 42, 5));
-        assert!(someone_else_in(&clients, 9, 5));
+        assert!(!someone_else_in(&clients, 42, &[5]));
+        assert!(someone_else_in(&clients, 9, &[5]));
+    }
+
+    #[test]
+    fn summon_clients_waiting_in_the_channel_are_not_listeners() {
+        // The caller left the home channel. Two other summon clients
+        // still wait there; the one that played is done.
+        let clients = [
+            ListedClient {
+                id: 5,
+                channel_id: 42,
+            },
+            ListedClient {
+                id: 7,
+                channel_id: 42,
+            },
+            ListedClient {
+                id: 8,
+                channel_id: 42,
+            },
+        ];
+        assert!(!someone_else_in(&clients, 42, &[5, 7, 8]));
+        assert!(someone_else_in(&clients, 42, &[5, 7]));
     }
 
     #[test]

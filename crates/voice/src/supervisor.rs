@@ -214,6 +214,12 @@ impl BotSupervisor {
         self.summon.restore_cap(server, cap)
     }
 
+    /// The channel summon clients on one server wait in. `None` means
+    /// none is picked: a summon client that is done disconnects.
+    pub fn set_summon_home(&self, server: &str, home: Option<u64>) -> Result<(), String> {
+        self.summon.set_home(server, home)
+    }
+
     /// Open real TeamSpeak sessions for summon clients. Saved-bot connect
     /// and disconnect do not call this, and do not start or stop summon
     /// clients.

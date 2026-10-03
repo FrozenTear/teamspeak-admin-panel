@@ -1,17 +1,17 @@
-//! Summon cap for one TeamSpeak server address.
+//! Summon cap and summon home channel for one TeamSpeak server address.
 //!
 //! Chat requests never reach this process. The music process is what
-//! enforces the cap. This route only stores the number the music
-//! process has already accepted, keyed by `serverAddr`.
+//! enforces the cap and moves summon clients home. These routes store
+//! what the music process has already accepted, keyed by `serverAddr`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
 use axum::Json;
 use axum::Router;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::response::Response;
-use axum::routing::get;
+use axum::routing::{get, put};
 use tracing::{error, warn};
 use ts6_manager_shared::music_bots as wire;
 
@@ -19,11 +19,16 @@ use crate::app_state::AppState;
 use crate::auth::extractors::{RequireAuth, RequireModerator};
 use crate::db::Database;
 use crate::music_runtime::MusicBotFront;
-use crate::routes::music_bots::bots::{bot_visibility, require_server_write};
+use crate::routes::control::{access, translate_control_error};
+use crate::routes::music_bots::bots::{bot_visibility, require_server_write, server_for_addr};
 use crate::routes::music_bots::{internal, map_music_runtime_error, validation};
+use crate::webquery::models::{ChannelEntry, VirtualServerEntry};
 
 pub(super) fn router() -> Router<AppState> {
-    Router::new().route("/api/music-summon-caps", get(list).put(set))
+    Router::new()
+        .route("/api/music-summon-caps", get(list).put(set))
+        .route("/api/music-summon-homes", put(set_home))
+        .route("/api/music-summon-homes/channels", get(home_channels))
 }
 
 async fn list(
@@ -37,6 +42,7 @@ async fn list(
             internal("summon cap list failed")
         })?;
     let mut caps = Vec::with_capacity(rows.len());
+    let mut homes = Vec::new();
     let mut seen = BTreeSet::new();
     for row in rows {
         let server_addr = music_bot::canon_server_addr(&row.serverAddr);
@@ -46,11 +52,289 @@ async fn list(
         if bot_visibility(&state, &user, &server_addr).await?.is_none() {
             continue;
         }
-        let cap = u32::try_from(row.cap)
-            .map_err(|_| internal("stored summon cap is outside the range the page can show"))?;
-        caps.push(wire::SummonCap { server_addr, cap });
+        if let Some(cap) = row.cap {
+            let cap = u32::try_from(cap).map_err(|_| {
+                internal("stored summon cap is outside the range the page can show")
+            })?;
+            caps.push(wire::SummonCap {
+                server_addr: server_addr.clone(),
+                cap,
+            });
+        }
+        if let Some(home) = row.homeChannel {
+            let channel_id = u64::try_from(home)
+                .map_err(|_| internal("stored summon home is not a channel id"))?;
+            homes.push(wire::SummonHome {
+                server_addr,
+                channel_id: Some(channel_id),
+            });
+        }
     }
-    Ok(Json(wire::SummonCapList { caps }))
+    Ok(Json(wire::SummonCapList { caps, homes }))
+}
+
+/// Pick the channel summon clients on one server wait in, or clear it.
+/// The music process takes it first; the store keeps what the process
+/// took. No permission beyond the server write the cap needs.
+async fn set_home(
+    State(state): State<AppState>,
+    RequireModerator(user): RequireModerator,
+    Json(req): Json<wire::SummonHome>,
+) -> Result<Json<wire::SummonHome>, Response> {
+    let server_addr = music_bot::canon_server_addr(&req.server_addr);
+    if server_addr.is_empty() {
+        return Err(validation("serverAddr must not be empty"));
+    }
+    if let Some(channel) = req.channel_id
+        && (channel == 0 || i64::try_from(channel).is_err())
+    {
+        return Err(validation("channelId is not a TeamSpeak channel id"));
+    }
+    let _server = require_server_write(&state, &user, &server_addr).await?;
+    // Its own task, so a dropped request cannot stop the save between the
+    // process and the store.
+    let save = tokio::spawn(save_home(
+        state.clone(),
+        server_addr.clone(),
+        req.channel_id,
+    ));
+    let channel_id = save
+        .await
+        .map_err(|_| internal("summon home save failed"))??;
+    Ok(Json(wire::SummonHome {
+        server_addr,
+        channel_id,
+    }))
+}
+
+/// Forward `home`, then store it, under the per-server save lock. A
+/// forward error is checked with a read: the process may have taken it.
+/// When either side fails, the process is put back on the stored home.
+async fn save_home(
+    state: AppState,
+    server: String,
+    home: Option<u64>,
+) -> Result<Option<u64>, Response> {
+    let mutex = state.music_bots.summon_save_mutex(&server);
+    let _guard = mutex.lock_owned().await;
+    let front = &state.music_bots.supervisor;
+    if let Err(err) = forward_home(front, &server, home).await {
+        let took_it = read_home_retry(front, &server).await == Some(home);
+        if !took_it {
+            error!(server = %server, ?home, error = %err, "summon home forward failed");
+            restore_home(&state, &server).await;
+            return Err(map_music_runtime_error(err));
+        }
+    }
+    if let Err(err) = store_home(&state.db, &server, home).await {
+        error!(server = %server, ?home, error = %err, "summon home was not stored");
+        restore_home(&state, &server).await;
+        return Err(internal("summon home was not stored"));
+    }
+    Ok(home)
+}
+
+async fn forward_home(
+    front: &MusicBotFront,
+    server: &str,
+    home: Option<u64>,
+) -> Result<(), crate::music_runtime::MusicRuntimeError> {
+    #[cfg(test)]
+    if save_fault::take_forward_error_before_accept(server) {
+        return Err(crate::music_runtime::MusicRuntimeError::Unavailable(
+            "summon home forward failed before the process changed".into(),
+        ));
+    }
+    let result = front.set_summon_home(server, home).await;
+    #[cfg(test)]
+    if result.is_ok() && save_fault::take_forward_error_after_accept(server) {
+        return Err(crate::music_runtime::MusicRuntimeError::Unavailable(
+            "summon home forward failed after the process took it".into(),
+        ));
+    }
+    result
+}
+
+/// The home the process holds. `None` when no read succeeded.
+async fn read_home_retry(front: &MusicBotFront, server: &str) -> Option<Option<u64>> {
+    let mut wait = Duration::from_millis(20);
+    for _ in 0..5 {
+        match front.read_summon_home(server).await {
+            Ok(seen) => return Some(seen),
+            Err(err) => {
+                warn!(server = %server, error = %err, "summon home process read failed");
+            }
+        }
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(Duration::from_millis(200));
+    }
+    None
+}
+
+async fn store_home(db: &Database, server: &str, home: Option<u64>) -> Result<(), anyhow::Error> {
+    #[cfg(test)]
+    if save_fault::fail_upsert(server) {
+        anyhow::bail!("summon home store failed before the row was written");
+    }
+    crate::repos::music_summon_cap::upsert_home(db, server, home).await
+}
+
+/// Put the music process back on the home the store holds.
+async fn restore_home(state: &AppState, server: &str) {
+    let stored = match crate::repos::music_summon_cap::get_home(&state.db, server).await {
+        Ok(stored) => stored,
+        Err(err) => {
+            warn!(server = %server, error = %err, "summon home re-read failed; the process keeps what it has");
+            return;
+        }
+    };
+    if let Err(err) = state
+        .music_bots
+        .supervisor
+        .set_summon_home(server, stored)
+        .await
+    {
+        warn!(server = %server, ?stored, error = %err, "summon home restore failed");
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HomeChannelsQuery {
+    server_addr: String,
+}
+
+/// The channels a summon home can be, read from the virtual server that
+/// answers on this address's voice port.
+async fn home_channels(
+    State(state): State<AppState>,
+    RequireAuth(user): RequireAuth,
+    Query(query): Query<HomeChannelsQuery>,
+) -> Result<Json<wire::SummonHomeChannelList>, Response> {
+    let server_addr = music_bot::canon_server_addr(&query.server_addr);
+    if server_addr.is_empty() {
+        return Err(validation("serverAddr must not be empty"));
+    }
+    let server = server_for_addr(&state, &server_addr).await?;
+    let connection = access::check_read(&state, &user, server.id).await?;
+    let control = state
+        .control
+        .get_or_build(connection.id, Some(&connection))
+        .await
+        .map_err(translate_control_error)?;
+    let servers = control
+        .serverlist()
+        .await
+        .map_err(translate_control_error)?;
+    let sid = virtual_server_for(&servers, voice_port(&server_addr)).ok_or_else(|| {
+        validation("no virtual server on this connection answers on that voice port")
+    })?;
+    let rows = control
+        .channellist_with_flags(sid, &["flags"])
+        .await
+        .map_err(translate_control_error)?;
+    Ok(Json(wire::SummonHomeChannelList {
+        server_addr,
+        channels: home_channel_options(&rows),
+    }))
+}
+
+/// The voice port of a canonical `host:port` address.
+fn voice_port(server_addr: &str) -> Option<i64> {
+    server_addr.rsplit_once(':')?.1.parse().ok()
+}
+
+/// The virtual server on `port`. A connection with a single virtual
+/// server that does not report its port is that server.
+fn virtual_server_for(servers: &[VirtualServerEntry], port: Option<i64>) -> Option<i64> {
+    if let Some(port) = port
+        && let Some(found) = servers.iter().find(|vs| vs.virtualserver_port == port)
+    {
+        return Some(found.virtualserver_id);
+    }
+    match servers {
+        [only] if only.virtualserver_port == 0 => Some(only.virtualserver_id),
+        _ => None,
+    }
+}
+
+/// Channels in the order the TeamSpeak client shows them, each with its
+/// parents' names in front. `channel_order` is the id of the sibling a
+/// channel sorts after (`0` is first).
+fn home_channel_options(rows: &[ChannelEntry]) -> Vec<wire::SummonHomeChannel> {
+    let ids: HashSet<i64> = rows.iter().map(|row| row.cid).collect();
+    let mut children: HashMap<i64, Vec<&ChannelEntry>> = HashMap::new();
+    for row in rows {
+        // A parent that is not on the list puts the channel at the top.
+        let parent = if ids.contains(&row.pid) { row.pid } else { 0 };
+        children.entry(parent).or_default().push(row);
+    }
+    let mut out = Vec::with_capacity(rows.len());
+    let mut done = HashSet::new();
+    let mut stack: Vec<(&ChannelEntry, String)> = Vec::new();
+    for top in sibling_order(children.get(&0).map(Vec::as_slice).unwrap_or(&[]))
+        .into_iter()
+        .rev()
+    {
+        stack.push((top, top.channel_name.clone()));
+    }
+    while let Some((row, path)) = stack.pop() {
+        if !done.insert(row.cid) {
+            continue;
+        }
+        let kids = sibling_order(children.get(&row.cid).map(Vec::as_slice).unwrap_or(&[]));
+        for kid in kids.into_iter().rev() {
+            stack.push((kid, format!("{path} / {}", kid.channel_name)));
+        }
+        let Ok(channel_id) = u64::try_from(row.cid) else {
+            continue;
+        };
+        out.push(wire::SummonHomeChannel {
+            channel_id,
+            path,
+            is_default: row.channel_flag_default != 0,
+        });
+    }
+    // A cycle in the parent links leaves rows unvisited. List them last.
+    for row in rows {
+        if !done.contains(&row.cid)
+            && let Ok(channel_id) = u64::try_from(row.cid)
+        {
+            out.push(wire::SummonHomeChannel {
+                channel_id,
+                path: row.channel_name.clone(),
+                is_default: row.channel_flag_default != 0,
+            });
+        }
+    }
+    out
+}
+
+/// One parent's children, first to last by the `channel_order` chain. A
+/// broken chain keeps the rest in channel-id order after it.
+fn sibling_order<'a>(kids: &[&'a ChannelEntry]) -> Vec<&'a ChannelEntry> {
+    let mut after: HashMap<i64, &'a ChannelEntry> = HashMap::new();
+    for kid in kids {
+        after.entry(kid.channel_order).or_insert(kid);
+    }
+    let mut ordered = Vec::with_capacity(kids.len());
+    let mut seen = HashSet::new();
+    let mut previous = 0;
+    while let Some(next) = after.get(&previous) {
+        if !seen.insert(next.cid) {
+            break;
+        }
+        ordered.push(*next);
+        previous = next.cid;
+    }
+    let mut rest: Vec<&'a ChannelEntry> = kids
+        .iter()
+        .copied()
+        .filter(|kid| !seen.contains(&kid.cid))
+        .collect();
+    rest.sort_by_key(|kid| kid.cid);
+    ordered.extend(rest);
+    ordered
 }
 
 async fn set(
@@ -628,6 +912,22 @@ pub(super) async fn cap_for_push(state: &AppState, server_addr: &str) -> Option<
     }
 }
 
+/// Home channel to carry on a saved-bot push. A lookup error is `None`:
+/// the push must not invent a home and must not fail bot create.
+pub(super) async fn home_for_push(state: &AppState, server_addr: &str) -> Option<u64> {
+    match crate::repos::music_summon_cap::get_home(&state.db, server_addr).await {
+        Ok(home) => home,
+        Err(err) => {
+            warn!(
+                server = %server_addr,
+                error = %err,
+                "summon home lookup failed; this push carries no home"
+            );
+            None
+        }
+    }
+}
+
 /// After a saved-bot push, write the number the process holds.
 /// The caller keeps the per-server save lock. A process with no number
 /// leaves the store unchanged. This does not return while a held number
@@ -954,5 +1254,107 @@ mod save_fault {
             .lock()
             .unwrap_or_else(|err| err.into_inner())
             .remove(&key);
+    }
+}
+
+#[cfg(test)]
+mod home_channel_tests {
+    use super::*;
+
+    fn channel(cid: i64, pid: i64, order: i64, name: &str) -> ChannelEntry {
+        ChannelEntry {
+            cid,
+            pid,
+            channel_order: order,
+            channel_name: name.into(),
+            ..Default::default()
+        }
+    }
+
+    fn vs(sid: i64, port: i64) -> VirtualServerEntry {
+        VirtualServerEntry {
+            virtualserver_id: sid,
+            virtualserver_name: format!("vs{sid}"),
+            virtualserver_status: "online".into(),
+            virtualserver_clientsonline: 0,
+            virtualserver_maxclients: 32,
+            virtualserver_port: port,
+        }
+    }
+
+    fn paths(rows: &[ChannelEntry]) -> Vec<(u64, String)> {
+        home_channel_options(rows)
+            .into_iter()
+            .map(|c| (c.channel_id, c.path))
+            .collect()
+    }
+
+    #[test]
+    fn channels_follow_the_tree_and_the_order_chain() {
+        // `channel_order` names the sibling a channel sorts after, so a
+        // sort by that number would put Bots before Games.
+        let mut lobby = channel(1, 0, 0, "Lobby");
+        lobby.channel_flag_default = 1;
+        let rows = vec![
+            channel(2, 0, 3, "Bots"),
+            channel(5, 2, 0, "Bot room"),
+            lobby,
+            channel(3, 0, 1, "Games"),
+            channel(6, 3, 0, "Room A"),
+            channel(7, 3, 6, "Room B"),
+        ];
+        assert_eq!(
+            paths(&rows),
+            vec![
+                (1, "Lobby".into()),
+                (3, "Games".into()),
+                (6, "Games / Room A".into()),
+                (7, "Games / Room B".into()),
+                (2, "Bots".into()),
+                (5, "Bots / Bot room".into()),
+            ]
+        );
+        let options = home_channel_options(&rows);
+        assert!(options[0].is_default);
+        assert!(options[1..].iter().all(|c| !c.is_default));
+    }
+
+    #[test]
+    fn a_broken_chain_or_a_missing_parent_still_lists_every_channel() {
+        let rows = vec![
+            channel(1, 0, 0, "Lobby"),
+            channel(4, 0, 99, "Lost order"),
+            channel(8, 42, 0, "Missing parent"),
+            channel(9, 10, 0, "Loop A"),
+            channel(10, 9, 0, "Loop B"),
+        ];
+        let listed = paths(&rows);
+        assert_eq!(listed.len(), rows.len());
+        assert_eq!(listed[0], (1, "Lobby".into()));
+        assert!(listed.contains(&(4, "Lost order".into())));
+        assert!(listed.contains(&(8, "Missing parent".into())));
+        assert!(listed.iter().any(|(id, _)| *id == 9));
+        assert!(listed.iter().any(|(id, _)| *id == 10));
+    }
+
+    #[test]
+    fn the_voice_port_picks_the_virtual_server() {
+        let servers = vec![vs(1, 9987), vs(2, 9988)];
+        assert_eq!(
+            virtual_server_for(&servers, voice_port("ts.example:9988")),
+            Some(2)
+        );
+        assert_eq!(
+            virtual_server_for(&servers, voice_port("ts.example:9987")),
+            Some(1)
+        );
+        assert_eq!(
+            virtual_server_for(&servers, voice_port("ts.example:9999")),
+            None
+        );
+        // One virtual server that does not say its port is that server.
+        assert_eq!(virtual_server_for(&[vs(4, 0)], Some(9987)), Some(4));
+        assert_eq!(virtual_server_for(&[vs(4, 9988)], Some(9987)), None);
+        assert_eq!(voice_port("::1:9987"), Some(9987));
     }
 }

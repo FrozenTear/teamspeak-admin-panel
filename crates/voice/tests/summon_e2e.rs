@@ -20,7 +20,14 @@
 //! a burst; that refusal is what the old quiet pool ran into on the live
 //! server. Leave a minute between runs for the same reason.
 //!
-//! Gated like the other fixture tests: feature + env + `#[ignore]`.
+//! `summon_home_e2e` picks a home channel. A summon client that is done
+//! waits there instead of leaving, a summon from another channel takes it
+//! without a new connection, it comes back after the song, it follows a
+//! new home, and it leaves when the home is cleared.
+//!
+//! Gated like the other fixture tests: feature + env + `#[ignore]`. The
+//! two tests take turns, and the second waits for the antiflood points of
+//! the first to decay.
 //!
 //!     make ts6-up
 //!     TS6_VOICE_FIXTURE=1 cargo test -p music-bot --features lifecycle-e2e \
@@ -63,6 +70,14 @@ const FLOOD_SETTLE: Duration = Duration::from_secs(30);
 const LATE_SETTLE: Duration = Duration::from_secs(12);
 /// Ada types `!stop` after 16 s of the 20 s tone, after the late client.
 const STOP_AFTER_FRAMES: usize = 800;
+/// Songs in the home test. Short: the test is about where the client goes
+/// after them.
+const SHORT_TONE_MS: u64 = 4_000;
+/// How long a move or a song may take to show in a person's book.
+const STEP_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// One fixture test at a time: every connect comes from the same IP.
+static FIXTURE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
@@ -82,6 +97,7 @@ async fn summon_e2e() {
         .with_test_writer()
         .try_init();
 
+    let _turn = FIXTURE.lock().await;
     if let Err(err) = run().await {
         eprintln!("\n=== summon_e2e failed ===");
         for (i, cause) in err.chain().enumerate() {
@@ -89,6 +105,37 @@ async fn summon_e2e() {
         }
         panic!("summon_e2e failed: {err:#}");
     }
+    // Let this test's connects decay before the next fixture test.
+    sleep(FLOOD_SETTLE).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn summon_home_e2e() {
+    if !env_flag("TS6_VOICE_FIXTURE") {
+        eprintln!(
+            "[summon_home_e2e] skipped. Set TS6_VOICE_FIXTURE=1 after `make ts6-up`. \
+             See docs/ts6-fixture.md."
+        );
+        return;
+    }
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,tsclientlib=warn,tsproto=warn".into()),
+        )
+        .with_test_writer()
+        .try_init();
+
+    let _turn = FIXTURE.lock().await;
+    if let Err(err) = run_home().await {
+        eprintln!("\n=== summon_home_e2e failed ===");
+        for (i, cause) in err.chain().enumerate() {
+            eprintln!("  [{i}] {cause}");
+        }
+        panic!("summon_home_e2e failed: {err:#}");
+    }
+    sleep(FLOOD_SETTLE).await;
 }
 
 async fn run() -> Result<()> {
@@ -232,6 +279,280 @@ async fn run() -> Result<()> {
 
     supervisor.shutdown_bot(bot_id).await.ok();
     let _ = std::fs::remove_dir_all(&workdir);
+    Ok(())
+}
+
+async fn run_home() -> Result<()> {
+    let addr = env::var("TS6_VOICE_FIXTURE_ADDR").unwrap_or_else(|_| "127.0.0.1:9987".into());
+    let tag = std::process::id();
+    let workdir = env::temp_dir().join(format!("music-bot-summon-home-e2e-{tag}"));
+    let _ = std::fs::remove_dir_all(&workdir);
+    let summon_dir = workdir.join("quiet-identities");
+    let cookie: Arc<RwLock<Option<PathBuf>>> = Arc::new(RwLock::new(None));
+    let key: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
+
+    // 1. One saved bot, summon on with cap 1.
+    let supervisor = BotSupervisor::new();
+    supervisor.enable_quiet_sessions(summon_dir.clone(), Arc::clone(&cookie), Arc::clone(&key));
+    let saved_identity = workdir.join("bot-1.identity");
+    let bot_id = supervisor
+        .spawn(
+            BotConfig::new("qa-summon-home", &saved_identity)
+                .with_server_addr(&addr)
+                .with_handshake_timeout(HANDSHAKE_TIMEOUT)
+                .with_auto_connect(true),
+            Arc::clone(&cookie),
+            Arc::clone(&key),
+        )
+        .await;
+    supervisor.note_summon_push(&addr, bot_id.0, Some(1), &saved_identity);
+    let mut bot_events = supervisor
+        .subscribe(bot_id)
+        .await
+        .context("saved bot events")?;
+    let bot_clid = wait_bot_connected(&mut bot_events).await?;
+
+    // 2. Ada sits in the bot room, which becomes the home. Bo sits in a
+    //    lounge.
+    let room_name = format!("Bot room {tag}");
+    let lounge_name = format!("Lounge {tag}");
+    let mut ada = Person::new(connect_person(&addr, &workdir, "qa-home-ada").await?);
+    let room = create_own_channel(&mut ada.con, &room_name, None).await?;
+    let mut bo = Person::new(connect_person(&addr, &workdir, "qa-home-bo").await?);
+    let lounge = create_own_channel(&mut bo.con, &lounge_name, None).await?;
+    supervisor
+        .set_summon_home(&addr, Some(room))
+        .map_err(anyhow::Error::msg)?;
+    eprintln!("home {room_name:?} ({room}), lounge {lounge_name:?} ({lounge})");
+    let settle_until = Instant::now() + FLOOD_SETTLE;
+    while Instant::now() < settle_until {
+        poll_once(&mut [&mut ada, &mut bo]).await?;
+    }
+
+    // 3. Ada summons from inside the home. The client plays there and,
+    //    when the song is done, stays there.
+    send(
+        &mut ada.con,
+        MessageTarget::Client(ClientId(bot_clid)),
+        &format!("!play synthetic://?hz=440&duration_ms={SHORT_TONE_MS}&amplitude=0.4"),
+    )
+    .await
+    .context("ada's private message")?;
+    let mut summon = 0u16;
+    poll_until(
+        &mut [&mut ada, &mut bo],
+        "a summon client playing in the home",
+        SUMMON_TIMEOUT,
+        |people| {
+            let Some(id) = people[0].summons_in(room).first().copied() else {
+                return false;
+            };
+            summon = id;
+            people[0].frames(id) >= MIN_FRAMES / 2
+        },
+    )
+    .await?;
+    let first_ids = supervisor.summon().summon_ids(&addr);
+    poll_until(
+        &mut [&mut ada, &mut bo],
+        "the summon client waiting in the home after its song",
+        STEP_TIMEOUT,
+        |people| {
+            supervisor.summon().waiting_ids(&addr).len() == 1
+                && people[0].channel_of(summon) == Some(room)
+        },
+    )
+    .await?;
+    eprintln!("summon client {summon} waits in the home after Ada's song");
+
+    // 4. Bo summons from the lounge. The waiting client comes over; no
+    //    second client connects.
+    send(
+        &mut bo.con,
+        MessageTarget::Poke(ClientId(bot_clid)),
+        &format!("!play synthetic://?hz=660&duration_ms={SHORT_TONE_MS}&amplitude=0.4"),
+    )
+    .await
+    .context("bo's poke")?;
+    poll_until(
+        &mut [&mut ada, &mut bo],
+        "the waiting client playing in the lounge",
+        SUMMON_TIMEOUT,
+        |people| {
+            people[1].channel_of(summon) == Some(lounge)
+                && people[1].frames(summon) >= MIN_FRAMES / 2
+        },
+    )
+    .await?;
+    if supervisor.summon().summon_ids(&addr) != first_ids {
+        bail!(
+            "Bo's summon started another client: {:?} after {first_ids:?}",
+            supervisor.summon().summon_ids(&addr)
+        );
+    }
+    if bo.summons_seen() != 1 || ada.summons_seen() != 1 {
+        bail!("a second summon client showed up on the server");
+    }
+    poll_until(
+        &mut [&mut ada, &mut bo],
+        "the summon client back in the home after Bo's song",
+        STEP_TIMEOUT,
+        |people| {
+            supervisor.summon().waiting_ids(&addr).len() == 1
+                && people[0].channel_of(summon) == Some(room)
+        },
+    )
+    .await?;
+    eprintln!("summon client {summon} served Bo and went home");
+
+    // 5. A new home moves the waiting client.
+    supervisor
+        .set_summon_home(&addr, Some(lounge))
+        .map_err(anyhow::Error::msg)?;
+    poll_until(
+        &mut [&mut ada, &mut bo],
+        "the waiting client in the new home",
+        STEP_TIMEOUT,
+        |people| {
+            supervisor.summon().waiting_ids(&addr).len() == 1
+                && people[1].channel_of(summon) == Some(lounge)
+        },
+    )
+    .await?;
+
+    // 6. No home: the waiting client leaves the server.
+    supervisor
+        .set_summon_home(&addr, None)
+        .map_err(anyhow::Error::msg)?;
+    poll_until(
+        &mut [&mut ada, &mut bo],
+        "the waiting client gone once no home is picked",
+        STEP_TIMEOUT,
+        |people| {
+            people[1].channel_of(summon).is_none() && supervisor.summon().quiet_count(&addr) == 0
+        },
+    )
+    .await?;
+    wait_until(
+        || summon_identity_files(&summon_dir) == 0,
+        "summon identity files removed",
+    )
+    .await?;
+
+    while let Ok(ev) = bot_events.try_recv() {
+        if matches!(ev, BotEvent::NowPlaying(_) | BotEvent::QueueChanged { .. }) {
+            bail!("the saved bot took a summon line as its own command: {ev:?}");
+        }
+    }
+    for person in [ada, bo] {
+        person.leave().await;
+    }
+    supervisor.shutdown_bot(bot_id).await.ok();
+    let _ = std::fs::remove_dir_all(&workdir);
+    Ok(())
+}
+
+/// A person's connection and the audio frames it received, per sender.
+struct Person {
+    con: Connection,
+    frames_from: HashMap<u16, usize>,
+    summons: std::collections::BTreeSet<u16>,
+}
+
+impl Person {
+    fn new(con: Connection) -> Self {
+        Self {
+            con,
+            frames_from: HashMap::new(),
+            summons: std::collections::BTreeSet::new(),
+        }
+    }
+
+    /// Summon clients in `channel` by their client ids.
+    fn summons_in(&self, channel: u64) -> Vec<u16> {
+        let Ok(book) = self.con.get_state() else {
+            return Vec::new();
+        };
+        book.clients
+            .iter()
+            .filter(|(_, client)| client.channel.0 == channel && client.name.starts_with("Summon"))
+            .map(|(id, _)| id.0)
+            .collect()
+    }
+
+    fn channel_of(&self, client: u16) -> Option<u64> {
+        let book = self.con.get_state().ok()?;
+        book.clients
+            .get(&ClientId(client))
+            .map(|client| client.channel.0)
+    }
+
+    fn frames(&self, from: u16) -> usize {
+        self.frames_from.get(&from).copied().unwrap_or(0)
+    }
+
+    /// Summon clients this person has seen anywhere on the server.
+    fn summons_seen(&self) -> usize {
+        self.summons.len()
+    }
+
+    async fn leave(mut self) {
+        let _ = self.con.disconnect(
+            DisconnectOptions::new()
+                .reason(Reason::Clientdisconnect)
+                .message("test done".to_string()),
+        );
+        drain_for(&mut self.con, Duration::from_millis(300)).await;
+    }
+}
+
+/// Poll every person until `done` holds.
+async fn poll_until(
+    people: &mut [&mut Person],
+    what: &str,
+    limit: Duration,
+    mut done: impl FnMut(&[&Person]) -> bool,
+) -> Result<()> {
+    let deadline = Instant::now() + limit;
+    loop {
+        {
+            let view: Vec<&Person> = people.iter().map(|person| &**person).collect();
+            if done(&view) {
+                return Ok(());
+            }
+        }
+        if Instant::now() >= deadline {
+            bail!("timed out waiting for {what}");
+        }
+        poll_once(people).await?;
+    }
+}
+
+/// One short poll of every person: count audio frames per sender and note
+/// every summon client on the server.
+async fn poll_once(people: &mut [&mut Person]) -> Result<()> {
+    for person in people.iter_mut() {
+        match timeout(Duration::from_millis(20), person.con.events().next()).await {
+            Ok(Some(Ok(StreamItem::Audio(packet)))) => {
+                if let AudioData::S2C { from, data, .. } = packet.data().data()
+                    && !data.is_empty()
+                {
+                    *person.frames_from.entry(*from).or_default() += 1;
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            Ok(Some(Err(err))) => bail!("person stream error: {err}"),
+            Ok(None) => bail!("person stream ended"),
+            Err(_) => {}
+        }
+        if let Ok(book) = person.con.get_state() {
+            for (id, client) in book.clients.iter() {
+                if client.name.starts_with("Summon") {
+                    person.summons.insert(id.0);
+                }
+            }
+        }
+    }
     Ok(())
 }
 

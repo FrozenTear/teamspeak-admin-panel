@@ -41,7 +41,7 @@ use crate::config::BotId;
 use crate::runtime_api::{
     BugReportContextResponse, EncodeHeadroom, HealthResponse, ListResponse, MutateOp, SendLead,
     SendRequest, SettingsRequest, SpawnRequest, SpawnResponse, StoreOp, SummonCapBody,
-    SummonHeardBody, WireError, store_err_to_wire,
+    SummonHeardBody, SummonHomeBody, WireError, store_err_to_wire,
 };
 use crate::store::{LibraryEntryId, PlaylistName, StoreError, TrackId};
 use crate::supervisor::BotSupervisor;
@@ -297,6 +297,7 @@ pub fn router_with_auth(state: RuntimeState, auth: ControlAuth) -> Router {
     let mut app = Router::new()
         .route("/v1/bots", get(list_bots).post(spawn_bot))
         .route("/v1/summon-cap", get(get_summon_cap).put(put_summon_cap))
+        .route("/v1/summon-home", get(get_summon_home).put(put_summon_home))
         .route("/v1/summon-heard", post(post_summon_heard))
         .route("/v1/bots/{id}", delete(shutdown_bot))
         .route("/v1/bots/{id}/command", post(send_command))
@@ -392,6 +393,7 @@ async fn spawn_bot(
     Json(req): Json<SpawnRequest>,
 ) -> Result<Json<SpawnResponse>, Response> {
     let summon_cap = req.summon_cap;
+    let summon_home = req.summon_home;
     let server_addr = req.config.server_addr.clone();
     let identity = req.config.identity_path.clone();
     let id = if let Some(id) = req.id {
@@ -417,6 +419,12 @@ async fn spawn_bot(
     state
         .supervisor
         .note_summon_push(&server_addr, id.0, summon_cap, &identity);
+    if let Some(home) = summon_home
+        && let Err(err) = state.supervisor.set_summon_home(&server_addr, Some(home))
+    {
+        // The saved bot is up. A bad home on the push does not undo it.
+        tracing::warn!(server = %server_addr, home, error = %err, "summon home on a push was refused");
+    }
     Ok(Json(SpawnResponse { id }))
 }
 
@@ -446,6 +454,31 @@ async fn put_summon_cap(
         None => state.supervisor.restore_summon_cap(&req.server_addr, None),
     };
     result.map_err(|err| status_err(StatusCode::BAD_REQUEST, &err))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The home channel the music process holds for one server. `channelId:
+/// null` is a server with none picked.
+async fn get_summon_home(
+    State(state): State<RuntimeState>,
+    Query(query): Query<SummonCapQuery>,
+) -> Json<SummonHomeBody> {
+    let server_addr = crate::canon_server_addr(&query.server_addr);
+    let channel_id = state.supervisor.summon().home(&server_addr);
+    Json(SummonHomeBody {
+        server_addr,
+        channel_id,
+    })
+}
+
+async fn put_summon_home(
+    State(state): State<RuntimeState>,
+    Json(req): Json<SummonHomeBody>,
+) -> Result<StatusCode, Response> {
+    state
+        .supervisor
+        .set_summon_home(&req.server_addr, req.channel_id)
+        .map_err(|err| status_err(StatusCode::BAD_REQUEST, &err))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -899,6 +932,7 @@ mod tests {
                             config: cfg,
                             id: None,
                             summon_cap: None,
+                            summon_home: None,
                         })
                         .unwrap(),
                     ))
@@ -1181,6 +1215,7 @@ mod tests {
                             config: cfg,
                             id: None,
                             summon_cap: None,
+                            summon_home: None,
                         })
                         .unwrap(),
                     ))
@@ -1587,6 +1622,7 @@ mod tests {
             .with_auto_connect(false),
             id: None,
             summon_cap: cap,
+            summon_home: None,
         }
     }
 
@@ -1823,6 +1859,93 @@ mod tests {
             .unwrap();
         let listed: ListResponse = json(listed).await;
         assert_eq!(listed.bots.len(), 1);
+    }
+
+    async fn read_summon_home(app: &Router, server: &str) -> SummonHomeBody {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/summon-home?serverAddr={server}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        json(resp).await
+    }
+
+    #[tokio::test]
+    async fn summon_home_is_held_per_server_and_rides_on_a_push() {
+        let state = RuntimeState::new();
+        let supervisor = Arc::clone(&state.supervisor);
+        let app = router(state);
+        let server = "10.4.0.1:9987";
+        let other = "10.4.0.1:9988";
+
+        // Nothing picked is null, not a channel the process made up.
+        let none = read_summon_home(&app, server).await;
+        assert_eq!(none.server_addr, server);
+        assert_eq!(none.channel_id, None);
+
+        let set = send_json(
+            &app,
+            "PUT",
+            "/v1/summon-home",
+            &SummonHomeBody {
+                server_addr: "10.4.0.1".into(),
+                channel_id: Some(12),
+            },
+        )
+        .await;
+        assert_eq!(set.status(), StatusCode::NO_CONTENT);
+        assert_eq!(read_summon_home(&app, server).await.channel_id, Some(12));
+        assert_eq!(read_summon_home(&app, other).await.channel_id, None);
+
+        let zero = send_json(
+            &app,
+            "PUT",
+            "/v1/summon-home",
+            &SummonHomeBody {
+                server_addr: server.into(),
+                channel_id: Some(0),
+            },
+        )
+        .await;
+        assert_eq!(zero.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(supervisor.summon().home(server), Some(12));
+
+        // A push without a home keeps the one held. A push with one
+        // sets it.
+        let bare = send_json(
+            &app,
+            "POST",
+            "/v1/bots",
+            &summon_spawn("bare", server, None),
+        )
+        .await;
+        assert_eq!(bare.status(), StatusCode::OK);
+        assert_eq!(supervisor.summon().home(server), Some(12));
+        let mut carrying = summon_spawn("carrying", other, Some(1));
+        carrying.summon_home = Some(30);
+        let pushed = send_json(&app, "POST", "/v1/bots", &carrying).await;
+        assert_eq!(pushed.status(), StatusCode::OK);
+        assert_eq!(supervisor.summon().home(other), Some(30));
+        assert_eq!(supervisor.summon().home(server), Some(12));
+
+        let cleared = send_json(
+            &app,
+            "PUT",
+            "/v1/summon-home",
+            &SummonHomeBody {
+                server_addr: server.into(),
+                channel_id: None,
+            },
+        )
+        .await;
+        assert_eq!(cleared.status(), StatusCode::NO_CONTENT);
+        assert_eq!(read_summon_home(&app, server).await.channel_id, None);
     }
 
     #[tokio::test]

@@ -13,6 +13,8 @@
 //!   summon client that is already connected;
 //! - channel chat in the channel a summon client is playing in, which
 //!   that client handles itself;
+//! - channel chat in the home channel, which a summon client waiting
+//!   there passes on;
 //! - channel or server chat the panel's server-query subscription
 //!   delivered (`POST /v1/summon-heard`).
 //!
@@ -43,6 +45,13 @@
 //! summon. Cap 0 turns summon off. A server with no number stored has
 //! summon off; a push that omits the number does not copy another
 //! server's number.
+//!
+//! A summon client that is not playing for anyone goes to the server's
+//! home channel, the one picked on the music page, and waits there. The
+//! next summon on that server takes a waiting client instead of opening
+//! a new connection. With no home picked, a client that is done
+//! disconnects, so it never waits in a public channel. Nothing connects
+//! only to wait: a client starts for a summon and waits after it.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -118,7 +127,9 @@ pub enum Heard {
     /// A private message, a poke, or server chat to one of our clients.
     Crossing,
     /// Channel or server chat the panel's server-query subscription
-    /// delivered.
+    /// delivered, or channel chat a waiting summon client heard in the
+    /// home channel. A summon client playing in that channel heard it
+    /// too.
     Panel,
 }
 
@@ -127,8 +138,41 @@ pub enum Heard {
 pub enum SessionCmd {
     /// Replace the song with this request.
     Play(String),
+    /// A waiting client was picked for this caller. The song is handed
+    /// over by [`SummonDirector::seat`].
+    Serve(u16),
+    /// The home channel changed. Go to the new one, or disconnect when
+    /// none is set.
+    Home,
     /// Stop and disconnect.
     Stop,
+}
+
+/// Where a summon client goes once it is not playing for anyone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Homeward {
+    /// Wait in this channel.
+    Home(u64),
+    /// No home channel is picked. Disconnect instead of waiting in a
+    /// public channel.
+    NoHome,
+    /// The server already has more summon clients than it may hold.
+    OverLimit,
+    /// This client was stopped.
+    Gone,
+}
+
+/// What a summon client is doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    /// Connecting, or finding the caller it was started or picked for.
+    Called,
+    /// In the caller's channel, playing for them.
+    Seated(u64),
+    /// Not playing for anyone, on its way to the home channel.
+    Returning,
+    /// Waiting in the home channel. The next summon takes it.
+    Idle,
 }
 
 /// The director's answer once a summon client knows the caller's channel.
@@ -148,8 +192,9 @@ struct Summon {
     id: u64,
     caller: u16,
     request: String,
-    /// The caller's channel, once this client was seated there.
-    channel: Option<u64>,
+    phase: Phase,
+    /// This client's own TeamSpeak client id, once it is connected.
+    client: Option<u16>,
     identity_path: PathBuf,
     /// When this client may open its connection.
     connect_at: Instant,
@@ -169,6 +214,10 @@ struct ServerPool {
     /// The address as a saved bot dials it. Summon clients dial the same
     /// string, not the lowercased pool key.
     dial: Option<String>,
+    /// Channel a summon client waits in when it is not playing for
+    /// anyone. `None` until one is picked: a client that is done then
+    /// disconnects.
+    home: Option<u64>,
     summons: Vec<Summon>,
     /// Last client list a summon client on this server reported.
     clients: Vec<ListedClient>,
@@ -219,6 +268,30 @@ impl ServerPool {
             parallel_limit(self.cap)
         } else {
             0
+        }
+    }
+
+    /// Stop clients that are not playing for anyone until the server is
+    /// back within its limit. A client that plays keeps its song.
+    fn trim_waiting(&mut self) {
+        let limit = self.limit();
+        while self.summons.len() > limit {
+            let Some(index) = self
+                .summons
+                .iter()
+                .rposition(|s| matches!(s.phase, Phase::Returning | Phase::Idle))
+            else {
+                break;
+            };
+            let removed = self.summons.remove(index);
+            let _ = removed.stop.send(true);
+        }
+    }
+
+    fn remove(&mut self, summon: u64) {
+        if let Some(index) = self.summons.iter().position(|s| s.id == summon) {
+            let removed = self.summons.remove(index);
+            let _ = removed.stop.send(true);
         }
     }
 }
@@ -324,6 +397,19 @@ impl SummonDirector {
         }
     }
 
+    /// Set the channel summon clients on this server wait in. Clients
+    /// that are waiting move there; with `None` they disconnect. A client
+    /// that is playing for someone keeps playing and goes to the new home
+    /// when it is done. Channel 0 is refused: it is not a channel.
+    pub fn set_home(&self, server: &str, home: Option<u64>) -> Result<(), String> {
+        self.lock().set_home(server, home)
+    }
+
+    /// The home channel this server's summon clients wait in.
+    pub fn home(&self, server: &str) -> Option<u64> {
+        self.lock().pool(server).and_then(|pool| pool.home)
+    }
+
     /// A saved bot is gone. The last one on a server disarms summon there
     /// and stops that server's summon clients. The stored cap is left in
     /// place.
@@ -350,7 +436,17 @@ impl SummonDirector {
     /// usually says so before the panel's copy arrives; the copy waits
     /// [`PANEL_GRACE`] so a late report still wins.
     pub fn hear_for_host(&self, host: &str, caller: u16, line: &str) {
-        let server = canon_server_addr(host);
+        self.hear_channel_line(canon_server_addr(host), caller, line);
+    }
+
+    /// Channel chat a waiting summon client heard in the home channel. A
+    /// saved bot or a summon client playing there answers that chat
+    /// itself, so this waits [`PANEL_GRACE`] like the panel's copy.
+    pub(crate) fn hear_home_chat(&self, server: &str, caller: u16, line: &str) {
+        self.hear_channel_line(canon_server_addr(server), caller, line);
+    }
+
+    fn hear_channel_line(&self, server: String, caller: u16, line: &str) {
         if server.is_empty() || song_arg(line).is_none() {
             return;
         }
@@ -376,6 +472,39 @@ impl SummonDirector {
     /// is true when a saved bot's identity is on that channel's list.
     pub fn seat(&self, server: &str, summon: u64, channel: u64, saved_bot_here: bool) -> Seat {
         self.lock().seat(server, summon, channel, saved_bot_here)
+    }
+
+    /// The summon client is not playing for anyone now. Says where it
+    /// goes: the home channel, or away.
+    pub fn release(&self, server: &str, summon: u64) -> Homeward {
+        self.lock().release(server, summon)
+    }
+
+    /// The summon client arrived in `channel` on its way home. It waits
+    /// there when that is still the home. Otherwise this answers like
+    /// [`Self::release`].
+    pub fn settle(&self, server: &str, summon: u64, channel: u64) -> Homeward {
+        self.lock().settle(server, summon, channel)
+    }
+
+    /// The summon client's own TeamSpeak client id.
+    pub fn note_own_client(&self, server: &str, summon: u64, client: u16) {
+        let mut state = self.lock();
+        let Some(pool) = state.pool_mut(server) else {
+            return;
+        };
+        if let Some(s) = pool.summons.iter_mut().find(|s| s.id == summon) {
+            s.client = Some(client);
+        }
+    }
+
+    /// TeamSpeak client ids of this server's summon clients. A channel
+    /// with only these in it is empty for a summon client playing there.
+    pub fn summon_clients(&self, server: &str) -> Vec<u16> {
+        self.lock()
+            .pool(server)
+            .map(|pool| pool.summons.iter().filter_map(|s| s.client).collect())
+            .unwrap_or_default()
     }
 
     /// The server refused a summon client as banned or flooding. No
@@ -453,8 +582,8 @@ impl SummonDirector {
         self.launch_pending();
     }
 
-    /// Summon clients this server holds right now: connecting, moving, or
-    /// playing.
+    /// Summon clients this server holds right now: connecting, moving,
+    /// playing, or waiting in the home channel.
     pub fn quiet_count(&self, server: &str) -> usize {
         self.lock()
             .pool(server)
@@ -511,7 +640,26 @@ impl SummonDirector {
 
     /// Channel a summon client was seated in, if any.
     pub fn seated_channel(&self, server: &str, summon: u64) -> Option<u64> {
-        self.lock().summon(server, summon).and_then(|s| s.channel)
+        self.lock()
+            .summon(server, summon)
+            .and_then(|s| match s.phase {
+                Phase::Seated(channel) => Some(channel),
+                _ => None,
+            })
+    }
+
+    /// Summon clients waiting in the home channel for the next summon.
+    pub fn waiting_ids(&self, server: &str) -> Vec<u64> {
+        self.lock()
+            .pool(server)
+            .map(|pool| {
+                pool.summons
+                    .iter()
+                    .filter(|s| s.phase == Phase::Idle)
+                    .map(|s| s.id)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn is_live(&self) -> bool {
@@ -619,6 +767,9 @@ impl SummonState {
         if !pool.saved_bots.is_empty() {
             pool.armed = true;
         }
+        // A lower number sends waiting clients away. A client that plays
+        // keeps its song.
+        pool.trim_waiting();
         Ok(())
     }
 
@@ -631,19 +782,53 @@ impl SummonState {
         };
         pool.cap = None;
         pool.armed = false;
-        // A client that is not seated yet has not played anything. It
-        // stops. A seated client keeps its song.
+        // A client that is not seated is not playing anything. It stops.
+        // A seated client keeps its song.
         let waiting: Vec<usize> = pool
             .summons
             .iter()
             .enumerate()
-            .filter(|(_, s)| s.channel.is_none())
+            .filter(|(_, s)| !matches!(s.phase, Phase::Seated(_)))
             .map(|(index, _)| index)
             .rev()
             .collect();
         for index in waiting {
             let removed = pool.summons.remove(index);
             let _ = removed.stop.send(true);
+        }
+        Ok(())
+    }
+
+    fn set_home(&mut self, server: &str, home: Option<u64>) -> Result<(), String> {
+        if server.trim().is_empty() {
+            return Err("server address is empty".into());
+        }
+        if home == Some(0) {
+            return Err("channel 0 is not a channel".into());
+        }
+        let pool = self.pool_entry(server);
+        if pool.home == home {
+            return Ok(());
+        }
+        pool.home = home;
+        if home.is_none() {
+            // Nowhere to wait. Waiting clients disconnect.
+            let waiting: Vec<u64> = pool
+                .summons
+                .iter()
+                .filter(|s| s.phase == Phase::Idle)
+                .map(|s| s.id)
+                .collect();
+            for summon in waiting {
+                pool.remove(summon);
+            }
+            return Ok(());
+        }
+        // Waiting clients follow the home. A client on its way home reads
+        // the new one when it arrives.
+        for s in pool.summons.iter_mut().filter(|s| s.phase == Phase::Idle) {
+            s.phase = Phase::Returning;
+            let _ = s.cmds.send(SessionCmd::Home);
         }
         Ok(())
     }
@@ -712,7 +897,10 @@ impl SummonState {
             .find(|client| client.id == caller)
             .map(|client| client.channel_id);
         if let Some(channel) = caller_at
-            && let Some(there) = pool.summons.iter().find(|s| s.channel == Some(channel))
+            && let Some(there) = pool
+                .summons
+                .iter()
+                .find(|s| s.phase == Phase::Seated(channel))
         {
             // That channel already has a summon client. It heard channel
             // chat itself; anything else is handed to it.
@@ -724,11 +912,25 @@ impl SummonState {
         if let Some(waiting) = pool
             .summons
             .iter_mut()
-            .find(|s| s.caller == caller && s.channel.is_none())
+            .find(|s| s.caller == caller && s.phase == Phase::Called)
         {
             // Still on its way. Play the newer line when it arrives.
             waiting.request = arg;
             return;
+        }
+        // A client waiting in the home channel is already connected. It
+        // takes the summon without a new connection.
+        while let Some(index) = pool.summons.iter().position(|s| s.phase == Phase::Idle) {
+            let picked = &mut pool.summons[index];
+            picked.caller = caller;
+            picked.request = arg.clone();
+            picked.phase = Phase::Called;
+            if picked.cmds.send(SessionCmd::Serve(caller)).is_ok() {
+                return;
+            }
+            // Its session is gone. Free the place and try the next one.
+            let id = picked.id;
+            pool.remove(id);
         }
         if pool.summons.len() >= limit {
             tracing::info!(
@@ -755,7 +957,8 @@ impl SummonState {
             id: next_id,
             caller,
             request: arg,
-            channel: None,
+            phase: Phase::Called,
+            client: None,
             identity_path,
             connect_at,
             launched: false,
@@ -770,7 +973,11 @@ impl SummonState {
         let Some(pool) = self.pool_mut(server) else {
             return Seat::Gone;
         };
-        if !pool.summons.iter().any(|s| s.id == summon) {
+        if !pool
+            .summons
+            .iter()
+            .any(|s| s.id == summon && s.phase == Phase::Called)
+        {
             return Seat::Gone;
         }
         if saved_bot_here {
@@ -779,17 +986,58 @@ impl SummonState {
         if pool
             .summons
             .iter()
-            .any(|s| s.id != summon && s.channel == Some(channel))
+            .any(|s| s.id != summon && s.phase == Phase::Seated(channel))
         {
             return Seat::Occupied;
         }
         let Some(seated) = pool.summons.iter_mut().find(|s| s.id == summon) else {
             return Seat::Gone;
         };
-        seated.channel = Some(channel);
+        seated.phase = Phase::Seated(channel);
         Seat::Go {
             request: seated.request.clone(),
         }
+    }
+
+    fn release(&mut self, server: &str, summon: u64) -> Homeward {
+        let Some(pool) = self.pool_mut(server) else {
+            return Homeward::Gone;
+        };
+        let Some(index) = pool.summons.iter().position(|s| s.id == summon) else {
+            return Homeward::Gone;
+        };
+        let verdict = if pool.summons.len() > pool.limit() {
+            Homeward::OverLimit
+        } else {
+            match pool.home {
+                Some(home) => Homeward::Home(home),
+                None => Homeward::NoHome,
+            }
+        };
+        if let Homeward::Home(_) = verdict {
+            pool.summons[index].phase = Phase::Returning;
+        } else {
+            // It disconnects. Its place is free now, not after the
+            // disconnect finishes.
+            pool.remove(summon);
+        }
+        verdict
+    }
+
+    fn settle(&mut self, server: &str, summon: u64, channel: u64) -> Homeward {
+        let Some(pool) = self.pool_mut(server) else {
+            return Homeward::Gone;
+        };
+        let home = pool.home;
+        let Some(arrived) = pool.summons.iter_mut().find(|s| s.id == summon) else {
+            return Homeward::Gone;
+        };
+        if home == Some(channel) && matches!(arrived.phase, Phase::Returning | Phase::Idle) {
+            arrived.phase = Phase::Idle;
+            return Homeward::Home(channel);
+        }
+        // The home changed while it was on its way.
+        self.release(server, summon)
     }
 
     fn claim_unlaunched(&mut self) -> Vec<SlotLaunch> {
@@ -1459,6 +1707,242 @@ mod tests {
         // Summon clients dial the address the saved bot was given.
         let launches = director.lock().claim_unlaunched();
         assert!(launches.iter().all(|l| l.dial == "Voice.Example"));
+    }
+
+    const HOME: u64 = 5;
+
+    /// Start a summon for `caller` and seat it in `channel`.
+    fn seated(director: &SummonDirector, caller: u16, channel: u64) -> (u64, SlotLaunch) {
+        director.hear(
+            SERVER,
+            caller,
+            &format!("!play yt:song for {caller}"),
+            Heard::Crossing,
+        );
+        let launch = director
+            .lock()
+            .claim_unlaunched()
+            .pop()
+            .expect("a new summon client");
+        assert!(matches!(
+            director.seat(SERVER, launch.summon, channel, false),
+            Seat::Go { .. }
+        ));
+        (launch.summon, launch)
+    }
+
+    /// A seated summon is done and settles in the home channel.
+    fn waits_at_home(director: &SummonDirector, summon: u64) {
+        assert_eq!(director.release(SERVER, summon), Homeward::Home(HOME));
+        assert_eq!(director.settle(SERVER, summon, HOME), Homeward::Home(HOME));
+    }
+
+    #[test]
+    fn with_no_home_a_done_client_disconnects() {
+        let director = armed(2);
+        let (id, mut launch) = seated(&director, 10, 42);
+        assert_eq!(director.home(SERVER), None);
+        assert_eq!(director.release(SERVER, id), Homeward::NoHome);
+        assert_eq!(director.quiet_count(SERVER), 0, "its place is free at once");
+        assert!(*launch.stop.borrow_and_update());
+        // A later summon needs a new connection.
+        director.hear(SERVER, 11, PLAY, Heard::Crossing);
+        assert_eq!(director.lock().claim_unlaunched().len(), 1);
+    }
+
+    #[test]
+    fn a_done_client_waits_at_home_and_takes_the_next_summon_without_a_connect() {
+        let director = armed(1);
+        director.set_home(SERVER, Some(HOME)).unwrap();
+        let (id, mut launch) = seated(&director, 10, 42);
+        waits_at_home(&director, id);
+        assert_eq!(director.waiting_ids(SERVER), vec![id]);
+        assert_eq!(director.seated_channel(SERVER, id), None);
+
+        director.hear(SERVER, 11, "!play yt:next caller", Heard::Crossing);
+        assert!(
+            director.lock().claim_unlaunched().is_empty(),
+            "no new connection"
+        );
+        assert_eq!(director.quiet_count(SERVER), 1);
+        assert_eq!(launch.cmds.try_recv().unwrap(), SessionCmd::Serve(11));
+        assert!(director.waiting_ids(SERVER).is_empty());
+        assert_eq!(
+            director.seat(SERVER, id, 43, false),
+            Seat::Go {
+                request: "yt:next caller".into()
+            }
+        );
+        assert_eq!(director.seated_channel(SERVER, id), Some(43));
+    }
+
+    #[test]
+    fn a_caller_in_the_home_channel_is_served_there() {
+        let director = armed(2);
+        director.set_home(SERVER, Some(HOME)).unwrap();
+        let (id, mut launch) = seated(&director, 10, 42);
+        waits_at_home(&director, id);
+        director.note_clients(SERVER, id, &[person(11, HOME)]);
+
+        director.hear(SERVER, 11, PLAY, Heard::Crossing);
+        assert_eq!(launch.cmds.try_recv().unwrap(), SessionCmd::Serve(11));
+        assert_eq!(
+            director.seat(SERVER, id, HOME, false),
+            Seat::Go {
+                request: SONG.into()
+            }
+        );
+        assert_eq!(director.seated_channel(SERVER, id), Some(HOME));
+    }
+
+    #[test]
+    fn a_waiting_client_is_picked_once() {
+        let director = armed(2);
+        director.set_home(SERVER, Some(HOME)).unwrap();
+        let (id, _launch) = seated(&director, 10, 42);
+        waits_at_home(&director, id);
+        director.hear(SERVER, 11, PLAY, Heard::Crossing);
+        director.hear(SERVER, 12, PLAY, Heard::Crossing);
+        assert_eq!(
+            director.lock().claim_unlaunched().len(),
+            1,
+            "the second caller gets a new client"
+        );
+        assert_eq!(director.quiet_count(SERVER), 2);
+    }
+
+    #[test]
+    fn a_waiting_client_whose_session_is_gone_is_replaced() {
+        let director = armed(2);
+        director.set_home(SERVER, Some(HOME)).unwrap();
+        let (id, launch) = seated(&director, 10, 42);
+        waits_at_home(&director, id);
+        drop(launch);
+        director.hear(SERVER, 11, PLAY, Heard::Crossing);
+        let ids = director.summon_ids(SERVER);
+        assert_eq!(ids.len(), 1);
+        assert_ne!(ids[0], id);
+        assert_eq!(director.lock().claim_unlaunched().len(), 1);
+    }
+
+    #[test]
+    fn changing_the_home_moves_waiting_clients_and_leaves_playing_ones() {
+        let director = armed(2);
+        director.set_home(SERVER, Some(HOME)).unwrap();
+        let (waiting, mut waiting_launch) = seated(&director, 10, 42);
+        let (playing, mut playing_launch) = seated(&director, 11, 43);
+        waits_at_home(&director, waiting);
+
+        director.set_home(SERVER, Some(9)).unwrap();
+        assert_eq!(director.home(SERVER), Some(9));
+        assert_eq!(waiting_launch.cmds.try_recv().unwrap(), SessionCmd::Home);
+        assert!(director.waiting_ids(SERVER).is_empty());
+        assert!(
+            playing_launch.cmds.try_recv().is_err(),
+            "a client that plays is not moved"
+        );
+        assert_eq!(director.seated_channel(SERVER, playing), Some(43));
+
+        assert_eq!(director.release(SERVER, waiting), Homeward::Home(9));
+        assert_eq!(director.settle(SERVER, waiting, 9), Homeward::Home(9));
+        assert_eq!(director.waiting_ids(SERVER), vec![waiting]);
+        // The client that played goes to the new home when it is done.
+        assert_eq!(director.release(SERVER, playing), Homeward::Home(9));
+    }
+
+    #[test]
+    fn a_client_on_its_way_home_follows_a_newer_home() {
+        let director = armed(2);
+        director.set_home(SERVER, Some(HOME)).unwrap();
+        let (id, mut launch) = seated(&director, 10, 42);
+        assert_eq!(director.release(SERVER, id), Homeward::Home(HOME));
+        director.set_home(SERVER, Some(9)).unwrap();
+        assert!(launch.cmds.try_recv().is_err());
+        assert_eq!(director.settle(SERVER, id, HOME), Homeward::Home(9));
+        assert!(director.waiting_ids(SERVER).is_empty());
+        assert_eq!(director.settle(SERVER, id, 9), Homeward::Home(9));
+        assert_eq!(director.waiting_ids(SERVER), vec![id]);
+    }
+
+    #[test]
+    fn clearing_the_home_sends_waiting_clients_away() {
+        let director = armed(2);
+        director.set_home(SERVER, Some(HOME)).unwrap();
+        let (waiting, mut waiting_launch) = seated(&director, 10, 42);
+        let (playing, _playing_launch) = seated(&director, 11, 43);
+        waits_at_home(&director, waiting);
+
+        director.set_home(SERVER, None).unwrap();
+        assert_eq!(director.summon_ids(SERVER), vec![playing]);
+        assert!(*waiting_launch.stop.borrow_and_update());
+        assert_eq!(director.seated_channel(SERVER, playing), Some(43));
+        assert_eq!(director.release(SERVER, playing), Homeward::NoHome);
+        assert_eq!(director.quiet_count(SERVER), 0);
+    }
+
+    #[test]
+    fn a_lower_cap_sends_waiting_clients_away_and_keeps_the_song() {
+        let director = armed(3);
+        director.set_home(SERVER, Some(HOME)).unwrap();
+        let (first, _a) = seated(&director, 10, 41);
+        let (second, _b) = seated(&director, 11, 42);
+        let (playing, _c) = seated(&director, 12, 43);
+        waits_at_home(&director, first);
+        waits_at_home(&director, second);
+        assert_eq!(director.quiet_count(SERVER), 3);
+
+        director.accept_cap(SERVER, 2).unwrap();
+        assert_eq!(director.quiet_count(SERVER), 2);
+        assert_eq!(director.seated_channel(SERVER, playing), Some(43));
+
+        director.accept_cap(SERVER, 0).unwrap();
+        assert_eq!(director.summon_ids(SERVER), vec![playing]);
+        assert_eq!(director.release(SERVER, playing), Homeward::OverLimit);
+        assert_eq!(director.quiet_count(SERVER), 0);
+    }
+
+    #[test]
+    fn clearing_the_cap_sends_waiting_clients_away() {
+        let director = armed(2);
+        director.set_home(SERVER, Some(HOME)).unwrap();
+        let (id, _launch) = seated(&director, 10, 42);
+        waits_at_home(&director, id);
+        director.restore_cap(SERVER, None).unwrap();
+        assert_eq!(director.quiet_count(SERVER), 0);
+    }
+
+    #[test]
+    fn channel_zero_is_not_a_home() {
+        let director = armed(2);
+        director.set_home(SERVER, Some(HOME)).unwrap();
+        assert!(director.set_home(SERVER, Some(0)).is_err());
+        assert!(director.set_home("  ", Some(HOME)).is_err());
+        assert_eq!(director.home(SERVER), Some(HOME));
+        // Spellings of one socket share one home.
+        assert_eq!(director.home("Voice.Example"), Some(HOME));
+        assert_eq!(director.home(OTHER), None);
+    }
+
+    #[test]
+    fn a_home_set_before_any_bot_is_kept() {
+        let director = director();
+        director.set_home(SERVER, Some(HOME)).unwrap();
+        director.note_push(SERVER, 1, Some(2), Path::new("/data/bot-1.identity"));
+        assert_eq!(director.home(SERVER), Some(HOME));
+        director.forget_saved(SERVER, 1);
+        assert_eq!(director.home(SERVER), Some(HOME));
+    }
+
+    #[test]
+    fn summon_clients_are_known_by_their_client_ids() {
+        let director = armed(2);
+        let (first, _a) = seated(&director, 10, 42);
+        let (second, _b) = seated(&director, 11, 43);
+        director.note_own_client(SERVER, first, 70);
+        director.note_own_client(SERVER, second, 71);
+        let mut ids = director.summon_clients(SERVER);
+        ids.sort();
+        assert_eq!(ids, vec![70, 71]);
     }
 
     #[test]

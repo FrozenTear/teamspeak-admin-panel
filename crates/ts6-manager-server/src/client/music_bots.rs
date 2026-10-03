@@ -81,6 +81,31 @@ pub async fn put_summon_cap(
     .await
 }
 
+pub async fn put_summon_home(
+    gate: Arc<RefreshGate>,
+    body: &wire::SummonHome,
+) -> Result<wire::SummonHome, ApiError> {
+    api::authorized_put_json::<_, wire::SummonHome>(
+        &gate,
+        &api::api_base(),
+        "/api/music-summon-homes",
+        body,
+    )
+    .await
+}
+
+/// Channels the summon home picker offers for one server address.
+pub async fn list_summon_home_channels(
+    gate: Arc<RefreshGate>,
+    server_addr: &str,
+) -> Result<wire::SummonHomeChannelList, ApiError> {
+    let path = format!(
+        "/api/music-summon-homes/channels?serverAddr={}",
+        urlencoding::encode(server_addr)
+    );
+    api::authorized_get_json::<wire::SummonHomeChannelList>(&gate, &api::api_base(), &path).await
+}
+
 pub async fn connect_bot(gate: Arc<RefreshGate>, bot: wire::BotId) -> Result<(), ApiError> {
     let path = format!("/api/music-bots/{}/connect", bot.0);
     api::authorized_post_json::<(), ()>(&gate, &api::api_base(), &path, None).await
