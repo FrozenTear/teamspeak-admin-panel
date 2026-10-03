@@ -77,8 +77,8 @@ pub struct EventSourceDeps {
     /// Flow-engine handle — the worker bridges join/chat/move notify
     /// frames into the automod trigger surface (PURA-300).
     pub flow_engine: crate::flow::FlowEngineHandle,
-    /// Music process. A channel summon already on this notify is
-    /// forwarded there. This worker does not look up the caller.
+    /// Music process. A channel or server-chat summon already on this
+    /// notify is forwarded there. This worker does not look up the caller.
     pub music: crate::music_runtime::MusicBotFront,
 }
 
@@ -533,16 +533,20 @@ fn parse_bridge_event(frame: &NotifyFrame) -> Option<BridgeEvent> {
     }
 }
 
-/// A channel `!play` or `!radio` the server-query subscription already
-/// delivered. `None` for any other target, or for a line that is not a song.
-/// The notify has no channel id. The quiet client's client list is the
-/// channel source, so this does not look the caller up.
+/// A `!play` or `!radio` sent as channel chat (targetmode 2) or server
+/// chat (targetmode 3) that the server-query subscription already
+/// delivered. `None` for a private message, or for a line that is not a
+/// song. The notify has no channel id. The summon client's own client
+/// list is the channel source, so this does not look the caller up.
 fn channel_summon(frame: &NotifyFrame) -> Option<(u16, String)> {
     if frame.event != "notifytextmessage" {
         return None;
     }
     let rec = frame.records.first()?;
-    if rec.get("targetmode").map(String::as_str) != Some("2") {
+    if !matches!(
+        rec.get("targetmode").map(String::as_str),
+        Some("2") | Some("3")
+    ) {
         return None;
     }
     let text = rec.get("msg")?.clone();
@@ -791,8 +795,20 @@ mod tests {
                     ("invokerid", "10"),
                 ],
             )),
+            Some((10, "!play https://cdn.example/one.mp3".into())),
+            "server chat reaches the music process from any channel"
+        );
+        assert_eq!(
+            channel_summon(&notify(
+                "notifytextmessage",
+                &[
+                    ("targetmode", "1"),
+                    ("msg", "!play https://cdn.example/one.mp3"),
+                    ("invokerid", "10"),
+                ],
+            )),
             None,
-            "server text is not the channel path"
+            "a private message to the query client is not a summon"
         );
         assert_eq!(
             channel_summon(&notify(

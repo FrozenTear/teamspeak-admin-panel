@@ -449,8 +449,9 @@ async fn put_summon_cap(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// A channel summon the panel's server-query subscription already has.
-/// The quiet client's own client list is the channel source. No lookup.
+/// A channel or server-chat summon the panel's server-query subscription
+/// already has. The summon client's own client list is the channel
+/// source. No lookup.
 async fn post_summon_heard(
     State(state): State<RuntimeState>,
     Json(req): Json<SummonHeardBody>,
@@ -1625,7 +1626,7 @@ mod tests {
         .await;
         assert_eq!(bare.status(), StatusCode::OK);
         assert!(!supervisor.summon().armed(server));
-        assert_eq!(supervisor.summon().quiet_count(server), 0);
+        assert_eq!(supervisor.summon().limit(server), 0);
         assert_eq!(supervisor.summon().cap(server), None);
 
         let armed = send_json(
@@ -1637,8 +1638,10 @@ mod tests {
         .await;
         assert_eq!(armed.status(), StatusCode::OK);
         assert!(supervisor.summon().armed(server));
-        assert_eq!(supervisor.summon().quiet_count(server), 2);
+        assert_eq!(supervisor.summon().limit(server), 2);
         assert_eq!(supervisor.summon().cap(server), Some(2));
+        // Arming starts nobody. A summon client exists only for a request.
+        assert_eq!(supervisor.summon().quiet_count(server), 0);
 
         let again = send_json(
             &app,
@@ -1648,24 +1651,14 @@ mod tests {
         )
         .await;
         assert_eq!(again.status(), StatusCode::OK);
-        assert_eq!(supervisor.summon().quiet_count(server), 2);
         assert_eq!(supervisor.summon().cap(server), Some(2));
 
         let elsewhere =
             send_json(&app, "POST", "/v1/bots", &summon_spawn("else", other, None)).await;
         assert_eq!(elsewhere.status(), StatusCode::OK);
-        assert_eq!(supervisor.summon().quiet_count(other), 0);
+        assert_eq!(supervisor.summon().limit(other), 0);
         assert_eq!(supervisor.summon().cap(other), None);
-        assert_eq!(supervisor.summon().quiet_count(server), 2);
-
-        let paths = supervisor.summon().identity_paths(server);
-        assert_eq!(paths.len(), 2);
-        assert_ne!(paths[0], paths[1]);
-        for path in &paths {
-            let name = path.file_name().and_then(|name| name.to_str()).unwrap();
-            assert!(name.starts_with("quiet-"), "{name}");
-            assert!(!name.starts_with("bot-"), "{name}");
-        }
+        assert_eq!(supervisor.summon().limit(server), 2);
 
         let listed = app
             .oneshot(
@@ -1678,6 +1671,78 @@ mod tests {
             .unwrap();
         let listed: ListResponse = json(listed).await;
         assert_eq!(listed.bots.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_heard_summon_starts_a_temporary_client_per_caller_even_on_cap_one() {
+        let state = RuntimeState::new();
+        let supervisor = Arc::clone(&state.supervisor);
+        let app = router(state);
+        let server = "10.5.0.1:9987";
+
+        let spawned = send_json(
+            &app,
+            "POST",
+            "/v1/bots",
+            &summon_spawn("desk", server, Some(1)),
+        )
+        .await;
+        assert_eq!(spawned.status(), StatusCode::OK);
+
+        for (caller, text) in [
+            (21_u16, "!play https://cdn.example/one.mp3"),
+            (22, "!radio https://radio.example/live"),
+            (23, "!np"),
+        ] {
+            let heard = send_json(
+                &app,
+                "POST",
+                "/v1/summon-heard",
+                &SummonHeardBody {
+                    server_host: "10.5.0.1".into(),
+                    invoker_id: caller,
+                    text: text.into(),
+                },
+            )
+            .await;
+            assert_eq!(heard.status(), StatusCode::NO_CONTENT);
+        }
+        // Two people, two temporary clients. `!np` is not a summon.
+        assert_eq!(supervisor.summon().quiet_count(server), 2);
+        let paths = supervisor.summon().identity_paths(server);
+        assert_eq!(paths.len(), 2);
+        assert_ne!(paths[0], paths[1]);
+        for path in &paths {
+            let name = path.file_name().and_then(|name| name.to_str()).unwrap();
+            assert!(name.starts_with("summon-"), "{name}");
+            assert!(!name.starts_with("bot-"), "{name}");
+        }
+
+        let empty_host = send_json(
+            &app,
+            "POST",
+            "/v1/summon-heard",
+            &SummonHeardBody {
+                server_host: "  ".into(),
+                invoker_id: 24,
+                text: "!play x".into(),
+            },
+        )
+        .await;
+        assert_eq!(empty_host.status(), StatusCode::BAD_REQUEST);
+
+        // Summon clients are not saved bots.
+        let listed = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/bots")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let listed: ListResponse = json(listed).await;
+        assert_eq!(listed.bots.len(), 1);
     }
 
     #[tokio::test]
@@ -1699,7 +1764,7 @@ mod tests {
         .await;
         assert_eq!(early.status(), StatusCode::NO_CONTENT);
         assert_eq!(supervisor.summon().cap(server), Some(3));
-        assert_eq!(supervisor.summon().quiet_count(server), 0);
+        assert_eq!(supervisor.summon().limit(server), 0);
         assert!(!supervisor.summon().armed(server));
 
         // A push that carries no number keeps the cap this PUT already
@@ -1714,7 +1779,7 @@ mod tests {
         assert_eq!(bare.status(), StatusCode::OK);
         assert!(supervisor.summon().armed(server));
         assert_eq!(supervisor.summon().cap(server), Some(3));
-        assert_eq!(supervisor.summon().quiet_count(server), 3);
+        assert_eq!(supervisor.summon().limit(server), 3);
 
         let accepted = send_json(
             &app,
@@ -1728,7 +1793,7 @@ mod tests {
         .await;
         assert_eq!(accepted.status(), StatusCode::NO_CONTENT);
         assert!(supervisor.summon().armed(server));
-        assert_eq!(supervisor.summon().quiet_count(server), 2);
+        assert_eq!(supervisor.summon().limit(server), 2);
         assert_eq!(supervisor.summon().cap(server), Some(2));
 
         for cap in [65_u32, 1000] {
@@ -1744,7 +1809,7 @@ mod tests {
             .await;
             assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "cap {cap}");
             assert_eq!(supervisor.summon().cap(server), Some(2));
-            assert_eq!(supervisor.summon().quiet_count(server), 2);
+            assert_eq!(supervisor.summon().limit(server), 2);
         }
 
         let listed = app
@@ -1787,7 +1852,7 @@ mod tests {
         )
         .await;
         assert_eq!(accepted.status(), StatusCode::NO_CONTENT);
-        assert_eq!(supervisor.summon().quiet_count(server), 2);
+        assert_eq!(supervisor.summon().limit(server), 2);
         assert!(supervisor.summon().armed(server));
 
         let cleared = send_json(
@@ -1803,7 +1868,7 @@ mod tests {
         assert_eq!(cleared.status(), StatusCode::NO_CONTENT);
         assert_eq!(supervisor.summon().cap(server), None);
         assert!(!supervisor.summon().armed(server));
-        assert_eq!(supervisor.summon().quiet_count(server), 0);
+        assert_eq!(supervisor.summon().limit(server), 0);
 
         let later = send_json(
             &app,
@@ -1814,7 +1879,7 @@ mod tests {
         .await;
         assert_eq!(later.status(), StatusCode::OK);
         assert!(!supervisor.summon().armed(server));
-        assert_eq!(supervisor.summon().quiet_count(server), 0);
+        assert_eq!(supervisor.summon().limit(server), 0);
         assert_eq!(supervisor.summon().cap(server), None);
     }
 }

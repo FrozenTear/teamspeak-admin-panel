@@ -488,8 +488,8 @@ impl MusicBotFront {
         }
     }
 
-    /// Quiet-client count for tests and the local process. `None` when
-    /// this front is only an HTTP client.
+    /// Summon clients the local process holds right now. `None` when this
+    /// front is only an HTTP client.
     #[cfg(test)]
     pub fn local_quiet_count(&self, server_addr: &str) -> Option<usize> {
         match &self.inner {
@@ -498,21 +498,47 @@ impl MusicBotFront {
         }
     }
 
-    /// Slot ids of the in-process quiet clients. `None` on a remote front.
+    /// Summon clients the local process may hold at once for this server:
+    /// 0 when summon is off or not armed, otherwise the cap and never
+    /// fewer than [`music_bot::MIN_PARALLEL_SUMMONS`]. `None` on a remote
+    /// front.
     #[cfg(test)]
-    pub fn local_slot_ids(&self, server_addr: &str) -> Option<Vec<u32>> {
+    pub fn local_summon_limit(&self, server_addr: &str) -> Option<usize> {
         match &self.inner {
-            FrontInner::Local(s) => Some(s.summon().slot_ids(server_addr)),
+            FrontInner::Local(s) => Some(s.summon().limit(server_addr)),
             FrontInner::Remote(_) => None,
         }
     }
 
-    /// Drop one in-process quiet client. Saved bots stay. `None` on a
+    /// Ids of the in-process summon clients. `None` on a remote front.
+    #[cfg(test)]
+    pub fn local_summon_ids(&self, server_addr: &str) -> Option<Vec<u64>> {
+        match &self.inner {
+            FrontInner::Local(s) => Some(s.summon().summon_ids(server_addr)),
+            FrontInner::Remote(_) => None,
+        }
+    }
+
+    /// Stop one in-process summon client. Saved bots stay. `None` on a
     /// remote front.
     #[cfg(test)]
-    pub fn local_drop_quiet(&self, server_addr: &str, slot: u32) -> Option<bool> {
+    pub fn local_drop_summon(&self, server_addr: &str, summon: u64) -> Option<bool> {
         match &self.inner {
-            FrontInner::Local(s) => Some(s.summon().drop_quiet(server_addr, slot)),
+            FrontInner::Local(s) => Some(s.summon().drop_summon(server_addr, summon)),
+            FrontInner::Remote(_) => None,
+        }
+    }
+
+    /// A summon line heard on the local process, as a saved bot hands it
+    /// over. `None` on a remote front.
+    #[cfg(test)]
+    pub fn local_hear_crossing(&self, server_addr: &str, caller: u16, line: &str) -> Option<()> {
+        match &self.inner {
+            FrontInner::Local(s) => {
+                s.summon()
+                    .hear(server_addr, caller, line, music_bot::Heard::Crossing);
+                Some(())
+            }
             FrontInner::Remote(_) => None,
         }
     }
@@ -2406,7 +2432,10 @@ mod tests {
             )
             .await
             .expect("spawn with cap");
-        assert_eq!(supervisor.summon().quiet_count(server), 2);
+        assert!(supervisor.summon().armed(server));
+        assert_eq!(supervisor.summon().limit(server), 2);
+        // Arming starts nobody. A summon client exists only for a request.
+        assert_eq!(supervisor.summon().quiet_count(server), 0);
         assert_eq!(front.list().await.unwrap().len(), 1);
 
         front
@@ -2423,8 +2452,14 @@ mod tests {
             )
             .await
             .expect("second spawn");
-        assert_eq!(supervisor.summon().quiet_count(server), 2);
+        assert_eq!(supervisor.summon().limit(server), 2);
         assert_eq!(supervisor.summon().cap(server), Some(2));
+
+        front
+            .hear_summon("10.4.0.1", 31, "!play https://cdn.example/one.mp3")
+            .await
+            .expect("forward a heard summon");
+        assert_eq!(supervisor.summon().quiet_count(server), 1);
 
         front
             .spawn_with_summon_cap(
@@ -2440,7 +2475,7 @@ mod tests {
             )
             .await
             .expect("other server");
-        assert_eq!(supervisor.summon().quiet_count(other), 0);
+        assert_eq!(supervisor.summon().limit(other), 0);
         assert_eq!(supervisor.summon().cap(other), None);
         assert_eq!(front.list().await.unwrap().len(), 3);
     }

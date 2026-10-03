@@ -2448,9 +2448,9 @@ async fn summon_cap_is_empty_until_stored() {
         state
             .music_bots
             .supervisor
-            .local_quiet_count("127.0.0.1:9987"),
+            .local_summon_limit("127.0.0.1:9987"),
         Some(0),
-        "a stored cap starts no quiet client until a saved bot is known"
+        "a stored cap arms nothing until a saved bot is known"
     );
     assert_eq!(created.status(), StatusCode::OK);
     let stored: wire::SummonCap = read_json(created).await;
@@ -2489,7 +2489,7 @@ async fn saved_bots_share_one_pool_and_do_not_write_the_cap() {
         state
             .music_bots
             .supervisor
-            .local_quiet_count("127.0.0.1:9987"),
+            .local_summon_limit("127.0.0.1:9987"),
         Some(0)
     );
 
@@ -2499,8 +2499,8 @@ async fn saved_bots_share_one_pool_and_do_not_write_the_cap() {
         state
             .music_bots
             .supervisor
-            .local_quiet_count("127.0.0.1:9987"),
-        Some(1),
+            .local_summon_limit("127.0.0.1:9987"),
+        Some(2),
         "a known saved bot is enough to arm the cap"
     );
 
@@ -2550,14 +2550,14 @@ async fn saved_bots_share_one_pool_and_do_not_write_the_cap() {
         state
             .music_bots
             .supervisor
-            .local_quiet_count("127.0.0.1:9987"),
-        Some(1)
+            .local_summon_limit("127.0.0.1:9987"),
+        Some(2)
     );
     assert_eq!(
         state
             .music_bots
             .supervisor
-            .local_quiet_count("127.0.0.1:9988"),
+            .local_summon_limit("127.0.0.1:9988"),
         Some(0)
     );
     let caps = get_summon_caps(&app, &token).await;
@@ -2584,7 +2584,9 @@ async fn saved_bots_share_one_pool_and_do_not_write_the_cap() {
         .await
         .unwrap();
     assert_eq!(rows.len(), 3);
-    assert!(rows.iter().all(|row| !row.identityPath.contains("quiet-")));
+    assert!(rows.iter().all(|row| {
+        !row.identityPath.contains("quiet-identities") && !row.identityPath.contains("summon-")
+    }));
 
     let fresh = crate::music_runtime::MusicBotFront::local(std::sync::Arc::new(
         music_bot::BotSupervisor::new(),
@@ -2610,12 +2612,12 @@ async fn saved_bots_share_one_pool_and_do_not_write_the_cap() {
             .unwrap();
     }
     assert_eq!(fresh.list().await.unwrap().len(), 3);
-    assert_eq!(fresh.local_quiet_count("127.0.0.1:9987"), Some(1));
-    assert_eq!(fresh.local_quiet_count("127.0.0.1:9988"), Some(0));
+    assert_eq!(fresh.local_summon_limit("127.0.0.1:9987"), Some(2));
+    assert_eq!(fresh.local_summon_limit("127.0.0.1:9988"), Some(0));
 }
 
 #[tokio::test]
-async fn connect_disconnect_and_dropping_a_quiet_client_leave_the_saved_bot() {
+async fn connect_disconnect_and_dropping_a_summon_client_leave_the_saved_bot() {
     let (app, token, state) = make_test_app().await;
     let created = create_test_bot(&app, &token).await;
     assert_eq!(
@@ -2624,6 +2626,18 @@ async fn connect_disconnect_and_dropping_a_quiet_client_leave_the_saved_bot() {
             .status(),
         StatusCode::OK
     );
+    assert_eq!(
+        state
+            .music_bots
+            .supervisor
+            .local_summon_limit("127.0.0.1:9987"),
+        Some(2)
+    );
+    state
+        .music_bots
+        .supervisor
+        .local_hear_crossing("127.0.0.1:9987", 40, "!play https://cdn.example/one.mp3")
+        .unwrap();
     assert_eq!(
         state
             .music_bots
@@ -2658,25 +2672,26 @@ async fn connect_disconnect_and_dropping_a_quiet_client_leave_the_saved_bot() {
         .await
         .unwrap();
     assert_eq!(disconnect.status(), StatusCode::ACCEPTED);
+    // Connect and Disconnect on the saved bot neither start nor stop a
+    // summon client, and leave summon armed.
     assert_eq!(
         state
             .music_bots
             .supervisor
-            .local_quiet_count("127.0.0.1:9987"),
-        Some(1)
+            .local_summon_limit("127.0.0.1:9987"),
+        Some(2)
     );
-
-    let slots = state
+    let summons = state
         .music_bots
         .supervisor
-        .local_slot_ids("127.0.0.1:9987")
+        .local_summon_ids("127.0.0.1:9987")
         .unwrap();
-    assert_eq!(slots.len(), 1);
+    assert_eq!(summons.len(), 1);
     assert!(
         state
             .music_bots
             .supervisor
-            .local_drop_quiet("127.0.0.1:9987", slots[0])
+            .local_drop_summon("127.0.0.1:9987", summons[0])
             .unwrap()
     );
     assert_eq!(
@@ -2685,6 +2700,13 @@ async fn connect_disconnect_and_dropping_a_quiet_client_leave_the_saved_bot() {
             .supervisor
             .local_quiet_count("127.0.0.1:9987"),
         Some(0)
+    );
+    assert_eq!(
+        state
+            .music_bots
+            .supervisor
+            .local_summon_limit("127.0.0.1:9987"),
+        Some(2)
     );
 
     let detail = app
@@ -2723,7 +2745,7 @@ async fn a_later_bot_push_carries_only_that_servers_stored_cap() {
         state
             .music_bots
             .supervisor
-            .local_quiet_count("127.0.0.1:9987"),
+            .local_summon_limit("127.0.0.1:9987"),
         Some(0)
     );
     let _created = create_test_bot(&app, &token).await;
@@ -2731,7 +2753,7 @@ async fn a_later_bot_push_carries_only_that_servers_stored_cap() {
         state
             .music_bots
             .supervisor
-            .local_quiet_count("127.0.0.1:9987"),
+            .local_summon_limit("127.0.0.1:9987"),
         Some(2)
     );
     let _second = create_test_bot(&app, &token).await;
@@ -2739,7 +2761,7 @@ async fn a_later_bot_push_carries_only_that_servers_stored_cap() {
         state
             .music_bots
             .supervisor
-            .local_quiet_count("127.0.0.1:9987"),
+            .local_summon_limit("127.0.0.1:9987"),
         Some(2)
     );
     assert_eq!(
@@ -2765,8 +2787,8 @@ async fn a_failed_store_rolls_the_music_process_back_to_the_stored_cap() {
         state
             .music_bots
             .supervisor
-            .local_quiet_count("127.0.0.1:9987"),
-        Some(1)
+            .local_summon_limit("127.0.0.1:9987"),
+        Some(2)
     );
 
     state
@@ -2791,8 +2813,8 @@ async fn a_failed_store_rolls_the_music_process_back_to_the_stored_cap() {
         state
             .music_bots
             .supervisor
-            .local_quiet_count("127.0.0.1:9987"),
-        Some(1)
+            .local_summon_limit("127.0.0.1:9987"),
+        Some(2)
     );
     assert_eq!(
         state
@@ -2852,7 +2874,7 @@ async fn a_failed_first_store_clears_the_number_the_process_accepted() {
         state
             .music_bots
             .supervisor
-            .local_quiet_count("127.0.0.1:9987"),
+            .local_summon_limit("127.0.0.1:9987"),
         Some(0)
     );
     assert!(get_summon_caps(&app, &token).await.caps.is_empty());
@@ -2870,7 +2892,7 @@ async fn a_failed_first_store_clears_the_number_the_process_accepted() {
         state
             .music_bots
             .supervisor
-            .local_quiet_count("127.0.0.1:9987"),
+            .local_summon_limit("127.0.0.1:9987"),
         Some(0)
     );
     assert_eq!(
@@ -2916,7 +2938,7 @@ async fn caps_the_caller_cannot_see_are_omitted() {
 }
 
 #[tokio::test]
-async fn deleting_the_last_saved_bot_stops_quiet_clients_and_the_cap_stays_settable() {
+async fn deleting_the_last_saved_bot_stops_summon_clients_and_the_cap_stays_settable() {
     let (app, token, state) = make_test_app().await;
     let created = create_test_bot(&app, &token).await;
     assert_eq!(
@@ -2925,6 +2947,18 @@ async fn deleting_the_last_saved_bot_stops_quiet_clients_and_the_cap_stays_setta
             .status(),
         StatusCode::OK
     );
+    assert_eq!(
+        state
+            .music_bots
+            .supervisor
+            .local_summon_limit("127.0.0.1:9987"),
+        Some(2)
+    );
+    state
+        .music_bots
+        .supervisor
+        .local_hear_crossing("127.0.0.1:9987", 41, "!play https://cdn.example/one.mp3")
+        .unwrap();
     assert_eq!(
         state
             .music_bots
@@ -2946,6 +2980,13 @@ async fn deleting_the_last_saved_bot_stops_quiet_clients_and_the_cap_stays_setta
         .await
         .unwrap();
     assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        state
+            .music_bots
+            .supervisor
+            .local_summon_limit("127.0.0.1:9987"),
+        Some(0)
+    );
     assert_eq!(
         state
             .music_bots
@@ -2978,7 +3019,7 @@ async fn deleting_the_last_saved_bot_stops_quiet_clients_and_the_cap_stays_setta
         state
             .music_bots
             .supervisor
-            .local_quiet_count("127.0.0.1:9987"),
+            .local_summon_limit("127.0.0.1:9987"),
         Some(0)
     );
 }
@@ -3005,8 +3046,8 @@ async fn two_saves_at_once_leave_the_process_on_the_stored_number() {
         state
             .music_bots
             .supervisor
-            .local_quiet_count("127.0.0.1:9987"),
-        Some(cap as usize)
+            .local_summon_limit("127.0.0.1:9987"),
+        Some(music_bot::parallel_limit(Some(cap)))
     );
 }
 
@@ -3044,7 +3085,7 @@ async fn a_dropped_save_stays_on_the_number_the_other_save_stores() {
         state
             .music_bots
             .supervisor
-            .local_quiet_count("127.0.0.1:9987"),
+            .local_summon_limit("127.0.0.1:9987"),
         Some(2)
     );
 }
@@ -3078,8 +3119,8 @@ async fn a_failed_first_save_does_not_clear_the_other_saves_number() {
         state
             .music_bots
             .supervisor
-            .local_quiet_count("127.0.0.1:9987"),
-        Some(1)
+            .local_summon_limit("127.0.0.1:9987"),
+        Some(2)
     );
 }
 
@@ -3813,7 +3854,7 @@ async fn a_bot_create_does_not_overwrite_a_cap_the_process_already_accepted() {
         .await
         .unwrap();
     assert_eq!(
-        state.music_bots.supervisor.local_quiet_count(server),
+        state.music_bots.supervisor.local_summon_limit(server),
         Some(0)
     );
     let created = create_bot_on(&app, &token, server).await;
@@ -3837,7 +3878,7 @@ async fn a_bot_create_does_not_overwrite_a_cap_the_process_already_accepted() {
         Some(true)
     );
     assert_eq!(
-        state.music_bots.supervisor.local_quiet_count(server),
+        state.music_bots.supervisor.local_summon_limit(server),
         Some(4)
     );
 }
@@ -3869,7 +3910,7 @@ async fn a_bot_create_without_a_stored_cap_arms_the_number_the_process_holds() {
         Some(true)
     );
     assert_eq!(
-        state.music_bots.supervisor.local_quiet_count(server),
+        state.music_bots.supervisor.local_summon_limit(server),
         Some(4)
     );
 }
@@ -3915,7 +3956,7 @@ async fn a_push_error_stores_the_cap_the_process_already_holds() {
         Some(true)
     );
     assert_eq!(
-        state.music_bots.supervisor.local_quiet_count(server),
+        state.music_bots.supervisor.local_summon_limit(server),
         Some(4)
     );
 }
@@ -3944,7 +3985,7 @@ async fn a_push_error_stores_a_held_cap_when_the_store_was_empty() {
         Some(true)
     );
     assert_eq!(
-        state.music_bots.supervisor.local_quiet_count(server),
+        state.music_bots.supervisor.local_summon_limit(server),
         Some(4)
     );
 }
@@ -4036,7 +4077,7 @@ async fn a_dropped_create_stores_the_cap_the_process_already_holds() {
         Some(true)
     );
     assert_eq!(
-        state.music_bots.supervisor.local_quiet_count(server),
+        state.music_bots.supervisor.local_summon_limit(server),
         Some(4)
     );
 }
@@ -4057,7 +4098,7 @@ async fn a_dropped_create_stores_a_held_cap_when_the_store_was_empty() {
         Some(true)
     );
     assert_eq!(
-        state.music_bots.supervisor.local_quiet_count(server),
+        state.music_bots.supervisor.local_summon_limit(server),
         Some(4)
     );
 }

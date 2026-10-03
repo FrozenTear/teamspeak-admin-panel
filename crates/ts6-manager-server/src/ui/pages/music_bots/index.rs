@@ -486,6 +486,7 @@ fn SummonCapEditor(props: SummonCapEditorProps) -> Element {
                         id: "summon-cap-{server_label}",
                         class: "input",
                         inputmode: "numeric",
+                        title: "Temporary summon clients this server may have at once. 0 turns summon off. Any other number allows at least two.",
                         value: "{draft.read()}",
                         oninput: move |e| draft.set(e.value()),
                     }
