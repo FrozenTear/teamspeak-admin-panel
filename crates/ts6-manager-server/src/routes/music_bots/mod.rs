@@ -32,6 +32,7 @@ mod playlists;
 mod queue;
 mod radio_stations;
 mod requests;
+mod summon;
 
 pub use bug_report_context::enrich_bug_report_request;
 
@@ -59,6 +60,7 @@ pub fn router() -> Router<AppState> {
         .merge(playlists::router())
         .merge(radio_stations::router())
         .merge(requests::router())
+        .merge(summon::router())
 }
 
 // ---- Error helpers (shared by every submodule) -------------------------

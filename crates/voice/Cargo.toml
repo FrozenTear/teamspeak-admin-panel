@@ -57,6 +57,10 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
+# Canonical server addresses live in the shared crate so the wasm music
+# page and this process group the same socket. The shared crate is
+# WASM-clean and pulls no TeamSpeak client code.
+ts6-manager-shared = { workspace = true }
 # Contabo music unit — internal loopback control plane + exec healthcheck.
 # Fullstack proxies here when MUSIC_RUNTIME_URL is set; this binary is
 # the only process that owns decode→Opus→TS6 wire send.

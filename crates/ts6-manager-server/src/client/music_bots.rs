@@ -59,6 +59,28 @@ pub async fn delete_bot(gate: Arc<RefreshGate>, bot: wire::BotId) -> Result<(), 
     api::authorized_delete(&gate, &api::api_base(), &path).await
 }
 
+pub async fn list_summon_caps(gate: Arc<RefreshGate>) -> Result<wire::SummonCapList, ApiError> {
+    api::authorized_get_json::<wire::SummonCapList>(
+        &gate,
+        &api::api_base(),
+        "/api/music-summon-caps",
+    )
+    .await
+}
+
+pub async fn put_summon_cap(
+    gate: Arc<RefreshGate>,
+    body: &wire::SummonCap,
+) -> Result<wire::SummonCap, ApiError> {
+    api::authorized_put_json::<_, wire::SummonCap>(
+        &gate,
+        &api::api_base(),
+        "/api/music-summon-caps",
+        body,
+    )
+    .await
+}
+
 pub async fn connect_bot(gate: Arc<RefreshGate>, bot: wire::BotId) -> Result<(), ApiError> {
     let path = format!("/api/music-bots/{}/connect", bot.0);
     api::authorized_post_json::<(), ()>(&gate, &api::api_base(), &path, None).await

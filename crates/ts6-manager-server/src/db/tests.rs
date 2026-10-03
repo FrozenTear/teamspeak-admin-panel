@@ -32,6 +32,7 @@ async fn migrations_apply_priority_slice_on_fresh_db() {
             "0016_moderation_appeal_filed_action_kind".to_string(),
             "0017_moderation_appeal_action_kinds".to_string(),
             "0018_music_bot_runtime".to_string(),
+            "0019_music_summon_cap".to_string(),
         ],
         "first run should apply every migration"
     );
@@ -51,7 +52,7 @@ async fn migrations_runner_is_idempotent() {
     );
     assert_eq!(
         second.skipped.len(),
-        18,
+        19,
         "second run should skip every migration applied on the first run"
     );
 }

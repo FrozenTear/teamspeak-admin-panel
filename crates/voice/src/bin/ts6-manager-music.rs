@@ -155,8 +155,6 @@ async fn main() -> Result<()> {
         decode_cpuset = %std::env::var("TS6_BOT_DECODE_CPUSET").unwrap_or_default(),
         "ts6-manager-music starting (owns the only Voice send loop; no Surreal)"
     );
-    let _ = PathBuf::from(data_dir);
-
     let state = music_bot::runtime_http::RuntimeState::new();
     if let Ok(cookie) = std::env::var("YT_COOKIE_FILE")
         && !cookie.is_empty()
@@ -168,6 +166,11 @@ async fn main() -> Result<()> {
     {
         *state.yt_api_key.write().unwrap_or_else(|e| e.into_inner()) = Some(key);
     }
+    state.supervisor.enable_quiet_sessions(
+        PathBuf::from(&data_dir).join("quiet-identities"),
+        std::sync::Arc::clone(&state.yt_cookie),
+        std::sync::Arc::clone(&state.yt_api_key),
+    );
 
     let app = music_bot::runtime_http::router_with_auth(state, auth);
     let listener = tokio::net::TcpListener::bind(args.listen)

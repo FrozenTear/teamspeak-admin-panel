@@ -159,10 +159,24 @@ async fn create(
     config = config.with_server_addr(req.server_addr.clone());
     config = config.with_auto_connect(auto_connect);
 
-    let id = supervisor
-        .spawn(config, state.yt_cookie.clone(), state.yt_api_key.clone())
-        .await
-        .map_err(map_music_runtime_error)?;
+    // The save lock covers the stored-cap read and the push, so a save
+    // in flight cannot change the row between them. A push error is not
+    // proof the process rejected the number. This reads until a read
+    // succeeds and, when the process holds a number, writes it before
+    // create returns. Dropping the handler does not cancel that write
+    // or release the lock first.
+    let mut push = super::summon::PushCapGuard::acquire(&state, &req.server_addr).await;
+    let summon_cap = super::summon::cap_for_push(&state, &req.server_addr).await;
+    let spawned = supervisor
+        .spawn_with_summon_cap(
+            config,
+            state.yt_cookie.clone(),
+            state.yt_api_key.clone(),
+            summon_cap,
+        )
+        .await;
+    push.finish().await;
+    let id = spawned.map_err(map_music_runtime_error)?;
     state.music_bots.watch(id).await;
 
     // PURA-357 — persist the bot's runtime config so it survives a
@@ -427,7 +441,7 @@ async fn server_for_addr(
         .ok_or_else(|| validation("serverAddr does not match a configured server"))
 }
 
-async fn require_server_write(
+pub(super) async fn require_server_write(
     state: &AppState,
     user: &crate::auth::extractors::AuthUser,
     server_addr: &str,
@@ -471,7 +485,7 @@ async fn match_addr(state: &AppState, server_addr: &str) -> Result<AddrMatch, Re
 /// nothing about a bot they cannot read — including one whose address
 /// matches no enabled server. A database failure is returned so the
 /// handler can answer 500.
-async fn bot_visibility(
+pub(super) async fn bot_visibility(
     state: &AppState,
     user: &crate::auth::extractors::AuthUser,
     server_addr: &str,

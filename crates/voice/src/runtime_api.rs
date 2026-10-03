@@ -30,6 +30,32 @@ pub struct SpawnRequest {
     pub config: BotConfig,
     #[serde(default)]
     pub id: Option<u64>,
+    /// Cap for `config.server_addr` when the API has one stored.
+    /// Omitted or null does not arm summon and does not copy another
+    /// server's number.
+    #[serde(default)]
+    pub summon_cap: Option<u32>,
+}
+
+/// Body of `PUT /v1/summon-cap`. One number for one server address.
+/// `cap: null` clears a number the database did not keep.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SummonCapBody {
+    pub server_addr: String,
+    pub cap: Option<u32>,
+}
+
+/// Body of `POST /v1/summon-heard`. A channel line the panel already
+/// received. `server_host` is the server connection's host, not a voice
+/// port. `invoker_id` is the TeamSpeak client id on that notify. This is
+/// not a request to look the caller up.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SummonHeardBody {
+    pub server_host: String,
+    pub invoker_id: u16,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

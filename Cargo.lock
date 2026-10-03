@@ -5102,6 +5102,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "ts6-manager-shared",
  "ts6-voice-fixture",
  "tsclientlib",
  "tsproto-packets",

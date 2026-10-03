@@ -251,6 +251,7 @@ pub(crate) async fn run_bot(
                                     &mut rx,
                                     &events,
                                     bot_id,
+                                    config.server_addr.as_str(),
                                     &store,
                                     Arc::clone(&yt_cookie),
                                     Arc::clone(&yt_api_key),
@@ -267,6 +268,7 @@ pub(crate) async fn run_bot(
                                     &mut rx,
                                     &events,
                                     bot_id,
+                                    config.server_addr.as_str(),
                                     &store,
                                     Arc::clone(&yt_cookie),
                                     Arc::clone(&yt_api_key),
@@ -587,6 +589,7 @@ async fn run_connected_loop(
     rx: &mut mpsc::Receiver<BotCommand>,
     events: &broadcast::Sender<BotEvent>,
     bot_id: BotId,
+    server: &str,
     store: &Arc<dyn MusicBotStore>,
     yt_cookie: Arc<RwLock<Option<PathBuf>>>,
     yt_api_key: Arc<RwLock<Option<String>>>,
@@ -682,6 +685,7 @@ async fn run_connected_loop(
                             &mut WireSink::Direct(&mut *con),
                             &mut current_audio,
                             bot_id,
+                            server,
                             store,
                             events,
                             &yt_cookie,
@@ -1351,6 +1355,7 @@ async fn run_split_connected_loop(
     rx: &mut mpsc::Receiver<BotCommand>,
     events: &broadcast::Sender<BotEvent>,
     bot_id: BotId,
+    server: &str,
     store: &Arc<dyn MusicBotStore>,
     yt_cookie: Arc<RwLock<Option<PathBuf>>>,
     yt_api_key: Arc<RwLock<Option<String>>>,
@@ -1386,6 +1391,7 @@ async fn run_split_connected_loop(
                             &mut WireSink::Split(&wire_cmd_tx),
                             &mut current_audio,
                             bot_id,
+                            server,
                             store,
                             events,
                             &yt_cookie,
@@ -2475,6 +2481,7 @@ pub(crate) fn arc_for_tests<T>(t: T) -> Arc<T> {
 /// with the invoker's name for debug-logging context.
 struct ChatLine {
     invoker: String,
+    invoker_id: u16,
     text: String,
 }
 
@@ -2508,6 +2515,7 @@ fn extract_channel_chat(item: &StreamItem, con: &Connection) -> Vec<ChatLine> {
             }
             out.push(ChatLine {
                 invoker: invoker.name.clone(),
+                invoker_id: invoker.id.0,
                 text: message.clone(),
             });
         }
@@ -2528,6 +2536,7 @@ async fn dispatch_chat_line(
     wire: &mut WireSink<'_>,
     current_audio: &mut Option<ActiveAudio>,
     bot_id: BotId,
+    server: &str,
     store: &Arc<dyn MusicBotStore>,
     events: &broadcast::Sender<BotEvent>,
     yt_cookie: &Arc<RwLock<Option<PathBuf>>>,
@@ -2544,6 +2553,12 @@ async fn dispatch_chat_line(
             // the command-dispatch latency the issue calls out as
             // previously unmeasured.
             info!(target: "music_bot_latency", invoker = %msg.invoker, command = ?parsed, "chat command received");
+            // A summon the quiet pool claims is not this bot's song. The
+            // sitting client moves on its own connection. Channel text
+            // from here is not forwarded.
+            if crate::summon::saved_bot_yields_summon(server, msg.invoker_id, &msg.text) {
+                return;
+            }
             // PURA-396 — `chat::handle_command` is `Connection`-free; the
             // reply rides the `WireSink` (a direct `send_reply`, or a
             // `WireCmd::ChatReply` to the wire task in the split path).

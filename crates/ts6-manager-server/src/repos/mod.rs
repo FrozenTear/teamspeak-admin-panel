@@ -29,6 +29,7 @@ pub mod moderation_tokens;
 pub mod music_bot_runtime;
 pub mod music_bots;
 pub mod music_requests;
+pub mod music_summon_cap;
 pub mod playlist_songs;
 pub mod playlists;
 pub mod radio_stations;

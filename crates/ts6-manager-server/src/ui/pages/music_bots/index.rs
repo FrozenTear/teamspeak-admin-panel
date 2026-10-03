@@ -19,6 +19,7 @@ use crate::ui::pages::music_bots::shared::{
     delete_control_label, format_error, orphaned_badge_class, state_badge_class, state_label,
     track_display_title,
 };
+use crate::ui::pages::music_bots::summon_groups::{self, SummonServerGroup};
 use crate::ui::routes::Route;
 
 #[component]
@@ -31,6 +32,9 @@ pub fn BotsIndexPage() -> Element {
     let toaster = use_toaster();
 
     let mut rows: Signal<Vec<wire::MusicBotSummary>> = use_signal(Vec::new);
+    let mut caps: Signal<Vec<wire::SummonCap>> = use_signal(Vec::new);
+    let mut caps_error: Signal<Option<ApiError>> = use_signal(|| None::<ApiError>);
+    let mut caps_known: Signal<bool> = use_signal(|| false);
     let mut error: Signal<Option<ApiError>> = use_signal(|| None::<ApiError>);
     let mut loading: Signal<bool> = use_signal(|| true);
     let mut reload: Signal<u64> = use_signal(|| 0u64);
@@ -56,6 +60,29 @@ pub fn BotsIndexPage() -> Element {
             loading.set(false);
         }
         None => loading.set(true),
+    });
+
+    let caps_snapshot = use_resource({
+        let gate = gate.clone();
+        move || {
+            let gate = gate.clone();
+            let _ = *reload.read();
+            async move { mb::list_summon_caps(gate).await }
+        }
+    });
+
+    use_effect(move || match &*caps_snapshot.read_unchecked() {
+        Some(Ok(list)) => {
+            caps.set(list.caps.clone());
+            caps_error.set(None);
+            caps_known.set(true);
+        }
+        Some(Err(e)) => {
+            caps.set(Vec::new());
+            caps_error.set(Some(e.clone()));
+            caps_known.set(false);
+        }
+        None => {}
     });
 
     let bump = move || reload.with_mut(|n| *n += 1);
@@ -154,13 +181,31 @@ pub fn BotsIndexPage() -> Element {
                 "{format_error(err)}"
             }
         }
+        if let Some(err) = caps_error.read().as_ref() {
+            Banner {
+                variant: BannerVariant::Danger,
+                title: "Could not load summon caps".to_string(),
+                "{format_error(err)}"
+            }
+        }
 
         section { class: "stack-md",
             if *loading.read() && rows.read().is_empty() {
                 div { class: "card", aria_busy: "true",
                     p { class: "muted", "Loading bots…" }
                 }
-            } else if rows.read().is_empty() {
+            } else if rows.read().is_empty()
+                && !*caps_known.read()
+                && caps_error.read().is_none()
+            {
+                div { class: "card", aria_busy: "true",
+                    p { class: "muted", "Loading bots…" }
+                }
+            } else if summon_groups::show_empty_bot_list(
+                rows.read().len(),
+                caps.read().len(),
+                *caps_known.read() || caps_error.read().is_some(),
+            ) {
                 div { class: "empty",
                     div { class: "icon", "♪" }
                     h3 { "No music bots yet" }
@@ -176,6 +221,12 @@ pub fn BotsIndexPage() -> Element {
             } else {
                 BotsTable {
                     rows: rows.read().clone(),
+                    caps: caps.read().clone(),
+                    caps_known: *caps_known.read(),
+                    on_cap_saved: EventHandler::new({
+                        let mut bump = bump;
+                        move |_: ()| bump()
+                    }),
                     on_connect: EventHandler::new({
                         let on_connect = on_connect.clone();
                         move |id: wire::BotId| on_connect(id)
@@ -216,6 +267,9 @@ pub fn BotsIndexPage() -> Element {
 #[derive(Props, Clone, PartialEq)]
 struct BotsTableProps {
     rows: Vec<wire::MusicBotSummary>,
+    caps: Vec<wire::SummonCap>,
+    caps_known: bool,
+    on_cap_saved: EventHandler<()>,
     on_connect: EventHandler<wire::BotId>,
     on_disconnect: EventHandler<wire::BotId>,
     on_delete: EventHandler<(wire::BotId, bool)>,
@@ -223,6 +277,9 @@ struct BotsTableProps {
 
 #[component]
 fn BotsTable(props: BotsTableProps) -> Element {
+    let groups: Vec<SummonServerGroup> = summon_groups::group_summon_caps(&props.rows, &props.caps);
+    let caps_known = props.caps_known;
+    let on_cap_saved = props.on_cap_saved;
     rsx! {
         table { class: "data-table",
             "aria-label": "Music bots",
@@ -236,23 +293,35 @@ fn BotsTable(props: BotsTableProps) -> Element {
                 }
             }
             tbody {
-                for b in props.rows.iter() {
+                for group in groups.iter() {
                     {
-                        let b = b.clone();
-                        let id = b.id;
-                        let state = b.state;
+                        let group = group.clone();
                         let on_connect = props.on_connect;
                         let on_disconnect = props.on_disconnect;
                         let on_delete = props.on_delete;
-                        let orphaned = b.orphaned;
-                        let delete_label = delete_control_label(orphaned);
-                        let online = matches!(state, wire::BotState::Connected | wire::BotState::InChannel | wire::BotState::Playing);
-                        let now_playing = b
-                            .now_playing
-                            .as_ref()
-                            .map(track_display_title)
-                            .unwrap_or_else(|| "—".into());
                         rsx! {
+                            if caps_known {
+                                SummonCapEditor {
+                                    key: "{group.server_addr}:{group.cap:?}",
+                                    server_addr: group.server_addr.clone(),
+                                    stored: group.cap,
+                                    on_saved: on_cap_saved,
+                                }
+                            }
+                            for b in group.bots.iter() {
+                                {
+                                    let b = b.clone();
+                                    let id = b.id;
+                                    let state = b.state;
+                                    let orphaned = b.orphaned;
+                                    let delete_label = delete_control_label(orphaned);
+                                    let online = matches!(state, wire::BotState::Connected | wire::BotState::InChannel | wire::BotState::Playing);
+                                    let now_playing = b
+                                        .now_playing
+                                        .as_ref()
+                                        .map(track_display_title)
+                                        .unwrap_or_else(|| "—".into());
+                                    rsx! {
                             tr { key: "{id.0}",
                                 td { class: "client-cell",
                                     Link {
@@ -324,7 +393,108 @@ fn BotsTable(props: BotsTableProps) -> Element {
                                     }
                                 }
                             }
+                                    }
+                                }
+                            }
                         }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Props, Clone, PartialEq)]
+struct SummonCapEditorProps {
+    server_addr: String,
+    stored: Option<u32>,
+    on_saved: EventHandler<()>,
+}
+
+fn stored_cap_text(stored: Option<u32>) -> String {
+    summon_groups::summon_cap_field_after_failed_save(stored)
+}
+
+#[component]
+fn SummonCapEditor(props: SummonCapEditorProps) -> Element {
+    let gate = use_auth_gate();
+    let toaster = use_toaster();
+    let stored_text = stored_cap_text(props.stored);
+    let mut draft: Signal<String> = use_signal(|| stored_text.clone());
+    let mut submitting: Signal<bool> = use_signal(|| false);
+    let server_addr = props.server_addr.clone();
+    let server_label = server_addr.clone();
+    let on_saved = props.on_saved;
+
+    let on_save = move |_| {
+        if *submitting.read() {
+            return;
+        }
+        let parsed = draft.read().trim().parse::<u32>();
+        let Ok(cap) = parsed else {
+            toaster.push(
+                ToastVariant::Danger,
+                "Summon cap was not saved",
+                Some("Enter a whole number.".into()),
+            );
+            draft.set(stored_text.clone());
+            return;
+        };
+        submitting.set(true);
+        let gate = gate.clone();
+        let server_addr = server_addr.clone();
+        let stored_text = stored_text.clone();
+        let on_saved = on_saved;
+        spawn(async move {
+            let body = wire::SummonCap {
+                server_addr: server_addr.clone(),
+                cap,
+            };
+            match mb::put_summon_cap(gate, &body).await {
+                Ok(_) => {
+                    submitting.set(false);
+                    toaster.push(
+                        ToastVariant::Success,
+                        format!("Summon cap for {server_addr} is {cap}"),
+                        None,
+                    );
+                    on_saved.call(());
+                }
+                Err(e) => {
+                    submitting.set(false);
+                    draft.set(stored_text);
+                    toaster.push(
+                        ToastVariant::Danger,
+                        "Summon cap was not saved",
+                        Some(format_error(&e)),
+                    );
+                }
+            }
+        });
+    };
+
+    rsx! {
+        tr { class: "summon-cap-row", key: "cap-{server_label}",
+            td { colspan: "5",
+                div { class: "summon-cap-editor",
+                    label {
+                        r#for: "summon-cap-{server_label}",
+                        "Summon cap"
+                    }
+                    span { class: "muted", "{server_label}" }
+                    input {
+                        id: "summon-cap-{server_label}",
+                        class: "input",
+                        inputmode: "numeric",
+                        value: "{draft.read()}",
+                        oninput: move |e| draft.set(e.value()),
+                    }
+                    Button {
+                        variant: ButtonVariant::Secondary,
+                        size: ButtonSize::Small,
+                        loading: *submitting.read(),
+                        onclick: on_save,
+                        "Save"
                     }
                 }
             }

@@ -212,6 +212,11 @@ mod server_entry {
             // itself from its own `MUSIC_DIR`.
             music_bot::install_music_dir(state.music_dir.clone());
             music_bot::warm_resolver();
+            state.music_bots.supervisor.enable_local_quiet_sessions(
+                state.data_dir.join("quiet-identities"),
+                state.yt_cookie.clone(),
+                state.yt_api_key.clone(),
+            );
         } else {
             if !state.music_bots.supervisor.wait_until_healthy(30).await {
                 tracing::warn!(
@@ -248,11 +253,22 @@ mod server_entry {
         // startup, and an `auto_connect=false` bot is restored idle.
         // When MUSIC_RUNTIME_URL is set, spawn_with_id is an HTTP hop
         // to the music unit (the only send loop).
+        let summon_caps = match crate::repos::music_summon_cap::list(&database).await {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "summon cap lookup failed; rehydrated bots will not arm summon"
+                );
+                Vec::new()
+            }
+        };
         match crate::repos::music_bot_runtime::list(&database).await {
             Ok(rows) => {
                 let count = rows.len();
                 for row in rows {
                     let id = music_bot::BotId(row.id as u64);
+                    let summon_cap = summon_cap_for_bot(&summon_caps, &row.serverAddr);
                     let config = music_bot::BotConfig::new(
                         row.name,
                         std::path::PathBuf::from(row.identityPath),
@@ -262,11 +278,12 @@ mod server_entry {
                     match state
                         .music_bots
                         .supervisor
-                        .spawn_with_id(
+                        .spawn_with_id_and_summon(
                             id,
                             config,
                             state.yt_cookie.clone(),
                             state.yt_api_key.clone(),
+                            summon_cap,
                         )
                         .await
                     {
@@ -338,6 +355,7 @@ mod server_entry {
                 hub: state.ws_hub.clone(),
                 control: state.control.clone(),
                 flow_engine: _flow_engine.handle(),
+                music: state.music_bots.supervisor.clone(),
             });
 
         // PURA-144 (WS-6) — sidecar `/stats` poller + per-server
@@ -570,6 +588,54 @@ mod server_entry {
         )
         .await?;
         Ok(())
+    }
+
+    /// The cap row is stored under the canonical address. A bot row keeps
+    /// the address as it was typed. Rehydrate matches those by the socket,
+    /// not by the exact string.
+    fn summon_cap_for_bot(
+        caps: &[crate::repos::music_summon_cap::MusicSummonCap],
+        server_addr: &str,
+    ) -> Option<u32> {
+        let want = music_bot::canon_server_addr(server_addr);
+        if want.is_empty() {
+            return None;
+        }
+        let cap = caps
+            .iter()
+            .find(|cap| music_bot::canon_server_addr(&cap.serverAddr) == want)?;
+        match u32::try_from(cap.cap) {
+            Ok(n) => Some(n),
+            Err(_) => {
+                tracing::warn!(
+                    server = %cap.serverAddr,
+                    stored = cap.cap,
+                    "stored summon cap is not a u32; this push will not arm summon"
+                );
+                None
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::summon_cap_for_bot;
+        use crate::repos::music_summon_cap::MusicSummonCap;
+
+        fn row(server_addr: &str, cap: i64) -> MusicSummonCap {
+            MusicSummonCap {
+                serverAddr: server_addr.to_string(),
+                cap,
+            }
+        }
+
+        #[test]
+        fn rehydrate_matches_the_canonical_server_address() {
+            let caps = vec![row("ts.example:9987", 3)];
+            assert_eq!(summon_cap_for_bot(&caps, "TS.Example:9987"), Some(3));
+            assert_eq!(summon_cap_for_bot(&caps, "ts.example"), Some(3));
+            assert_eq!(summon_cap_for_bot(&caps, "ts.example:9988"), None);
+        }
     }
 }
 

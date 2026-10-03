@@ -17,11 +17,13 @@ mod command;
 mod config;
 mod event;
 pub mod healthcheck;
+mod quiet_session;
 mod runtime;
 pub mod runtime_api;
 pub mod runtime_http;
 mod state;
 mod store;
+mod summon;
 mod supervisor;
 mod voice_bug_report;
 
@@ -36,6 +38,7 @@ pub use store::{
     InMemoryMusicBotStore, LibraryEntry, LibraryEntryId, MusicBotStore, NewLibraryEntry, NewTrack,
     PlaylistName, SNAPSHOT_VERSION, StoreError, StoreResult, Track, TrackId,
 };
+pub use summon::{MAX_SUMMON_CAP, SummonDirector, TECH_SUPPORT_CHANNEL, canon_server_addr};
 pub use supervisor::{BotHandle, BotInfo, BotSupervisor, SendError, spawn_bot};
 
 /// Voice `context` bag for `POST /api/bug-reports` (PR #28).

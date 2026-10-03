@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use axum::Json;
 use axum::Router;
-use axum::extract::{Path, Request, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::Response;
@@ -40,8 +40,8 @@ pub use music_bot_audio::cpuset::MUSIC_RUNTIME_TOKEN_ENV;
 use crate::config::BotId;
 use crate::runtime_api::{
     BugReportContextResponse, EncodeHeadroom, HealthResponse, ListResponse, MutateOp, SendLead,
-    SendRequest, SettingsRequest, SpawnRequest, SpawnResponse, StoreOp, WireError,
-    store_err_to_wire,
+    SendRequest, SettingsRequest, SpawnRequest, SpawnResponse, StoreOp, SummonCapBody,
+    SummonHeardBody, WireError, store_err_to_wire,
 };
 use crate::store::{LibraryEntryId, PlaylistName, StoreError, TrackId};
 use crate::supervisor::BotSupervisor;
@@ -296,6 +296,8 @@ pub fn router(state: RuntimeState) -> Router {
 pub fn router_with_auth(state: RuntimeState, auth: ControlAuth) -> Router {
     let mut app = Router::new()
         .route("/v1/bots", get(list_bots).post(spawn_bot))
+        .route("/v1/summon-cap", get(get_summon_cap).put(put_summon_cap))
+        .route("/v1/summon-heard", post(post_summon_heard))
         .route("/v1/bots/{id}", delete(shutdown_bot))
         .route("/v1/bots/{id}/command", post(send_command))
         .route("/v1/bots/{id}/events", get(events_sse))
@@ -389,6 +391,9 @@ async fn spawn_bot(
     State(state): State<RuntimeState>,
     Json(req): Json<SpawnRequest>,
 ) -> Result<Json<SpawnResponse>, Response> {
+    let summon_cap = req.summon_cap;
+    let server_addr = req.config.server_addr.clone();
+    let identity = req.config.identity_path.clone();
     let id = if let Some(id) = req.id {
         state
             .supervisor
@@ -409,7 +414,55 @@ async fn spawn_bot(
             )
             .await
     };
+    state
+        .supervisor
+        .note_summon_push(&server_addr, id.0, summon_cap, &identity);
     Ok(Json(SpawnResponse { id }))
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SummonCapQuery {
+    server_addr: String,
+}
+
+/// The cap the music process currently holds. A missing row is `cap: null`.
+/// This is not a client lookup.
+async fn get_summon_cap(
+    State(state): State<RuntimeState>,
+    Query(query): Query<SummonCapQuery>,
+) -> Json<SummonCapBody> {
+    let server_addr = crate::canon_server_addr(&query.server_addr);
+    let cap = state.supervisor.summon().cap(&server_addr);
+    Json(SummonCapBody { server_addr, cap })
+}
+
+async fn put_summon_cap(
+    State(state): State<RuntimeState>,
+    Json(req): Json<SummonCapBody>,
+) -> Result<StatusCode, Response> {
+    let result = match req.cap {
+        Some(cap) => state.supervisor.accept_summon_cap(&req.server_addr, cap),
+        None => state.supervisor.restore_summon_cap(&req.server_addr, None),
+    };
+    result.map_err(|err| status_err(StatusCode::BAD_REQUEST, &err))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// A channel summon the panel's server-query subscription already has.
+/// The quiet client's own client list is the channel source. No lookup.
+async fn post_summon_heard(
+    State(state): State<RuntimeState>,
+    Json(req): Json<SummonHeardBody>,
+) -> Result<StatusCode, Response> {
+    if req.server_host.trim().is_empty() {
+        return Err(status_err(StatusCode::BAD_REQUEST, "server host is empty"));
+    }
+    state
+        .supervisor
+        .summon()
+        .hear_for_host(&req.server_host, req.invoker_id, &req.text);
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn shutdown_bot(
@@ -844,6 +897,7 @@ mod tests {
                         serde_json::to_vec(&SpawnRequest {
                             config: cfg,
                             id: None,
+                            summon_cap: None,
                         })
                         .unwrap(),
                     ))
@@ -1125,6 +1179,7 @@ mod tests {
                         serde_json::to_vec(&SpawnRequest {
                             config: cfg,
                             id: None,
+                            summon_cap: None,
                         })
                         .unwrap(),
                     ))
@@ -1519,5 +1574,247 @@ mod tests {
             .ensure_bind_allowed(addr("192.0.2.10:3002"))
             .expect_err("non-loopback");
         assert!(!err.to_string().contains(t));
+    }
+
+    fn summon_spawn(name: &str, server: &str, cap: Option<u32>) -> SpawnRequest {
+        SpawnRequest {
+            config: BotConfig::new(
+                name,
+                std::env::temp_dir().join(format!("summon-http-{name}.identity")),
+            )
+            .with_server_addr(server)
+            .with_auto_connect(false),
+            id: None,
+            summon_cap: cap,
+        }
+    }
+
+    async fn send_json(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        body: &impl serde::Serialize,
+    ) -> axum::http::Response<Body> {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn summon_push_arms_only_the_server_whose_number_it_carries() {
+        let state = RuntimeState::new();
+        let supervisor = Arc::clone(&state.supervisor);
+        let app = router(state);
+        let server = "10.2.0.1:9987";
+        let other = "10.2.0.2:9987";
+
+        let bare = send_json(
+            &app,
+            "POST",
+            "/v1/bots",
+            &summon_spawn("bare", server, None),
+        )
+        .await;
+        assert_eq!(bare.status(), StatusCode::OK);
+        assert!(!supervisor.summon().armed(server));
+        assert_eq!(supervisor.summon().quiet_count(server), 0);
+        assert_eq!(supervisor.summon().cap(server), None);
+
+        let armed = send_json(
+            &app,
+            "POST",
+            "/v1/bots",
+            &summon_spawn("armed", server, Some(2)),
+        )
+        .await;
+        assert_eq!(armed.status(), StatusCode::OK);
+        assert!(supervisor.summon().armed(server));
+        assert_eq!(supervisor.summon().quiet_count(server), 2);
+        assert_eq!(supervisor.summon().cap(server), Some(2));
+
+        let again = send_json(
+            &app,
+            "POST",
+            "/v1/bots",
+            &summon_spawn("again", server, Some(9)),
+        )
+        .await;
+        assert_eq!(again.status(), StatusCode::OK);
+        assert_eq!(supervisor.summon().quiet_count(server), 2);
+        assert_eq!(supervisor.summon().cap(server), Some(2));
+
+        let elsewhere =
+            send_json(&app, "POST", "/v1/bots", &summon_spawn("else", other, None)).await;
+        assert_eq!(elsewhere.status(), StatusCode::OK);
+        assert_eq!(supervisor.summon().quiet_count(other), 0);
+        assert_eq!(supervisor.summon().cap(other), None);
+        assert_eq!(supervisor.summon().quiet_count(server), 2);
+
+        let paths = supervisor.summon().identity_paths(server);
+        assert_eq!(paths.len(), 2);
+        assert_ne!(paths[0], paths[1]);
+        for path in &paths {
+            let name = path.file_name().and_then(|name| name.to_str()).unwrap();
+            assert!(name.starts_with("quiet-"), "{name}");
+            assert!(!name.starts_with("bot-"), "{name}");
+        }
+
+        let listed = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/bots")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let listed: ListResponse = json(listed).await;
+        assert_eq!(listed.bots.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn summon_cap_put_waits_for_a_saved_bot_and_refuses_past_the_ceiling() {
+        let state = RuntimeState::new();
+        let supervisor = Arc::clone(&state.supervisor);
+        let app = router(state);
+        let server = "10.3.0.1:9987";
+
+        let early = send_json(
+            &app,
+            "PUT",
+            "/v1/summon-cap",
+            &SummonCapBody {
+                server_addr: server.into(),
+                cap: Some(3),
+            },
+        )
+        .await;
+        assert_eq!(early.status(), StatusCode::NO_CONTENT);
+        assert_eq!(supervisor.summon().cap(server), Some(3));
+        assert_eq!(supervisor.summon().quiet_count(server), 0);
+        assert!(!supervisor.summon().armed(server));
+
+        // A push that carries no number keeps the cap this PUT already
+        // stored and arms the pool with that number.
+        let bare = send_json(
+            &app,
+            "POST",
+            "/v1/bots",
+            &summon_spawn("known", server, None),
+        )
+        .await;
+        assert_eq!(bare.status(), StatusCode::OK);
+        assert!(supervisor.summon().armed(server));
+        assert_eq!(supervisor.summon().cap(server), Some(3));
+        assert_eq!(supervisor.summon().quiet_count(server), 3);
+
+        let accepted = send_json(
+            &app,
+            "PUT",
+            "/v1/summon-cap",
+            &SummonCapBody {
+                server_addr: server.into(),
+                cap: Some(2),
+            },
+        )
+        .await;
+        assert_eq!(accepted.status(), StatusCode::NO_CONTENT);
+        assert!(supervisor.summon().armed(server));
+        assert_eq!(supervisor.summon().quiet_count(server), 2);
+        assert_eq!(supervisor.summon().cap(server), Some(2));
+
+        for cap in [65_u32, 1000] {
+            let refused = send_json(
+                &app,
+                "PUT",
+                "/v1/summon-cap",
+                &SummonCapBody {
+                    server_addr: server.into(),
+                    cap: Some(cap),
+                },
+            )
+            .await;
+            assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "cap {cap}");
+            assert_eq!(supervisor.summon().cap(server), Some(2));
+            assert_eq!(supervisor.summon().quiet_count(server), 2);
+        }
+
+        let listed = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/bots")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let listed: ListResponse = json(listed).await;
+        assert_eq!(listed.bots.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn summon_cap_null_clears_an_accepted_number() {
+        let state = RuntimeState::new();
+        let supervisor = Arc::clone(&state.supervisor);
+        let app = router(state);
+        let server = "10.4.0.1:9987";
+
+        let spawned = send_json(
+            &app,
+            "POST",
+            "/v1/bots",
+            &summon_spawn("known", server, None),
+        )
+        .await;
+        assert_eq!(spawned.status(), StatusCode::OK);
+
+        let accepted = send_json(
+            &app,
+            "PUT",
+            "/v1/summon-cap",
+            &SummonCapBody {
+                server_addr: server.into(),
+                cap: Some(2),
+            },
+        )
+        .await;
+        assert_eq!(accepted.status(), StatusCode::NO_CONTENT);
+        assert_eq!(supervisor.summon().quiet_count(server), 2);
+        assert!(supervisor.summon().armed(server));
+
+        let cleared = send_json(
+            &app,
+            "PUT",
+            "/v1/summon-cap",
+            &SummonCapBody {
+                server_addr: server.into(),
+                cap: None,
+            },
+        )
+        .await;
+        assert_eq!(cleared.status(), StatusCode::NO_CONTENT);
+        assert_eq!(supervisor.summon().cap(server), None);
+        assert!(!supervisor.summon().armed(server));
+        assert_eq!(supervisor.summon().quiet_count(server), 0);
+
+        let later = send_json(
+            &app,
+            "POST",
+            "/v1/bots",
+            &summon_spawn("later", server, None),
+        )
+        .await;
+        assert_eq!(later.status(), StatusCode::OK);
+        assert!(!supervisor.summon().armed(server));
+        assert_eq!(supervisor.summon().quiet_count(server), 0);
+        assert_eq!(supervisor.summon().cap(server), None);
     }
 }

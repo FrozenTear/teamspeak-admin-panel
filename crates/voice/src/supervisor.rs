@@ -21,6 +21,7 @@ use crate::store::{
     InMemoryMusicBotStore, LibraryEntry, LibraryEntryId, MusicBotStore, NewLibraryEntry,
     PlaylistName, StoreResult, Track,
 };
+use crate::summon::SummonDirector;
 
 /// Capacity of each bot's command queue. The dispatcher only ever has
 /// one in-flight command, but a small buffer absorbs UI jitter without
@@ -154,6 +155,7 @@ pub struct BotSupervisor {
     next_id: AtomicU64,
     bots: Arc<Mutex<HashMap<BotId, BotHandle>>>,
     store: Arc<dyn MusicBotStore>,
+    summon: SummonDirector,
 }
 
 impl Default for BotSupervisor {
@@ -180,7 +182,47 @@ impl BotSupervisor {
             next_id: AtomicU64::new(1),
             bots: Arc::new(Mutex::new(HashMap::new())),
             store,
+            summon: SummonDirector::new(std::env::temp_dir().join("ts6-quiet-identities")),
         }
+    }
+
+    /// Quiet-client pool. Not part of [`Self::list`].
+    pub fn summon(&self) -> &SummonDirector {
+        &self.summon
+    }
+
+    /// A saved-bot push. `cap` is the number this push carries. `None`
+    /// does not arm summon.
+    pub fn note_summon_push(
+        &self,
+        server: &str,
+        bot_id: u64,
+        cap: Option<u32>,
+        saved_identity: &std::path::Path,
+    ) {
+        self.summon.note_push(server, bot_id, cap, saved_identity);
+    }
+
+    /// The music process accepts a new cap for one server.
+    pub fn accept_summon_cap(&self, server: &str, cap: u32) -> Result<(), String> {
+        self.summon.accept_cap(server, cap)
+    }
+
+    /// Put the process back on the cap the database still has. `None`
+    /// clears the number and the quiet clients the rejected accept started.
+    pub fn restore_summon_cap(&self, server: &str, cap: Option<u32>) -> Result<(), String> {
+        self.summon.restore_cap(server, cap)
+    }
+
+    /// Open real TeamSpeak sessions for quiet clients. Saved-bot connect
+    /// and disconnect do not call this.
+    pub fn enable_quiet_sessions(
+        &self,
+        identity_dir: std::path::PathBuf,
+        yt_cookie: Arc<RwLock<Option<std::path::PathBuf>>>,
+        yt_api_key: Arc<RwLock<Option<String>>>,
+    ) {
+        self.summon.enable_live(identity_dir, yt_cookie, yt_api_key);
     }
 
     /// Borrow the store. Tests + WS-5 REST handlers reach for this when
@@ -274,7 +316,12 @@ impl BotSupervisor {
     pub async fn shutdown_bot(&self, id: BotId) -> Result<(), SendError> {
         let handle = self.bots.lock().await.remove(&id);
         match handle {
-            Some(h) => h.shutdown().await,
+            Some(h) => {
+                let server = h.config.server_addr.clone();
+                let result = h.shutdown().await;
+                self.summon.forget_saved(&server, id.0);
+                result
+            }
             None => Err(SendError::ActorGone),
         }
     }

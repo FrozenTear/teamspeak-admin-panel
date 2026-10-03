@@ -89,6 +89,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0018_music_bot_runtime",
         include_str!("../../migrations/0018_music_bot_runtime.surql"),
     ),
+    (
+        "0019_music_summon_cap",
+        include_str!("../../migrations/0019_music_summon_cap.surql"),
+    ),
 ];
 
 #[derive(Debug, Deserialize, SurrealValue)]
