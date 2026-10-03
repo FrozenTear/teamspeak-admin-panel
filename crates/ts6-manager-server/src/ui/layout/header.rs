@@ -2,7 +2,8 @@
 //! HTML at `study-documents/design-system/preview/dashboard.html` line 139.
 //!
 //! Phase 1 ships:
-//!  - hamburger button (mobile only, currently inert — drawer animation is Phase 2)
+//!  - hamburger button (mobile only). Toggles the primary nav drawer; the
+//!    links are the sidebar's, not a second menu.
 //!  - server-selector pill — functional Dropdown (PURA-27) backed by stub data
 //!    until the live `GET /api/servers` route lands
 //!  - websocket dot (stub status; wires to the real WS hub when it lands)
@@ -24,6 +25,9 @@ use crate::ui::routes::Route;
 use crate::ui::theme::{Theme, use_theme};
 use ts6_manager_shared::auth::LogoutRequest;
 
+use super::nav_drawer::{NAV_TOGGLE_ID, NavDrawer};
+use super::sidebar::NAV_LANDMARK_ID;
+
 /// Header bar. Pulls user + theme from context — no props needed.
 #[allow(non_snake_case)]
 #[component]
@@ -31,6 +35,8 @@ pub fn Header() -> Element {
     let session = use_session();
     let nav = use_navigator();
     let theme_ctx = use_theme();
+    // Before the anonymous early return so the hook order stays stable.
+    let drawer = use_context::<NavDrawer>();
 
     let mut logging_out = use_signal(|| false);
     let user_menu_open = use_signal(|| false);
@@ -65,6 +71,14 @@ pub fn Header() -> Element {
         });
     };
 
+    let nav_open = drawer.is_open();
+    let nav_label = if nav_open {
+        "Close navigation"
+    } else {
+        "Open navigation"
+    };
+    let nav_expanded = if nav_open { "true" } else { "false" };
+
     let mut theme_signal = theme_ctx.theme;
     let current_theme = *theme_signal.read();
     let toggle_label = match current_theme {
@@ -88,9 +102,11 @@ pub fn Header() -> Element {
             button {
                 class: "btn btn-ghost btn-sm hamburger",
                 r#type: "button",
-                "aria-label": "Open navigation",
-                disabled: true,
-                title: "Mobile drawer arrives in Phase 2",
+                id: "{NAV_TOGGLE_ID}",
+                "aria-label": "{nav_label}",
+                "aria-expanded": "{nav_expanded}",
+                "aria-controls": "{NAV_LANDMARK_ID}",
+                onclick: move |_| drawer.toggle(),
                 "☰"
             }
 
@@ -221,6 +237,7 @@ fn api_base() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::sync::Arc;
 
     use crate::client::dioxus::{DioxusSession, provide_auth_gate};
@@ -272,8 +289,14 @@ mod tests {
         HeaderHarness {},
     }
 
+    thread_local! {
+        static NAV_OPEN_SEED: Cell<bool> = const { Cell::new(false) };
+    }
+
     #[component]
     fn HeaderHarness() -> Element {
+        let nav_open = NAV_OPEN_SEED.with(Cell::get);
+        use_context_provider(|| NavDrawer::new(Signal::new(nav_open)));
         // Authenticated session — `Header` matches `AuthState::Anonymous`
         // to render an empty fragment, so the test must seed a real user.
         let session = use_context_provider(|| DioxusSession {
@@ -309,11 +332,140 @@ mod tests {
     }
 
     fn render_header_harness() -> String {
+        render_header_with_nav(false)
+    }
+
+    fn render_header_with_nav(open: bool) -> String {
+        NAV_OPEN_SEED.with(|cell| cell.set(open));
         let mut dom = VirtualDom::new(|| {
             rsx! { Router::<TestRoute> {} }
         });
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
+    }
+
+    fn hamburger_open_tag(html: &str) -> &str {
+        let class_at = html
+            .find(r#"class="btn btn-ghost btn-sm hamburger""#)
+            .expect("hamburger button");
+        let start = html[..class_at].rfind('<').expect("hamburger tag start");
+        let end = html[start..].find('>').expect("hamburger tag end") + start;
+        &html[start..=end]
+    }
+
+    /// The narrow layout hides the sidebar and shows this control. It has to
+    /// be a real button (not `disabled`) whose label matches the drawer, and
+    /// the open class has to bring that same sidebar back.
+    #[test]
+    fn nav_control_is_usable_at_narrow_width() {
+        let closed = render_header_with_nav(false);
+        let closed_tag = hamburger_open_tag(&closed);
+        assert!(
+            !closed_tag.contains("disabled"),
+            "nav control must be usable at a narrow width, not disabled: {closed_tag}"
+        );
+        assert!(
+            closed_tag.contains(r#"aria-label="Open navigation""#),
+            "closed menu label: {closed_tag}"
+        );
+        assert!(
+            closed_tag.contains(r#"aria-expanded="false""#),
+            "closed menu state: {closed_tag}"
+        );
+        assert!(
+            closed_tag.contains(r#"aria-controls="primary-nav""#),
+            "control must point at the primary nav: {closed_tag}"
+        );
+        assert!(
+            closed_tag.contains(r#"id="nav-toggle""#),
+            "toggle id: {closed_tag}"
+        );
+        assert!(
+            !closed.contains("Mobile drawer arrives in Phase 2"),
+            "placeholder title should be gone: {closed}"
+        );
+
+        let open = render_header_with_nav(true);
+        let open_tag = hamburger_open_tag(&open);
+        assert!(
+            !open_tag.contains("disabled"),
+            "open nav control must stay usable: {open_tag}"
+        );
+        assert!(
+            open_tag.contains(r#"aria-label="Close navigation""#),
+            "open menu label: {open_tag}"
+        );
+        assert!(
+            open_tag.contains(r#"aria-expanded="true""#),
+            "open menu state: {open_tag}"
+        );
+
+        let layout_css = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/layout.css"));
+        let components_css = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/components.css"
+        ));
+        let hamburger_media = media_block_containing(layout_css, ".app .hamburger");
+        assert!(
+            hamburger_media.contains("max-width: 768px"),
+            "hamburger should show at the phone breakpoint: {hamburger_media}"
+        );
+        assert!(
+            hamburger_media.contains("display: inline-flex"),
+            "narrow layout should show the nav control: {hamburger_media}"
+        );
+
+        let sidebar_media =
+            media_block_containing(components_css, ".app .sidebar { display: none; }");
+        assert!(
+            sidebar_media.contains("max-width: 768px"),
+            "sidebar hides at the phone breakpoint: {sidebar_media}"
+        );
+        let open_at = sidebar_media
+            .find(".app.is-nav-open .sidebar")
+            .expect("open drawer rule");
+        let open_rule = brace_block(&sidebar_media[open_at..]);
+        assert!(
+            open_rule.contains("display: block"),
+            "opening the menu should show the sidebar: {open_rule}"
+        );
+        assert!(
+            !open_rule.contains("display: none"),
+            "open drawer must not stay hidden: {open_rule}"
+        );
+    }
+
+    fn media_block_containing<'a>(css: &'a str, needle: &str) -> &'a str {
+        let mut search_from = 0;
+        while let Some(rel) = css[search_from..].find("@media") {
+            let start = search_from + rel;
+            let block = brace_block(&css[start..]);
+            let abs_end = start + block.len();
+            let block = &css[start..abs_end];
+            if block.contains(needle) {
+                return block;
+            }
+            search_from = abs_end;
+        }
+        panic!("no @media block contains {needle}");
+    }
+
+    fn brace_block(css: &str) -> &str {
+        let open = css.find('{').expect("opening brace");
+        let mut depth = 0;
+        for (i, ch) in css[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &css[..=open + i];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unclosed brace");
     }
 
     #[test]

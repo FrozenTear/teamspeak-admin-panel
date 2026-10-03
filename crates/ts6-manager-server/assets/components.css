@@ -711,9 +711,46 @@ a:hover {
     grid-template-rows: var(--header-height) auto 1fr;
   }
   .app .sidebar { display: none; }
+  /* Same sidebar, shown as a left drawer while `.is-nav-open` is set.
+   * Above this breakpoint the selector does not match, so the grid
+   * sidebar is unchanged. The menu button stays above the scrim so it
+   * can close the drawer again. */
+  .app.is-nav-open .sidebar {
+    display: block;
+    position: fixed;
+    top: var(--header-height);
+    left: 0;
+    bottom: 0;
+    width: var(--sidebar-width-expanded);
+    z-index: var(--z-modal);
+    box-shadow: var(--shadow-lg);
+    overscroll-behavior: contain;
+    animation: nav-drawer-in var(--motion-normal) var(--ease-standard);
+  }
+  .app.is-nav-open .nav-backdrop {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: var(--z-overlay);
+    /* Same scrim as `.modal-backdrop` / `.drawer-backdrop`. */
+    background: rgba(11, 14, 19, 0.7);
+  }
+  .app.is-nav-open .hamburger {
+    position: relative;
+    z-index: var(--z-popover);
+    background: var(--bg-canvas);
+  }
   .app .header { grid-column: 1; padding: 0 var(--space-5); }
   .app .main { grid-column: 1; padding: var(--space-5) var(--space-5); }
 }
+@keyframes nav-drawer-in {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .app.is-nav-open .sidebar { animation: none; }
+}
+.nav-backdrop { display: none; }
 .sidebar {
   grid-row: 1 / 3;
   background: var(--bg-surface);
