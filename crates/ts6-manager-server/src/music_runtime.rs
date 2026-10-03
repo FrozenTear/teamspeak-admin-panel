@@ -355,6 +355,15 @@ impl MusicBotFront {
             FrontInner::Local(s) => {
                 let id = s.spawn(config, yt_cookie, yt_api_key).await;
                 s.note_summon_push(&server, id.0, summon_cap, &identity);
+                // The push has been applied. A later error is the reply,
+                // not a rejected cap: a delivered request can time out or
+                // fail to decode on the way back.
+                #[cfg(test)]
+                if spawn_fault::take_error_after_push(&server) {
+                    return Err(MusicRuntimeError::Unavailable(
+                        "spawn reply failed after the push was applied".into(),
+                    ));
+                }
                 Ok(id)
             }
             FrontInner::Remote(r) => {
@@ -1546,6 +1555,54 @@ impl MusicBotStore for RemoteMusicRuntime {
             tag: tag.map(str::to_string),
         })
         .await
+    }
+}
+
+/// The next local spawn for `server` applies the push, then returns an
+/// error. Other servers are left alone.
+#[cfg(test)]
+pub fn arm_spawn_error_after_push(server: &str) {
+    spawn_fault::arm_error_after_push(server);
+}
+
+#[cfg(test)]
+pub fn clear_spawn_error_after_push(server: &str) {
+    spawn_fault::clear(server);
+}
+
+#[cfg(test)]
+mod spawn_fault {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    fn table() -> &'static Mutex<HashMap<String, bool>> {
+        static TABLE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+        TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(super) fn arm_error_after_push(server: &str) {
+        let key = music_bot::canon_server_addr(server);
+        table()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .insert(key, true);
+    }
+
+    pub(super) fn take_error_after_push(server: &str) -> bool {
+        let key = music_bot::canon_server_addr(server);
+        table()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .remove(&key)
+            .unwrap_or(false)
+    }
+
+    pub(super) fn clear(server: &str) {
+        let key = music_bot::canon_server_addr(server);
+        table()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .remove(&key);
     }
 }
 

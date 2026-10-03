@@ -3873,3 +3873,191 @@ async fn a_bot_create_without_a_stored_cap_arms_the_number_the_process_holds() {
         Some(4)
     );
 }
+
+async fn assert_store_matches_process(state: &AppState, server: &str) {
+    let process = state.music_bots.supervisor.local_summon_cap(server);
+    let stored = crate::repos::music_summon_cap::get(&state.db, server)
+        .await
+        .unwrap();
+    assert_eq!(
+        stored,
+        process.flatten(),
+        "the store and the process must hold the same number"
+    );
+}
+
+#[tokio::test]
+async fn a_push_error_stores_the_cap_the_process_already_holds() {
+    let (app, token, state) = make_test_app().await;
+    let server = "127.0.0.1:9961";
+    assert_eq!(
+        put_summon_cap(&app, &token, server, 1).await.status(),
+        StatusCode::OK
+    );
+    state
+        .music_bots
+        .supervisor
+        .set_summon_cap(server, 4)
+        .await
+        .unwrap();
+    crate::music_runtime::arm_spawn_error_after_push(server);
+    let created = create_bot_on(&app, &token, server).await;
+    crate::music_runtime::clear_spawn_error_after_push(server);
+    assert_eq!(created.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        state.music_bots.supervisor.local_summon_cap(server),
+        Some(Some(4)),
+        "the push was applied before the reply failed"
+    );
+    assert_store_matches_process(&state, server).await;
+    assert_eq!(
+        state.music_bots.supervisor.local_summon_armed(server),
+        Some(true)
+    );
+    assert_eq!(
+        state.music_bots.supervisor.local_quiet_count(server),
+        Some(4)
+    );
+}
+
+#[tokio::test]
+async fn a_push_error_stores_a_held_cap_when_the_store_was_empty() {
+    let (app, token, state) = make_test_app().await;
+    let server = "127.0.0.1:9962";
+    state
+        .music_bots
+        .supervisor
+        .set_summon_cap(server, 4)
+        .await
+        .unwrap();
+    crate::music_runtime::arm_spawn_error_after_push(server);
+    let created = create_bot_on(&app, &token, server).await;
+    crate::music_runtime::clear_spawn_error_after_push(server);
+    assert_eq!(created.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        state.music_bots.supervisor.local_summon_cap(server),
+        Some(Some(4))
+    );
+    assert_store_matches_process(&state, server).await;
+    assert_eq!(
+        state.music_bots.supervisor.local_summon_armed(server),
+        Some(true)
+    );
+    assert_eq!(
+        state.music_bots.supervisor.local_quiet_count(server),
+        Some(4)
+    );
+}
+
+async fn drop_create_while_the_cap_write_is_in_progress(
+    app: &Router,
+    token: &str,
+    state: &AppState,
+    server: &str,
+    stored_before: Option<u32>,
+) {
+    super::summon::arm_process_read_failures(server, 1);
+    let (pause, release) = super::summon::align_pause(server);
+    let app2 = app.clone();
+    let token2 = token.to_string();
+    let server_for_task = server.to_string();
+    let created =
+        tokio::spawn(async move { create_bot_on(&app2, &token2, &server_for_task).await });
+    pause
+        .await
+        .expect("the cap write waits under the save lock");
+    assert_eq!(
+        crate::repos::music_summon_cap::get(&state.db, server)
+            .await
+            .unwrap(),
+        stored_before,
+        "the write has not landed yet"
+    );
+    created.abort();
+    let _ = created.await;
+    assert!(
+        state
+            .music_bots
+            .summon_save_mutex(server)
+            .try_lock()
+            .is_err(),
+        "dropping create leaves the cap write holding the save lock"
+    );
+    assert_eq!(
+        state.music_bots.supervisor.local_summon_cap(server),
+        Some(Some(4))
+    );
+    assert_eq!(
+        crate::repos::music_summon_cap::get(&state.db, server)
+            .await
+            .unwrap(),
+        stored_before,
+        "a dropped create must not leave the store behind while the write still holds the lock"
+    );
+    release
+        .send(())
+        .expect("the cap write is still waiting on the process read");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if state
+            .music_bots
+            .summon_save_mutex(server)
+            .try_lock()
+            .is_ok()
+        {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("the cap write did not finish after the process read succeeded");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    super::summon::clear_cap_save_fault(server);
+    assert_store_matches_process(state, server).await;
+}
+
+#[tokio::test]
+async fn a_dropped_create_stores_the_cap_the_process_already_holds() {
+    let (app, token, state) = make_test_app().await;
+    let server = "127.0.0.1:9963";
+    assert_eq!(
+        put_summon_cap(&app, &token, server, 1).await.status(),
+        StatusCode::OK
+    );
+    state
+        .music_bots
+        .supervisor
+        .set_summon_cap(server, 4)
+        .await
+        .unwrap();
+    drop_create_while_the_cap_write_is_in_progress(&app, &token, &state, server, Some(1)).await;
+    assert_eq!(
+        state.music_bots.supervisor.local_summon_armed(server),
+        Some(true)
+    );
+    assert_eq!(
+        state.music_bots.supervisor.local_quiet_count(server),
+        Some(4)
+    );
+}
+
+#[tokio::test]
+async fn a_dropped_create_stores_a_held_cap_when_the_store_was_empty() {
+    let (app, token, state) = make_test_app().await;
+    let server = "127.0.0.1:9964";
+    state
+        .music_bots
+        .supervisor
+        .set_summon_cap(server, 4)
+        .await
+        .unwrap();
+    drop_create_while_the_cap_write_is_in_progress(&app, &token, &state, server, None).await;
+    assert_eq!(
+        state.music_bots.supervisor.local_summon_armed(server),
+        Some(true)
+    );
+    assert_eq!(
+        state.music_bots.supervisor.local_quiet_count(server),
+        Some(4)
+    );
+}

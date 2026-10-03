@@ -639,6 +639,89 @@ pub(super) async fn store_held_cap(state: &AppState, server: &str) {
     store_accepted(&state.db, server, cap).await;
 }
 
+/// The per-server save lock around a saved-bot push.
+///
+/// `finish` writes the number the process holds. That write runs on its
+/// own task, so dropping the create handler while it is in progress does
+/// not release the lock or skip the write. A process with no number
+/// leaves the store unchanged.
+pub(super) struct PushCapGuard {
+    state: AppState,
+    server: String,
+    mutex: Option<std::sync::Arc<tokio::sync::Mutex<()>>>,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    settled: bool,
+    /// The write task already owns the guard. Drop must not start another.
+    handed_off: bool,
+}
+
+impl PushCapGuard {
+    pub(super) async fn acquire(state: &AppState, server: &str) -> Self {
+        let mutex = state.music_bots.summon_save_mutex(server);
+        let guard = mutex.clone().lock_owned().await;
+        Self {
+            state: state.clone(),
+            server: server.to_string(),
+            mutex: Some(mutex),
+            guard: Some(guard),
+            settled: false,
+            handed_off: false,
+        }
+    }
+
+    /// Read the process and store a held number. Returns only after that
+    /// finishes. The lock stays with the write if this guard is dropped
+    /// while the write is still running.
+    pub(super) async fn finish(&mut self) {
+        if self.settled || self.handed_off {
+            return;
+        }
+        // Set before the guard moves. Drop then leaves this task in
+        // charge of the lock instead of starting a second write.
+        self.handed_off = true;
+        let Some(mutex) = self.mutex.clone() else {
+            self.settled = true;
+            return;
+        };
+        let guard = self.guard.take();
+        let state = self.state.clone();
+        let server = self.server.clone();
+        let handle = tokio::spawn(async move {
+            let _guard = match guard {
+                Some(held) => held,
+                None => mutex.lock_owned().await,
+            };
+            store_held_cap(&state, &server).await;
+        });
+        if handle.await.is_ok() {
+            self.settled = true;
+        }
+    }
+}
+
+impl Drop for PushCapGuard {
+    fn drop(&mut self) {
+        if self.settled || self.handed_off {
+            return;
+        }
+        let Some(mutex) = self.mutex.take() else {
+            return;
+        };
+        let guard = self.guard.take();
+        let state = self.state.clone();
+        let server = std::mem::take(&mut self.server);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _guard = match guard {
+                    Some(held) => held,
+                    None => mutex.lock_owned().await,
+                };
+                store_held_cap(&state, &server).await;
+            });
+        }
+    }
+}
+
 /// Fail the next `upserts` store writes and the next `restores` restore
 /// attempts for `server`. Other servers are left alone.
 #[cfg(test)]
