@@ -10,6 +10,7 @@
 //! outside the layout because the spec puts it on its own surface.
 
 mod header;
+mod nav_drawer;
 mod servers_context;
 mod sidebar;
 
@@ -28,6 +29,8 @@ use crate::ui::components::{
     WsReconnectBanner,
 };
 use crate::ui::routes::Route;
+
+use nav_drawer::NavDrawer;
 
 /// Pull the current location path from the SPA URL. On the server (SSR)
 /// the navigator's serialised representation is used directly. The
@@ -101,6 +104,10 @@ pub fn AppShell() -> Element {
     // so the hook order is stable across renders — for anon sessions
     // the fetch errors out harmlessly before the chrome bounces to /login.
     let _servers = mount_servers_context();
+    // Phone drawer state. Mounted before the anon return for the same
+    // reason: Header and Sidebar read it, and the hook order must not
+    // change when the session flips from anonymous to authenticated.
+    let drawer = NavDrawer::provide();
 
     if !is_authed {
         return rsx! { "" };
@@ -114,8 +121,20 @@ pub fn AppShell() -> Element {
         state.user().map(|u| u.role == "admin").unwrap_or(false)
     };
 
+    let nav_open = drawer.is_open();
+    // `.is-nav-open` is a no-op above 768px. The narrow breakpoint in
+    // `components.css` is what turns the sidebar into a drawer.
+    let app_class = if nav_open { "app is-nav-open" } else { "app" };
+
     rsx! {
-        div { class: "app",
+        div {
+            class: "{app_class}",
+            onkeydown: move |evt: KeyboardEvent| {
+                if evt.key() == Key::Escape && drawer.is_open() {
+                    evt.prevent_default();
+                    drawer.close_from_escape();
+                }
+            },
             // Skip-to-nav link is the first focusable element. Visually
             // hidden until focused (via `.skip-link` in `layout.css`); on
             // activation, browser focus jumps to the sidebar `<nav>` so a
@@ -127,6 +146,16 @@ pub fn AppShell() -> Element {
                 "Skip to navigation"
             }
             Sidebar { active: route.clone(), is_admin }
+            if nav_open {
+                // Covers the page, including the header, so a tap outside
+                // the drawer dismisses it. The menu button sits above this
+                // layer (see `.app.is-nav-open .hamburger`).
+                div {
+                    class: "nav-backdrop",
+                    "aria-hidden": "true",
+                    onclick: move |_| drawer.close(),
+                }
+            }
             Header {}
             div { class: "mobile-selector-bar",
                 ServerSelector { variant: ServerSelectorVariant::Mobile }

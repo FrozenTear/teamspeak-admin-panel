@@ -9,6 +9,8 @@ use dioxus::prelude::*;
 
 use crate::ui::routes::Route;
 
+use super::nav_drawer::NavDrawer;
+
 /// `id` of the sidebar `<nav>` landmark. Shared so the AppShell's
 /// skip-to-navigation link can target it via `href="#primary-nav"` and the
 /// id stays in lock-step if it ever gets renamed.
@@ -74,10 +76,16 @@ pub fn NavItem(props: NavItemProps) -> Element {
     // `dioxus-router-0.7.7/src/components/link.rs:194`. Don't pass an
     // explicit `aria-current`; it would render the attribute twice and
     // confuse screen readers.
+    let drawer = try_consume_context::<NavDrawer>();
     rsx! {
         Link {
             to: props.to.clone(),
             class: "{class}",
+            onclick: move |_| {
+                if let Some(drawer) = drawer {
+                    drawer.close_for_navigation();
+                }
+            },
             span { class: "icn", "{props.icon}" }
             "{props.label}"
         }
@@ -187,6 +195,7 @@ pub fn Sidebar(props: SidebarProps) -> Element {
             | Route::FlowDetailPage { .. }
             | Route::FlowEditPage { .. }
     );
+    let drawer = try_consume_context::<NavDrawer>();
     rsx! {
         aside { class: "sidebar",
             // Brand sits OUTSIDE `<nav aria-label="Primary">` so the
@@ -196,7 +205,14 @@ pub fn Sidebar(props: SidebarProps) -> Element {
             // `aria-current="page"` only ever fires on at most one element
             // at a time — the brand on `/`, the Dashboard NavItem on
             // `/dashboard`, and never both (PURA-37).
-            Link { to: Route::Home {}, class: "brand",
+            Link {
+                to: Route::Home {},
+                class: "brand",
+                onclick: move |_| {
+                    if let Some(drawer) = drawer {
+                        drawer.close_for_navigation();
+                    }
+                },
                 span { class: "mark" }
                 "TS6 Manager"
             }

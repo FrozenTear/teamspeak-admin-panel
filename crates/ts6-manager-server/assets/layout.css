@@ -133,8 +133,9 @@
 .app .mobile-selector-bar {
   display: none;
 }
-/* Hamburger lives in the header for slot order but is desktop-hidden;
- * it flips on at the same breakpoint that collapses the sidebar. */
+/* Hamburger lives in the header for slot order but is desktop-hidden.
+ * It flips on at the same breakpoint that hides the sidebar, and it
+ * toggles `.app.is-nav-open` so that sidebar opens as a drawer. */
 .app .hamburger {
   display: none;
 }
