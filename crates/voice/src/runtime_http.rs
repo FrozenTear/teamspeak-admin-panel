@@ -41,7 +41,7 @@ use crate::config::BotId;
 use crate::runtime_api::{
     BugReportContextResponse, EncodeHeadroom, HealthResponse, ListResponse, MutateOp, SendLead,
     SendRequest, SettingsRequest, SpawnRequest, SpawnResponse, StoreOp, SummonCapBody,
-    SummonHeardBody, WireError, store_err_to_wire,
+    SummonHeardBody, SummonHomeBody, WireError, store_err_to_wire,
 };
 use crate::store::{LibraryEntryId, PlaylistName, StoreError, TrackId};
 use crate::supervisor::BotSupervisor;
@@ -297,6 +297,7 @@ pub fn router_with_auth(state: RuntimeState, auth: ControlAuth) -> Router {
     let mut app = Router::new()
         .route("/v1/bots", get(list_bots).post(spawn_bot))
         .route("/v1/summon-cap", get(get_summon_cap).put(put_summon_cap))
+        .route("/v1/summon-home", get(get_summon_home).put(put_summon_home))
         .route("/v1/summon-heard", post(post_summon_heard))
         .route("/v1/bots/{id}", delete(shutdown_bot))
         .route("/v1/bots/{id}/command", post(send_command))
@@ -392,6 +393,7 @@ async fn spawn_bot(
     Json(req): Json<SpawnRequest>,
 ) -> Result<Json<SpawnResponse>, Response> {
     let summon_cap = req.summon_cap;
+    let summon_home = req.summon_home;
     let server_addr = req.config.server_addr.clone();
     let identity = req.config.identity_path.clone();
     let id = if let Some(id) = req.id {
@@ -417,6 +419,12 @@ async fn spawn_bot(
     state
         .supervisor
         .note_summon_push(&server_addr, id.0, summon_cap, &identity);
+    if let Some(home) = summon_home
+        && let Err(err) = state.supervisor.set_summon_home(&server_addr, Some(home))
+    {
+        // The saved bot is up. A bad home on the push does not undo it.
+        tracing::warn!(server = %server_addr, home, error = %err, "summon home on a push was refused");
+    }
     Ok(Json(SpawnResponse { id }))
 }
 
@@ -449,8 +457,34 @@ async fn put_summon_cap(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// A channel summon the panel's server-query subscription already has.
-/// The quiet client's own client list is the channel source. No lookup.
+/// The home channel the music process holds for one server. `channelId:
+/// null` is a server with none picked.
+async fn get_summon_home(
+    State(state): State<RuntimeState>,
+    Query(query): Query<SummonCapQuery>,
+) -> Json<SummonHomeBody> {
+    let server_addr = crate::canon_server_addr(&query.server_addr);
+    let channel_id = state.supervisor.summon().home(&server_addr);
+    Json(SummonHomeBody {
+        server_addr,
+        channel_id,
+    })
+}
+
+async fn put_summon_home(
+    State(state): State<RuntimeState>,
+    Json(req): Json<SummonHomeBody>,
+) -> Result<StatusCode, Response> {
+    state
+        .supervisor
+        .set_summon_home(&req.server_addr, req.channel_id)
+        .map_err(|err| status_err(StatusCode::BAD_REQUEST, &err))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// A channel or server-chat summon the panel's server-query subscription
+/// already has. The summon client's own client list is the channel
+/// source. No lookup.
 async fn post_summon_heard(
     State(state): State<RuntimeState>,
     Json(req): Json<SummonHeardBody>,
@@ -898,6 +932,7 @@ mod tests {
                             config: cfg,
                             id: None,
                             summon_cap: None,
+                            summon_home: None,
                         })
                         .unwrap(),
                     ))
@@ -1180,6 +1215,7 @@ mod tests {
                             config: cfg,
                             id: None,
                             summon_cap: None,
+                            summon_home: None,
                         })
                         .unwrap(),
                     ))
@@ -1586,6 +1622,7 @@ mod tests {
             .with_auto_connect(false),
             id: None,
             summon_cap: cap,
+            summon_home: None,
         }
     }
 
@@ -1625,7 +1662,7 @@ mod tests {
         .await;
         assert_eq!(bare.status(), StatusCode::OK);
         assert!(!supervisor.summon().armed(server));
-        assert_eq!(supervisor.summon().quiet_count(server), 0);
+        assert_eq!(supervisor.summon().limit(server), 0);
         assert_eq!(supervisor.summon().cap(server), None);
 
         let armed = send_json(
@@ -1637,8 +1674,10 @@ mod tests {
         .await;
         assert_eq!(armed.status(), StatusCode::OK);
         assert!(supervisor.summon().armed(server));
-        assert_eq!(supervisor.summon().quiet_count(server), 2);
+        assert_eq!(supervisor.summon().limit(server), 2);
         assert_eq!(supervisor.summon().cap(server), Some(2));
+        // Arming starts nobody. A summon client exists only for a request.
+        assert_eq!(supervisor.summon().quiet_count(server), 0);
 
         let again = send_json(
             &app,
@@ -1648,24 +1687,14 @@ mod tests {
         )
         .await;
         assert_eq!(again.status(), StatusCode::OK);
-        assert_eq!(supervisor.summon().quiet_count(server), 2);
         assert_eq!(supervisor.summon().cap(server), Some(2));
 
         let elsewhere =
             send_json(&app, "POST", "/v1/bots", &summon_spawn("else", other, None)).await;
         assert_eq!(elsewhere.status(), StatusCode::OK);
-        assert_eq!(supervisor.summon().quiet_count(other), 0);
+        assert_eq!(supervisor.summon().limit(other), 0);
         assert_eq!(supervisor.summon().cap(other), None);
-        assert_eq!(supervisor.summon().quiet_count(server), 2);
-
-        let paths = supervisor.summon().identity_paths(server);
-        assert_eq!(paths.len(), 2);
-        assert_ne!(paths[0], paths[1]);
-        for path in &paths {
-            let name = path.file_name().and_then(|name| name.to_str()).unwrap();
-            assert!(name.starts_with("quiet-"), "{name}");
-            assert!(!name.starts_with("bot-"), "{name}");
-        }
+        assert_eq!(supervisor.summon().limit(server), 2);
 
         let listed = app
             .oneshot(
@@ -1678,6 +1707,78 @@ mod tests {
             .unwrap();
         let listed: ListResponse = json(listed).await;
         assert_eq!(listed.bots.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_heard_summon_starts_a_temporary_client_per_caller_even_on_cap_one() {
+        let state = RuntimeState::new();
+        let supervisor = Arc::clone(&state.supervisor);
+        let app = router(state);
+        let server = "10.5.0.1:9987";
+
+        let spawned = send_json(
+            &app,
+            "POST",
+            "/v1/bots",
+            &summon_spawn("desk", server, Some(1)),
+        )
+        .await;
+        assert_eq!(spawned.status(), StatusCode::OK);
+
+        for (caller, text) in [
+            (21_u16, "!play https://cdn.example/one.mp3"),
+            (22, "!radio https://radio.example/live"),
+            (23, "!np"),
+        ] {
+            let heard = send_json(
+                &app,
+                "POST",
+                "/v1/summon-heard",
+                &SummonHeardBody {
+                    server_host: "10.5.0.1".into(),
+                    invoker_id: caller,
+                    text: text.into(),
+                },
+            )
+            .await;
+            assert_eq!(heard.status(), StatusCode::NO_CONTENT);
+        }
+        // Two people, two temporary clients. `!np` is not a summon.
+        assert_eq!(supervisor.summon().quiet_count(server), 2);
+        let paths = supervisor.summon().identity_paths(server);
+        assert_eq!(paths.len(), 2);
+        assert_ne!(paths[0], paths[1]);
+        for path in &paths {
+            let name = path.file_name().and_then(|name| name.to_str()).unwrap();
+            assert!(name.starts_with("summon-"), "{name}");
+            assert!(!name.starts_with("bot-"), "{name}");
+        }
+
+        let empty_host = send_json(
+            &app,
+            "POST",
+            "/v1/summon-heard",
+            &SummonHeardBody {
+                server_host: "  ".into(),
+                invoker_id: 24,
+                text: "!play x".into(),
+            },
+        )
+        .await;
+        assert_eq!(empty_host.status(), StatusCode::BAD_REQUEST);
+
+        // Summon clients are not saved bots.
+        let listed = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/bots")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let listed: ListResponse = json(listed).await;
+        assert_eq!(listed.bots.len(), 1);
     }
 
     #[tokio::test]
@@ -1699,7 +1800,7 @@ mod tests {
         .await;
         assert_eq!(early.status(), StatusCode::NO_CONTENT);
         assert_eq!(supervisor.summon().cap(server), Some(3));
-        assert_eq!(supervisor.summon().quiet_count(server), 0);
+        assert_eq!(supervisor.summon().limit(server), 0);
         assert!(!supervisor.summon().armed(server));
 
         // A push that carries no number keeps the cap this PUT already
@@ -1714,7 +1815,7 @@ mod tests {
         assert_eq!(bare.status(), StatusCode::OK);
         assert!(supervisor.summon().armed(server));
         assert_eq!(supervisor.summon().cap(server), Some(3));
-        assert_eq!(supervisor.summon().quiet_count(server), 3);
+        assert_eq!(supervisor.summon().limit(server), 3);
 
         let accepted = send_json(
             &app,
@@ -1728,7 +1829,7 @@ mod tests {
         .await;
         assert_eq!(accepted.status(), StatusCode::NO_CONTENT);
         assert!(supervisor.summon().armed(server));
-        assert_eq!(supervisor.summon().quiet_count(server), 2);
+        assert_eq!(supervisor.summon().limit(server), 2);
         assert_eq!(supervisor.summon().cap(server), Some(2));
 
         for cap in [65_u32, 1000] {
@@ -1744,7 +1845,7 @@ mod tests {
             .await;
             assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "cap {cap}");
             assert_eq!(supervisor.summon().cap(server), Some(2));
-            assert_eq!(supervisor.summon().quiet_count(server), 2);
+            assert_eq!(supervisor.summon().limit(server), 2);
         }
 
         let listed = app
@@ -1758,6 +1859,93 @@ mod tests {
             .unwrap();
         let listed: ListResponse = json(listed).await;
         assert_eq!(listed.bots.len(), 1);
+    }
+
+    async fn read_summon_home(app: &Router, server: &str) -> SummonHomeBody {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/summon-home?serverAddr={server}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        json(resp).await
+    }
+
+    #[tokio::test]
+    async fn summon_home_is_held_per_server_and_rides_on_a_push() {
+        let state = RuntimeState::new();
+        let supervisor = Arc::clone(&state.supervisor);
+        let app = router(state);
+        let server = "10.4.0.1:9987";
+        let other = "10.4.0.1:9988";
+
+        // Nothing picked is null, not a channel the process made up.
+        let none = read_summon_home(&app, server).await;
+        assert_eq!(none.server_addr, server);
+        assert_eq!(none.channel_id, None);
+
+        let set = send_json(
+            &app,
+            "PUT",
+            "/v1/summon-home",
+            &SummonHomeBody {
+                server_addr: "10.4.0.1".into(),
+                channel_id: Some(12),
+            },
+        )
+        .await;
+        assert_eq!(set.status(), StatusCode::NO_CONTENT);
+        assert_eq!(read_summon_home(&app, server).await.channel_id, Some(12));
+        assert_eq!(read_summon_home(&app, other).await.channel_id, None);
+
+        let zero = send_json(
+            &app,
+            "PUT",
+            "/v1/summon-home",
+            &SummonHomeBody {
+                server_addr: server.into(),
+                channel_id: Some(0),
+            },
+        )
+        .await;
+        assert_eq!(zero.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(supervisor.summon().home(server), Some(12));
+
+        // A push without a home keeps the one held. A push with one
+        // sets it.
+        let bare = send_json(
+            &app,
+            "POST",
+            "/v1/bots",
+            &summon_spawn("bare", server, None),
+        )
+        .await;
+        assert_eq!(bare.status(), StatusCode::OK);
+        assert_eq!(supervisor.summon().home(server), Some(12));
+        let mut carrying = summon_spawn("carrying", other, Some(1));
+        carrying.summon_home = Some(30);
+        let pushed = send_json(&app, "POST", "/v1/bots", &carrying).await;
+        assert_eq!(pushed.status(), StatusCode::OK);
+        assert_eq!(supervisor.summon().home(other), Some(30));
+        assert_eq!(supervisor.summon().home(server), Some(12));
+
+        let cleared = send_json(
+            &app,
+            "PUT",
+            "/v1/summon-home",
+            &SummonHomeBody {
+                server_addr: server.into(),
+                channel_id: None,
+            },
+        )
+        .await;
+        assert_eq!(cleared.status(), StatusCode::NO_CONTENT);
+        assert_eq!(read_summon_home(&app, server).await.channel_id, None);
     }
 
     #[tokio::test]
@@ -1787,7 +1975,7 @@ mod tests {
         )
         .await;
         assert_eq!(accepted.status(), StatusCode::NO_CONTENT);
-        assert_eq!(supervisor.summon().quiet_count(server), 2);
+        assert_eq!(supervisor.summon().limit(server), 2);
         assert!(supervisor.summon().armed(server));
 
         let cleared = send_json(
@@ -1803,7 +1991,7 @@ mod tests {
         assert_eq!(cleared.status(), StatusCode::NO_CONTENT);
         assert_eq!(supervisor.summon().cap(server), None);
         assert!(!supervisor.summon().armed(server));
-        assert_eq!(supervisor.summon().quiet_count(server), 0);
+        assert_eq!(supervisor.summon().limit(server), 0);
 
         let later = send_json(
             &app,
@@ -1814,7 +2002,7 @@ mod tests {
         .await;
         assert_eq!(later.status(), StatusCode::OK);
         assert!(!supervisor.summon().armed(server));
-        assert_eq!(supervisor.summon().quiet_count(server), 0);
+        assert_eq!(supervisor.summon().limit(server), 0);
         assert_eq!(supervisor.summon().cap(server), None);
     }
 }

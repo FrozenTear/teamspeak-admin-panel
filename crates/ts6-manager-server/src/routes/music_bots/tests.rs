@@ -2448,9 +2448,9 @@ async fn summon_cap_is_empty_until_stored() {
         state
             .music_bots
             .supervisor
-            .local_quiet_count("127.0.0.1:9987"),
+            .local_summon_limit("127.0.0.1:9987"),
         Some(0),
-        "a stored cap starts no quiet client until a saved bot is known"
+        "a stored cap arms nothing until a saved bot is known"
     );
     assert_eq!(created.status(), StatusCode::OK);
     let stored: wire::SummonCap = read_json(created).await;
@@ -2489,7 +2489,7 @@ async fn saved_bots_share_one_pool_and_do_not_write_the_cap() {
         state
             .music_bots
             .supervisor
-            .local_quiet_count("127.0.0.1:9987"),
+            .local_summon_limit("127.0.0.1:9987"),
         Some(0)
     );
 
@@ -2499,8 +2499,8 @@ async fn saved_bots_share_one_pool_and_do_not_write_the_cap() {
         state
             .music_bots
             .supervisor
-            .local_quiet_count("127.0.0.1:9987"),
-        Some(1),
+            .local_summon_limit("127.0.0.1:9987"),
+        Some(2),
         "a known saved bot is enough to arm the cap"
     );
 
@@ -2550,14 +2550,14 @@ async fn saved_bots_share_one_pool_and_do_not_write_the_cap() {
         state
             .music_bots
             .supervisor
-            .local_quiet_count("127.0.0.1:9987"),
-        Some(1)
+            .local_summon_limit("127.0.0.1:9987"),
+        Some(2)
     );
     assert_eq!(
         state
             .music_bots
             .supervisor
-            .local_quiet_count("127.0.0.1:9988"),
+            .local_summon_limit("127.0.0.1:9988"),
         Some(0)
     );
     let caps = get_summon_caps(&app, &token).await;
@@ -2584,13 +2584,18 @@ async fn saved_bots_share_one_pool_and_do_not_write_the_cap() {
         .await
         .unwrap();
     assert_eq!(rows.len(), 3);
-    assert!(rows.iter().all(|row| !row.identityPath.contains("quiet-")));
+    assert!(rows.iter().all(|row| {
+        !row.identityPath.contains("quiet-identities") && !row.identityPath.contains("summon-")
+    }));
 
     let fresh = crate::music_runtime::MusicBotFront::local(std::sync::Arc::new(
         music_bot::BotSupervisor::new(),
     ));
     for row in &rows {
         let cap = crate::repos::music_summon_cap::get(&state.db, &row.serverAddr)
+            .await
+            .unwrap();
+        let home = crate::repos::music_summon_cap::get_home(&state.db, &row.serverAddr)
             .await
             .unwrap();
         fresh
@@ -2605,17 +2610,18 @@ async fn saved_bots_share_one_pool_and_do_not_write_the_cap() {
                 state.yt_cookie.clone(),
                 state.yt_api_key.clone(),
                 cap,
+                home,
             )
             .await
             .unwrap();
     }
     assert_eq!(fresh.list().await.unwrap().len(), 3);
-    assert_eq!(fresh.local_quiet_count("127.0.0.1:9987"), Some(1));
-    assert_eq!(fresh.local_quiet_count("127.0.0.1:9988"), Some(0));
+    assert_eq!(fresh.local_summon_limit("127.0.0.1:9987"), Some(2));
+    assert_eq!(fresh.local_summon_limit("127.0.0.1:9988"), Some(0));
 }
 
 #[tokio::test]
-async fn connect_disconnect_and_dropping_a_quiet_client_leave_the_saved_bot() {
+async fn connect_disconnect_and_dropping_a_summon_client_leave_the_saved_bot() {
     let (app, token, state) = make_test_app().await;
     let created = create_test_bot(&app, &token).await;
     assert_eq!(
@@ -2624,6 +2630,18 @@ async fn connect_disconnect_and_dropping_a_quiet_client_leave_the_saved_bot() {
             .status(),
         StatusCode::OK
     );
+    assert_eq!(
+        state
+            .music_bots
+            .supervisor
+            .local_summon_limit("127.0.0.1:9987"),
+        Some(2)
+    );
+    state
+        .music_bots
+        .supervisor
+        .local_hear_crossing("127.0.0.1:9987", 40, "!play https://cdn.example/one.mp3")
+        .unwrap();
     assert_eq!(
         state
             .music_bots
@@ -2658,25 +2676,26 @@ async fn connect_disconnect_and_dropping_a_quiet_client_leave_the_saved_bot() {
         .await
         .unwrap();
     assert_eq!(disconnect.status(), StatusCode::ACCEPTED);
+    // Connect and Disconnect on the saved bot neither start nor stop a
+    // summon client, and leave summon armed.
     assert_eq!(
         state
             .music_bots
             .supervisor
-            .local_quiet_count("127.0.0.1:9987"),
-        Some(1)
+            .local_summon_limit("127.0.0.1:9987"),
+        Some(2)
     );
-
-    let slots = state
+    let summons = state
         .music_bots
         .supervisor
-        .local_slot_ids("127.0.0.1:9987")
+        .local_summon_ids("127.0.0.1:9987")
         .unwrap();
-    assert_eq!(slots.len(), 1);
+    assert_eq!(summons.len(), 1);
     assert!(
         state
             .music_bots
             .supervisor
-            .local_drop_quiet("127.0.0.1:9987", slots[0])
+            .local_drop_summon("127.0.0.1:9987", summons[0])
             .unwrap()
     );
     assert_eq!(
@@ -2685,6 +2704,13 @@ async fn connect_disconnect_and_dropping_a_quiet_client_leave_the_saved_bot() {
             .supervisor
             .local_quiet_count("127.0.0.1:9987"),
         Some(0)
+    );
+    assert_eq!(
+        state
+            .music_bots
+            .supervisor
+            .local_summon_limit("127.0.0.1:9987"),
+        Some(2)
     );
 
     let detail = app
@@ -2723,7 +2749,7 @@ async fn a_later_bot_push_carries_only_that_servers_stored_cap() {
         state
             .music_bots
             .supervisor
-            .local_quiet_count("127.0.0.1:9987"),
+            .local_summon_limit("127.0.0.1:9987"),
         Some(0)
     );
     let _created = create_test_bot(&app, &token).await;
@@ -2731,7 +2757,7 @@ async fn a_later_bot_push_carries_only_that_servers_stored_cap() {
         state
             .music_bots
             .supervisor
-            .local_quiet_count("127.0.0.1:9987"),
+            .local_summon_limit("127.0.0.1:9987"),
         Some(2)
     );
     let _second = create_test_bot(&app, &token).await;
@@ -2739,7 +2765,7 @@ async fn a_later_bot_push_carries_only_that_servers_stored_cap() {
         state
             .music_bots
             .supervisor
-            .local_quiet_count("127.0.0.1:9987"),
+            .local_summon_limit("127.0.0.1:9987"),
         Some(2)
     );
     assert_eq!(
@@ -2765,8 +2791,8 @@ async fn a_failed_store_rolls_the_music_process_back_to_the_stored_cap() {
         state
             .music_bots
             .supervisor
-            .local_quiet_count("127.0.0.1:9987"),
-        Some(1)
+            .local_summon_limit("127.0.0.1:9987"),
+        Some(2)
     );
 
     state
@@ -2791,8 +2817,8 @@ async fn a_failed_store_rolls_the_music_process_back_to_the_stored_cap() {
         state
             .music_bots
             .supervisor
-            .local_quiet_count("127.0.0.1:9987"),
-        Some(1)
+            .local_summon_limit("127.0.0.1:9987"),
+        Some(2)
     );
     assert_eq!(
         state
@@ -2852,7 +2878,7 @@ async fn a_failed_first_store_clears_the_number_the_process_accepted() {
         state
             .music_bots
             .supervisor
-            .local_quiet_count("127.0.0.1:9987"),
+            .local_summon_limit("127.0.0.1:9987"),
         Some(0)
     );
     assert!(get_summon_caps(&app, &token).await.caps.is_empty());
@@ -2870,7 +2896,7 @@ async fn a_failed_first_store_clears_the_number_the_process_accepted() {
         state
             .music_bots
             .supervisor
-            .local_quiet_count("127.0.0.1:9987"),
+            .local_summon_limit("127.0.0.1:9987"),
         Some(0)
     );
     assert_eq!(
@@ -2916,7 +2942,7 @@ async fn caps_the_caller_cannot_see_are_omitted() {
 }
 
 #[tokio::test]
-async fn deleting_the_last_saved_bot_stops_quiet_clients_and_the_cap_stays_settable() {
+async fn deleting_the_last_saved_bot_stops_summon_clients_and_the_cap_stays_settable() {
     let (app, token, state) = make_test_app().await;
     let created = create_test_bot(&app, &token).await;
     assert_eq!(
@@ -2925,6 +2951,18 @@ async fn deleting_the_last_saved_bot_stops_quiet_clients_and_the_cap_stays_setta
             .status(),
         StatusCode::OK
     );
+    assert_eq!(
+        state
+            .music_bots
+            .supervisor
+            .local_summon_limit("127.0.0.1:9987"),
+        Some(2)
+    );
+    state
+        .music_bots
+        .supervisor
+        .local_hear_crossing("127.0.0.1:9987", 41, "!play https://cdn.example/one.mp3")
+        .unwrap();
     assert_eq!(
         state
             .music_bots
@@ -2946,6 +2984,13 @@ async fn deleting_the_last_saved_bot_stops_quiet_clients_and_the_cap_stays_setta
         .await
         .unwrap();
     assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        state
+            .music_bots
+            .supervisor
+            .local_summon_limit("127.0.0.1:9987"),
+        Some(0)
+    );
     assert_eq!(
         state
             .music_bots
@@ -2978,7 +3023,7 @@ async fn deleting_the_last_saved_bot_stops_quiet_clients_and_the_cap_stays_setta
         state
             .music_bots
             .supervisor
-            .local_quiet_count("127.0.0.1:9987"),
+            .local_summon_limit("127.0.0.1:9987"),
         Some(0)
     );
 }
@@ -3005,8 +3050,8 @@ async fn two_saves_at_once_leave_the_process_on_the_stored_number() {
         state
             .music_bots
             .supervisor
-            .local_quiet_count("127.0.0.1:9987"),
-        Some(cap as usize)
+            .local_summon_limit("127.0.0.1:9987"),
+        Some(music_bot::parallel_limit(Some(cap)))
     );
 }
 
@@ -3044,7 +3089,7 @@ async fn a_dropped_save_stays_on_the_number_the_other_save_stores() {
         state
             .music_bots
             .supervisor
-            .local_quiet_count("127.0.0.1:9987"),
+            .local_summon_limit("127.0.0.1:9987"),
         Some(2)
     );
 }
@@ -3078,8 +3123,8 @@ async fn a_failed_first_save_does_not_clear_the_other_saves_number() {
         state
             .music_bots
             .supervisor
-            .local_quiet_count("127.0.0.1:9987"),
-        Some(1)
+            .local_summon_limit("127.0.0.1:9987"),
+        Some(2)
     );
 }
 
@@ -3813,7 +3858,7 @@ async fn a_bot_create_does_not_overwrite_a_cap_the_process_already_accepted() {
         .await
         .unwrap();
     assert_eq!(
-        state.music_bots.supervisor.local_quiet_count(server),
+        state.music_bots.supervisor.local_summon_limit(server),
         Some(0)
     );
     let created = create_bot_on(&app, &token, server).await;
@@ -3837,7 +3882,7 @@ async fn a_bot_create_does_not_overwrite_a_cap_the_process_already_accepted() {
         Some(true)
     );
     assert_eq!(
-        state.music_bots.supervisor.local_quiet_count(server),
+        state.music_bots.supervisor.local_summon_limit(server),
         Some(4)
     );
 }
@@ -3869,7 +3914,7 @@ async fn a_bot_create_without_a_stored_cap_arms_the_number_the_process_holds() {
         Some(true)
     );
     assert_eq!(
-        state.music_bots.supervisor.local_quiet_count(server),
+        state.music_bots.supervisor.local_summon_limit(server),
         Some(4)
     );
 }
@@ -3915,7 +3960,7 @@ async fn a_push_error_stores_the_cap_the_process_already_holds() {
         Some(true)
     );
     assert_eq!(
-        state.music_bots.supervisor.local_quiet_count(server),
+        state.music_bots.supervisor.local_summon_limit(server),
         Some(4)
     );
 }
@@ -3944,7 +3989,7 @@ async fn a_push_error_stores_a_held_cap_when_the_store_was_empty() {
         Some(true)
     );
     assert_eq!(
-        state.music_bots.supervisor.local_quiet_count(server),
+        state.music_bots.supervisor.local_summon_limit(server),
         Some(4)
     );
 }
@@ -4036,7 +4081,7 @@ async fn a_dropped_create_stores_the_cap_the_process_already_holds() {
         Some(true)
     );
     assert_eq!(
-        state.music_bots.supervisor.local_quiet_count(server),
+        state.music_bots.supervisor.local_summon_limit(server),
         Some(4)
     );
 }
@@ -4057,7 +4102,298 @@ async fn a_dropped_create_stores_a_held_cap_when_the_store_was_empty() {
         Some(true)
     );
     assert_eq!(
-        state.music_bots.supervisor.local_quiet_count(server),
+        state.music_bots.supervisor.local_summon_limit(server),
         Some(4)
     );
+}
+
+async fn put_summon_home(
+    app: &Router,
+    token: &str,
+    server: &str,
+    channel_id: Option<u64>,
+) -> axum::http::Response<Body> {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/api/music-summon-homes")
+                .header("authorization", auth_header(token))
+                .header("content-type", "application/json")
+                .body(json_body(&wire::SummonHome {
+                    server_addr: server.into(),
+                    channel_id,
+                }))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+async fn process_home(state: &AppState, server: &str) -> Option<u64> {
+    state
+        .music_bots
+        .supervisor
+        .read_summon_home(server)
+        .await
+        .unwrap()
+}
+
+async fn stored_home(state: &AppState, server: &str) -> Option<u64> {
+    crate::repos::music_summon_cap::get_home(&state.db, server)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn summon_home_is_absent_until_picked_and_shares_the_cap_row() {
+    let (app, token, state) = make_test_app().await;
+    let server = "127.0.0.1:9941";
+    let listed = get_summon_caps(&app, &token).await;
+    assert!(listed.homes.is_empty(), "nothing picked is not a home");
+
+    let picked = put_summon_home(&app, &token, server, Some(12)).await;
+    assert_eq!(picked.status(), StatusCode::OK);
+    let picked: wire::SummonHome = read_json(picked).await;
+    assert_eq!(picked.channel_id, Some(12));
+    assert_eq!(process_home(&state, server).await, Some(12));
+    let listed = get_summon_caps(&app, &token).await;
+    assert_eq!(
+        listed.homes,
+        vec![wire::SummonHome {
+            server_addr: server.into(),
+            channel_id: Some(12),
+        }]
+    );
+    assert!(listed.caps.is_empty(), "a home does not invent a cap");
+
+    assert_eq!(
+        put_summon_cap(&app, &token, server, 1).await.status(),
+        StatusCode::OK
+    );
+    let listed = get_summon_caps(&app, &token).await;
+    assert_eq!(listed.caps.len(), 1);
+    assert_eq!(listed.caps[0].cap, 1);
+    assert_eq!(listed.homes.len(), 1);
+    assert_eq!(
+        crate::repos::music_summon_cap::list(&state.db)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let cleared = put_summon_home(&app, &token, server, None).await;
+    assert_eq!(cleared.status(), StatusCode::OK);
+    assert_eq!(process_home(&state, server).await, None);
+    let listed = get_summon_caps(&app, &token).await;
+    assert!(listed.homes.is_empty());
+    assert_eq!(listed.caps[0].cap, 1, "clearing the home keeps the cap");
+
+    for bad in [Some(0), Some(u64::MAX)] {
+        let refused = put_summon_home(&app, &token, server, bad).await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "{bad:?}");
+    }
+    let empty = put_summon_home(&app, &token, "   ", Some(12)).await;
+    assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(stored_home(&state, server).await, None);
+}
+
+#[tokio::test]
+async fn a_summon_home_save_needs_the_same_access_as_the_cap() {
+    let (app, _token, state) = make_test_app().await;
+    let server = "127.0.0.1:9942";
+    let viewer_id = seed_user_role(&state, "viewer-home", "viewer").await;
+    let viewer = mint_token_role(&state, viewer_id, "viewer-home", "viewer");
+    let refused = put_summon_home(&app, &viewer, server, Some(12)).await;
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    assert_eq!(process_home(&state, server).await, None);
+    assert_eq!(stored_home(&state, server).await, None);
+}
+
+#[tokio::test]
+async fn a_bot_push_carries_the_stored_home() {
+    let (app, token, state) = make_test_app().await;
+    let server = "127.0.0.1:9943";
+    crate::repos::music_summon_cap::upsert_home(&state.db, server, Some(21))
+        .await
+        .unwrap();
+    assert_eq!(process_home(&state, server).await, None);
+    let created = create_bot_on(&app, &token, server).await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    assert_eq!(process_home(&state, server).await, Some(21));
+}
+
+#[tokio::test]
+async fn a_failed_home_store_puts_the_process_back_on_the_stored_home() {
+    let (app, token, state) = make_test_app().await;
+    let server = "127.0.0.1:9944";
+    assert_eq!(
+        put_summon_home(&app, &token, server, Some(12))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    super::summon::arm_cap_save_fault(server, 1, 0);
+    let failed = put_summon_home(&app, &token, server, Some(30)).await;
+    super::summon::clear_cap_save_fault(server);
+    assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(process_home(&state, server).await, Some(12));
+    assert_eq!(stored_home(&state, server).await, Some(12));
+}
+
+#[tokio::test]
+async fn a_home_forward_error_is_settled_by_what_the_process_holds() {
+    let (app, token, state) = make_test_app().await;
+    let server = "127.0.0.1:9945";
+    // The process took it, then the reply failed: that home is stored.
+    super::summon::arm_forward_error_after_accept(server);
+    let landed = put_summon_home(&app, &token, server, Some(12)).await;
+    assert_eq!(landed.status(), StatusCode::OK);
+    assert_eq!(process_home(&state, server).await, Some(12));
+    assert_eq!(stored_home(&state, server).await, Some(12));
+
+    // The process never took it: both sides keep the old home.
+    super::summon::arm_forward_error_before_accept(server);
+    let lost = put_summon_home(&app, &token, server, Some(30)).await;
+    super::summon::clear_cap_save_fault(server);
+    assert!(lost.status().is_server_error(), "{}", lost.status());
+    assert_eq!(process_home(&state, server).await, Some(12));
+    assert_eq!(stored_home(&state, server).await, Some(12));
+}
+
+/// WebQuery stand-in for the home picker: two virtual servers, one per
+/// voice port, each with its own channels.
+async fn boot_home_picker_webquery(api_key: &'static str) -> u16 {
+    use axum::extract::Path as AxPath;
+    use axum::http::HeaderMap;
+    use axum::routing::get;
+    use serde_json::{Value, json};
+
+    fn reply(headers: &HeaderMap, api_key: &str, body: Value) -> axum::Json<Value> {
+        let ok = headers
+            .get("x-api-key")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value == api_key);
+        if !ok {
+            return axum::Json(json!({
+                "body": null,
+                "status": {"code": 1283, "message": "client_query_login_failed"},
+            }));
+        }
+        axum::Json(json!({ "body": body, "status": {"code": 0, "message": "ok"} }))
+    }
+
+    let app = Router::new()
+        .route(
+            "/serverlist",
+            get(move |headers: HeaderMap| async move {
+                reply(
+                    &headers,
+                    api_key,
+                    json!([
+                        { "virtualserver_id": "1", "virtualserver_name": "Main", "virtualserver_port": "9987" },
+                        { "virtualserver_id": "2", "virtualserver_name": "Side", "virtualserver_port": "9946" }
+                    ]),
+                )
+            }),
+        )
+        .route(
+            "/{sid}/{cmd}",
+            get(move |headers: HeaderMap, AxPath((sid, cmd)): AxPath<(i64, String)>| async move {
+                assert!(cmd.starts_with("channellist"), "{cmd}");
+                let body = if sid == 2 {
+                    json!([
+                        { "cid": "1", "pid": "0", "channel_order": "0", "channel_name": "Side lobby", "channel_flag_default": "1" },
+                        { "cid": "3", "pid": "0", "channel_order": "1", "channel_name": "Bot room" }
+                    ])
+                } else {
+                    json!([
+                        { "cid": "1", "pid": "0", "channel_order": "0", "channel_name": "Lobby", "channel_flag_default": "1" }
+                    ])
+                };
+                reply(&headers, api_key, body)
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    port
+}
+
+#[tokio::test]
+async fn the_home_picker_lists_the_channels_on_that_voice_port() {
+    let (app, token, state) = make_test_app().await;
+    let api_key = "home-picker-key";
+    let port = boot_home_picker_webquery(api_key).await;
+    let connection = server_connections::list(&state.db).await.unwrap().remove(0);
+    server_connections::patch(
+        &state.db,
+        connection.id,
+        server_connections::PatchServerConnection {
+            name: None,
+            host: None,
+            webquery_port: Some(i64::from(port)),
+            api_key: Some(crate::crypto::seal(api_key).unwrap()),
+            use_https: None,
+            ssh_port: None,
+            ssh_username: None,
+            ssh_password: None,
+            control_path: None,
+            ssh_auth_method: None,
+            ssh_host_key_fingerprint: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let get_channels = |server: &str| {
+        let app = app.clone();
+        let token = token.clone();
+        let uri = format!("/api/music-summon-homes/channels?serverAddr={server}");
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(uri)
+                    .header("authorization", auth_header(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    let side = get_channels("127.0.0.1:9946").await;
+    assert_eq!(side.status(), StatusCode::OK);
+    let side: wire::SummonHomeChannelList = read_json(side).await;
+    assert_eq!(side.server_addr, "127.0.0.1:9946");
+    assert_eq!(
+        side.channels,
+        vec![
+            wire::SummonHomeChannel {
+                channel_id: 1,
+                path: "Side lobby".into(),
+                is_default: true,
+            },
+            wire::SummonHomeChannel {
+                channel_id: 3,
+                path: "Bot room".into(),
+                is_default: false,
+            },
+        ]
+    );
+
+    let main: wire::SummonHomeChannelList = read_json(get_channels("127.0.0.1").await).await;
+    assert_eq!(main.server_addr, "127.0.0.1:9987");
+    assert_eq!(main.channels.len(), 1);
+    assert_eq!(main.channels[0].path, "Lobby");
+
+    let nowhere = get_channels("127.0.0.1:9999").await;
+    assert_eq!(nowhere.status(), StatusCode::BAD_REQUEST);
+    let unknown = get_channels("10.255.255.1:9987").await;
+    assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
 }

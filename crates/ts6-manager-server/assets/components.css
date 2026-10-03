@@ -903,6 +903,15 @@ a:hover {
 .summon-cap-editor .input {
   width: 5rem;
 }
+.summon-cap-editor select.input {
+  width: auto;
+  min-width: 12rem;
+  max-width: 24rem;
+}
+.summon-home-note {
+  margin: var(--space-2) 0 0;
+  font-size: var(--text-sm);
+}
 button.client-uid-copy {
   display: inline-block;
   padding: 0;

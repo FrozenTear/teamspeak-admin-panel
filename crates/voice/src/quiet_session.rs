@@ -1,302 +1,466 @@
-//! One quiet client's TeamSpeak connection.
+//! One summon client's TeamSpeak connection.
 //!
-//! The client connects in [`TECH_SUPPORT_CHANNEL`], then subscribes to
-//! every channel on this same connection (`Server::set_subscribed(true)`,
-//! which tsclientlib sends as `channelsubscribeall`). Moves are
-//! `clientmove` on that connection. Opus frames are handed to
-//! `send_audio` only while the director says the client is in the
-//! caller's channel with a song open.
+//! The client connects without asking for a channel, so it lands in the
+//! server's default channel. TeamSpeak 6 refuses the whole connection
+//! when the channel a client asks for at connect is full; a client that
+//! asks for nothing cannot be refused that way. It subscribes to every
+//! channel on this same connection (`Server::set_subscribed(true)`, which
+//! tsclientlib sends as `channelsubscribeall`), finds the caller on its
+//! own client list, and `clientmove`s there. It plays only once it is in
+//! the caller's channel.
+//!
+//! When it is not playing for anyone it goes to the home channel picked
+//! on the music page and waits there on the same connection. The next
+//! summon takes it from there. With no home picked it disconnects
+//! instead, so it never waits in a public channel.
 
-use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
-use tokio::sync::mpsc;
-use tracing::warn;
+use tokio::sync::{mpsc, watch};
+use tracing::{info, warn};
 use tsclientlib::prelude::*;
 use tsclientlib::{
-    ChannelId as TsChannelId, ClientId, Connection, DisconnectOptions, MessageHandle,
-    MessageTarget, Reason, StreamItem, events::Event as BookEvent,
+    ChannelId as TsChannelId, ClientId, ConnectOptions, Connection, DisconnectOptions, Identity,
+    MessageHandle, MessageTarget, Reason, StreamItem, TsError, events::Event as BookEvent,
 };
 
 use music_bot_audio::VolumeHandle;
 
 use crate::audio::{self, ActiveAudio, AudioMsg, SendTimingMonitor};
+use crate::chat::{ParsedCommand, parse as parse_chat};
 use crate::summon::{
-    ListedClient, LiveQuiet, QuietInstruction, SlotLaunch, SummonDirector, TECH_SUPPORT_CHANNEL,
-    cold_audio_source, mint_quiet_identity,
+    Heard, Homeward, ListedClient, LiveQuiet, Seat, SessionCmd, SlotLaunch, SummonDirector,
+    cold_audio_source, discard_quiet_identity, is_summon_line, mint_quiet_identity,
 };
+
+/// Nickname of a summon client. The server renames a duplicate.
+const SUMMON_NAME: &str = "Summon";
+
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+const OWN_CLIENT_WAIT: Duration = Duration::from_secs(2);
+/// How long the client list may take to show the caller after
+/// `channelsubscribeall`.
+const CALLER_WAIT: Duration = Duration::from_secs(3);
+const MOVE_WAIT: Duration = Duration::from_secs(5);
+const DISCONNECT_DRAIN: Duration = Duration::from_secs(1);
+
+/// Why a summon client stopped playing for someone, or why it left.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Outcome {
+    Stopped,
+    StopCommand,
+    CallerNotFound,
+    Occupied,
+    SavedBotChannel,
+    MoveRefused(String),
+    ResolveFailed(String),
+    SongEnded,
+    ChannelEmpty,
+    MovedAway,
+    ConnectionLost,
+    SendFailed(String),
+    NoHome,
+    OverLimit,
+    HomeRefused(String),
+}
+
+impl Outcome {
+    /// The client disconnects instead of going home.
+    fn ends_session(&self) -> bool {
+        matches!(
+            self,
+            Outcome::Stopped | Outcome::ConnectionLost | Outcome::SendFailed(_)
+        )
+    }
+}
+
+impl std::fmt::Display for Outcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Outcome::Stopped => write!(f, "stopped"),
+            Outcome::StopCommand => write!(f, "!stop in its channel"),
+            Outcome::CallerNotFound => write!(f, "the caller was not on its client list"),
+            Outcome::Occupied => write!(f, "another summon client plays in that channel"),
+            Outcome::SavedBotChannel => write!(f, "a saved bot sits in that channel"),
+            Outcome::MoveRefused(err) => write!(f, "the server refused the move: {err}"),
+            Outcome::ResolveFailed(err) => write!(f, "the song did not start: {err}"),
+            Outcome::SongEnded => write!(f, "the song ended"),
+            Outcome::ChannelEmpty => write!(f, "nobody is left in the channel"),
+            Outcome::MovedAway => write!(f, "it was moved out of the channel"),
+            Outcome::ConnectionLost => write!(f, "the connection dropped"),
+            Outcome::SendFailed(err) => write!(f, "send_audio failed: {err}"),
+            Outcome::NoHome => write!(f, "no home channel is picked"),
+            Outcome::OverLimit => write!(f, "the server is over its limit of summon clients"),
+            Outcome::HomeRefused(err) => {
+                write!(f, "the server refused the move to the home channel: {err}")
+            }
+        }
+    }
+}
 
 pub(crate) async fn run(
     director: SummonDirector,
     launch: SlotLaunch,
     live: LiveQuiet,
-) -> Result<()> {
-    let server = launch.server.clone();
-    let slot = launch.slot;
-    let generation = launch.generation;
-    let mut stop = launch.stop;
-    let mut pulse = launch.pulse;
-    let mut session_end = SessionEnd {
+) -> Result<Outcome> {
+    let SlotLaunch {
+        server,
+        dial,
+        summon,
+        caller,
+        identity_path,
+        connect_at,
+        mut stop,
+        mut cmds,
+    } = launch;
+    let _end = SessionEnd {
         director: director.clone(),
         server: server.clone(),
-        slot,
-        generation,
-        replace: true,
+        summon,
+        identity_path: Some(identity_path.clone()),
     };
-    if *stop.borrow() {
-        return Ok(());
-    }
-    let identity = mint_quiet_identity(&launch.identity_path)
-        .await
-        .context("mint quiet identity")?;
-    let mut con = Connection::build(server.as_str())
-        .name("Summon")
-        .identity(identity)
-        .channel(TECH_SUPPORT_CHANNEL)
-        .log_commands(false)
-        .log_packets(false)
-        .log_udp_packets(false)
-        .connect()
-        .context("quiet client connect")?;
-
-    let connected = ts6_voice_fixture::wait_for_connected(&mut con, Duration::from_secs(30))
-        .await
-        .context("quiet client handshake")?;
-    if !connected {
-        anyhow::bail!("quiet client handshake did not finish");
-    }
-    let mut own = wait_own(&mut con).await?;
-    if !landed_in_tech_support(&mut con).await? {
-        session_end.replace = false;
-        anyhow::bail!("quiet client did not land in {TECH_SUPPORT_CHANNEL}");
-    }
-    subscribe_all(&mut con).context("subscribe channels")?;
-    if let Some((at, clients)) = snapshot(&con)
-        && !director.mark_ready_gen(&server, slot, generation, at, own.0, &clients)
-    {
-        anyhow::bail!("quiet slot was replaced before it became ready");
-    }
-
-    let mut current: Option<ActiveAudio> = None;
-    let mut frames: Option<mpsc::Receiver<AudioMsg>> = None;
-    let mut monitor = SendTimingMonitor::new();
-    let volume = VolumeHandle::default();
-    let heard = director.pull_heard_gen(&server, slot, generation);
-    let mut pending_move = apply(
-        &director,
-        &live,
-        &server,
-        slot,
-        generation,
-        &mut con,
-        &mut current,
-        &mut frames,
-        &volume,
-        heard,
-    )
-    .await;
-    let mut playback = director.playback_open_gen(&server, slot, generation);
-    let mut resubscribe = false;
-    let mut resubscribe_tries: u8 = 0;
-    let mut trust_on_next_book = false;
-
+    // Paced so a burst of summons cannot trip the server's flood
+    // protection for every client on this host.
+    let slot = tokio::time::sleep_until(connect_at.into());
+    tokio::pin!(slot);
     loop {
         if *stop.borrow() {
-            break;
-        }
-        if let Some(active) = current.as_ref() {
-            active.set_paused(!playback);
+            return Ok(Outcome::Stopped);
         }
         tokio::select! {
             biased;
             changed = stop.changed() => {
-                if changed.is_err() || *stop.borrow() {
-                    break;
-                }
-            }
-            changed = pulse.changed() => {
                 if changed.is_err() {
-                    continue;
-                }
-                let instr = director.drain_pending_gen(&server, slot, generation);
-                if let Some(handle) = apply(
-                    &director,
-                    &live,
-                    &server,
-                    slot,
-                    generation,
-                    &mut con,
-                    &mut current,
-                    &mut frames,
-                    &volume,
-                    instr,
-                )
-                .await
-                {
-                    pending_move = Some(handle);
-                }
-                playback = director.playback_open_gen(&server, slot, generation);
-            }
-            ev = async { con.events().next().await } => {
-                match ev {
-                    Some(Ok(StreamItem::DisconnectedTemporarily(reason))) => {
-                        warn!(%server, slot, ?reason, "quiet client reconnecting");
-                        resubscribe = true;
-                        resubscribe_tries = 0;
-                    }
-                    Some(Ok(_item)) if resubscribe => {
-                        resubscribe_tries = resubscribe_tries.saturating_add(1);
-                        if resubscribe_tries > 5 {
-                            anyhow::bail!("quiet client did not resubscribe after reconnect");
-                        }
-                        if let Some(id) = own_id(&con) {
-                            own = id;
-                            if subscribe_all(&mut con).is_ok() {
-                                if let Some((at, _)) = snapshot(&con) {
-                                    director.mark_reconnected(&server, slot, generation, at);
-                                }
-                                resubscribe = false;
-                                trust_on_next_book = true;
-                            }
-                        }
-                    }
-                    Some(Ok(item)) => {
-                        if trust_on_next_book && matches!(item, StreamItem::BookEvents(_)) {
-                            director.note_list_trusted(&server, slot, generation);
-                            trust_on_next_book = false;
-                        }
-                        if classify_move_reply(pending_move, &item) == MoveReply::Refused {
-                            pending_move = None;
-                            let refused =
-                                director.on_move_refused_gen(&server, slot, generation);
-                            if let Some(handle) = apply(
-                                &director,
-                                &live,
-                                &server,
-                                slot,
-                                generation,
-                                &mut con,
-                                &mut current,
-                                &mut frames,
-                                &volume,
-                                refused,
-                            )
-                            .await
-                            {
-                                pending_move = Some(handle);
-                            }
-                            playback = director.playback_open_gen(&server, slot, generation);
-                            continue;
-                        }
-                        if classify_move_reply(pending_move, &item) == MoveReply::Accepted {
-                            pending_move = None;
-                        }
-                        let mut instr = instructions_for(
-                            &director,
-                            &server,
-                            slot,
-                            generation,
-                            own,
-                            &con,
-                            &item,
-                        );
-                        instr.extend(director.drain_pending_gen(&server, slot, generation));
-                        if let Some(handle) = apply(
-                            &director,
-                            &live,
-                            &server,
-                            slot,
-                            generation,
-                            &mut con,
-                            &mut current,
-                            &mut frames,
-                            &volume,
-                            instr,
-                        )
-                        .await
-                        {
-                            pending_move = Some(handle);
-                        }
-                        playback = director.playback_open_gen(&server, slot, generation);
-                    }
-                    Some(Err(err)) => {
-                        warn!(%server, slot, error = %err, "quiet client stream error");
-                        break;
-                    }
-                    None => break,
+                    return Ok(Outcome::Stopped);
                 }
             }
-            msg = recv_frame(&mut frames) => {
-                match msg {
-                    Some(AudioMsg::Frame { bytes, enqueued_at, .. }) => {
-                        if director.offer_frame_gen(&server, slot, generation)
-                            && let Err(err) = audio::send_opus_frame(
-                                &mut con,
-                                &bytes,
-                                enqueued_at,
-                                &mut monitor,
-                                false,
-                            )
-                        {
-                            warn!(%server, slot, error = %err, "quiet client send_audio failed");
-                            let instr =
-                                director.on_playback_finished_gen(&server, slot, generation);
-                            if let Some(handle) = apply(
-                                &director,
-                                &live,
-                                &server,
-                                slot,
-                                generation,
-                                &mut con,
-                                &mut current,
-                                &mut frames,
-                                &volume,
-                                instr,
-                            )
-                            .await
-                            {
-                                pending_move = Some(handle);
-                            }
-                            playback = director.playback_open_gen(&server, slot, generation);
-                        }
-                    }
-                    Some(AudioMsg::Finished) | None => {
-                        frames = None;
-                        let instr = director.on_playback_finished_gen(&server, slot, generation);
-                        if let Some(handle) = apply(
-                            &director,
-                            &live,
-                            &server,
-                            slot,
-                            generation,
-                            &mut con,
-                            &mut current,
-                            &mut frames,
-                            &volume,
-                            instr,
-                        )
-                        .await
-                        {
-                            pending_move = Some(handle);
-                        }
-                        playback = director.playback_open_gen(&server, slot, generation);
-                    }
-                    Some(AudioMsg::CatchupDropped(_)) | Some(AudioMsg::PipelineEvent(_)) => {}
+            _ = &mut slot => break,
+        }
+    }
+    let identity = mint_quiet_identity(&identity_path)
+        .await
+        .context("mint summon identity")?;
+    let mut con = connect_options(&dial, identity)
+        .connect()
+        .context("summon client connect")?;
+
+    if let Err(err) = handshake(&mut con).await {
+        if is_flood_refusal(&err) {
+            director.note_flood_refusal(&server);
+        }
+        return Err(err.context("summon client handshake"));
+    }
+    let own = wait_own(&mut con).await?;
+    director.note_own_client(&server, summon, own.0);
+    subscribe_all(&mut con).context("subscribe channels")?;
+
+    let mut session = Session {
+        director: &director,
+        server: &server,
+        summon,
+        own,
+        live: &live,
+        con: &mut con,
+        stop: &mut stop,
+        cmds: &mut cmds,
+    };
+    let outcome = session.run(caller).await;
+    leave(&mut con).await;
+    outcome
+}
+
+/// A connected summon client.
+struct Session<'a> {
+    director: &'a SummonDirector,
+    server: &'a str,
+    summon: u64,
+    own: ClientId,
+    live: &'a LiveQuiet,
+    con: &'a mut Connection,
+    stop: &'a mut watch::Receiver<bool>,
+    cmds: &'a mut mpsc::UnboundedReceiver<SessionCmd>,
+}
+
+/// What ended a wait in the home channel.
+enum Waited {
+    /// The director picked this client for a summon.
+    Serve(u16),
+    /// The home channel changed.
+    Rehome,
+    Leave(Outcome),
+}
+
+/// Where a trip to the home channel ended.
+enum Trip {
+    Arrived(u64),
+    Leave(Outcome),
+}
+
+impl Session<'_> {
+    /// Serve `caller`, then wait at home for the next summon, until a
+    /// reason to disconnect comes up. Returns that reason.
+    async fn run(&mut self, caller: u16) -> Result<Outcome> {
+        let (server, summon) = (self.server, self.summon);
+        let mut next = Some(caller);
+        loop {
+            if let Some(caller) = next.take() {
+                let outcome = self.serve(caller).await?;
+                if outcome.ends_session() {
+                    return Ok(outcome);
                 }
+                info!(%server, summon, caller, %outcome, "summon request ended");
+            }
+            let home = match self.go_home().await? {
+                Trip::Arrived(home) => home,
+                Trip::Leave(outcome) => return Ok(outcome),
+            };
+            info!(%server, summon, home, "summon client is waiting in the home channel");
+            match self.wait_at_home(home).await {
+                Waited::Serve(caller) => next = Some(caller),
+                Waited::Rehome => {}
+                Waited::Leave(outcome) => return Ok(outcome),
             }
         }
     }
 
-    audio::tear_down(&mut current);
-    audio::send_voice_stop(&mut con);
-    let _ = con.disconnect(
-        DisconnectOptions::new()
-            .reason(Reason::Clientdisconnect)
-            .message("summon ended".to_string()),
-    );
-    Ok(())
+    /// Find `caller`, go to their channel, and play until the song ends
+    /// or the channel stops it. Says why it stopped playing.
+    async fn serve(&mut self, caller: u16) -> Result<Outcome> {
+        let (director, server, summon, own) = (self.director, self.server, self.summon, self.own);
+        let (live, con, stop, cmds) = (self.live, &mut *self.con, &mut *self.stop, &mut *self.cmds);
+        let Some(channel) = wait_for_caller(con, caller).await? else {
+            return Ok(Outcome::CallerNotFound);
+        };
+        let saved = saved_bot_uids(&director.saved_identities(server)).await;
+        let saved_here = uid_in_channel(con, channel, &saved);
+        let request = match director.seat(server, summon, channel, saved_here) {
+            Seat::Go { request } => request,
+            Seat::Occupied => return Ok(Outcome::Occupied),
+            Seat::SavedBot => return Ok(Outcome::SavedBotChannel),
+            Seat::Gone => return Ok(Outcome::Stopped),
+        };
+        if own_channel(con) != Some(channel) {
+            let handle = move_to(con, channel)?;
+            if let Moved::Refused(err) = wait_moved(con, handle, channel).await? {
+                return Ok(Outcome::MoveRefused(err));
+            }
+        }
+        info!(%server, summon, caller, channel, "summon client is in the caller's channel");
+        if let Some((_, clients)) = snapshot(con) {
+            director.note_clients(server, summon, &clients);
+        }
+
+        let mut current: Option<ActiveAudio> = None;
+        let mut frames: Option<mpsc::Receiver<AudioMsg>> = None;
+        let mut monitor = SendTimingMonitor::new();
+        let volume = VolumeHandle::default();
+        if let Err(err) = play(live, &request, con, &mut current, &mut frames, &volume).await {
+            return Ok(Outcome::ResolveFailed(err));
+        }
+
+        let outcome = loop {
+            tokio::select! {
+                biased;
+                changed = stop.changed() => {
+                    if changed.is_err() || *stop.borrow() {
+                        break Outcome::Stopped;
+                    }
+                }
+                cmd = cmds.recv() => match cmd {
+                    Some(SessionCmd::Play(arg)) => {
+                        if let Err(err) =
+                            play(live, &arg, con, &mut current, &mut frames, &volume).await
+                        {
+                            break Outcome::ResolveFailed(err);
+                        }
+                    }
+                    // Sent only to a client that waits at home.
+                    Some(SessionCmd::Serve(_) | SessionCmd::Home) => {}
+                    Some(SessionCmd::Stop) | None => break Outcome::Stopped,
+                },
+                ev = async { con.events().next().await } => match ev {
+                    Some(Ok(item)) => {
+                        match react(director, server, summon, own, channel, con, &item) {
+                            React::Stay => {}
+                            React::Play(arg) => {
+                                if let Err(err) =
+                                    play(live, &arg, con, &mut current, &mut frames, &volume)
+                                        .await
+                                {
+                                    break Outcome::ResolveFailed(err);
+                                }
+                            }
+                            React::Done(outcome) => break outcome,
+                        }
+                    }
+                    Some(Err(err)) => {
+                        warn!(%server, summon, error = %err, "summon client stream error");
+                        break Outcome::ConnectionLost;
+                    }
+                    None => break Outcome::ConnectionLost,
+                },
+                msg = recv_frame(&mut frames) => match msg {
+                    Some(AudioMsg::Frame { bytes, enqueued_at, .. }) => {
+                        if let Err(err) =
+                            audio::send_opus_frame(con, &bytes, enqueued_at, &mut monitor, false)
+                        {
+                            break Outcome::SendFailed(err.to_string());
+                        }
+                    }
+                    Some(AudioMsg::Finished) | None => break Outcome::SongEnded,
+                    Some(AudioMsg::CatchupDropped(_)) | Some(AudioMsg::PipelineEvent(_)) => {}
+                },
+            }
+        };
+
+        audio::tear_down(&mut current);
+        audio::send_voice_stop(con);
+        Ok(outcome)
+    }
+
+    /// Go to the home channel. A client with nowhere to wait leaves.
+    async fn go_home(&mut self) -> Result<Trip> {
+        let (director, server, summon) = (self.director, self.server, self.summon);
+        let con = &mut *self.con;
+        let mut verdict = director.release(server, summon);
+        loop {
+            let home = match verdict {
+                Homeward::Home(home) => home,
+                Homeward::NoHome => return Ok(Trip::Leave(Outcome::NoHome)),
+                Homeward::OverLimit => return Ok(Trip::Leave(Outcome::OverLimit)),
+                Homeward::Gone => return Ok(Trip::Leave(Outcome::Stopped)),
+            };
+            if own_channel(con) != Some(home) {
+                let handle = move_to(con, home)?;
+                if let Moved::Refused(err) = wait_moved(con, handle, home).await? {
+                    return Ok(Trip::Leave(Outcome::HomeRefused(err)));
+                }
+            }
+            verdict = director.settle(server, summon, home);
+            if verdict == Homeward::Home(home) {
+                return Ok(Trip::Arrived(home));
+            }
+        }
+    }
+
+    /// Wait in `home` until a summon picks this client, the home
+    /// changes, or a reason to disconnect comes up.
+    async fn wait_at_home(&mut self, home: u64) -> Waited {
+        let (director, server, summon, own) = (self.director, self.server, self.summon, self.own);
+        let (con, stop, cmds) = (&mut *self.con, &mut *self.stop, &mut *self.cmds);
+        loop {
+            tokio::select! {
+                biased;
+                changed = stop.changed() => {
+                    if changed.is_err() || *stop.borrow() {
+                        return Waited::Leave(Outcome::Stopped);
+                    }
+                }
+                cmd = cmds.recv() => match cmd {
+                    Some(SessionCmd::Serve(caller)) => return Waited::Serve(caller),
+                    Some(SessionCmd::Home) => return Waited::Rehome,
+                    // A song for the channel it played in before.
+                    Some(SessionCmd::Play(_)) => {}
+                    Some(SessionCmd::Stop) | None => return Waited::Leave(Outcome::Stopped),
+                },
+                ev = async { con.events().next().await } => match ev {
+                    Some(Ok(item)) => {
+                        if let Some(outcome) =
+                            react_at_home(director, server, summon, own, home, con, &item)
+                        {
+                            return Waited::Leave(outcome);
+                        }
+                    }
+                    Some(Err(err)) => {
+                        warn!(%server, summon, error = %err, "summon client stream error");
+                        return Waited::Leave(Outcome::ConnectionLost);
+                    }
+                    None => return Waited::Leave(Outcome::ConnectionLost),
+                },
+            }
+        }
+    }
+}
+
+/// Drive the event stream until the server sends the first book. A
+/// refusal keeps the server's error code: the log prints it, and a flood
+/// refusal starts the cool-down.
+async fn handshake(con: &mut Connection) -> Result<()> {
+    let deadline = tokio::time::sleep(HANDSHAKE_TIMEOUT);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut deadline => {
+                anyhow::bail!("handshake did not finish within {HANDSHAKE_TIMEOUT:?}")
+            }
+            ev = async { con.events().next().await } => match ev {
+                Some(Ok(StreamItem::BookEvents(_))) => return Ok(()),
+                Some(Ok(_)) => continue,
+                Some(Err(err)) => return Err(anyhow::Error::new(err)),
+                None => anyhow::bail!("stream ended before the handshake finished"),
+            }
+        }
+    }
+}
+
+/// True when the server refused the connection as banned or flooding.
+/// TeamSpeak answers a host that connected too often with
+/// `ConnectFailedBanned` until its antiflood points decay.
+fn is_flood_refusal(err: &anyhow::Error) -> bool {
+    matches!(
+        err.downcast_ref::<tsclientlib::Error>(),
+        Some(tsclientlib::Error::ConnectTs(
+            TsError::ConnectFailedBanned | TsError::BanFlooding | TsError::ClientIsFlooding
+        ))
+    )
+}
+
+/// Connect options for a summon client. There is no `.channel(..)`: a
+/// full channel named at connect makes TeamSpeak 6 refuse the handshake
+/// with `ChannelMaxclientsReached`. The move happens after connect.
+fn connect_options(dial: &str, identity: Identity) -> ConnectOptions {
+    Connection::build(dial)
+        .name(SUMMON_NAME)
+        .identity(identity)
+        .log_commands(false)
+        .log_packets(false)
+        .log_udp_packets(false)
+}
+
+/// Start `request` as the song. A failed resolve is the summon's end.
+async fn play(
+    live: &LiveQuiet,
+    request: &str,
+    con: &mut Connection,
+    current: &mut Option<ActiveAudio>,
+    frames: &mut Option<mpsc::Receiver<AudioMsg>>,
+    volume: &VolumeHandle,
+) -> std::result::Result<(), String> {
+    let cookie = live
+        .yt_cookie
+        .read()
+        .unwrap_or_else(|err| err.into_inner())
+        .clone();
+    *frames = None;
+    if audio::tear_down(current) {
+        audio::send_voice_stop(con);
+    }
+    let source = cold_audio_source(request);
+    match audio::start_pipeline(current, &source, cookie, volume).await {
+        Ok(_) => {
+            *frames = current.as_mut().and_then(|active| active.audio_rx.take());
+            Ok(())
+        }
+        Err(err) => {
+            *frames = None;
+            audio::tear_down(current);
+            Err(err.to_string())
+        }
+    }
 }
 
 async fn recv_frame(frames: &mut Option<mpsc::Receiver<AudioMsg>>) -> Option<AudioMsg> {
@@ -306,174 +470,152 @@ async fn recv_frame(frames: &mut Option<mpsc::Receiver<AudioMsg>>) -> Option<Aud
     }
 }
 
-fn instructions_for(
+/// What one stream item means for a seated summon client.
+#[derive(Debug, PartialEq, Eq)]
+enum React {
+    Stay,
+    Play(String),
+    /// It stops playing for the caller, for this reason.
+    Done(Outcome),
+}
+
+fn react(
     director: &SummonDirector,
     server: &str,
-    slot: u32,
-    generation: u64,
+    summon: u64,
     own: ClientId,
+    channel: u64,
     con: &Connection,
     item: &StreamItem,
-) -> Vec<QuietInstruction> {
-    // Voice packets are not book events. Snapshotting the client list
-    // here would take the director lock on every incoming frame.
-    let StreamItem::BookEvents(events) = item else {
-        return Vec::new();
-    };
-    let Some((at, clients)) = snapshot(con) else {
-        return Vec::new();
-    };
-    let mut out = director.on_book_gen(server, slot, generation, at, &clients);
-    for event in events {
-        let BookEvent::Message {
-            target,
-            invoker,
-            message,
-        } = event
-        else {
-            continue;
-        };
-        match target {
-            // Channel text is delivered only inside the sender's channel.
-            // It is a command when this connection is already there. It
-            // is not how a summon typed somewhere else reaches Tech Support.
-            MessageTarget::Channel => {
+) -> React {
+    match item {
+        StreamItem::BookEvents(events) => {
+            let Some((at, clients)) = snapshot(con) else {
+                return React::Stay;
+            };
+            director.note_clients(server, summon, &clients);
+            let mut next = React::Stay;
+            for event in events {
+                let BookEvent::Message {
+                    target,
+                    invoker,
+                    message,
+                } = event
+                else {
+                    continue;
+                };
                 if invoker.id == own {
                     continue;
                 }
-                let sender_channel = clients
-                    .iter()
-                    .find(|client| client.id == invoker.id.0)
-                    .map(|client| client.channel_id);
-                let sender_here =
-                    sender_channel.is_some_and(|channel| channel_text_is_local(channel, at));
-                if sender_here {
-                    out.extend(director.on_chat_gen(
-                        server,
-                        slot,
-                        generation,
-                        invoker.id.0,
-                        message,
-                        &clients,
-                    ));
+                match line_for(*target, message) {
+                    Line::Song(arg) => next = React::Play(arg),
+                    Line::Stop => return React::Done(Outcome::StopCommand),
+                    Line::Crossing => {
+                        director.hear(server, invoker.id.0, message, Heard::Crossing);
+                    }
+                    Line::Ignore => {}
                 }
             }
-            // Server text, a private message, or a poke can arrive here
-            // while this client sits in Tech Support. The move happens
-            // when that text is the staged summon, not before.
-            MessageTarget::Server | MessageTarget::Client(_) | MessageTarget::Poke(_) => {
-                if let Some(moved) =
-                    director.ack_delivery_gen(server, slot, generation, message, &clients)
-                {
-                    out.extend(moved);
-                } else if director.holds_staged_text(server, message) || invoker.id == own {
-                    // The saved bot's copy of a summon, or our own echo.
-                } else {
-                    out.extend(director.on_chat_gen(
-                        server,
-                        slot,
-                        generation,
-                        invoker.id.0,
-                        message,
-                        &clients,
-                    ));
-                }
+            if at != channel {
+                return React::Done(Outcome::MovedAway);
             }
+            // Other summon clients waiting in this channel are not
+            // listeners.
+            let mut ours = director.summon_clients(server);
+            ours.push(own.0);
+            if !someone_else_in(&clients, channel, &ours) {
+                return React::Done(Outcome::ChannelEmpty);
+            }
+            next
         }
+        StreamItem::DisconnectedTemporarily(_) => React::Done(Outcome::ConnectionLost),
+        _ => React::Stay,
     }
-    out
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn apply(
+/// What one stream item means for a client waiting in the home channel.
+/// `Some` is why it leaves.
+fn react_at_home(
     director: &SummonDirector,
-    live: &LiveQuiet,
     server: &str,
-    slot: u32,
-    generation: u64,
-    con: &mut Connection,
-    current: &mut Option<ActiveAudio>,
-    frames: &mut Option<mpsc::Receiver<AudioMsg>>,
-    volume: &VolumeHandle,
-    instrs: Vec<QuietInstruction>,
-) -> Option<MessageHandle> {
-    let mut queue: VecDeque<QuietInstruction> = instrs.into();
-    let mut sent = None;
-    while let Some(instr) = queue.pop_front() {
-        // A reply from the channel this client is sitting in would not
-        // reach the caller. The director leaves `reply` empty; do not
-        // invent one.
-        let _ = instr.reply;
-        if instr.stop_audio || instr.shutdown {
-            *frames = None;
-            if audio::tear_down(current) {
-                audio::send_voice_stop(con);
-            }
-        }
-        if let Some(channel) = instr.move_to {
-            if let Some(active) = current.as_ref() {
-                active.set_paused(true);
-            }
-            match move_to(con, channel) {
-                Ok(handle) => sent = Some(handle),
-                Err(err) => {
-                    warn!(%server, slot, error = %err, "quiet client move failed");
-                    for follow in director
-                        .on_move_failed_gen(server, slot, generation)
-                        .into_iter()
-                        .rev()
-                    {
-                        queue.push_front(follow);
+    summon: u64,
+    own: ClientId,
+    home: u64,
+    con: &Connection,
+    item: &StreamItem,
+) -> Option<Outcome> {
+    match item {
+        StreamItem::BookEvents(events) => {
+            let (at, clients) = snapshot(con)?;
+            director.note_clients(server, summon, &clients);
+            for event in events {
+                let BookEvent::Message {
+                    target,
+                    invoker,
+                    message,
+                } = event
+                else {
+                    continue;
+                };
+                if invoker.id == own || !is_summon_line(message) {
+                    continue;
+                }
+                match target {
+                    // Someone in the home channel. A saved bot or a summon
+                    // client playing there answers that chat itself.
+                    MessageTarget::Channel => {
+                        director.hear_home_chat(server, invoker.id.0, message);
+                    }
+                    MessageTarget::Server | MessageTarget::Client(_) | MessageTarget::Poke(_) => {
+                        director.hear(server, invoker.id.0, message, Heard::Crossing);
                     }
                 }
             }
+            // Moved or kicked out of the home channel by someone else.
+            (at != home).then_some(Outcome::MovedAway)
         }
-        if let Some(arg) = instr.play
-            && director.playback_open_gen(server, slot, generation)
-        {
-            let cookie = live
-                .yt_cookie
-                .read()
-                .unwrap_or_else(|err| err.into_inner())
-                .clone();
-            let source = cold_audio_source(&arg);
-            *frames = None;
-            if audio::tear_down(current) {
-                audio::send_voice_stop(con);
-            }
-            match audio::start_pipeline(current, &source, cookie, volume).await {
-                Ok(_) => {
-                    *frames = current.as_mut().and_then(|active| active.audio_rx.take());
-                }
-                Err(err) => {
-                    warn!(%server, slot, error = %err, "quiet client cold resolve failed");
-                    *frames = None;
-                    audio::tear_down(current);
-                    let back = director.on_playback_finished_gen(server, slot, generation);
-                    for back in back {
-                        if back.stop_audio {
-                            audio::send_voice_stop(con);
-                        }
-                        if let Some(channel) = back.move_to
-                            && let Ok(handle) = move_to(con, channel)
-                        {
-                            sent = Some(handle);
-                        }
-                    }
-                }
-            }
-        }
-        if instr.shutdown {
-            *frames = None;
-            audio::tear_down(current);
-        }
+        StreamItem::DisconnectedTemporarily(_) => Some(Outcome::ConnectionLost),
+        _ => None,
     }
-    sent
 }
 
-/// Channel text is delivered only inside the sender's channel.
-fn channel_text_is_local(sender_channel: u64, here: u64) -> bool {
-    sender_channel == here
+/// A chat line as a seated summon client sees it.
+#[derive(Debug, PartialEq, Eq)]
+enum Line {
+    /// `!play` or `!radio` typed in this client's channel.
+    Song(String),
+    /// `!stop` typed in this client's channel.
+    Stop,
+    /// A summon line sent as server chat, a private message, or a poke.
+    /// The director decides where it goes.
+    Crossing,
+    Ignore,
+}
+
+fn line_for(target: MessageTarget, message: &str) -> Line {
+    match target {
+        // Channel chat arrives only from the channel this client is in.
+        MessageTarget::Channel => match parse_chat(message) {
+            Ok(ParsedCommand::Play { arg } | ParsedCommand::Radio { arg }) => Line::Song(arg),
+            Ok(ParsedCommand::Stop) => Line::Stop,
+            _ => Line::Ignore,
+        },
+        MessageTarget::Server | MessageTarget::Client(_) | MessageTarget::Poke(_) => {
+            if is_summon_line(message) {
+                Line::Crossing
+            } else {
+                Line::Ignore
+            }
+        }
+    }
+}
+
+/// True when someone other than `ours`, this server's summon clients,
+/// is in `channel`.
+fn someone_else_in(clients: &[ListedClient], channel: u64, ours: &[u16]) -> bool {
+    clients
+        .iter()
+        .any(|client| client.channel_id == channel && !ours.contains(&client.id))
 }
 
 fn subscribe_all(con: &mut Connection) -> Result<()> {
@@ -482,7 +624,7 @@ fn subscribe_all(con: &mut Connection) -> Result<()> {
         book.server.set_subscribed(true)
     };
     cmd.send(con)
-        .context("channelsubscribeall on the quiet client's connection")?;
+        .context("channelsubscribeall on the summon client's connection")?;
     Ok(())
 }
 
@@ -498,19 +640,41 @@ fn move_to(con: &mut Connection, channel: u64) -> Result<MessageHandle> {
     cmd.send_with_result(con).context("clientmove")
 }
 
-/// What a `clientmove` result means for the handle this session is waiting on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MoveReply {
-    Refused,
-    Accepted,
-    Other,
+enum Moved {
+    Arrived,
+    Refused(String),
 }
 
-fn classify_move_reply(pending: Option<MessageHandle>, item: &StreamItem) -> MoveReply {
-    match (pending, item) {
-        (Some(want), StreamItem::MessageResult(got, Err(_))) if want == *got => MoveReply::Refused,
-        (Some(want), StreamItem::MessageResult(got, Ok(()))) if want == *got => MoveReply::Accepted,
-        _ => MoveReply::Other,
+/// Wait until the book shows this client in `channel`, or the server
+/// refuses the move. A full or locked channel is a refusal, not an error.
+async fn wait_moved(con: &mut Connection, handle: MessageHandle, channel: u64) -> Result<Moved> {
+    let deadline = tokio::time::sleep(MOVE_WAIT);
+    tokio::pin!(deadline);
+    loop {
+        if own_channel(con) == Some(channel) {
+            return Ok(Moved::Arrived);
+        }
+        tokio::select! {
+            biased;
+            _ = &mut deadline => anyhow::bail!("clientmove to channel {channel} was not confirmed"),
+            ev = async { con.events().next().await } => match ev {
+                Some(Ok(item)) => {
+                    if let Some(refused) = move_refusal(handle, &item) {
+                        return Ok(Moved::Refused(refused));
+                    }
+                }
+                Some(Err(err)) => return Err(anyhow::anyhow!("stream error: {err}")),
+                None => anyhow::bail!("stream ended before the move finished"),
+            }
+        }
+    }
+}
+
+/// The server's error text when `item` is the refusal of `handle`.
+fn move_refusal(handle: MessageHandle, item: &StreamItem) -> Option<String> {
+    match item {
+        StreamItem::MessageResult(got, Err(err)) if *got == handle => Some(err.to_string()),
+        _ => None,
     }
 }
 
@@ -529,8 +693,42 @@ fn snapshot(con: &Connection) -> Option<(u64, Vec<ListedClient>)> {
     Some((at, clients))
 }
 
+fn own_channel(con: &Connection) -> Option<u64> {
+    let book = con.get_state().ok()?;
+    book.clients.get(&book.own_client).map(|own| own.channel.0)
+}
+
+fn caller_channel(con: &Connection, caller: u16) -> Option<u64> {
+    let book = con.get_state().ok()?;
+    book.clients
+        .get(&ClientId(caller))
+        .map(|client| client.channel.0)
+}
+
+/// Wait for the caller to show up on the list `channelsubscribeall`
+/// fills. `None` when the caller is not on the server, or sits in a
+/// channel this client may not subscribe to.
+async fn wait_for_caller(con: &mut Connection, caller: u16) -> Result<Option<u64>> {
+    let deadline = tokio::time::sleep(CALLER_WAIT);
+    tokio::pin!(deadline);
+    loop {
+        if let Some(channel) = caller_channel(con, caller) {
+            return Ok(Some(channel));
+        }
+        tokio::select! {
+            biased;
+            _ = &mut deadline => return Ok(None),
+            ev = async { con.events().next().await } => match ev {
+                Some(Ok(_)) => continue,
+                Some(Err(err)) => return Err(anyhow::anyhow!("stream error: {err}")),
+                None => anyhow::bail!("stream ended before the caller showed up"),
+            }
+        }
+    }
+}
+
 async fn wait_own(con: &mut Connection) -> Result<ClientId> {
-    let deadline = tokio::time::sleep(Duration::from_secs(2));
+    let deadline = tokio::time::sleep(OWN_CLIENT_WAIT);
     tokio::pin!(deadline);
     loop {
         if let Some(id) = own_id(con) {
@@ -538,11 +736,11 @@ async fn wait_own(con: &mut Connection) -> Result<ClientId> {
         }
         tokio::select! {
             biased;
-            _ = &mut deadline => anyhow::bail!("quiet client never appeared in its own book"),
+            _ = &mut deadline => anyhow::bail!("summon client never appeared in its own book"),
             ev = async { con.events().next().await } => match ev {
                 Some(Ok(_)) => continue,
                 Some(Err(err)) => return Err(anyhow::anyhow!("stream error: {err}")),
-                None => anyhow::bail!("stream ended before the quiet client appeared"),
+                None => anyhow::bail!("stream ended before the summon client appeared"),
             }
         }
     }
@@ -554,70 +752,105 @@ fn own_id(con: &Connection) -> Option<ClientId> {
     Some(book.own_client)
 }
 
-struct SessionEnd {
-    director: SummonDirector,
-    server: String,
-    slot: u32,
-    generation: u64,
-    /// False when Tech Support is missing. That end does not schedule
-    /// another identity and another join of the default channel.
-    replace: bool,
-}
-
-impl Drop for SessionEnd {
-    fn drop(&mut self) {
-        if self.replace {
-            self.director
-                .session_ended(&self.server, self.slot, self.generation);
-        } else {
-            self.director
-                .session_ended_no_relaunch(&self.server, self.slot, self.generation);
-        }
+/// UIDs of the saved bots' identity files. A file that is missing or
+/// does not parse is skipped.
+async fn saved_bot_uids(paths: &[PathBuf]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    for path in paths {
+        let Ok(raw) = tokio::fs::read_to_string(path).await else {
+            continue;
+        };
+        let Ok(identity) = serde_json::from_str::<Identity>(raw.trim()) else {
+            continue;
+        };
+        out.push(identity.key().to_pub().get_uid_no_base64());
     }
+    out
 }
 
-/// True only when this connection is in the channel named Tech Support.
-/// A missing or rejected channel leaves the client in the default
-/// channel; that is not a place to sit or to play.
-async fn landed_in_tech_support(con: &mut Connection) -> Result<bool> {
-    let deadline = tokio::time::sleep(Duration::from_secs(2));
+fn uid_in_channel(con: &Connection, channel: u64, uids: &[Vec<u8>]) -> bool {
+    let Ok(book) = con.get_state() else {
+        return false;
+    };
+    book.clients.values().any(|client| {
+        client.channel.0 == channel
+            && client
+                .uid
+                .as_ref()
+                .is_some_and(|uid| uids.iter().any(|saved| saved == &uid.0))
+    })
+}
+
+/// Disconnect and give the server a moment to see it.
+async fn leave(con: &mut Connection) {
+    let _ = con.disconnect(
+        DisconnectOptions::new()
+            .reason(Reason::Clientdisconnect)
+            .message("summon ended".to_string()),
+    );
+    let deadline = tokio::time::sleep(DISCONNECT_DRAIN);
     tokio::pin!(deadline);
     loop {
-        if let Some(name) = own_channel_name(con) {
-            return Ok(name == TECH_SUPPORT_CHANNEL);
-        }
         tokio::select! {
             biased;
-            _ = &mut deadline => return Ok(false),
+            _ = &mut deadline => break,
             ev = async { con.events().next().await } => match ev {
                 Some(Ok(_)) => continue,
-                Some(Err(err)) => return Err(anyhow::anyhow!("stream error: {err}")),
-                None => anyhow::bail!("stream ended before the channel name arrived"),
+                Some(Err(_)) | None => break,
             }
         }
     }
 }
 
-fn own_channel_name(con: &Connection) -> Option<String> {
-    let book = con.get_state().ok()?;
-    let own = book.clients.get(&book.own_client)?;
-    let channel = book.channels.get(&own.channel)?;
-    Some(channel.name.to_string())
+/// Frees the summon's place and removes its identity file however the
+/// session ends.
+struct SessionEnd {
+    director: SummonDirector,
+    server: String,
+    summon: u64,
+    identity_path: Option<PathBuf>,
+}
+
+impl Drop for SessionEnd {
+    fn drop(&mut self) {
+        self.director.session_ended(&self.server, self.summon);
+        if let Some(path) = self.identity_path.take()
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            handle.spawn(async move { discard_quiet_identity(&path).await });
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::summon::{DeliveryHow, SummonArrival};
-    use tsclientlib::{ClientId, CommandError, MessageHandle, MessageTarget, StreamItem, TsError};
+    use tsclientlib::CommandError;
 
-    /// Server text, a private message, or a poke. Never channel text.
-    fn crossing_target(arrival: &SummonArrival) -> MessageTarget {
-        match arrival.how {
-            DeliveryHow::Server => MessageTarget::Server,
-            DeliveryHow::Private => MessageTarget::Client(ClientId(arrival.target)),
-            DeliveryHow::Poke => MessageTarget::Poke(ClientId(arrival.target)),
+    #[test]
+    fn summon_clients_do_not_ask_for_a_channel_at_connect() {
+        let options = connect_options("voice.example:9987", Identity::create());
+        let debug = format!("{options:?}");
+        assert!(debug.contains("channel: None"), "{debug}");
+        assert!(!debug.contains("Tech Support"), "{debug}");
+    }
+
+    #[test]
+    fn a_banned_or_flooding_refusal_starts_the_cool_down() {
+        for code in [
+            TsError::ConnectFailedBanned,
+            TsError::BanFlooding,
+            TsError::ClientIsFlooding,
+        ] {
+            let err = anyhow::Error::new(tsclientlib::Error::ConnectTs(code))
+                .context("summon client handshake");
+            assert!(is_flood_refusal(&err), "{code:?}");
         }
+        let full = anyhow::Error::new(tsclientlib::Error::ConnectTs(
+            TsError::ChannelMaxclientsReached,
+        ));
+        assert!(!is_flood_refusal(&full));
+        assert!(!is_flood_refusal(&anyhow::anyhow!("timed out")));
     }
 
     #[test]
@@ -630,70 +863,84 @@ mod tests {
                 missing_permission: None,
             }),
         );
-        assert_eq!(
-            classify_move_reply(Some(handle), &refused),
-            MoveReply::Refused
-        );
-        assert_eq!(
-            classify_move_reply(Some(MessageHandle(8)), &refused),
-            MoveReply::Other
-        );
+        assert!(move_refusal(handle, &refused).is_some());
+        assert_eq!(move_refusal(MessageHandle(8), &refused), None);
         let accepted = StreamItem::MessageResult(handle, Ok(()));
+        assert_eq!(move_refusal(handle, &accepted), None);
+    }
+
+    #[test]
+    fn channel_chat_is_this_clients_command() {
         assert_eq!(
-            classify_move_reply(Some(handle), &accepted),
-            MoveReply::Accepted
+            line_for(MessageTarget::Channel, "!play yt:next"),
+            Line::Song("yt:next".into())
         );
+        assert_eq!(
+            line_for(MessageTarget::Channel, "!radio https://radio.example/live"),
+            Line::Song("https://radio.example/live".into())
+        );
+        assert_eq!(line_for(MessageTarget::Channel, "!stop"), Line::Stop);
+        assert_eq!(line_for(MessageTarget::Channel, "!np"), Line::Ignore);
+        assert_eq!(line_for(MessageTarget::Channel, "hello"), Line::Ignore);
     }
 
     #[test]
-    fn channel_text_does_not_cross_into_tech_support() {
-        assert!(channel_text_is_local(5, 5));
-        assert!(!channel_text_is_local(5, 42));
-    }
-
-    #[test]
-    fn crossing_delivery_is_not_channel_text() {
-        let text = "!play https://cdn.example/one.mp3".to_string();
-        for how in [DeliveryHow::Server, DeliveryHow::Private, DeliveryHow::Poke] {
-            let target = crossing_target(&SummonArrival {
-                how,
-                target: 1,
-                text: text.clone(),
-            });
-            assert!(!matches!(target, MessageTarget::Channel));
+    fn server_private_and_poke_lines_go_to_the_director() {
+        for target in [
+            MessageTarget::Server,
+            MessageTarget::Client(ClientId(4)),
+            MessageTarget::Poke(ClientId(4)),
+        ] {
+            assert_eq!(line_for(target, "!play yt:song"), Line::Crossing);
+            assert_eq!(line_for(target, "!stop"), Line::Ignore);
+            assert_eq!(line_for(target, "hi"), Line::Ignore);
         }
-        assert!(matches!(
-            crossing_target(&SummonArrival {
-                how: DeliveryHow::Private,
-                target: 1,
-                text: text.clone(),
-            }),
-            MessageTarget::Client(ClientId(1))
-        ));
-        assert!(matches!(
-            crossing_target(&SummonArrival {
-                how: DeliveryHow::Poke,
-                target: 1,
-                text: text.clone(),
-            }),
-            MessageTarget::Poke(ClientId(1))
-        ));
-        assert!(matches!(
-            crossing_target(&SummonArrival {
-                how: DeliveryHow::Server,
-                target: 0,
-                text,
-            }),
-            MessageTarget::Server
-        ));
     }
 
     #[test]
-    fn voice_packets_are_not_book_work() {
-        let item = StreamItem::IdentityLevelIncreased;
-        assert!(!matches!(item, StreamItem::BookEvents(_)));
-        let item =
-            StreamItem::DisconnectedTemporarily(tsclientlib::TemporaryDisconnectReason::Serverstop);
-        assert!(!matches!(item, StreamItem::BookEvents(_)));
+    fn a_channel_with_only_this_client_is_empty() {
+        let clients = [
+            ListedClient {
+                id: 5,
+                channel_id: 42,
+            },
+            ListedClient {
+                id: 6,
+                channel_id: 9,
+            },
+        ];
+        assert!(!someone_else_in(&clients, 42, &[5]));
+        assert!(someone_else_in(&clients, 9, &[5]));
+    }
+
+    #[test]
+    fn summon_clients_waiting_in_the_channel_are_not_listeners() {
+        // The caller left the home channel. Two other summon clients
+        // still wait there; the one that played is done.
+        let clients = [
+            ListedClient {
+                id: 5,
+                channel_id: 42,
+            },
+            ListedClient {
+                id: 7,
+                channel_id: 42,
+            },
+            ListedClient {
+                id: 8,
+                channel_id: 42,
+            },
+        ];
+        assert!(!someone_else_in(&clients, 42, &[5, 7, 8]));
+        assert!(someone_else_in(&clients, 42, &[5, 7]));
+    }
+
+    #[test]
+    fn outcomes_say_why_the_client_left() {
+        assert_eq!(
+            Outcome::MoveRefused("ChannelMaxclientsReached".into()).to_string(),
+            "the server refused the move: ChannelMaxclientsReached"
+        );
+        assert_eq!(Outcome::SongEnded.to_string(), "the song ended");
     }
 }

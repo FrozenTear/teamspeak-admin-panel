@@ -269,6 +269,7 @@ mod server_entry {
                 for row in rows {
                     let id = music_bot::BotId(row.id as u64);
                     let summon_cap = summon_cap_for_bot(&summon_caps, &row.serverAddr);
+                    let summon_home = summon_home_for_bot(&summon_caps, &row.serverAddr);
                     let config = music_bot::BotConfig::new(
                         row.name,
                         std::path::PathBuf::from(row.identityPath),
@@ -284,6 +285,7 @@ mod server_entry {
                             state.yt_cookie.clone(),
                             state.yt_api_key.clone(),
                             summon_cap,
+                            summon_home,
                         )
                         .await
                     {
@@ -597,19 +599,14 @@ mod server_entry {
         caps: &[crate::repos::music_summon_cap::MusicSummonCap],
         server_addr: &str,
     ) -> Option<u32> {
-        let want = music_bot::canon_server_addr(server_addr);
-        if want.is_empty() {
-            return None;
-        }
-        let cap = caps
-            .iter()
-            .find(|cap| music_bot::canon_server_addr(&cap.serverAddr) == want)?;
-        match u32::try_from(cap.cap) {
+        let row = summon_row_for_bot(caps, server_addr)?;
+        let stored = row.cap?;
+        match u32::try_from(stored) {
             Ok(n) => Some(n),
             Err(_) => {
                 tracing::warn!(
-                    server = %cap.serverAddr,
-                    stored = cap.cap,
+                    server = %row.serverAddr,
+                    stored,
                     "stored summon cap is not a u32; this push will not arm summon"
                 );
                 None
@@ -617,24 +614,72 @@ mod server_entry {
         }
     }
 
+    /// The home channel stored on the same row. `None` when none is
+    /// picked; the push then leaves the process without one.
+    fn summon_home_for_bot(
+        caps: &[crate::repos::music_summon_cap::MusicSummonCap],
+        server_addr: &str,
+    ) -> Option<u64> {
+        let row = summon_row_for_bot(caps, server_addr)?;
+        let stored = row.homeChannel?;
+        match u64::try_from(stored) {
+            Ok(home) if home > 0 => Some(home),
+            _ => {
+                tracing::warn!(
+                    server = %row.serverAddr,
+                    stored,
+                    "stored summon home is not a channel id; this push carries no home"
+                );
+                None
+            }
+        }
+    }
+
+    fn summon_row_for_bot<'a>(
+        caps: &'a [crate::repos::music_summon_cap::MusicSummonCap],
+        server_addr: &str,
+    ) -> Option<&'a crate::repos::music_summon_cap::MusicSummonCap> {
+        let want = music_bot::canon_server_addr(server_addr);
+        if want.is_empty() {
+            return None;
+        }
+        caps.iter()
+            .find(|cap| music_bot::canon_server_addr(&cap.serverAddr) == want)
+    }
+
     #[cfg(test)]
     mod tests {
-        use super::summon_cap_for_bot;
+        use super::{summon_cap_for_bot, summon_home_for_bot};
         use crate::repos::music_summon_cap::MusicSummonCap;
 
-        fn row(server_addr: &str, cap: i64) -> MusicSummonCap {
+        fn row(server_addr: &str, cap: Option<i64>, home: Option<i64>) -> MusicSummonCap {
             MusicSummonCap {
                 serverAddr: server_addr.to_string(),
                 cap,
+                homeChannel: home,
             }
         }
 
         #[test]
         fn rehydrate_matches_the_canonical_server_address() {
-            let caps = vec![row("ts.example:9987", 3)];
+            let caps = vec![row("ts.example:9987", Some(3), None)];
             assert_eq!(summon_cap_for_bot(&caps, "TS.Example:9987"), Some(3));
             assert_eq!(summon_cap_for_bot(&caps, "ts.example"), Some(3));
             assert_eq!(summon_cap_for_bot(&caps, "ts.example:9988"), None);
+        }
+
+        #[test]
+        fn rehydrate_carries_the_stored_home_and_invents_neither_value() {
+            let caps = vec![
+                row("ts.example:9987", Some(1), Some(12)),
+                row("ts.example:9988", None, Some(30)),
+                row("ts.example:9989", Some(2), None),
+            ];
+            assert_eq!(summon_home_for_bot(&caps, "TS.Example"), Some(12));
+            assert_eq!(summon_home_for_bot(&caps, "ts.example:9988"), Some(30));
+            assert_eq!(summon_cap_for_bot(&caps, "ts.example:9988"), None);
+            assert_eq!(summon_home_for_bot(&caps, "ts.example:9989"), None);
+            assert_eq!(summon_home_for_bot(&caps, "other.example"), None);
         }
     }
 }

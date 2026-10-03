@@ -44,6 +44,9 @@ pub struct VirtualServerEntry {
     pub virtualserver_clientsonline: i64,
     #[serde(default, deserialize_with = "stringy::deserialize_default")]
     pub virtualserver_maxclients: i64,
+    /// Voice port. `0` when the upstream row leaves it out.
+    #[serde(default, deserialize_with = "stringy::deserialize_default")]
+    pub virtualserver_port: i64,
 }
 
 /// `channellist` row. The basic projection has `cid` / `channel_name` /

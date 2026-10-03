@@ -33,6 +33,7 @@ pub fn BotsIndexPage() -> Element {
 
     let mut rows: Signal<Vec<wire::MusicBotSummary>> = use_signal(Vec::new);
     let mut caps: Signal<Vec<wire::SummonCap>> = use_signal(Vec::new);
+    let mut homes: Signal<Vec<wire::SummonHome>> = use_signal(Vec::new);
     let mut caps_error: Signal<Option<ApiError>> = use_signal(|| None::<ApiError>);
     let mut caps_known: Signal<bool> = use_signal(|| false);
     let mut error: Signal<Option<ApiError>> = use_signal(|| None::<ApiError>);
@@ -74,11 +75,13 @@ pub fn BotsIndexPage() -> Element {
     use_effect(move || match &*caps_snapshot.read_unchecked() {
         Some(Ok(list)) => {
             caps.set(list.caps.clone());
+            homes.set(list.homes.clone());
             caps_error.set(None);
             caps_known.set(true);
         }
         Some(Err(e)) => {
             caps.set(Vec::new());
+            homes.set(Vec::new());
             caps_error.set(Some(e.clone()));
             caps_known.set(false);
         }
@@ -203,7 +206,7 @@ pub fn BotsIndexPage() -> Element {
                 }
             } else if summon_groups::show_empty_bot_list(
                 rows.read().len(),
-                caps.read().len(),
+                caps.read().len() + homes.read().len(),
                 *caps_known.read() || caps_error.read().is_some(),
             ) {
                 div { class: "empty",
@@ -222,6 +225,7 @@ pub fn BotsIndexPage() -> Element {
                 BotsTable {
                     rows: rows.read().clone(),
                     caps: caps.read().clone(),
+                    homes: homes.read().clone(),
                     caps_known: *caps_known.read(),
                     on_cap_saved: EventHandler::new({
                         let mut bump = bump;
@@ -268,6 +272,7 @@ pub fn BotsIndexPage() -> Element {
 struct BotsTableProps {
     rows: Vec<wire::MusicBotSummary>,
     caps: Vec<wire::SummonCap>,
+    homes: Vec<wire::SummonHome>,
     caps_known: bool,
     on_cap_saved: EventHandler<()>,
     on_connect: EventHandler<wire::BotId>,
@@ -277,7 +282,8 @@ struct BotsTableProps {
 
 #[component]
 fn BotsTable(props: BotsTableProps) -> Element {
-    let groups: Vec<SummonServerGroup> = summon_groups::group_summon_caps(&props.rows, &props.caps);
+    let groups: Vec<SummonServerGroup> =
+        summon_groups::group_summon_settings(&props.rows, &props.caps, &props.homes);
     let caps_known = props.caps_known;
     let on_cap_saved = props.on_cap_saved;
     rsx! {
@@ -305,6 +311,14 @@ fn BotsTable(props: BotsTableProps) -> Element {
                                     key: "{group.server_addr}:{group.cap:?}",
                                     server_addr: group.server_addr.clone(),
                                     stored: group.cap,
+                                    on_saved: on_cap_saved,
+                                }
+                            }
+                            if caps_known {
+                                SummonHomeEditor {
+                                    key: "{group.server_addr}:home:{group.home:?}",
+                                    server_addr: group.server_addr.clone(),
+                                    stored: group.home,
                                     on_saved: on_cap_saved,
                                 }
                             }
@@ -486,6 +500,7 @@ fn SummonCapEditor(props: SummonCapEditorProps) -> Element {
                         id: "summon-cap-{server_label}",
                         class: "input",
                         inputmode: "numeric",
+                        title: "Temporary summon clients this server may have at once. 0 turns summon off. Any other number allows at least two.",
                         value: "{draft.read()}",
                         oninput: move |e| draft.set(e.value()),
                     }
@@ -496,6 +511,141 @@ fn SummonCapEditor(props: SummonCapEditorProps) -> Element {
                         onclick: on_save,
                         "Save"
                     }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Props, Clone, PartialEq)]
+struct SummonHomeEditorProps {
+    server_addr: String,
+    stored: Option<u64>,
+    on_saved: EventHandler<()>,
+}
+
+/// Picks the channel this server's summon clients wait in. "No home
+/// picked" is a real choice: a summon client then disconnects when it is
+/// done instead of waiting in a public channel.
+#[component]
+fn SummonHomeEditor(props: SummonHomeEditorProps) -> Element {
+    let gate = use_auth_gate();
+    let toaster = use_toaster();
+    let stored = props.stored;
+    let stored_text = summon_groups::summon_home_field_after_failed_save(stored);
+    let mut draft: Signal<String> = use_signal(|| stored_text.clone());
+    let mut submitting: Signal<bool> = use_signal(|| false);
+    let server_addr = props.server_addr.clone();
+    let server_label = server_addr.clone();
+    let on_saved = props.on_saved;
+
+    let channels = use_resource({
+        let gate = gate.clone();
+        let server_addr = server_addr.clone();
+        move || {
+            let gate = gate.clone();
+            let server_addr = server_addr.clone();
+            async move { mb::list_summon_home_channels(gate, &server_addr).await }
+        }
+    });
+    let (loaded, load_error) = match &*channels.read_unchecked() {
+        Some(Ok(list)) => (Some(list.channels.clone()), None),
+        Some(Err(e)) => (None, Some(format_error(e))),
+        None => (None, None),
+    };
+    let options = summon_groups::summon_home_options(stored, loaded.as_deref().unwrap_or(&[]));
+    let note = summon_groups::summon_home_note(stored, loaded.as_deref());
+    let labels = options.clone();
+
+    let on_save = move |_| {
+        if *submitting.read() {
+            return;
+        }
+        let picked = draft.read().trim().to_string();
+        let Ok(channel_id) = summon_groups::parse_summon_home_field(&picked) else {
+            toaster.push(
+                ToastVariant::Danger,
+                "Summon home was not saved",
+                Some("Pick a channel from the list.".into()),
+            );
+            draft.set(stored_text.clone());
+            return;
+        };
+        submitting.set(true);
+        let gate = gate.clone();
+        let server_addr = server_addr.clone();
+        let stored_text = stored_text.clone();
+        let on_saved = on_saved;
+        let label = labels
+            .iter()
+            .find(|(value, _)| *value == picked)
+            .map(|(_, label)| label.clone())
+            .unwrap_or_else(|| picked.clone());
+        spawn(async move {
+            let body = wire::SummonHome {
+                server_addr: server_addr.clone(),
+                channel_id,
+            };
+            match mb::put_summon_home(gate, &body).await {
+                Ok(_) => {
+                    submitting.set(false);
+                    let title = match channel_id {
+                        Some(_) => format!("Summon home for {server_addr} is {label}"),
+                        None => format!("Summon home for {server_addr} is cleared"),
+                    };
+                    toaster.push(ToastVariant::Success, title, None);
+                    on_saved.call(());
+                }
+                Err(e) => {
+                    submitting.set(false);
+                    draft.set(stored_text);
+                    toaster.push(
+                        ToastVariant::Danger,
+                        "Summon home was not saved",
+                        Some(format_error(&e)),
+                    );
+                }
+            }
+        });
+    };
+
+    rsx! {
+        tr { class: "summon-cap-row", key: "home-{server_label}",
+            td { colspan: "5",
+                div { class: "summon-cap-editor",
+                    label {
+                        r#for: "summon-home-{server_label}",
+                        "Summon home"
+                    }
+                    span { class: "muted", "{server_label}" }
+                    select {
+                        id: "summon-home-{server_label}",
+                        class: "input",
+                        title: "Channel summon clients wait in when they are not playing for anyone. A summon still moves one into the caller's channel.",
+                        value: "{draft.read()}",
+                        onchange: move |e| draft.set(e.value()),
+                        for (value, label) in options.iter() {
+                            option {
+                                key: "{value}",
+                                value: "{value}",
+                                selected: *value == *draft.read(),
+                                "{label}"
+                            }
+                        }
+                    }
+                    Button {
+                        variant: ButtonVariant::Secondary,
+                        size: ButtonSize::Small,
+                        loading: *submitting.read(),
+                        onclick: on_save,
+                        "Save"
+                    }
+                }
+                if let Some(note) = note {
+                    p { class: "summon-home-note muted", "{note}" }
+                }
+                if let Some(err) = load_error {
+                    p { class: "summon-home-note muted", "Channels could not be loaded: {err}" }
                 }
             }
         }

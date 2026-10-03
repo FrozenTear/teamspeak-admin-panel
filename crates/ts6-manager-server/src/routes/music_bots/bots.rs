@@ -167,12 +167,14 @@ async fn create(
     // or release the lock first.
     let mut push = super::summon::PushCapGuard::acquire(&state, &req.server_addr).await;
     let summon_cap = super::summon::cap_for_push(&state, &req.server_addr).await;
+    let summon_home = super::summon::home_for_push(&state, &req.server_addr).await;
     let spawned = supervisor
         .spawn_with_summon_cap(
             config,
             state.yt_cookie.clone(),
             state.yt_api_key.clone(),
             summon_cap,
+            summon_home,
         )
         .await;
     push.finish().await;
@@ -427,7 +429,7 @@ fn hosts_equal(configured: &str, parsed: &str) -> bool {
         .eq_ignore_ascii_case(parsed)
 }
 
-async fn server_for_addr(
+pub(super) async fn server_for_addr(
     state: &AppState,
     server_addr: &str,
 ) -> Result<ServerConnection, Response> {

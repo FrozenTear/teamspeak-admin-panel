@@ -14,7 +14,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use music_bot::runtime_api::{
     BugReportContextResponse, ListResponse, MutateOp, SendRequest, SettingsRequest, SpawnRequest,
-    SpawnResponse, StoreOp, SummonCapBody, SummonHeardBody, WireError, store_err_from_wire,
+    SpawnResponse, StoreOp, SummonCapBody, SummonHeardBody, SummonHomeBody, WireError,
+    store_err_from_wire,
 };
 use music_bot::{
     BotCommand, BotConfig, BotEvent, BotId, BotInfo, BotSupervisor, LibraryEntry, LibraryEntryId,
@@ -233,6 +234,16 @@ enum FrontInner {
     Remote(RemoteMusicRuntime),
 }
 
+/// Apply the home a push carries to the in-process director, as the
+/// remote process does for `SpawnRequest::summon_home`.
+fn note_local_home(supervisor: &BotSupervisor, server: &str, home: Option<u64>) {
+    if let Some(home) = home
+        && let Err(err) = supervisor.set_summon_home(server, Some(home))
+    {
+        warn!(%server, home, error = %err, "summon home on a push was refused");
+    }
+}
+
 impl MusicBotFront {
     pub fn local(supervisor: Arc<BotSupervisor>) -> Self {
         Self {
@@ -312,6 +323,7 @@ impl MusicBotFront {
                     config,
                     id: None,
                     summon_cap: None,
+                    summon_home: None,
                 })
                 .await
             }
@@ -334,6 +346,7 @@ impl MusicBotFront {
                     config,
                     id: Some(id.0),
                     summon_cap: None,
+                    summon_home: None,
                 })
                 .await
             }
@@ -341,13 +354,16 @@ impl MusicBotFront {
     }
 
     /// Spawn a saved bot and, when `summon_cap` is `Some`, carry that
-    /// server's number on the push. `None` does not arm summon.
+    /// server's number on the push. `None` does not arm summon. A
+    /// `summon_home` is the stored home channel; `None` leaves the home
+    /// the process holds.
     pub async fn spawn_with_summon_cap(
         &self,
         config: BotConfig,
         yt_cookie: Arc<RwLock<Option<PathBuf>>>,
         yt_api_key: Arc<RwLock<Option<String>>>,
         summon_cap: Option<u32>,
+        summon_home: Option<u64>,
     ) -> Result<BotId, MusicRuntimeError> {
         let server = config.server_addr.clone();
         let identity = config.identity_path.clone();
@@ -355,6 +371,7 @@ impl MusicBotFront {
             FrontInner::Local(s) => {
                 let id = s.spawn(config, yt_cookie, yt_api_key).await;
                 s.note_summon_push(&server, id.0, summon_cap, &identity);
+                note_local_home(s, &server, summon_home);
                 // The push has been applied. A later error is the reply,
                 // not a rejected cap: a delivered request can time out or
                 // fail to decode on the way back.
@@ -371,14 +388,15 @@ impl MusicBotFront {
                     config,
                     id: None,
                     summon_cap,
+                    summon_home,
                 })
                 .await
             }
         }
     }
 
-    /// Rehydrate a saved bot and carry the server's summon cap when one
-    /// is stored.
+    /// Rehydrate a saved bot and carry the server's summon cap and home
+    /// channel when they are stored.
     pub async fn spawn_with_id_and_summon(
         &self,
         id: BotId,
@@ -386,6 +404,7 @@ impl MusicBotFront {
         yt_cookie: Arc<RwLock<Option<PathBuf>>>,
         yt_api_key: Arc<RwLock<Option<String>>>,
         summon_cap: Option<u32>,
+        summon_home: Option<u64>,
     ) -> Result<BotId, MusicRuntimeError> {
         let server = config.server_addr.clone();
         let identity = config.identity_path.clone();
@@ -393,6 +412,7 @@ impl MusicBotFront {
             FrontInner::Local(s) => {
                 let id = s.spawn_with_id(id, config, yt_cookie, yt_api_key).await;
                 s.note_summon_push(&server, id.0, summon_cap, &identity);
+                note_local_home(s, &server, summon_home);
                 Ok(id)
             }
             FrontInner::Remote(r) => {
@@ -400,6 +420,7 @@ impl MusicBotFront {
                     config,
                     id: Some(id.0),
                     summon_cap,
+                    summon_home,
                 })
                 .await
             }
@@ -431,6 +452,33 @@ impl MusicBotFront {
                 .accept_summon_cap(server_addr, cap)
                 .map_err(MusicRuntimeError::Unavailable),
             FrontInner::Remote(r) => r.set_summon_cap(server_addr, cap).await,
+        }
+    }
+
+    /// The home channel the music process holds for this server. An
+    /// error is a failed read, not a refused channel.
+    pub async fn read_summon_home(
+        &self,
+        server_addr: &str,
+    ) -> Result<Option<u64>, MusicRuntimeError> {
+        match &self.inner {
+            FrontInner::Local(s) => Ok(s.summon().home(server_addr)),
+            FrontInner::Remote(r) => r.read_summon_home(server_addr).await,
+        }
+    }
+
+    /// Forward a home channel to the music process. `None` clears it. An
+    /// `Err` does not by itself mean the process kept the old home.
+    pub async fn set_summon_home(
+        &self,
+        server_addr: &str,
+        home: Option<u64>,
+    ) -> Result<(), MusicRuntimeError> {
+        match &self.inner {
+            FrontInner::Local(s) => s
+                .set_summon_home(server_addr, home)
+                .map_err(MusicRuntimeError::Unavailable),
+            FrontInner::Remote(r) => r.set_summon_home(server_addr, home).await,
         }
     }
 
@@ -488,8 +536,8 @@ impl MusicBotFront {
         }
     }
 
-    /// Quiet-client count for tests and the local process. `None` when
-    /// this front is only an HTTP client.
+    /// Summon clients the local process holds right now. `None` when this
+    /// front is only an HTTP client.
     #[cfg(test)]
     pub fn local_quiet_count(&self, server_addr: &str) -> Option<usize> {
         match &self.inner {
@@ -498,21 +546,47 @@ impl MusicBotFront {
         }
     }
 
-    /// Slot ids of the in-process quiet clients. `None` on a remote front.
+    /// Summon clients the local process may hold at once for this server:
+    /// 0 when summon is off or not armed, otherwise the cap and never
+    /// fewer than [`music_bot::MIN_PARALLEL_SUMMONS`]. `None` on a remote
+    /// front.
     #[cfg(test)]
-    pub fn local_slot_ids(&self, server_addr: &str) -> Option<Vec<u32>> {
+    pub fn local_summon_limit(&self, server_addr: &str) -> Option<usize> {
         match &self.inner {
-            FrontInner::Local(s) => Some(s.summon().slot_ids(server_addr)),
+            FrontInner::Local(s) => Some(s.summon().limit(server_addr)),
             FrontInner::Remote(_) => None,
         }
     }
 
-    /// Drop one in-process quiet client. Saved bots stay. `None` on a
+    /// Ids of the in-process summon clients. `None` on a remote front.
+    #[cfg(test)]
+    pub fn local_summon_ids(&self, server_addr: &str) -> Option<Vec<u64>> {
+        match &self.inner {
+            FrontInner::Local(s) => Some(s.summon().summon_ids(server_addr)),
+            FrontInner::Remote(_) => None,
+        }
+    }
+
+    /// Stop one in-process summon client. Saved bots stay. `None` on a
     /// remote front.
     #[cfg(test)]
-    pub fn local_drop_quiet(&self, server_addr: &str, slot: u32) -> Option<bool> {
+    pub fn local_drop_summon(&self, server_addr: &str, summon: u64) -> Option<bool> {
         match &self.inner {
-            FrontInner::Local(s) => Some(s.summon().drop_quiet(server_addr, slot)),
+            FrontInner::Local(s) => Some(s.summon().drop_summon(server_addr, summon)),
+            FrontInner::Remote(_) => None,
+        }
+    }
+
+    /// A summon line heard on the local process, as a saved bot hands it
+    /// over. `None` on a remote front.
+    #[cfg(test)]
+    pub fn local_hear_crossing(&self, server_addr: &str, caller: u16, line: &str) -> Option<()> {
+        match &self.inner {
+            FrontInner::Local(s) => {
+                s.summon()
+                    .hear(server_addr, caller, line, music_bot::Heard::Crossing);
+                Some(())
+            }
             FrontInner::Remote(_) => None,
         }
     }
@@ -1017,6 +1091,51 @@ impl RemoteMusicRuntime {
         self.reject_unauthorized("summon heard", resp.status())?;
         if !resp.status().is_success() {
             return Err(runtime_err(format!("summon heard: {}", resp.status())));
+        }
+        self.clear_auth_latch();
+        Ok(())
+    }
+
+    async fn read_summon_home(&self, server_addr: &str) -> Result<Option<u64>, MusicRuntimeError> {
+        let resp = self
+            .authorize(
+                self.http
+                    .get(format!("{}/v1/summon-home", self.base))
+                    .query(&[("serverAddr", server_addr)]),
+            )?
+            .send()
+            .await
+            .map_err(|e| runtime_err(format!("summon home read: {e}")))?;
+        self.reject_unauthorized("summon home read", resp.status())?;
+        if !resp.status().is_success() {
+            return Err(runtime_err(format!("summon home read: {}", resp.status())));
+        }
+        self.clear_auth_latch();
+        let body: SummonHomeBody = resp
+            .json()
+            .await
+            .map_err(|e| runtime_err(format!("summon home read: {e}")))?;
+        Ok(body.channel_id)
+    }
+
+    async fn set_summon_home(
+        &self,
+        server_addr: &str,
+        home: Option<u64>,
+    ) -> Result<(), MusicRuntimeError> {
+        let resp = self
+            .authorize(self.http.put(format!("{}/v1/summon-home", self.base)).json(
+                &SummonHomeBody {
+                    server_addr: server_addr.to_string(),
+                    channel_id: home,
+                },
+            ))?
+            .send()
+            .await
+            .map_err(|e| runtime_err(format!("summon home: {e}")))?;
+        self.reject_unauthorized("summon home", resp.status())?;
+        if !resp.status().is_success() {
+            return Err(runtime_err(format!("summon home: {}", resp.status())));
         }
         self.clear_auth_latch();
         Ok(())
@@ -2403,11 +2522,29 @@ mod tests {
                 Arc::clone(&cookie),
                 Arc::clone(&key),
                 Some(2),
+                None,
             )
             .await
             .expect("spawn with cap");
-        assert_eq!(supervisor.summon().quiet_count(server), 2);
+        assert!(supervisor.summon().armed(server));
+        assert_eq!(supervisor.summon().limit(server), 2);
+        // Arming starts nobody. A summon client exists only for a request.
+        assert_eq!(supervisor.summon().quiet_count(server), 0);
         assert_eq!(front.list().await.unwrap().len(), 1);
+        assert_eq!(
+            front.read_summon_home(server).await.expect("read home"),
+            None
+        );
+
+        front
+            .set_summon_home(server, Some(12))
+            .await
+            .expect("put home");
+        assert_eq!(supervisor.summon().home(server), Some(12));
+        assert_eq!(
+            front.read_summon_home(server).await.expect("read home"),
+            Some(12)
+        );
 
         front
             .spawn_with_summon_cap(
@@ -2420,11 +2557,20 @@ mod tests {
                 Arc::clone(&cookie),
                 Arc::clone(&key),
                 Some(9),
+                Some(14),
             )
             .await
             .expect("second spawn");
-        assert_eq!(supervisor.summon().quiet_count(server), 2);
+        assert_eq!(supervisor.summon().limit(server), 2);
         assert_eq!(supervisor.summon().cap(server), Some(2));
+        // The stored home rides on a push.
+        assert_eq!(supervisor.summon().home(server), Some(14));
+
+        front
+            .hear_summon("10.4.0.1", 31, "!play https://cdn.example/one.mp3")
+            .await
+            .expect("forward a heard summon");
+        assert_eq!(supervisor.summon().quiet_count(server), 1);
 
         front
             .spawn_with_summon_cap(
@@ -2437,11 +2583,19 @@ mod tests {
                 cookie,
                 key,
                 None,
+                None,
             )
             .await
             .expect("other server");
-        assert_eq!(supervisor.summon().quiet_count(other), 0);
+        assert_eq!(supervisor.summon().limit(other), 0);
         assert_eq!(supervisor.summon().cap(other), None);
+        assert_eq!(supervisor.summon().home(other), None);
         assert_eq!(front.list().await.unwrap().len(), 3);
+
+        front
+            .set_summon_home(server, None)
+            .await
+            .expect("clear home");
+        assert_eq!(front.read_summon_home(server).await.expect("read"), None);
     }
 }

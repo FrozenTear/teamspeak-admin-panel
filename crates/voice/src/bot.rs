@@ -2483,42 +2483,70 @@ struct ChatLine {
     invoker: String,
     invoker_id: u16,
     text: String,
+    origin: ChatOrigin,
 }
 
-/// Pluck out incoming `MessageTarget::Channel` chat lines from a
-/// `BookEvents` `StreamItem`. We deliberately filter:
-/// - **Target**: only `Channel` (server-wide and private chat go elsewhere
-///   — and they aren't what `!`-commands operate on).
+/// Where a chat line reached this bot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatOrigin {
+    /// Channel chat in this bot's own channel: the bot's own command.
+    Channel,
+    /// A summon line sent to this bot as a private message, a poke, or
+    /// server chat. `caller_here` is true when the sender sits in this
+    /// bot's channel, where channel chat is the way to ask this bot.
+    Summon { caller_here: bool },
+}
+
+/// Pluck out incoming chat lines from a `BookEvents` `StreamItem`:
+/// - **Channel** chat is this bot's command, as before summon existed.
+/// - **Private message, poke, or server chat** is kept only when it is a
+///   summon line (`!play` / `!radio`). The bot does not play it; it is
+///   handed to the summon director.
 /// - **Invoker**: skip the bot's own client id, otherwise the bot would
 ///   parse its own replies if a reply ever started with `!`.
 ///
 /// Returns an empty `Vec` for non-`BookEvents` items and for items that
-/// carried no channel chat — the common case stays cheap.
+/// carried no such chat — the common case stays cheap.
 fn extract_channel_chat(item: &StreamItem, con: &Connection) -> Vec<ChatLine> {
     let StreamItem::BookEvents(events) = item else {
         return Vec::new();
     };
-    let own_client_id = match con.get_state() {
-        Ok(book) => Some(book.own_client),
-        Err(_) => None,
-    };
+    let book = con.get_state().ok();
+    let own_client_id = book.map(|book| book.own_client);
+    let own_channel =
+        book.and_then(|book| book.clients.get(&book.own_client).map(|own| own.channel.0));
     let mut out = Vec::new();
     for ev in events {
-        if let BookEvent::Message {
-            target: MessageTarget::Channel,
+        let BookEvent::Message {
+            target,
             invoker,
             message,
         } = ev
-        {
-            if Some(invoker.id) == own_client_id {
-                continue;
-            }
-            out.push(ChatLine {
-                invoker: invoker.name.clone(),
-                invoker_id: invoker.id.0,
-                text: message.clone(),
-            });
+        else {
+            continue;
+        };
+        if Some(invoker.id) == own_client_id {
+            continue;
         }
+        let origin = match target {
+            MessageTarget::Channel => ChatOrigin::Channel,
+            MessageTarget::Server | MessageTarget::Client(_) | MessageTarget::Poke(_) => {
+                if !crate::summon::is_summon_line(message) {
+                    continue;
+                }
+                let caller_channel = book
+                    .and_then(|book| book.clients.get(&invoker.id).map(|client| client.channel.0));
+                ChatOrigin::Summon {
+                    caller_here: caller_channel.is_some() && caller_channel == own_channel,
+                }
+            }
+        };
+        out.push(ChatLine {
+            invoker: invoker.name.clone(),
+            invoker_id: invoker.id.0,
+            text: message.clone(),
+            origin,
+        });
     }
     out
 }
@@ -2544,6 +2572,21 @@ async fn dispatch_chat_line(
     bot_volume: &VolumeHandle,
     msg: &ChatLine,
 ) {
+    if let ChatOrigin::Summon { caller_here } = msg.origin {
+        // Not this bot's command. Someone in another channel asked for a
+        // temporary client; one in this channel uses channel chat.
+        info!(
+            invoker = %msg.invoker,
+            caller_here,
+            "summon line heard by a saved bot"
+        );
+        if caller_here {
+            crate::summon::saved_bot_claims_line(server, msg.invoker_id, &msg.text);
+        } else {
+            crate::summon::saved_bot_heard_crossing(server, msg.invoker_id, &msg.text);
+        }
+        return;
+    }
     match chat::parse(&msg.text) {
         Ok(parsed) => {
             // PURA-330 — INFO so the chat-command-received timestamp is in
@@ -2553,12 +2596,9 @@ async fn dispatch_chat_line(
             // the command-dispatch latency the issue calls out as
             // previously unmeasured.
             info!(target: "music_bot_latency", invoker = %msg.invoker, command = ?parsed, "chat command received");
-            // A summon the quiet pool claims is not this bot's song. The
-            // sitting client moves on its own connection. Channel text
-            // from here is not forwarded.
-            if crate::summon::saved_bot_yields_summon(server, msg.invoker_id, &msg.text) {
-                return;
-            }
+            // This bot plays its own channel's `!play`. The panel's copy of
+            // the same line must not summon a second client in here.
+            crate::summon::saved_bot_claims_line(server, msg.invoker_id, &msg.text);
             // PURA-396 — `chat::handle_command` is `Connection`-free; the
             // reply rides the `WireSink` (a direct `send_reply`, or a
             // `WireCmd::ChatReply` to the wire task in the split path).
