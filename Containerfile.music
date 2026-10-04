@@ -39,7 +39,7 @@ RUN cargo build --release --locked --bin ts6-manager-music \
 # -----------------------------------------------------------------------------
 FROM docker.io/debian:bookworm-slim
 
-ARG YTDLP_VERSION=2026.03.17
+ARG YTDLP_VERSION=2026.08.19
 ARG DENO_VERSION=v2.7.14
 ARG TARGETARCH
 RUN apt-get update \
