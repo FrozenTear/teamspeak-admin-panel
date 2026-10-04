@@ -497,36 +497,33 @@ async fn recv_frame_unless(
     }
 }
 
-/// Whether the seated send loop is holding frames, and how long the
-/// last hold lasted. The sibling parks on the same transitions. The
-/// pipeline stays spawned, so resume continues the same playback.
+/// Whether the seated send loop is holding frames. The sibling parks on
+/// the same transitions. The pipeline stays spawned, so resume continues
+/// the same playback.
+///
+/// `lifted` is the last resume. A frame queued before that resume waited
+/// through every hold since it was stamped, including an earlier pause
+/// that a second pause would otherwise overwrite. The send path reads the
+/// dequeue gap from the stamp, so the stamp becomes the later of the
+/// enqueue time and that lift.
 struct PlaybackHold {
     paused: bool,
-    started: Option<Instant>,
-    /// When the last hold lifted, and how long it lasted. A frame stamped
-    /// before that lift waited through the hold, which is not a send stall.
-    lifted: Option<(Instant, Duration)>,
+    lifted: Option<Instant>,
 }
 
 impl PlaybackHold {
     fn new() -> Self {
         Self {
             paused: false,
-            started: None,
             lifted: None,
         }
     }
 
     fn apply(&mut self, current: &Option<ActiveAudio>, pause: bool) {
         if pause {
-            if !self.paused {
-                self.started = Some(Instant::now());
-            }
             self.paused = true;
         } else if self.paused {
-            if let Some(started) = self.started.take() {
-                self.lifted = Some((Instant::now(), started.elapsed()));
-            }
+            self.lifted = Some(Instant::now());
             self.paused = false;
         }
         if let Some(active) = current {
@@ -537,18 +534,18 @@ impl PlaybackHold {
     /// A new song replaces the pipeline. Its frames were not held.
     fn clear_for_new_song(&mut self) {
         self.paused = false;
-        self.started = None;
         self.lifted = None;
     }
 
-    /// Move a stamp that waited through the hold forward by the hold, so
-    /// the send path's dequeue gap is the wait outside the pause.
+    /// A frame stamped before the last resume waited through the holds.
+    /// Its stamp becomes the later of the enqueue time and the lift, so
+    /// the dequeue gap is only the wait after that resume. Adding only
+    /// the last pause length leaves an earlier pause in the gap, and the
+    /// 10 ms check logs a false stall.
     fn stamp(&self, enqueued_at: Instant) -> Instant {
         match self.lifted {
-            Some((lifted, held)) if enqueued_at < lifted => {
-                enqueued_at.checked_add(held).unwrap_or(enqueued_at)
-            }
-            _ => enqueued_at,
+            Some(lifted) => enqueued_at.max(lifted),
+            None => enqueued_at,
         }
     }
 }
@@ -599,8 +596,8 @@ fn react(
                 return Vec::new();
             };
             director.note_clients(server, summon, &clients);
-            // Commands in this batch are kept in order. A later pause
-            // must not replace an earlier song.
+            // The last song in this batch is the one that starts. A pause
+            // after that song is kept, so it holds the song that won.
             let mut batch = Vec::new();
             for event in events {
                 let BookEvent::Message {
@@ -738,13 +735,22 @@ fn command_react(line: Line) -> React {
     }
 }
 
-/// Append one channel command. `Some` is a stop, which ends the batch
-/// the way a single command always did. A pause is appended, so it does
-/// not replace a song already in the batch.
+/// Record one channel command. `Some` is a stop, which ends the batch
+/// the way a single command always did.
+///
+/// A song replaces the batch, so the last song is the one that starts.
+/// Starting an earlier song as well ends playback when that song is
+/// rejected before it plays, and the song that won never starts. A pause
+/// or resume after the song that won is kept, so it still holds that song.
 fn note_command(batch: &mut Vec<React>, line: Line) -> Option<Outcome> {
     match command_react(line) {
         React::Done(outcome) => Some(outcome),
         React::Stay => None,
+        React::Play(arg) => {
+            batch.clear();
+            batch.push(React::Play(arg));
+            None
+        }
         react => {
             batch.push(react);
             None
@@ -1082,10 +1088,77 @@ mod tests {
             )
             .is_none()
         );
+        // The song replaces the batch, so the earlier pause does not
+        // hold a playback that has not started.
         assert!(matches!(
             pause_then_song.as_slice(),
-            [React::Pause, React::Play(_)]
+            [React::Play(arg)] if arg == "yt:after"
         ));
+    }
+
+    /// The last song in one batch is the one that starts. A metadata URL
+    /// is rejected before it plays; if that line stayed in the batch, the
+    /// send loop would end the song there and the next line would never
+    /// start. A pause after the song that won still holds it.
+    #[tokio::test]
+    async fn a_rejected_first_song_in_a_batch_does_not_drop_the_second() {
+        let rejected = "http://169.254.169.254/latest/meta-data";
+        let kept = "synthetic://?hz=440&duration_ms=400&amplitude=0.2";
+        let mut batch = Vec::new();
+        assert!(
+            note_command(
+                &mut batch,
+                line_for(MessageTarget::Channel, &format!("!play {rejected}"))
+            )
+            .is_none()
+        );
+        assert!(
+            note_command(
+                &mut batch,
+                line_for(MessageTarget::Channel, &format!("!play {kept}"))
+            )
+            .is_none()
+        );
+        assert!(note_command(&mut batch, line_for(MessageTarget::Channel, "!pause")).is_none());
+
+        let mut current: Option<ActiveAudio> = None;
+        let volume = VolumeHandle::default();
+        let mut hold = PlaybackHold::new();
+        let mut started = None;
+        for step in batch {
+            match step {
+                React::Stay => {}
+                React::Pause => hold.apply(&current, true),
+                React::Resume => hold.apply(&current, false),
+                React::Play(arg) => {
+                    hold.clear_for_new_song();
+                    let source = crate::command::AudioSource::Url(arg);
+                    match audio::start_pipeline(&mut current, &source, None, &volume).await {
+                        Ok(label) => started = Some(label),
+                        // The send loop ends the song on the first resolve
+                        // that fails. A rejected earlier line therefore
+                        // drops every song after it.
+                        Err(_) => {
+                            audio::tear_down(&mut current);
+                            break;
+                        }
+                    }
+                }
+                React::Done(_) => break,
+            }
+        }
+
+        let label = started.expect("the rejected song ended playback before the last song");
+        assert!(
+            label.starts_with("synthetic("),
+            "played {label} instead of the last song"
+        );
+        assert!(current.is_some(), "the last song did not start");
+        assert!(
+            hold.paused,
+            "the pause after the song that won did not hold it"
+        );
+        audio::tear_down(&mut current);
     }
 
     #[test]
@@ -1278,22 +1351,50 @@ mod tests {
     #[test]
     fn a_pause_hold_is_not_a_send_stall() {
         // The send path warns when a frame's dequeue gap reaches 10 ms.
-        // A hold is not that gap: the stamp moves forward by the hold.
+        // A hold is not that gap: the stamp moves to the lift.
         let enqueued = Instant::now();
-        let held = Duration::from_millis(400);
-        let lifted = enqueued + held;
-        let hold = PlaybackHold {
-            paused: false,
-            started: None,
-            lifted: Some((lifted, held)),
-        };
+        let mut hold = PlaybackHold::new();
+        hold.apply(&None, true);
+        std::thread::sleep(Duration::from_millis(30));
+        let before_lift = Instant::now();
+        hold.apply(&None, false);
+        assert!(before_lift.saturating_duration_since(enqueued) >= Duration::from_millis(25));
         let stamp = hold.stamp(enqueued);
-        let gap = lifted.saturating_duration_since(stamp);
         assert!(
-            gap < Duration::from_millis(10),
-            "the hold still looks like a loop stall: {gap:?}"
+            stamp >= before_lift,
+            "a single pause still looks like a loop stall"
         );
-        let after = lifted + Duration::from_millis(1);
+        let after = Instant::now();
+        assert_eq!(hold.stamp(after), after);
+    }
+
+    #[test]
+    fn two_pauses_before_a_queued_frame_are_not_a_send_stall() {
+        // The frame is queued, then a resume and a second pause both
+        // happen before the send loop takes it. Remembering only the last
+        // pause length leaves the first pause in the dequeue gap.
+        let enqueued = Instant::now();
+        let mut hold = PlaybackHold::new();
+        hold.apply(&None, true);
+        std::thread::sleep(Duration::from_millis(40));
+        hold.apply(&None, false);
+        let first_pause = enqueued.elapsed();
+
+        hold.apply(&None, true);
+        std::thread::sleep(Duration::from_millis(40));
+        let before_lift = Instant::now();
+        hold.apply(&None, false);
+        assert!(
+            first_pause >= Duration::from_millis(30),
+            "the first pause was too short to expose a false stall: {first_pause:?}"
+        );
+        let stamp = hold.stamp(enqueued);
+        let leftover = before_lift.saturating_duration_since(stamp);
+        assert!(
+            stamp >= before_lift,
+            "the first pause is still in the dequeue gap: {leftover:?}"
+        );
+        let after = Instant::now();
         assert_eq!(hold.stamp(after), after);
     }
 
