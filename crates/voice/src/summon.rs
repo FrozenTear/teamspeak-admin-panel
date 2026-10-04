@@ -6,8 +6,12 @@
 //! song ends. Nothing here writes a `music_bot_runtime` row, and nothing
 //! here is returned from [`crate::supervisor::BotSupervisor::list`].
 //!
-//! A summon line is `!play <song>` or `!radio <station>`. It reaches this
-//! module from any channel in one of these ways:
+//! A summon line is `!play <song>` or `!radio <station>`. `!pause` and
+//! `!resume` are not summon lines. The client already playing in the
+//! sender's channel claims them and holds its send loop. A pause or
+//! resume in any other channel stays with the saved bot there. Pause
+//! does not start a client and does not change the cap. A summon line
+//! reaches this module from any channel in one of these ways:
 //!
 //! - a private message, a poke, or server chat to a saved bot, or to a
 //!   summon client that is already connected;
@@ -144,6 +148,10 @@ pub enum SessionCmd {
     /// The home channel changed. Go to the new one, or disconnect when
     /// none is set.
     Home,
+    /// Hold the send loop. The connection and the channel stay.
+    Pause,
+    /// Continue the playback the pause held.
+    Resume,
     /// Stop and disconnect.
     Stop,
 }
@@ -860,6 +868,13 @@ impl SummonState {
     }
 
     fn hear(&mut self, server: &str, caller: u16, line: &str, heard: Heard, now: Instant) {
+        if let Some(hold) = hold_kind(line) {
+            // Not a song. Claim it only for the client already playing
+            // in the sender's channel. With no such client the line is
+            // not claimed: nothing starts and the cap stays as it is.
+            self.claim_hold(server, caller, hold);
+            return;
+        }
         let Some(arg) = song_arg(line) else {
             return;
         };
@@ -967,6 +982,36 @@ impl SummonState {
             cmds_rx: Some(cmds_rx),
         });
         self.next_summon = next_id.saturating_add(1);
+    }
+
+    /// Hand `!pause` / `!resume` to the summon client playing in the
+    /// sender's channel. No seated client there means the line is not
+    /// claimed: no slot is taken, no client is armed, and the stored cap
+    /// is left as it is.
+    fn claim_hold(&mut self, server: &str, caller: u16, hold: Hold) {
+        let Some(pool) = self.pool_mut(server) else {
+            return;
+        };
+        let Some(channel) = pool
+            .clients
+            .iter()
+            .find(|client| client.id == caller)
+            .map(|client| client.channel_id)
+        else {
+            return;
+        };
+        let Some(there) = pool
+            .summons
+            .iter()
+            .find(|summon| summon.phase == Phase::Seated(channel))
+        else {
+            return;
+        };
+        let cmd = match hold {
+            Hold::Pause => SessionCmd::Pause,
+            Hold::Resume => SessionCmd::Resume,
+        };
+        let _ = there.cmds.send(cmd);
     }
 
     fn seat(&mut self, server: &str, summon: u64, channel: u64, saved_bot_here: bool) -> Seat {
@@ -1090,6 +1135,20 @@ fn song_arg(line: &str) -> Option<String> {
         Ok(ParsedCommand::Play { arg } | ParsedCommand::Radio { arg }) => Some(arg),
         _ => None,
     }
+}
+
+/// `!pause` or `!resume` / `!unpause`. Not a summon line.
+fn hold_kind(line: &str) -> Option<Hold> {
+    match parse_chat(line) {
+        Ok(ParsedCommand::Pause) => Some(Hold::Pause),
+        Ok(ParsedCommand::Resume) => Some(Hold::Resume),
+        _ => None,
+    }
+}
+
+enum Hold {
+    Pause,
+    Resume,
 }
 
 /// True for `!play <song>` and `!radio <station>`.
@@ -1398,6 +1457,125 @@ mod tests {
     }
 
     #[test]
+    fn cap_zero_still_does_not_claim_song_lines() {
+        let director = armed(0);
+        director.hear(SERVER, 10, PLAY, Heard::Crossing);
+        director.hear(
+            SERVER,
+            10,
+            "!radio https://radio.example/live",
+            Heard::Panel,
+        );
+        director.hear(SERVER, 10, "!pause", Heard::Crossing);
+        director.hear(SERVER, 10, "!resume", Heard::Panel);
+        assert_eq!(director.quiet_count(SERVER), 0);
+        assert_eq!(director.cap(SERVER), Some(0));
+        assert!(director.lock().claim_unlaunched().is_empty());
+    }
+
+    #[test]
+    fn a_pause_in_a_channel_with_no_playing_quiet_client_is_not_claimed() {
+        let director = armed(2);
+        let cap = director.cap(SERVER);
+        director.hear(SERVER, 10, "!pause", Heard::Panel);
+        director.hear(SERVER, 10, "!resume", Heard::Crossing);
+        director.hear(SERVER, 10, "!unpause", Heard::Panel);
+        assert_eq!(director.quiet_count(SERVER), 0);
+        assert_eq!(director.cap(SERVER), cap);
+        assert!(director.lock().claim_unlaunched().is_empty());
+
+        // A client playing in another channel does not take the line.
+        // The saved bot in the sender's channel keeps it.
+        let (id, mut launch) = seated(&director, 4, 42);
+        director.note_clients(SERVER, id, &[person(10, 7), person(4, 42)]);
+        director.hear(SERVER, 10, "!pause", Heard::Panel);
+        director.hear(SERVER, 10, "!resume", Heard::Crossing);
+        assert!(launch.cmds.try_recv().is_err());
+        assert_eq!(director.seated_channel(SERVER, id), Some(42));
+        assert_eq!(director.quiet_count(SERVER), 1);
+        assert_eq!(director.cap(SERVER), cap);
+    }
+
+    #[test]
+    fn pause_and_resume_are_claimed_by_the_client_playing_in_the_senders_channel() {
+        let director = armed(2);
+        director.set_home(SERVER, Some(HOME)).unwrap();
+        let (id, mut launch) = seated(&director, 10, 42);
+        director.note_clients(
+            SERVER,
+            id,
+            &[person(10, 42), person(11, 1), person(12, HOME)],
+        );
+        let cap = director.cap(SERVER);
+        let ids = director.summon_ids(SERVER);
+
+        director.hear(SERVER, 10, "!pause", Heard::Panel);
+        assert_eq!(launch.cmds.try_recv().unwrap(), SessionCmd::Pause);
+        director.hear(SERVER, 10, "!resume", Heard::Crossing);
+        assert_eq!(launch.cmds.try_recv().unwrap(), SessionCmd::Resume);
+        director.hear(SERVER, 10, "!unpause", Heard::Panel);
+        assert_eq!(launch.cmds.try_recv().unwrap(), SessionCmd::Resume);
+
+        // The client stays seated. It does not go home, and it does not
+        // start playback in channel 1 (the default channel the old quiet
+        // clients called Tech Support).
+        assert_eq!(director.seated_channel(SERVER, id), Some(42));
+        assert!(director.waiting_ids(SERVER).is_empty());
+        assert_eq!(director.summon_ids(SERVER), ids);
+        assert_eq!(director.cap(SERVER), cap);
+        assert!(director.lock().claim_unlaunched().is_empty());
+
+        // Someone in that default channel, or in the home channel, is
+        // not this client. Their pause is not claimed.
+        director.hear(SERVER, 11, "!pause", Heard::Panel);
+        director.hear(SERVER, 12, "!resume", Heard::Panel);
+        assert!(launch.cmds.try_recv().is_err());
+        assert_eq!(director.quiet_count(SERVER), 1);
+        assert_eq!(director.seated_channel(SERVER, id), Some(42));
+        assert_eq!(director.cap(SERVER), cap);
+    }
+
+    #[test]
+    fn a_pause_does_not_stick_a_slot_arm_a_client_or_change_the_cap() {
+        let bare = director();
+        bare.hear(SERVER, 10, "!pause", Heard::Crossing);
+        bare.hear(SERVER, 10, "!resume", Heard::Panel);
+        assert!(!bare.armed(SERVER));
+        assert_eq!(bare.cap(SERVER), None);
+        assert_eq!(bare.quiet_count(SERVER), 0);
+
+        let director = armed(2);
+        director.set_home(SERVER, Some(HOME)).unwrap();
+        let (id, mut launch) = seated(&director, 10, 42);
+        waits_at_home(&director, id);
+        // Waiting is not playing. Pause does not turn the slot into a
+        // song and does not open another client.
+        director.note_clients(SERVER, id, &[person(10, HOME)]);
+        director.hear(SERVER, 10, "!pause", Heard::Panel);
+        director.hear(SERVER, 10, "!resume", Heard::Crossing);
+        assert!(launch.cmds.try_recv().is_err());
+        assert_eq!(director.waiting_ids(SERVER), vec![id]);
+        assert_eq!(director.quiet_count(SERVER), 1);
+        assert_eq!(director.cap(SERVER), Some(2));
+        assert!(director.lock().claim_unlaunched().is_empty());
+    }
+
+    #[test]
+    fn a_stop_sends_the_playing_client_home() {
+        let director = armed(2);
+        director.set_home(SERVER, Some(HOME)).unwrap();
+        let (id, mut launch) = seated(&director, 10, 42);
+        // !stop is the client's own command. It ends the song, and the
+        // session asks where to go. With a home picked, that is home.
+        assert_eq!(director.release(SERVER, id), Homeward::Home(HOME));
+        assert_eq!(director.settle(SERVER, id, HOME), Homeward::Home(HOME));
+        assert_eq!(director.waiting_ids(SERVER), vec![id]);
+        assert_eq!(director.seated_channel(SERVER, id), None);
+        assert!(launch.cmds.try_recv().is_err());
+        assert_eq!(director.cap(SERVER), Some(2));
+    }
+
+    #[test]
     fn a_summon_from_any_channel_is_seated_there() {
         // The quiet pool's old home was "Tech Support". A caller there is
         // seated there like a caller anywhere else.
@@ -1509,7 +1687,7 @@ mod tests {
     #[test]
     fn lines_that_are_not_songs_start_nothing() {
         let director = armed(2);
-        for line in ["!stop", "!np", "hello", "!play", ""] {
+        for line in ["!stop", "!np", "!pause", "!resume", "hello", "!play", ""] {
             director.hear(SERVER, 10, line, Heard::Crossing);
         }
         assert_eq!(director.quiet_count(SERVER), 0);
