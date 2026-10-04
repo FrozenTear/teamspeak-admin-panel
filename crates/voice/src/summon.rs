@@ -6,8 +6,11 @@
 //! song ends. Nothing here writes a `music_bot_runtime` row, and nothing
 //! here is returned from [`crate::supervisor::BotSupervisor::list`].
 //!
-//! A summon line is `!play <song>` or `!radio <station>`. It reaches this
-//! module from any channel in one of these ways:
+//! A summon line is `!play <song>` or `!radio <station>`. `!pause` and
+//! `!resume` are not summon lines. The client that is playing handles
+//! them in its own channel chat. They do not start a client and they
+//! do not change the cap. A summon line reaches this module from any
+//! channel in one of these ways:
 //!
 //! - a private message, a poke, or server chat to a saved bot, or to a
 //!   summon client that is already connected;
@@ -1398,6 +1401,32 @@ mod tests {
     }
 
     #[test]
+    fn a_pause_does_not_start_a_client_or_change_the_cap() {
+        let bare = director();
+        bare.hear(SERVER, 10, "!pause", Heard::Crossing);
+        bare.hear(SERVER, 10, "!resume", Heard::Panel);
+        assert!(!bare.armed(SERVER));
+        assert_eq!(bare.cap(SERVER), None);
+        assert_eq!(bare.quiet_count(SERVER), 0);
+
+        // Waiting in the home channel is not playing. A pause is not a
+        // song, so nothing starts there and the slot stays a waiter.
+        let director = armed(2);
+        director.set_home(SERVER, Some(HOME)).unwrap();
+        let (id, mut launch) = seated(&director, 10, 42);
+        waits_at_home(&director, id);
+        director.note_clients(SERVER, id, &[person(10, HOME)]);
+        director.hear(SERVER, 10, "!pause", Heard::Panel);
+        director.hear(SERVER, 10, "!resume", Heard::Crossing);
+        assert!(launch.cmds.try_recv().is_err());
+        assert_eq!(director.waiting_ids(SERVER), vec![id]);
+        assert_eq!(director.seated_channel(SERVER, id), None);
+        assert_eq!(director.quiet_count(SERVER), 1);
+        assert_eq!(director.cap(SERVER), Some(2));
+        assert!(director.lock().claim_unlaunched().is_empty());
+    }
+
+    #[test]
     fn a_summon_from_any_channel_is_seated_there() {
         // The quiet pool's old home was "Tech Support". A caller there is
         // seated there like a caller anywhere else.
@@ -1509,7 +1538,7 @@ mod tests {
     #[test]
     fn lines_that_are_not_songs_start_nothing() {
         let director = armed(2);
-        for line in ["!stop", "!np", "hello", "!play", ""] {
+        for line in ["!stop", "!np", "!pause", "!resume", "hello", "!play", ""] {
             director.hear(SERVER, 10, line, Heard::Crossing);
         }
         assert_eq!(director.quiet_count(SERVER), 0);

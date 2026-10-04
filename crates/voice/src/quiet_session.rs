@@ -13,9 +13,13 @@
 //! on the music page and waits there on the same connection. The next
 //! summon takes it from there. With no home picked it disconnects
 //! instead, so it never waits in a public channel.
+//!
+//! `!pause` holds the send loop: frames stop and the voice connection
+//! stays up. The client stays in the channel. `!resume` continues that
+//! same playback. `!stop` still ends the song and sends the client home.
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
@@ -257,11 +261,14 @@ impl Session<'_> {
         let mut frames: Option<mpsc::Receiver<AudioMsg>> = None;
         let mut monitor = SendTimingMonitor::new();
         let volume = VolumeHandle::default();
+        // `!pause` closes this gate and parks the sibling. Frames stop
+        // and the voice connection stays up.
+        let mut hold = PlaybackHold::new();
         if let Err(err) = play(live, &request, con, &mut current, &mut frames, &volume).await {
             return Ok(Outcome::ResolveFailed(err));
         }
 
-        let outcome = loop {
+        let outcome = 'play: loop {
             tokio::select! {
                 biased;
                 changed = stop.changed() => {
@@ -271,6 +278,7 @@ impl Session<'_> {
                 }
                 cmd = cmds.recv() => match cmd {
                     Some(SessionCmd::Play(arg)) => {
+                        hold.clear_for_new_song();
                         if let Err(err) =
                             play(live, &arg, con, &mut current, &mut frames, &volume).await
                         {
@@ -283,17 +291,22 @@ impl Session<'_> {
                 },
                 ev = async { con.events().next().await } => match ev {
                     Some(Ok(item)) => {
-                        match react(director, server, summon, own, channel, con, &item) {
-                            React::Stay => {}
-                            React::Play(arg) => {
-                                if let Err(err) =
-                                    play(live, &arg, con, &mut current, &mut frames, &volume)
-                                        .await
-                                {
-                                    break Outcome::ResolveFailed(err);
+                        for step in react(director, server, summon, own, channel, con, &item) {
+                            match step {
+                                React::Stay => {}
+                                React::Pause => hold.apply(&current, true),
+                                React::Resume => hold.apply(&current, false),
+                                React::Play(arg) => {
+                                    hold.clear_for_new_song();
+                                    if let Err(err) =
+                                        play(live, &arg, con, &mut current, &mut frames, &volume)
+                                            .await
+                                    {
+                                        break 'play Outcome::ResolveFailed(err);
+                                    }
                                 }
+                                React::Done(outcome) => break 'play outcome,
                             }
-                            React::Done(outcome) => break outcome,
                         }
                     }
                     Some(Err(err)) => {
@@ -302,12 +315,13 @@ impl Session<'_> {
                     }
                     None => break Outcome::ConnectionLost,
                 },
-                msg = recv_frame(&mut frames) => match msg {
+                msg = recv_frame_unless(&mut frames, hold.paused) => match msg {
                     Some(AudioMsg::Frame { bytes, enqueued_at, .. }) => {
+                        let enqueued_at = hold.stamp(enqueued_at);
                         if let Err(err) =
-                            audio::send_opus_frame(con, &bytes, enqueued_at, &mut monitor, false)
+                            send_quiet_frame(con, &bytes, enqueued_at, &mut monitor)
                         {
-                            break Outcome::SendFailed(err.to_string());
+                            break Outcome::SendFailed(err);
                         }
                     }
                     Some(AudioMsg::Finished) | None => break Outcome::SongEnded,
@@ -470,13 +484,101 @@ async fn recv_frame(frames: &mut Option<mpsc::Receiver<AudioMsg>>) -> Option<Aud
     }
 }
 
+/// The send loop's frame arm. While `paused` is set this stays pending,
+/// so a frame already queued is left there and nothing goes on the wire.
+async fn recv_frame_unless(
+    frames: &mut Option<mpsc::Receiver<AudioMsg>>,
+    paused: bool,
+) -> Option<AudioMsg> {
+    if paused {
+        std::future::pending().await
+    } else {
+        recv_frame(frames).await
+    }
+}
+
+/// Whether the seated send loop is holding frames. The sibling parks on
+/// the same transitions. The pipeline stays spawned, so resume continues
+/// the same playback.
+///
+/// `lifted` is the last resume. A frame queued before that resume waited
+/// through every hold since it was stamped, including an earlier pause
+/// that a second pause would otherwise overwrite. The send path reads the
+/// dequeue gap from the stamp, so the stamp becomes the later of the
+/// enqueue time and that lift.
+struct PlaybackHold {
+    paused: bool,
+    lifted: Option<Instant>,
+}
+
+impl PlaybackHold {
+    fn new() -> Self {
+        Self {
+            paused: false,
+            lifted: None,
+        }
+    }
+
+    fn apply(&mut self, current: &Option<ActiveAudio>, pause: bool) {
+        if pause {
+            self.paused = true;
+        } else if self.paused {
+            self.lifted = Some(Instant::now());
+            self.paused = false;
+        }
+        if let Some(active) = current {
+            active.set_paused(self.paused);
+        }
+    }
+
+    /// A new song replaces the pipeline. Its frames were not held.
+    fn clear_for_new_song(&mut self) {
+        self.paused = false;
+        self.lifted = None;
+    }
+
+    /// A frame stamped before the last resume waited through the holds.
+    /// Its stamp becomes the later of the enqueue time and the lift, so
+    /// the dequeue gap is only the wait after that resume. Adding only
+    /// the last pause length leaves an earlier pause in the gap, and the
+    /// 10 ms check logs a false stall.
+    fn stamp(&self, enqueued_at: Instant) -> Instant {
+        match self.lifted {
+            Some(lifted) => enqueued_at.max(lifted),
+            None => enqueued_at,
+        }
+    }
+}
+
+fn send_quiet_frame(
+    con: &mut impl audio::OutgoingVoice,
+    bytes: &[u8],
+    enqueued_at: std::time::Instant,
+    monitor: &mut SendTimingMonitor,
+) -> Result<(), String> {
+    audio::send_opus_frame(con, bytes, enqueued_at, monitor, false).map_err(|err| err.to_string())
+}
+
 /// What one stream item means for a seated summon client.
 #[derive(Debug, PartialEq, Eq)]
 enum React {
     Stay,
     Play(String),
+    /// Hold the send loop. The connection and the channel stay.
+    Pause,
+    /// Continue the playback the pause held.
+    Resume,
     /// It stops playing for the caller, for this reason.
     Done(Outcome),
+}
+
+#[cfg(test)]
+impl React {
+    /// Pause and resume leave the client where it is. A `Done` ends the
+    /// song, and the session then sends the client home or away.
+    fn leaves_the_channel(&self) -> bool {
+        matches!(self, React::Done(_))
+    }
 }
 
 fn react(
@@ -487,14 +589,16 @@ fn react(
     channel: u64,
     con: &Connection,
     item: &StreamItem,
-) -> React {
+) -> Vec<React> {
     match item {
         StreamItem::BookEvents(events) => {
             let Some((at, clients)) = snapshot(con) else {
-                return React::Stay;
+                return Vec::new();
             };
             director.note_clients(server, summon, &clients);
-            let mut next = React::Stay;
+            // The last song in this batch is the one that starts. A pause
+            // after that song is kept, so it holds the song that won.
+            let mut batch = Vec::new();
             for event in events {
                 let BookEvent::Message {
                     target,
@@ -508,28 +612,30 @@ fn react(
                     continue;
                 }
                 match line_for(*target, message) {
-                    Line::Song(arg) => next = React::Play(arg),
-                    Line::Stop => return React::Done(Outcome::StopCommand),
                     Line::Crossing => {
                         director.hear(server, invoker.id.0, message, Heard::Crossing);
                     }
-                    Line::Ignore => {}
+                    line => {
+                        if let Some(outcome) = note_command(&mut batch, line) {
+                            return vec![React::Done(outcome)];
+                        }
+                    }
                 }
             }
             if at != channel {
-                return React::Done(Outcome::MovedAway);
+                return vec![React::Done(Outcome::MovedAway)];
             }
             // Other summon clients waiting in this channel are not
             // listeners.
             let mut ours = director.summon_clients(server);
             ours.push(own.0);
             if !someone_else_in(&clients, channel, &ours) {
-                return React::Done(Outcome::ChannelEmpty);
+                return vec![React::Done(Outcome::ChannelEmpty)];
             }
-            next
+            batch
         }
-        StreamItem::DisconnectedTemporarily(_) => React::Done(Outcome::ConnectionLost),
-        _ => React::Stay,
+        StreamItem::DisconnectedTemporarily(_) => vec![React::Done(Outcome::ConnectionLost)],
+        _ => Vec::new(),
     }
 }
 
@@ -586,6 +692,10 @@ enum Line {
     Song(String),
     /// `!stop` typed in this client's channel.
     Stop,
+    /// `!pause` typed in this client's channel.
+    Pause,
+    /// `!resume` or `!unpause` typed in this client's channel.
+    Resume,
     /// A summon line sent as server chat, a private message, or a poke.
     /// The director decides where it goes.
     Crossing,
@@ -598,6 +708,8 @@ fn line_for(target: MessageTarget, message: &str) -> Line {
         MessageTarget::Channel => match parse_chat(message) {
             Ok(ParsedCommand::Play { arg } | ParsedCommand::Radio { arg }) => Line::Song(arg),
             Ok(ParsedCommand::Stop) => Line::Stop,
+            Ok(ParsedCommand::Pause) => Line::Pause,
+            Ok(ParsedCommand::Resume) => Line::Resume,
             _ => Line::Ignore,
         },
         MessageTarget::Server | MessageTarget::Client(_) | MessageTarget::Poke(_) => {
@@ -606,6 +718,42 @@ fn line_for(target: MessageTarget, message: &str) -> Line {
             } else {
                 Line::Ignore
             }
+        }
+    }
+}
+
+/// What a channel command means for a client that is already seated.
+/// Pause and resume are not songs: they do not start a resolve and they
+/// do not leave the channel.
+fn command_react(line: Line) -> React {
+    match line {
+        Line::Song(arg) => React::Play(arg),
+        Line::Stop => React::Done(Outcome::StopCommand),
+        Line::Pause => React::Pause,
+        Line::Resume => React::Resume,
+        Line::Crossing | Line::Ignore => React::Stay,
+    }
+}
+
+/// Record one channel command. `Some` is a stop, which ends the batch
+/// the way a single command always did.
+///
+/// A song replaces the batch, so the last song is the one that starts.
+/// Starting an earlier song as well ends playback when that song is
+/// rejected before it plays, and the song that won never starts. A pause
+/// or resume after the song that won is kept, so it still holds that song.
+fn note_command(batch: &mut Vec<React>, line: Line) -> Option<Outcome> {
+    match command_react(line) {
+        React::Done(outcome) => Some(outcome),
+        React::Stay => None,
+        React::Play(arg) => {
+            batch.clear();
+            batch.push(React::Play(arg));
+            None
+        }
+        react => {
+            batch.push(react);
+            None
         }
     }
 }
@@ -880,8 +1028,150 @@ mod tests {
             Line::Song("https://radio.example/live".into())
         );
         assert_eq!(line_for(MessageTarget::Channel, "!stop"), Line::Stop);
+        assert_eq!(line_for(MessageTarget::Channel, "!pause"), Line::Pause);
+        assert_eq!(line_for(MessageTarget::Channel, "!resume"), Line::Resume);
+        assert_eq!(line_for(MessageTarget::Channel, "!unpause"), Line::Resume);
         assert_eq!(line_for(MessageTarget::Channel, "!np"), Line::Ignore);
         assert_eq!(line_for(MessageTarget::Channel, "hello"), Line::Ignore);
+    }
+
+    #[test]
+    fn pause_and_resume_do_not_end_playback_or_start_a_song() {
+        for line in ["!pause", "!resume", "!unpause"] {
+            let react = command_react(line_for(MessageTarget::Channel, line));
+            assert!(
+                matches!(react, React::Pause | React::Resume),
+                "{line} -> {react:?}"
+            );
+            // Not Done: the client stays connected, stays in the channel,
+            // and the summon slot stays taken. Not a song: nothing new
+            // starts, including in the home channel.
+            assert!(!react.leaves_the_channel(), "{line}");
+            assert!(!matches!(react, React::Play(_)), "{line}");
+        }
+    }
+
+    #[test]
+    fn a_pause_in_the_same_batch_does_not_swallow_a_song() {
+        let mut song_then_pause = Vec::new();
+        assert!(
+            note_command(
+                &mut song_then_pause,
+                line_for(MessageTarget::Channel, "!play yt:next")
+            )
+            .is_none()
+        );
+        assert!(
+            note_command(
+                &mut song_then_pause,
+                line_for(MessageTarget::Channel, "!pause")
+            )
+            .is_none()
+        );
+        assert!(matches!(
+            song_then_pause.as_slice(),
+            [React::Play(_), React::Pause]
+        ));
+
+        let mut pause_then_song = Vec::new();
+        assert!(
+            note_command(
+                &mut pause_then_song,
+                line_for(MessageTarget::Channel, "!pause")
+            )
+            .is_none()
+        );
+        assert!(
+            note_command(
+                &mut pause_then_song,
+                line_for(MessageTarget::Channel, "!play yt:after")
+            )
+            .is_none()
+        );
+        // The song replaces the batch, so the earlier pause does not
+        // hold a playback that has not started.
+        assert!(matches!(
+            pause_then_song.as_slice(),
+            [React::Play(arg)] if arg == "yt:after"
+        ));
+    }
+
+    /// The last song in one batch is the one that starts. A metadata URL
+    /// is rejected before it plays; if that line stayed in the batch, the
+    /// send loop would end the song there and the next line would never
+    /// start. A pause after the song that won still holds it.
+    #[tokio::test]
+    async fn a_rejected_first_song_in_a_batch_does_not_drop_the_second() {
+        let rejected = "http://169.254.169.254/latest/meta-data";
+        let kept = "synthetic://?hz=440&duration_ms=400&amplitude=0.2";
+        let mut batch = Vec::new();
+        assert!(
+            note_command(
+                &mut batch,
+                line_for(MessageTarget::Channel, &format!("!play {rejected}"))
+            )
+            .is_none()
+        );
+        assert!(
+            note_command(
+                &mut batch,
+                line_for(MessageTarget::Channel, &format!("!play {kept}"))
+            )
+            .is_none()
+        );
+        assert!(note_command(&mut batch, line_for(MessageTarget::Channel, "!pause")).is_none());
+
+        let mut current: Option<ActiveAudio> = None;
+        let volume = VolumeHandle::default();
+        let mut hold = PlaybackHold::new();
+        let mut started = None;
+        for step in batch {
+            match step {
+                React::Stay => {}
+                React::Pause => hold.apply(&current, true),
+                React::Resume => hold.apply(&current, false),
+                React::Play(arg) => {
+                    hold.clear_for_new_song();
+                    let source = crate::command::AudioSource::Url(arg);
+                    match audio::start_pipeline(&mut current, &source, None, &volume).await {
+                        Ok(label) => started = Some(label),
+                        // The send loop ends the song on the first resolve
+                        // that fails. A rejected earlier line therefore
+                        // drops every song after it.
+                        Err(_) => {
+                            audio::tear_down(&mut current);
+                            break;
+                        }
+                    }
+                }
+                React::Done(_) => break,
+            }
+        }
+
+        let label = started.expect("the rejected song ended playback before the last song");
+        assert!(
+            label.starts_with("synthetic("),
+            "played {label} instead of the last song"
+        );
+        assert!(current.is_some(), "the last song did not start");
+        assert!(
+            hold.paused,
+            "the pause after the song that won did not hold it"
+        );
+        audio::tear_down(&mut current);
+    }
+
+    #[test]
+    fn stop_still_sends_the_client_home() {
+        assert_eq!(line_for(MessageTarget::Channel, "!stop"), Line::Stop);
+        assert!(matches!(
+            command_react(Line::Stop),
+            React::Done(Outcome::StopCommand)
+        ));
+        // Stop ends the song. It does not drop the session, so the client
+        // goes to the home channel instead of disconnecting.
+        assert!(!Outcome::StopCommand.ends_session());
+        assert!(Outcome::ConnectionLost.ends_session());
     }
 
     #[test]
@@ -893,6 +1183,8 @@ mod tests {
         ] {
             assert_eq!(line_for(target, "!play yt:song"), Line::Crossing);
             assert_eq!(line_for(target, "!stop"), Line::Ignore);
+            assert_eq!(line_for(target, "!pause"), Line::Ignore);
+            assert_eq!(line_for(target, "!resume"), Line::Ignore);
             assert_eq!(line_for(target, "hi"), Line::Ignore);
         }
     }
@@ -942,5 +1234,178 @@ mod tests {
             "the server refused the move: ChannelMaxclientsReached"
         );
         assert_eq!(Outcome::SongEnded.to_string(), "the song ended");
+    }
+
+    struct CountingVoice {
+        sends: usize,
+    }
+
+    impl audio::OutgoingVoice for CountingVoice {
+        fn send_audio(
+            &mut self,
+            _packet: tsproto_packets::packets::OutPacket,
+        ) -> std::result::Result<(), tsclientlib::Error> {
+            self.sends += 1;
+            Ok(())
+        }
+
+        fn try_flush_outgoing(&mut self) -> std::result::Result<usize, tsclientlib::Error> {
+            Ok(0)
+        }
+    }
+
+    /// Pause parks the sibling and the send loop. Frames stop, the voice
+    /// connection stays up, and resume reads the same pipeline.
+    #[tokio::test]
+    async fn pause_stops_frames_and_resume_continues_the_same_playback() {
+        let mut current: Option<ActiveAudio> = None;
+        let volume = VolumeHandle::default();
+        let source = crate::command::AudioSource::Url(
+            "synthetic://?hz=440&duration_ms=3000&amplitude=0.2".into(),
+        );
+        audio::start_pipeline(&mut current, &source, None, &volume)
+            .await
+            .expect("synthetic playback");
+        let label = current.as_ref().expect("pipeline").source_label.clone();
+        let mut frames = current.as_mut().and_then(|active| active.audio_rx.take());
+        let mut voice = CountingVoice { sends: 0 };
+        let mut monitor = SendTimingMonitor::new();
+        let mut hold = PlaybackHold::new();
+
+        send_until_paced(&mut frames, &mut voice, &mut monitor).await;
+        let sends_before = voice.sends;
+
+        hold.apply(&current, true);
+        let held = tokio::time::timeout(
+            Duration::from_millis(350),
+            recv_frame_unless(&mut frames, hold.paused),
+        )
+        .await;
+        assert!(held.is_err(), "the paused send loop took a frame");
+        assert_eq!(voice.sends, sends_before, "a frame went out while paused");
+        // Frames already queued stay off the wire. The sibling parks, so
+        // the queue does not keep growing and the pipeline stays put.
+        let _queued = drain_ready(&mut frames);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            drain_ready(&mut frames),
+            0,
+            "frames kept arriving while paused"
+        );
+        assert!(current.is_some(), "pause dropped the pipeline");
+        assert_eq!(current.as_ref().unwrap().source_label, label);
+        assert_eq!(voice.sends, sends_before, "pause wrote a voice-stop");
+
+        hold.apply(&current, false);
+        let resumed = tokio::time::timeout(
+            Duration::from_secs(1),
+            recv_frame_unless(&mut frames, hold.paused),
+        )
+        .await
+        .expect("resume did not continue the playback");
+        match resumed {
+            Some(AudioMsg::Frame {
+                bytes, enqueued_at, ..
+            }) => {
+                send_quiet_frame(&mut voice, &bytes, enqueued_at, &mut monitor)
+                    .expect("voice connection still accepts frames");
+            }
+            other => panic!("resume did not continue the same playback: {other:?}"),
+        }
+        assert!(voice.sends > sends_before);
+        assert!(current.is_some(), "resume replaced the pipeline");
+        assert_eq!(current.as_ref().unwrap().source_label, label);
+        assert!(frames.is_some(), "resume opened a second playback");
+    }
+
+    async fn send_until_paced(
+        frames: &mut Option<mpsc::Receiver<AudioMsg>>,
+        voice: &mut CountingVoice,
+        monitor: &mut SendTimingMonitor,
+    ) {
+        let mut sent = 0usize;
+        let mut last = std::time::Instant::now();
+        loop {
+            match recv_frame_unless(frames, false).await {
+                Some(AudioMsg::Frame {
+                    bytes, enqueued_at, ..
+                }) => {
+                    send_quiet_frame(voice, &bytes, enqueued_at, monitor)
+                        .expect("voice connection still accepts frames");
+                    sent += 1;
+                    let now = std::time::Instant::now();
+                    let gap = now.duration_since(last);
+                    last = now;
+                    if sent >= 3 && gap >= Duration::from_millis(15) {
+                        return;
+                    }
+                }
+                Some(AudioMsg::Finished) | None => {
+                    panic!("playback ended before the send loop was pacing")
+                }
+                Some(AudioMsg::CatchupDropped(_) | AudioMsg::PipelineEvent(_)) => {}
+            }
+        }
+    }
+
+    #[test]
+    fn a_pause_hold_is_not_a_send_stall() {
+        // The send path warns when a frame's dequeue gap reaches 10 ms.
+        // A hold is not that gap: the stamp moves to the lift.
+        let enqueued = Instant::now();
+        let mut hold = PlaybackHold::new();
+        hold.apply(&None, true);
+        std::thread::sleep(Duration::from_millis(30));
+        let before_lift = Instant::now();
+        hold.apply(&None, false);
+        assert!(before_lift.saturating_duration_since(enqueued) >= Duration::from_millis(25));
+        let stamp = hold.stamp(enqueued);
+        assert!(
+            stamp >= before_lift,
+            "a single pause still looks like a loop stall"
+        );
+        let after = Instant::now();
+        assert_eq!(hold.stamp(after), after);
+    }
+
+    #[test]
+    fn two_pauses_before_a_queued_frame_are_not_a_send_stall() {
+        // The frame is queued, then a resume and a second pause both
+        // happen before the send loop takes it. Remembering only the last
+        // pause length leaves the first pause in the dequeue gap.
+        let enqueued = Instant::now();
+        let mut hold = PlaybackHold::new();
+        hold.apply(&None, true);
+        std::thread::sleep(Duration::from_millis(40));
+        hold.apply(&None, false);
+        let first_pause = enqueued.elapsed();
+
+        hold.apply(&None, true);
+        std::thread::sleep(Duration::from_millis(40));
+        let before_lift = Instant::now();
+        hold.apply(&None, false);
+        assert!(
+            first_pause >= Duration::from_millis(30),
+            "the first pause was too short to expose a false stall: {first_pause:?}"
+        );
+        let stamp = hold.stamp(enqueued);
+        let leftover = before_lift.saturating_duration_since(stamp);
+        assert!(
+            stamp >= before_lift,
+            "the first pause is still in the dequeue gap: {leftover:?}"
+        );
+        let after = Instant::now();
+        assert_eq!(hold.stamp(after), after);
+    }
+
+    fn drain_ready(frames: &mut Option<mpsc::Receiver<AudioMsg>>) -> usize {
+        let Some(rx) = frames.as_mut() else {
+            return 0;
+        };
+        let mut n = 0;
+        while rx.try_recv().is_ok() {
+            n += 1;
+        }
+        n
     }
 }
