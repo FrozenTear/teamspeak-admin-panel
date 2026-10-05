@@ -362,7 +362,7 @@ async fn refresh_if_due(
             if stop.get() || slot.borrow().as_deref() != Some(session_id.as_str()) {
                 return;
             }
-            apply_fatal(&slot, gate, &mut io, err);
+            apply_fatal(slot, gate, &mut io, err);
         }
     }
 }
