@@ -4,12 +4,23 @@
 //! writes them as `moq-lite` groups into a per-source [`BroadcastProducer`]
 //! registered against the sidecar's [`crate::origin::SidecarOrigin`].
 //!
-//! Per-source = one [`Pipeline`]; per-codec = one [`FfmpegProcess`].
-//! Splitting video and audio into separate FFmpeg invocations doubles the
-//! decode cost on the input but lets each subprocess crash + restart
-//! independently, and keeps the stdout pipe single-format so the parser
-//! doesn't have to demux. Quality presets / unified single-process layout
-//! are deferred to WS-4 once we have real numbers to optimise against.
+//! Per-source = one [`Pipeline`]; per-codec = one supervisor. Splitting
+//! video and audio into separate FFmpeg invocations doubles the decode
+//! cost and gives each subprocess its own clock. That is fine for a live
+//! test pattern. It is not fine for a long file: the clocks drift, the
+//! IVF frame timestamp is discarded in the video mux, and the panel player
+//! invents `seq * 33ms` (`video_player.rs`). Watch-together step 3 is one
+//! ffmpeg, one PTS, carried on the moq frame and scheduled against the
+//! audio clock. This pipeline does not do that. Publishing the IVF ticks
+//! from these two processes would advertise two unrelated clocks.
+//!
+//! File, progressive-VOD, and lavfi inputs are read at native rate
+//! (`-re` immediately before `-i`, ffmpeg's `-readrate 1`). A lavfi
+//! generator hands over the next frame as soon as it is pulled, so
+//! without `-re` a test pattern encodes as fast as the cores allow and
+//! a CPU sample is not a live encode. Live schemes stay unpaced: `-re`
+//! on a live ingest fills the socket buffer and the source drops
+//! packets. See `pace_file_or_vod` for URL classification.
 //!
 //! The WS-0 reference player (`moq-spike/player/`) subscribes to track
 //! name `"video"` and decodes raw VP8 frames. We keep that contract:
@@ -87,12 +98,17 @@ pub struct PipelineConfig {
 ///
 /// - `Url` — the same URL feeds both video and audio FFmpeg subprocesses.
 ///   Anything `ffmpeg -i` accepts: file paths, RTSP/HTTP URLs, etc.
+///   `pace_input` inserts `-re` before `-i` for a file or progressive VOD.
+///   Build it with [`SourceInput::from_input`] so the bit is chosen from
+///   the operator string. [`SourceInput::with_ffmpeg_url`] keeps that bit
+///   when `POST /source` rewrites `-i` to the loopback pin proxy.
 /// - `Lavfi { video, audio }` — synthetic sources (e.g. `testsrc2=...`,
 ///   `sine=...`). The video subprocess gets the video spec only; the
-///   audio subprocess gets the audio spec only.
+///   audio subprocess gets the audio spec only. Both are paced with
+///   `-re` so a WAN smoke runs at the generator's rate.
 #[derive(Debug, Clone)]
 pub enum SourceInput {
-    Url(String),
+    Url { url: String, pace_input: bool },
     Lavfi { video: String, audio: String },
 }
 
@@ -103,15 +119,60 @@ enum TrackKind {
 }
 
 impl SourceInput {
+    /// Classify `input` (operator path or URL) and remember whether
+    /// ffmpeg should read it at native rate.
+    ///
+    /// Call this with the string the operator named, before any pin-proxy
+    /// rewrite. The loopback token URL has no container extension, so
+    /// classifying it would drop `-re` for every proxied VOD.
+    pub fn from_input(input: impl Into<String>) -> Self {
+        let url = input.into();
+        let pace_input = pace_file_or_vod(&url);
+        Self::Url { url, pace_input }
+    }
+
+    /// Replace the ffmpeg `-i` string without reclassifying.
+    ///
+    /// `POST /source` hands ffmpeg `http://127.0.0.1:<port>/<token>`.
+    /// Pacing stays whatever [`Self::from_input`] decided for the
+    /// operator URL. Lavfi is unchanged.
+    #[must_use]
+    pub fn with_ffmpeg_url(self, ffmpeg_url: impl Into<String>) -> Self {
+        match self {
+            Self::Url { pace_input, .. } => Self::Url {
+                url: ffmpeg_url.into(),
+                pace_input,
+            },
+            other => other,
+        }
+    }
+
+    /// Whether this input is read at native rate (`-re`).
+    ///
+    /// Lavfi is always paced. URL inputs follow [`pace_file_or_vod`].
+    pub fn pace_input(&self) -> bool {
+        match self {
+            Self::Url { pace_input, .. } => *pace_input,
+            Self::Lavfi { .. } => true,
+        }
+    }
+
     fn args_for(&self, kind: TrackKind) -> Vec<String> {
         match self {
-            SourceInput::Url(url) => {
+            SourceInput::Url { url, pace_input } => {
                 let mut args = Vec::new();
                 if let Some(whitelist) = protocol_whitelist_for(url) {
                     args.push("-protocol_whitelist".into());
                     args.push(whitelist.into());
                 }
                 args.extend(tls_args_for(url));
+                // Input option. Immediately before `-i` so it applies to
+                // this input and not to a later output. `-re` is
+                // `-readrate 1` on the bookworm-era ffmpeg this sidecar
+                // runs; the short flag is the one those builds document.
+                if *pace_input {
+                    args.push("-re".into());
+                }
                 args.push("-i".into());
                 args.push(url.clone());
                 args
@@ -121,17 +182,152 @@ impl SourceInput {
                     TrackKind::Video => video,
                     TrackKind::Audio => audio,
                 };
-                vec!["-f".into(), "lavfi".into(), "-i".into(), spec.clone()]
+                // `-f lavfi` selects the input. `-re` is the next input
+                // option, immediately before `-i`, same slot file/VOD
+                // uses. Lavfi timestamps advance at the generator rate
+                // (`rate=15`, `sample_rate=48000`) but the demuxer pulls
+                // the next frame immediately unless `-re` sleeps.
+                vec![
+                    "-f".into(),
+                    "lavfi".into(),
+                    "-re".into(),
+                    "-i".into(),
+                    spec.clone(),
+                ]
             }
         }
     }
 
     fn display(&self) -> String {
         match self {
-            SourceInput::Url(u) => u.clone(),
+            SourceInput::Url { url, .. } => url.clone(),
             SourceInput::Lavfi { video, audio } => format!("lavfi[{video} | {audio}]"),
         }
     }
+}
+
+/// Whether `input` is a file or progressive VOD that FFmpeg would
+/// otherwise read as fast as it can decode.
+///
+/// `-re` belongs on those inputs. It does not belong on a live ingest:
+/// ffmpeg sleeps on the packet timestamp while the socket buffer fills,
+/// and the source drops packets. Lavfi is paced separately and never
+/// reaches this function.
+///
+/// Paced:
+/// - local paths with no URL scheme (`/srv/ts6-media/inbox/episode.mp4`,
+///   `episode.mkv`), whatever the extension
+/// - `file:` / `file://`
+/// - `http` / `https` (including ffmpeg's `http:/host/…` form) whose
+///   path ends in a finite container (`.mp4`, `.mkv`, `.webm`, …),
+///   query string ignored
+///
+/// Not paced:
+/// - any other scheme, written the way ffmpeg accepts it: `rtsp://…`,
+///   `udp://@239.0.0.1:1234`, or without the slashes (`udp:239.0.0.1:1234`,
+///   `srt:host:9000`, `rtmp:host/app/key`)
+/// - `pipe:` / `fd:`
+/// - playlist URLs (`.m3u8`, `.mpd`), including `http:/host/live.m3u8`.
+///   The same extension is live HLS and HLS VOD. Download the episode
+///   (ani-cli `-d`) and pass the file.
+/// - `.ts` (live MPEG-TS over HTTP) and `.flv` (HTTP-FLV)
+/// - Icecast-style audio mounts: `.mp3`, `.aac`, `.ogg`, `.opus`
+/// - extension-less HTTP, including the loopback pin-proxy token and a
+///   CDN URL whose container is only in a query parameter
+///
+/// Residual: a live fMP4 served at a `.mp4` path (go2rtc
+/// `…/api/stream.mp4?src=cam`) is still paced. Telling that from a
+/// finite file needs the upstream response (`Content-Length` /
+/// `Accept-Ranges` versus a chunked body), not the path.
+fn pace_file_or_vod(input: &str) -> bool {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    match ffmpeg_scheme(&lower) {
+        None => true,
+        Some("file") => true,
+        Some("http") | Some("https") => http_path_is_progressive_vod(&lower),
+        Some(_) => false,
+    }
+}
+
+/// ffmpeg scheme: `^[A-Za-z][A-Za-z0-9+.-]*:` at the start of the string.
+///
+/// `://` is not required. `udp:239.0.0.1:1234` and `http:/host/live.m3u8`
+/// are URLs. `None` means a local path.
+fn ffmpeg_scheme(lower: &str) -> Option<&str> {
+    let bytes = lower.as_bytes();
+    if bytes.first().is_none_or(|c| !c.is_ascii_alphabetic()) {
+        return None;
+    }
+    let mut end = 1usize;
+    while end < bytes.len() {
+        let c = bytes[end];
+        if c.is_ascii_alphanumeric() || c == b'+' || c == b'.' || c == b'-' {
+            end += 1;
+            continue;
+        }
+        break;
+    }
+    if end < bytes.len() && bytes[end] == b':' {
+        Some(&lower[..end])
+    } else {
+        None
+    }
+}
+
+fn http_path_is_progressive_vod(lower_url: &str) -> bool {
+    let Some(scheme) = ffmpeg_scheme(lower_url) else {
+        return false;
+    };
+    let after_scheme = &lower_url[scheme.len() + 1..];
+    let without_query = after_scheme
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    // `http://host/v.mp4` and ffmpeg's `http:/host/v.mp4` both leave
+    // `host/v.mp4` once the slashes after the colon are skipped.
+    let after_slashes = without_query.trim_start_matches('/');
+    let Some(slash) = after_slashes.find('/') else {
+        return false;
+    };
+    extension_is_progressive_vod(&after_slashes[slash..])
+}
+
+fn extension_is_progressive_vod(path: &str) -> bool {
+    let path = path.trim_end_matches('/');
+    let file = path.rsplit('/').next().unwrap_or(path);
+    let Some((stem, ext)) = file.rsplit_once('.') else {
+        return false;
+    };
+    if stem.is_empty() || ext.is_empty() || !ext.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return false;
+    }
+    // Finite containers only. Left off this HTTP list because they are
+    // usually live: playlists (m3u8, mpd), MPEG-TS (.ts), HTTP-FLV
+    // (.flv), and Icecast audio mounts (.mp3, .aac, .ogg, .opus).
+    // A local path never reaches here. A `.mp4` path can still be live
+    // fMP4; see `pace_file_or_vod`.
+    matches!(
+        ext,
+        "3gp"
+            | "avi"
+            | "flac"
+            | "m2ts"
+            | "m4a"
+            | "m4v"
+            | "mkv"
+            | "mov"
+            | "mp4"
+            | "mpeg"
+            | "mpg"
+            | "ogv"
+            | "wav"
+            | "webm"
+            | "wmv"
+    )
 }
 
 /// Protocols FFmpeg may open for a URL input. Must be passed *before* `-i`.
@@ -242,6 +438,11 @@ impl PipelineMetrics {
 pub struct Pipeline {
     name: String,
     preset: QualityPreset,
+    /// Operator input after any pin-proxy rewrite. `pace_input` was
+    /// chosen before that rewrite. Read by the `POST /source` handler
+    /// test; the supervisors already hold their own copy of the config.
+    #[cfg(test)]
+    source: SourceInput,
     origin: Arc<SidecarOrigin>,
     metrics: Arc<PipelineMetrics>,
     _broadcast: BroadcastProducer,
@@ -297,12 +498,15 @@ impl Pipeline {
             broadcast = %config.name,
             source = %source_display,
             preset = %config.preset,
+            pace_input = config.source.pace_input(),
             "pipeline started"
         );
 
         Ok(Self {
             name: config.name,
             preset: config.preset,
+            #[cfg(test)]
+            source: config.source.clone(),
             origin,
             metrics,
             _broadcast: broadcast,
@@ -321,6 +525,13 @@ impl Pipeline {
     /// life of the pipeline (see [`QualityPreset`] docs).
     pub fn preset(&self) -> QualityPreset {
         self.preset
+    }
+
+    /// Input ffmpeg is reading, including the pacing bit decided from
+    /// the operator URL.
+    #[cfg(test)]
+    pub(crate) fn source(&self) -> &SourceInput {
+        &self.source
     }
 
     /// Shared counters touched by the supervisor + mux loops. Cloneable
@@ -601,6 +812,14 @@ fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
 // FFmpeg argument sets
 // -----------------------------------------------------------------------
 
+/// libvpx `-cpu-used` on the video encode path.
+///
+/// Bookworm ffmpeg documents the libvpx option as -16..=16
+/// (`ffmpeg -h encoder=libvpx`). 8 is inside that range. 16 is the
+/// fastest the option accepts; 8 is the speed this spike uses so a
+/// live encode stays cheap without jumping to the quality floor.
+const LIBVPX_CPU_USED: &str = "8";
+
 /// Build the FFmpeg argv for the video subprocess. Resolution, framerate
 /// and bitrate come from [`QualityPreset`] (spec §23.4). The filter
 /// chain mirrors the spec's letterbox/pillarbox pattern from §24.1.1 so
@@ -611,6 +830,9 @@ fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
 ///
 /// Public for unit testing (the integration test on `control_plane.rs`
 /// asserts argv contents reflect the requested preset).
+///
+/// libvpx speed is not part of the preset. Every preset uses
+/// `-deadline realtime` and [`LIBVPX_CPU_USED`].
 pub fn ffmpeg_video_args(config: &PipelineConfig) -> Vec<String> {
     let preset = config.preset;
     let fps = preset.framerate();
@@ -642,7 +864,11 @@ pub fn ffmpeg_video_args(config: &PipelineConfig) -> Vec<String> {
         "-deadline".into(),
         "realtime".into(),
         "-cpu-used".into(),
-        "5".into(),
+        // Bookworm `ffmpeg -h encoder=libvpx` accepts `-cpu-used` in
+        // -16..=16. 8 is inside that range (16 is the top). Realtime
+        // plus a higher cpu-used is what keeps a live MoQ encode off
+        // the whole box; scale, fps, and bitrate stay on the preset.
+        LIBVPX_CPU_USED.into(),
         "-g".into(),
         fps.to_string(),
         "-keyint_min".into(),
@@ -656,7 +882,13 @@ pub fn ffmpeg_video_args(config: &PipelineConfig) -> Vec<String> {
     args
 }
 
-fn ffmpeg_audio_args(config: &PipelineConfig) -> Vec<String> {
+/// Audio encode stays the live profile: Opus mono, 64k,
+/// `-application voip`. Watch-together step 4 is the anime profile
+/// (stereo, 128k, `-application audio`, source fps instead of the
+/// `720p` preset's forced 30). Not this change.
+///
+/// Public so the boot-path tests can assert lavfi audio is paced.
+pub fn ffmpeg_audio_args(config: &PipelineConfig) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "-hide_banner".into(),
         "-loglevel".into(),
@@ -728,7 +960,11 @@ async fn mux_video(
     let mut frame_buf = Vec::with_capacity(64 * 1024);
     let mut frame_header = [0u8; 12];
     loop {
-        // Frame header: size (u32 LE) + timestamp (u64 LE).
+        // Frame header: size (u32 LE) + timestamp (u64 LE, IVF timebase).
+        // The timestamp bytes are intentionally unused. Video and audio
+        // are separate ffmpeg processes, so these ticks are not a shared
+        // PTS. Watch-together step 3 has to come from one ffmpeg. Using
+        // this field now would look like sync and still drift.
         match read_exact_or_eof(&mut reader, &mut frame_header).await? {
             Ok(()) => {}
             Err(()) => {
@@ -1209,7 +1445,7 @@ mod tests {
     fn https_input_forces_tls_verify() {
         let cfg = PipelineConfig::new(
             "src",
-            SourceInput::Url("https://download.samplelib.com/mp4/sample-5s.mp4".into()),
+            SourceInput::from_input("https://download.samplelib.com/mp4/sample-5s.mp4"),
         );
         let args = ffmpeg_video_args(&cfg);
         assert_eq!(
@@ -1222,6 +1458,11 @@ mod tests {
             Some("http,https,tcp,tls,crypto"),
             "https input MUST constrain protocols; argv = {args:?}"
         );
+        assert_eq!(
+            args.iter().position(|a| a == "-re").map(|i| i + 1),
+            args.iter().position(|a| a == "-i"),
+            "progressive mp4 MUST be paced with -re immediately before -i; argv = {args:?}"
+        );
     }
 
     #[test]
@@ -1229,7 +1470,7 @@ mod tests {
         // FFmpeg only honours protocol AVOptions that appear *before* the
         // `-i` they apply to. A `-tls_verify` placed after `-i` is silently
         // ignored — which would re-open the rebinding hole.
-        let cfg = PipelineConfig::new("src", SourceInput::Url("https://cdn.example/v.mp4".into()));
+        let cfg = PipelineConfig::new("src", SourceInput::from_input("https://cdn.example/v.mp4"));
         let args = ffmpeg_audio_args(&cfg);
         let verify_idx = args.iter().position(|a| a == "-tls_verify");
         let whitelist_idx = args.iter().position(|a| a == "-protocol_whitelist");
@@ -1255,12 +1496,16 @@ mod tests {
         // on an http:// URL.
         let cfg = PipelineConfig::new(
             "src",
-            SourceInput::Url("http://127.0.0.1:54321/3f2a-token".into()),
+            SourceInput::from_input("http://127.0.0.1:54321/3f2a-token"),
         );
         let args = ffmpeg_video_args(&cfg);
         assert!(
             !args.iter().any(|a| a == "-tls_verify"),
             "http loopback input must not carry -tls_verify; argv = {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a == "-re" || a == "-readrate"),
+            "pin-proxy token URL must not be paced on its own; argv = {args:?}"
         );
         assert_eq!(
             value_after(&args, "-protocol_whitelist"),
@@ -1294,6 +1539,15 @@ mod tests {
             !args.iter().any(|a| a == "-protocol_whitelist"),
             "synthetic lavfi input must not carry -protocol_whitelist; argv = {args:?}"
         );
+        assert_re_immediately_before_input(&args);
+        let audio = ffmpeg_audio_args(&cfg);
+        assert_re_immediately_before_input(&audio);
+        assert_eq!(
+            value_after(&audio, "-i"),
+            Some("sine=frequency=440"),
+            "{audio:?}"
+        );
+        assert_live_audio_profile(&audio);
     }
 
     #[test]
@@ -1305,5 +1559,241 @@ mod tests {
         assert!(tls_args_for("http://h/x").is_empty());
         assert!(tls_args_for("rtsp://h/x").is_empty());
         assert!(tls_args_for("file:///etc/passwd").is_empty());
+    }
+
+    fn assert_re_immediately_before_input(args: &[String]) {
+        let re = args
+            .iter()
+            .position(|a| a == "-re")
+            .unwrap_or_else(|| panic!("missing -re: {args:?}"));
+        let i = args
+            .iter()
+            .position(|a| a == "-i")
+            .unwrap_or_else(|| panic!("missing -i: {args:?}"));
+        assert_eq!(
+            re + 1,
+            i,
+            "-re must be the input option immediately before -i: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a == "-readrate"),
+            "do not also pass -readrate: {args:?}"
+        );
+    }
+
+    fn assert_live_audio_profile(args: &[String]) {
+        assert_eq!(value_after(args, "-application"), Some("voip"));
+        assert_eq!(value_after(args, "-b:a"), Some("64k"));
+        assert_eq!(value_after(args, "-ac"), Some("1"));
+        assert_eq!(value_after(args, "-ar"), Some("48000"));
+    }
+
+    /// Realtime libvpx speed is independent of the preset. Scale, fps,
+    /// and bitrate stay on the preset. Lavfi and files are paced; a
+    /// live scheme is not.
+    #[test]
+    fn libvpx_realtime_flags_follow_every_preset() {
+        let presets = [
+            (QualityPreset::P480, 854, 480, 24, "1000k"),
+            (QualityPreset::P720, 1280, 720, 30, "2500k"),
+            (QualityPreset::P1080, 1920, 1080, 30, "4500k"),
+        ];
+        let sources = [
+            SourceInput::Lavfi {
+                video: "testsrc2=size=320x240:rate=15".into(),
+                audio: "sine=frequency=440:sample_rate=48000".into(),
+            },
+            SourceInput::from_input("/srv/ts6-media/inbox/episode.mp4"),
+            SourceInput::from_input("rtsp://cam.example/live"),
+        ];
+        for (preset, w, h, fps, bitrate) in presets {
+            for source in &sources {
+                let paced = source.pace_input();
+                let label = format!("{preset} {}", source.display());
+                let cfg = PipelineConfig::new("src", source.clone()).with_preset(preset);
+                let video = ffmpeg_video_args(&cfg);
+                assert_eq!(
+                    value_after(&video, "-deadline"),
+                    Some("realtime"),
+                    "{label}"
+                );
+                assert_eq!(
+                    value_after(&video, "-cpu-used"),
+                    Some(LIBVPX_CPU_USED),
+                    "{label}"
+                );
+                assert_eq!(value_after(&video, "-c:v"), Some("libvpx"), "{label}");
+                assert_eq!(value_after(&video, "-b:v"), Some(bitrate), "{label}");
+                assert_eq!(value_after(&video, "-maxrate"), Some(bitrate), "{label}");
+                let fps_s = fps.to_string();
+                assert_eq!(value_after(&video, "-g"), Some(fps_s.as_str()), "{label}");
+                let vf = value_after(&video, "-vf").unwrap_or_else(|| panic!("{label}"));
+                assert!(vf.contains(&format!("fps={fps}")), "{label}: {vf}");
+                assert!(vf.contains(&format!("scale={w}:{h}")), "{label}: {vf}");
+                let audio = ffmpeg_audio_args(&cfg);
+                assert!(
+                    !audio.iter().any(|a| a == "-cpu-used" || a == "-deadline"),
+                    "audio encode stays off the libvpx flags: {label} {audio:?}"
+                );
+                assert_live_audio_profile(&audio);
+                if paced {
+                    assert_re_immediately_before_input(&video);
+                    assert_re_immediately_before_input(&audio);
+                } else {
+                    assert!(!video.iter().any(|a| a == "-re"), "{label} {video:?}");
+                    assert!(!audio.iter().any(|a| a == "-re"), "{label} {audio:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn file_and_progressive_vod_are_read_at_native_rate() {
+        let cases = [
+            "/srv/ts6-media/inbox/episode.mp4",
+            "tests/fixtures/sample.mkv",
+            "episode.webm",
+            "file:///srv/ts6-media/inbox/episode.mkv",
+            "https://download.samplelib.com/mp4/sample-5s.mp4",
+            "https://cdn.example/v.MP4?token=abc",
+            "https://user:pass@cdn.example/show.webm#t=12",
+            "http://cdn.example:8443/a.m4v",
+            "http://[::1]/episode.mov",
+            // ffmpeg's single-slash form is still http, and a container
+            // extension still paces.
+            "http:/cdn.example/episode.mp4",
+            // Local paths and file: stay paced whatever the extension,
+            // including ones HTTP treats as live.
+            "/srv/ts6-media/inbox/live.flv",
+            "/srv/ts6-media/inbox/track.mp3",
+            "live.flv",
+            "file:///var/media/stream.aac",
+            "file:episode.opus",
+        ];
+        for input in cases {
+            let cfg = PipelineConfig::new("src", SourceInput::from_input(input));
+            assert!(cfg.source.pace_input(), "{input}");
+            for args in [ffmpeg_video_args(&cfg), ffmpeg_audio_args(&cfg)] {
+                let re = args
+                    .iter()
+                    .position(|a| a == "-re")
+                    .unwrap_or_else(|| panic!("{input} missing -re: {args:?}"));
+                let i = args
+                    .iter()
+                    .position(|a| a == "-i")
+                    .unwrap_or_else(|| panic!("{input} missing -i: {args:?}"));
+                assert_eq!(
+                    re + 1,
+                    i,
+                    "-re must be the input option immediately before -i; {input} {args:?}"
+                );
+                assert_eq!(args[i + 1], input);
+                assert!(
+                    !args.iter().any(|a| a == "-readrate"),
+                    "do not also pass -readrate; {input} {args:?}"
+                );
+            }
+            assert_live_audio_profile(&ffmpeg_audio_args(&cfg));
+        }
+    }
+
+    #[test]
+    fn live_schemes_and_playlists_are_not_readrate_paced() {
+        let cases = [
+            SourceInput::from_input("rtsp://cam.example/live"),
+            SourceInput::from_input("rtsps://cam.example/live"),
+            SourceInput::from_input("rtmp://ingest.example/app/stream"),
+            SourceInput::from_input("udp://239.1.1.1:5000"),
+            SourceInput::from_input("udp://@239.0.0.1:1234"),
+            SourceInput::from_input("rtp://239.1.1.1:5000"),
+            SourceInput::from_input("srt://media.example:9000?mode=caller"),
+            SourceInput::from_input("https://cdn.example/live/index.m3u8"),
+            SourceInput::from_input("https://cdn.example/manifest.mpd?token=1"),
+            SourceInput::from_input("http://iptv.example/channel.ts"),
+            SourceInput::from_input("http://127.0.0.1:54321/3f2a-token"),
+            SourceInput::from_input("https://cache.example/videoplayback?mime=video%2Fmp4"),
+            SourceInput::from_input("http://camera.example/stream"),
+            SourceInput::from_input("pipe:0"),
+            SourceInput::from_input("fd:3"),
+            // HTTP-FLV and Icecast mounts are live. The same extensions
+            // on a local path stay paced (see the file table above).
+            SourceInput::from_input("https://cdn.example/live/x.flv"),
+            SourceInput::from_input("https://radio.example/stream.mp3"),
+            SourceInput::from_input("https://radio.example/stream.aac"),
+            SourceInput::from_input("http://radio.example:8000/live.ogg"),
+            SourceInput::from_input("https://radio.example/mount.opus"),
+            SourceInput::from_input("http:/cdn.example/live/x.flv"),
+            // ffmpeg accepts scheme: without "//". Those are not files.
+            SourceInput::from_input("udp:239.0.0.1:1234"),
+            SourceInput::from_input("srt:host:9000"),
+            SourceInput::from_input("rtmp:host/app/key"),
+            SourceInput::from_input("http:/host/live.m3u8"),
+        ];
+        for src in cases {
+            let label = src.display();
+            assert!(!src.pace_input(), "{label}");
+            let cfg = PipelineConfig::new("src", src);
+            for args in [ffmpeg_video_args(&cfg), ffmpeg_audio_args(&cfg)] {
+                assert!(
+                    !args.iter().any(|a| a == "-re" || a == "-readrate"),
+                    "{label} must not be paced: {args:?}"
+                );
+            }
+            assert_live_audio_profile(&ffmpeg_audio_args(&cfg));
+        }
+    }
+
+    #[test]
+    fn pin_proxy_rewrite_keeps_operator_pacing_decision() {
+        let paced = SourceInput::from_input("https://cdn.example/ep.mp4?sig=1")
+            .with_ffmpeg_url("http://127.0.0.1:54321/3f2a-token");
+        let cfg = PipelineConfig::new("src", paced);
+        let args = ffmpeg_video_args(&cfg);
+        let re = args.iter().position(|a| a == "-re").expect("-re");
+        let i = args.iter().position(|a| a == "-i").expect("-i");
+        assert_eq!(re + 1, i, "{args:?}");
+        assert_eq!(args[i + 1], "http://127.0.0.1:54321/3f2a-token");
+        assert_eq!(
+            value_after(&args, "-protocol_whitelist"),
+            Some("http,tcp,crypto"),
+            "rewritten pin URL must keep the loopback whitelist; argv = {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a == "-tls_verify"),
+            "loopback pin URL must not gain -tls_verify; argv = {args:?}"
+        );
+        let whitelist = value_after(&args, "-protocol_whitelist").unwrap();
+        assert!(
+            !whitelist
+                .split(',')
+                .any(|protocol| protocol == "https" || protocol == "file"),
+            "{whitelist}"
+        );
+        assert_live_audio_profile(&ffmpeg_audio_args(&cfg));
+        assert!(ffmpeg_audio_args(&cfg).iter().any(|a| a == "-re"));
+
+        let live = SourceInput::from_input("https://cdn.example/live/index.m3u8")
+            .with_ffmpeg_url("http://127.0.0.1:54321/3f2a-token");
+        let live_args = ffmpeg_video_args(&PipelineConfig::new("src", live));
+        assert!(
+            !live_args.iter().any(|a| a == "-re"),
+            "live playlist must stay unpaced after the pin rewrite: {live_args:?}"
+        );
+    }
+
+    #[test]
+    fn with_ffmpeg_url_leaves_lavfi_alone() {
+        let src = SourceInput::Lavfi {
+            video: "v".into(),
+            audio: "a".into(),
+        };
+        let out = src.with_ffmpeg_url("http://127.0.0.1/x");
+        match out {
+            SourceInput::Lavfi { video, audio } => {
+                assert_eq!(video, "v");
+                assert_eq!(audio, "a");
+            }
+            SourceInput::Url { .. } => panic!("lavfi retargeted into a url"),
+        }
     }
 }

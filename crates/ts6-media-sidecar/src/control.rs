@@ -363,7 +363,12 @@ pub async fn post_source(
             ApiError::InvalidRequest(e.to_string())
         })?,
     };
-    let cfg = PipelineConfig::new(source_id.clone(), SourceInput::Url(ffmpeg_url.clone()))
+    // Classify pacing on the operator URL before the pin rewrite.
+    // `http://127.0.0.1/<token>` has no container extension, so
+    // classifying the ffmpeg URL would drop `-re` for every VOD.
+    let source = SourceInput::from_input(req.url.clone()).with_ffmpeg_url(ffmpeg_url.clone());
+    let pace_input = source.pace_input();
+    let cfg = PipelineConfig::new(source_id.clone(), source)
         .with_ffmpeg_path(state.ffmpeg_path.clone())
         .with_preset(preset)
         .with_diagnostics(state.diagnostics.clone());
@@ -395,6 +400,7 @@ pub async fn post_source(
         ffmpeg_url = %ffmpeg_url,
         proxied = %pin_token.is_some(),
         %preset,
+        pace_input,
         "pipeline registered"
     );
 
@@ -685,5 +691,134 @@ mod tests {
         assert!(invalid_source_id("camera-1").is_none());
         assert!(invalid_source_id("01HXY-source").is_none());
         assert!(invalid_source_id(&uuid::Uuid::new_v4().to_string()).is_none());
+    }
+
+    /// Pacing is taken from the operator URL, then the pin rewrite
+    /// replaces `-i`. Classifying the loopback token
+    /// (`SourceInput::from_input(ffmpeg_url)`) drops `-re`: the token
+    /// has no container extension.
+    #[tokio::test]
+    async fn post_source_paces_operator_url_before_pin_rewrite() {
+        let resolver: Arc<dyn Resolver> =
+            Arc::new(MockResolver::new().with("cdn.example", vec![ip("203.0.113.10")]));
+        let proxy = Arc::new(
+            PinProxy::start(Arc::clone(&resolver))
+                .await
+                .expect("proxy start"),
+        );
+        let state = ControlPlaneState {
+            origin: Arc::new(SidecarOrigin::new()),
+            registry: PipelineRegistry::new(),
+            resolver,
+            ffmpeg_path: std::path::PathBuf::from("/bin/true"),
+            pin_proxy: Arc::clone(&proxy),
+            diagnostics: Arc::new(crate::diagnostics::Diagnostics::new()),
+        };
+
+        let (status, _) = post_source(
+            State(state.clone()),
+            Json(StartSourceRequest {
+                url: "https://cdn.example/episode.mp4".into(),
+                source_id: Some("ep".into()),
+                preset: Some("480p".into()),
+            }),
+        )
+        .await
+        .expect("progressive mp4 starts");
+        assert_eq!(status, StatusCode::CREATED);
+        assert_operator_pace(&state, "ep", true, &["episode.mp4", "cdn.example"]).await;
+        post_source_stop(
+            State(state.clone()),
+            Json(StopSourceRequest {
+                source_id: "ep".into(),
+            }),
+        )
+        .await
+        .expect("stop ep");
+
+        let (status, _) = post_source(
+            State(state.clone()),
+            Json(StartSourceRequest {
+                url: "https://cdn.example/live/x.flv".into(),
+                source_id: Some("flv".into()),
+                preset: None,
+            }),
+        )
+        .await
+        .expect("http-flv starts");
+        assert_eq!(status, StatusCode::CREATED);
+        assert_operator_pace(&state, "flv", false, &["x.flv", "cdn.example"]).await;
+        post_source_stop(
+            State(state.clone()),
+            Json(StopSourceRequest {
+                source_id: "flv".into(),
+            }),
+        )
+        .await
+        .expect("stop flv");
+
+        proxy.shutdown();
+    }
+
+    async fn assert_operator_pace(
+        state: &ControlPlaneState,
+        source_id: &str,
+        expect_pace: bool,
+        absent_from_ffmpeg_url: &[&str],
+    ) {
+        let guard = state.registry.inner.read().await;
+        let entry = guard.get(source_id).expect("pipeline registered");
+        let source = entry.pipeline.source().clone();
+        drop(guard);
+
+        let SourceInput::Url { url, pace_input } = source.clone() else {
+            panic!("{source_id} was not a URL source");
+        };
+        assert_eq!(
+            pace_input, expect_pace,
+            "{source_id} pace bit must come from the operator URL"
+        );
+        assert!(
+            url.starts_with("http://127.0.0.1:"),
+            "{source_id} ffmpeg -i must be the loopback pin, got {url}"
+        );
+        for needle in absent_from_ffmpeg_url {
+            assert!(
+                !url.contains(needle),
+                "{source_id} pin URL must not carry {needle}: {url}"
+            );
+        }
+        // The token has no container extension. Classifying it is unpaced
+        // for every proxied source, paced or not.
+        assert!(
+            !SourceInput::from_input(&url).pace_input(),
+            "from_input(ffmpeg_url) is unpaced; the handler must not use it ({url})"
+        );
+
+        let cfg = PipelineConfig::new(source_id, source);
+        let video = crate::pipeline::ffmpeg_video_args(&cfg);
+        let audio = crate::pipeline::ffmpeg_audio_args(&cfg);
+        for args in [&video, &audio] {
+            let i = args
+                .iter()
+                .position(|a| a == "-i")
+                .unwrap_or_else(|| panic!("{source_id} missing -i: {args:?}"));
+            assert_eq!(args[i + 1], url, "{source_id} {args:?}");
+            let has_re = args.iter().any(|a| a == "-re");
+            assert_eq!(has_re, expect_pace, "{source_id} {args:?}");
+            if expect_pace {
+                let re = args.iter().position(|a| a == "-re").expect("-re");
+                assert_eq!(re + 1, i, "{source_id} {args:?}");
+            }
+        }
+        let wl = video
+            .iter()
+            .position(|a| a == "-protocol_whitelist")
+            .map(|i| video[i + 1].as_str());
+        assert_eq!(
+            wl,
+            Some("http,tcp,crypto"),
+            "pin URL keeps the loopback whitelist; {video:?}"
+        );
     }
 }
