@@ -27,8 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use russh::client::{self, Handler};
-use russh::keys::ssh_key::PublicKey;
-use russh::keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg};
+use russh::keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
 use russh::{ChannelMsg, Disconnect};
 use zeroize::Zeroizing;
 
@@ -162,9 +161,12 @@ impl Handler for BridgeHandler {
 
     async fn check_server_key(
         &mut self,
-        server_public_key: &PublicKey,
+        server_public_key: &PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        let ok = self.verifier.verify(server_public_key);
+        // 0.63 hands us a key or a certificate. Verification is against
+        // the raw public key in either case.
+        let server_public_key = server_public_key.public_key();
+        let ok = self.verifier.verify(&server_public_key);
         if !ok {
             self.rejected.store(true, Ordering::SeqCst);
         }
@@ -203,8 +205,11 @@ impl RusshChannel {
 #[async_trait]
 impl SshChannel for RusshChannel {
     async fn write(&mut self, bytes: &[u8]) -> Result<(), TransportError> {
+        // `Channel::data` takes `AsyncRead` as of russh 0.63. `data_bytes`
+        // wants an owned buffer: the async method is `'static`, so a
+        // borrowed slice cannot cross the await.
         self.channel
-            .data(bytes)
+            .data_bytes(bytes.to_vec())
             .await
             .map_err(|e| TransportError::Io(e.to_string()))
     }

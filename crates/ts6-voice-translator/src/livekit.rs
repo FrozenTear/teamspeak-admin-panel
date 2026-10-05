@@ -109,6 +109,9 @@ impl LiveKitConfig {
                 can_publish_data: false,
             },
         };
+        // Same dual-backend panic as the panel JWT helper: workspace builds
+        // enable both jsonwebtoken crypto features, so pick aws-lc once.
+        let _ = jsonwebtoken::crypto::aws_lc::DEFAULT_PROVIDER.install_default();
         let token = encode(
             &Header::default(),
             &claims,

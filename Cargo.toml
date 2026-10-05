@@ -168,8 +168,14 @@ argon2 = "0.5"
 async-trait = "0.1"
 bcrypt = "0.17"
 hex = "0.4"
-hickory-resolver = "0.24"
-jsonwebtoken = "9"
+# 0.26 pulls hickory-proto ≥0.26.1 (RUSTSEC-2026-0119). The 0.24 line
+# cannot take that fix.
+hickory-resolver = "0.26"
+# 10.3+ clears the type-confusion advisory. Stay on the 10.x line.
+# `aws_lc_rs` is the process default we install before sign/verify.
+# Workspace builds also pull `rust_crypto` via livekit-api; jsonwebtoken 10
+# panics unless exactly one backend is selected or a provider is installed.
+jsonwebtoken = { version = "10.3", features = ["aws_lc_rs"] }
 governor = "0.6"
 rand = "0.8"
 scrypt = { version = "0.11", default-features = false, features = ["std"] }
@@ -207,11 +213,12 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # ADR-0001 picked russh; ADR-0001 said to pin both `russh` and
 # `russh-keys`, but at 0.60 the russh maintainers absorbed the keys
 # crate back into `russh::keys`, so a separate `russh-keys` line would
-# pull in a stale beta. Pin the minor (`0.60` → `>=0.60.0, <0.61.0`)
-# and bump deliberately. Default features `aws-lc-rs + flate2 + rsa`
-# match the rustls posture (no OpenSSL) and cover every key algorithm
-# we expect to encounter on operator-supplied TS6 servers.
-russh = { version = "0.60", default-features = false, features = ["aws-lc-rs", "flate2", "rsa"] }
+# pull in a stale beta. Pin the minor (`0.63` → `>=0.63.0, <0.64.0`)
+# and bump deliberately. 0.63.2+ clears RUSTSEC-2026-0153 / 0154.
+# Default features `aws-lc-rs + flate2 + rsa` match the rustls posture
+# (no OpenSSL) and cover every key algorithm we expect to encounter
+# on operator-supplied TS6 servers.
+russh = { version = "0.63", default-features = false, features = ["aws-lc-rs", "flate2", "rsa"] }
 
 # PURA-85 — `Zeroizing<String>` wraps cleartext SSH credentials
 # (`RusshAuth::Password` and `RusshAuth::Key`) so the dropped allocation is

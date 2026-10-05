@@ -28,29 +28,38 @@ pub trait Resolver: Send + Sync {
 
 /// Production resolver backed by `hickory-resolver` and the system's DNS config.
 ///
-/// Holds a `TokioAsyncResolver` and reuses it across calls. Cheap to clone
-/// (it's `Arc`-internally in hickory).
+/// Holds a `TokioResolver` and reuses it across calls. Cheap to clone
+/// (the resolver is internally shared).
 ///
 /// Feature-gated behind `hickory` so consumers with their own resolver (the
 /// sibling-workspace `ts6-media-sidecar` uses `tokio::net::lookup_host`) can
 /// drop the dep entirely.
 #[cfg(feature = "hickory")]
 pub struct HickoryResolver {
-    inner: std::sync::Arc<hickory_resolver::TokioAsyncResolver>,
+    inner: std::sync::Arc<hickory_resolver::TokioResolver>,
 }
 
 #[cfg(feature = "hickory")]
 impl HickoryResolver {
     /// Build a resolver from the system's `/etc/resolv.conf` (or the platform
-    /// equivalent). Falls back to `from_default_options` if system config is
-    /// not readable, so this is safe inside containers that omit resolv.conf.
+    /// equivalent). Falls back to Google's public resolvers if system config
+    /// is not readable, so this is safe inside containers that omit resolv.conf.
     pub fn from_system() -> Result<Self, ResolveError> {
-        let resolver = match hickory_resolver::TokioAsyncResolver::tokio_from_system_conf() {
-            Ok(r) => r,
-            Err(_) => hickory_resolver::TokioAsyncResolver::tokio(
-                hickory_resolver::config::ResolverConfig::default(),
-                hickory_resolver::config::ResolverOpts::default(),
-            ),
+        let resolver = match hickory_resolver::TokioResolver::builder_tokio() {
+            Ok(builder) => builder
+                .build()
+                .map_err(|e| ResolveError::Other(e.to_string()))?,
+            Err(_) => {
+                let builder = hickory_resolver::TokioResolver::builder_with_config(
+                    hickory_resolver::config::ResolverConfig::udp_and_tcp(
+                        &hickory_resolver::config::GOOGLE,
+                    ),
+                    hickory_resolver::net::runtime::TokioRuntimeProvider::default(),
+                );
+                builder
+                    .build()
+                    .map_err(|e| ResolveError::Other(e.to_string()))?
+            }
         };
         Ok(Self {
             inner: std::sync::Arc::new(resolver),
@@ -64,11 +73,11 @@ impl Resolver for HickoryResolver {
     async fn resolve(&self, host: &str) -> Result<Vec<IpAddr>, ResolveError> {
         match self.inner.lookup_ip(host).await {
             Ok(rec) => Ok(rec.iter().collect()),
-            Err(e) => match e.kind() {
-                hickory_resolver::error::ResolveErrorKind::NoRecordsFound { .. } => {
-                    Err(ResolveError::NotFound)
-                }
-                _ => Err(ResolveError::Other(e.to_string())),
+            Err(e) => match e {
+                hickory_resolver::net::NetError::Dns(
+                    hickory_resolver::net::DnsError::NoRecordsFound(_),
+                ) => Err(ResolveError::NotFound),
+                other => Err(ResolveError::Other(other.to_string())),
             },
         }
     }

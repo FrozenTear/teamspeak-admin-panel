@@ -16,6 +16,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
 
+/// jsonwebtoken 10 panics on sign/verify when both `aws_lc_rs` (surrealdb-core)
+/// and `rust_crypto` (livekit-api) are enabled in one build. Installing one
+/// provider once per process selects the backend. A later call returns `Err`
+/// because the default is already set; that is success.
+fn ensure_jwt_crypto() {
+    let _ = jsonwebtoken::crypto::aws_lc::DEFAULT_PROVIDER.install_default();
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AccessClaims {
     pub id: i64,
@@ -66,6 +74,7 @@ pub fn mint_access(
 /// [`mint_access`]; use this when you already have an `iat`/`exp` pair (e.g.
 /// in tests).
 pub fn encode_access(claims: &AccessClaims, secret: &[u8]) -> Result<String, Error> {
+    ensure_jwt_crypto();
     let header = Header::new(Algorithm::HS256);
     let key = EncodingKey::from_secret(secret);
     encode(&header, claims, &key).map_err(|_| Error::Encode)
@@ -77,6 +86,7 @@ pub fn encode_access(claims: &AccessClaims, secret: &[u8]) -> Result<String, Err
 /// token, expired `exp`, or wrong algorithm. The route layer maps this to
 /// HTTP 401 with body `{"error":"Invalid or expired token"}` (spec §6.4.1).
 pub fn verify_access(token: &str, secret: &[u8]) -> Result<AccessClaims, Error> {
+    ensure_jwt_crypto();
     let key = DecodingKey::from_secret(secret);
     let mut validation = Validation::new(Algorithm::HS256);
     // Spec does not require `aud` or `iss`; do not enforce them.
