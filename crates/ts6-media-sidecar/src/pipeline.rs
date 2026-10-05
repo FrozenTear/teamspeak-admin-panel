@@ -439,7 +439,9 @@ pub struct Pipeline {
     name: String,
     preset: QualityPreset,
     /// Operator input after any pin-proxy rewrite. `pace_input` was
-    /// chosen before that rewrite.
+    /// chosen before that rewrite. Read by the `POST /source` handler
+    /// test; the supervisors already hold their own copy of the config.
+    #[cfg(test)]
     source: SourceInput,
     origin: Arc<SidecarOrigin>,
     metrics: Arc<PipelineMetrics>,
@@ -503,6 +505,7 @@ impl Pipeline {
         Ok(Self {
             name: config.name,
             preset: config.preset,
+            #[cfg(test)]
             source: config.source.clone(),
             origin,
             metrics,
@@ -526,6 +529,7 @@ impl Pipeline {
 
     /// Input ffmpeg is reading, including the pacing bit decided from
     /// the operator URL.
+    #[cfg(test)]
     pub(crate) fn source(&self) -> &SourceInput {
         &self.source
     }
