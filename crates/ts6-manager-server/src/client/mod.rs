@@ -49,4 +49,5 @@ pub mod store;
 pub mod ui_prefs;
 pub mod users;
 pub mod video_sources;
+pub mod watch;
 pub mod ws;

@@ -253,6 +253,50 @@ where
     result
 }
 
+/// `POST` that returns the HTTP status and raw body.
+///
+/// [`authorized_post_json`] folds error bodies down to `{ "error" }`.
+/// Watch session create needs the rest of a `409` (`sessionId`,
+/// `broadcast`), so the caller classifies the body itself. A `401` still
+/// comes back as [`ApiError::Unauthorized`] from the refresh gate.
+pub async fn authorized_post_raw<B>(
+    gate: &RefreshGate,
+    base: &str,
+    path: &str,
+    body: Option<&B>,
+) -> Result<(u16, String), ApiError>
+where
+    B: serde::Serialize + ?Sized,
+{
+    log_api_call_enter("POST", path);
+    let body_string = body
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| ApiError::Deserialise(e.to_string()))?;
+    let (status, raw) = gate
+        .run(|snap| {
+            let base = base.to_owned();
+            let path = path.to_owned();
+            let body_string = body_string.clone();
+            async move {
+                authorized_send_raw(
+                    HttpMethod::Post,
+                    &base,
+                    &path,
+                    body_string.as_deref(),
+                    &snap,
+                )
+                .await
+            }
+        })
+        .await
+        .map_err(ApiError::from)?;
+
+    let logged = classify_maybe_empty::<serde_json::Value>(status, &raw);
+    log_api_call_exit("POST", path, status, &logged);
+    Ok((status, raw))
+}
+
 /// `DELETE {base}{path}` with refresh-gating. 204 → `Ok(())`.
 pub async fn authorized_delete(gate: &RefreshGate, base: &str, path: &str) -> Result<(), ApiError> {
     log_api_call_enter("DELETE", path);

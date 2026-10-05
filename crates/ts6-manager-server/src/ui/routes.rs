@@ -29,7 +29,7 @@ use crate::ui::pages::{
     NotFoundPage, PermissionGrantsPage, PermissionsCatalogPage, PublicWidgetPage,
     RadioStationsPage, ServerEditPage, ServerGroupDetailPage, ServerGroupsPage, ServerInfoPage,
     ServersIndexPage, SettingsPage, SetupPage, SubjectHistoryPage, TokensPage, VideoSourcesPage,
-    WidgetsPage,
+    WatchPage, WidgetsPage,
 };
 
 #[rustfmt::skip]
@@ -102,6 +102,10 @@ pub enum Route {
     // Channels/Bans.
     #[route("/video-sources")]
     VideoSourcesPage {},
+
+    // MoQ watch-together. Subscribes with a ticket from `/api/watch/sessions`.
+    #[route("/watch")]
+    WatchPage {},
 
     // PURA-124 WS-6 — music-bots product. Per-bot resources nest under
     // the bot id so the URLs stay shareable; the index lives at the
@@ -277,6 +281,9 @@ mod tests {
     fn known_paths_still_match_their_explicit_route() {
         let route = Route::from_str("/dashboard").expect("dashboard parse");
         assert!(matches!(route, Route::DashboardPlaceholder {}));
+
+        let route = Route::from_str("/watch").expect("watch parse");
+        assert!(matches!(route, Route::WatchPage {}));
 
         let route = Route::from_str("/music-bots").expect("bots index parse");
         assert!(matches!(route, Route::BotsIndexPage {}));

@@ -145,6 +145,7 @@ pub fn Sidebar(props: SidebarProps) -> Element {
     let logs_active = matches!(props.active, Route::LogsPage {});
     let widgets_active = matches!(props.active, Route::WidgetsPage {});
     let video_sources_active = matches!(props.active, Route::VideoSourcesPage {});
+    let watch_active = matches!(props.active, Route::WatchPage {});
     let settings_active = matches!(props.active, Route::SettingsPage {});
     let admin_users_active = matches!(props.active, Route::AdminUsersPage {});
     let audit_active = matches!(props.active, Route::AuditPage {});
@@ -224,6 +225,7 @@ pub fn Sidebar(props: SidebarProps) -> Element {
                     NavItem { icon: "⊙", label: "Server info", to: Route::ServerInfoPage {}, active: server_info_active }
                     // PURA-145 WS-7 — operator-facing MoQ pipeline manager.
                     NavItem { icon: "▶", label: "Video sources", to: Route::VideoSourcesPage {}, active: video_sources_active }
+                    NavItem { icon: "◉", label: "Watch", to: Route::WatchPage {}, active: watch_active }
                     PlaceholderItem { icon: "▤", label: "Files" }
                 }
 
