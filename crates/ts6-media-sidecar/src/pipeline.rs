@@ -215,32 +215,37 @@ impl SourceInput {
 /// reaches this function.
 ///
 /// Paced:
-/// - local paths (`/srv/ts6-media/inbox/episode.mp4`, `episode.mkv`)
-/// - `file://`
-/// - `http://` / `https://` whose path ends in a finite container
-///   (`.mp4`, `.mkv`, `.webm`, …), query string ignored
+/// - local paths with no URL scheme (`/srv/ts6-media/inbox/episode.mp4`,
+///   `episode.mkv`), whatever the extension
+/// - `file:` / `file://`
+/// - `http` / `https` (including ffmpeg's `http:/host/…` form) whose
+///   path ends in a finite container (`.mp4`, `.mkv`, `.webm`, …),
+///   query string ignored
 ///
 /// Not paced:
-/// - any other scheme (`rtsp`, `rtmp`, `rtp`, `udp`, `srt`, …), including
-///   ffmpeg multicast forms (`udp://@239.0.0.1:1234`)
+/// - any other scheme, written the way ffmpeg accepts it: `rtsp://…`,
+///   `udp://@239.0.0.1:1234`, or without the slashes (`udp:239.0.0.1:1234`,
+///   `srt:host:9000`, `rtmp:host/app/key`)
 /// - `pipe:` / `fd:`
-/// - playlist URLs (`.m3u8`, `.mpd`). The same extension is live HLS and
-///   HLS VOD, and `-re` on a live playlist is the failure this guard
-///   exists to avoid. Download the episode (ani-cli `-d`) and pass the
-///   file. Playlist VOD pacing needs an explicit signal later.
-/// - `.ts`, which is how live MPEG-TS is often published over HTTP
+/// - playlist URLs (`.m3u8`, `.mpd`), including `http:/host/live.m3u8`.
+///   The same extension is live HLS and HLS VOD. Download the episode
+///   (ani-cli `-d`) and pass the file.
+/// - `.ts` (live MPEG-TS over HTTP) and `.flv` (HTTP-FLV)
+/// - Icecast-style audio mounts: `.mp3`, `.aac`, `.ogg`, `.opus`
 /// - extension-less HTTP, including the loopback pin-proxy token and a
 ///   CDN URL whose container is only in a query parameter
+///
+/// Residual: a live fMP4 served at a `.mp4` path (go2rtc
+/// `…/api/stream.mp4?src=cam`) is still paced. Telling that from a
+/// finite file needs the upstream response (`Content-Length` /
+/// `Accept-Ranges` versus a chunked body), not the path.
 fn pace_file_or_vod(input: &str) -> bool {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return false;
     }
     let lower = trimmed.to_ascii_lowercase();
-    if lower.starts_with("pipe:") || lower.starts_with("fd:") {
-        return false;
-    }
-    match split_scheme(&lower) {
+    match ffmpeg_scheme(&lower) {
         None => true,
         Some("file") => true,
         Some("http") | Some("https") => http_path_is_progressive_vod(&lower),
@@ -248,33 +253,47 @@ fn pace_file_or_vod(input: &str) -> bool {
     }
 }
 
-/// Scheme before `://`.
+/// ffmpeg scheme: `^[A-Za-z][A-Za-z0-9+.-]*:` at the start of the string.
 ///
-/// `None` means there is no URL scheme, so the string is a local path.
-/// `Some("")` means a `://` was present but the scheme was empty or
-/// illegal — not a local path, and not paced.
-fn split_scheme(lower: &str) -> Option<&str> {
-    let end = lower.find("://")?;
-    let scheme = &lower[..end];
-    if scheme.is_empty()
-        || !scheme
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '.' || c == '-')
-    {
-        return Some("");
+/// `://` is not required. `udp:239.0.0.1:1234` and `http:/host/live.m3u8`
+/// are URLs. `None` means a local path.
+fn ffmpeg_scheme(lower: &str) -> Option<&str> {
+    let bytes = lower.as_bytes();
+    if bytes.first().is_none_or(|c| !c.is_ascii_alphabetic()) {
+        return None;
     }
-    Some(scheme)
+    let mut end = 1usize;
+    while end < bytes.len() {
+        let c = bytes[end];
+        if c.is_ascii_alphanumeric() || c == b'+' || c == b'.' || c == b'-' {
+            end += 1;
+            continue;
+        }
+        break;
+    }
+    if end < bytes.len() && bytes[end] == b':' {
+        Some(&lower[..end])
+    } else {
+        None
+    }
 }
 
 fn http_path_is_progressive_vod(lower_url: &str) -> bool {
-    let Some((_, after)) = lower_url.split_once("://") else {
+    let Some(scheme) = ffmpeg_scheme(lower_url) else {
         return false;
     };
-    let without_query = after.split(['?', '#']).next().unwrap_or(after);
-    let Some(slash) = without_query.find('/') else {
+    let after_scheme = &lower_url[scheme.len() + 1..];
+    let without_query = after_scheme
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    // `http://host/v.mp4` and ffmpeg's `http:/host/v.mp4` both leave
+    // `host/v.mp4` once the slashes after the colon are skipped.
+    let after_slashes = without_query.trim_start_matches('/');
+    let Some(slash) = after_slashes.find('/') else {
         return false;
     };
-    extension_is_progressive_vod(&without_query[slash..])
+    extension_is_progressive_vod(&after_slashes[slash..])
 }
 
 fn extension_is_progressive_vod(path: &str) -> bool {
@@ -286,27 +305,25 @@ fn extension_is_progressive_vod(path: &str) -> bool {
     if stem.is_empty() || ext.is_empty() || !ext.chars().all(|c| c.is_ascii_alphanumeric()) {
         return false;
     }
-    // Finite containers. Playlists (m3u8, mpd) and MPEG-TS (.ts) are
-    // excluded: both are live transports this sidecar already ingests.
+    // Finite containers only. Left off this HTTP list because they are
+    // usually live: playlists (m3u8, mpd), MPEG-TS (.ts), HTTP-FLV
+    // (.flv), and Icecast audio mounts (.mp3, .aac, .ogg, .opus).
+    // A local path never reaches here. A `.mp4` path can still be live
+    // fMP4; see `pace_file_or_vod`.
     matches!(
         ext,
         "3gp"
-            | "aac"
             | "avi"
             | "flac"
-            | "flv"
             | "m2ts"
             | "m4a"
             | "m4v"
             | "mkv"
             | "mov"
-            | "mp3"
             | "mp4"
             | "mpeg"
             | "mpg"
-            | "ogg"
             | "ogv"
-            | "opus"
             | "wav"
             | "webm"
             | "wmv"
@@ -421,6 +438,9 @@ impl PipelineMetrics {
 pub struct Pipeline {
     name: String,
     preset: QualityPreset,
+    /// Operator input after any pin-proxy rewrite. `pace_input` was
+    /// chosen before that rewrite.
+    source: SourceInput,
     origin: Arc<SidecarOrigin>,
     metrics: Arc<PipelineMetrics>,
     _broadcast: BroadcastProducer,
@@ -483,6 +503,7 @@ impl Pipeline {
         Ok(Self {
             name: config.name,
             preset: config.preset,
+            source: config.source.clone(),
             origin,
             metrics,
             _broadcast: broadcast,
@@ -501,6 +522,12 @@ impl Pipeline {
     /// life of the pipeline (see [`QualityPreset`] docs).
     pub fn preset(&self) -> QualityPreset {
         self.preset
+    }
+
+    /// Input ffmpeg is reading, including the pacing bit decided from
+    /// the operator URL.
+    pub(crate) fn source(&self) -> &SourceInput {
+        &self.source
     }
 
     /// Shared counters touched by the supervisor + mux loops. Cloneable
@@ -1628,6 +1655,16 @@ mod tests {
             "https://user:pass@cdn.example/show.webm#t=12",
             "http://cdn.example:8443/a.m4v",
             "http://[::1]/episode.mov",
+            // ffmpeg's single-slash form is still http, and a container
+            // extension still paces.
+            "http:/cdn.example/episode.mp4",
+            // Local paths and file: stay paced whatever the extension,
+            // including ones HTTP treats as live.
+            "/srv/ts6-media/inbox/live.flv",
+            "/srv/ts6-media/inbox/track.mp3",
+            "live.flv",
+            "file:///var/media/stream.aac",
+            "file:episode.opus",
         ];
         for input in cases {
             let cfg = PipelineConfig::new("src", SourceInput::from_input(input));
@@ -1674,6 +1711,19 @@ mod tests {
             SourceInput::from_input("http://camera.example/stream"),
             SourceInput::from_input("pipe:0"),
             SourceInput::from_input("fd:3"),
+            // HTTP-FLV and Icecast mounts are live. The same extensions
+            // on a local path stay paced (see the file table above).
+            SourceInput::from_input("https://cdn.example/live/x.flv"),
+            SourceInput::from_input("https://radio.example/stream.mp3"),
+            SourceInput::from_input("https://radio.example/stream.aac"),
+            SourceInput::from_input("http://radio.example:8000/live.ogg"),
+            SourceInput::from_input("https://radio.example/mount.opus"),
+            SourceInput::from_input("http:/cdn.example/live/x.flv"),
+            // ffmpeg accepts scheme: without "//". Those are not files.
+            SourceInput::from_input("udp:239.0.0.1:1234"),
+            SourceInput::from_input("srt:host:9000"),
+            SourceInput::from_input("rtmp:host/app/key"),
+            SourceInput::from_input("http:/host/live.m3u8"),
         ];
         for src in cases {
             let label = src.display();

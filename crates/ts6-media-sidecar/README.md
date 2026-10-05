@@ -219,18 +219,25 @@ DNS-rebinding defence for `POST /source` is the loopback pin proxy
   boot `--source https://` URLs, which do not go through this proxy,
   set `-tls_verify 1` and
   `-protocol_whitelist http,https,tcp,tls,crypto`.
-* File paths, `file://`, HTTP(S) URLs whose path ends in a progressive
-  container (`.mp4`, `.mkv`, `.webm`, …), and lavfi get `-re`
-  immediately before `-i` (ffmpeg's `-readrate 1`). Lavfi generators
-  hand over the next frame as soon as it is pulled; without `-re` a
-  test pattern encodes as fast as the cores allow, so a CPU sample is
-  not a live encode. The file/VOD decision is made on the operator URL
-  and kept when `POST /source` rewrites `-i` to the loopback pin
-  token. Live schemes (`rtsp`, `rtmp`, `rtp`, `udp`, `srt`, …),
-  extension-less HTTP, `.ts`, and playlist URLs (`.m3u8`, `.mpd`) are
-  not paced. `-re` on a live ingest drops packets. Playlist VOD still
-  bursts until something can tell it from live HLS; download the file
-  and pass that.
+* File paths, `file:` (with or without `//`), HTTP(S) URLs whose path
+  ends in a finite container (`.mp4`, `.mkv`, `.webm`, …), and lavfi
+  get `-re` immediately before `-i` (ffmpeg's `-readrate 1`). A local
+  path is paced whatever its extension. Lavfi generators hand over the
+  next frame as soon as it is pulled; without `-re` a test pattern
+  encodes as fast as the cores allow, so a CPU sample is not a live
+  encode. The file/VOD decision is made on the operator URL and kept
+  when `POST /source` rewrites `-i` to the loopback pin token. A URL
+  is any ffmpeg scheme prefix (`^[A-Za-z][A-Za-z0-9+.-]*:`), so
+  `udp:239.0.0.1:1234`, `srt:host:9000`, `rtmp:host/app/key`, and
+  `http:/host/live.m3u8` are not local files. Live schemes (`rtsp`,
+  `rtmp`, `rtp`, `udp`, `srt`, …), extension-less HTTP, `.ts`,
+  HTTP-FLV (`.flv`), Icecast mounts (`.mp3`, `.aac`, `.ogg`, `.opus`),
+  and playlist URLs (`.m3u8`, `.mpd`) are not paced. `-re` on a live
+  ingest drops packets. Playlist VOD still bursts until something can
+  tell it from live HLS; download the file and pass that. Residual:
+  live fMP4 served at a `.mp4` path (go2rtc `…/api/stream.mp4?src=cam`)
+  is still paced. Telling that from a finite file needs the upstream
+  response, not the path.
 * Video encode is libvpx `-deadline realtime -cpu-used 8` for every
   preset. Bookworm ffmpeg accepts `-cpu-used` from -16 to 16. Scale,
   framerate, and bitrate still come from the preset. Audio stays Opus
@@ -359,8 +366,10 @@ against the WS-0 reference player.
 - **No anime encode profile.** Opus stays mono / 64k /
   `-application voip`. The `720p` preset still forces 30 fps.
   Watch-together step 4.
-- **Playlist VOD is not paced.** `.m3u8` / `.mpd` can be live. Pass a
-  file or a progressive container URL to get `-re`.
+- **Playlist VOD is not paced.** `.m3u8` / `.mpd` can be live. HTTP-FLV
+  and Icecast audio mounts are not paced either. Pass a file or a
+  progressive container URL to get `-re`. A live fMP4 at a `.mp4`
+  path is still paced; the path cannot tell it from a finite file.
 - **No on-the-fly preset switching.** WS-4 (PURA-142) wires `preset` into
   the FFmpeg encoder triple, but switching presets on a live stream is
   deferred to v1.1 — operators must `POST /source/stop` + `POST /source`.
