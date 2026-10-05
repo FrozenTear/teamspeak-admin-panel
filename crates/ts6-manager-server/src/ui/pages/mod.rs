@@ -30,6 +30,7 @@ mod settings;
 mod setup;
 mod talk_power;
 mod video_sources;
+mod watch;
 mod widgets;
 
 pub use admin::{AdminUsersPage, AuditPage};
@@ -61,4 +62,5 @@ pub use servers_index::ServersIndexPage;
 pub use settings::SettingsPage;
 pub use setup::SetupPage;
 pub use video_sources::VideoSourcesPage;
+pub use watch::WatchPage;
 pub use widgets::WidgetsPage;

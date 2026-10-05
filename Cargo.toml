@@ -110,6 +110,7 @@ web-sys = { version = "0.3", features = [
     "VideoDecoder",
     "VideoDecoderConfig",
     "VideoDecoderInit",
+    "CodecState",
     "VideoFrame",
     "EncodedVideoChunk",
     "EncodedVideoChunkInit",

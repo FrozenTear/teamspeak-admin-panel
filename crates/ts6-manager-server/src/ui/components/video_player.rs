@@ -6,6 +6,11 @@
 //! The wire format details (QUIC varint, SUBSCRIBE frame, GROUP stream
 //! framing) live in [ADR-0007](../../../../../../docs/adr/0007-moq-flavor-and-draft-pin.md).
 //!
+//! After a gap (skipped or incomplete group, decoder error, or the tab
+//! returning from the background) delta frames are discarded until the
+//! next VP8 keyframe. The decoder is reset before that keyframe is fed.
+//! See [`super::keyframe_gate`].
+//!
 //! ## Hooks
 //!
 //! The session loop is owned by a [`SessionGuard`] stashed in `use_hook`.
@@ -49,11 +54,47 @@ impl PlayerState {
     pub fn describe(&self) -> String {
         match self {
             PlayerState::Idle => "Waiting…".into(),
-            PlayerState::Unsupported => "WebTransport not supported".into(),
+            PlayerState::Unsupported => "WebTransport or WebCodecs missing".into(),
             PlayerState::Connecting => "Connecting…".into(),
             PlayerState::Playing => "Playing".into(),
             PlayerState::Stopped => "Stopped".into(),
             PlayerState::Error(msg) => format!("Error: {msg}"),
+        }
+    }
+}
+
+/// How the player trusts the relay certificate.
+///
+/// Existing preview and widget mounts keep [`CertTrust::FetchFromRelay`].
+/// The Watch page passes the hash from `POST /api/watch/sessions`.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub enum CertTrust {
+    /// `GET http://<relay-host>/certificate.sha256`, then the OS trust store
+    /// when that fetch fails.
+    #[default]
+    FetchFromRelay,
+    /// 64 hex characters from the watch grant's `certHash`.
+    Sha256Hex(String),
+    /// The grant's `certHash` was null. Use the OS trust store.
+    System,
+}
+
+/// Counters the Watch page prints while a broadcast is open.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlayerDebug {
+    pub state: PlayerState,
+    pub frames_decoded: u64,
+    pub frames_dropped: u64,
+    pub keyframe_waits: u64,
+}
+
+impl Default for PlayerDebug {
+    fn default() -> Self {
+        Self {
+            state: PlayerState::Idle,
+            frames_decoded: 0,
+            frames_dropped: 0,
+            keyframe_waits: 0,
         }
     }
 }
@@ -70,6 +111,20 @@ pub fn VideoPlayer(
     /// remounts the component when the user taps to unmute.
     #[props(default = false)]
     muted: bool,
+    /// WebTransport subprotocol. Empty selects `moq-lite-04`.
+    #[props(default)]
+    alpn: String,
+    /// moq-lite track name for VP8. Empty selects `video`.
+    #[props(default)]
+    video_track: String,
+    /// moq-lite track name for Opus. Empty selects `audio`.
+    #[props(default)]
+    audio_track: String,
+    #[props(default)] cert: CertTrust,
+    /// When set, the session loop writes connection state and frame counters
+    /// here for the Watch page debug line.
+    #[props(default)]
+    debug: Option<Signal<PlayerDebug>>,
 ) -> Element {
     let state: Signal<PlayerState> = use_signal(|| PlayerState::Idle);
 
@@ -97,21 +152,47 @@ pub fn VideoPlayer(
         let canvas_id = canvas_id.clone();
         let relay_url = relay_url.clone();
         let namespace = namespace.clone();
+        let alpn = if alpn.is_empty() {
+            "moq-lite-04".to_string()
+        } else {
+            alpn.clone()
+        };
+        let video_track = if video_track.is_empty() {
+            "video".to_string()
+        } else {
+            video_track.clone()
+        };
+        let audio_track = if audio_track.is_empty() {
+            "audio".to_string()
+        } else {
+            audio_track.clone()
+        };
+        let cert = cert.clone();
         let state_for_hook = state;
         let _guard = use_hook(move || {
-            wt::start(
+            wt::start(wt::StartArgs {
                 relay_url,
                 namespace,
                 canvas_id,
                 autoplay,
                 muted,
-                state_for_hook,
-            )
+                alpn,
+                video_track,
+                audio_track,
+                cert,
+                debug,
+                state: state_for_hook,
+            })
         });
     }
 
     let _ = autoplay; // silence unused on non-wasm
     let _ = muted;
+    let _ = alpn;
+    let _ = video_track;
+    let _ = audio_track;
+    let _ = cert;
+    let _ = debug;
 
     let status_text = state.read().describe();
     let unsupported = matches!(*state.read(), PlayerState::Unsupported);
@@ -123,7 +204,7 @@ pub fn VideoPlayer(
                     class: "video-player__fallback",
                     role: "status",
                     "aria-live": "polite",
-                    "This browser does not support WebTransport. Use Chrome/Edge/Firefox 117+."
+                    "This browser does not support WebTransport or WebCodecs VideoDecoder. Use Chrome or Edge."
                 }
             } else {
                 canvas {
@@ -159,7 +240,10 @@ pub fn VideoPlayer(
 
 #[cfg(target_arch = "wasm32")]
 mod wt {
-    use super::PlayerState;
+    use super::{CertTrust, PlayerDebug, PlayerState};
+    use crate::ui::components::keyframe_gate::{
+        GateAction, GroupAdmit, KeyframeGate, vp8_is_keyframe,
+    };
     use dioxus::prelude::{ReadableExt, Signal, WritableExt};
     use js_sys::{Array, Float32Array, Reflect, Uint8Array};
     use std::cell::{Cell, RefCell};
@@ -169,11 +253,12 @@ mod wt {
     use web_sys::{
         AudioBuffer, AudioBufferSourceNode, AudioContext, AudioData, AudioDataCopyToOptions,
         AudioDecoder, AudioDecoderConfig, AudioDecoderInit, AudioSampleFormat,
-        CanvasRenderingContext2d, EncodedAudioChunk, EncodedAudioChunkInit, EncodedAudioChunkType,
-        EncodedVideoChunk, EncodedVideoChunkInit, EncodedVideoChunkType, HtmlCanvasElement,
-        ReadableStream, ReadableStreamDefaultReader, VideoDecoder, VideoDecoderConfig,
-        VideoDecoderInit, VideoFrame, WebTransport, WebTransportBidirectionalStream,
-        WebTransportHash, WebTransportOptions, WritableStreamDefaultWriter,
+        CanvasRenderingContext2d, CodecState, EncodedAudioChunk, EncodedAudioChunkInit,
+        EncodedAudioChunkType, EncodedVideoChunk, EncodedVideoChunkInit, EncodedVideoChunkType,
+        EventTarget, HtmlCanvasElement, ReadableStream, ReadableStreamDefaultReader, VideoDecoder,
+        VideoDecoderConfig, VideoDecoderInit, VideoFrame, WebTransport,
+        WebTransportBidirectionalStream, WebTransportHash, WebTransportOptions,
+        WritableStreamDefaultWriter,
     };
 
     // Subscribe ids — one per track in this broadcast. The values are
@@ -205,51 +290,88 @@ mod wt {
         }
     }
 
+    pub struct StartArgs {
+        pub relay_url: String,
+        pub namespace: String,
+        pub canvas_id: String,
+        pub autoplay: bool,
+        pub muted: bool,
+        pub alpn: String,
+        pub video_track: String,
+        pub audio_track: String,
+        pub cert: CertTrust,
+        pub debug: Option<Signal<PlayerDebug>>,
+        pub state: Signal<PlayerState>,
+    }
+
     /// Public entry called from the component's `use_hook`. Spawns the
     /// session loop on `wasm_bindgen_futures::spawn_local` and returns a
     /// guard that owns the teardown.
-    pub fn start(
-        relay_url: String,
-        namespace: String,
-        canvas_id: String,
-        autoplay: bool,
-        muted: bool,
-        mut state: Signal<PlayerState>,
-    ) -> Rc<SessionGuard> {
+    pub fn start(args: StartArgs) -> Rc<SessionGuard> {
+        let StartArgs {
+            relay_url,
+            namespace,
+            canvas_id,
+            autoplay,
+            muted,
+            alpn,
+            video_track,
+            audio_track,
+            cert,
+            debug,
+            mut state,
+        } = args;
         let stop = Rc::new(Cell::new(false));
         let wt_slot: Rc<RefCell<Option<WebTransport>>> = Rc::new(RefCell::new(None));
 
-        if !webtransport_supported() {
-            state.set(PlayerState::Unsupported);
+        if !media_apis_available() {
+            set_state(&mut state, PlayerState::Unsupported, debug, None);
             return Rc::new(SessionGuard { stop, wt: wt_slot });
         }
         if !autoplay {
             return Rc::new(SessionGuard { stop, wt: wt_slot });
         }
 
-        state.set(PlayerState::Connecting);
+        set_state(&mut state, PlayerState::Connecting, debug, None);
         let stop_for_task = stop.clone();
         let wt_for_task = wt_slot.clone();
         let mut state_for_task = state;
         wasm_bindgen_futures::spawn_local(async move {
-            let res = run_session(
-                &relay_url,
-                &namespace,
-                &canvas_id,
+            let gate = Rc::new(RefCell::new(KeyframeGate::new()));
+            let publish_at = Rc::new(Cell::new(0.0));
+            publish_debug(
+                debug,
+                &PlayerState::Connecting,
+                &gate.borrow(),
+                &publish_at,
+                true,
+            );
+            let res = run_session(SessionArgs {
+                relay_url: &relay_url,
+                namespace: &namespace,
+                canvas_id: &canvas_id,
                 muted,
-                state_for_task,
-                stop_for_task.clone(),
-                wt_for_task.clone(),
-            )
+                alpn: &alpn,
+                video_track: &video_track,
+                audio_track: &audio_track,
+                cert: &cert,
+                state: state_for_task,
+                stop: stop_for_task.clone(),
+                wt_slot: wt_for_task.clone(),
+                gate: gate.clone(),
+                debug,
+                publish_at: publish_at.clone(),
+            })
             .await;
-            if stop_for_task.get() {
-                state_for_task.set(PlayerState::Stopped);
+            let next = if stop_for_task.get() {
+                PlayerState::Stopped
             } else if let Err(err) = res {
                 tracing::warn!(error = %err, "video_player session failed");
-                state_for_task.set(PlayerState::Error(err));
+                PlayerState::Error(err)
             } else {
-                state_for_task.set(PlayerState::Stopped);
-            }
+                PlayerState::Stopped
+            };
+            set_state(&mut state_for_task, next, debug, Some(&gate.borrow()));
             // Make sure the JS handle is released even on the happy path.
             if let Some(wt) = wt_for_task.borrow_mut().take() {
                 wt.close();
@@ -259,31 +381,99 @@ mod wt {
         Rc::new(SessionGuard { stop, wt: wt_slot })
     }
 
-    fn webtransport_supported() -> bool {
+    fn media_apis_available() -> bool {
+        js_ctor_present("WebTransport") && js_ctor_present("VideoDecoder")
+    }
+
+    fn js_ctor_present(name: &str) -> bool {
         let Some(window) = web_sys::window() else {
             return false;
         };
-        Reflect::get(window.as_ref(), &JsValue::from_str("WebTransport"))
+        Reflect::get(window.as_ref(), &JsValue::from_str(name))
             .map(|v| !v.is_undefined() && !v.is_null())
             .unwrap_or(false)
+    }
+
+    fn set_state(
+        state: &mut Signal<PlayerState>,
+        next: PlayerState,
+        debug: Option<Signal<PlayerDebug>>,
+        gate: Option<&KeyframeGate>,
+    ) {
+        state.set(next.clone());
+        if let Some(mut debug) = debug {
+            debug.set(PlayerDebug {
+                state: next,
+                frames_decoded: gate.map(KeyframeGate::frames_decoded).unwrap_or(0),
+                frames_dropped: gate.map(KeyframeGate::frames_dropped).unwrap_or(0),
+                keyframe_waits: gate.map(KeyframeGate::keyframe_waits).unwrap_or(0),
+            });
+        }
+    }
+
+    fn publish_debug(
+        debug: Option<Signal<PlayerDebug>>,
+        state: &PlayerState,
+        gate: &KeyframeGate,
+        last_ms: &Cell<f64>,
+        force: bool,
+    ) {
+        let Some(mut debug) = debug else {
+            return;
+        };
+        let now = performance_now();
+        if !force && now - last_ms.get() < 250.0 {
+            return;
+        }
+        last_ms.set(now);
+        debug.set(PlayerDebug {
+            state: state.clone(),
+            frames_decoded: gate.frames_decoded(),
+            frames_dropped: gate.frames_dropped(),
+            keyframe_waits: gate.keyframe_waits(),
+        });
     }
 
     // ---------------------------------------------------------------------
     // Main session driver
     // ---------------------------------------------------------------------
 
-    async fn run_session(
-        relay_url: &str,
-        namespace: &str,
-        canvas_id: &str,
+    struct SessionArgs<'a> {
+        relay_url: &'a str,
+        namespace: &'a str,
+        canvas_id: &'a str,
         muted: bool,
+        alpn: &'a str,
+        video_track: &'a str,
+        audio_track: &'a str,
+        cert: &'a CertTrust,
         state: Signal<PlayerState>,
         stop: Rc<Cell<bool>>,
         wt_slot: Rc<RefCell<Option<WebTransport>>>,
-    ) -> Result<(), String> {
-        // Build the WebTransport init dict: ALPN-pinned moq-lite-04 +
-        // optional self-signed cert hash for dev relays (sidecar serves
-        // it at HTTP /certificate.sha256).
+        gate: Rc<RefCell<KeyframeGate>>,
+        debug: Option<Signal<PlayerDebug>>,
+        publish_at: Rc<Cell<f64>>,
+    }
+
+    async fn run_session(args: SessionArgs<'_>) -> Result<(), String> {
+        let SessionArgs {
+            relay_url,
+            namespace,
+            canvas_id,
+            muted,
+            alpn,
+            video_track,
+            audio_track,
+            cert,
+            state,
+            stop,
+            wt_slot,
+            gate,
+            debug,
+            publish_at,
+        } = args;
+        // Build the WebTransport init dict: ALPN from the watch grant
+        // (moq-lite-04) plus an optional self-signed cert hash.
         //
         // `protocols` is a vendor extension exposed by Chrome's WebTransport
         // implementation (PURA-138 WS-0 GO note: the moq-rs relay only
@@ -292,7 +482,7 @@ mod wt {
         // to `Reflect::set` to attach the field.
         let opts = WebTransportOptions::new();
         let protocols = Array::new();
-        protocols.push(&JsValue::from_str("moq-lite-04"));
+        protocols.push(&JsValue::from_str(alpn));
         Reflect::set(
             opts.as_ref(),
             &JsValue::from_str("protocols"),
@@ -300,7 +490,7 @@ mod wt {
         )
         .map_err(|e| format!("set protocols: {}", js_err(&e)))?;
 
-        if let Some(hash_bytes) = fetch_cert_hash(relay_url).await {
+        if let Some(hash_bytes) = resolve_cert_hash(cert, relay_url).await? {
             let hash = WebTransportHash::new();
             hash.set_algorithm("sha-256");
             let buf = Uint8Array::new_with_length(hash_bytes.len() as u32);
@@ -318,15 +508,27 @@ mod wt {
             .await
             .map_err(|e| format!("WebTransport.ready: {}", js_err(&e)))?;
 
+        // Every video SUBSCRIBE starts in the wait-for-keyframe state,
+        // including the initial join and any later resubscribe on this gate.
+        // Deltas until that key are dropped and counted as keyframe waits.
+        gate.borrow_mut().begin_subscribe();
+        publish_debug(
+            debug,
+            &PlayerState::Connecting,
+            &gate.borrow(),
+            &publish_at,
+            true,
+        );
+
         // ── Subscribe to video; subscribe to audio only when not muted.
         //    Skipping the audio SUBSCRIBE entirely on muted mounts saves a
         //    pointless round-trip on public embeds whose autoplay policy
         //    will block the AudioContext anyway. The public viewer
         //    remounts the component with `muted=false` once the user
         //    clicks the tap-to-unmute overlay.
-        subscribe(&wt, SUBSCRIBE_VIDEO, namespace, "video").await?;
+        subscribe(&wt, SUBSCRIBE_VIDEO, namespace, video_track).await?;
         if !muted {
-            subscribe(&wt, SUBSCRIBE_AUDIO, namespace, "audio").await?;
+            subscribe(&wt, SUBSCRIBE_AUDIO, namespace, audio_track).await?;
         }
 
         // ── Build decoders + sinks.
@@ -339,7 +541,8 @@ mod wt {
             .map_err(|_| "canvas 2d context cast failed".to_string())?;
         let ctx = Rc::new(ctx);
 
-        let video_decoder = build_video_decoder(ctx.clone(), state)?;
+        let video_decoder = build_video_decoder(ctx.clone(), gate.clone())?;
+        let _visibility = install_visibility_gate(gate.clone(), video_decoder.clone());
         // Build the audio decoder lazily; muted mounts never feed it.
         let audio_decoder: Option<Rc<AudioDecoderHandle>> = if muted {
             None
@@ -365,6 +568,9 @@ mod wt {
                     if stop.get() {
                         break;
                     }
+                    // The transport died. A later mount starts a new gate
+                    // in the wait-for-keyframe state.
+                    gate.borrow_mut().note_gap();
                     return Err(format!("uni-stream reader read: {}", js_err(&e)));
                 }
             };
@@ -387,6 +593,9 @@ mod wt {
             let audio_decoder = audio_decoder.clone();
             let state_for_group = state;
             let stop_for_group = stop.clone();
+            let gate_for_group = gate.clone();
+            let debug_for_group = debug;
+            let publish_at_for_group = publish_at.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 if let Err(err) = drain_group(
                     stream,
@@ -394,6 +603,9 @@ mod wt {
                     audio_decoder,
                     state_for_group,
                     stop_for_group,
+                    gate_for_group,
+                    debug_for_group,
+                    publish_at_for_group,
                 )
                 .await
                 {
@@ -404,6 +616,42 @@ mod wt {
 
         let _ = state; // keep moveable into the future logic above
         Ok(())
+    }
+
+    /// Hide and show both discard deltas until the next keyframe. Returning
+    /// from the background is when a stalled decoder otherwise paints snow.
+    fn install_visibility_gate(
+        gate: Rc<RefCell<KeyframeGate>>,
+        video_decoder: Rc<VideoDecoderHandle>,
+    ) -> Option<ListenerGuard> {
+        let window = web_sys::window()?;
+        let document = window.document()?;
+        let target: EventTarget = document.unchecked_into();
+        let closure = Closure::wrap(Box::new(move || {
+            gate.borrow_mut().note_gap();
+            video_decoder.discard_queued();
+        }) as Box<dyn FnMut()>);
+        if target
+            .add_event_listener_with_callback("visibilitychange", closure.as_ref().unchecked_ref())
+            .is_err()
+        {
+            return None;
+        }
+        Some(ListenerGuard { target, closure })
+    }
+
+    struct ListenerGuard {
+        target: EventTarget,
+        closure: Closure<dyn FnMut()>,
+    }
+
+    impl Drop for ListenerGuard {
+        fn drop(&mut self) {
+            let _ = self.target.remove_event_listener_with_callback(
+                "visibilitychange",
+                self.closure.as_ref().unchecked_ref(),
+            );
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -488,6 +736,9 @@ mod wt {
         audio_decoder: Option<Rc<AudioDecoderHandle>>,
         mut state: Signal<PlayerState>,
         stop: Rc<Cell<bool>>,
+        gate: Rc<RefCell<KeyframeGate>>,
+        debug: Option<Signal<PlayerDebug>>,
+        publish_at: Rc<Cell<f64>>,
     ) -> Result<(), String> {
         let reader: ReadableStreamDefaultReader = stream
             .get_reader()
@@ -504,7 +755,26 @@ mod wt {
 
         let _msg_len = sr.uvarint().await?;
         let subscribe_id = sr.uvarint().await?;
-        let _sequence = sr.uvarint().await?;
+        let sequence = match sr.uvarint().await {
+            Ok(seq) => seq,
+            Err(err) => {
+                if subscribe_id == SUBSCRIBE_VIDEO {
+                    mark_video_gap(&gate, &video_decoder, debug, &state, &publish_at);
+                }
+                return Err(err);
+            }
+        };
+
+        // Snapshot lateness before the body read. A newer key accepted
+        // while this read is in flight is handled by the group sequence
+        // inside `on_frame`, not by flipping this flag.
+        let late = if subscribe_id == SUBSCRIBE_VIDEO {
+            matches!(gate.borrow_mut().begin_group(sequence), GroupAdmit::Late)
+        } else {
+            false
+        };
+        let mut saw_frame = false;
+        let mut failed = false;
 
         loop {
             if stop.get() {
@@ -514,15 +784,43 @@ mod wt {
                 Some(n) => n as usize,
                 None => break, // clean stream EOF
             };
-            let bytes = sr.read_bytes(frame_len).await?;
+            let bytes = match sr.read_bytes(frame_len).await {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    if subscribe_id == SUBSCRIBE_VIDEO {
+                        mark_video_gap(&gate, &video_decoder, debug, &state, &publish_at);
+                    }
+                    return Err(err);
+                }
+            };
+            saw_frame = true;
             match subscribe_id {
                 SUBSCRIBE_VIDEO => {
                     let is_key = vp8_is_keyframe(&bytes);
-                    video_decoder.feed(bytes, is_key)?;
-                    // Promote to "Playing" on the first decoded keyframe.
-                    if is_key && matches!(*state.peek(), PlayerState::Connecting) {
-                        state.set(PlayerState::Playing);
+                    let action = gate.borrow_mut().on_frame(is_key, sequence, late);
+                    match action {
+                        GateAction::Drop => {}
+                        GateAction::Feed { flush_before } => {
+                            if let Err(err) = video_decoder.feed(&bytes, is_key, flush_before) {
+                                mark_video_gap(&gate, &video_decoder, debug, &state, &publish_at);
+                                tracing::warn!(error = %err, "video decode failed; waiting for keyframe");
+                                failed = true;
+                                break;
+                            }
+                            // Promote to "Playing" once a frame is actually fed.
+                            // The gate only feeds a keyframe first.
+                            if matches!(*state.peek(), PlayerState::Connecting) {
+                                set_state(
+                                    &mut state,
+                                    PlayerState::Playing,
+                                    debug,
+                                    Some(&gate.borrow()),
+                                );
+                            }
+                        }
                     }
+                    let current = state.peek().clone();
+                    publish_debug(debug, &current, &gate.borrow(), &publish_at, false);
                 }
                 SUBSCRIBE_AUDIO => {
                     // `None` when the component is muted (WS-8 public
@@ -536,11 +834,30 @@ mod wt {
                 }
             }
         }
+        if subscribe_id == SUBSCRIBE_VIDEO && !failed {
+            if saw_frame {
+                gate.borrow_mut().complete_group(sequence);
+            } else {
+                // Header arrived and the stream ended before a frame.
+                mark_video_gap(&gate, &video_decoder, debug, &state, &publish_at);
+            }
+            let current = state.peek().clone();
+            publish_debug(debug, &current, &gate.borrow(), &publish_at, true);
+        }
         Ok(())
     }
 
-    fn vp8_is_keyframe(data: &[u8]) -> bool {
-        !data.is_empty() && (data[0] & 0x01) == 0
+    fn mark_video_gap(
+        gate: &RefCell<KeyframeGate>,
+        video_decoder: &VideoDecoderHandle,
+        debug: Option<Signal<PlayerDebug>>,
+        state: &Signal<PlayerState>,
+        publish_at: &Cell<f64>,
+    ) {
+        gate.borrow_mut().note_gap();
+        video_decoder.discard_queued();
+        let current = state.peek().clone();
+        publish_debug(debug, &current, &gate.borrow(), publish_at, true);
     }
 
     // ---------------------------------------------------------------------
@@ -548,17 +865,19 @@ mod wt {
     // ---------------------------------------------------------------------
 
     pub struct VideoDecoderHandle {
-        decoder: VideoDecoder,
+        decoder: RefCell<VideoDecoder>,
+        broken: Rc<Cell<bool>>,
         frame_seq: Cell<u64>,
         // Closures must outlive every `decode()` call. Holding them in
-        // the handle keeps them alive until the component unmounts.
+        // the handle keeps them alive until the component unmounts, and
+        // lets a closed decoder be rebuilt with the same callbacks.
         _output_closure: Closure<dyn FnMut(JsValue)>,
         _error_closure: Closure<dyn FnMut(JsValue)>,
     }
 
     fn build_video_decoder(
         ctx: Rc<CanvasRenderingContext2d>,
-        state: Signal<PlayerState>,
+        gate: Rc<RefCell<KeyframeGate>>,
     ) -> Result<Rc<VideoDecoderHandle>, String> {
         // Audio clock baseline for "drop late video frames". Without an
         // AudioContext handle here we use performance.now()-based timing;
@@ -588,14 +907,34 @@ mod wt {
             last_paint_for_output.set(now);
         }) as Box<dyn FnMut(JsValue)>);
 
-        let state_for_err = state;
+        let broken = Rc::new(Cell::new(false));
+        let broken_for_err = broken.clone();
+        let gate_for_err = gate;
         let error = Closure::wrap(Box::new(move |e: JsValue| {
-            let mut state = state_for_err;
-            let msg = format!("VideoDecoder: {}", js_err(&e));
-            tracing::warn!("{msg}");
-            state.set(PlayerState::Error(msg));
+            // The decoder is closed after this callback. The next keyframe
+            // rebuilds it. Deltas until then are dropped by the gate.
+            tracing::warn!("VideoDecoder: {}", js_err(&e));
+            broken_for_err.set(true);
+            gate_for_err.borrow_mut().note_gap();
         }) as Box<dyn FnMut(JsValue)>);
 
+        let decoder = new_video_decoder(&error, &output)?;
+
+        let _ = ctx; // closure already owns its own clone
+
+        Ok(Rc::new(VideoDecoderHandle {
+            decoder: RefCell::new(decoder),
+            broken,
+            frame_seq: Cell::new(0),
+            _output_closure: output,
+            _error_closure: error,
+        }))
+    }
+
+    fn new_video_decoder(
+        error: &Closure<dyn FnMut(JsValue)>,
+        output: &Closure<dyn FnMut(JsValue)>,
+    ) -> Result<VideoDecoder, String> {
         let init = VideoDecoderInit::new(
             error.as_ref().unchecked_ref(),
             output.as_ref().unchecked_ref(),
@@ -604,23 +943,52 @@ mod wt {
             VideoDecoder::new(&init).map_err(|e| format!("VideoDecoder::new: {}", js_err(&e)))?;
         // VP8 codec string — same as the reference player. The fixture
         // emits 1280×720 30fps VP8 keyframed groups (PURA-140 WS-2).
+        configure_vp8(&decoder)?;
+        Ok(decoder)
+    }
+
+    fn configure_vp8(decoder: &VideoDecoder) -> Result<(), String> {
         let config = VideoDecoderConfig::new("vp8");
         decoder
             .configure(&config)
-            .map_err(|e| format!("VideoDecoder.configure: {}", js_err(&e)))?;
+            .map_err(|e| format!("VideoDecoder.configure: {}", js_err(&e)))
+    }
 
-        let _ = ctx; // closure already owns its own clone
-
-        Ok(Rc::new(VideoDecoderHandle {
-            decoder,
-            frame_seq: Cell::new(0),
-            _output_closure: output,
-            _error_closure: error,
-        }))
+    fn decoder_is_closed(decoder: &VideoDecoder) -> bool {
+        matches!(decoder.state(), CodecState::Closed)
     }
 
     impl VideoDecoderHandle {
-        fn feed(&self, data: Vec<u8>, is_key: bool) -> Result<(), String> {
+        fn discard_queued(&self) {
+            self.broken.set(true);
+            let decoder = self.decoder.borrow();
+            if !decoder_is_closed(&decoder) {
+                let _ = decoder.reset();
+            }
+        }
+
+        /// `reset` returns the decoder to unconfigured. A closed decoder
+        /// (the state after the error callback) has to be constructed again.
+        fn recover(&self) -> Result<(), String> {
+            let closed = decoder_is_closed(&self.decoder.borrow());
+            if closed || self.broken.get() {
+                let decoder = new_video_decoder(&self._error_closure, &self._output_closure)?;
+                *self.decoder.borrow_mut() = decoder;
+            } else {
+                let decoder = self.decoder.borrow();
+                decoder
+                    .reset()
+                    .map_err(|e| format!("VideoDecoder.reset: {}", js_err(&e)))?;
+                configure_vp8(&decoder)?;
+            }
+            self.broken.set(false);
+            Ok(())
+        }
+
+        fn feed(&self, data: &[u8], is_key: bool, flush_before: bool) -> Result<(), String> {
+            if flush_before || self.broken.get() {
+                self.recover()?;
+            }
             // Synthesise a monotonically-increasing timestamp; WebCodecs
             // needs SOMETHING for ordering — exact wall-clock value does
             // not matter for live playback. web-sys binds the
@@ -632,7 +1000,7 @@ mod wt {
             let ts_ms = ((seq as i64).wrapping_mul(33) & 0x7fff_ffff) as i32;
 
             let buf = Uint8Array::new_with_length(data.len() as u32);
-            buf.copy_from(&data);
+            buf.copy_from(data);
 
             let kind = if is_key {
                 EncodedVideoChunkType::Key
@@ -643,6 +1011,7 @@ mod wt {
             let chunk = EncodedVideoChunk::new(&init)
                 .map_err(|e| format!("EncodedVideoChunk: {}", js_err(&e)))?;
             self.decoder
+                .borrow()
                 .decode(&chunk)
                 .map_err(|e| format!("VideoDecoder.decode: {}", js_err(&e)))
         }
@@ -1000,6 +1369,21 @@ mod wt {
         format!("{e:?}")
     }
 
+    async fn resolve_cert_hash(
+        cert: &CertTrust,
+        relay_url: &str,
+    ) -> Result<Option<Vec<u8>>, String> {
+        match cert {
+            CertTrust::FetchFromRelay => Ok(fetch_cert_hash(relay_url).await),
+            CertTrust::System => Ok(None),
+            CertTrust::Sha256Hex(hex) => {
+                let bytes = crate::client::watch::decode_cert_hash(hex)
+                    .ok_or_else(|| "cert hash is not 64 hex characters".to_string())?;
+                Ok(Some(bytes.to_vec()))
+            }
+        }
+    }
+
     async fn fetch_cert_hash(relay_url: &str) -> Option<Vec<u8>> {
         // The sidecar serves the SHA-256 hex of its self-signed cert at
         // `http://<host>:<port>/certificate.sha256`. In production behind
@@ -1023,15 +1407,6 @@ mod wt {
         }
         let text_js = JsFuture::from(resp.text().ok()?).await.ok()?;
         let hex = text_js.as_string()?;
-        let hex = hex.trim();
-        if hex.len() != 64 {
-            return None;
-        }
-        let mut out = Vec::with_capacity(32);
-        for i in 0..32 {
-            let byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
-            out.push(byte);
-        }
-        Some(out)
+        crate::client::watch::decode_cert_hash(&hex).map(|bytes| bytes.to_vec())
     }
 }
