@@ -168,8 +168,8 @@ async fn main() -> Result<()> {
 /// control-plane only (no `--source` and no lavfi pair).
 ///
 /// The preset is the CLI `--preset`, default `720p`. Lavfi and file
-/// boots share it. Pacing stays on [`SourceInput::from_input`]: lavfi
-/// is unpaced, a file path is paced.
+/// boots share it. Lavfi is always paced. A file path is paced by
+/// [`SourceInput::from_input`].
 fn boot_pipeline_config(args: &Args) -> Option<PipelineConfig> {
     let preset = args.preset;
     let ffmpeg_path = args.ffmpeg_path.clone();
@@ -305,13 +305,12 @@ mod tests {
             let args = lavfi_args(flag);
             let cfg = boot_pipeline_config(&args).expect("lavfi boot config");
             assert_eq!(cfg.preset, preset, "{flag}");
-            assert!(
-                !cfg.source.pace_input(),
-                "lavfi boot must stay unpaced under {flag}"
-            );
+            assert!(cfg.source.pace_input(), "{flag}");
             let argv = ffmpeg_video_args(&cfg);
             assert_eq!(value_after(&argv, "-b:v"), Some(bitrate), "{flag}");
             assert_eq!(value_after(&argv, "-maxrate"), Some(bitrate), "{flag}");
+            assert_eq!(value_after(&argv, "-deadline"), Some("realtime"), "{flag}");
+            assert_eq!(value_after(&argv, "-cpu-used"), Some("8"), "{flag}");
             let fps_s = fps.to_string();
             assert_eq!(value_after(&argv, "-g"), Some(fps_s.as_str()), "{flag}");
             let vf = value_after(&argv, "-vf").unwrap_or_else(|| panic!("{flag}: {argv:?}"));
@@ -324,9 +323,25 @@ mod tests {
                 Some("testsrc2=size=320x240:rate=15"),
                 "{flag}"
             );
-            assert!(
-                !argv.iter().any(|a| a == "-re" || a == "-readrate"),
-                "lavfi boot must not gain pacing: {argv:?}"
+            let re = argv.iter().position(|a| a == "-re").expect("-re");
+            let i = argv.iter().position(|a| a == "-i").expect("-i");
+            assert_eq!(
+                re + 1,
+                i,
+                "lavfi video -re must sit immediately before -i: {argv:?}"
+            );
+            let audio = ts6_media_sidecar::pipeline::ffmpeg_audio_args(&cfg);
+            let audio_re = audio.iter().position(|a| a == "-re").expect("audio -re");
+            let audio_i = audio.iter().position(|a| a == "-i").expect("audio -i");
+            assert_eq!(
+                audio_re + 1,
+                audio_i,
+                "lavfi audio -re must sit immediately before -i: {audio:?}"
+            );
+            assert_eq!(
+                value_after(&audio, "-i"),
+                Some("sine=frequency=440:sample_rate=48000"),
+                "{flag}"
             );
         }
     }
@@ -348,11 +363,17 @@ mod tests {
         .expect("lavfi boot without --preset");
         let cfg = boot_pipeline_config(&args).expect("lavfi boot config");
         assert_eq!(cfg.preset, QualityPreset::P720);
+        assert!(cfg.source.pace_input());
         let argv = ffmpeg_video_args(&cfg);
         let vf = value_after(&argv, "-vf").expect("-vf");
         assert!(vf.contains("fps=30"), "{vf}");
         assert!(vf.contains("scale=1280:720"), "{vf}");
         assert_eq!(value_after(&argv, "-b:v"), Some("2500k"));
+        assert_eq!(value_after(&argv, "-deadline"), Some("realtime"));
+        assert_eq!(value_after(&argv, "-cpu-used"), Some("8"));
+        let re = argv.iter().position(|a| a == "-re").expect("-re");
+        let i = argv.iter().position(|a| a == "-i").expect("-i");
+        assert_eq!(re + 1, i, "{argv:?}");
     }
 
     #[test]

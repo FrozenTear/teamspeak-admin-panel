@@ -219,15 +219,22 @@ DNS-rebinding defence for `POST /source` is the loopback pin proxy
   boot `--source https://` URLs, which do not go through this proxy,
   set `-tls_verify 1` and
   `-protocol_whitelist http,https,tcp,tls,crypto`.
-* File paths, `file://`, and HTTP(S) URLs whose path ends in a
-  progressive container (`.mp4`, `.mkv`, `.webm`, …) get `-re`
-  immediately before `-i` (ffmpeg's `-readrate 1`). The decision is
-  made on the operator URL and kept when `POST /source` rewrites `-i`
-  to the loopback pin token. Lavfi, live schemes (`rtsp`, `rtmp`,
-  `rtp`, `udp`, `srt`, …), extension-less HTTP, `.ts`, and playlist
-  URLs (`.m3u8`, `.mpd`) are not paced. `-re` on a live ingest drops
-  packets. Playlist VOD still bursts until something can tell it from
-  live HLS; download the file and pass that.
+* File paths, `file://`, HTTP(S) URLs whose path ends in a progressive
+  container (`.mp4`, `.mkv`, `.webm`, …), and lavfi get `-re`
+  immediately before `-i` (ffmpeg's `-readrate 1`). Lavfi generators
+  hand over the next frame as soon as it is pulled; without `-re` a
+  test pattern encodes as fast as the cores allow, so a CPU sample is
+  not a live encode. The file/VOD decision is made on the operator URL
+  and kept when `POST /source` rewrites `-i` to the loopback pin
+  token. Live schemes (`rtsp`, `rtmp`, `rtp`, `udp`, `srt`, …),
+  extension-less HTTP, `.ts`, and playlist URLs (`.m3u8`, `.mpd`) are
+  not paced. `-re` on a live ingest drops packets. Playlist VOD still
+  bursts until something can tell it from live HLS; download the file
+  and pass that.
+* Video encode is libvpx `-deadline realtime -cpu-used 8` for every
+  preset. Bookworm ffmpeg accepts `-cpu-used` from -16 to 16. Scale,
+  framerate, and bitrate still come from the preset. Audio stays Opus
+  mono / 64k / `-application voip`.
 
 The earlier "rewrite the FFmpeg-input URL to the resolved IP literal"
 approach (PURA-149) was reverted because it broke TLS SNI / `Host:`
@@ -265,10 +272,13 @@ cargo run --release -- \
     --source tests/fixtures/sample.mp4
 ```
 
-Synthetic lavfi source (no fixture file needed). `--preset` takes the
-same strings as `POST /source` (`480p`, `720p`, `1080p`). Omitting it
-is `720p` (1280×720 at 30 fps). A spare-port lavfi WAN smoke should
-pass `480p` so the encode stays cheap:
+Synthetic lavfi source (no fixture file needed). The sidecar inserts
+`-re` before each lavfi `-i`, so the pattern runs at the generator
+rate instead of as fast as encode allows. `--preset` takes the same
+strings as `POST /source` (`480p`, `720p`, `1080p`). Omitting it is
+`720p` (1280×720 at 30 fps). A spare-port lavfi WAN smoke should pass
+`480p`. Encode is `-deadline realtime -cpu-used 8` at that preset's
+scale, fps, and bitrate:
 
 ```sh
 cargo run --release -- \

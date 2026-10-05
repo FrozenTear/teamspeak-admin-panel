@@ -14,9 +14,13 @@
 //! audio clock. This pipeline does not do that. Publishing the IVF ticks
 //! from these two processes would advertise two unrelated clocks.
 //!
-//! File and progressive-VOD inputs are read at native rate (`-re` before
-//! `-i`, ffmpeg's `-readrate 1`). Live schemes and lavfi are not. See
-//! `pace_file_or_vod`.
+//! File, progressive-VOD, and lavfi inputs are read at native rate
+//! (`-re` immediately before `-i`, ffmpeg's `-readrate 1`). A lavfi
+//! generator hands over the next frame as soon as it is pulled, so
+//! without `-re` a test pattern encodes as fast as the cores allow and
+//! a CPU sample is not a live encode. Live schemes stay unpaced: `-re`
+//! on a live ingest fills the socket buffer and the source drops
+//! packets. See `pace_file_or_vod` for URL classification.
 //!
 //! The WS-0 reference player (`moq-spike/player/`) subscribes to track
 //! name `"video"` and decodes raw VP8 frames. We keep that contract:
@@ -100,8 +104,8 @@ pub struct PipelineConfig {
 ///   when `POST /source` rewrites `-i` to the loopback pin proxy.
 /// - `Lavfi { video, audio }` — synthetic sources (e.g. `testsrc2=...`,
 ///   `sine=...`). The video subprocess gets the video spec only; the
-///   audio subprocess gets the audio spec only. Never paced: `-re` would
-///   change the realtime test source the WAN smoke already uses.
+///   audio subprocess gets the audio spec only. Both are paced with
+///   `-re` so a WAN smoke runs at the generator's rate.
 #[derive(Debug, Clone)]
 pub enum SourceInput {
     Url { url: String, pace_input: bool },
@@ -144,10 +148,12 @@ impl SourceInput {
     }
 
     /// Whether this input is read at native rate (`-re`).
+    ///
+    /// Lavfi is always paced. URL inputs follow [`pace_file_or_vod`].
     pub fn pace_input(&self) -> bool {
         match self {
             Self::Url { pace_input, .. } => *pace_input,
-            Self::Lavfi { .. } => false,
+            Self::Lavfi { .. } => true,
         }
     }
 
@@ -176,7 +182,18 @@ impl SourceInput {
                     TrackKind::Video => video,
                     TrackKind::Audio => audio,
                 };
-                vec!["-f".into(), "lavfi".into(), "-i".into(), spec.clone()]
+                // `-f lavfi` selects the input. `-re` is the next input
+                // option, immediately before `-i`, same slot file/VOD
+                // uses. Lavfi timestamps advance at the generator rate
+                // (`rate=15`, `sample_rate=48000`) but the demuxer pulls
+                // the next frame immediately unless `-re` sleeps.
+                vec![
+                    "-f".into(),
+                    "lavfi".into(),
+                    "-re".into(),
+                    "-i".into(),
+                    spec.clone(),
+                ]
             }
         }
     }
@@ -194,7 +211,8 @@ impl SourceInput {
 ///
 /// `-re` belongs on those inputs. It does not belong on a live ingest:
 /// ffmpeg sleeps on the packet timestamp while the socket buffer fills,
-/// and the source drops packets. Lavfi never reaches this function.
+/// and the source drops packets. Lavfi is paced separately and never
+/// reaches this function.
 ///
 /// Paced:
 /// - local paths (`/srv/ts6-media/inbox/episode.mp4`, `episode.mkv`)
@@ -763,6 +781,14 @@ fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
 // FFmpeg argument sets
 // -----------------------------------------------------------------------
 
+/// libvpx `-cpu-used` on the video encode path.
+///
+/// Bookworm ffmpeg documents the libvpx option as -16..=16
+/// (`ffmpeg -h encoder=libvpx`). 8 is inside that range. 16 is the
+/// fastest the option accepts; 8 is the speed this spike uses so a
+/// live encode stays cheap without jumping to the quality floor.
+const LIBVPX_CPU_USED: &str = "8";
+
 /// Build the FFmpeg argv for the video subprocess. Resolution, framerate
 /// and bitrate come from [`QualityPreset`] (spec §23.4). The filter
 /// chain mirrors the spec's letterbox/pillarbox pattern from §24.1.1 so
@@ -773,6 +799,9 @@ fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
 ///
 /// Public for unit testing (the integration test on `control_plane.rs`
 /// asserts argv contents reflect the requested preset).
+///
+/// libvpx speed is not part of the preset. Every preset uses
+/// `-deadline realtime` and [`LIBVPX_CPU_USED`].
 pub fn ffmpeg_video_args(config: &PipelineConfig) -> Vec<String> {
     let preset = config.preset;
     let fps = preset.framerate();
@@ -804,7 +833,11 @@ pub fn ffmpeg_video_args(config: &PipelineConfig) -> Vec<String> {
         "-deadline".into(),
         "realtime".into(),
         "-cpu-used".into(),
-        "5".into(),
+        // Bookworm `ffmpeg -h encoder=libvpx` accepts `-cpu-used` in
+        // -16..=16. 8 is inside that range (16 is the top). Realtime
+        // plus a higher cpu-used is what keeps a live MoQ encode off
+        // the whole box; scale, fps, and bitrate stay on the preset.
+        LIBVPX_CPU_USED.into(),
         "-g".into(),
         fps.to_string(),
         "-keyint_min".into(),
@@ -822,7 +855,9 @@ pub fn ffmpeg_video_args(config: &PipelineConfig) -> Vec<String> {
 /// `-application voip`. Watch-together step 4 is the anime profile
 /// (stereo, 128k, `-application audio`, source fps instead of the
 /// `720p` preset's forced 30). Not this change.
-fn ffmpeg_audio_args(config: &PipelineConfig) -> Vec<String> {
+///
+/// Public so the boot-path tests can assert lavfi audio is paced.
+pub fn ffmpeg_audio_args(config: &PipelineConfig) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "-hide_banner".into(),
         "-loglevel".into(),
@@ -1473,15 +1508,15 @@ mod tests {
             !args.iter().any(|a| a == "-protocol_whitelist"),
             "synthetic lavfi input must not carry -protocol_whitelist; argv = {args:?}"
         );
-        assert!(
-            !args.iter().any(|a| a == "-re" || a == "-readrate"),
-            "synthetic lavfi input must not be paced; argv = {args:?}"
-        );
+        assert_re_immediately_before_input(&args);
         let audio = ffmpeg_audio_args(&cfg);
-        assert!(
-            !audio.iter().any(|a| a == "-re" || a == "-readrate"),
-            "lavfi audio must not be paced; argv = {audio:?}"
+        assert_re_immediately_before_input(&audio);
+        assert_eq!(
+            value_after(&audio, "-i"),
+            Some("sine=frequency=440"),
+            "{audio:?}"
         );
+        assert_live_audio_profile(&audio);
     }
 
     #[test]
@@ -1495,11 +1530,90 @@ mod tests {
         assert!(tls_args_for("file:///etc/passwd").is_empty());
     }
 
+    fn assert_re_immediately_before_input(args: &[String]) {
+        let re = args
+            .iter()
+            .position(|a| a == "-re")
+            .unwrap_or_else(|| panic!("missing -re: {args:?}"));
+        let i = args
+            .iter()
+            .position(|a| a == "-i")
+            .unwrap_or_else(|| panic!("missing -i: {args:?}"));
+        assert_eq!(
+            re + 1,
+            i,
+            "-re must be the input option immediately before -i: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a == "-readrate"),
+            "do not also pass -readrate: {args:?}"
+        );
+    }
+
     fn assert_live_audio_profile(args: &[String]) {
         assert_eq!(value_after(args, "-application"), Some("voip"));
         assert_eq!(value_after(args, "-b:a"), Some("64k"));
         assert_eq!(value_after(args, "-ac"), Some("1"));
         assert_eq!(value_after(args, "-ar"), Some("48000"));
+    }
+
+    /// Realtime libvpx speed is independent of the preset. Scale, fps,
+    /// and bitrate stay on the preset. Lavfi and files are paced; a
+    /// live scheme is not.
+    #[test]
+    fn libvpx_realtime_flags_follow_every_preset() {
+        let presets = [
+            (QualityPreset::P480, 854, 480, 24, "1000k"),
+            (QualityPreset::P720, 1280, 720, 30, "2500k"),
+            (QualityPreset::P1080, 1920, 1080, 30, "4500k"),
+        ];
+        let sources = [
+            SourceInput::Lavfi {
+                video: "testsrc2=size=320x240:rate=15".into(),
+                audio: "sine=frequency=440:sample_rate=48000".into(),
+            },
+            SourceInput::from_input("/srv/ts6-media/inbox/episode.mp4"),
+            SourceInput::from_input("rtsp://cam.example/live"),
+        ];
+        for (preset, w, h, fps, bitrate) in presets {
+            for source in &sources {
+                let paced = source.pace_input();
+                let label = format!("{preset} {}", source.display());
+                let cfg = PipelineConfig::new("src", source.clone()).with_preset(preset);
+                let video = ffmpeg_video_args(&cfg);
+                assert_eq!(
+                    value_after(&video, "-deadline"),
+                    Some("realtime"),
+                    "{label}"
+                );
+                assert_eq!(
+                    value_after(&video, "-cpu-used"),
+                    Some(LIBVPX_CPU_USED),
+                    "{label}"
+                );
+                assert_eq!(value_after(&video, "-c:v"), Some("libvpx"), "{label}");
+                assert_eq!(value_after(&video, "-b:v"), Some(bitrate), "{label}");
+                assert_eq!(value_after(&video, "-maxrate"), Some(bitrate), "{label}");
+                let fps_s = fps.to_string();
+                assert_eq!(value_after(&video, "-g"), Some(fps_s.as_str()), "{label}");
+                let vf = value_after(&video, "-vf").unwrap_or_else(|| panic!("{label}"));
+                assert!(vf.contains(&format!("fps={fps}")), "{label}: {vf}");
+                assert!(vf.contains(&format!("scale={w}:{h}")), "{label}: {vf}");
+                let audio = ffmpeg_audio_args(&cfg);
+                assert!(
+                    !audio.iter().any(|a| a == "-cpu-used" || a == "-deadline"),
+                    "audio encode stays off the libvpx flags: {label} {audio:?}"
+                );
+                assert_live_audio_profile(&audio);
+                if paced {
+                    assert_re_immediately_before_input(&video);
+                    assert_re_immediately_before_input(&audio);
+                } else {
+                    assert!(!video.iter().any(|a| a == "-re"), "{label} {video:?}");
+                    assert!(!audio.iter().any(|a| a == "-re"), "{label} {audio:?}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -1543,7 +1657,7 @@ mod tests {
     }
 
     #[test]
-    fn live_lavfi_and_playlists_are_not_readrate_paced() {
+    fn live_schemes_and_playlists_are_not_readrate_paced() {
         let cases = [
             SourceInput::from_input("rtsp://cam.example/live"),
             SourceInput::from_input("rtsps://cam.example/live"),
@@ -1560,10 +1674,6 @@ mod tests {
             SourceInput::from_input("http://camera.example/stream"),
             SourceInput::from_input("pipe:0"),
             SourceInput::from_input("fd:3"),
-            SourceInput::Lavfi {
-                video: "testsrc2=size=320x240:rate=30".into(),
-                audio: "sine=frequency=440".into(),
-            },
         ];
         for src in cases {
             let label = src.display();
