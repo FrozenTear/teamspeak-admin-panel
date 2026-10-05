@@ -477,7 +477,7 @@ fn ffmpeg_argv_reflects_preset() {
 
     fn argv_for(preset: QualityPreset) -> Vec<String> {
         let cfg =
-            PipelineConfig::new("test", SourceInput::Url("http://x/".into())).with_preset(preset);
+            PipelineConfig::new("test", SourceInput::from_input("http://x/")).with_preset(preset);
         ffmpeg_video_args(&cfg)
     }
 

@@ -219,6 +219,15 @@ DNS-rebinding defence for `POST /source` is the loopback pin proxy
   boot `--source https://` URLs, which do not go through this proxy,
   set `-tls_verify 1` and
   `-protocol_whitelist http,https,tcp,tls,crypto`.
+* File paths, `file://`, and HTTP(S) URLs whose path ends in a
+  progressive container (`.mp4`, `.mkv`, `.webm`, …) get `-re`
+  immediately before `-i` (ffmpeg's `-readrate 1`). The decision is
+  made on the operator URL and kept when `POST /source` rewrites `-i`
+  to the loopback pin token. Lavfi, live schemes (`rtsp`, `rtmp`,
+  `rtp`, `udp`, `srt`, …), extension-less HTTP, `.ts`, and playlist
+  URLs (`.m3u8`, `.mpd`) are not paced. `-re` on a live ingest drops
+  packets. Playlist VOD still bursts until something can tell it from
+  live HLS; download the file and pass that.
 
 The earlier "rewrite the FFmpeg-input URL to the resolved IP literal"
 approach (PURA-149) was reverted because it broke TLS SNI / `Host:`
@@ -244,7 +253,8 @@ start a pipeline at boot. The pipeline registers a broadcast under
 `--source-name` and publishes `video` + `audio` tracks the
 WS-0 reference player can subscribe to.
 
-Examples — pipe a local file (FFmpeg transcodes to VP8/Opus):
+Examples — play a local file at native rate (`-re`; FFmpeg transcodes
+to VP8/Opus). Without `-re` a 24-minute file is published as a burst.
 
 ```sh
 cargo run --release -- \
@@ -328,6 +338,15 @@ against the WS-0 reference player.
 
 ## What this crate does NOT do yet
 
+- **No shared A/V clock.** Video and audio are still two ffmpeg
+  processes, and the IVF timestamp is not published. The panel player
+  stamps video at `seq * 33ms`. A long file will drift until one ffmpeg
+  carries a single PTS through to the player (watch-together step 3).
+- **No anime encode profile.** Opus stays mono / 64k /
+  `-application voip`. The `720p` preset still forces 30 fps.
+  Watch-together step 4.
+- **Playlist VOD is not paced.** `.m3u8` / `.mpd` can be live. Pass a
+  file or a progressive container URL to get `-re`.
 - **No on-the-fly preset switching.** WS-4 (PURA-142) wires `preset` into
   the FFmpeg encoder triple, but switching presets on a live stream is
   deferred to v1.1 — operators must `POST /source/stop` + `POST /source`.

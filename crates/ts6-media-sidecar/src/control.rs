@@ -363,7 +363,12 @@ pub async fn post_source(
             ApiError::InvalidRequest(e.to_string())
         })?,
     };
-    let cfg = PipelineConfig::new(source_id.clone(), SourceInput::Url(ffmpeg_url.clone()))
+    // Classify pacing on the operator URL before the pin rewrite.
+    // `http://127.0.0.1/<token>` has no container extension, so
+    // classifying the ffmpeg URL would drop `-re` for every VOD.
+    let source = SourceInput::from_input(req.url.clone()).with_ffmpeg_url(ffmpeg_url.clone());
+    let pace_input = source.pace_input();
+    let cfg = PipelineConfig::new(source_id.clone(), source)
         .with_ffmpeg_path(state.ffmpeg_path.clone())
         .with_preset(preset)
         .with_diagnostics(state.diagnostics.clone());
@@ -395,6 +400,7 @@ pub async fn post_source(
         ffmpeg_url = %ffmpeg_url,
         proxied = %pin_token.is_some(),
         %preset,
+        pace_input,
         "pipeline registered"
     );
 
