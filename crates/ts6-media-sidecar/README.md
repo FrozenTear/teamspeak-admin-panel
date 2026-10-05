@@ -265,7 +265,10 @@ cargo run --release -- \
     --source tests/fixtures/sample.mp4
 ```
 
-Synthetic lavfi source (no fixture file needed):
+Synthetic lavfi source (no fixture file needed). `--preset` takes the
+same strings as `POST /source` (`480p`, `720p`, `1080p`). Omitting it
+is `720p` (1280×720 at 30 fps). A spare-port lavfi WAN smoke should
+pass `480p` so the encode stays cheap:
 
 ```sh
 cargo run --release -- \
@@ -273,6 +276,7 @@ cargo run --release -- \
     --http-listen '127.0.0.1:7080' \
     --tls-generate localhost \
     --source-name camera-1 \
+    --preset 480p \
     --source-lavfi-video 'testsrc2=size=320x240:rate=15' \
     --source-lavfi-audio 'sine=frequency=440:sample_rate=48000'
 ```
