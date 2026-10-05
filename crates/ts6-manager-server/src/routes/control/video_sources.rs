@@ -537,6 +537,7 @@ mod tests {
             music_dir: std::path::PathBuf::from("/data/music"),
             proxy_trust: crate::web::proxy::ProxyTrust::direct(),
             bug_reports: crate::bug_reports::unconfigured_sink(),
+            watch: crate::watch::Store::new(),
         };
         (state, mock)
     }
@@ -912,6 +913,7 @@ mod tests {
             music_dir: std::path::PathBuf::from("/data/music"),
             proxy_trust: crate::web::proxy::ProxyTrust::direct(),
             bug_reports: crate::bug_reports::unconfigured_sink(),
+            watch: crate::watch::Store::new(),
         };
         let token = seed_admin_token(&state).await;
         let server = seed_server(&state).await;
