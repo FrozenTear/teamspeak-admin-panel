@@ -158,6 +158,14 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Install Opus (and cmake/pkg-config)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libopus-dev \
+            pkg-config \
+            cmake
+
       - name: Pull TS6 fixture image
         run: docker pull "$TS6_FIXTURE_IMAGE"
 
