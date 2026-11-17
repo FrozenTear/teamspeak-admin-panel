@@ -790,7 +790,7 @@ msg = [
 	# -> {ClientSetServerQueryLogin} notifyclientserverqueryloginpassword client_login_password=qm2niw4m
 	{ name="ClientSetServerQueryLoginRequest", notify="clientsetserverquerylogin",  attributes=["client_login_name", "client_login_password?", "cldbid?"] }, # 'client_login_password' is always ignored, 'cldbid' only exists for full client(?)
 	# clientupdate client_nickname=Seebi1 client_input_muted=1 client_away=1 client_away_message=AFK return_code=__1_
-	{ name="ClientUpdate",                  notify="clientupdate",                  attributes=["client_nickname?", "client_input_muted?", "client_output_muted?", "client_away?", "client_away_message?", "client_input_hardware?", "client_output_hardware?", "client_is_channel_commander?", "client_flag_avatar?", "client_nickname_phonetic?", "client_talk_request@clientupdate?", "client_talk_request_msg?", "client_is_recording?", "client_is_streaming?", "client_transport?", "client_badges?"] },
+	{ name="ClientUpdate",                  notify="clientupdate",                  attributes=["client_nickname?", "client_input_muted?", "client_output_muted?", "client_away?", "client_away_message?", "client_input_hardware?", "client_output_hardware?", "client_is_channel_commander?", "client_flag_avatar?", "client_nickname_phonetic?", "client_talk_request@clientupdate?", "client_talk_request_msg?", "client_is_recording?", "client_is_streaming?", "client_badges?"] },
 	# complainadd tcldbid=7 message=annoying
 	# -> void
 	{ name="ComplainAdd",                   notify="complainadd",                   attributes=["tcldbid", "message"] },
