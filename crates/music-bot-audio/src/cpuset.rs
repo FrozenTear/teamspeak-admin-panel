@@ -390,7 +390,8 @@ pub fn comm_matches(contents: &str, expected: &str) -> bool {
 /// Tids under `{proc_root}/{pid}/task/*/comm` whose comm equals `expected`.
 ///
 /// Missing task directory → empty list (the process or thread group is
-/// already gone). A comm file that disappears mid-walk is skipped.
+/// already gone). A task that exits mid-walk is skipped (see
+/// [`task_vanished`]).
 pub fn tids_with_comm_under(proc_root: &Path, pid: u32, expected: &str) -> io::Result<Vec<u32>> {
     let task_dir = proc_root.join(pid.to_string()).join("task");
     let entries = match std::fs::read_dir(&task_dir) {
@@ -400,7 +401,11 @@ pub fn tids_with_comm_under(proc_root: &Path, pid: u32, expected: &str) -> io::R
     };
     let mut tids = Vec::new();
     for entry in entries {
-        let entry = entry?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) if task_vanished(&err) => continue,
+            Err(err) => return Err(err),
+        };
         let Some(tid) = entry
             .file_name()
             .to_str()
@@ -411,12 +416,23 @@ pub fn tids_with_comm_under(proc_root: &Path, pid: u32, expected: &str) -> io::R
         match std::fs::read_to_string(entry.path().join("comm")) {
             Ok(contents) if comm_matches(&contents, expected) => tids.push(tid),
             Ok(_) => {}
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) if task_vanished(&err) => {}
             Err(err) => return Err(err),
         }
     }
     tids.sort_unstable();
     Ok(tids)
+}
+
+/// True when `err` means the task exited between readdir and the read.
+///
+/// Linux reports a reaped task as `ENOENT` or as `ESRCH` (os error 3),
+/// depending on how far teardown has got. `ESRCH` maps to no stable
+/// `io::ErrorKind`, so it is matched by number. Without this, one
+/// exiting thread fails the whole walk and the voice-rt nice is skipped.
+fn task_vanished(err: &io::Error) -> bool {
+    const ESRCH: i32 = 3;
+    err.kind() == io::ErrorKind::NotFound || err.raw_os_error() == Some(ESRCH)
 }
 
 /// `voice-rt` tids of `pid` as seen in `/proc`.
@@ -542,6 +558,15 @@ pub fn nice_voice_rt_from_env() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_vanished_matches_enoent_and_esrch_only() {
+        assert!(task_vanished(&io::Error::from(io::ErrorKind::NotFound)));
+        assert!(task_vanished(&io::Error::from_raw_os_error(3)));
+        assert!(!task_vanished(&io::Error::from(
+            io::ErrorKind::PermissionDenied
+        )));
+    }
 
     #[tokio::test]
     async fn spawned_child_does_not_inherit_music_runtime_token() {
