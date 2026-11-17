@@ -389,18 +389,19 @@ pub fn comm_matches(contents: &str, expected: &str) -> bool {
 
 /// Tids under `{proc_root}/{pid}/task/*/comm` whose comm equals `expected`.
 ///
-/// Missing task directory → empty list (the process or thread group is
-/// already gone). A task that exits mid-walk is skipped (see
-/// [`task_vanished`]).
+/// Task directory gone ([`task_vanished`]) → empty list (the process or
+/// thread group already exited). A task that exits mid-walk is skipped.
 pub fn tids_with_comm_under(proc_root: &Path, pid: u32, expected: &str) -> io::Result<Vec<u32>> {
     let task_dir = proc_root.join(pid.to_string()).join("task");
     let entries = match std::fs::read_dir(&task_dir) {
         Ok(entries) => entries,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) if task_vanished(&err) => return Ok(Vec::new()),
         Err(err) => return Err(err),
     };
     let mut tids = Vec::new();
     for entry in entries {
+        // Likely unreachable on procfs. std ends the iteration after an
+        // error, so `continue` stops the walk rather than skipping one task.
         let entry = match entry {
             Ok(entry) => entry,
             Err(err) if task_vanished(&err) => continue,
@@ -426,13 +427,13 @@ pub fn tids_with_comm_under(proc_root: &Path, pid: u32, expected: &str) -> io::R
 
 /// True when `err` means the task exited between readdir and the read.
 ///
-/// Linux reports a reaped task as `ENOENT` or as `ESRCH` (os error 3),
-/// depending on how far teardown has got. `ESRCH` maps to no stable
-/// `io::ErrorKind`, so it is matched by number. Without this, one
-/// exiting thread fails the whole walk and the voice-rt nice is skipped.
+/// Linux reports a reaped task as `ENOENT` or as `ESRCH`, depending on
+/// how far teardown has got. `ESRCH` maps to no stable `io::ErrorKind`,
+/// so it is matched by number. Without this, one exiting thread fails
+/// the whole walk, and [`nice_voice_rt_from_env`] logs a warn and skips
+/// the renice.
 fn task_vanished(err: &io::Error) -> bool {
-    const ESRCH: i32 = 3;
-    err.kind() == io::ErrorKind::NotFound || err.raw_os_error() == Some(ESRCH)
+    err.kind() == io::ErrorKind::NotFound || err.raw_os_error() == Some(libc::ESRCH)
 }
 
 /// `voice-rt` tids of `pid` as seen in `/proc`.
@@ -544,8 +545,8 @@ pub fn nice_voice_rt_from_env() {
                 pid,
                 nice,
                 error = %err,
-                "in-process voice-rt renice failed (expected EPERM for a negative \
-                 TS6_BOT_NICE without CAP_SYS_NICE). Host \
+                "in-process voice-rt renice failed (EPERM is expected for a \
+                 negative TS6_BOT_NICE without CAP_SYS_NICE). Host \
                  apply-fullstack-soft-pin.sh is a one-shot voice-rt comm walk \
                  after /health; a music restart drops that nice until the \
                  script runs again. Later voice-rt tids (tokio blocking pool) \
@@ -562,7 +563,7 @@ mod tests {
     #[test]
     fn task_vanished_matches_enoent_and_esrch_only() {
         assert!(task_vanished(&io::Error::from(io::ErrorKind::NotFound)));
-        assert!(task_vanished(&io::Error::from_raw_os_error(3)));
+        assert!(task_vanished(&io::Error::from_raw_os_error(libc::ESRCH)));
         assert!(!task_vanished(&io::Error::from(
             io::ErrorKind::PermissionDenied
         )));
