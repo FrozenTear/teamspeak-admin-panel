@@ -150,7 +150,8 @@ mod tests {
         ensure_voice_runtime();
         let mut tids = Vec::new();
         for _ in 0..50 {
-            tids = music_bot_audio::cpuset::voice_rt_tids(std::process::id()).unwrap_or_default();
+            tids = music_bot_audio::cpuset::voice_rt_tids(std::process::id())
+                .expect("voice-rt /proc walk");
             if tids.len() >= VOICE_WORKER_THREADS {
                 break;
             }
