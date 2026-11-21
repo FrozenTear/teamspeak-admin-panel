@@ -311,6 +311,44 @@ impl SidecarClient {
         serde_json::from_slice(&bytes)
             .map_err(|e| SidecarClientError::Malformed(format!("get_diagnostics: {e}")))
     }
+
+    /// SHA-256 hex of the sidecar TLS certificate (`GET /certificate.sha256`).
+    ///
+    /// `Ok(None)` when the sidecar has no fingerprint endpoint (`404`).
+    /// The watch API treats transport and malformed failures as "no hash"
+    /// so a publicly trusted relay still yields a ticket.
+    pub async fn certificate_sha256(&self) -> SidecarResult<Option<String>> {
+        let url = format!("{}/certificate.sha256", self.base_url);
+        let resp = self
+            .http
+            .get(&url)
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+            .map_err(|e| SidecarClientError::Transport(e.to_string()))?;
+        let status = resp.status();
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| SidecarClientError::Transport(e.to_string()))?;
+        if status == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            return Err(SidecarClientError::Upstream {
+                status,
+                body: String::from_utf8_lossy(&bytes).into_owned(),
+            });
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        let hex = text.trim();
+        if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(SidecarClientError::Malformed(
+                "certificate.sha256: expected 64 hex chars".into(),
+            ));
+        }
+        Ok(Some(hex.to_ascii_lowercase()))
+    }
 }
 
 /// Test helper: loopback mock that speaks `/source`, `/stats`, `/health`,
@@ -353,6 +391,7 @@ mod tests {
             .route("/stats", get(handle_stats))
             .route("/diagnostics", get(handle_diagnostics))
             .route("/health", get(handle_health))
+            .route("/certificate.sha256", get(handle_certificate))
             .with_state(state.clone());
         let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
             .await
@@ -411,6 +450,10 @@ mod tests {
 
     async fn handle_health(State(_): State<MockState>) -> Json<serde_json::Value> {
         Json(json!({"status": "ok", "uptime_s": 12, "sessions": 0, "broadcasts": 1}))
+    }
+
+    async fn handle_certificate(State(_): State<MockState>) -> String {
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n".into()
     }
 
     async fn handle_diagnostics(State(_): State<MockState>) -> Json<serde_json::Value> {
@@ -478,6 +521,15 @@ mod tests {
             Some("reason=ip_not_allowed class=loopback ago_s=9")
         );
         assert!(diag.sidecar_moq_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn certificate_sha256_trims_hex() {
+        let (base, _mock) = boot_mock_sidecar().await;
+        let client = SidecarClient::new(base);
+        let hash = client.certificate_sha256().await.unwrap().unwrap();
+        assert_eq!(hash.len(), 64);
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[tokio::test]

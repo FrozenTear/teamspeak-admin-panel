@@ -111,6 +111,9 @@ pub struct AppState {
     /// token/repo are unset so `POST /api/bug-reports` can 503 without
     /// crashing boot.
     pub bug_reports: crate::bug_reports::BugReportSinkHandle,
+    /// v1.7 MoQ watch-together spike. One session per panel user and one
+    /// playhead per broadcast. Process-local; a restart clears it.
+    pub watch: crate::watch::Store,
 }
 
 impl AppState {
@@ -195,6 +198,7 @@ impl AppState {
                 cfg.trusted_proxy_cidrs.clone(),
             ),
             bug_reports: crate::bug_reports::sink_from_config(&cfg.bug_reports),
+            watch: crate::watch::Store::new(),
         }
     }
 }

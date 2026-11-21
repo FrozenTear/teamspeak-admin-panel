@@ -42,6 +42,8 @@ mod routes;
 mod sshbridge;
 mod ui;
 #[cfg(feature = "server")]
+mod watch;
+#[cfg(feature = "server")]
 mod web;
 #[cfg(feature = "server")]
 mod webquery;
@@ -484,6 +486,9 @@ mod server_entry {
         // Operator bug reports (`POST /api/bug-reports`). RequireAuth;
         // GitHub sink is optional (503 when env is unset).
         let bug_reports_router = routes::bug_reports::router().with_state(state.clone());
+        // v1.7 MoQ watch-together spike: subscribe ticket, one session per
+        // user, shared playhead. JWT-gated except ticket redeem.
+        let watch_router = routes::watch::router().with_state(state.clone());
 
         // PURA-17: `serve_dioxus_application` registers static assets +
         // server functions and adds a fallback that serves the dx-CLI
@@ -531,6 +536,7 @@ mod server_entry {
             // PURA-307 — Phase 9.2 public report/appeal surface.
             .merge(public_moderation_router)
             .merge(bug_reports_router)
+            .merge(watch_router)
             .serve_dioxus_application(serve_cfg, ui::App)
             .layer(web::cors_layer(&cfg.frontend_url));
         // Music Bot bug-report seat: merge `musicBotLatency` / `logTail`

@@ -93,6 +93,7 @@ async fn setup() -> (FlowApiState, FlowEngine, i64) {
         music_dir: std::path::PathBuf::from("/data/music"),
         proxy_trust: crate::web::proxy::ProxyTrust::direct(),
         bug_reports: crate::bug_reports::unconfigured_sink(),
+        watch: crate::watch::Store::new(),
     };
 
     let engine = FlowEngine::start(EngineDeps::new(db.clone(), Arc::new(BasicDispatcher)))

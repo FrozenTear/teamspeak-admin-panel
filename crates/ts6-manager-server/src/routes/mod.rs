@@ -19,6 +19,7 @@ pub mod servers;
 pub mod settings;
 pub mod setup;
 pub mod users;
+pub mod watch;
 
 use ts6_manager_shared::servers::ServerSummary;
 
