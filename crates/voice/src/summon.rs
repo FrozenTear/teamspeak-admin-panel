@@ -6,10 +6,12 @@
 //! song ends. Nothing here writes a `music_bot_runtime` row, and nothing
 //! here is returned from [`crate::supervisor::BotSupervisor::list`].
 //!
-//! A summon line is `!play <song>` or `!radio <station>`. `!pause` and
-//! `!resume` are not summon lines. The client that is playing handles
-//! them in its own channel chat. They do not start a client and they
-//! do not change the cap. A summon line reaches this module from any
+//! A summon line is `!play <song>` or `!radio <station>`. `!pause`,
+//! `!resume` and `!vol N` are not summon lines. The client that is
+//! playing handles them in its own channel chat. They do not start a
+//! client and they do not change the cap. `!vol N` sets the server's
+//! shared output gain, so it changes every saved bot and every summon
+//! client playing on that server. A summon line reaches this module from any
 //! channel in one of these ways:
 //!
 //! - a private message, a poke, or server chat to a saved bot, or to a
@@ -61,6 +63,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+use music_bot_audio::VolumeHandle;
 use tokio::sync::{mpsc, watch};
 
 use crate::chat::{ParsedCommand, parse as parse_chat};
@@ -303,6 +306,11 @@ struct SummonState {
     identity_dir: PathBuf,
     next_summon: u64,
     servers: BTreeMap<String, ServerPool>,
+    /// One output-gain cell per server, keyed like `servers`. Saved bots
+    /// and summon clients on that server hold clones of it. It is kept
+    /// apart from the pools so it does not depend on summon being armed,
+    /// and it stays for the life of the process.
+    volumes: BTreeMap<String, VolumeHandle>,
 }
 
 /// Summon clients a server may hold at once for a stored cap. Zero means
@@ -367,9 +375,34 @@ impl SummonDirector {
                 identity_dir: identity_dir.into(),
                 next_summon: 1,
                 servers: BTreeMap::new(),
+                volumes: BTreeMap::new(),
             })),
             live: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// The output-gain handle a saved bot on `server` uses. The first
+    /// call for a server stores a new handle at unity and returns it.
+    /// Every later call returns a clone of the stored handle, so there is
+    /// one cell per server: the panel slider and `!vol` on any saved bot
+    /// move every saved bot and every summon client on that server.
+    ///
+    /// The handle is never removed. A bot that starts later on the same
+    /// server, including a restart of the last bot there, takes the gain
+    /// already in force and does not go back to unity.
+    pub(crate) fn server_volume(&self, server: &str) -> VolumeHandle {
+        self.lock()
+            .volumes
+            .entry(canon_server_addr(server))
+            .or_default()
+            .clone()
+    }
+
+    /// The shared output-gain handle for `server`, when a saved bot has
+    /// registered one. It never stores a handle. See
+    /// [`Self::server_volume`].
+    pub(crate) fn volume_for(&self, server: &str) -> Option<VolumeHandle> {
+        self.lock().volumes.get(&canon_server_addr(server)).cloned()
     }
 
     /// Remember a saved bot. `cap` is the number carried on this push.
