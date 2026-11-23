@@ -260,7 +260,7 @@ impl Session<'_> {
         let mut current: Option<ActiveAudio> = None;
         let mut frames: Option<mpsc::Receiver<AudioMsg>> = None;
         let mut monitor = SendTimingMonitor::new();
-        let volume = VolumeHandle::default();
+        let volume = session_volume(director, server);
         // `!pause` closes this gate and parks the sibling. Frames stop
         // and the voice connection stays up.
         let mut hold = PlaybackHold::new();
@@ -296,6 +296,7 @@ impl Session<'_> {
                                 React::Stay => {}
                                 React::Pause => hold.apply(&current, true),
                                 React::Resume => hold.apply(&current, false),
+                                React::Volume(percent) => set_volume(&volume, percent),
                                 React::Play(arg) => {
                                     hold.clear_for_new_song();
                                     if let Err(err) =
@@ -445,6 +446,21 @@ fn connect_options(dial: &str, identity: Identity) -> ConnectOptions {
         .log_udp_packets(false)
 }
 
+/// The output gain a summon client on `server` plays at. It is the
+/// handle the server's saved bots registered, so the panel slider and
+/// `!vol` reach this client too. A server with no handle yet gets a
+/// handle of its own at unity; a bot that registers later does not
+/// reach a song that already started on it.
+fn session_volume(director: &SummonDirector, server: &str) -> VolumeHandle {
+    director.volume_for(server).unwrap_or_default()
+}
+
+/// Apply `!vol N`. The same percent to gain step as the saved bot's chat.
+fn set_volume(volume: &VolumeHandle, percent: u8) {
+    volume.set(f32::from(percent) / 100.0);
+    info!(gain = volume.get(), "summon chat !vol applied");
+}
+
 /// Start `request` as the song. A failed resolve is the summon's end.
 async fn play(
     live: &LiveQuiet,
@@ -568,6 +584,9 @@ enum React {
     Pause,
     /// Continue the playback the pause held.
     Resume,
+    /// Set the server's shared output gain to this percent, 0 to 100.
+    /// The song, the connection and the channel stay.
+    Volume(u8),
     /// It stops playing for the caller, for this reason.
     Done(Outcome),
 }
@@ -696,6 +715,8 @@ enum Line {
     Pause,
     /// `!resume` or `!unpause` typed in this client's channel.
     Resume,
+    /// `!vol N` typed in this client's channel, N from 0 to 100.
+    Volume(u8),
     /// A summon line sent as server chat, a private message, or a poke.
     /// The director decides where it goes.
     Crossing,
@@ -710,6 +731,7 @@ fn line_for(target: MessageTarget, message: &str) -> Line {
             Ok(ParsedCommand::Stop) => Line::Stop,
             Ok(ParsedCommand::Pause) => Line::Pause,
             Ok(ParsedCommand::Resume) => Line::Resume,
+            Ok(ParsedCommand::Volume(percent)) => Line::Volume(percent),
             _ => Line::Ignore,
         },
         MessageTarget::Server | MessageTarget::Client(_) | MessageTarget::Poke(_) => {
@@ -723,14 +745,15 @@ fn line_for(target: MessageTarget, message: &str) -> Line {
 }
 
 /// What a channel command means for a client that is already seated.
-/// Pause and resume are not songs: they do not start a resolve and they
-/// do not leave the channel.
+/// Pause, resume and volume are not songs: they do not start a resolve
+/// and they do not leave the channel.
 fn command_react(line: Line) -> React {
     match line {
         Line::Song(arg) => React::Play(arg),
         Line::Stop => React::Done(Outcome::StopCommand),
         Line::Pause => React::Pause,
         Line::Resume => React::Resume,
+        Line::Volume(percent) => React::Volume(percent),
         Line::Crossing | Line::Ignore => React::Stay,
     }
 }
@@ -742,6 +765,7 @@ fn command_react(line: Line) -> React {
 /// Starting an earlier song as well ends playback when that song is
 /// rejected before it plays, and the song that won never starts. A pause
 /// or resume after the song that won is kept, so it still holds that song.
+/// A volume is appended the same way and never removes a song.
 fn note_command(batch: &mut Vec<React>, line: Line) -> Option<Outcome> {
     match command_react(line) {
         React::Done(outcome) => Some(outcome),
@@ -1130,6 +1154,7 @@ mod tests {
                 React::Stay => {}
                 React::Pause => hold.apply(&current, true),
                 React::Resume => hold.apply(&current, false),
+                React::Volume(percent) => set_volume(&volume, percent),
                 React::Play(arg) => {
                     hold.clear_for_new_song();
                     let source = crate::command::AudioSource::Url(arg);
@@ -1159,6 +1184,115 @@ mod tests {
             "the pause after the song that won did not hold it"
         );
         audio::tear_down(&mut current);
+    }
+
+    #[test]
+    fn channel_vol_sets_the_volume() {
+        assert_eq!(
+            line_for(MessageTarget::Channel, "!vol 40"),
+            Line::Volume(40)
+        );
+        assert_eq!(line_for(MessageTarget::Channel, "!vol 0"), Line::Volume(0));
+        assert_eq!(
+            line_for(MessageTarget::Channel, "!vol 100"),
+            Line::Volume(100)
+        );
+        for bad in ["!vol", "!vol abc", "!vol 101", "!vol -5"] {
+            assert_eq!(line_for(MessageTarget::Channel, bad), Line::Ignore, "{bad}");
+        }
+    }
+
+    #[test]
+    fn vol_outside_the_channel_is_not_a_command() {
+        for target in [
+            MessageTarget::Server,
+            MessageTarget::Client(ClientId(4)),
+            MessageTarget::Poke(ClientId(4)),
+        ] {
+            assert_eq!(line_for(target, "!vol 40"), Line::Ignore);
+        }
+    }
+
+    #[test]
+    fn vol_does_not_end_playback_or_start_a_song() {
+        let react = command_react(line_for(MessageTarget::Channel, "!vol 40"));
+        assert_eq!(react, React::Volume(40));
+        assert!(!react.leaves_the_channel());
+    }
+
+    #[test]
+    fn a_vol_in_the_same_batch_does_not_swallow_a_song() {
+        let note = |batch: &mut Vec<React>, line: &str| {
+            note_command(batch, line_for(MessageTarget::Channel, line))
+        };
+
+        let mut song_then_vol = Vec::new();
+        assert!(note(&mut song_then_vol, "!play yt:next").is_none());
+        assert!(note(&mut song_then_vol, "!vol 40").is_none());
+        assert_eq!(
+            song_then_vol,
+            [React::Play("yt:next".into()), React::Volume(40)]
+        );
+
+        // A song after the volume replaces the batch like any song. The
+        // volume before it is dropped with the rest, so the only loss is
+        // a `!vol` typed in the same batch as a later `!play`.
+        let mut vol_then_song = Vec::new();
+        assert!(note(&mut vol_then_song, "!vol 40").is_none());
+        assert!(note(&mut vol_then_song, "!play yt:next").is_none());
+        assert_eq!(vol_then_song, [React::Play("yt:next".into())]);
+
+        // Bad input is not a command and leaves the batch alone.
+        let mut bad_vol = Vec::new();
+        assert!(note(&mut bad_vol, "!play yt:next").is_none());
+        assert!(note(&mut bad_vol, "!vol 101").is_none());
+        assert_eq!(bad_vol, [React::Play("yt:next".into())]);
+    }
+
+    #[test]
+    fn a_summon_plays_at_the_servers_registered_volume() {
+        let director = SummonDirector::new(std::env::temp_dir().join("ts6-quiet-vol-shared"));
+        // The saved bot registers under the address it dials. The summon
+        // session asks with the same server in another spelling.
+        let saved = director.register_volume("ts.example", VolumeHandle::default());
+        let summon = session_volume(&director, "ts.example:9987");
+        assert_eq!(summon.get(), music_bot_audio::UNITY_GAIN);
+
+        // The panel slider or the saved bot's `!vol`.
+        saved.set(0.4);
+        assert_eq!(summon.get(), 0.4);
+
+        // `!vol` in the summon client's channel moves the saved bot too.
+        set_volume(&summon, 25);
+        assert_eq!(saved.get(), 0.25);
+
+        // A second saved bot on the server takes the handle in force. It
+        // does not put a second cell there and does not reset the gain.
+        let second = director.register_volume("ts.example:9987", VolumeHandle::default());
+        assert_eq!(second.get(), 0.25);
+        second.set(0.6);
+        assert_eq!(saved.get(), 0.6);
+        assert_eq!(summon.get(), 0.6);
+        assert_eq!(session_volume(&director, "ts.example").get(), 0.6);
+
+        // Another server has its own gain.
+        assert!(director.volume_for("other.example").is_none());
+    }
+
+    #[test]
+    fn a_summon_without_a_registered_volume_plays_at_unity() {
+        let director = SummonDirector::new(std::env::temp_dir().join("ts6-quiet-vol-default"));
+        assert!(director.volume_for("ts.example").is_none());
+        let summon = session_volume(&director, "ts.example");
+        assert_eq!(summon.get(), music_bot_audio::UNITY_GAIN);
+
+        // A handle registered afterwards is a different cell. It does not
+        // reach the handle this session already took.
+        let saved = director.register_volume("ts.example", VolumeHandle::default());
+        saved.set(0.3);
+        assert_eq!(summon.get(), music_bot_audio::UNITY_GAIN);
+        // The next session on that server does share it.
+        assert_eq!(session_volume(&director, "ts.example").get(), 0.3);
     }
 
     #[test]

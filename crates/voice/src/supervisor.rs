@@ -53,6 +53,21 @@ pub fn spawn_bot(
     yt_cookie: Arc<RwLock<Option<PathBuf>>>,
     yt_api_key: Arc<RwLock<Option<String>>>,
 ) -> BotHandle {
+    spawn_bot_with(id, config, store, yt_cookie, yt_api_key, None)
+}
+
+/// [`spawn_bot`] for a bot that belongs to a supervisor. With `summon`
+/// the actor registers its output gain on that director, so the summon
+/// clients on the bot's server play at the same gain. Without one the
+/// bot keeps a handle of its own.
+fn spawn_bot_with(
+    id: BotId,
+    config: BotConfig,
+    store: Arc<dyn MusicBotStore>,
+    yt_cookie: Arc<RwLock<Option<PathBuf>>>,
+    yt_api_key: Arc<RwLock<Option<String>>>,
+    summon: Option<SummonDirector>,
+) -> BotHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_BUFFER);
     let (event_tx, _) = broadcast::channel(config.event_buffer.max(1));
     let event_tx_for_actor = event_tx.clone();
@@ -67,6 +82,7 @@ pub fn spawn_bot(
             event_tx_for_actor,
             yt_cookie,
             yt_api_key,
+            summon,
         )
         .await;
     });
@@ -257,7 +273,14 @@ impl BotSupervisor {
     ) -> BotId {
         let id = BotId(self.next_id.fetch_add(1, Ordering::Relaxed));
         let name = config.name.clone();
-        let handle = spawn_bot(id, config, Arc::clone(&self.store), yt_cookie, yt_api_key);
+        let handle = spawn_bot_with(
+            id,
+            config,
+            Arc::clone(&self.store),
+            yt_cookie,
+            yt_api_key,
+            Some(self.summon.clone()),
+        );
         self.bots.lock().await.insert(id, handle);
         info!(%id, %name, "spawned bot");
         id
@@ -279,7 +302,14 @@ impl BotSupervisor {
         yt_api_key: Arc<RwLock<Option<String>>>,
     ) -> BotId {
         let name = config.name.clone();
-        let handle = spawn_bot(id, config, Arc::clone(&self.store), yt_cookie, yt_api_key);
+        let handle = spawn_bot_with(
+            id,
+            config,
+            Arc::clone(&self.store),
+            yt_cookie,
+            yt_api_key,
+            Some(self.summon.clone()),
+        );
         self.bots.lock().await.insert(id, handle);
         // Keep the minted-id counter ahead of every rehydrated id.
         self.next_id.fetch_max(id.0 + 1, Ordering::Relaxed);
@@ -517,6 +547,51 @@ mod tests {
             v
         };
         assert_eq!(ids, vec![5, 6]);
+
+        sup.shutdown_all().await;
+    }
+
+    /// A bot the supervisor starts registers its output gain on the
+    /// supervisor's director, under the server it dials. Summon clients
+    /// on that server take the same handle. Nothing has to enable live
+    /// summon sessions first.
+    #[tokio::test]
+    async fn a_supervised_bot_registers_its_volume_for_its_server() {
+        let sup = BotSupervisor::new();
+        let cookie = Arc::new(RwLock::new(None));
+        let api_key = Arc::new(RwLock::new(None));
+        assert!(sup.summon().volume_for("vol.example").is_none());
+
+        for name in ["vol-first", "vol-second"] {
+            sup.spawn(
+                idle_config(name).with_server_addr("Vol.Example:9987"),
+                Arc::clone(&cookie),
+                Arc::clone(&api_key),
+            )
+            .await;
+        }
+
+        // The actor registers when it starts, on the voice runtime.
+        let registered = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(volume) = sup.summon().volume_for("vol.example") {
+                    break volume;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the bot did not register its volume");
+        assert_eq!(registered.get(), music_bot_audio::UNITY_GAIN);
+
+        // One cell for the server: a later registration, which is what
+        // the second bot does, gets the handle in force and its gain.
+        registered.set(0.5);
+        let later = sup
+            .summon()
+            .register_volume("vol.example", music_bot_audio::VolumeHandle::default());
+        assert_eq!(later.get(), 0.5);
+        assert!(sup.summon().volume_for("elsewhere.example").is_none());
 
         sup.shutdown_all().await;
     }

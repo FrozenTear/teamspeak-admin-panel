@@ -61,6 +61,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+use music_bot_audio::VolumeHandle;
 use tokio::sync::{mpsc, watch};
 
 use crate::chat::{ParsedCommand, parse as parse_chat};
@@ -303,6 +304,11 @@ struct SummonState {
     identity_dir: PathBuf,
     next_summon: u64,
     servers: BTreeMap<String, ServerPool>,
+    /// One output-gain cell per server, keyed like `servers`. Saved bots
+    /// and summon clients on that server hold clones of it. It is kept
+    /// apart from the pools so it does not depend on summon being armed,
+    /// and it stays for the life of the process.
+    volumes: BTreeMap<String, VolumeHandle>,
 }
 
 /// Summon clients a server may hold at once for a stored cap. Zero means
@@ -367,9 +373,33 @@ impl SummonDirector {
                 identity_dir: identity_dir.into(),
                 next_summon: 1,
                 servers: BTreeMap::new(),
+                volumes: BTreeMap::new(),
             })),
             live: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// The output-gain handle a saved bot on `server` uses. The first
+    /// call for a server stores `fresh` and returns it. Every later call
+    /// returns a clone of the stored handle and drops `fresh`, so there
+    /// is one cell per server: the panel slider and `!vol` on any saved
+    /// bot move every saved bot and every summon client on that server.
+    ///
+    /// The handle is never removed. A bot that starts later on the same
+    /// server, including a restart of the last bot there, takes the gain
+    /// already in force and does not go back to unity.
+    pub fn register_volume(&self, server: &str, fresh: VolumeHandle) -> VolumeHandle {
+        self.lock()
+            .volumes
+            .entry(canon_server_addr(server))
+            .or_insert(fresh)
+            .clone()
+    }
+
+    /// The shared output-gain handle for `server`, when a saved bot has
+    /// registered one. See [`Self::register_volume`].
+    pub fn volume_for(&self, server: &str) -> Option<VolumeHandle> {
+        self.lock().volumes.get(&canon_server_addr(server)).cloned()
     }
 
     /// Remember a saved bot. `cap` is the number carried on this push.

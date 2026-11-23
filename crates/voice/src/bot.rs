@@ -48,6 +48,7 @@ use crate::config::{BotConfig, BotId};
 use crate::event::{BotError, BotEvent, DisconnectKind};
 use crate::state::BotState;
 use crate::store::{MusicBotStore, StoreError, Track, TrackId};
+use crate::summon::SummonDirector;
 
 /// PURA-347 — frames per playback-progress tick. Opus frames carry 20 ms
 /// of audio each, so 50 frames is exactly one second of content. The
@@ -61,6 +62,11 @@ const FRAMES_PER_PROGRESS_TICK: u64 = 50;
 /// `yt_cookie` is a live-updated cookie-file path (PURA-223). The actor
 /// reads the current value each time it starts a new yt-dlp pipeline so
 /// a UI-uploaded cookie takes effect on the next track without a restart.
+///
+/// `summon` is the supervisor's director. The actor registers its output
+/// gain there for `config.server_addr`, so the server's summon clients
+/// play at the same gain. `None` keeps a handle of the bot's own.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_bot(
     bot_id: BotId,
     config: BotConfig,
@@ -69,6 +75,7 @@ pub(crate) async fn run_bot(
     events: broadcast::Sender<BotEvent>,
     yt_cookie: Arc<RwLock<Option<PathBuf>>>,
     yt_api_key: Arc<RwLock<Option<String>>>,
+    summon: Option<SummonDirector>,
 ) {
     let span = tracing::info_span!("music_bot", bot_id = %bot_id, name = %config.name);
     let _enter = span.enter();
@@ -80,7 +87,15 @@ pub(crate) async fn run_bot(
     // an operator's volume setting survives reconnects (the connected loop
     // is re-entered on each handshake); cloned into every pipeline the bot
     // spawns so a change applies to the live track and every later one.
-    let bot_volume = VolumeHandle::default();
+    //
+    // With a director the handle is the server's shared cell: summon
+    // clients on this server play through a clone of it, so the panel
+    // slider and `!vol` reach them too. A bot that starts while the
+    // server already has a handle takes that one, at its present gain.
+    let bot_volume = match &summon {
+        Some(director) => director.register_volume(&config.server_addr, VolumeHandle::default()),
+        None => VolumeHandle::default(),
+    };
     // Re-armed on every successful handshake; consumed by the connected loop.
     let mut connection: Option<Connection> = None;
     let mut shutdown_requested = false;
@@ -1947,7 +1962,7 @@ async fn handle_audio_command(
             // and is inherited by every later track and reconnect. No
             // pipeline need be active — the value is staged for next play.
             bot_volume.set(gain);
-            debug!(gain = bot_volume.get(), "AudioCommand::SetVolume applied");
+            info!(gain = bot_volume.get(), "AudioCommand::SetVolume applied");
         }
         // SkipPrev / NowPlaying don't have pipeline support yet — leave
         // them on the stub path so REST/UI subscribers see a
@@ -2669,7 +2684,7 @@ async fn apply_chat_audio_action(
             // PURA-351 — `!vol` lowers here. Same shared handle the REST
             // `SetVolume` command and every pipeline use; applies live.
             bot_volume.set(gain);
-            debug!(gain = bot_volume.get(), "chat !vol applied");
+            info!(gain = bot_volume.get(), "chat !vol applied");
         }
         ChatAudioAction::StartIfIdle => {
             // `!play` — start the queue head. A no-op when a pipeline is
@@ -3525,6 +3540,7 @@ mod tests {
             events_tx,
             Arc::new(RwLock::new(None)),
             Arc::new(RwLock::new(None)),
+            None,
         ));
         LocalActor {
             tx,
