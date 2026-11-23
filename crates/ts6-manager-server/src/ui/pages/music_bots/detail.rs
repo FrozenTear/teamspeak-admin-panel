@@ -870,10 +870,12 @@ fn PlayNowComposer(bot_id: u64, state: wire::BotState, mut reload: Signal<u64>) 
 /// confirmed value and toasts.
 ///
 /// The bot snapshot does not echo the current gain, so the slider opens
-/// at 100 % on every page load. The music bot itself defaults to unity
-/// gain, so that is truthful for a fresh bot; restoring a non-default
-/// level after a reload is a follow-up (would need the gain in
-/// `MusicBotDetail`).
+/// at 100 % on every page load. That is only a starting position, not
+/// the gain in force: saved bots and summon clients on one server share
+/// one gain, and a bot created or re-created on a server that already
+/// has one keeps it, so another bot, a summon `!vol`, or an earlier bot
+/// may have moved it. Showing the real level would need the gain in
+/// `MusicBotDetail` (a follow-up).
 #[component]
 fn VolumeSlider(bot_id: u64, disabled: bool) -> Element {
     let bot = wire::BotId(bot_id);

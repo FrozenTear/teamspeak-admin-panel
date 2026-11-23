@@ -48,7 +48,6 @@ use crate::config::{BotConfig, BotId};
 use crate::event::{BotError, BotEvent, DisconnectKind};
 use crate::state::BotState;
 use crate::store::{MusicBotStore, StoreError, Track, TrackId};
-use crate::summon::SummonDirector;
 
 /// PURA-347 — frames per playback-progress tick. Opus frames carry 20 ms
 /// of audio each, so 50 frames is exactly one second of content. The
@@ -63,9 +62,10 @@ const FRAMES_PER_PROGRESS_TICK: u64 = 50;
 /// reads the current value each time it starts a new yt-dlp pipeline so
 /// a UI-uploaded cookie takes effect on the next track without a restart.
 ///
-/// `summon` is the supervisor's director. The actor registers its output
-/// gain there for `config.server_addr`, so the server's summon clients
-/// play at the same gain. `None` keeps a handle of the bot's own.
+/// `bot_volume` is the actor's output gain. A bot the supervisor starts
+/// gets its server's shared cell from the director, registered before
+/// the actor is spawned, so the server's summon clients play at the same
+/// gain. A bot spawned without a director gets a handle of its own.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_bot(
     bot_id: BotId,
@@ -75,7 +75,7 @@ pub(crate) async fn run_bot(
     events: broadcast::Sender<BotEvent>,
     yt_cookie: Arc<RwLock<Option<PathBuf>>>,
     yt_api_key: Arc<RwLock<Option<String>>>,
-    summon: Option<SummonDirector>,
+    bot_volume: VolumeHandle,
 ) {
     let span = tracing::info_span!("music_bot", bot_id = %bot_id, name = %config.name);
     let _enter = span.enter();
@@ -88,14 +88,10 @@ pub(crate) async fn run_bot(
     // is re-entered on each handshake); cloned into every pipeline the bot
     // spawns so a change applies to the live track and every later one.
     //
-    // With a director the handle is the server's shared cell: summon
+    // For a supervised bot the handle is the server's shared cell: summon
     // clients on this server play through a clone of it, so the panel
     // slider and `!vol` reach them too. A bot that starts while the
     // server already has a handle takes that one, at its present gain.
-    let bot_volume = match &summon {
-        Some(director) => director.register_volume(&config.server_addr, VolumeHandle::default()),
-        None => VolumeHandle::default(),
-    };
     // Re-armed on every successful handshake; consumed by the connected loop.
     let mut connection: Option<Connection> = None;
     let mut shutdown_requested = false;
@@ -3540,7 +3536,7 @@ mod tests {
             events_tx,
             Arc::new(RwLock::new(None)),
             Arc::new(RwLock::new(None)),
-            None,
+            VolumeHandle::default(),
         ));
         LocalActor {
             tx,

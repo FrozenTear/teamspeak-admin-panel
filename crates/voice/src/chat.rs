@@ -63,7 +63,10 @@ pub enum ParsedCommand {
     Skip,
     /// `!prev` — replay the previous track if available.
     Prev,
-    /// `!vol <0..100>` — set per-bot volume.
+    /// `!vol <0..100>`: set the output volume. For a bot the supervisor
+    /// started, that is the cell its server shares with the other saved
+    /// bots and the summon clients there, so it changes all of them. A
+    /// bot spawned without a director keeps a volume of its own.
     Volume(u8),
     /// `!np` — reply with the current now-playing line.
     NowPlaying,
@@ -195,6 +198,12 @@ pub fn parse(line: &str) -> Result<ParsedCommand, ParseError> {
     }
 }
 
+/// The linear gain for a `!vol` percent, 0 to 100: `0.0..=1.0`. Saved
+/// bot chat and summon chat both use this step.
+pub(crate) fn percent_to_gain(percent: u8) -> f32 {
+    f32::from(percent) / 100.0
+}
+
 /// Lower a parsed command into store mutations + `BotEvent`s, returning
 /// the operator-facing reply line and the [`ChatAudioAction`] the bot
 /// actor must apply.
@@ -237,7 +246,7 @@ pub(crate) async fn handle_command(
             // `0.0..=1.0`. The connected loop applies it to the bot's
             // shared `VolumeHandle`, so it lands on the live track and
             // every later one.
-            let gain = f32::from(v) / 100.0;
+            let gain = percent_to_gain(v);
             (format!("volume {v}%"), ChatAudioAction::SetVolume(gain))
         }
         ParsedCommand::NowPlaying => (handle_np(bot_id, store).await, ChatAudioAction::None),

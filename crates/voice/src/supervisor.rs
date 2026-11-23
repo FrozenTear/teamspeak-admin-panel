@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
+use music_bot_audio::VolumeHandle;
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
@@ -29,8 +30,10 @@ use crate::summon::SummonDirector;
 const COMMAND_BUFFER: usize = 16;
 
 /// Spawn a bot actor without a supervisor. The caller owns the returned
-/// `BotHandle` directly. The supervisor uses this same constructor under
-/// the hood so behaviour stays identical.
+/// `BotHandle` directly. The supervisor builds its bots the same way,
+/// with one difference: a supervised bot plays through its server's
+/// shared output-gain cell (see [`BotSupervisor::spawn`]), and a bot
+/// spawned here has a gain of its own.
 ///
 /// `store` is the `MusicBotStore` the actor uses for queue / playlist /
 /// library state — see [`InMemoryMusicBotStore`] for a default; WS-5
@@ -57,17 +60,24 @@ pub fn spawn_bot(
 }
 
 /// [`spawn_bot`] for a bot that belongs to a supervisor. With `summon`
-/// the actor registers its output gain on that director, so the summon
-/// clients on the bot's server play at the same gain. Without one the
-/// bot keeps a handle of its own.
+/// the bot's output gain is that director's cell for the bot's server,
+/// registered here before the actor is spawned, so the summon clients on
+/// that server play at the same gain from the moment this returns.
+/// Without one the bot keeps a handle of its own.
 fn spawn_bot_with(
     id: BotId,
     config: BotConfig,
     store: Arc<dyn MusicBotStore>,
     yt_cookie: Arc<RwLock<Option<PathBuf>>>,
     yt_api_key: Arc<RwLock<Option<String>>>,
-    summon: Option<SummonDirector>,
+    summon: Option<&SummonDirector>,
 ) -> BotHandle {
+    let bot_volume = match summon {
+        Some(director) => director.server_volume(&config.server_addr),
+        None => VolumeHandle::default(),
+    };
+    #[cfg(test)]
+    let volume = bot_volume.clone();
     let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_BUFFER);
     let (event_tx, _) = broadcast::channel(config.event_buffer.max(1));
     let event_tx_for_actor = event_tx.clone();
@@ -82,7 +92,7 @@ fn spawn_bot_with(
             event_tx_for_actor,
             yt_cookie,
             yt_api_key,
-            summon,
+            bot_volume,
         )
         .await;
     });
@@ -92,6 +102,8 @@ fn spawn_bot_with(
         commands: cmd_tx,
         events: event_tx,
         join,
+        #[cfg(test)]
+        volume,
     }
 }
 
@@ -104,6 +116,10 @@ pub struct BotHandle {
     commands: mpsc::Sender<BotCommand>,
     events: broadcast::Sender<BotEvent>,
     join: JoinHandle<()>,
+    /// A clone of the output-gain handle the actor plays through, so a
+    /// test can see which cell the actor got.
+    #[cfg(test)]
+    volume: VolumeHandle,
 }
 
 impl BotHandle {
@@ -265,6 +281,10 @@ impl BotSupervisor {
     ///
     /// `yt_cookie` is the live-updated cookie-file path (PURA-223).
     /// The caller typically passes `AppState::yt_cookie.clone()`.
+    ///
+    /// The bot plays through its server's output-gain cell on
+    /// [`Self::summon`], registered before this returns. The other saved
+    /// bots and the summon clients on that server share it.
     pub async fn spawn(
         &self,
         config: BotConfig,
@@ -279,7 +299,7 @@ impl BotSupervisor {
             Arc::clone(&self.store),
             yt_cookie,
             yt_api_key,
-            Some(self.summon.clone()),
+            Some(&self.summon),
         );
         self.bots.lock().await.insert(id, handle);
         info!(%id, %name, "spawned bot");
@@ -308,7 +328,7 @@ impl BotSupervisor {
             Arc::clone(&self.store),
             yt_cookie,
             yt_api_key,
-            Some(self.summon.clone()),
+            Some(&self.summon),
         );
         self.bots.lock().await.insert(id, handle);
         // Keep the minted-id counter ahead of every rehydrated id.
@@ -552,9 +572,10 @@ mod tests {
     }
 
     /// A bot the supervisor starts registers its output gain on the
-    /// supervisor's director, under the server it dials. Summon clients
-    /// on that server take the same handle. Nothing has to enable live
-    /// summon sessions first.
+    /// supervisor's director, under the server it dials, before `spawn`
+    /// returns. A second bot on the same server plays through that same
+    /// cell at the gain in force. Summon clients on that server take the
+    /// same handle. Nothing has to enable live summon sessions first.
     #[tokio::test]
     async fn a_supervised_bot_registers_its_volume_for_its_server() {
         let sup = BotSupervisor::new();
@@ -562,36 +583,41 @@ mod tests {
         let api_key = Arc::new(RwLock::new(None));
         assert!(sup.summon().volume_for("vol.example").is_none());
 
-        for name in ["vol-first", "vol-second"] {
-            sup.spawn(
-                idle_config(name).with_server_addr("Vol.Example:9987"),
+        let first = sup
+            .spawn(
+                idle_config("vol-first").with_server_addr("Vol.Example:9987"),
                 Arc::clone(&cookie),
                 Arc::clone(&api_key),
             )
             .await;
-        }
-
-        // The actor registers when it starts, on the voice runtime.
-        let registered = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                if let Some(volume) = sup.summon().volume_for("vol.example") {
-                    break volume;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("the bot did not register its volume");
-        assert_eq!(registered.get(), music_bot_audio::UNITY_GAIN);
-
-        // One cell for the server: a later registration, which is what
-        // the second bot does, gets the handle in force and its gain.
-        registered.set(0.5);
-        let later = sup
+        // Registered by the time `spawn` returns. No wait on the actor.
+        let registered = sup
             .summon()
-            .register_volume("vol.example", music_bot_audio::VolumeHandle::default());
-        assert_eq!(later.get(), 0.5);
+            .volume_for("vol.example")
+            .expect("the bot did not register its volume");
+        assert_eq!(registered.get(), music_bot_audio::UNITY_GAIN);
+        let first_volume = sup.bots.lock().await[&first].volume.clone();
+        registered.set(0.5);
+        assert_eq!(first_volume.get(), 0.5, "the actor has another cell");
+
+        // A second bot on the server, in another spelling, takes the
+        // cell in force and its gain. It does not reset it to unity.
+        let second = sup
+            .spawn(
+                idle_config("vol-second").with_server_addr("vol.example"),
+                Arc::clone(&cookie),
+                Arc::clone(&api_key),
+            )
+            .await;
+        let second_volume = sup.bots.lock().await[&second].volume.clone();
+        assert_eq!(second_volume.get(), 0.5);
+        second_volume.set(0.3);
+        assert_eq!(first_volume.get(), 0.3);
+        assert_eq!(registered.get(), 0.3);
+
+        // Another server, or another port on this one, is a separate cell.
         assert!(sup.summon().volume_for("elsewhere.example").is_none());
+        assert!(sup.summon().volume_for("vol.example:9988").is_none());
 
         sup.shutdown_all().await;
     }

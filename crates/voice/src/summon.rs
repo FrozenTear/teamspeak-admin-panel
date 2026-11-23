@@ -6,10 +6,12 @@
 //! song ends. Nothing here writes a `music_bot_runtime` row, and nothing
 //! here is returned from [`crate::supervisor::BotSupervisor::list`].
 //!
-//! A summon line is `!play <song>` or `!radio <station>`. `!pause` and
-//! `!resume` are not summon lines. The client that is playing handles
-//! them in its own channel chat. They do not start a client and they
-//! do not change the cap. A summon line reaches this module from any
+//! A summon line is `!play <song>` or `!radio <station>`. `!pause`,
+//! `!resume` and `!vol N` are not summon lines. The client that is
+//! playing handles them in its own channel chat. They do not start a
+//! client and they do not change the cap. `!vol N` sets the server's
+//! shared output gain, so it changes every saved bot and every summon
+//! client playing on that server. A summon line reaches this module from any
 //! channel in one of these ways:
 //!
 //! - a private message, a poke, or server chat to a saved bot, or to a
@@ -380,25 +382,26 @@ impl SummonDirector {
     }
 
     /// The output-gain handle a saved bot on `server` uses. The first
-    /// call for a server stores `fresh` and returns it. Every later call
-    /// returns a clone of the stored handle and drops `fresh`, so there
-    /// is one cell per server: the panel slider and `!vol` on any saved
-    /// bot move every saved bot and every summon client on that server.
+    /// call for a server stores a new handle at unity and returns it.
+    /// Every later call returns a clone of the stored handle, so there is
+    /// one cell per server: the panel slider and `!vol` on any saved bot
+    /// move every saved bot and every summon client on that server.
     ///
     /// The handle is never removed. A bot that starts later on the same
     /// server, including a restart of the last bot there, takes the gain
     /// already in force and does not go back to unity.
-    pub fn register_volume(&self, server: &str, fresh: VolumeHandle) -> VolumeHandle {
+    pub(crate) fn server_volume(&self, server: &str) -> VolumeHandle {
         self.lock()
             .volumes
             .entry(canon_server_addr(server))
-            .or_insert(fresh)
+            .or_default()
             .clone()
     }
 
     /// The shared output-gain handle for `server`, when a saved bot has
-    /// registered one. See [`Self::register_volume`].
-    pub fn volume_for(&self, server: &str) -> Option<VolumeHandle> {
+    /// registered one. It never stores a handle. See
+    /// [`Self::server_volume`].
+    pub(crate) fn volume_for(&self, server: &str) -> Option<VolumeHandle> {
         self.lock().volumes.get(&canon_server_addr(server)).cloned()
     }
 
